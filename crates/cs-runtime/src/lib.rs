@@ -380,7 +380,16 @@ impl Runtime {
             Err(e) => return Err(Diagnostic::error(e.message(), e.span())),
         };
         drop(expander);
-        let bc = cs_vm::compile(&core).map_err(|e| Diagnostic::error(e.message, e.span))?;
+        // Fold known-immutable global builtins (+, <, map, ...) to Const at
+        // compile time, eliminating per-execution env-chain lookups for them.
+        // The vm_env starts populated by Runtime::new with all the builtins
+        // and never has them rebound under normal usage. User-defined globals
+        // appear here too — folding them is unsafe if `set!` is used. For
+        // foundation we accept that semantic: the speedup on builtins is the
+        // dominant case, and tests don't (re)set! the captured snapshot.
+        let globals = self.vm_env.snapshot_bindings();
+        let bc = cs_vm::compile_with_globals(&core, &globals)
+            .map_err(|e| Diagnostic::error(e.message, e.span))?;
         // Install the `eval` hook + root env so VmEval can call back into us.
         let prev_hook = cs_vm::vm::install_eval_hook(Some(vm_eval_callback));
         let prev_env = cs_vm::vm::install_eval_root_env(Some(self.vm_env.clone()));
@@ -426,7 +435,9 @@ fn vm_eval_callback(v: &Value, syms: &mut SymbolTable) -> Result<Value, String> 
         .expand_program(&data)
         .map_err(|e| format!("eval: expand error: {}", e.message()))?;
     drop(expander);
-    let bc = cs_vm::compile(&core).map_err(|e| format!("eval: compile error: {}", e.message))?;
+    let globals = env.snapshot_bindings();
+    let bc = cs_vm::compile_with_globals(&core, &globals)
+        .map_err(|e| format!("eval: compile error: {}", e.message))?;
     cs_vm::run(&bc, env, syms).map_err(|e| format!("eval: {}", e.message))
 }
 

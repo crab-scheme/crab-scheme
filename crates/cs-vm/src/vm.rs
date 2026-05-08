@@ -199,6 +199,21 @@ impl Env {
     pub fn define(&self, name: Symbol, value: Value) {
         self.bindings.borrow_mut().insert(name, value);
     }
+
+    /// Snapshot the bindings of this env (and all parents) into a flat
+    /// HashMap. Used by the compiler to fold known-immutable globals to
+    /// `Inst::Const`. Closer-to-root parents are overridden by closer-to-
+    /// leaf children if the same symbol exists at multiple levels.
+    pub fn snapshot_bindings(&self) -> HashMap<Symbol, Value> {
+        let mut out = HashMap::new();
+        if let Some(p) = &self.parent {
+            out = p.snapshot_bindings();
+        }
+        for (k, v) in self.bindings.borrow().iter() {
+            out.insert(*k, v.clone());
+        }
+        out
+    }
 }
 
 struct Frame {

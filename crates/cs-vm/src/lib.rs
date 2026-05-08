@@ -17,6 +17,6 @@ pub mod compiler;
 pub mod opcode;
 pub mod vm;
 
-pub use compiler::{compile, CompileError};
+pub use compiler::{compile, compile_with_globals, CompileError};
 pub use opcode::{Bytecode, Inst};
 pub use vm::{run, VmError};
