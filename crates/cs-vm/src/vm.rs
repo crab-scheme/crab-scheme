@@ -506,10 +506,25 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                             .collect::<Result<_, _>>()?;
                         let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
                         let mut out = Vec::with_capacity(n);
-                        for i in 0..n {
-                            let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-                            let r = vm_call_sync(&proc_val, &row, syms)?;
-                            out.push(r);
+                        if lists.len() == 1 {
+                            // Single-list fast path: avoid per-element row Vec
+                            // allocation by passing a slice view.
+                            let list = &lists[0];
+                            for item in list {
+                                let r = vm_call_sync(&proc_val, std::slice::from_ref(item), syms)?;
+                                out.push(r);
+                            }
+                        } else {
+                            // Multi-list: reuse one row buffer across iterations.
+                            let mut row: Vec<Value> = Vec::with_capacity(lists.len());
+                            for i in 0..n {
+                                row.clear();
+                                for l in &lists {
+                                    row.push(l[i].clone());
+                                }
+                                let r = vm_call_sync(&proc_val, &row, syms)?;
+                                out.push(r);
+                            }
                         }
                         let result = Value::list(out);
                         stack.push(result);
@@ -533,9 +548,19 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                             .map(collect_proper_list)
                             .collect::<Result<_, _>>()?;
                         let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
-                        for i in 0..n {
-                            let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-                            vm_call_sync(&proc_val, &row, syms)?;
+                        if lists.len() == 1 {
+                            for item in &lists[0] {
+                                vm_call_sync(&proc_val, std::slice::from_ref(item), syms)?;
+                            }
+                        } else {
+                            let mut row: Vec<Value> = Vec::with_capacity(lists.len());
+                            for i in 0..n {
+                                row.clear();
+                                for l in &lists {
+                                    row.push(l[i].clone());
+                                }
+                                vm_call_sync(&proc_val, &row, syms)?;
+                            }
                         }
                         stack.push(Value::Unspecified);
                         if is_tail {
@@ -669,12 +694,25 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                             .map(collect_proper_list)
                             .collect::<Result<_, _>>()?;
                         let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
-                        for i in 0..n {
-                            let mut row: Vec<Value> = vec![acc.clone()];
-                            for l in &lists {
-                                row.push(l[i].clone());
+                        if lists.len() == 1 {
+                            // Fast path: single list. Reuse a 2-slot row buf.
+                            let list = &lists[0];
+                            let mut row: [Value; 2] = [Value::Unspecified, Value::Unspecified];
+                            for item in list {
+                                row[0] = acc;
+                                row[1] = item.clone();
+                                acc = vm_call_sync(&proc_val, &row, syms)?;
                             }
-                            acc = vm_call_sync(&proc_val, &row, syms)?;
+                        } else {
+                            let mut row: Vec<Value> = Vec::with_capacity(lists.len() + 1);
+                            for i in 0..n {
+                                row.clear();
+                                row.push(acc.clone());
+                                for l in &lists {
+                                    row.push(l[i].clone());
+                                }
+                                acc = vm_call_sync(&proc_val, &row, syms)?;
+                            }
                         }
                         stack.push(acc);
                         if is_tail {
@@ -699,13 +737,24 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                             .collect::<Result<_, _>>()?;
                         let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
                         let mut acc = init;
-                        for i in (0..n).rev() {
-                            let mut row: Vec<Value> = Vec::with_capacity(lists.len() + 1);
-                            for l in &lists {
-                                row.push(l[i].clone());
+                        if lists.len() == 1 {
+                            let list = &lists[0];
+                            let mut row: [Value; 2] = [Value::Unspecified, Value::Unspecified];
+                            for item in list.iter().take(n).rev() {
+                                row[0] = item.clone();
+                                row[1] = acc;
+                                acc = vm_call_sync(&proc_val, &row, syms)?;
                             }
-                            row.push(acc);
-                            acc = vm_call_sync(&proc_val, &row, syms)?;
+                        } else {
+                            let mut row: Vec<Value> = Vec::with_capacity(lists.len() + 1);
+                            for i in (0..n).rev() {
+                                row.clear();
+                                for l in &lists {
+                                    row.push(l[i].clone());
+                                }
+                                row.push(acc);
+                                acc = vm_call_sync(&proc_val, &row, syms)?;
+                            }
                         }
                         stack.push(acc);
                         if is_tail {
