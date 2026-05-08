@@ -298,33 +298,41 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
             Inst::Call(n) | Inst::TailCall(n) => {
                 let n = *n;
                 let is_tail = matches!(inst_ref, Inst::TailCall(_));
-                if stack.len() < n + 1 {
+                let stack_len = stack.len();
+                if stack_len < n + 1 {
                     return Err(VmError::new("stack underflow on Call"));
                 }
-                let args_start = stack.len() - n;
-                let mut args: Vec<Value> = stack.drain(args_start..).collect();
-                let mut func = stack
-                    .pop()
-                    .ok_or_else(|| VmError::new("missing function on Call"))?;
-                // FAST PATH: closure / builtin / builtin-with-syms.
-                // These are the overwhelming majority of Call sites; checking
-                // them before the HO-marker fan-out cuts ~20 downcast_ref's
-                // off the hot path.
-                if let Value::Procedure(p) = &func {
-                    let any = p.as_any();
+                let func_idx = stack_len - n - 1;
+                let args_start = func_idx + 1;
+                // FAST PATH: peek at func without popping; pass args as a
+                // slice into the stack — no per-Call Vec<Value> allocation.
+                // Covers closure / builtin / builtinSyms / parameter (the
+                // overwhelming majority of Call sites).
+                let func_proc = match &stack[func_idx] {
+                    Value::Procedure(p) => p.clone(),
+                    other => {
+                        return Err(VmError::new(format!(
+                            "call to non-procedure ({})",
+                            other.type_name()
+                        )));
+                    }
+                };
+                {
+                    let any = func_proc.as_any();
                     if let Some(closure) = any.downcast_ref::<VmClosure>() {
                         let lam = &closure.bc.lambdas[closure.lambda_idx];
-                        if !lambda_arity_ok(lam, args.len()) {
+                        if !lambda_arity_ok(lam, n) {
                             return Err(VmError::new("arity mismatch"));
                         }
                         let new_env = Env::child(closure.env.clone());
-                        for (name, v) in lam.params.iter().zip(args.iter()) {
-                            new_env.define(*name, v.clone());
+                        for (i, name) in lam.params.iter().enumerate() {
+                            new_env.define(*name, stack[args_start + i].clone());
                         }
                         if let Some(rest_name) = lam.rest {
-                            let rest = &args[lam.params.len()..];
+                            let rest = &stack[args_start + lam.params.len()..stack_len];
                             new_env.define(rest_name, Value::list(rest.iter().cloned()));
                         }
+                        stack.truncate(func_idx);
                         if is_tail {
                             let last = frames.last_mut().unwrap();
                             last.insts = lam.body.clone();
@@ -342,8 +350,9 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                         continue;
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltin>() {
-                        let r =
-                            (b.f)(&args).map_err(|e| VmError::new(format!("{}: {}", b.name, e)))?;
+                        let r = (b.f)(&stack[args_start..stack_len])
+                            .map_err(|e| VmError::new(format!("{}: {}", b.name, e)))?;
+                        stack.truncate(func_idx);
                         stack.push(r);
                         if is_tail {
                             frames.pop();
@@ -356,8 +365,9 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                         continue;
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltinSyms>() {
-                        let r = (b.f)(&args, syms)
+                        let r = (b.f)(&stack[args_start..stack_len], syms)
                             .map_err(|e| VmError::new(format!("{}: {}", b.name, e)))?;
+                        stack.truncate(func_idx);
                         stack.push(r);
                         if is_tail {
                             frames.pop();
@@ -369,16 +379,17 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                         }
                         continue;
                     }
-                    // Parameter: 0 args reads, 1 arg writes.
                     if let Some(param) = any.downcast_ref::<cs_core::Parameter>() {
-                        let r = if args.is_empty() {
+                        let r = if n == 0 {
                             param.cell.borrow().clone()
-                        } else if args.len() == 1 {
-                            *param.cell.borrow_mut() = args.remove(0);
+                        } else if n == 1 {
+                            let v = stack[args_start].clone();
+                            *param.cell.borrow_mut() = v;
                             Value::Unspecified
                         } else {
                             return Err(VmError::new("parameter: 0 or 1 arg"));
                         };
+                        stack.truncate(func_idx);
                         stack.push(r);
                         if is_tail {
                             frames.pop();
@@ -391,6 +402,12 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                         continue;
                     }
                 }
+                // SLOW PATH: drain into Vec<Value> and pop func for HO marker
+                // dispatch. (map/fold/filter/raise/with-exception-handler/...)
+                let mut args: Vec<Value> = stack.drain(args_start..).collect();
+                let mut func = stack
+                    .pop()
+                    .ok_or_else(|| VmError::new("missing function on Call"))?;
                 // SLOW PATH: HO marker dispatch (map/fold/filter/raise/...).
                 // Native HO: (map proc list) — produce a list.
                 if let Value::Procedure(p) = &func {
