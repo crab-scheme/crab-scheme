@@ -349,8 +349,39 @@ impl Runtime {
         };
         drop(expander);
         let mut ctx = EvalCtx::new(self.top.clone(), &mut self.syms, &mut self.macros);
-        eval(&core, self.top.clone(), &mut ctx)
-            .map_err(|e: EvalError| Diagnostic::error(e.message(), e.span).with_code("E_RUNTIME"))
+        let result = eval(&core, self.top.clone(), &mut ctx);
+        // Drain pending side-channels before ctx drops so we can render
+        // proper messages even when EvalError carried only the sentinel
+        // string (e.g. "__escape__" or "__raised__" coming back through a
+        // higher builtin).
+        let pending_raise = ctx.pending_raise.take();
+        let pending_escape = ctx.pending_escape.take();
+        result.map_err(|e: EvalError| {
+            let msg = match &e.kind {
+                crate::eval::EvalErrorKind::Raised(v) => format_condition(v, &self.syms),
+                crate::eval::EvalErrorKind::Escape(id, v) => format!(
+                    "uncaught escape continuation #{} (value: {})",
+                    id,
+                    v.format_with(&self.syms, WriteMode::Write)
+                ),
+                crate::eval::EvalErrorKind::Message(m) => match m.as_str() {
+                    "__escape__" => match pending_escape {
+                        Some((id, v)) => format!(
+                            "uncaught escape continuation #{} (value: {})",
+                            id,
+                            v.format_with(&self.syms, WriteMode::Write)
+                        ),
+                        None => "uncaught escape continuation".to_string(),
+                    },
+                    "__raised__" => match &pending_raise {
+                        Some(cond) => format_condition(cond, &self.syms),
+                        None => "raised (no condition)".to_string(),
+                    },
+                    other => other.to_string(),
+                },
+            };
+            Diagnostic::error(msg, e.span).with_code("E_RUNTIME")
+        })
     }
 
     /// Define a binding in the top-level environment.
@@ -397,11 +428,28 @@ impl Runtime {
         // Install the `eval` hook + root env so VmEval can call back into us.
         let prev_hook = cs_vm::vm::install_eval_hook(Some(vm_eval_callback));
         let prev_env = cs_vm::vm::install_eval_root_env(Some(self.vm_env.clone()));
-        let result = cs_vm::run(&bc, self.vm_env.clone(), &mut self.syms)
-            .map_err(|e| Diagnostic::error(e.message, cs_diag::Span::DUMMY));
+        let result = cs_vm::run(&bc, self.vm_env.clone(), &mut self.syms);
         cs_vm::vm::install_eval_hook(prev_hook);
         cs_vm::vm::install_eval_root_env(prev_env);
-        result
+        // Render VM errors with proper condition formatting.
+        result.map_err(|e| {
+            let msg = match e.message.as_str() {
+                "__raised__" => match cs_vm::vm::vm_take_pending_raise() {
+                    Some(cond) => format_condition(&cond, &self.syms),
+                    None => "raised (no condition)".to_string(),
+                },
+                "__escape__" => match cs_vm::vm::vm_take_pending_escape() {
+                    Some((id, v)) => format!(
+                        "uncaught escape continuation #{} (value: {})",
+                        id,
+                        v.format_with(&self.syms, WriteMode::Write)
+                    ),
+                    None => "uncaught escape continuation".to_string(),
+                },
+                _ => e.message,
+            };
+            Diagnostic::error(msg, cs_diag::Span::DUMMY).with_code("E_RUNTIME")
+        })
     }
 
     /// Look up a top-level binding.
@@ -413,6 +461,54 @@ impl Runtime {
             None
         })?;
         self.top.get(sym)
+    }
+}
+
+/// Render a raised condition value as a human-friendly error message.
+/// The condition shape produced by `error` / `make-condition` is a list
+/// `("error" "msg" irritants...)`. Other values fall back to a generic
+/// "uncaught: <value>" rendering using the runtime's symbol table.
+fn format_condition(v: &Value, syms: &SymbolTable) -> String {
+    if let Value::Pair(p) = v {
+        // Check shape: list with first element string "error".
+        if let Value::String(tag) = &*p.car.borrow() {
+            if tag.borrow().as_str() == "error" {
+                let tail = p.cdr.borrow().clone();
+                let items: Vec<Value> = collect_list(&tail);
+                if !items.is_empty() {
+                    if let Value::String(msg) = &items[0] {
+                        let m = msg.borrow().clone();
+                        if items.len() == 1 {
+                            return format!("error: {}", m);
+                        }
+                        let irritants: Vec<String> = items[1..]
+                            .iter()
+                            .map(|i| i.format_with(syms, WriteMode::Write))
+                            .collect();
+                        return format!("error: {} ({})", m, irritants.join(" "));
+                    }
+                }
+            }
+        }
+    }
+    format!("uncaught: {}", v.format_with(syms, WriteMode::Write))
+}
+
+fn collect_list(v: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut cur = v.clone();
+    loop {
+        match cur {
+            Value::Null => return out,
+            Value::Pair(p) => {
+                out.push(p.car.borrow().clone());
+                cur = p.cdr.borrow().clone();
+            }
+            other => {
+                out.push(other);
+                return out;
+            }
+        }
     }
 }
 

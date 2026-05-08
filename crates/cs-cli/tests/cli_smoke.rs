@@ -177,3 +177,41 @@ fn repl_starts_in_vm_tier_when_flag_passed() {
     assert!(out.contains("(vm)"), "stdout: {:?}", out);
     assert!(out.contains("121"), "stdout: {:?}", out);
 }
+
+#[test]
+fn raised_condition_renders_as_error_msg() {
+    // (error "msg" irritants...) on either tier should render as
+    // "error: msg (irritants...)" rather than the raw list shape.
+    let (_, err, code) = run_eval(r#"(error "bad thing" 42 "extra")"#);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains(r#"error: bad thing (42 "extra")"#),
+        "stderr: {:?}",
+        err
+    );
+}
+
+#[test]
+fn assertion_renders_friendly_message() {
+    let (_, err, code) = run_eval("(assert (= 1 2))");
+    assert_eq!(code, 2);
+    assert!(err.contains("assertion failed"), "stderr: {:?}", err);
+    // No raw list-shape leakage into the user-facing message.
+    assert!(
+        !err.contains(r#"("error""#),
+        "raw condition shape leaked into stderr: {:?}",
+        err
+    );
+}
+
+#[test]
+fn vm_raised_renders_as_error_msg() {
+    let out = cli()
+        .args(["--tier", "vm", "-e", r#"(error "x")"#])
+        .output()
+        .expect("spawn");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(err.contains("error: x"), "stderr: {:?}", err);
+    assert!(!err.contains("__raised__"), "stderr: {:?}", err);
+}

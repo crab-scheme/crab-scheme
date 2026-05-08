@@ -41,6 +41,19 @@ fn take_pending_raise() -> Option<Value> {
     VM_PENDING_RAISE.with(|cell| cell.borrow_mut().take())
 }
 
+/// Public accessor for cs-runtime to drain VM_PENDING_RAISE on top-level
+/// `__raised__` errors so callers can render the condition value rather
+/// than the internal sentinel string.
+pub fn vm_take_pending_raise() -> Option<Value> {
+    take_pending_raise()
+}
+
+/// Public accessor for cs-runtime to drain VM_PENDING_ESCAPE on top-level
+/// `__escape__` errors.
+pub fn vm_take_pending_escape() -> Option<(u64, Value)> {
+    take_pending_escape()
+}
+
 fn set_pending_raise(v: Value) {
     VM_PENDING_RAISE.with(|cell| *cell.borrow_mut() = Some(v));
 }
