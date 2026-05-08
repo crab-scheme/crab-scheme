@@ -1,0 +1,632 @@
+//! CrabScheme runtime: tree-walking interpreter, environments, builtins.
+
+pub mod builtins;
+pub mod env;
+pub mod eval;
+pub mod proc;
+
+use std::rc::Rc;
+
+use cs_core::{SymbolTable, Value, WriteMode};
+use cs_diag::{Diagnostic, FileId, SourceMap};
+use cs_expand::Expander;
+use cs_parse::read_all;
+
+use crate::env::Frame;
+use crate::eval::{eval, EvalCtx, EvalError};
+
+/// A CrabScheme runtime instance. Owns the symbol table, source map, and
+/// top-level environment.
+pub struct Runtime {
+    syms: SymbolTable,
+    sources: SourceMap,
+    top: Rc<Frame>,
+    macros: std::collections::HashMap<cs_core::Symbol, cs_expand::Macro>,
+    /// VM-tier persistent root env (lazily populated with pure builtins at construction).
+    vm_env: Rc<cs_vm::vm::Env>,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Runtime {
+    pub fn new() -> Self {
+        let mut syms = SymbolTable::new();
+        let top = Frame::root();
+        builtins::install_into(&top, &mut syms);
+        let vm_env = cs_vm::vm::Env::root();
+        for (name, f) in builtins::pure_builtins() {
+            let sym = syms.intern(name);
+            vm_env.define(sym, cs_vm::vm::make_vm_builtin(name, f));
+        }
+        // Register symbol-aware VM builtins.
+        let symbol_to_string_sym = syms.intern("symbol->string");
+        vm_env.define(
+            symbol_to_string_sym,
+            cs_vm::vm::make_vm_builtin_syms("symbol->string", |args, st| {
+                if args.len() != 1 {
+                    return Err("symbol->string: 1 arg".into());
+                }
+                match &args[0] {
+                    Value::Symbol(s) => Ok(Value::string(st.name(*s).to_string())),
+                    other => Err(format!(
+                        "symbol->string: expected symbol, got {}",
+                        other.type_name()
+                    )),
+                }
+            }),
+        );
+        let string_to_symbol_sym = syms.intern("string->symbol");
+        vm_env.define(
+            string_to_symbol_sym,
+            cs_vm::vm::make_vm_builtin_syms("string->symbol", |args, st| {
+                if args.len() != 1 {
+                    return Err("string->symbol: 1 arg".into());
+                }
+                match &args[0] {
+                    Value::String(s) => Ok(Value::Symbol(st.intern(&s.borrow()))),
+                    other => Err(format!(
+                        "string->symbol: expected string, got {}",
+                        other.type_name()
+                    )),
+                }
+            }),
+        );
+        // apply: VM-native dispatch (spreads last arg as list).
+        let apply_sym = syms.intern("apply");
+        vm_env.define(apply_sym, cs_vm::vm::make_vm_apply());
+        let map_sym = syms.intern("map");
+        vm_env.define(map_sym, cs_vm::vm::make_vm_map());
+        let for_each_sym = syms.intern("for-each");
+        vm_env.define(for_each_sym, cs_vm::vm::make_vm_for_each());
+        let filter_sym = syms.intern("filter");
+        vm_env.define(filter_sym, cs_vm::vm::make_vm_filter());
+        let find_sym = syms.intern("find");
+        vm_env.define(find_sym, cs_vm::vm::make_vm_find());
+        let any_sym = syms.intern("any");
+        vm_env.define(any_sym, cs_vm::vm::make_vm_any());
+        let every_sym = syms.intern("every");
+        vm_env.define(every_sym, cs_vm::vm::make_vm_every());
+        let exists_sym = syms.intern("exists");
+        vm_env.define(exists_sym, cs_vm::vm::make_vm_any());
+        let for_all_sym = syms.intern("for-all");
+        vm_env.define(for_all_sym, cs_vm::vm::make_vm_every());
+        let fold_left_sym = syms.intern("fold-left");
+        vm_env.define(fold_left_sym, cs_vm::vm::make_vm_fold_left());
+        let fold_right_sym = syms.intern("fold-right");
+        vm_env.define(fold_right_sym, cs_vm::vm::make_vm_fold_right());
+        let reduce_sym = syms.intern("reduce");
+        vm_env.define(reduce_sym, cs_vm::vm::make_vm_reduce());
+        let count_sym = syms.intern("count");
+        vm_env.define(count_sym, cs_vm::vm::make_vm_count());
+        let partition_sym = syms.intern("partition");
+        vm_env.define(partition_sym, cs_vm::vm::make_vm_partition());
+        let values_sym = syms.intern("values");
+        vm_env.define(values_sym, cs_vm::vm::make_vm_values());
+        let cwv_sym = syms.intern("call-with-values");
+        vm_env.define(cwv_sym, cs_vm::vm::make_vm_call_with_values());
+        // Vector / string / hashtable / sort / unfold HO ops.
+        let vmap_sym = syms.intern("vector-map");
+        vm_env.define(vmap_sym, cs_vm::vm::make_vm_vector_map());
+        let vfor_sym = syms.intern("vector-for-each");
+        vm_env.define(vfor_sym, cs_vm::vm::make_vm_vector_for_each());
+        let vfold_sym = syms.intern("vector-fold");
+        vm_env.define(vfold_sym, cs_vm::vm::make_vm_vector_fold());
+        let vfilter_sym = syms.intern("vector-filter");
+        vm_env.define(vfilter_sym, cs_vm::vm::make_vm_vector_filter());
+        let smap_sym = syms.intern("string-map");
+        vm_env.define(smap_sym, cs_vm::vm::make_vm_string_map());
+        let sfor_sym = syms.intern("string-for-each");
+        vm_env.define(sfor_sym, cs_vm::vm::make_vm_string_for_each());
+        let hwalk_sym = syms.intern("hashtable-walk");
+        vm_env.define(hwalk_sym, cs_vm::vm::make_vm_hashtable_walk());
+        let hfor_sym = syms.intern("hashtable-for-each");
+        vm_env.define(hfor_sym, cs_vm::vm::make_vm_hashtable_for_each());
+        let hfold_sym = syms.intern("hashtable-fold");
+        vm_env.define(hfold_sym, cs_vm::vm::make_vm_hashtable_fold());
+        let hupdate_sym = syms.intern("hashtable-update!");
+        vm_env.define(hupdate_sym, cs_vm::vm::make_vm_hashtable_update());
+        let unfold_sym = syms.intern("unfold");
+        vm_env.define(unfold_sym, cs_vm::vm::make_vm_unfold());
+        let lsort_sym = syms.intern("list-sort");
+        vm_env.define(lsort_sym, cs_vm::vm::make_vm_list_sort());
+        let vsort_sym = syms.intern("vector-sort");
+        vm_env.define(vsort_sym, cs_vm::vm::make_vm_vector_sort());
+        let vsortb_sym = syms.intern("vector-sort!");
+        vm_env.define(vsortb_sym, cs_vm::vm::make_vm_vector_sort_bang());
+        // zip-with is just an alias for map.
+        let zipw_sym = syms.intern("zip-with");
+        vm_env.define(zipw_sym, cs_vm::vm::make_vm_map());
+        let tab_sym = syms.intern("tabulate");
+        vm_env.define(tab_sym, cs_vm::vm::make_vm_tabulate());
+        let rem_sym = syms.intern("remove");
+        vm_env.define(rem_sym, cs_vm::vm::make_vm_remove());
+        let force_sym = syms.intern("force");
+        vm_env.define(force_sym, cs_vm::vm::make_vm_force());
+        // get-string-all does not need ctx; install as pure VM builtin.
+        let gsa_sym = syms.intern("get-string-all");
+        vm_env.define(
+            gsa_sym,
+            cs_vm::vm::make_vm_builtin("get-string-all", |args| {
+                if args.len() != 1 {
+                    return Err("get-string-all: 1 arg".into());
+                }
+                match &args[0] {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::StringInput(state) => {
+                            let mut s = state.borrow_mut();
+                            if s.pos >= s.chars.len() {
+                                return Ok(Value::Eof);
+                            }
+                            let collected: String = s.chars[s.pos..].iter().collect();
+                            s.pos = s.chars.len();
+                            Ok(Value::string(collected))
+                        }
+                        _ => Err("get-string-all: not an input port".into()),
+                    },
+                    other => Err(format!(
+                        "get-string-all: expected port, got {}",
+                        other.type_name()
+                    )),
+                }
+            }),
+        );
+        // read-line: takes 1 arg (port). Tree-walker variant uses ctx for
+        // implicit current-input-port; we require explicit on VM tier.
+        let rl_sym = syms.intern("read-line");
+        vm_env.define(
+            rl_sym,
+            cs_vm::vm::make_vm_builtin("read-line", |args| {
+                if args.len() != 1 {
+                    return Err("read-line: 1 arg (port)".into());
+                }
+                match &args[0] {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::StringInput(state) => {
+                            let mut s = state.borrow_mut();
+                            if s.pos >= s.chars.len() {
+                                return Ok(Value::Eof);
+                            }
+                            let mut line = String::new();
+                            while s.pos < s.chars.len() {
+                                let c = s.chars[s.pos];
+                                s.pos += 1;
+                                if c == '\n' {
+                                    break;
+                                }
+                                line.push(c);
+                            }
+                            Ok(Value::string(line))
+                        }
+                        _ => Err("read-line: not an input port".into()),
+                    },
+                    other => Err(format!(
+                        "read-line: expected port, got {}",
+                        other.type_name()
+                    )),
+                }
+            }),
+        );
+        // Exception support.
+        let raise_sym = syms.intern("raise");
+        vm_env.define(raise_sym, cs_vm::vm::make_vm_raise());
+        let error_sym = syms.intern("error");
+        vm_env.define(error_sym, cs_vm::vm::make_vm_error_fn());
+        let weh_sym = syms.intern("with-exception-handler");
+        vm_env.define(weh_sym, cs_vm::vm::make_vm_with_exception_handler());
+        let dwind_sym = syms.intern("dynamic-wind");
+        vm_env.define(dwind_sym, cs_vm::vm::make_vm_dynamic_wind());
+        // read: needs symbol table to intern parsed symbols.
+        let read_sym = syms.intern("read");
+        vm_env.define(
+            read_sym,
+            cs_vm::vm::make_vm_builtin_syms("read", |args, st| {
+                if args.len() != 1 {
+                    return Err("read: 1 arg (string-input port)".into());
+                }
+                match &args[0] {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::StringInput(state) => {
+                            let mut s = state.borrow_mut();
+                            let remaining: String = s.chars[s.pos..].iter().collect();
+                            if remaining.trim().is_empty() {
+                                return Ok(Value::Eof);
+                            }
+                            let file_id = cs_diag::FileId(u32::MAX - 2);
+                            let mut reader = cs_parse::Reader::new(file_id, &remaining);
+                            let datum = reader
+                                .read(st)
+                                .map_err(|e| format!("read: {}", e.message()))?;
+                            let consumed_bytes = match &datum {
+                                Some(d) => d.span().end as usize,
+                                None => remaining.len(),
+                            };
+                            let consumed_chars = remaining
+                                .char_indices()
+                                .take_while(|(b, _)| *b < consumed_bytes)
+                                .count();
+                            s.pos += consumed_chars;
+                            Ok(datum.map(|d| d.to_value()).unwrap_or(Value::Eof))
+                        }
+                        _ => Err("read: not a string input port".into()),
+                    },
+                    other => Err(format!("read: expected port, got {}", other.type_name())),
+                }
+            }),
+        );
+        let gensym_sym = syms.intern("gensym");
+        vm_env.define(
+            gensym_sym,
+            cs_vm::vm::make_vm_builtin_syms("gensym", |args, st| {
+                let prefix = if args.is_empty() {
+                    "g".to_string()
+                } else {
+                    match &args[0] {
+                        Value::String(s) => s.borrow().clone(),
+                        Value::Symbol(s) => st.name(*s).to_string(),
+                        _ => "g".to_string(),
+                    }
+                };
+                let n = st.len();
+                let name = format!("{}__{}", prefix, n);
+                Ok(Value::Symbol(st.intern(&name)))
+            }),
+        );
+        Self {
+            syms,
+            sources: SourceMap::new(),
+            top,
+            macros: std::collections::HashMap::new(),
+            vm_env,
+        }
+    }
+
+    pub fn symbols(&self) -> &SymbolTable {
+        &self.syms
+    }
+
+    pub fn source_map(&self) -> &SourceMap {
+        &self.sources
+    }
+
+    /// Evaluate a string of Scheme source. Returns the value of the final
+    /// top-level expression (or `Unspecified` for empty/define-only input).
+    pub fn eval_str(&mut self, name: &str, src: &str) -> Result<Value, Diagnostic> {
+        let file_id = self.sources.add(name, src);
+        self.eval_str_in_file(file_id, src)
+    }
+
+    fn eval_str_in_file(&mut self, file_id: FileId, src: &str) -> Result<Value, Diagnostic> {
+        let data = match read_all(file_id, src, &mut self.syms) {
+            Ok(d) => d,
+            Err(errs) => {
+                let e = &errs[0];
+                return Err(Diagnostic::error(e.message(), e.span()));
+            }
+        };
+        let mut expander = Expander::new(&mut self.syms, &mut self.macros);
+        let core = match expander.expand_program(&data) {
+            Ok(c) => c,
+            Err(e) => return Err(Diagnostic::error(e.message(), e.span())),
+        };
+        drop(expander);
+        let mut ctx = EvalCtx::new(self.top.clone(), &mut self.syms, &mut self.macros);
+        eval(&core, self.top.clone(), &mut ctx)
+            .map_err(|e: EvalError| Diagnostic::error(e.message(), e.span).with_code("E_RUNTIME"))
+    }
+
+    /// Define a binding in the top-level environment.
+    pub fn define(&mut self, name: &str, value: Value) {
+        let sym = self.syms.intern(name);
+        self.top.define(sym, value);
+    }
+
+    /// Format a Value using this runtime's symbol table.
+    pub fn format_value(&self, v: &Value, mode: WriteMode) -> String {
+        v.format_with(&self.syms, mode)
+    }
+
+    /// Evaluate a string of Scheme source via the **bytecode VM** tier.
+    /// Foundation: only pure builtins are supported. Higher-order builtins
+    /// (apply/map/raise/with-exception-handler/etc.) and parameterize/dynamic-wind
+    /// fall back to the tree-walker via per-call dispatch — for now this VM
+    /// path is best-effort for pure-arithmetic / pure-list programs.
+    pub fn eval_str_via_vm(&mut self, name: &str, src: &str) -> Result<Value, Diagnostic> {
+        let file_id = self.sources.add(name, src);
+        let data = match read_all(file_id, src, &mut self.syms) {
+            Ok(d) => d,
+            Err(errs) => {
+                let e = &errs[0];
+                return Err(Diagnostic::error(e.message(), e.span()));
+            }
+        };
+        let mut expander = Expander::new(&mut self.syms, &mut self.macros);
+        let core = match expander.expand_program(&data) {
+            Ok(c) => c,
+            Err(e) => return Err(Diagnostic::error(e.message(), e.span())),
+        };
+        drop(expander);
+        let bc = cs_vm::compile(&core).map_err(|e| Diagnostic::error(e.message, e.span))?;
+        cs_vm::run(&bc, self.vm_env.clone(), &mut self.syms)
+            .map_err(|e| Diagnostic::error(e.message, cs_diag::Span::DUMMY))
+    }
+
+    /// Look up a top-level binding.
+    pub fn lookup(&self, name: &str) -> Option<Value> {
+        // Note: this looks up in top frame only — sufficient for embed API tests.
+        let sym = self.syms.by_name_lookup(name).or_else(|| {
+            // Symbol may not exist yet. We can't insert because &self;
+            // return None.
+            None
+        })?;
+        self.top.get(sym)
+    }
+}
+
+// Helper so cs-runtime can look up symbols by name without intern.
+trait SymTableExt {
+    fn by_name_lookup(&self, name: &str) -> Option<cs_core::Symbol>;
+}
+
+impl SymTableExt for SymbolTable {
+    fn by_name_lookup(&self, name: &str) -> Option<cs_core::Symbol> {
+        // Linear scan; fine for embed API.
+        for i in 0..self.len() {
+            let sym = cs_core::Symbol(i as u32);
+            if self.name(sym) == name {
+                return Some(sym);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(src: &str) -> Value {
+        let mut rt = Runtime::new();
+        rt.eval_str("<test>", src).unwrap_or_else(|d| {
+            panic!("eval error: {}", d.message);
+        })
+    }
+
+    fn run_str(src: &str) -> String {
+        let mut rt = Runtime::new();
+        let v = rt.eval_str("<test>", src).unwrap_or_else(|d| {
+            panic!("eval error: {}", d.message);
+        });
+        rt.format_value(&v, WriteMode::Write)
+    }
+
+    #[test]
+    fn add_two_numbers() {
+        let v = run("(+ 1 2)");
+        assert_eq!(format!("{}", v), "3");
+    }
+
+    #[test]
+    fn nested_arithmetic() {
+        let v = run("(* (+ 1 2) (- 10 3))");
+        assert_eq!(format!("{}", v), "21");
+    }
+
+    #[test]
+    fn if_true() {
+        let v = run("(if #t 1 2)");
+        assert_eq!(format!("{}", v), "1");
+    }
+
+    #[test]
+    fn if_false() {
+        let v = run("(if #f 1 2)");
+        assert_eq!(format!("{}", v), "2");
+    }
+
+    #[test]
+    fn lambda_application() {
+        let v = run("((lambda (x) (* x x)) 7)");
+        assert_eq!(format!("{}", v), "49");
+    }
+
+    #[test]
+    fn define_and_call() {
+        let v = run("(define (square x) (* x x)) (square 6)");
+        assert_eq!(format!("{}", v), "36");
+    }
+
+    #[test]
+    fn let_binding() {
+        let v = run("(let ((x 3) (y 4)) (+ (* x x) (* y y)))");
+        assert_eq!(format!("{}", v), "25");
+    }
+
+    #[test]
+    fn factorial_recursive() {
+        let v = run("(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 6)");
+        assert_eq!(format!("{}", v), "720");
+    }
+
+    #[test]
+    fn factorial_iterative_tail_call() {
+        // Must not stack-overflow for n=10000 thanks to tail call elimination.
+        let v = run("(define (fact-iter n acc)
+               (if (= n 0) acc (fact-iter (- n 1) (* n acc))))
+             (fact-iter 100 1)");
+        // 100! is huge but verifiable by length and trailing zero count.
+        let s = format!("{}", v);
+        assert!(s.len() > 100, "expected large bignum, got {}", s);
+        assert!(s.ends_with("00"));
+    }
+
+    #[test]
+    fn list_operations() {
+        let v = run("(length (list 1 2 3 4 5))");
+        assert_eq!(format!("{}", v), "5");
+    }
+
+    #[test]
+    fn cons_car_cdr() {
+        assert_eq!(format!("{}", run("(car (cons 1 2))")), "1");
+        assert_eq!(format!("{}", run("(cdr (cons 1 2))")), "2");
+    }
+
+    #[test]
+    fn quote_list() {
+        let v = run("'(1 2 3)");
+        assert_eq!(format!("{}", v), "(1 2 3)");
+    }
+
+    #[test]
+    fn equal_predicate() {
+        assert_eq!(format!("{}", run("(equal? '(1 2 3) '(1 2 3))")), "#t");
+        assert_eq!(format!("{}", run("(equal? '(1 2 3) '(1 2 4))")), "#f");
+    }
+
+    #[test]
+    fn closures_capture_lexical_env() {
+        let v = run("(define (make-adder n) (lambda (x) (+ x n)))
+             ((make-adder 10) 5)");
+        assert_eq!(format!("{}", v), "15");
+    }
+
+    #[test]
+    fn cond_form() {
+        let s = run_str(
+            "(define (classify n)
+               (cond ((< n 0) 'negative)
+                     ((= n 0) 'zero)
+                     (else 'positive)))
+             (list (classify -5) (classify 0) (classify 7))",
+        );
+        assert_eq!(s, "(negative zero positive)");
+    }
+
+    #[test]
+    fn symbols_print_correctly() {
+        assert_eq!(run_str("'foo"), "foo");
+        assert_eq!(run_str("'(a b c)"), "(a b c)");
+    }
+
+    #[test]
+    fn map_squares() {
+        assert_eq!(
+            run_str("(map (lambda (x) (* x x)) '(1 2 3 4 5))"),
+            "(1 4 9 16 25)"
+        );
+    }
+
+    #[test]
+    fn for_each_side_effect() {
+        run("(for-each (lambda (x) x) '(1 2 3))");
+    }
+
+    #[test]
+    fn apply_basic() {
+        assert_eq!(run_str("(apply + '(1 2 3 4 5))"), "15");
+        assert_eq!(run_str("(apply + 1 2 '(3 4 5))"), "15");
+    }
+
+    #[test]
+    fn modulo_quotient_remainder() {
+        assert_eq!(run_str("(modulo 13 4)"), "1");
+        assert_eq!(run_str("(modulo -13 4)"), "3");
+        assert_eq!(run_str("(modulo 13 -4)"), "-3");
+        assert_eq!(run_str("(quotient 13 4)"), "3");
+        assert_eq!(run_str("(remainder 13 4)"), "1");
+        assert_eq!(run_str("(remainder -13 4)"), "-1");
+    }
+
+    #[test]
+    fn min_max_expt() {
+        assert_eq!(run_str("(min 3 1 4 1 5 9 2 6)"), "1");
+        assert_eq!(run_str("(max 3 1 4 1 5 9 2 6)"), "9");
+        assert_eq!(run_str("(expt 2 10)"), "1024");
+        assert_eq!(run_str("(expt 3 3)"), "27");
+    }
+
+    #[test]
+    fn internal_defines_lifted() {
+        let s = run_str(
+            "(define (f n)
+               (define (helper x) (* x 2))
+               (helper n))
+             (f 21)",
+        );
+        assert_eq!(s, "42");
+    }
+
+    #[test]
+    fn mutually_recursive_internal_defines() {
+        let s = run_str(
+            "(define (parity n)
+               (define (is-even? x) (if (= x 0) #t (is-odd? (- x 1))))
+               (define (is-odd? x) (if (= x 0) #f (is-even? (- x 1))))
+               (list (is-even? n) (is-odd? n)))
+             (parity 10)",
+        );
+        assert_eq!(s, "(#t #f)");
+    }
+
+    #[test]
+    fn list_tail_and_ref() {
+        assert_eq!(run_str("(list-tail '(a b c d e) 2)"), "(c d e)");
+        assert_eq!(run_str("(list-ref '(a b c d e) 2)"), "c");
+    }
+
+    #[test]
+    fn string_to_list_round_trip() {
+        assert_eq!(
+            run_str("(list->string (string->list \"hello\"))"),
+            "\"hello\""
+        );
+    }
+
+    #[test]
+    fn char_predicates() {
+        assert_eq!(run_str("(char? #\\a)"), "#t");
+        assert_eq!(run_str("(char->integer #\\A)"), "65");
+        assert_eq!(run_str("(integer->char 65)"), "#\\A");
+    }
+
+    #[test]
+    fn set_car_cdr_mutation() {
+        assert_eq!(
+            run_str(
+                "(define p (cons 1 2))
+                 (set-car! p 10)
+                 (set-cdr! p 20)
+                 p"
+            ),
+            "(10 . 20)"
+        );
+    }
+
+    #[test]
+    fn fibonacci() {
+        let v = run("(define (fib n)
+               (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+             (fib 10)");
+        assert_eq!(format!("{}", v), "55");
+    }
+
+    #[test]
+    fn arity_error_reported() {
+        let mut rt = Runtime::new();
+        let err = rt
+            .eval_str("<test>", "((lambda (x y) (+ x y)) 1)")
+            .unwrap_err();
+        assert!(err.message.contains("arity"));
+    }
+
+    #[test]
+    fn undefined_variable_error() {
+        let mut rt = Runtime::new();
+        let err = rt.eval_str("<test>", "(+ x 1)").unwrap_err();
+        assert!(err.message.contains("undefined"));
+    }
+}

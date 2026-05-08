@@ -1,0 +1,17 @@
+[package]
+name = "cs-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cs-core = { workspace = true }
+cs-diag = { workspace = true }
+cs-expand = { workspace = true }
+cs-ir = { workspace = true }
+cs-lex = { workspace = true }
+cs-parse = { workspace = true }
+cs-vm = { workspace = true }
+num-traits = { workspace = true }
+thiserror = { workspace = true }

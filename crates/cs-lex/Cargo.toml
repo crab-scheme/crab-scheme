@@ -1,0 +1,12 @@
+[package]
+name = "cs-lex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cs-core = { workspace = true }
+cs-diag = { workspace = true }
+logos = { workspace = true }
+unicode-normalization = { workspace = true }

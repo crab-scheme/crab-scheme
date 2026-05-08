@@ -1,0 +1,25 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code working files (ephemeral)
+.claude/scheduled_tasks.lock
+.claude/tasks.md
+.claude/plan.md
+.claude/scratch.md
+.claude/cache/
+
+# Spec workflow runtime artifacts (keep specs themselves)
+.spec-workflow/.cache/
+.spec-workflow/runtime/

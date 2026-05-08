@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cs-diag",
+    "crates/cs-core",
+    "crates/cs-lex",
+    "crates/cs-parse",
+    "crates/cs-ir",
+    "crates/cs-expand",
+    "crates/cs-runtime",
+    "crates/cs-vm",
+    "crates/cs-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.86"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ztaylor/crabscheme"
+
+[workspace.dependencies]
+# Internal crates
+cs-diag = { path = "crates/cs-diag" }
+cs-core = { path = "crates/cs-core" }
+cs-lex = { path = "crates/cs-lex" }
+cs-parse = { path = "crates/cs-parse" }
+cs-ir = { path = "crates/cs-ir" }
+cs-expand = { path = "crates/cs-expand" }
+cs-runtime = { path = "crates/cs-runtime" }
+cs-vm = { path = "crates/cs-vm" }
+
+# External crates
+logos = "0.14"
+num-bigint = "0.4"
+num-rational = "0.4"
+num-traits = "0.2"
+unicode-normalization = "0.1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

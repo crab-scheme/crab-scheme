@@ -1,0 +1,240 @@
+# Tasks Document — Foundation Milestone
+
+- [ ] 1. Initialize Cargo workspace and toolchain pinning
+  - File: `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`, `deny.toml`
+  - Create workspace `Cargo.toml` with `[workspace]`, `resolver = "2"`, `members = ["crates/*", "xtask"]` (xtask added in task 5).
+  - Add `[workspace.dependencies]` block with all crates listed in `tech.md` pinned to specific versions.
+  - Pin Rust toolchain (stable for non-JIT crates) in `rust-toolchain.toml`.
+  - Configure `rustfmt.toml` with project conventions (group_imports = "StdExternalCrate", reorder_imports = true).
+  - Configure `deny.toml` with allowed licenses (Apache-2.0, MIT, BSD-2/3, ISC, MPL-2.0) and advisory checks.
+  - Purpose: establish reproducible build foundation.
+  - _Leverage: structure.md directory plan_
+  - _Requirements: 1.1, 1.4_
+  - _Prompt: Role: Rust workspace architect | Task: Create the Cargo workspace skeleton for CrabScheme exactly per structure.md, with `[workspace.dependencies]` declaring all dependencies named in tech.md (logos, miette, num-bigint, num-rational, unicode-normalization, unicode-segmentation, rustyline, clap with derive feature, tracing, tracing-subscriber, insta, proptest, criterion, assert_cmd, expectrl, anyhow, thiserror), pin rust-toolchain.toml to current stable, configure rustfmt.toml and deny.toml | Restrictions: do not create individual crate directories yet (later tasks); do not commit Cargo.lock until first crate exists; license allowlist must be exactly the set above | Success: `cargo metadata` succeeds, no crates listed, all dep versions resolved consistently_
+
+- [ ] 2. Create CI workflow and developer documentation skeleton
+  - File: `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `README.md`, `CHANGELOG.md`, `LICENSE-APACHE`, `LICENSE-MIT`, `docs/adr/0000-template.md`
+  - CI workflow runs on push/PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo doc --workspace --no-deps -- -D warnings`, `cargo deny check`.
+  - Run on Linux x86_64, macOS arm64; Windows added later.
+  - Release workflow stub creates GitHub Releases with cross-compiled binaries (full impl deferred to M9).
+  - README explains: what CrabScheme is, project status badge, quickstart, link to ROADMAP and steering docs.
+  - LICENSE files are dual Apache-2.0/MIT.
+  - ADR template has: Title, Status (Proposed/Accepted/Deprecated/Superseded), Context, Decision, Consequences, Date.
+  - Purpose: establish PR gate from day one so quality cannot regress silently.
+  - _Leverage: structure.md docs/adr layout_
+  - _Requirements: 1.5, 1.7_
+  - _Prompt: Role: DevOps engineer specializing in Rust CI | Task: Author GitHub Actions workflows that run all gates listed in tech.md (rustfmt, clippy with -D warnings, cargo test --workspace, rustdoc with -D warnings, cargo-deny), set up matrix for Linux x86_64 and macOS arm64, configure Rust toolchain caching, write README that introduces the project and points to .spec-workflow/steering/, create dual Apache-2.0/MIT LICENSE files with appropriate copyright lines, and create the ADR template at docs/adr/0000-template.md per the format in the task description | Restrictions: do not enable nightly toolchain (added later for HolyJIT); do not add binary release automation beyond a stub workflow; CI must fail on the first warning, never warn-only | Success: pushing the workspace skeleton triggers a green CI build; `cargo deny check` passes_
+
+- [ ] 3. Create `cs-diag` crate: spans, source map, diagnostics
+  - File: `crates/cs-diag/Cargo.toml`, `crates/cs-diag/src/lib.rs`, `crates/cs-diag/src/span.rs`, `crates/cs-diag/src/source_map.rs`, `crates/cs-diag/src/diagnostic.rs`, `crates/cs-diag/src/render.rs`
+  - Define `FileId(u32)`, `Span { file: FileId, start: u32, end: u32 }` with helpers (`merge`, `is_dummy`, `contains`).
+  - `SourceMap` interns file contents keyed by `FileId`, returns line/column for byte offsets via cached newline index.
+  - `Diagnostic` has severity, code, message, primary span, labels, notes per design.md.
+  - `render(diag, sm, ColorMode) -> String` produces ANSI or plain output. Use `miette` internally as the renderer; expose only our `Diagnostic` type.
+  - Public API tested with snapshot tests (`insta`) capturing rendered output for representative diagnostics.
+  - Purpose: every other crate emits diagnostics through this layer; locking it down first prevents downstream churn.
+  - _Leverage: external crates `miette`, `insta`, `unicode-width`_
+  - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5_
+  - _Prompt: Role: Rust library author with experience building rustc-quality diagnostics | Task: Implement cs-diag exactly per design.md "cs-diag" component spec, with FileId/Span/SourceMap/Diagnostic types and a render function that wraps miette, supporting ANSI color via ColorMode (Always/Never/Auto), insta snapshot tests covering at least 4 representative diagnostics (single-line error, multi-line error, error with multiple labels, error with notes), and rustdoc on every public item including a Use example | Restrictions: Diagnostic must be our type, not miette's, so we can swap renderers later; Span must be Copy and ≤ 16 bytes; never panic; do not touch any other crate | Success: `cargo test -p cs-diag` passes, snapshot tests reviewed and committed, rustdoc warnings = 0, no clippy warnings_
+
+- [ ] 4. Create `cs-core` crate: Value, Symbol, Number, Port stub
+  - File: `crates/cs-core/Cargo.toml`, `crates/cs-core/src/lib.rs`, `crates/cs-core/src/value.rs`, `crates/cs-core/src/symbol.rs`, `crates/cs-core/src/number/mod.rs` + submodules, `crates/cs-core/src/eq.rs`, `crates/cs-core/src/port.rs`, `crates/cs-core/src/text.rs`
+  - `Value` enum exactly as in design.md "Data Models §Value".
+  - `SymbolTable` is a `HashMap<Rc<str>, Symbol>` plus reverse lookup; `Symbol(u32)` indexes into a `Vec<Rc<str>>`. Per-`Runtime`, no globals.
+  - `Number` enum with `Fixnum(i64)`, `Big(Rc<BigInt>)`, `Rat(Rc<Rational>)`, `Flonum(f64)`.
+  - Implement `add`, `sub`, `mul`, `div`, `neg`, `abs`, `eq`, `cmp` on `Number` honoring R6RS contagion (exact-with-exact stays exact; any inexact contaminates).
+  - Fixnum overflow promotes to `Big`. Integer division producing non-integer produces `Rat`.
+  - `eq.rs` implements `eq`, `eqv`, `equal` per R6RS §11.5; `equal` handles cycles via the standard interleaved approach (small bound + slow set-based check).
+  - `Port` is a trait with `read_char`, `read_line`, `write_str`, `write_char`, `peek_char`, `flush`, `close`. Concrete impls land in `cs-runtime`.
+  - Property tests: arbitrary `Number` round-trips through arithmetic identities (`(+ a b) == (+ b a)`, `(* a 1) == a`, exact + exact stays exact unless division forces rational).
+  - Purpose: lock the universal value type before anything reads or evaluates.
+  - _Leverage: `num-bigint`, `num-rational`, `unicode-normalization`, `proptest`, `cs-diag`_
+  - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6_
+  - _Prompt: Role: Rust author with deep familiarity with R6RS numeric semantics | Task: Implement cs-core's Value, Symbol/SymbolTable, Number tower (Fixnum/Big/Rat/Flonum) with R6RS-conforming arithmetic and contagion per spec §11.7.1, eq/eqv/equal in eq.rs (equal? must terminate on cycles via set-based path tracking), Port trait, and property tests that verify identity and contagion properties for ≥ 10,000 cases per property | Restrictions: no `unsafe`; no globals (SymbolTable is per-Runtime); String value uses `Rc<RefCell<String>>` because R6RS strings are mutable; do not stub fixnum overflow — must promote to BigInt; complex numbers are out of scope for this milestone; do NOT depend on cs-lex/cs-parse/cs-runtime | Success: `cargo test -p cs-core` passes, proptest properties hold for 10k cases, `equal?` terminates on a self-referential pair, rustdoc clean, no clippy warnings, R6RS §11.5 and §11.7 acceptance criteria covered by tests_
+
+- [ ] 5. Add `xtask` crate for repo automation
+  - File: `xtask/Cargo.toml`, `xtask/src/main.rs`, `xtask/src/conformance.rs` (stub), and `.cargo/config.toml` aliasing `xtask = "run --package xtask --"`.
+  - Subcommands: `conformance` (stub returning "no tests yet"), `bench-report` (stub), `publish` (stub). Each prints a banner and the planned behavior so later tasks have a place to fill in.
+  - `xtask` is a binary crate, not part of the library workspace surface.
+  - Purpose: project-local automation entry point; conformance harness will land here.
+  - _Leverage: `clap` for subcommand dispatch_
+  - _Requirements: 10.1_
+  - _Prompt: Role: Rust tooling author | Task: Create the xtask binary crate per Matklad's xtask pattern, with subcommands conformance/bench-report/publish (stubs for now), wired up via .cargo/config.toml alias so `cargo xtask <cmd>` works from the repo root, ensure xtask is in the workspace members list | Restrictions: xtask must not depend on any other CrabScheme crate yet (the conformance subcommand will gain that dep later); subcommands print "not yet implemented" rather than panicking | Success: `cargo xtask conformance` runs and prints the stub message; `cargo xtask --help` shows all three subcommands_
+
+- [ ] 6. Create `cs-lex` crate: tokenizer with logos
+  - File: `crates/cs-lex/Cargo.toml`, `crates/cs-lex/src/lib.rs`, `crates/cs-lex/src/token.rs`, `crates/cs-lex/src/lexer.rs`
+  - `Token<'src>` enum covering every R6RS §4.2 lexeme listed in design.md "cs-lex".
+  - Use `logos` derive macro on a `Logos` token enum, then convert to the public `Token` (allows lossless source-text capture for numbers and strings, which need post-processing).
+  - String literal post-processing: handle every R6RS escape (`\a`, `\b`, `\t`, `\n`, `\v`, `\f`, `\r`, `\"`, `\\`, `\xHHHH;`).
+  - Identifier post-processing: NFC-normalize per R6RS §4.2.4; allow R6RS pipe-quoted identifiers `|with spaces|`.
+  - Number post-processing: parse with explicit radix prefixes (`#b`, `#o`, `#d`, `#x`) and exactness markers (`#e`, `#i`); produce `Number` (or report `LexError`).
+  - Block comments `#| … |#` must nest correctly.
+  - Lexer is an iterator yielding `(Token, Span)`; on error yields a `LexError` with span and skips ahead to a synchronization point.
+  - Tests: every token shape (≥ 80 cases); fuzz target stub `fuzz_targets/lex.rs`.
+  - Purpose: turn source bytes into a typed token stream with spans.
+  - _Leverage: `logos`, `unicode-normalization`, `cs-diag`, `cs-core` (for Number)_
+  - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6_
+  - _Prompt: Role: Rust author specializing in lexer construction with logos | Task: Implement cs-lex per design.md, using logos for the bulk of the state machine, post-processing strings (all R6RS escapes including \xHHHH;), identifiers (NFC normalization, pipe-quoted form), and numbers (radix and exactness prefixes per R6RS §4.2.8); produce span-bearing tokens; recover from errors and continue lexing; cover all token shapes with insta snapshot tests of token streams from canonical inputs | Restrictions: nested block comments (#| ... #| ... |# ... |#) must work to arbitrary depth; never panic on any input including invalid UTF-8 (return error); do not handle datum syntax here (#; comments are reported as a token, the reader handles them); do NOT implement #!fold-case or #!no-fold-case (R7RS-only) at this milestone | Success: `cargo test -p cs-lex` passes; insta snapshots reviewed and committed; lexer handles all R6RS §4.2 lexemes; fuzz target builds_
+
+- [ ] 7. Create `cs-parse` crate: datum reader
+  - File: `crates/cs-parse/Cargo.toml`, `crates/cs-parse/src/lib.rs`, `crates/cs-parse/src/datum.rs`, `crates/cs-parse/src/reader.rs`, `crates/cs-parse/src/print.rs`
+  - `Datum` enum exactly as in design.md "cs-parse".
+  - Hand-rolled recursive-descent over `cs_lex::Lexer`. Functions: `read_one`, `read_all`, `peek_datum`, `skip_datum_comment`.
+  - Handle reader macros: `'x` → `(quote x)`, `` `x `` → `(quasiquote x)`, `,x` → `(unquote x)`, `,@x` → `(unquote-splicing x)`. Retain both the abbreviation form and span info for round-trip pretty-printing.
+  - Handle `#;` datum comments: read and discard the next datum.
+  - `print.rs` provides `write` (R6RS `write` semantics: read-back-able) and `display`. Round-trip property: `read(write(d)) == d`.
+  - Reader returns multiple errors via accumulator (`Vec<ReaderError>`), each with a span; truncate at 10 errors per session.
+  - Tests: every datum shape; cyclic-datum support via `#0=` and `#0#` is **deferred** to a later spec (note in code).
+  - Property test: arbitrary `Datum` (depth ≤ 5) → `parse(write(d)) == d`.
+  - Purpose: produce the datum tree the rest of the pipeline consumes.
+  - _Leverage: `cs-lex`, `cs-core`, `cs-diag`, `proptest`_
+  - _Requirements: 4.1, 4.2, 4.3, 4.5, 4.6, 4.7_
+  - _Prompt: Role: Compiler-front-end specialist familiar with R6RS reader semantics | Task: Implement cs-parse per design.md with hand-rolled recursive-descent over the cs-lex token stream, supporting all datum shapes (Boolean/Number/Character/String/Symbol/Pair/Null/Vector/ByteVector and reader macros for quote/quasiquote/unquote/unquote-splicing/#; datum-comment), retaining spans on every node, accumulating up to 10 reader errors per session, plus a `write` and `display` printer in print.rs; add proptest verifying parse(write(d)) == d for randomly generated bounded-depth datums (≥ 1000 cases) | Restrictions: do not implement #0= / #0# datum labels (cyclic datums) — leave a TODO with milestone reference; do not depend on cs-runtime; reader must not panic on any input | Success: `cargo test -p cs-parse` passes; round-trip property holds; insta snapshots for canonical inputs (Larceny test corpus headers) committed_
+
+- [ ] 8. Create `cs-ir` crate: CoreExpr definition
+  - File: `crates/cs-ir/Cargo.toml`, `crates/cs-ir/src/lib.rs`, `crates/cs-ir/src/expr.rs`, `crates/cs-ir/src/var.rs`
+  - `CoreExpr` enum, `VarId`, `Params` types per design.md "cs-ir".
+  - `VarId` is wrapped in a `VarTable` per-Runtime (`HashMap<Symbol, VarId>` plus reverse lookup) so name resolution is interner-cheap.
+  - Implement `Display` for `CoreExpr` producing canonical S-expression notation (`(if cond then alt)`, `(lambda (x y) body)`, `(letrec* ((x e1) (y e2)) body)` etc.) so debugging dumps are readable.
+  - No evaluation logic here — just types.
+  - Tests: round-trip `parse → expand → display` for canonical forms.
+  - Purpose: stable IR seen by every execution tier.
+  - _Leverage: `cs-core`, `cs-diag`_
+  - _Requirements: 5.1_
+  - _Prompt: Role: Compiler IR designer | Task: Implement cs-ir's CoreExpr/VarId/Params/VarTable per design.md, with a Display impl that prints canonical Scheme-style S-expressions for debugging, and rustdoc on every variant explaining what it represents and the R6RS section it derives from | Restrictions: this crate must contain no evaluation logic (that lives in cs-runtime); CoreExpr must remain `Clone` but not `Copy`; do not store live `Value` references inside CoreExpr (use the `Value` constructor for `Const` to keep IR self-contained); plan for serde derive (`#[derive(Serialize, Deserialize)]`) but feature-gate behind `serde` feature so users without serde don't pay | Success: `cargo test -p cs-ir` passes; Display output is round-trippable through cs-parse for the canonical forms_
+
+- [ ] 9. Create `cs-expand` crate: core-form recognizer
+  - File: `crates/cs-expand/Cargo.toml`, `crates/cs-expand/src/lib.rs`, `crates/cs-expand/src/expander.rs`, `crates/cs-expand/src/desugar.rs`
+  - `Expander` holds a reference to `SymbolTable` and `VarTable` and a stack of lexical scopes mapping `Symbol → VarId`.
+  - `expand(d, exp) -> Result<CoreExpr, ExpandError>` matches on the head symbol of pairs:
+    - `quote`, `if`, `set!`, `begin`, `lambda`, `define`, `letrec`, `letrec*` → direct lowering.
+    - `let`, `let*`, `cond`, `case`, `and`, `or`, `when`, `unless` → desugar to the above (in `desugar.rs`).
+    - Anything else → `App { func, args }`.
+    - Bare symbol → `Ref { var }` after lookup; emit `&undefined`-style ExpandError if unbound? — **no**, leave the unbound-variable check for runtime per Requirement 5.4. Just resolve to a fresh `VarId` placeholder so unbound refs reach evaluation.
+  - Internal-define lifting: `lambda` body containing `define` forms must be lifted to `letrec*` per R6RS §11.4.6. Implement this faithfully.
+  - Tests for every desugaring; insta snapshots showing `Datum → CoreExpr` for canonical examples.
+  - Purpose: lowering layer between user-visible syntax and the evaluator's IR.
+  - _Leverage: `cs-core`, `cs-parse`, `cs-ir`, `cs-diag`_
+  - _Requirements: 5.1, 5.5, 5.6, 5.7_
+  - _Prompt: Role: Scheme implementor with strong R6RS expertise | Task: Implement cs-expand as a core-form recognizer (NOT a hygienic macro expander — that comes later) with the rules in the task description, including correct internal-define lifting per R6RS §11.4.6, desugaring for let/let*/cond/case/and/or/when/unless, and clear ExpandError messages with source spans; add insta snapshots for canonical inputs covering each core form and each desugaring | Restrictions: this is NOT yet a syntax-rules implementation — do not import or build hygiene machinery; macro forms in user code (define-syntax, syntax-rules) must produce a clear "not yet supported, see milestone M3" error rather than silently lowering; spans on output CoreExpr must trace back to input Datum spans | Success: `cargo test -p cs-expand` passes; snapshots committed; can expand a non-trivial Scheme program (e.g. factorial, Fibonacci, Ackermann) end to end_
+
+- [ ] 10. Create `cs-runtime` crate skeleton: Runtime, Env, eval entry points
+  - File: `crates/cs-runtime/Cargo.toml`, `crates/cs-runtime/src/lib.rs`, `crates/cs-runtime/src/runtime.rs`, `crates/cs-runtime/src/env.rs`, `crates/cs-runtime/src/eval.rs`, `crates/cs-runtime/src/condition.rs`, `crates/cs-runtime/src/builtins/mod.rs`
+  - `Runtime` owns `SymbolTable`, `VarTable`, top-level `Env`, `SourceMap`, builtins registry, port table.
+  - `Env` is a chain of frames. Each frame: `Vec<Cell<Value>>` (mutability via `Cell<Value>` since Value is Clone, sufficient for now). Lookup is `(depth, slot)`; resolution from `VarId` to `(depth, slot)` happens during expansion or as a JIT memo.
+  - Skeleton `eval(rt, env, expr) -> EvalResult` recursively reducing each `CoreExpr` variant. **Tail calls** implemented via a trampoline: `App` in tail position returns a `Bounce(Procedure, Vec<Value>)` value the outer loop dispatches without growing the host stack.
+  - `Condition` enum mirrors R6RS hierarchy: `&condition`, `&warning`, `&serious`, `&error`, `&violation`, `&assertion`, `&undefined`, `&irritants`, `&who`, `&message`. Render via `Display` for diagnostic.
+  - `eval_str` chains `lex → read → expand → eval` and converts errors to `Diagnostic`.
+  - This task creates the skeleton; arithmetic and list builtins land in task 11, control in task 12.
+  - Tests: `(if #t 1 2)`, `(let ((x 1)) x)`, `(define x 5) x`, simple lambda call, lexical capture, tail-call non-growth (verify by counting trampoline iterations).
+  - Purpose: get end-to-end "lex → read → expand → eval → result" working for a tiny subset.
+  - _Leverage: all upstream crates_
+  - _Requirements: 2, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7_
+  - _Prompt: Role: Scheme runtime author with experience implementing tree-walking interpreters | Task: Implement cs-runtime's Runtime/Env/eval skeleton per design.md, with a heap-allocated continuation stack (NOT host stack) so deep recursion is bounded by configured limit (default 1M frames), tail-call trampolining for App in tail position, full Condition hierarchy in condition.rs, eval_str entry point that owns the lex→read→expand→eval pipeline and turns errors into Diagnostics, and a builtins module skeleton ready for task 11 to populate | Restrictions: no `unsafe`; eval must NEVER consume host stack proportional to user-program recursion depth; condition raise must unwind through dynamic-wind correctly (place hooks now even if dynamic-wind isn't fully wired until task 12); do not implement any builtins yet beyond what's needed to test the skeleton (literally just `+` for two fixnums to verify dispatch); errors carry spans threaded from the IR | Success: `cargo test -p cs-runtime` passes a small set of expressions; tail call test confirms host-stack growth is O(1) regardless of recursion depth; cargo doc clean_
+
+- [ ] 11. Implement arithmetic, list, string, character, equality builtins in `cs-runtime/builtins`
+  - File: `crates/cs-runtime/src/builtins/{arith.rs, list.rs, string.rs, char.rs, equality.rs, type_pred.rs, mod.rs}`
+  - Arithmetic: `+`, `-`, `*`, `/`, `=`, `<`, `>`, `<=`, `>=`, `zero?`, `positive?`, `negative?`, `abs`, `min`, `max`, `quotient`, `remainder`, `modulo`, `expt`, `exact`, `inexact`.
+  - List: `cons`, `car`, `cdr`, `set-car!`, `set-cdr!`, `list`, `length`, `append`, `reverse`, `map`, `for-each`, `assoc`, `member`, `null?`, `pair?`.
+  - String: `string?`, `string-length`, `string-ref`, `string-set!`, `string=?`, `string<?`, `string->list`, `list->string`, `string->symbol`, `symbol->string`, `make-string`.
+  - Character: `char?`, `char=?`, `char<?`, `char->integer`, `integer->char`.
+  - Equality: `eq?`, `eqv?`, `equal?` (delegating to `cs-core::eq`).
+  - Type predicates: `number?`, `integer?`, `rational?`, `real?`, `boolean?`, `symbol?`, `procedure?`.
+  - Each builtin: validates arity, validates types, raises `&assertion` with `who:` and `irritants:` on type error.
+  - Each builtin registered in a master table at `Runtime::new()`.
+  - Tests: per-category tests with R6RS-prescribed edge cases (`(remainder -13 4)`, `(modulo -13 4)`, etc.).
+  - Purpose: deliver the foundation builtin surface needed for real programs.
+  - _Leverage: `cs-core`'s Number arithmetic and equality_
+  - _Requirements: 6.1, 6.5_
+  - _Prompt: Role: Scheme implementor implementing the R6RS standard procedure set | Task: Implement every builtin listed in the task description in cs-runtime/builtins/, organized by category (arith/list/string/char/equality/type_pred), each builtin validating arity and operand types and raising structured &assertion conditions on violation, with tests covering R6RS-prescribed edge cases (negative arguments to quotient/remainder/modulo per §11.7.3, `(/ 0)` raises division-by-zero, `(string-ref s i)` bounds checking, mutation of literal-derived strings allowed since literals are wrapped on read, `equal?` on cyclic structures terminates, etc.); each builtin's name string matches R6RS exactly | Restrictions: do NOT implement call-with-current-continuation here (deferred); do not implement file I/O builtins beyond display/write/newline (those land in task 12 with port plumbing); do not lower into JIT-friendly forms — these are pure interpreter dispatch; any `unsafe` requires explicit ADR | Success: `cargo test -p cs-runtime` passes ≥ 50 builtin-specific tests; conformance harness can run R6RS-suite tests covering §11.7, 11.8, 11.9, 11.10, 11.11, 11.12_
+
+- [ ] 12. Implement control builtins, ports, and dynamic-wind in `cs-runtime`
+  - File: `crates/cs-runtime/src/builtins/control.rs`, `crates/cs-runtime/src/builtins/io.rs`, `crates/cs-runtime/src/port_impls.rs`, additions to `crates/cs-runtime/src/eval.rs`
+  - Control: `apply`, `values`, `call-with-values`, `dynamic-wind`, `error`, `raise`, `with-exception-handler`, `guard` (limited form — full `guard` syntax is a macro, lower it as a desugaring in cs-expand task 9 if not already done).
+  - I/O: `display`, `write`, `newline`, `read`, `eof-object?`, `current-input-port`, `current-output-port`, `current-error-port`, `port?`.
+  - Concrete `Port` implementations: `StdinPort`, `StdoutPort`, `StderrPort`, `StringInputPort`, `StringOutputPort`. Live in `port_impls.rs`.
+  - `dynamic-wind` requires non-local control: maintain a wind stack on the `Runtime` per dynamic extent. On `raise`/non-local return, walk the wind stack invoking `after` thunks down to the common ancestor.
+  - Tests: `(call-with-values (lambda () (values 1 2)) +)` → `3`. `(dynamic-wind … …)` ordering tests. `apply` with proper-list and improper-list arguments. `raise` propagation.
+  - Purpose: complete the foundation builtin surface so real programs and tests run.
+  - _Leverage: `cs-core::Port` trait, std::io_
+  - _Requirements: 6.1, 6.2, 6.3, 6.4_
+  - _Prompt: Role: Scheme runtime implementor with experience implementing R6RS conditions and dynamic-wind | Task: Implement the remaining foundation builtins in cs-runtime/builtins/{control,io} per the task description, plus concrete Port implementations in port_impls.rs covering stdin/stdout/stderr/StringInput/StringOutput; ensure dynamic-wind invariants hold under raise/with-exception-handler unwinding by maintaining a wind stack on Runtime walked during non-local return; ensure raise sets up the condition correctly (with-exception-handler receives the condition value); tests must cover R6RS §11.15 dynamic-wind scenarios verbatim | Restrictions: do NOT implement call/cc — limited non-local control via raise/with-exception-handler is sufficient for foundation; full continuations are a later spec; do not introduce threading; ports must be Send+Sync? (no, per-Runtime, so Send is enough); make sure ports flush on drop | Success: `cargo test -p cs-runtime` passes additional ≥ 30 tests covering control flow, ports, and dynamic-wind; can run a Scheme program that reads stdin and writes formatted output_
+
+- [ ] 13. Wire conformance harness in `cs-test` and seed the foundation corpus
+  - File: `crates/cs-test/Cargo.toml`, `crates/cs-test/src/main.rs`, `crates/cs-test/src/runner.rs`, `crates/cs-test/src/report.rs`, `tests/conformance/foundation/*.scm` (≥ 100 test files), `xtask/src/conformance.rs` (replacing stub)
+  - Test format: each file is a Scheme program that ends with `(test-section "name")` and a series of `(test name expected actual)` calls. Helpers defined in `tests/conformance/foundation/_prelude.scm` loaded before each test.
+  - `cs-test` runner: per-file, `Runtime::new`, evaluate prelude, evaluate file, collect results.
+  - Output: `target/conformance.json` with `{ "tests": [{name, file, status: pass|fail|skip, message?}], "summary": {...} }`.
+  - `xtask conformance` invokes the runner and prints a colorized summary.
+  - CI calls `cargo xtask conformance`; emits the JSON; fails the run if pass count drops below the previous trunk baseline (baseline stored in `bench/conformance-baseline.json`).
+  - Curate ≥ 100 starter tests covering R6RS §11.5, 11.7, 11.8, 11.9, 11.10, 11.11, 11.12, 11.16. Hand-port them from the Larceny test suite into the project's test format; cite source headers for license attribution.
+  - Purpose: turn conformance into a CI-visible scoreboard from the very first milestone.
+  - _Leverage: `cs-runtime`, `cs-cli`'s eval flow_
+  - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6_
+  - _Prompt: Role: Test infrastructure engineer specializing in language conformance testing | Task: Build the cs-test conformance harness exactly per design.md and Requirement 10, with the test-file format described in the task description, JSON report emission to target/conformance.json, integration with `cargo xtask conformance`, and a baseline regression check in CI; seed the corpus with ≥ 100 R6RS tests covering the listed sections — these can be authored by hand following R6RS examples or licensed-from-Larceny ports (with proper attribution) | Restrictions: each test runs in a fresh Runtime (no cross-test state); skipped tests must have a documented reason; do not include tests that require macros, full continuations, or ports beyond stdout (those land in later milestones); the JSON report format must be stable enough for the dashboard generator to depend on it | Success: `cargo xtask conformance` runs ≥ 100 tests with ≥ 90% pass rate; failures are listed with reproducible commands; CI fails if pass count regresses; report format documented_
+
+- [ ] 14. Implement `cs-repl` crate
+  - File: `crates/cs-repl/Cargo.toml`, `crates/cs-repl/src/lib.rs`, `crates/cs-repl/src/repl.rs`, `crates/cs-repl/src/multiline.rs`, `crates/cs-repl/src/history.rs`
+  - `Repl::new(rt: Runtime, opts: ReplOpts) -> Self`, `Repl::run(self) -> Result<(), Diagnostic>`.
+  - `multiline.rs` detects when input is incomplete by attempting `cs-parse::read_one` on the buffer; if it returns `Incomplete`, switch to continuation prompt.
+  - History persisted to `${XDG_DATA_HOME:-~/.local/share}/crabscheme/history` with mode `0600` on POSIX.
+  - Tab completion stub (real completion lands later — for now bind to something inert).
+  - Ctrl-C: clear current buffer, redraw prompt, do not exit. Ctrl-D on empty buffer: exit 0.
+  - Tests: PTY-driven via `expectrl` covering the seven REPL acceptance criteria.
+  - Purpose: the user-facing exploration interface.
+  - _Leverage: `rustyline`, `cs-runtime`, `cs-parse`, `cs-diag`_
+  - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8_
+  - _Prompt: Role: REPL implementor familiar with rustyline | Task: Implement cs-repl per design.md with all eight REPL acceptance criteria; multi-line detection by trial-parsing the buffer and treating Reader's "Incomplete" verdict as the switch trigger; rustyline configured for emacs keybindings; persistent history at the XDG path with 0600 permissions on POSIX (no-op on Windows); PTY-driven tests covering each criterion | Restrictions: do not implement tab completion of identifiers yet (placeholder only); do not block on stdin if reader signals input was complete; ensure Ctrl-C never exits; do not break terminal raw mode on panic — install a panic hook that restores the terminal | Success: `cargo test -p cs-repl` passes; manual smoke test shows multi-line entry, history navigation, Ctrl-C clearing, Ctrl-D exiting; `crabscheme` (no args) launches REPL within 50ms_
+
+- [ ] 15. Implement `cs-cli` crate (the `crabscheme` binary)
+  - File: `crates/cs-cli/Cargo.toml`, `crates/cs-cli/src/main.rs`, `crates/cs-cli/src/cmd/{run.rs, eval.rs, repl.rs, version.rs, mod.rs}`
+  - Subcommands: `run <file>`, `repl`, `version`, plus top-level `-e <expr>` shortcut and `--` argument forwarding to `(command-line)`.
+  - Global flags: `--color=always|never|auto` (default auto), `--trace=phase[,phase…]` (lex,read,expand,eval), `--history <path>`.
+  - `crabscheme` with no subcommand and no `-e` opens the REPL.
+  - `crabscheme run --` followed by program args sets `(command-line)`.
+  - `--version` prints semver, target triple, git commit (built-in via `vergen`), Rust toolchain.
+  - Exit codes: 0 normal, 1 user error (bad CLI args / file not found), 2 evaluation error.
+  - Tests: blackbox via `assert_cmd`, covering each Requirement 8 acceptance criterion.
+  - Purpose: ship the binary users actually run.
+  - _Leverage: `clap` derive, `cs-runtime`, `cs-repl`, `vergen`_
+  - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7_
+  - _Prompt: Role: Rust CLI engineer | Task: Implement cs-cli per design.md with clap derive subcommands run/repl/version, top-level -e for one-shot eval, -- separator forwarding remaining args to `(command-line)`, --color and --trace global flags, vergen-driven --version output, and blackbox tests with assert_cmd covering each Requirement 8 acceptance criterion | Restrictions: do not duplicate evaluation logic — always go through cs-runtime::Runtime::eval_str; trace events must be JSON Lines on stderr per Requirement 8.7; exit codes must match: 0 success, 1 user-error before runtime ready, 2 evaluation error; do not enable nightly-only clap features | Success: `crabscheme --help` documents all surfaces; `crabscheme -e '(+ 1 2)'` prints `3` and exits 0; `crabscheme run nonexistent.scm` exits 1 with diagnostic on stderr; `crabscheme run --trace=expand foo.scm` emits structured JSON Lines on stderr_
+
+- [ ] 16. End-to-end golden tests in `tests/golden`
+  - File: `tests/golden/{factorial.scm, ackermann.scm, fibonacci.scm, list-ops.scm, error-cases.scm}` plus expected-output `.txt` files; `tests/golden/runner.rs` integration test
+  - Each `.scm` file evaluates a small program; runner uses `assert_cmd` to invoke `crabscheme run <file>` and diffs stdout against `<file>.expected`.
+  - Cover at least: factorial, Fibonacci, Ackermann (smallish args), list reversal, string manipulation, error path with structured diagnostic.
+  - Purpose: demonstrate end-to-end functionality and lock against regressions.
+  - _Leverage: `cs-cli` binary, `assert_cmd`_
+  - _Requirements: All foundation requirements_
+  - _Prompt: Role: Integration-test author | Task: Create the golden test suite per the task description, with each .scm file paired with an .expected file, a runner that invokes the crabscheme binary and asserts stdout matches expected (whitespace-insensitive), and coverage of factorial, Fibonacci, Ackermann (depth bounded for tree-walker speed), list reversal, string manipulation, and at least one error case verifying diagnostic format | Restrictions: do not depend on Scheme features not yet implemented in foundation (no syntax-rules, no call/cc, no records, no I/O beyond display/write/newline); error-case tests pin the exact stderr format so diagnostic regressions are caught | Success: `cargo test --test golden` passes; running `crabscheme run tests/golden/factorial.scm` manually produces the expected output; CI runs golden tests on every PR_
+
+- [ ] 17. Property-test the full pipeline in `tests/differential`
+  - File: `tests/differential/pipeline_proptest.rs`
+  - Generate arbitrary `Datum` (depth ≤ 4) using a proptest strategy; verify that `read(write(d)) == d`.
+  - Generate small CoreExprs that are guaranteed-evaluable (constants, lambdas, applications of pure builtins) and verify evaluator determinism.
+  - Foundation has only the tree-walker, so this is not yet differential; it scaffolds the harness so M3+ can plug in additional backends and reuse the corpus and comparators.
+  - Purpose: lock pipeline invariants and create the seam later tiers fit into.
+  - _Leverage: `proptest`, `cs-parse`, `cs-runtime`_
+  - _Requirements: 4.1, 4.7_
+  - _Prompt: Role: Property-testing specialist | Task: Implement the differential-testing scaffold per the task description: proptest strategies for Datum and CoreExpr, the parse-print round-trip property, an evaluator-determinism property running each generated expression twice in fresh Runtimes and asserting identical results, and a pluggable Backend trait the harness uses to execute (single backend = TreeWalker for now); aim for ≥ 1000 generated cases per property in standard runs and ≥ 10000 in CI release-blocking jobs | Restrictions: bound generation depth and complexity to keep run time under 30 seconds in CI; do not generate expressions involving features not yet implemented; expression generators must produce R6RS-valid programs; failures must shrink to minimal reproducers | Success: properties run green for ≥ 10000 cases; shrinking produces minimal counterexamples on injected bug; harness is documented for future tiers to plug into_
+
+- [ ] 18. Document foundation in `docs/architecture.md` and ADRs
+  - File: `docs/architecture.md`, `docs/adr/0001-rust-as-host-language.md`, `docs/adr/0002-tagged-enum-value-foundation.md`, `docs/adr/0003-numeric-backend-num-vs-rug.md`, `docs/adr/0004-no-syntax-rules-at-foundation.md`, `docs/adr/0005-jit-backend-trait-design.md`
+  - `architecture.md`: pipeline diagram, crate responsibilities, how diagnostics flow, where to add new builtins, where to add new desugarings.
+  - ADRs ratify decisions already made in tech.md and provide the historical context.
+  - Purpose: lower onboarding cost and lock decision-history before later milestones edit the same areas.
+  - _Leverage: tech.md decision log_
+  - _Requirements: NFR (architecture documentation)_
+  - _Prompt: Role: Technical writer / developer-advocate familiar with Rust and Scheme | Task: Author docs/architecture.md walking a new contributor through the codebase top-down (start with the binary, descend through cs-cli → cs-runtime → cs-expand → cs-parse → cs-lex → cs-core, with diagrams), and write ADRs 0001-0005 ratifying the decisions in tech.md (host language Rust, tagged-enum Value, num-bigint vs rug, no syntax-rules at foundation, JitBackend trait design) using the ADR template; cross-link from architecture.md to each ADR | Restrictions: ADRs are immutable once Accepted — write them as historical records, not living docs; architecture.md may evolve so it explicitly says so; keep diagrams in mermaid for in-repo rendering; do not document features not yet implemented | Success: a Rust engineer with no Scheme background can read architecture.md and the ADRs in one session and understand the project's structure and decision history_
+
+- [ ] 19. Foundation milestone exit gate
+  - File: (no new files; this is a verification task)
+  - Run `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo doc --workspace --no-deps -- -D warnings`, `cargo deny check`, `cargo xtask conformance` (target ≥ 100 passing tests), `cargo bench --package cs-runtime` (record baseline) — all green.
+  - Tag the commit `foundation-milestone-complete` and update CHANGELOG.md.
+  - Capture conformance baseline in `bench/conformance-baseline.json`.
+  - Capture perf baseline (`(fib 25)` tree-walker time) in `bench/perf-baseline.json`.
+  - Purpose: explicit checkpoint that the foundation is shippable before starting the next spec (Macro Expander).
+  - _Leverage: All gates described in tech.md_
+  - _Requirements: All_
+  - _Prompt: Role: Release manager | Task: Run the complete CI gate locally (rustfmt, clippy with -D warnings, test --workspace, rustdoc with -D warnings, cargo-deny, xtask conformance, criterion bench), confirm all green, update CHANGELOG.md with the foundation milestone's complete change list, capture conformance and perf baselines under bench/, tag the commit foundation-milestone-complete, and write a one-page milestone-exit report in docs/milestones/foundation-exit.md summarizing what shipped, what was deferred, and known limitations going into the next milestone | Restrictions: do not skip gates; if any gate fails, fix or document the deferral with an issue link; baselines must be reproducible (record toolchain, host CPU, build profile); CHANGELOG entries must be human-meaningful, not commit-message dumps | Success: all gates green; tag pushed; baselines committed; milestone-exit report committed; ROADMAP.md updated to mark M0–M2 complete_
