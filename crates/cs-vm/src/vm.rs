@@ -16,6 +16,10 @@ thread_local! {
     /// Side-channel for `raise` / `error`. Set by raise; read by
     /// with-exception-handler when a callee returns Err.
     static VM_PENDING_RAISE: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// Side-channel for `call/cc` escape: when a continuation is invoked,
+    /// it stashes (id, value) here and returns Err("__escape__"). The
+    /// matching call/cc handler reads it; non-matching call/cc rethrows.
+    static VM_PENDING_ESCAPE: RefCell<Option<(u64, Value)>> = const { RefCell::new(None) };
     /// Current input port (R6RS dynamic `current-input-port`). Set by
     /// `with-input-from-string`; read by `read` / `read-line` / `read-char`
     /// when called with no port arg.
@@ -39,6 +43,20 @@ fn take_pending_raise() -> Option<Value> {
 
 fn set_pending_raise(v: Value) {
     VM_PENDING_RAISE.with(|cell| *cell.borrow_mut() = Some(v));
+}
+
+fn take_pending_escape() -> Option<(u64, Value)> {
+    VM_PENDING_ESCAPE.with(|cell| cell.borrow_mut().take())
+}
+
+fn set_pending_escape(id: u64, v: Value) {
+    VM_PENDING_ESCAPE.with(|cell| *cell.borrow_mut() = Some((id, v)));
+}
+
+static VM_CONTINUATION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_continuation_id() -> u64 {
+    VM_CONTINUATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn current_input_port() -> Option<Value> {
@@ -497,6 +515,16 @@ pub fn run_with_entry(
                             }
                         }
                         continue;
+                    }
+                    // Continuation: stash (id, value) and unwind via Err.
+                    if let Some(k) = any.downcast_ref::<VmContinuation>() {
+                        let v = if n == 0 {
+                            Value::Unspecified
+                        } else {
+                            stack[args_start].clone()
+                        };
+                        set_pending_escape(k.id, v);
+                        return Err(VmError::new("__escape__"));
                     }
                 }
                 // SLOW PATH: drain into Vec<Value> and pop func for HO marker
@@ -1159,6 +1187,45 @@ pub fn run_with_entry(
                                 return stack.pop().ok_or_else(|| {
                                     VmError::new("empty stack at tail-with-input-from-string")
                                 });
+                            }
+                        }
+                        continue;
+                    }
+                    if p.as_any().downcast_ref::<VmCallCc>().is_some() {
+                        if args.len() != 1 {
+                            return Err(VmError::new("call/cc: 1 arg"));
+                        }
+                        let proc_val = args.remove(0);
+                        let id = next_continuation_id();
+                        let k = make_vm_continuation(id);
+                        let res = vm_call_sync(&proc_val, &[k], syms);
+                        let v = match res {
+                            Ok(v) => v,
+                            Err(e) => {
+                                if e.message == "__escape__" {
+                                    if let Some((eid, val)) = take_pending_escape() {
+                                        if eid == id {
+                                            val
+                                        } else {
+                                            // Not ours — rethrow.
+                                            set_pending_escape(eid, val);
+                                            return Err(e);
+                                        }
+                                    } else {
+                                        return Err(e);
+                                    }
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        };
+                        stack.push(v);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack
+                                    .pop()
+                                    .ok_or_else(|| VmError::new("empty stack at tail-call/cc"));
                             }
                         }
                         continue;
@@ -1867,15 +1934,24 @@ pub struct VmErrorFn;
 #[derive(Debug)]
 pub struct VmWithExceptionHandler;
 #[derive(Debug)]
-pub struct VmGuardCallcc;
+pub struct VmCallCc;
 #[derive(Debug)]
 pub struct VmDynamicWind;
+
+/// Escape-only continuation produced by `call/cc`. Holds the unique id
+/// installed by the originating call/cc; invoking it triggers a VmError
+/// with `__escape__:<id>` and stashes the value in VM_PENDING_ESCAPE.
+#[derive(Debug)]
+pub struct VmContinuation {
+    pub id: u64,
+}
 
 impl_proc_named!(VmRaise, "raise");
 impl_proc_named!(VmErrorFn, "error");
 impl_proc_named!(VmWithExceptionHandler, "with-exception-handler");
-impl_proc_named!(VmGuardCallcc, "call/cc");
+impl_proc_named!(VmCallCc, "call/cc");
 impl_proc_named!(VmDynamicWind, "dynamic-wind");
+impl_proc_named!(VmContinuation, "continuation");
 
 pub fn make_vm_raise() -> Value {
     Value::Procedure(Rc::new(VmRaise) as Rc<dyn Procedure>)
@@ -1888,6 +1964,12 @@ pub fn make_vm_with_exception_handler() -> Value {
 }
 pub fn make_vm_dynamic_wind() -> Value {
     Value::Procedure(Rc::new(VmDynamicWind) as Rc<dyn Procedure>)
+}
+pub fn make_vm_call_cc() -> Value {
+    Value::Procedure(Rc::new(VmCallCc) as Rc<dyn Procedure>)
+}
+pub fn make_vm_continuation(id: u64) -> Value {
+    Value::Procedure(Rc::new(VmContinuation { id }) as Rc<dyn Procedure>)
 }
 
 /// Build a "condition" value matching the tree-walker's `make_condition`:
@@ -1960,6 +2042,15 @@ pub fn vm_call_sync(
                     }
                 }
                 return vm_call_sync(&inner, &spread, syms);
+            }
+            if let Some(k) = any.downcast_ref::<VmContinuation>() {
+                let v = if args.is_empty() {
+                    Value::Unspecified
+                } else {
+                    args[0].clone()
+                };
+                set_pending_escape(k.id, v);
+                return Err(VmError::new("__escape__"));
             }
             if any.downcast_ref::<VmValues>().is_some() {
                 if args.len() == 1 {

@@ -243,6 +243,10 @@ impl Runtime {
         vm_env.define(weh_sym, cs_vm::vm::make_vm_with_exception_handler());
         let dwind_sym = syms.intern("dynamic-wind");
         vm_env.define(dwind_sym, cs_vm::vm::make_vm_dynamic_wind());
+        let cc_sym = syms.intern("call/cc");
+        vm_env.define(cc_sym, cs_vm::vm::make_vm_call_cc());
+        let cwcc_sym = syms.intern("call-with-current-continuation");
+        vm_env.define(cwcc_sym, cs_vm::vm::make_vm_call_cc());
         // read: needs symbol table to intern parsed symbols. With 0 args,
         // falls back to the VM thread-local current-input-port.
         let read_sym = syms.intern("read");

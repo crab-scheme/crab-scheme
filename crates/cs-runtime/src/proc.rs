@@ -61,6 +61,29 @@ impl Procedure for Closure {
 // same type. Re-export for backward compat.
 pub use cs_core::{make_parameter, Parameter};
 
+/// Escape-only first-class continuation produced by `call/cc`. Calling it
+/// with one argument unwinds the stack to the originating `call/cc` and
+/// returns that argument. Calls to a continuation outside its dynamic
+/// extent are not supported (the matching call/cc has already returned).
+#[derive(Debug)]
+pub struct Continuation {
+    pub id: u64,
+}
+
+impl Procedure for Continuation {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> Option<&str> {
+        Some("continuation")
+    }
+}
+
+pub fn make_continuation(id: u64) -> Value {
+    let p: Rc<dyn Procedure> = Rc::new(Continuation { id });
+    Value::Procedure(p)
+}
+
 pub fn make_builtin_pure(name: &'static str, f: PureBuiltinFn) -> Value {
     let p: Rc<dyn Procedure> = Rc::new(Builtin {
         name,

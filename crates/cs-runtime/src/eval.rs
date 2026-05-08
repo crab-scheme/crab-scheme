@@ -13,6 +13,11 @@ use crate::proc::{make_closure, Builtin, BuiltinFn, Closure, Parameter};
 pub enum EvalErrorKind {
     Message(String),
     Raised(Value),
+    /// Escape from a `call/cc`: the embedded `id` matches the call/cc that
+    /// installed this continuation, and the captured value becomes the
+    /// result of that call/cc. Caught only by the matching call/cc; any
+    /// other handler must rethrow.
+    Escape(u64, Value),
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +45,16 @@ impl EvalError {
         match &self.kind {
             EvalErrorKind::Message(m) => m.clone(),
             EvalErrorKind::Raised(v) => format!("uncaught: {}", v),
+            EvalErrorKind::Escape(id, v) => {
+                format!("escape continuation #{} invoked: {}", id, v)
+            }
+        }
+    }
+
+    pub fn escape(id: u64, v: Value, span: Span) -> Self {
+        Self {
+            kind: EvalErrorKind::Escape(id, v),
+            span,
         }
     }
 }
@@ -54,6 +69,11 @@ pub struct EvalCtx<'a> {
     /// condition, it stashes the value here and returns `Err`. eval picks
     /// it up and converts to `EvalErrorKind::Raised`.
     pub pending_raise: Option<Value>,
+    /// Side channel: when a higher-order builtin (e.g. call/cc) needs to
+    /// rethrow an Escape continuation that isn't its own match, it stashes
+    /// (id, value) here and returns `Err("__escape__")`. The wrapper
+    /// `builtin_err_to_eval` rebuilds the EvalErrorKind::Escape.
+    pub pending_escape: Option<(u64, Value)>,
     /// Side channel for multi-value returns from `values`.
     pub pending_values: Option<Vec<Value>>,
     /// Current input port (per-dynamic-extent).
@@ -75,6 +95,7 @@ impl<'a> EvalCtx<'a> {
             depth: 0,
             max_depth: 1_000_000,
             pending_raise: None,
+            pending_escape: None,
             pending_values: None,
             current_input_port: None,
             current_output_port: None,
@@ -94,6 +115,8 @@ fn call_parameter(param: &Parameter, args: &[Value]) -> Value {
 fn builtin_err_to_eval(ctx: &mut EvalCtx, msg: String, span: Span) -> EvalError {
     if let Some(cond) = ctx.pending_raise.take() {
         EvalError::raised(cond, span)
+    } else if let Some((id, v)) = ctx.pending_escape.take() {
+        EvalError::escape(id, v, span)
     } else {
         EvalError::new(msg, span)
     }
@@ -144,6 +167,18 @@ pub fn apply_procedure(
             }
             if let Some(param) = any.downcast_ref::<Parameter>() {
                 return Ok(call_parameter(param, args));
+            }
+            if let Some(k) = any.downcast_ref::<crate::proc::Continuation>() {
+                let v = if args.is_empty() {
+                    Value::Unspecified
+                } else {
+                    args[0].clone()
+                };
+                // Stash via side-channel so higher-order builtins that
+                // collapse `EvalError -> String` (via .message()) still let
+                // call/cc reconstruct the Escape via builtin_err_to_eval.
+                ctx.pending_escape = Some((k.id, v));
+                return Err(EvalError::new("__escape__", Span::DUMMY));
             }
             Err(EvalError::new("unknown procedure type", Span::DUMMY))
         }
@@ -266,6 +301,11 @@ pub fn eval(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Value,
                         }
                         if let Some(param) = any.downcast_ref::<Parameter>() {
                             return Ok(call_parameter(param, &arg_vals));
+                        }
+                        if let Some(k) = any.downcast_ref::<crate::proc::Continuation>() {
+                            let v = arg_vals.first().cloned().unwrap_or(Value::Unspecified);
+                            ctx.pending_escape = Some((k.id, v));
+                            return Err(EvalError::new("__escape__", span));
                         }
                         return Err(EvalError::new("unknown procedure type", span));
                     }

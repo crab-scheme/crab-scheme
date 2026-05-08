@@ -264,6 +264,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("hashtable-walk", b_hashtable_walk),
         ("values", b_values),
         ("call-with-values", b_call_with_values),
+        ("call/cc", b_call_cc),
+        ("call-with-current-continuation", b_call_cc),
         // SRFI-1 higher-order list ops
         ("filter", b_filter),
         ("fold-left", b_fold_left),
@@ -1593,9 +1595,18 @@ fn b_with_exception_handler(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, 
                             ctx.pending_raise = Some(c2);
                             Err("__raised__".to_string())
                         }
+                        crate::eval::EvalErrorKind::Escape(eid, v) => {
+                            ctx.pending_escape = Some((eid, v));
+                            Err("__escape__".to_string())
+                        }
                         crate::eval::EvalErrorKind::Message(m) => Err(m),
                     },
                 }
+            }
+            crate::eval::EvalErrorKind::Escape(eid, v) => {
+                ctx.pending_raise = prev;
+                ctx.pending_escape = Some((eid, v));
+                Err("__escape__".to_string())
             }
             crate::eval::EvalErrorKind::Message(m) => {
                 ctx.pending_raise = prev;
@@ -2017,6 +2028,61 @@ fn b_values(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     }
     ctx.pending_values = Some(args.to_vec());
     Ok(Value::Unspecified)
+}
+
+// Monotonic counter for call/cc continuation ids. Each call/cc invocation
+// gets a unique id so unwinding only catches its own escape and rethrows
+// others.
+static CONTINUATION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// `(call/cc proc)` / `(call-with-current-continuation proc)` — escape-only
+/// continuation. Allocates a fresh id, builds a Continuation procedure,
+/// calls proc with it. If proc returns normally, that's the result.
+/// If proc (or anything it calls) invokes the continuation with `v`,
+/// EvalError::Escape unwinds the stack to here and `v` is the result.
+fn b_call_cc(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("call/cc", "1", args.len()));
+    }
+    let id = CONTINUATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let k = crate::proc::make_continuation(id);
+    let prev_escape = ctx.pending_escape.take();
+    match apply_procedure(&args[0], &[k], ctx) {
+        Ok(v) => {
+            ctx.pending_escape = prev_escape;
+            Ok(v)
+        }
+        Err(e) => {
+            // Continuation invocations can arrive via two paths:
+            // (a) directly as EvalErrorKind::Escape (when invoked inside
+            //     simple eval of an App)
+            // (b) via the pending_escape side-channel + a Message error
+            //     (when the invocation was buried inside a higher builtin
+            //      whose `.map_err(|e| e.message())` collapsed the kind)
+            // Check both.
+            let escape = match &e.kind {
+                crate::eval::EvalErrorKind::Escape(eid, v) => Some((*eid, v.clone())),
+                _ => ctx.pending_escape.take(),
+            };
+            if let Some((eid, v)) = escape {
+                if eid == id {
+                    ctx.pending_escape = prev_escape;
+                    return Ok(v);
+                }
+                ctx.pending_escape = Some((eid, v));
+                return Err("__escape__".to_string());
+            }
+            ctx.pending_escape = prev_escape;
+            match e.kind {
+                crate::eval::EvalErrorKind::Raised(cond) => {
+                    ctx.pending_raise = Some(cond);
+                    Err("__raised__".to_string())
+                }
+                crate::eval::EvalErrorKind::Message(m) => Err(m),
+                crate::eval::EvalErrorKind::Escape(_, _) => unreachable!(),
+            }
+        }
+    }
 }
 
 /// `(call-with-values producer consumer)` — calls producer with no args,
@@ -2559,6 +2625,10 @@ fn b_dynamic_wind(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             crate::eval::EvalErrorKind::Raised(cond) => {
                 ctx.pending_raise = Some(cond);
                 Err("__raised__".to_string())
+            }
+            crate::eval::EvalErrorKind::Escape(eid, v) => {
+                ctx.pending_escape = Some((eid, v));
+                Err("__escape__".to_string())
             }
             crate::eval::EvalErrorKind::Message(m) => Err(m),
         },
