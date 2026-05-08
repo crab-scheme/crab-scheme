@@ -49,7 +49,7 @@ fn main() -> ExitCode {
 
     match cli.cmd {
         Some(Cmd::Run { file }) => run_file(&file, via_vm),
-        Some(Cmd::Repl) | None => run_repl(),
+        Some(Cmd::Repl) | None => run_repl(via_vm),
     }
 }
 
@@ -107,19 +107,21 @@ fn run_file(path: &str, via_vm: bool) -> ExitCode {
     }
 }
 
-fn run_repl() -> ExitCode {
+fn run_repl(start_via_vm: bool) -> ExitCode {
     let mut rt = Runtime::new();
     let mut counter: u32 = 0;
+    let mut via_vm = start_via_vm;
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut buffer = String::new();
     println!(
-        "crabscheme {} — type Scheme expressions, ^D to exit",
-        env!("CARGO_PKG_VERSION")
+        "crabscheme {} ({}) — :help for commands, ^D to exit",
+        env!("CARGO_PKG_VERSION"),
+        if via_vm { "vm" } else { "walker" },
     );
     loop {
         if buffer.is_empty() {
-            print!("> ");
+            print!("{}> ", if via_vm { "vm" } else { "" });
         } else {
             print!("… ");
         }
@@ -133,6 +135,15 @@ fn run_repl() -> ExitCode {
             Ok(_) => {}
             Err(_) => return ExitCode::from(1),
         }
+        // REPL command: line starts with `:` and we're not mid-expression.
+        let trimmed = line.trim();
+        if buffer.is_empty() && trimmed.starts_with(':') {
+            match handle_repl_cmd(trimmed, &mut via_vm, &mut rt) {
+                ReplCmdResult::Continue => {}
+                ReplCmdResult::Quit => return ExitCode::SUCCESS,
+            }
+            continue;
+        }
         buffer.push_str(&line);
         if !is_balanced(&buffer) {
             continue;
@@ -140,16 +151,98 @@ fn run_repl() -> ExitCode {
         counter += 1;
         let name = format!("<repl:{}>", counter);
         let to_eval = std::mem::take(&mut buffer);
-        match rt.eval_str(&name, &to_eval) {
+        let result = if via_vm {
+            rt.eval_str_via_vm(&name, &to_eval)
+        } else {
+            rt.eval_str(&name, &to_eval)
+        };
+        match result {
             Ok(v) => {
                 if !matches!(v, Value::Unspecified) {
-                    println!("{}", v);
+                    println!("{}", rt.format_value(&v, WriteMode::Write));
                 }
             }
             Err(diag) => {
                 let s = render(&diag, rt.source_map());
                 eprint!("{}", s);
             }
+        }
+    }
+}
+
+enum ReplCmdResult {
+    Continue,
+    Quit,
+}
+
+fn handle_repl_cmd(line: &str, via_vm: &mut bool, rt: &mut Runtime) -> ReplCmdResult {
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let arg = parts.next().unwrap_or("").trim();
+    match cmd {
+        ":quit" | ":q" | ":exit" => ReplCmdResult::Quit,
+        ":help" | ":h" | ":?" => {
+            println!(
+                ":help                  this list\n\
+                 :quit                  exit (also ^D)\n\
+                 :tier walker|vm        switch execution tier (current: {})\n\
+                 :time <expr>           evaluate <expr> and report wall time\n\
+                 :reset                 reinitialize runtime, dropping definitions",
+                if *via_vm { "vm" } else { "walker" }
+            );
+            ReplCmdResult::Continue
+        }
+        ":tier" => {
+            match arg {
+                "walker" => {
+                    *via_vm = false;
+                    println!("tier: walker");
+                }
+                "vm" => {
+                    *via_vm = true;
+                    println!("tier: vm");
+                }
+                "" => {
+                    println!("tier: {}", if *via_vm { "vm" } else { "walker" });
+                }
+                other => println!("unknown tier {:?} — use walker or vm", other),
+            }
+            ReplCmdResult::Continue
+        }
+        ":time" => {
+            if arg.is_empty() {
+                println!(":time needs an expression");
+                return ReplCmdResult::Continue;
+            }
+            let t = std::time::Instant::now();
+            let r = if *via_vm {
+                rt.eval_str_via_vm("<:time>", arg)
+            } else {
+                rt.eval_str("<:time>", arg)
+            };
+            let dt = t.elapsed();
+            match r {
+                Ok(v) => {
+                    if !matches!(v, Value::Unspecified) {
+                        println!("{}", rt.format_value(&v, WriteMode::Write));
+                    }
+                    println!("; {:.3?}", dt);
+                }
+                Err(diag) => {
+                    let s = render(&diag, rt.source_map());
+                    eprint!("{}", s);
+                }
+            }
+            ReplCmdResult::Continue
+        }
+        ":reset" => {
+            *rt = Runtime::new();
+            println!("runtime reset");
+            ReplCmdResult::Continue
+        }
+        other => {
+            println!("unknown REPL command {:?} — try :help", other);
+            ReplCmdResult::Continue
         }
     }
 }
