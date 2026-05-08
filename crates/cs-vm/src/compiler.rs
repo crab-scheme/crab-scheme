@@ -32,7 +32,7 @@ pub fn compile(expr: &CoreExpr) -> Result<Bytecode, CompileError> {
     compile_expr(expr, &mut top_insts, &mut lambdas, true)?;
     Ok(Bytecode {
         insts: Rc::new(top_insts),
-        lambdas,
+        lambdas: Rc::new(lambdas),
     })
 }
 

@@ -39,11 +39,13 @@ pub enum Inst {
 /// A compiled program: instructions plus a table of nested compiled lambdas.
 /// Bodies (top-level and per-lambda) are wrapped in `Rc` so frame creation
 /// during Call/TailCall is a refcount bump rather than a Vec clone.
+/// `lambdas` is also Rc-shared so HO bridge calls (vm_call_sync) avoid a
+/// Vec<CompiledLambda> deep-clone per invocation.
 #[derive(Clone, Debug, Default)]
 pub struct Bytecode {
     pub insts: Rc<Vec<Inst>>,
     /// Compiled lambdas referenced by `MakeClosure` instructions.
-    pub lambdas: Vec<CompiledLambda>,
+    pub lambdas: Rc<Vec<CompiledLambda>>,
 }
 
 #[derive(Clone, Debug)]
