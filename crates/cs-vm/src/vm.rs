@@ -294,13 +294,26 @@ struct Frame {
 }
 
 pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Value, VmError> {
-    let bc_rc = Rc::new(bc.clone());
+    run_with_entry(Rc::new(bc.clone()), None, top_env, syms)
+}
+
+/// Like [`run`] but accepts an already-shared `Rc<Bytecode>` (avoiding a
+/// heap allocation per call) and an optional `entry_insts` override for
+/// running a specific lambda body. `vm_call_sync` uses this for HO bridge
+/// calls to skip constructing a sub-Bytecode per element.
+pub fn run_with_entry(
+    bc: Rc<Bytecode>,
+    entry_insts: Option<Rc<Vec<Inst>>>,
+    top_env: Rc<Env>,
+    syms: &mut SymbolTable,
+) -> Result<Value, VmError> {
+    let insts = entry_insts.unwrap_or_else(|| bc.insts.clone());
     let mut stack: Vec<Value> = Vec::new();
     let mut frames: Vec<Frame> = vec![Frame {
-        insts: bc_rc.insts.clone(),
+        insts,
         ip: 0,
         env: top_env,
-        bc: bc_rc.clone(),
+        bc,
     }];
     loop {
         let Some(frame) = frames.last_mut() else {
@@ -1915,12 +1928,11 @@ pub fn vm_call_sync(
                     let rest_args = &args[lam.params.len()..];
                     new_env.define(rest_name, Value::list(rest_args.iter().cloned()));
                 }
-                // Wrap lambda body in a fresh Bytecode and recursively run.
-                let sub_bc = Bytecode {
-                    insts: lam.body.clone(),
-                    lambdas: c.bc.lambdas.clone(),
-                };
-                return run(&sub_bc, new_env, syms);
+                // Reuse the closure's existing Rc<Bytecode> with an entry-
+                // insts override; avoids allocating a sub-Bytecode per HO
+                // call (saves a Bytecode struct + Rc<Bytecode> heap alloc
+                // per element of map/fold/filter/...).
+                return run_with_entry(c.bc.clone(), Some(lam.body.clone()), new_env, syms);
             }
             if any.downcast_ref::<VmApply>().is_some() {
                 if args.is_empty() {
