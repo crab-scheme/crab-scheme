@@ -271,9 +271,13 @@ fn vm_conformance_exceptions() {
     assert_eq!(walker, vm);
 }
 
-// bitwise_eval.scm requires `eval`, which is not yet ported to the VM tier
-// (would need to invoke the parser+expander+VM compile mid-execution); the
-// walker handles it via re-entry. Skipped on VM until that bridge is added.
+#[test]
+fn vm_conformance_bitwise_eval() {
+    let walker = pass_count_walker("bitwise_eval.scm");
+    let vm = pass_count_vm("bitwise_eval.scm").expect("vm should run bitwise_eval.scm");
+    println!("bitwise_eval: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
 
 #[test]
 fn vm_conformance_do_and_guard() {
@@ -299,9 +303,13 @@ fn vm_conformance_promises() {
     assert_eq!(walker, vm);
 }
 
-// let_values_dynwind.scm uses with-output-to-string (current_output_port).
-// dynamic-wind itself works on VM, but the file's tests rely on output-port
-// state that isn't yet bridged. Skipped pending current-output-port port.
+#[test]
+fn vm_conformance_let_values_dynwind() {
+    let walker = pass_count_walker("let_values_dynwind.scm");
+    let vm = pass_count_vm("let_values_dynwind.scm").expect("vm should run let_values_dynwind.scm");
+    println!("let_values_dynwind: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
 
 #[test]
 fn vm_conformance_parameters_srfi1() {
@@ -319,8 +327,13 @@ fn vm_conformance_transcendental_io() {
     assert_eq!(walker, vm);
 }
 
-// bytevectors_misc.scm uses with-output-to-string (needs current_output_port
-// state, not yet ported to VM). Skipped on VM until port-state bridge lands.
+#[test]
+fn vm_conformance_bytevectors_misc() {
+    let walker = pass_count_walker("bytevectors_misc.scm");
+    let vm = pass_count_vm("bytevectors_misc.scm").expect("vm should run bytevectors_misc.scm");
+    println!("bytevectors_misc: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
 
 #[test]
 fn vm_conformance_hashtables() {

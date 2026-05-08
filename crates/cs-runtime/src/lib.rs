@@ -146,6 +146,25 @@ impl Runtime {
         vm_env.define(rem_sym, cs_vm::vm::make_vm_remove());
         let force_sym = syms.intern("force");
         vm_env.define(force_sym, cs_vm::vm::make_vm_force());
+        // I/O port-state ops.
+        let display_sym = syms.intern("display");
+        vm_env.define(display_sym, cs_vm::vm::make_vm_display());
+        let write_sym = syms.intern("write");
+        vm_env.define(write_sym, cs_vm::vm::make_vm_write());
+        let newline_sym = syms.intern("newline");
+        vm_env.define(newline_sym, cs_vm::vm::make_vm_newline());
+        let wos_sym = syms.intern("with-output-to-string");
+        vm_env.define(wos_sym, cs_vm::vm::make_vm_with_output_to_string());
+        let wis_sym = syms.intern("with-input-from-string");
+        vm_env.define(wis_sym, cs_vm::vm::make_vm_with_input_from_string());
+        let cip_sym = syms.intern("current-input-port");
+        vm_env.define(cip_sym, cs_vm::vm::make_vm_current_input_port());
+        let cop_sym = syms.intern("current-output-port");
+        vm_env.define(cop_sym, cs_vm::vm::make_vm_current_output_port());
+        // eval: thread-local hook installed at entry to eval_str_via_vm so
+        // VmEval can call back into the runtime without a direct cycle.
+        let eval_sym = syms.intern("eval");
+        vm_env.define(eval_sym, cs_vm::vm::make_vm_eval());
         // get-string-all does not need ctx; install as pure VM builtin.
         let gsa_sym = syms.intern("get-string-all");
         vm_env.define(
@@ -174,16 +193,21 @@ impl Runtime {
                 }
             }),
         );
-        // read-line: takes 1 arg (port). Tree-walker variant uses ctx for
-        // implicit current-input-port; we require explicit on VM tier.
+        // read-line: 1 arg explicit port, or 0 args using current-input-port.
         let rl_sym = syms.intern("read-line");
         vm_env.define(
             rl_sym,
             cs_vm::vm::make_vm_builtin("read-line", |args| {
-                if args.len() != 1 {
-                    return Err("read-line: 1 arg (port)".into());
+                if args.len() > 1 {
+                    return Err("read-line: 0 or 1 arg".into());
                 }
-                match &args[0] {
+                let port = if args.is_empty() {
+                    cs_vm::vm::vm_current_input_port_value()
+                        .ok_or_else(|| "read-line: no current input port".to_string())?
+                } else {
+                    args[0].clone()
+                };
+                match &port {
                     Value::Port(p) => match &**p {
                         cs_core::Port::StringInput(state) => {
                             let mut s = state.borrow_mut();
@@ -219,15 +243,22 @@ impl Runtime {
         vm_env.define(weh_sym, cs_vm::vm::make_vm_with_exception_handler());
         let dwind_sym = syms.intern("dynamic-wind");
         vm_env.define(dwind_sym, cs_vm::vm::make_vm_dynamic_wind());
-        // read: needs symbol table to intern parsed symbols.
+        // read: needs symbol table to intern parsed symbols. With 0 args,
+        // falls back to the VM thread-local current-input-port.
         let read_sym = syms.intern("read");
         vm_env.define(
             read_sym,
             cs_vm::vm::make_vm_builtin_syms("read", |args, st| {
-                if args.len() != 1 {
-                    return Err("read: 1 arg (string-input port)".into());
+                if args.len() > 1 {
+                    return Err("read: 0 or 1 arg".into());
                 }
-                match &args[0] {
+                let port = if args.is_empty() {
+                    cs_vm::vm::vm_current_input_port_value()
+                        .ok_or_else(|| "read: no current input port".to_string())?
+                } else {
+                    args[0].clone()
+                };
+                match &port {
                     Value::Port(p) => match &**p {
                         cs_core::Port::StringInput(state) => {
                             let mut s = state.borrow_mut();
@@ -350,8 +381,14 @@ impl Runtime {
         };
         drop(expander);
         let bc = cs_vm::compile(&core).map_err(|e| Diagnostic::error(e.message, e.span))?;
-        cs_vm::run(&bc, self.vm_env.clone(), &mut self.syms)
-            .map_err(|e| Diagnostic::error(e.message, cs_diag::Span::DUMMY))
+        // Install the `eval` hook + root env so VmEval can call back into us.
+        let prev_hook = cs_vm::vm::install_eval_hook(Some(vm_eval_callback));
+        let prev_env = cs_vm::vm::install_eval_root_env(Some(self.vm_env.clone()));
+        let result = cs_vm::run(&bc, self.vm_env.clone(), &mut self.syms)
+            .map_err(|e| Diagnostic::error(e.message, cs_diag::Span::DUMMY));
+        cs_vm::vm::install_eval_hook(prev_hook);
+        cs_vm::vm::install_eval_root_env(prev_env);
+        result
     }
 
     /// Look up a top-level binding.
@@ -364,6 +401,33 @@ impl Runtime {
         })?;
         self.top.get(sym)
     }
+}
+
+/// Callback installed via `cs_vm::install_eval_hook` so the VM `eval`
+/// builtin can re-enter the parser+expander+compiler+VM. Foundation: uses
+/// an empty macro env (no syntactic forms beyond core builtins are available
+/// to evaluated code at this milestone).
+fn vm_eval_callback(v: &Value, syms: &mut SymbolTable) -> Result<Value, String> {
+    let env =
+        cs_vm::vm::vm_eval_root_env().ok_or_else(|| "eval: no root env installed".to_string())?;
+    // Format the datum back to source, then re-parse → expand → compile → run.
+    let datum_str = v.format_with(syms, WriteMode::Write);
+    let file_id = cs_diag::FileId(u32::MAX - 3);
+    let data = read_all(file_id, &datum_str, syms).map_err(|errs| {
+        let e = errs.into_iter().next().unwrap();
+        format!("eval: parse error: {}", e.message())
+    })?;
+    if data.is_empty() {
+        return Ok(Value::Unspecified);
+    }
+    let mut macros = std::collections::HashMap::new();
+    let mut expander = Expander::new(syms, &mut macros);
+    let core = expander
+        .expand_program(&data)
+        .map_err(|e| format!("eval: expand error: {}", e.message()))?;
+    drop(expander);
+    let bc = cs_vm::compile(&core).map_err(|e| format!("eval: compile error: {}", e.message))?;
+    cs_vm::run(&bc, env, syms).map_err(|e| format!("eval: {}", e.message))
 }
 
 // Helper so cs-runtime can look up symbols by name without intern.

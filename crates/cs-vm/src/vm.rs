@@ -16,6 +16,13 @@ thread_local! {
     /// Side-channel for `raise` / `error`. Set by raise; read by
     /// with-exception-handler when a callee returns Err.
     static VM_PENDING_RAISE: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// Current input port (R6RS dynamic `current-input-port`). Set by
+    /// `with-input-from-string`; read by `read` / `read-line` / `read-char`
+    /// when called with no port arg.
+    static VM_CURRENT_INPUT_PORT: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// Current output port (R6RS dynamic `current-output-port`). Set by
+    /// `with-output-to-string`; read by `display`/`write`/`newline` etc.
+    static VM_CURRENT_OUTPUT_PORT: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 fn take_pending_values() -> Option<Vec<Value>> {
@@ -32,6 +39,92 @@ fn take_pending_raise() -> Option<Value> {
 
 fn set_pending_raise(v: Value) {
     VM_PENDING_RAISE.with(|cell| *cell.borrow_mut() = Some(v));
+}
+
+fn current_input_port() -> Option<Value> {
+    VM_CURRENT_INPUT_PORT.with(|cell| cell.borrow().clone())
+}
+
+fn current_output_port() -> Option<Value> {
+    VM_CURRENT_OUTPUT_PORT.with(|cell| cell.borrow().clone())
+}
+
+/// Public accessor for cs-runtime to read the current VM input port from
+/// inside a registered VmBuiltin/VmBuiltinSyms callback.
+pub fn vm_current_input_port_value() -> Option<Value> {
+    current_input_port()
+}
+
+/// Public accessor for cs-runtime to read the current VM output port.
+pub fn vm_current_output_port_value() -> Option<Value> {
+    current_output_port()
+}
+
+/// Function-pointer hook for `eval`: cs-runtime installs this before driving
+/// the VM. The hook takes the value to eval and the live symbol table, and
+/// returns the evaluated value. It typically reads cs-vm thread-locals like
+/// `vm_eval_root_env` to find the env in which to run the sub-program.
+pub type VmEvalHook = fn(&Value, &mut SymbolTable) -> Result<Value, String>;
+
+thread_local! {
+    static VM_EVAL_HOOK: RefCell<Option<VmEvalHook>> = const { RefCell::new(None) };
+    static VM_EVAL_ROOT_ENV: RefCell<Option<Rc<Env>>> = const { RefCell::new(None) };
+}
+
+/// Install the `eval` hook for the current thread. Returns the previous hook
+/// so callers can restore it after the VM run completes.
+pub fn install_eval_hook(hook: Option<VmEvalHook>) -> Option<VmEvalHook> {
+    VM_EVAL_HOOK.with(|cell| {
+        let prev = *cell.borrow();
+        *cell.borrow_mut() = hook;
+        prev
+    })
+}
+
+/// Install the root env that the eval hook should use as the parent env when
+/// running an evaluated sub-program. Returns the previous value for restore.
+pub fn install_eval_root_env(env: Option<Rc<Env>>) -> Option<Rc<Env>> {
+    VM_EVAL_ROOT_ENV.with(|cell| {
+        cell.borrow_mut().take().or_else(|| {
+            // Use only when current is None; replacement done below.
+            None
+        })
+    });
+    VM_EVAL_ROOT_ENV.with(|cell| {
+        let prev = cell.borrow_mut().take();
+        *cell.borrow_mut() = env;
+        prev
+    })
+}
+
+/// Read the eval root env (used by the hook to compile-and-run sub-programs
+/// against the live runtime's VM environment).
+pub fn vm_eval_root_env() -> Option<Rc<Env>> {
+    VM_EVAL_ROOT_ENV.with(|cell| cell.borrow().clone())
+}
+
+fn run_eval_hook(v: &Value, syms: &mut SymbolTable) -> Result<Value, VmError> {
+    let hook = VM_EVAL_HOOK.with(|cell| *cell.borrow());
+    match hook {
+        Some(f) => f(v, syms).map_err(VmError::new),
+        None => Err(VmError::new("eval: no hook installed")),
+    }
+}
+
+fn swap_input_port(new: Option<Value>) -> Option<Value> {
+    VM_CURRENT_INPUT_PORT.with(|cell| {
+        let prev = cell.borrow_mut().take();
+        *cell.borrow_mut() = new;
+        prev
+    })
+}
+
+fn swap_output_port(new: Option<Value>) -> Option<Value> {
+    VM_CURRENT_OUTPUT_PORT.with(|cell| {
+        let prev = cell.borrow_mut().take();
+        *cell.borrow_mut() = new;
+        prev
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -643,6 +736,175 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                         }
                         continue;
                     }
+                    if p.as_any().downcast_ref::<VmEval>().is_some() {
+                        if args.is_empty() || args.len() > 2 {
+                            return Err(VmError::new("eval: 1 or 2 args"));
+                        }
+                        // Ignore env arg (foundation: always top-level).
+                        let v = args.remove(0);
+                        let r = run_eval_hook(&v, syms)?;
+                        stack.push(r);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack
+                                    .pop()
+                                    .ok_or_else(|| VmError::new("empty stack at tail-eval"));
+                            }
+                        }
+                        continue;
+                    }
+                    if p.as_any().downcast_ref::<VmDisplay>().is_some() {
+                        if args.is_empty() || args.len() > 2 {
+                            return Err(VmError::new("display: 1 or 2 args"));
+                        }
+                        let s = args[0].format_with(syms, cs_core::WriteMode::Display);
+                        let explicit = if args.len() == 2 {
+                            Some(args.remove(1))
+                        } else {
+                            None
+                        };
+                        let r = write_to_current_output(&s, explicit)?;
+                        stack.push(r);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack
+                                    .pop()
+                                    .ok_or_else(|| VmError::new("empty stack at tail-display"));
+                            }
+                        }
+                        continue;
+                    }
+                    if p.as_any().downcast_ref::<VmWrite>().is_some() {
+                        if args.is_empty() || args.len() > 2 {
+                            return Err(VmError::new("write: 1 or 2 args"));
+                        }
+                        let s = args[0].format_with(syms, cs_core::WriteMode::Write);
+                        let explicit = if args.len() == 2 {
+                            Some(args.remove(1))
+                        } else {
+                            None
+                        };
+                        let r = write_to_current_output(&s, explicit)?;
+                        stack.push(r);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack
+                                    .pop()
+                                    .ok_or_else(|| VmError::new("empty stack at tail-write"));
+                            }
+                        }
+                        continue;
+                    }
+                    if p.as_any().downcast_ref::<VmNewline>().is_some() {
+                        if args.len() > 1 {
+                            return Err(VmError::new("newline: 0 or 1 arg"));
+                        }
+                        let explicit = if args.len() == 1 {
+                            Some(args.remove(0))
+                        } else {
+                            None
+                        };
+                        let r = write_to_current_output("\n", explicit)?;
+                        stack.push(r);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack
+                                    .pop()
+                                    .ok_or_else(|| VmError::new("empty stack at tail-newline"));
+                            }
+                        }
+                        continue;
+                    }
+                    if p.as_any().downcast_ref::<VmCurrentInputPort>().is_some() {
+                        if !args.is_empty() {
+                            return Err(VmError::new("current-input-port: 0 args"));
+                        }
+                        stack.push(current_input_port().unwrap_or(Value::Unspecified));
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack.pop().ok_or_else(|| {
+                                    VmError::new("empty stack at tail-current-input-port")
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    if p.as_any().downcast_ref::<VmCurrentOutputPort>().is_some() {
+                        if !args.is_empty() {
+                            return Err(VmError::new("current-output-port: 0 args"));
+                        }
+                        stack.push(current_output_port().unwrap_or(Value::Unspecified));
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack.pop().ok_or_else(|| {
+                                    VmError::new("empty stack at tail-current-output-port")
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    if p.as_any().downcast_ref::<VmWithOutputToString>().is_some() {
+                        if args.len() != 1 {
+                            return Err(VmError::new("with-output-to-string: 1 arg"));
+                        }
+                        let thunk = args.remove(0);
+                        let port = cs_core::Port::string_output();
+                        let port_val = Value::Port(port.clone());
+                        let prev = swap_output_port(Some(port_val));
+                        let res = vm_call_sync(&thunk, &[], syms);
+                        swap_output_port(prev);
+                        res?;
+                        let collected = match &*port {
+                            cs_core::Port::StringOutput(buf) => buf.borrow().clone(),
+                            _ => unreachable!(),
+                        };
+                        stack.push(Value::string(collected));
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack.pop().ok_or_else(|| {
+                                    VmError::new("empty stack at tail-with-output-to-string")
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    if p.as_any().downcast_ref::<VmWithInputFromString>().is_some() {
+                        if args.len() != 2 {
+                            return Err(VmError::new("with-input-from-string: 2 args"));
+                        }
+                        let s = match &args[0] {
+                            Value::String(s) => s.borrow().clone(),
+                            other => {
+                                return Err(VmError::new(format!(
+                                    "with-input-from-string: expected string, got {}",
+                                    other.type_name()
+                                )));
+                            }
+                        };
+                        let thunk = args.remove(1);
+                        let port = Value::Port(cs_core::Port::string_input(&s));
+                        let prev = swap_input_port(Some(port));
+                        let res = vm_call_sync(&thunk, &[], syms);
+                        swap_input_port(prev);
+                        let v = res?;
+                        stack.push(v);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack.pop().ok_or_else(|| {
+                                    VmError::new("empty stack at tail-with-input-from-string")
+                                });
+                            }
+                        }
+                        continue;
+                    }
                     if p.as_any().downcast_ref::<VmDynamicWind>().is_some() {
                         if args.len() != 3 {
                             return Err(VmError::new("dynamic-wind: 3 args"));
@@ -1221,6 +1483,79 @@ pub fn make_vm_remove() -> Value {
 }
 pub fn make_vm_force() -> Value {
     Value::Procedure(Rc::new(VmForce) as Rc<dyn Procedure>)
+}
+
+/// `eval` marker: dispatches to the installed VmEvalHook.
+#[derive(Debug)]
+pub struct VmEval;
+impl_proc_named!(VmEval, "eval");
+pub fn make_vm_eval() -> Value {
+    Value::Procedure(Rc::new(VmEval) as Rc<dyn Procedure>)
+}
+
+/// I/O port-state markers.
+#[derive(Debug)]
+pub struct VmDisplay;
+#[derive(Debug)]
+pub struct VmWrite;
+#[derive(Debug)]
+pub struct VmNewline;
+#[derive(Debug)]
+pub struct VmWithOutputToString;
+#[derive(Debug)]
+pub struct VmWithInputFromString;
+#[derive(Debug)]
+pub struct VmCurrentInputPort;
+#[derive(Debug)]
+pub struct VmCurrentOutputPort;
+impl_proc_named!(VmDisplay, "display");
+impl_proc_named!(VmWrite, "write");
+impl_proc_named!(VmNewline, "newline");
+impl_proc_named!(VmWithOutputToString, "with-output-to-string");
+impl_proc_named!(VmWithInputFromString, "with-input-from-string");
+impl_proc_named!(VmCurrentInputPort, "current-input-port");
+impl_proc_named!(VmCurrentOutputPort, "current-output-port");
+pub fn make_vm_display() -> Value {
+    Value::Procedure(Rc::new(VmDisplay) as Rc<dyn Procedure>)
+}
+pub fn make_vm_write() -> Value {
+    Value::Procedure(Rc::new(VmWrite) as Rc<dyn Procedure>)
+}
+pub fn make_vm_newline() -> Value {
+    Value::Procedure(Rc::new(VmNewline) as Rc<dyn Procedure>)
+}
+pub fn make_vm_with_output_to_string() -> Value {
+    Value::Procedure(Rc::new(VmWithOutputToString) as Rc<dyn Procedure>)
+}
+pub fn make_vm_with_input_from_string() -> Value {
+    Value::Procedure(Rc::new(VmWithInputFromString) as Rc<dyn Procedure>)
+}
+pub fn make_vm_current_input_port() -> Value {
+    Value::Procedure(Rc::new(VmCurrentInputPort) as Rc<dyn Procedure>)
+}
+pub fn make_vm_current_output_port() -> Value {
+    Value::Procedure(Rc::new(VmCurrentOutputPort) as Rc<dyn Procedure>)
+}
+
+fn write_to_current_output(s: &str, explicit_port: Option<Value>) -> Result<Value, VmError> {
+    let target = explicit_port.or_else(current_output_port);
+    match target {
+        Some(Value::Port(p)) => match &*p {
+            cs_core::Port::StringOutput(buf) => {
+                buf.borrow_mut().push_str(s);
+                Ok(Value::Unspecified)
+            }
+            _ => Err(VmError::new("write/display: not an output port")),
+        },
+        Some(other) => Err(VmError::new(format!(
+            "write/display: expected port, got {}",
+            other.type_name()
+        ))),
+        None => {
+            print!("{}", s);
+            Ok(Value::Unspecified)
+        }
+    }
 }
 
 pub fn make_vm_vector_map() -> Value {
