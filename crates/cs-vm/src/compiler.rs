@@ -3,6 +3,8 @@
 //! Foundation scope: lowers Const, Ref, Set, If, Begin, App, Lambda, Letrec.
 //! Lambdas are compiled into a separate body that gets `Return` appended.
 
+use std::rc::Rc;
+
 use cs_core::Value;
 use cs_diag::Span;
 use cs_ir::{CoreExpr, Params};
@@ -25,9 +27,13 @@ impl CompileError {
 }
 
 pub fn compile(expr: &CoreExpr) -> Result<Bytecode, CompileError> {
-    let mut bc = Bytecode::default();
-    compile_expr(expr, &mut bc.insts, &mut bc.lambdas, true)?;
-    Ok(bc)
+    let mut top_insts: Vec<Inst> = Vec::new();
+    let mut lambdas: Vec<CompiledLambda> = Vec::new();
+    compile_expr(expr, &mut top_insts, &mut lambdas, true)?;
+    Ok(Bytecode {
+        insts: Rc::new(top_insts),
+        lambdas,
+    })
 }
 
 fn compile_expr(
@@ -114,7 +120,7 @@ fn compile_expr(
             lambdas.push(CompiledLambda {
                 params: fixed,
                 rest,
-                body: body_insts,
+                body: Rc::new(body_insts),
             });
             out.push(Inst::MakeClosure(lambda_idx));
             let _ = span;
@@ -146,7 +152,7 @@ fn compile_expr(
             lambdas.push(CompiledLambda {
                 params: Vec::new(),
                 rest: None,
-                body: body_insts,
+                body: Rc::new(body_insts),
             });
             out.push(Inst::MakeClosure(lambda_idx));
             if is_tail {

@@ -1,5 +1,7 @@
 //! Bytecode instructions and the [`Bytecode`] container.
 
+use std::rc::Rc;
+
 use cs_core::{Symbol, Value};
 
 #[derive(Clone, Debug)]
@@ -35,9 +37,11 @@ pub enum Inst {
 }
 
 /// A compiled program: instructions plus a table of nested compiled lambdas.
+/// Bodies (top-level and per-lambda) are wrapped in `Rc` so frame creation
+/// during Call/TailCall is a refcount bump rather than a Vec clone.
 #[derive(Clone, Debug, Default)]
 pub struct Bytecode {
-    pub insts: Vec<Inst>,
+    pub insts: Rc<Vec<Inst>>,
     /// Compiled lambdas referenced by `MakeClosure` instructions.
     pub lambdas: Vec<CompiledLambda>,
 }
@@ -46,5 +50,5 @@ pub struct Bytecode {
 pub struct CompiledLambda {
     pub params: Vec<Symbol>,
     pub rest: Option<Symbol>,
-    pub body: Vec<Inst>,
+    pub body: Rc<Vec<Inst>>,
 }

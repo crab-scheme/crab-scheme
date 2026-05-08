@@ -202,7 +202,7 @@ impl Env {
 }
 
 struct Frame {
-    insts: Vec<Inst>,
+    insts: Rc<Vec<Inst>>,
     ip: usize,
     env: Rc<Env>,
     /// Captured shared bytecode (so closures can resolve their lambda body).
@@ -213,7 +213,7 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
     let bc_rc = Rc::new(bc.clone());
     let mut stack: Vec<Value> = Vec::new();
     let mut frames: Vec<Frame> = vec![Frame {
-        insts: bc.insts.clone(),
+        insts: bc_rc.insts.clone(),
         ip: 0,
         env: top_env,
         bc: bc_rc.clone(),
@@ -232,11 +232,15 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
             }
             continue;
         }
-        let inst = frame.insts[frame.ip].clone();
+        // Borrow-by-reference dispatch: avoids cloning the instruction (and
+        // its Value payload for Const) per VM tick. Owned data is taken only
+        // in the arms that need it (Const stack-push, Call/TailCall).
+        let inst_ref = &frame.insts[frame.ip];
         frame.ip += 1;
-        match inst {
-            Inst::Const(v) => stack.push(v),
+        match inst_ref {
+            Inst::Const(v) => stack.push(v.clone()),
             Inst::LoadVar(s) => {
+                let s = *s;
                 let v = frame
                     .env
                     .get(s)
@@ -244,6 +248,7 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                 stack.push(v);
             }
             Inst::SetVar(s) => {
+                let s = *s;
                 let v = stack
                     .pop()
                     .ok_or_else(|| VmError::new("stack underflow on Set"))?;
@@ -256,6 +261,7 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                 }
             }
             Inst::DefineGlobal(s) => {
+                let s = *s;
                 let v = stack
                     .pop()
                     .ok_or_else(|| VmError::new("stack underflow on Define"))?;
@@ -266,6 +272,7 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                 root.define(s, v);
             }
             Inst::DefineLocal(s) => {
+                let s = *s;
                 let v = stack
                     .pop()
                     .ok_or_else(|| VmError::new("stack underflow on DefineLocal"))?;
@@ -277,6 +284,7 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                     .ok_or_else(|| VmError::new("stack underflow on Pop"))?;
             }
             Inst::JumpIfFalse(target) => {
+                let target = *target;
                 let v = stack
                     .pop()
                     .ok_or_else(|| VmError::new("stack underflow on JumpIfFalse"))?;
@@ -285,10 +293,11 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                 }
             }
             Inst::Jump(target) => {
-                frame.ip = target;
+                frame.ip = *target;
             }
             Inst::Call(n) | Inst::TailCall(n) => {
-                let is_tail = matches!(inst, Inst::TailCall(_));
+                let n = *n;
+                let is_tail = matches!(inst_ref, Inst::TailCall(_));
                 if stack.len() < n + 1 {
                     return Err(VmError::new("stack underflow on Call"));
                 }
@@ -297,6 +306,92 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
                 let mut func = stack
                     .pop()
                     .ok_or_else(|| VmError::new("missing function on Call"))?;
+                // FAST PATH: closure / builtin / builtin-with-syms.
+                // These are the overwhelming majority of Call sites; checking
+                // them before the HO-marker fan-out cuts ~20 downcast_ref's
+                // off the hot path.
+                if let Value::Procedure(p) = &func {
+                    let any = p.as_any();
+                    if let Some(closure) = any.downcast_ref::<VmClosure>() {
+                        let lam = &closure.bc.lambdas[closure.lambda_idx];
+                        if !lambda_arity_ok(lam, args.len()) {
+                            return Err(VmError::new("arity mismatch"));
+                        }
+                        let new_env = Env::child(closure.env.clone());
+                        for (name, v) in lam.params.iter().zip(args.iter()) {
+                            new_env.define(*name, v.clone());
+                        }
+                        if let Some(rest_name) = lam.rest {
+                            let rest = &args[lam.params.len()..];
+                            new_env.define(rest_name, Value::list(rest.iter().cloned()));
+                        }
+                        if is_tail {
+                            let last = frames.last_mut().unwrap();
+                            last.insts = lam.body.clone();
+                            last.ip = 0;
+                            last.env = new_env;
+                            last.bc = closure.bc.clone();
+                        } else {
+                            frames.push(Frame {
+                                insts: lam.body.clone(),
+                                ip: 0,
+                                env: new_env,
+                                bc: closure.bc.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                    if let Some(b) = any.downcast_ref::<VmBuiltin>() {
+                        let r =
+                            (b.f)(&args).map_err(|e| VmError::new(format!("{}: {}", b.name, e)))?;
+                        stack.push(r);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack
+                                    .pop()
+                                    .ok_or_else(|| VmError::new("empty stack at tail-builtin"));
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(b) = any.downcast_ref::<VmBuiltinSyms>() {
+                        let r = (b.f)(&args, syms)
+                            .map_err(|e| VmError::new(format!("{}: {}", b.name, e)))?;
+                        stack.push(r);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack
+                                    .pop()
+                                    .ok_or_else(|| VmError::new("empty stack at tail-builtin"));
+                            }
+                        }
+                        continue;
+                    }
+                    // Parameter: 0 args reads, 1 arg writes.
+                    if let Some(param) = any.downcast_ref::<cs_core::Parameter>() {
+                        let r = if args.is_empty() {
+                            param.cell.borrow().clone()
+                        } else if args.len() == 1 {
+                            *param.cell.borrow_mut() = args.remove(0);
+                            Value::Unspecified
+                        } else {
+                            return Err(VmError::new("parameter: 0 or 1 arg"));
+                        };
+                        stack.push(r);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack
+                                    .pop()
+                                    .ok_or_else(|| VmError::new("empty stack at tail-parameter"));
+                            }
+                        }
+                        continue;
+                    }
+                }
+                // SLOW PATH: HO marker dispatch (map/fold/filter/raise/...).
                 // Native HO: (map proc list) — produce a list.
                 if let Value::Procedure(p) = &func {
                     if p.as_any().downcast_ref::<VmMap>().is_some() {
@@ -1136,7 +1231,7 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
             }
             Inst::MakeClosure(idx) => {
                 let cl = VmClosure {
-                    lambda_idx: idx,
+                    lambda_idx: *idx,
                     env: frame.env.clone(),
                     bc: frame.bc.clone(),
                 };
