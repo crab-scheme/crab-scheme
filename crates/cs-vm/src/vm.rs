@@ -157,9 +157,78 @@ impl Procedure for VmClosure {
     }
 }
 
+/// Hybrid binding storage: small frames (the overwhelming majority — function
+/// params, letrec bindings, let bindings) live in a `Vec<(Symbol, Value)>`
+/// with linear scan, which beats HashMap overhead for ≤~12 entries. Once a
+/// frame grows past `SMALL_THRESHOLD` entries we promote to a HashMap so
+/// the root env (~80 builtins, plus user-defined globals) stays O(1).
+const SMALL_THRESHOLD: usize = 12;
+
+#[derive(Debug)]
+enum Bindings {
+    Small(Vec<(Symbol, Value)>),
+    Large(HashMap<Symbol, Value>),
+}
+
+impl Default for Bindings {
+    fn default() -> Self {
+        Bindings::Small(Vec::new())
+    }
+}
+
+impl Bindings {
+    fn get(&self, name: Symbol) -> Option<Value> {
+        match self {
+            Bindings::Small(v) => v
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, val)| val.clone()),
+            Bindings::Large(m) => m.get(&name).cloned(),
+        }
+    }
+
+    fn contains(&self, name: Symbol) -> bool {
+        match self {
+            Bindings::Small(v) => v.iter().any(|(k, _)| *k == name),
+            Bindings::Large(m) => m.contains_key(&name),
+        }
+    }
+
+    fn insert(&mut self, name: Symbol, value: Value) {
+        match self {
+            Bindings::Small(v) => {
+                if let Some(slot) = v.iter_mut().find(|(k, _)| *k == name) {
+                    slot.1 = value;
+                    return;
+                }
+                v.push((name, value));
+                // Promote to HashMap once we exceed the threshold.
+                if v.len() > SMALL_THRESHOLD {
+                    let drained: Vec<(Symbol, Value)> = v.drain(..).collect();
+                    let mut m = HashMap::with_capacity(drained.len() * 2);
+                    for (k, val) in drained {
+                        m.insert(k, val);
+                    }
+                    *self = Bindings::Large(m);
+                }
+            }
+            Bindings::Large(m) => {
+                m.insert(name, value);
+            }
+        }
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = (Symbol, Value)> + '_> {
+        match self {
+            Bindings::Small(v) => Box::new(v.iter().map(|(k, val)| (*k, val.clone()))),
+            Bindings::Large(m) => Box::new(m.iter().map(|(k, v)| (*k, v.clone()))),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Env {
-    pub bindings: RefCell<HashMap<Symbol, Value>>,
+    bindings: RefCell<Bindings>,
     pub parent: Option<Rc<Env>>,
 }
 
@@ -170,14 +239,14 @@ impl Env {
 
     pub fn child(parent: Rc<Self>) -> Rc<Self> {
         Rc::new(Self {
-            bindings: RefCell::new(HashMap::new()),
+            bindings: RefCell::new(Bindings::default()),
             parent: Some(parent),
         })
     }
 
     pub fn get(&self, name: Symbol) -> Option<Value> {
-        if let Some(v) = self.bindings.borrow().get(&name) {
-            return Some(v.clone());
+        if let Some(v) = self.bindings.borrow().get(name) {
+            return Some(v);
         }
         if let Some(p) = &self.parent {
             return p.get(name);
@@ -186,7 +255,7 @@ impl Env {
     }
 
     pub fn set_existing(&self, name: Symbol, value: Value) -> bool {
-        if self.bindings.borrow().contains_key(&name) {
+        if self.bindings.borrow().contains(name) {
             self.bindings.borrow_mut().insert(name, value);
             return true;
         }
@@ -210,7 +279,7 @@ impl Env {
             out = p.snapshot_bindings();
         }
         for (k, v) in self.bindings.borrow().iter() {
-            out.insert(*k, v.clone());
+            out.insert(k, v);
         }
         out
     }
