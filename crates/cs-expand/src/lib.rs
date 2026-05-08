@@ -96,6 +96,7 @@ struct Keywords {
     unquote: Symbol,
     unquote_splicing: Symbol,
     assert_: Symbol,
+    case_lambda: Symbol,
 }
 
 impl Keywords {
@@ -138,6 +139,7 @@ impl Keywords {
             unquote: syms.intern("unquote"),
             unquote_splicing: syms.intern("unquote-splicing"),
             assert_: syms.intern("assert"),
+            case_lambda: syms.intern("case-lambda"),
         }
     }
 }
@@ -469,6 +471,9 @@ impl<'a> Expander<'a> {
             }
             if s == self.keywords.assert_ {
                 return self.expand_assert(&tail_items, span);
+            }
+            if s == self.keywords.case_lambda {
+                return self.expand_case_lambda(&tail_items, span);
             }
             if s == self.keywords.delay {
                 return self.expand_delay(&tail_items, span);
@@ -1852,6 +1857,146 @@ impl<'a> Expander<'a> {
     }
 
     /// `(delay expr)` desugars to `(make-promise (lambda () expr))`.
+    /// `(case-lambda (formals1 body1) (formals2 body2) ...)` — arity-
+    /// dispatched procedure. Lowered to a single rest-arg lambda that
+    /// inspects (length args) and re-applies the matching clause.
+    /// R6RS: each formals can be a fixed-arity list or a rest-arg pattern.
+    fn expand_case_lambda(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        if items.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "case-lambda needs at least one clause".into(),
+                span,
+            });
+        }
+        // The dispatch arg ("args") binds to the rest-list.
+        let args_sym = self.syms.intern("__case-lambda-args__");
+        let length_sym = self.syms.intern("length");
+        let apply_sym = self.syms.intern("apply");
+        let eq_sym = self.syms.intern("=");
+        let ge_sym = self.syms.intern(">=");
+        let error_sym = self.syms.intern("error");
+
+        let mut acc = CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: error_sym,
+                span,
+            }),
+            args: vec![CoreExpr::Const {
+                value: Value::string("case-lambda: no matching arity"),
+                span,
+            }],
+            span,
+        };
+        for clause in items.iter().rev() {
+            let parts = collect_proper_list_strict(clause).ok_or(ExpandError::BadSyntax {
+                what: "case-lambda clause must be (formals body...)".into(),
+                span: clause.span(),
+            })?;
+            if parts.is_empty() {
+                return Err(ExpandError::BadSyntax {
+                    what: "case-lambda clause needs formals + body".into(),
+                    span: clause.span(),
+                });
+            }
+            let formals = &parts[0];
+            let body_items = &parts[1..];
+            // Parse the formals into (fixed-names, rest-name, has-rest).
+            let (params, has_rest) = parse_case_lambda_formals(formals)?;
+            // Build the inner lambda for this clause.
+            let body = self.expand_body(body_items, clause.span())?;
+            let inner_lam = CoreExpr::Lambda {
+                params: params.clone(),
+                body: Rc::new(body),
+                span: clause.span(),
+            };
+            // Build the dispatch test based on arity.
+            let n_fixed = params.fixed.len() as i64;
+            let arity_test = if has_rest {
+                // (>= (length args) n_fixed)
+                CoreExpr::App {
+                    func: Rc::new(CoreExpr::Ref {
+                        name: ge_sym,
+                        span: clause.span(),
+                    }),
+                    args: vec![
+                        CoreExpr::App {
+                            func: Rc::new(CoreExpr::Ref {
+                                name: length_sym,
+                                span: clause.span(),
+                            }),
+                            args: vec![CoreExpr::Ref {
+                                name: args_sym,
+                                span: clause.span(),
+                            }],
+                            span: clause.span(),
+                        },
+                        CoreExpr::Const {
+                            value: Value::fixnum(n_fixed),
+                            span: clause.span(),
+                        },
+                    ],
+                    span: clause.span(),
+                }
+            } else {
+                // (= (length args) n_fixed)
+                CoreExpr::App {
+                    func: Rc::new(CoreExpr::Ref {
+                        name: eq_sym,
+                        span: clause.span(),
+                    }),
+                    args: vec![
+                        CoreExpr::App {
+                            func: Rc::new(CoreExpr::Ref {
+                                name: length_sym,
+                                span: clause.span(),
+                            }),
+                            args: vec![CoreExpr::Ref {
+                                name: args_sym,
+                                span: clause.span(),
+                            }],
+                            span: clause.span(),
+                        },
+                        CoreExpr::Const {
+                            value: Value::fixnum(n_fixed),
+                            span: clause.span(),
+                        },
+                    ],
+                    span: clause.span(),
+                }
+            };
+            // (apply <inner-lam> args)
+            let apply_call = CoreExpr::App {
+                func: Rc::new(CoreExpr::Ref {
+                    name: apply_sym,
+                    span: clause.span(),
+                }),
+                args: vec![
+                    inner_lam,
+                    CoreExpr::Ref {
+                        name: args_sym,
+                        span: clause.span(),
+                    },
+                ],
+                span: clause.span(),
+            };
+            acc = CoreExpr::If {
+                cond: Rc::new(arity_test),
+                then: Rc::new(apply_call),
+                alt: Rc::new(acc),
+                span: clause.span(),
+            };
+        }
+        // Outer lambda with rest-arg.
+        Ok(CoreExpr::Lambda {
+            params: Params {
+                fixed: Vec::new(),
+                rest: Some(args_sym),
+            },
+            body: Rc::new(acc),
+            span,
+        })
+    }
+
     /// `(assert <expr>)` — evaluates `<expr>`; if truthy, yields unspecified;
     /// otherwise raises an error. R6RS spec calls for an
     /// `&assertion-violation` condition; we use the existing string-tagged
@@ -3129,6 +3274,12 @@ fn parse_bindings(d: &Datum) -> Result<Vec<(Symbol, Datum)>, ExpandError> {
         out.push((name, vs.into_iter().next().unwrap()));
     }
     Ok(out)
+}
+
+fn parse_case_lambda_formals(d: &Datum) -> Result<(Params, bool), ExpandError> {
+    let params = parse_lambda_params(d)?;
+    let has_rest = params.rest.is_some();
+    Ok((params, has_rest))
 }
 
 fn parse_lambda_params(d: &Datum) -> Result<Params, ExpandError> {

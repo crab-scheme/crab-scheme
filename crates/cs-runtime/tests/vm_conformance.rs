@@ -352,6 +352,14 @@ fn vm_conformance_named_let_assert() {
 }
 
 #[test]
+fn vm_conformance_case_lambda() {
+    let walker = pass_count_walker("case_lambda.scm");
+    let vm = pass_count_vm("case_lambda.scm").expect("vm should run case_lambda.scm");
+    println!("case_lambda: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
+
+#[test]
 fn vm_conformance_hashtables() {
     let walker = pass_count_walker("hashtables.scm");
     let vm = pass_count_vm("hashtables.scm").expect("vm should run hashtables.scm");
