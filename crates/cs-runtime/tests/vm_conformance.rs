@@ -344,6 +344,14 @@ fn vm_conformance_call_cc() {
 }
 
 #[test]
+fn vm_conformance_named_let_assert() {
+    let walker = pass_count_walker("named_let_assert.scm");
+    let vm = pass_count_vm("named_let_assert.scm").expect("vm should run named_let_assert.scm");
+    println!("named_let_assert: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
+
+#[test]
 fn vm_conformance_hashtables() {
     let walker = pass_count_walker("hashtables.scm");
     let vm = pass_count_vm("hashtables.scm").expect("vm should run hashtables.scm");

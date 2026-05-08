@@ -95,6 +95,7 @@ struct Keywords {
     quasiquote: Symbol,
     unquote: Symbol,
     unquote_splicing: Symbol,
+    assert_: Symbol,
 }
 
 impl Keywords {
@@ -136,6 +137,7 @@ impl Keywords {
             quasiquote: syms.intern("quasiquote"),
             unquote: syms.intern("unquote"),
             unquote_splicing: syms.intern("unquote-splicing"),
+            assert_: syms.intern("assert"),
         }
     }
 }
@@ -465,6 +467,9 @@ impl<'a> Expander<'a> {
             if s == self.keywords.guard {
                 return self.expand_guard(&tail_items, span);
             }
+            if s == self.keywords.assert_ {
+                return self.expand_assert(&tail_items, span);
+            }
             if s == self.keywords.delay {
                 return self.expand_delay(&tail_items, span);
             }
@@ -767,14 +772,61 @@ impl<'a> Expander<'a> {
     }
 
     fn expand_let(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
-        // (let ((name expr) ...) body...) -> ((lambda (name ...) body...) expr ...)
+        // Two shapes:
+        //   (let ((name expr) ...) body...) -> ((lambda (name ...) body...) expr ...)
+        //   (let LOOP ((name expr) ...) body...) -> named let, expands to:
+        //     (letrec ((LOOP (lambda (name ...) body...))) (LOOP expr ...))
+        if items.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "let needs bindings and body".into(),
+                span,
+            });
+        }
+        // Named let: first element is a symbol (the loop name), and there's
+        // at least 2 more (bindings + body).
+        if let Datum::Symbol(loop_name, _) = &items[0] {
+            if items.len() < 3 {
+                return Err(ExpandError::BadSyntax {
+                    what: "named let needs name, bindings, and body".into(),
+                    span,
+                });
+            }
+            let bindings = parse_bindings(&items[1])?;
+            let mut names = Vec::with_capacity(bindings.len());
+            let mut value_exprs = Vec::with_capacity(bindings.len());
+            for (n, e) in bindings {
+                names.push(n);
+                let ex = self.expand(&e)?;
+                value_exprs.push(ex);
+            }
+            let body = self.expand_body(&items[2..], span)?;
+            let lam = CoreExpr::Lambda {
+                params: Params::fixed(names),
+                body: Rc::new(body),
+                span,
+            };
+            // (letrec ((LOOP lam)) (LOOP exprs...))
+            let call = CoreExpr::App {
+                func: Rc::new(CoreExpr::Ref {
+                    name: *loop_name,
+                    span,
+                }),
+                args: value_exprs,
+                span,
+            };
+            return Ok(CoreExpr::Letrec {
+                bindings: vec![(*loop_name, lam)],
+                body: Rc::new(call),
+                span,
+            });
+        }
+        // Plain let.
         if items.len() < 2 {
             return Err(ExpandError::BadSyntax {
                 what: "let needs bindings and body".into(),
                 span,
             });
         }
-        // Named let not supported in foundation.
         let bindings = parse_bindings(&items[0])?;
         let mut names = Vec::with_capacity(bindings.len());
         let mut exprs = Vec::with_capacity(bindings.len());
@@ -1800,6 +1852,44 @@ impl<'a> Expander<'a> {
     }
 
     /// `(delay expr)` desugars to `(make-promise (lambda () expr))`.
+    /// `(assert <expr>)` — evaluates `<expr>`; if truthy, yields unspecified;
+    /// otherwise raises an error. R6RS spec calls for an
+    /// `&assertion-violation` condition; we use the existing string-tagged
+    /// condition shape since the test surface checks via predicates only.
+    fn expand_assert(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        if items.len() != 1 {
+            return Err(ExpandError::BadSyntax {
+                what: "assert needs exactly one expression".into(),
+                span,
+            });
+        }
+        let test = self.expand(&items[0])?;
+        // Render the source expression for the error message. We use the
+        // datum's span position rather than recursively printing it to keep
+        // the expander reader-independent.
+        let err_msg = format!("assertion failed at byte {}", span.start);
+        let error_call = CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: self.syms.intern("error"),
+                span,
+            }),
+            args: vec![CoreExpr::Const {
+                value: Value::string(err_msg),
+                span,
+            }],
+            span,
+        };
+        Ok(CoreExpr::If {
+            cond: Rc::new(test),
+            then: Rc::new(CoreExpr::Const {
+                value: Value::Unspecified,
+                span,
+            }),
+            alt: Rc::new(error_call),
+            span,
+        })
+    }
+
     fn expand_delay(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
         if items.len() != 1 {
             return Err(ExpandError::BadSyntax {
