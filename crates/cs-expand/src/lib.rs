@@ -2223,10 +2223,9 @@ impl<'a> Expander<'a> {
     }
 
     /// `(assert <expr>)` — evaluates `<expr>`; if truthy, yields unspecified;
-    /// otherwise raises an error containing the source form of the failed
-    /// expression. R6RS spec calls for an `&assertion-violation` condition;
-    /// we use the existing string-tagged condition shape since the test
-    /// surface checks via predicates only.
+    /// otherwise raises an `&assertion` condition (per R6RS). The condition
+    /// also carries a `&who` of `'assert` and a `&message` containing the
+    /// source form of the failed expression so handlers can identify it.
     fn expand_assert(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
         if items.len() != 1 {
             return Err(ExpandError::BadSyntax {
@@ -2239,15 +2238,20 @@ impl<'a> Expander<'a> {
         let datum_src = items[0].format_with(self.syms);
         let test = self.expand(&items[0])?;
         let err_msg = format!("assertion failed: {}", datum_src);
+        let assert_who_sym = self.syms.intern("assert");
+        let av_sym = self.syms.intern("assertion-violation");
         let error_call = CoreExpr::App {
-            func: Rc::new(CoreExpr::Ref {
-                name: self.syms.intern("error"),
-                span,
-            }),
-            args: vec![CoreExpr::Const {
-                value: Value::string(err_msg),
-                span,
-            }],
+            func: Rc::new(CoreExpr::Ref { name: av_sym, span }),
+            args: vec![
+                CoreExpr::Const {
+                    value: Value::Symbol(assert_who_sym),
+                    span,
+                },
+                CoreExpr::Const {
+                    value: Value::string(err_msg),
+                    span,
+                },
+            ],
             span,
         };
         Ok(CoreExpr::If {

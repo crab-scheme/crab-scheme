@@ -64,3 +64,18 @@
              (and (string? msg)
                   (string-contains msg "(= 1 2)")))))
     (lambda () (assert (= 1 2)) #f)))
+
+; assert raises an &assertion (R6RS), NOT a generic &error.
+(test-true "assert-is-assertion-violation"
+  (with-exception-handler
+    (lambda (c) (assertion-violation? c))
+    (lambda () (assert (= 1 2)) #f)))
+(test-false "assert-is-not-error"
+  (with-exception-handler
+    (lambda (c) (error? c))
+    (lambda () (assert (= 1 2)) #f)))
+; assert tags the &who as 'assert so handlers can identify it.
+(test-equal "assert-who-is-assert" 'assert
+  (with-exception-handler
+    (lambda (c) (condition-who c))
+    (lambda () (assert (= 1 2)) #f)))
