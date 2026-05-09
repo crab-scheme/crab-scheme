@@ -499,6 +499,11 @@ fn conformance_r7rs_call_with_port() {
 }
 
 #[test]
+fn conformance_r7rs_port_mgmt() {
+    run_conformance_file("r7rs_port_mgmt.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -603,6 +608,7 @@ fn conformance_aggregate_count() {
                 "r7rs_read_error.scm",
                 "r7rs_exit.scm",
                 "r7rs_call_with_port.scm",
+                "r7rs_port_mgmt.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

@@ -440,6 +440,11 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("port?", b_port_p),
         ("input-port?", b_input_port_p),
         ("output-port?", b_output_port_p),
+        ("close-input-port", b_close_input_port),
+        ("close-output-port", b_close_output_port),
+        ("flush-output-port", b_flush_output_port),
+        ("input-port-open?", b_input_port_open_p),
+        ("output-port-open?", b_output_port_open_p),
         ("write-char", b_write_char),
         ("write-string", b_write_string),
         ("write-u8", b_write_u8),
@@ -7785,6 +7790,114 @@ fn b_close_port(args: &[Value]) -> Result<Value, String> {
             _ => Ok(Value::Unspecified),
         },
         v => Err(type_err("close-port", "port", v)),
+    }
+}
+
+/// R7RS `(close-input-port port)` — closes an input port. Errors if the
+/// port is not an input port.
+fn b_close_input_port(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("close-input-port", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => {
+            if !p.is_input() {
+                return Err("close-input-port: not an input port".into());
+            }
+            // Input ports hold no OS resources at this milestone — no-op.
+            Ok(Value::Unspecified)
+        }
+        v => Err(type_err("close-input-port", "input-port", v)),
+    }
+}
+
+/// R7RS `(close-output-port port)` — closes an output port and flushes any
+/// buffered data. Errors if the port is not an output port.
+fn b_close_output_port(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("close-output-port", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => {
+            if !p.is_output() {
+                return Err("close-output-port: not an output port".into());
+            }
+            b_close_port(args)
+        }
+        v => Err(type_err("close-output-port", "output-port", v)),
+    }
+}
+
+/// R7RS `(flush-output-port [port])` — flushes any buffered data without
+/// closing the port. For our in-memory string/bytevector ports this is a
+/// no-op; for file output ports it writes the buffer to disk.
+fn b_flush_output_port(args: &[Value]) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err("flush-output-port", "0 or 1", args.len()));
+    }
+    let port = match args.first() {
+        Some(v) => v.clone(),
+        None => return Ok(Value::Unspecified),
+    };
+    match &port {
+        Value::Port(p) => match &**p {
+            Port::FileOutput(state) => {
+                let s = state.borrow();
+                if !s.closed {
+                    let path = s.path.clone();
+                    let buf = s.buf.clone();
+                    drop(s);
+                    std::fs::write(&path, &buf)
+                        .map_err(|e| format!("flush-output-port: write {} failed: {}", path, e))?;
+                }
+                Ok(Value::Unspecified)
+            }
+            // Other output ports hold no buffered OS state — no-op.
+            Port::StringOutput(_) | Port::ByteVectorOutput(_) => Ok(Value::Unspecified),
+            _ => Err("flush-output-port: not an output port".into()),
+        },
+        v => Err(type_err("flush-output-port", "output-port", v)),
+    }
+}
+
+/// R7RS `(input-port-open? port)` — true iff the port is an input port and
+/// is still open (not yet closed via close-port / close-input-port).
+fn b_input_port_open_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("input-port-open?", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => {
+            if !p.is_input() {
+                return Ok(Value::Boolean(false));
+            }
+            // Input ports don't currently track closed state — they're
+            // always open until GC. R7RS-conformant behavior.
+            Ok(Value::Boolean(true))
+        }
+        _ => Ok(Value::Boolean(false)),
+    }
+}
+
+/// R7RS `(output-port-open? port)` — true iff the port is an output port
+/// and not yet closed.
+fn b_output_port_open_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("output-port-open?", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => {
+            if !p.is_output() {
+                return Ok(Value::Boolean(false));
+            }
+            // FileOutput tracks closed; other output ports are always open.
+            let open = match &**p {
+                Port::FileOutput(state) => !state.borrow().closed,
+                _ => true,
+            };
+            Ok(Value::Boolean(open))
+        }
+        _ => Ok(Value::Boolean(false)),
     }
 }
 

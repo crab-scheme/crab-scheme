@@ -222,12 +222,14 @@ Iters 117+ are filling R7RS gaps one per iter:
   catchable condition with the value as a field; both tiers
 - 129 R7RS port helpers: call-with-port, call-with-input-string,
   call-with-output-string. Both tiers via vm_call_sync shims
+- 130 R7RS port management: close-input-port, close-output-port,
+  flush-output-port, input-port-open?, output-port-open?
   (this iter)
 
 Current totals:
-- 83 conformance test files (cli)
-- VM tier: 85 tests
-- Aggregate: 1713 individual Scheme tests passing
+- 84 conformance test files (cli)
+- VM tier: 86 tests
+- Aggregate: 1732 individual Scheme tests passing
 
 ## Loop cadence
 
