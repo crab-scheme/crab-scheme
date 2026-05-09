@@ -235,12 +235,14 @@ Iters 117+ are filling R7RS gaps one per iter:
   with message + irritants. Fires whenever the template is expanded —
   only "matched" branches in syntax-rules reach it.
 - 135 R7RS string-copy + bytevector-copy with optional [start [end]];
-  added missing string-set! (this iter)
+  added missing string-set!
+- 136 R7RS string->list, vector->list, string->vector, vector->string
+  with optional [start [end]] (this iter)
 
 Current totals:
-- 89 conformance test files (cli)
-- VM tier: 91 tests
-- Aggregate: 1815 individual Scheme tests passing
+- 90 conformance test files (cli)
+- VM tier: 92 tests
+- Aggregate: 1834 individual Scheme tests passing
 
 ## Loop cadence
 

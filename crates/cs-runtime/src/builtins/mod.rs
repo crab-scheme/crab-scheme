@@ -2237,13 +2237,37 @@ fn b_string_set_bang(args: &[Value]) -> Result<Value, String> {
 }
 
 fn b_string_to_list(args: &[Value]) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(arity_err("string->list", "1", args.len()));
+    // R7RS: (string->list s [start [end]]). Indices are character (not byte)
+    // positions so multibyte UTF-8 strings work correctly.
+    if args.is_empty() || args.len() > 3 {
+        return Err(arity_err("string->list", "1..3", args.len()));
     }
-    match &args[0] {
-        Value::String(s) => Ok(Value::list(s.borrow().chars().map(Value::Character))),
-        v => Err(type_err("string->list", "string", v)),
-    }
+    let chars: Vec<char> = match &args[0] {
+        Value::String(s) => s.borrow().chars().collect(),
+        v => return Err(type_err("string->list", "string", v)),
+    };
+    let len = chars.len();
+    let start = if args.len() >= 2 {
+        let i = as_int_i64("string->list", &args[1])?;
+        if i < 0 || (i as usize) > len {
+            return Err(format!("string->list: start out of range: {}", i));
+        }
+        i as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 3 {
+        let i = as_int_i64("string->list", &args[2])?;
+        if i < 0 || (i as usize) > len || (i as usize) < start {
+            return Err(format!("string->list: end out of range: {}", i));
+        }
+        i as usize
+    } else {
+        len
+    };
+    Ok(Value::list(
+        chars[start..end].iter().copied().map(Value::Character),
+    ))
 }
 
 fn b_list_to_string(args: &[Value]) -> Result<Value, String> {
@@ -2856,13 +2880,34 @@ fn b_vector_fill(args: &[Value]) -> Result<Value, String> {
 }
 
 fn b_vector_to_list(args: &[Value]) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(arity_err("vector->list", "1", args.len()));
+    // R7RS: (vector->list v [start [end]]).
+    if args.is_empty() || args.len() > 3 {
+        return Err(arity_err("vector->list", "1..3", args.len()));
     }
-    match &args[0] {
-        Value::Vector(v) => Ok(Value::list(v.borrow().iter().cloned())),
-        v => Err(type_err("vector->list", "vector", v)),
-    }
+    let items: Vec<Value> = match &args[0] {
+        Value::Vector(v) => v.borrow().clone(),
+        v => return Err(type_err("vector->list", "vector", v)),
+    };
+    let len = items.len();
+    let start = if args.len() >= 2 {
+        let i = as_int_i64("vector->list", &args[1])?;
+        if i < 0 || (i as usize) > len {
+            return Err(format!("vector->list: start out of range: {}", i));
+        }
+        i as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 3 {
+        let i = as_int_i64("vector->list", &args[2])?;
+        if i < 0 || (i as usize) > len || (i as usize) < start {
+            return Err(format!("vector->list: end out of range: {}", i));
+        }
+        i as usize
+    } else {
+        len
+    };
+    Ok(Value::list(items[start..end].iter().cloned()))
 }
 
 fn b_list_to_vector(args: &[Value]) -> Result<Value, String> {
@@ -8802,35 +8847,77 @@ fn b_string_join(args: &[Value]) -> Result<Value, String> {
 }
 
 fn b_string_to_vector(args: &[Value]) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(arity_err("string->vector", "1", args.len()));
+    // R7RS: (string->vector s [start [end]]).
+    if args.is_empty() || args.len() > 3 {
+        return Err(arity_err("string->vector", "1..3", args.len()));
     }
-    match &args[0] {
-        Value::String(s) => {
-            let v: Vec<Value> = s.borrow().chars().map(Value::Character).collect();
-            Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(v))))
+    let chars: Vec<char> = match &args[0] {
+        Value::String(s) => s.borrow().chars().collect(),
+        v => return Err(type_err("string->vector", "string", v)),
+    };
+    let len = chars.len();
+    let start = if args.len() >= 2 {
+        let i = as_int_i64("string->vector", &args[1])?;
+        if i < 0 || (i as usize) > len {
+            return Err(format!("string->vector: start out of range: {}", i));
         }
-        v => Err(type_err("string->vector", "string", v)),
-    }
+        i as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 3 {
+        let i = as_int_i64("string->vector", &args[2])?;
+        if i < 0 || (i as usize) > len || (i as usize) < start {
+            return Err(format!("string->vector: end out of range: {}", i));
+        }
+        i as usize
+    } else {
+        len
+    };
+    let v: Vec<Value> = chars[start..end]
+        .iter()
+        .copied()
+        .map(Value::Character)
+        .collect();
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(v))))
 }
 
 fn b_vector_to_string(args: &[Value]) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(arity_err("vector->string", "1", args.len()));
+    // R7RS: (vector->string v [start [end]]).
+    if args.is_empty() || args.len() > 3 {
+        return Err(arity_err("vector->string", "1..3", args.len()));
     }
-    match &args[0] {
-        Value::Vector(v) => {
-            let mut s = String::new();
-            for item in v.borrow().iter() {
-                match item {
-                    Value::Character(c) => s.push(*c),
-                    other => return Err(type_err("vector->string", "character", other)),
-                }
-            }
-            Ok(Value::string(s))
+    let items: Vec<Value> = match &args[0] {
+        Value::Vector(v) => v.borrow().clone(),
+        v => return Err(type_err("vector->string", "vector of characters", v)),
+    };
+    let len = items.len();
+    let start = if args.len() >= 2 {
+        let i = as_int_i64("vector->string", &args[1])?;
+        if i < 0 || (i as usize) > len {
+            return Err(format!("vector->string: start out of range: {}", i));
         }
-        v => Err(type_err("vector->string", "vector of characters", v)),
+        i as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 3 {
+        let i = as_int_i64("vector->string", &args[2])?;
+        if i < 0 || (i as usize) > len || (i as usize) < start {
+            return Err(format!("vector->string: end out of range: {}", i));
+        }
+        i as usize
+    } else {
+        len
+    };
+    let mut s = String::new();
+    for item in &items[start..end] {
+        match item {
+            Value::Character(c) => s.push(*c),
+            other => return Err(type_err("vector->string", "character", other)),
+        }
     }
+    Ok(Value::string(s))
 }
 
 fn b_string_reverse(args: &[Value]) -> Result<Value, String> {

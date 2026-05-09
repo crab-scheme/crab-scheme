@@ -824,3 +824,11 @@ fn vm_conformance_r7rs_copy() {
     println!("r7rs_copy: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_to_list() {
+    let walker = pass_count_walker("r7rs_to_list.scm");
+    let vm = pass_count_vm("r7rs_to_list.scm").expect("vm should run r7rs_to_list.scm");
+    println!("r7rs_to_list: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
