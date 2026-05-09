@@ -1889,7 +1889,34 @@ impl<'a> Expander<'a> {
                 what: "case clause must be a list".into(),
                 span: clause.span(),
             })?;
-            let body = if body_items.is_empty() {
+            // R7RS `=>` arrow form: when the body starts with `=>`,
+            // the second body element is a procedure that receives
+            // the key as its argument. Shape: ((d ...) => proc) or
+            // (else => proc).
+            let arrow_form = body_items
+                .first()
+                .and_then(|d| match d {
+                    Datum::Symbol(s, _) if *s == self.keywords.arrow => Some(()),
+                    _ => None,
+                })
+                .is_some();
+            let body = if arrow_form {
+                if body_items.len() != 2 {
+                    return Err(ExpandError::BadSyntax {
+                        what: "case `=>` clause needs exactly one expression after =>".into(),
+                        span: clause.span(),
+                    });
+                }
+                let proc_expr = self.expand(&body_items[1])?;
+                CoreExpr::App {
+                    func: Rc::new(proc_expr),
+                    args: vec![CoreExpr::Ref {
+                        name: key_sym,
+                        span: clause.span(),
+                    }],
+                    span: clause.span(),
+                }
+            } else if body_items.is_empty() {
                 CoreExpr::Const {
                     value: Value::Unspecified,
                     span: clause.span(),

@@ -444,6 +444,11 @@ fn conformance_r7rs_define_record_type() {
 }
 
 #[test]
+fn conformance_r7rs_case_arrow() {
+    run_conformance_file("r7rs_case_arrow.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -537,6 +542,7 @@ fn conformance_aggregate_count() {
                 "exact_integer_sqrt.scm",
                 "r7rs_assoc_member_compare.scm",
                 "r7rs_define_record_type.scm",
+                "r7rs_case_arrow.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
