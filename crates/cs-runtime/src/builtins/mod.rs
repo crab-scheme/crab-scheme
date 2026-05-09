@@ -550,6 +550,9 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("dynamic-wind", b_dynamic_wind),
         ("with-input-from-string", b_with_input_from_string),
         ("with-output-to-string", b_with_output_to_string),
+        ("call-with-port", b_call_with_port),
+        ("call-with-input-string", b_call_with_input_string),
+        ("call-with-output-string", b_call_with_output_string),
         ("with-output-to-file", b_with_output_to_file),
         ("with-input-from-file", b_with_input_from_file),
         ("current-input-port", b_current_input_port),
@@ -5978,6 +5981,55 @@ fn b_with_output_to_string(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, S
     ctx.current_output_port = prev;
     result?;
     // Extract accumulated string from the port we kept a reference to.
+    match &*port {
+        Port::StringOutput(buf) => Ok(Value::string(buf.borrow().clone())),
+        _ => unreachable!(),
+    }
+}
+
+/// R7RS `(call-with-port port proc)` — passes the port to proc and closes
+/// the port when proc returns (or unwinds). Returns proc's value.
+fn b_call_with_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("call-with-port", "2", args.len()));
+    }
+    if !matches!(&args[0], Value::Port(_)) {
+        return Err(type_err("call-with-port", "port", &args[0]));
+    }
+    let port = args[0].clone();
+    let result = apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| e.message());
+    // Best-effort close — ignore close errors so they don't mask the
+    // proc's return / error.
+    let _ = b_close_port(&[port]);
+    result
+}
+
+/// R7RS `(call-with-input-string str proc)` — convenience wrapper:
+/// open a string input port, hand it to proc, close it on return.
+fn b_call_with_input_string(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("call-with-input-string", "2", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("call-with-input-string", "string", v)),
+    };
+    let port = Value::Port(Port::string_input(&s));
+    let result = apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| e.message());
+    let _ = b_close_port(&[port]);
+    result
+}
+
+/// R7RS `(call-with-output-string proc)` — open a string output port,
+/// pass it to proc, then return the accumulated string.
+fn b_call_with_output_string(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("call-with-output-string", "1", args.len()));
+    }
+    let port = Port::string_output();
+    let port_val = Value::Port(port.clone());
+    let result = apply_procedure(&args[0], &[port_val], ctx).map_err(|e| e.message());
+    result?;
     match &*port {
         Port::StringOutput(buf) => Ok(Value::string(buf.borrow().clone())),
         _ => unreachable!(),

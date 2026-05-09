@@ -212,6 +212,76 @@ impl Runtime {
         vm_env.define(wof_sym, cs_vm::vm::make_vm_with_output_to_file());
         let wiff_sym = syms.intern("with-input-from-file");
         vm_env.define(wiff_sym, cs_vm::vm::make_vm_with_input_from_file());
+        // R7RS port helpers built atop vm_call_sync.
+        let cwp_sym = syms.intern("call-with-port");
+        vm_env.define(
+            cwp_sym,
+            cs_vm::vm::make_vm_builtin_syms("call-with-port", |args, st| {
+                if args.len() != 2 {
+                    return Err("call-with-port: 2 args".into());
+                }
+                if !matches!(&args[0], Value::Port(_)) {
+                    return Err(format!(
+                        "call-with-port: expected port, got {}",
+                        args[0].type_name()
+                    ));
+                }
+                let port = args[0].clone();
+                let proc = args[1].clone();
+                let res = cs_vm::vm::vm_call_sync(&proc, &[port.clone()], st)
+                    .map_err(|e| e.message.clone());
+                // Best-effort close (only matters for file ports).
+                if let Value::Port(p) = &port {
+                    if let cs_core::Port::FileOutput(state) = &**p {
+                        let mut st = state.borrow_mut();
+                        if !st.closed {
+                            let _ = std::fs::write(&st.path, &st.buf);
+                            st.closed = true;
+                        }
+                    }
+                }
+                res
+            }),
+        );
+        let cwis_sym = syms.intern("call-with-input-string");
+        vm_env.define(
+            cwis_sym,
+            cs_vm::vm::make_vm_builtin_syms("call-with-input-string", |args, st| {
+                if args.len() != 2 {
+                    return Err("call-with-input-string: 2 args".into());
+                }
+                let s = match &args[0] {
+                    Value::String(s) => s.borrow().clone(),
+                    other => {
+                        return Err(format!(
+                            "call-with-input-string: expected string, got {}",
+                            other.type_name()
+                        ))
+                    }
+                };
+                let port = Value::Port(cs_core::Port::string_input(&s));
+                let proc = args[1].clone();
+                cs_vm::vm::vm_call_sync(&proc, &[port], st).map_err(|e| e.message.clone())
+            }),
+        );
+        let cwos_sym = syms.intern("call-with-output-string");
+        vm_env.define(
+            cwos_sym,
+            cs_vm::vm::make_vm_builtin_syms("call-with-output-string", |args, st| {
+                if args.len() != 1 {
+                    return Err("call-with-output-string: 1 arg".into());
+                }
+                let port = cs_core::Port::string_output();
+                let port_val = Value::Port(port.clone());
+                let proc = args[0].clone();
+                let _ = cs_vm::vm::vm_call_sync(&proc, &[port_val], st)
+                    .map_err(|e| e.message.clone())?;
+                match &*port {
+                    cs_core::Port::StringOutput(buf) => Ok(Value::string(buf.borrow().clone())),
+                    _ => unreachable!(),
+                }
+            }),
+        );
         let cip_sym = syms.intern("current-input-port");
         vm_env.define(cip_sym, cs_vm::vm::make_vm_current_input_port());
         let cop_sym = syms.intern("current-output-port");

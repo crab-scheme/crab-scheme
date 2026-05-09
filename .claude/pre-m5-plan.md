@@ -220,12 +220,14 @@ Iters 117+ are filling R7RS gaps one per iter:
 - 127 wire &read-error tag into b_read on both walker and VM tiers
 - 128 R7RS (exit) and (emergency-exit) — raise &exit-requested
   catchable condition with the value as a field; both tiers
+- 129 R7RS port helpers: call-with-port, call-with-input-string,
+  call-with-output-string. Both tiers via vm_call_sync shims
   (this iter)
 
 Current totals:
-- 82 conformance test files (cli)
-- VM tier: 84 tests
-- Aggregate: 1701 individual Scheme tests passing
+- 83 conformance test files (cli)
+- VM tier: 85 tests
+- Aggregate: 1713 individual Scheme tests passing
 
 ## Loop cadence
 
