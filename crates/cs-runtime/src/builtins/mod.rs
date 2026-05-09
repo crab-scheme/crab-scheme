@@ -412,6 +412,10 @@ fn type_err(name: &str, expected: &str, got: &Value) -> String {
         }
         _ => String::new(),
     };
+    // Stash the offending value so the dispatcher can attach it as an
+    // &irritants simple when this string Err is converted into a raised
+    // condition. Drained by `builtin_err_to_eval` / VM equivalent.
+    cs_core::stash_builtin_err_irritant(got.clone());
     format!(
         "{}: expected {}, got {}{}",
         name,

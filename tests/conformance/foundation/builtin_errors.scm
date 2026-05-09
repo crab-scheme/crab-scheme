@@ -1,7 +1,8 @@
 (test-section "builtin errors are catchable conditions")
 
 ; Type errors raise a proper condition. The handler can introspect via
-; the standard R6RS predicates and accessors.
+; the standard R6RS predicates and accessors, including the offending
+; value as an &irritants simple.
 (define c1
   (with-exception-handler (lambda (c) c)
     (lambda () (+ 1 'foo))))
@@ -10,6 +11,8 @@
 (test-true  "+-bad-arg-who?"      (who-condition? c1))
 (test-equal "+-bad-arg-who"       '+ (condition-who c1))
 (test-true  "+-bad-arg-msg?"      (message-condition? c1))
+(test-true  "+-bad-arg-irritants?" (irritants-condition? c1))
+(test-equal "+-bad-arg-irritants" '(foo) (condition-irritants c1))
 
 ; Comparisons
 (define c2

@@ -2014,6 +2014,10 @@ fn as_number(v: &Value, name: &str) -> Result<cs_core::Number, String> {
                 }
                 _ => String::new(),
             };
+            // Stash for the dispatch loop's condition builder so the
+            // raised condition carries the offending value as an
+            // &irritants simple.
+            cs_core::stash_builtin_err_irritant(other.clone());
             Err(format!(
                 "{}: expected number, got {}{}",
                 name,
@@ -3316,6 +3320,9 @@ fn prefix_builtin_err(name: &str, msg: &str) -> String {
 /// Sentinel strings (`__raised__`, `__escape__`) pass through unchanged
 /// — those are protocol markers, not real failures.
 pub fn builtin_err_to_raised(name: &str, e: &str, syms: &mut SymbolTable, span: Span) -> VmError {
+    // Drain unconditionally so a stale value from a prior failure can't
+    // attach to an unrelated path.
+    let irritants = cs_core::take_builtin_err_irritant();
     if e == "__raised__" || e == "__escape__" || e == "__stack-overflow__" {
         return VmError::new(e).with_span(span);
     }
@@ -3333,7 +3340,7 @@ pub fn builtin_err_to_raised(name: &str, e: &str, syms: &mut SymbolTable, span: 
         }
         None => (None, prefixed),
     };
-    set_pending_raise(make_vm_error_condition(who, message, Vec::new()));
+    set_pending_raise(make_vm_error_condition(who, message, irritants));
     VmError::new("__raised__").with_span(span)
 }
 

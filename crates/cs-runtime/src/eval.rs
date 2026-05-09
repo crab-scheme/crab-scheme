@@ -126,6 +126,9 @@ fn call_parameter(param: &Parameter, args: &[Value]) -> Value {
 }
 
 fn builtin_err_to_eval(ctx: &mut EvalCtx, msg: String, span: Span) -> EvalError {
+    // Drain unconditionally so a stale value from a prior failure can't
+    // attach to an unrelated path (e.g. an Err that bypasses type_err).
+    let irritants = cs_core::take_builtin_err_irritant();
     if let Some(cond) = ctx.pending_raise.take() {
         return EvalError::raised(cond, span);
     }
@@ -143,7 +146,8 @@ fn builtin_err_to_eval(ctx: &mut EvalCtx, msg: String, span: Span) -> EvalError 
     // Build a proper R6RS condition so user code can catch builtin
     // failures with `with-exception-handler` / `guard`. Most builtins
     // format their errors as "<who>: <message>" — split on the first
-    // colon and surface the prefix as &who.
+    // colon and surface the prefix as &who. The offending value (when
+    // a `type_err` was the source) is attached as &irritants.
     let (who, message) = match msg.find(": ") {
         Some(idx) => {
             let who_str = &msg[..idx];
@@ -155,7 +159,7 @@ fn builtin_err_to_eval(ctx: &mut EvalCtx, msg: String, span: Span) -> EvalError 
         }
         None => (None, msg.clone()),
     };
-    let cond = crate::builtins::make_error_condition(who, message, Vec::new());
+    let cond = crate::builtins::make_error_condition(who, message, irritants);
     EvalError::raised(cond, span)
 }
 
