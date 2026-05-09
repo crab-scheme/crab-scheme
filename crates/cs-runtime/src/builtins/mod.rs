@@ -75,6 +75,68 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("bitwise-bit-count", b_bitwise_bit_count),
         ("bitwise-length", b_bitwise_length),
         ("bitwise-bit-set?", b_bitwise_bit_set_p),
+        // R6RS (rnrs arithmetic fixnums) — typed fixnum-only ops; raise on
+        // non-fixnum or out-of-range results (no implicit promotion to Big).
+        ("fx+", b_fx_add),
+        ("fx-", b_fx_sub),
+        ("fx*", b_fx_mul),
+        ("fxdiv", b_fx_div),
+        ("fxmod", b_fx_mod),
+        ("fxdiv0", b_fx_div0),
+        ("fxmod0", b_fx_mod0),
+        ("fx=?", b_fx_eq),
+        ("fx<?", b_fx_lt),
+        ("fx>?", b_fx_gt),
+        ("fx<=?", b_fx_le),
+        ("fx>=?", b_fx_ge),
+        ("fxzero?", b_fx_zero),
+        ("fxpositive?", b_fx_positive),
+        ("fxnegative?", b_fx_negative),
+        ("fxodd?", b_fx_odd),
+        ("fxeven?", b_fx_even),
+        ("fxmax", b_fx_max),
+        ("fxmin", b_fx_min),
+        ("fxnot", b_fx_not),
+        ("fxand", b_fx_and),
+        ("fxior", b_fx_ior),
+        ("fxxor", b_fx_xor),
+        ("fxarithmetic-shift", b_fx_arith_shift),
+        ("fxarithmetic-shift-left", b_fx_arith_shift_left),
+        ("fxarithmetic-shift-right", b_fx_arith_shift_right),
+        // R6RS (rnrs arithmetic flonums) — typed flonum-only ops; raise on
+        // non-flonum operands. Pure IEEE-754 (no exact contagion).
+        ("fl+", b_fl_add),
+        ("fl-", b_fl_sub),
+        ("fl*", b_fl_mul),
+        ("fl/", b_fl_div),
+        ("fl=?", b_fl_eq),
+        ("fl<?", b_fl_lt),
+        ("fl>?", b_fl_gt),
+        ("fl<=?", b_fl_le),
+        ("fl>=?", b_fl_ge),
+        ("flzero?", b_fl_zero),
+        ("flpositive?", b_fl_positive),
+        ("flnegative?", b_fl_negative),
+        ("flmax", b_fl_max),
+        ("flmin", b_fl_min),
+        ("flabs", b_fl_abs),
+        ("flfloor", b_fl_floor),
+        ("flceiling", b_fl_ceiling),
+        ("fltruncate", b_fl_truncate),
+        ("flround", b_fl_round),
+        ("flsqrt", b_fl_sqrt),
+        ("flexp", b_fl_exp),
+        ("fllog", b_fl_log),
+        ("flsin", b_fl_sin),
+        ("flcos", b_fl_cos),
+        ("fltan", b_fl_tan),
+        ("flnan?", b_fl_nan),
+        ("flfinite?", b_fl_finite),
+        ("flinfinite?", b_fl_infinite),
+        ("flinteger?", b_fl_integer),
+        ("fleven?", b_fl_even),
+        ("flodd?", b_fl_odd),
+        ("fixnum->flonum", b_fixnum_to_flonum),
         // type predicates
         ("number?", b_number_p),
         ("integer?", b_integer_p),
@@ -827,6 +889,523 @@ fn b_div0_and_mod0(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let (d, m) = div0_and_mod0_num(&args[0], &args[1])?;
     ctx.pending_values = Some(vec![d, m]);
     Ok(Value::Unspecified)
+}
+
+// =====================================================================
+// R6RS (rnrs arithmetic fixnums) — typed fixnum ops.
+// Differ from generic + - * etc.: operands MUST be fixnums (not bignums,
+// not flonums), and overflow raises &implementation-restriction rather
+// than promoting to BigInt. We model the error as a string for now,
+// which surfaces as a generic error condition.
+
+fn as_fx(name: &str, v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Number(Number::Fixnum(n)) => Ok(*n),
+        _ => Err(type_err(name, "fixnum", v)),
+    }
+}
+
+fn fx_overflow(name: &str) -> String {
+    format!("{}: fixnum overflow", name)
+}
+
+fn b_fx_add(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("fx+", "2", args.len()));
+    }
+    let a = as_fx("fx+", &args[0])?;
+    let b = as_fx("fx+", &args[1])?;
+    a.checked_add(b)
+        .map(Value::fixnum)
+        .ok_or_else(|| fx_overflow("fx+"))
+}
+
+fn b_fx_sub(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_err("fx-", "1 or 2", args.len()));
+    }
+    if args.len() == 1 {
+        let a = as_fx("fx-", &args[0])?;
+        return a
+            .checked_neg()
+            .map(Value::fixnum)
+            .ok_or_else(|| fx_overflow("fx-"));
+    }
+    let a = as_fx("fx-", &args[0])?;
+    let b = as_fx("fx-", &args[1])?;
+    a.checked_sub(b)
+        .map(Value::fixnum)
+        .ok_or_else(|| fx_overflow("fx-"))
+}
+
+fn b_fx_mul(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("fx*", "2", args.len()));
+    }
+    let a = as_fx("fx*", &args[0])?;
+    let b = as_fx("fx*", &args[1])?;
+    a.checked_mul(b)
+        .map(Value::fixnum)
+        .ok_or_else(|| fx_overflow("fx*"))
+}
+
+fn b_fx_div(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("fxdiv", "2", args.len()));
+    }
+    let a = as_fx("fxdiv", &args[0])?;
+    let b = as_fx("fxdiv", &args[1])?;
+    if b == 0 {
+        return Err("fxdiv: division by zero".into());
+    }
+    let xn = Number::Fixnum(a);
+    let yn = Number::Fixnum(b);
+    let r = xn
+        .euclid_div(&yn)
+        .map_err(|_| "fxdiv: division by zero".to_string())?;
+    match r {
+        Number::Fixnum(v) => Ok(Value::fixnum(v)),
+        _ => Err(fx_overflow("fxdiv")),
+    }
+}
+
+fn b_fx_mod(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("fxmod", "2", args.len()));
+    }
+    let a = as_fx("fxmod", &args[0])?;
+    let b = as_fx("fxmod", &args[1])?;
+    if b == 0 {
+        return Err("fxmod: division by zero".into());
+    }
+    let xn = Number::Fixnum(a);
+    let yn = Number::Fixnum(b);
+    let r = xn
+        .euclid_mod(&yn)
+        .map_err(|_| "fxmod: division by zero".to_string())?;
+    match r {
+        Number::Fixnum(v) => Ok(Value::fixnum(v)),
+        _ => Err(fx_overflow("fxmod")),
+    }
+}
+
+fn b_fx_div0(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("fxdiv0", "2", args.len()));
+    }
+    let a = as_fx("fxdiv0", &args[0])?;
+    let b = as_fx("fxdiv0", &args[1])?;
+    if b == 0 {
+        return Err("fxdiv0: division by zero".into());
+    }
+    let xn = Number::Fixnum(a);
+    let yn = Number::Fixnum(b);
+    let r = xn
+        .euclid_div0(&yn)
+        .map_err(|_| "fxdiv0: division by zero".to_string())?;
+    match r {
+        Number::Fixnum(v) => Ok(Value::fixnum(v)),
+        _ => Err(fx_overflow("fxdiv0")),
+    }
+}
+
+fn b_fx_mod0(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("fxmod0", "2", args.len()));
+    }
+    let a = as_fx("fxmod0", &args[0])?;
+    let b = as_fx("fxmod0", &args[1])?;
+    if b == 0 {
+        return Err("fxmod0: division by zero".into());
+    }
+    let xn = Number::Fixnum(a);
+    let yn = Number::Fixnum(b);
+    let r = xn
+        .euclid_mod0(&yn)
+        .map_err(|_| "fxmod0: division by zero".to_string())?;
+    match r {
+        Number::Fixnum(v) => Ok(Value::fixnum(v)),
+        _ => Err(fx_overflow("fxmod0")),
+    }
+}
+
+fn fx_chain_pred(
+    name: &str,
+    args: &[Value],
+    cmp: impl Fn(i64, i64) -> bool,
+) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err(arity_err(name, "at least 2", args.len()));
+    }
+    let mut prev = as_fx(name, &args[0])?;
+    for a in &args[1..] {
+        let cur = as_fx(name, a)?;
+        if !cmp(prev, cur) {
+            return Ok(Value::Boolean(false));
+        }
+        prev = cur;
+    }
+    Ok(Value::Boolean(true))
+}
+
+fn b_fx_eq(args: &[Value]) -> Result<Value, String> {
+    fx_chain_pred("fx=?", args, |a, b| a == b)
+}
+fn b_fx_lt(args: &[Value]) -> Result<Value, String> {
+    fx_chain_pred("fx<?", args, |a, b| a < b)
+}
+fn b_fx_gt(args: &[Value]) -> Result<Value, String> {
+    fx_chain_pred("fx>?", args, |a, b| a > b)
+}
+fn b_fx_le(args: &[Value]) -> Result<Value, String> {
+    fx_chain_pred("fx<=?", args, |a, b| a <= b)
+}
+fn b_fx_ge(args: &[Value]) -> Result<Value, String> {
+    fx_chain_pred("fx>=?", args, |a, b| a >= b)
+}
+
+fn fx_pred1(name: &str, args: &[Value], pred: impl Fn(i64) -> bool) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err(name, "1", args.len()));
+    }
+    Ok(Value::Boolean(pred(as_fx(name, &args[0])?)))
+}
+
+fn b_fx_zero(args: &[Value]) -> Result<Value, String> {
+    fx_pred1("fxzero?", args, |x| x == 0)
+}
+fn b_fx_positive(args: &[Value]) -> Result<Value, String> {
+    fx_pred1("fxpositive?", args, |x| x > 0)
+}
+fn b_fx_negative(args: &[Value]) -> Result<Value, String> {
+    fx_pred1("fxnegative?", args, |x| x < 0)
+}
+fn b_fx_odd(args: &[Value]) -> Result<Value, String> {
+    fx_pred1("fxodd?", args, |x| x.rem_euclid(2) != 0)
+}
+fn b_fx_even(args: &[Value]) -> Result<Value, String> {
+    fx_pred1("fxeven?", args, |x| x.rem_euclid(2) == 0)
+}
+
+fn b_fx_max(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err(arity_err("fxmax", "at least 1", 0));
+    }
+    let mut acc = as_fx("fxmax", &args[0])?;
+    for a in &args[1..] {
+        let v = as_fx("fxmax", a)?;
+        if v > acc {
+            acc = v;
+        }
+    }
+    Ok(Value::fixnum(acc))
+}
+
+fn b_fx_min(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err(arity_err("fxmin", "at least 1", 0));
+    }
+    let mut acc = as_fx("fxmin", &args[0])?;
+    for a in &args[1..] {
+        let v = as_fx("fxmin", a)?;
+        if v < acc {
+            acc = v;
+        }
+    }
+    Ok(Value::fixnum(acc))
+}
+
+fn b_fx_not(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("fxnot", "1", args.len()));
+    }
+    Ok(Value::fixnum(!as_fx("fxnot", &args[0])?))
+}
+
+fn fx_fold_bits(
+    name: &str,
+    args: &[Value],
+    ident: i64,
+    op: impl Fn(i64, i64) -> i64,
+) -> Result<Value, String> {
+    let mut acc = ident;
+    for a in args {
+        acc = op(acc, as_fx(name, a)?);
+    }
+    Ok(Value::fixnum(acc))
+}
+
+fn b_fx_and(args: &[Value]) -> Result<Value, String> {
+    fx_fold_bits("fxand", args, -1, |a, b| a & b)
+}
+fn b_fx_ior(args: &[Value]) -> Result<Value, String> {
+    fx_fold_bits("fxior", args, 0, |a, b| a | b)
+}
+fn b_fx_xor(args: &[Value]) -> Result<Value, String> {
+    fx_fold_bits("fxxor", args, 0, |a, b| a ^ b)
+}
+
+fn b_fx_arith_shift(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("fxarithmetic-shift", "2", args.len()));
+    }
+    let x = as_fx("fxarithmetic-shift", &args[0])?;
+    let k = as_fx("fxarithmetic-shift", &args[1])?;
+    if k >= 64 || k <= -64 {
+        return Err(fx_overflow("fxarithmetic-shift"));
+    }
+    let r = if k >= 0 { x << k } else { x >> (-k) };
+    Ok(Value::fixnum(r))
+}
+
+fn b_fx_arith_shift_left(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("fxarithmetic-shift-left", "2", args.len()));
+    }
+    let x = as_fx("fxarithmetic-shift-left", &args[0])?;
+    let k = as_fx("fxarithmetic-shift-left", &args[1])?;
+    if !(0..64).contains(&k) {
+        return Err(fx_overflow("fxarithmetic-shift-left"));
+    }
+    Ok(Value::fixnum(x << k))
+}
+
+fn b_fx_arith_shift_right(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("fxarithmetic-shift-right", "2", args.len()));
+    }
+    let x = as_fx("fxarithmetic-shift-right", &args[0])?;
+    let k = as_fx("fxarithmetic-shift-right", &args[1])?;
+    if !(0..64).contains(&k) {
+        return Err(fx_overflow("fxarithmetic-shift-right"));
+    }
+    Ok(Value::fixnum(x >> k))
+}
+
+// =====================================================================
+// R6RS (rnrs arithmetic flonums) — typed flonum ops.
+// Operands MUST be flonums (no fixnum/big/rational); pure IEEE-754
+// semantics (no exact contagion, NaN/inf propagate naturally).
+
+fn as_fl(name: &str, v: &Value) -> Result<f64, String> {
+    match v {
+        Value::Number(Number::Flonum(f)) => Ok(*f),
+        _ => Err(type_err(name, "flonum", v)),
+    }
+}
+
+fn b_fl_add(args: &[Value]) -> Result<Value, String> {
+    let mut acc = 0.0f64;
+    for a in args {
+        acc += as_fl("fl+", a)?;
+    }
+    Ok(Value::Number(Number::Flonum(acc)))
+}
+
+fn b_fl_sub(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err(arity_err("fl-", "at least 1", 0));
+    }
+    if args.len() == 1 {
+        return Ok(Value::Number(Number::Flonum(-as_fl("fl-", &args[0])?)));
+    }
+    let mut acc = as_fl("fl-", &args[0])?;
+    for a in &args[1..] {
+        acc -= as_fl("fl-", a)?;
+    }
+    Ok(Value::Number(Number::Flonum(acc)))
+}
+
+fn b_fl_mul(args: &[Value]) -> Result<Value, String> {
+    let mut acc = 1.0f64;
+    for a in args {
+        acc *= as_fl("fl*", a)?;
+    }
+    Ok(Value::Number(Number::Flonum(acc)))
+}
+
+fn b_fl_div(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err(arity_err("fl/", "at least 1", 0));
+    }
+    if args.len() == 1 {
+        return Ok(Value::Number(Number::Flonum(1.0 / as_fl("fl/", &args[0])?)));
+    }
+    let mut acc = as_fl("fl/", &args[0])?;
+    for a in &args[1..] {
+        acc /= as_fl("fl/", a)?;
+    }
+    Ok(Value::Number(Number::Flonum(acc)))
+}
+
+fn fl_chain_pred(
+    name: &str,
+    args: &[Value],
+    cmp: impl Fn(f64, f64) -> bool,
+) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err(arity_err(name, "at least 2", args.len()));
+    }
+    let mut prev = as_fl(name, &args[0])?;
+    for a in &args[1..] {
+        let cur = as_fl(name, a)?;
+        if !cmp(prev, cur) {
+            return Ok(Value::Boolean(false));
+        }
+        prev = cur;
+    }
+    Ok(Value::Boolean(true))
+}
+
+fn b_fl_eq(args: &[Value]) -> Result<Value, String> {
+    fl_chain_pred("fl=?", args, |a, b| a == b)
+}
+fn b_fl_lt(args: &[Value]) -> Result<Value, String> {
+    fl_chain_pred("fl<?", args, |a, b| a < b)
+}
+fn b_fl_gt(args: &[Value]) -> Result<Value, String> {
+    fl_chain_pred("fl>?", args, |a, b| a > b)
+}
+fn b_fl_le(args: &[Value]) -> Result<Value, String> {
+    fl_chain_pred("fl<=?", args, |a, b| a <= b)
+}
+fn b_fl_ge(args: &[Value]) -> Result<Value, String> {
+    fl_chain_pred("fl>=?", args, |a, b| a >= b)
+}
+
+fn fl_pred1(name: &str, args: &[Value], pred: impl Fn(f64) -> bool) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err(name, "1", args.len()));
+    }
+    Ok(Value::Boolean(pred(as_fl(name, &args[0])?)))
+}
+
+fn b_fl_zero(args: &[Value]) -> Result<Value, String> {
+    fl_pred1("flzero?", args, |x| x == 0.0)
+}
+fn b_fl_positive(args: &[Value]) -> Result<Value, String> {
+    fl_pred1("flpositive?", args, |x| x > 0.0)
+}
+fn b_fl_negative(args: &[Value]) -> Result<Value, String> {
+    fl_pred1("flnegative?", args, |x| x < 0.0)
+}
+fn b_fl_nan(args: &[Value]) -> Result<Value, String> {
+    fl_pred1("flnan?", args, f64::is_nan)
+}
+fn b_fl_finite(args: &[Value]) -> Result<Value, String> {
+    fl_pred1("flfinite?", args, f64::is_finite)
+}
+fn b_fl_infinite(args: &[Value]) -> Result<Value, String> {
+    fl_pred1("flinfinite?", args, f64::is_infinite)
+}
+fn b_fl_integer(args: &[Value]) -> Result<Value, String> {
+    fl_pred1("flinteger?", args, |x| x.is_finite() && x.fract() == 0.0)
+}
+fn b_fl_even(args: &[Value]) -> Result<Value, String> {
+    fl_pred1("fleven?", args, |x| {
+        x.is_finite() && x.fract() == 0.0 && (x as i64).rem_euclid(2) == 0
+    })
+}
+fn b_fl_odd(args: &[Value]) -> Result<Value, String> {
+    fl_pred1("flodd?", args, |x| {
+        x.is_finite() && x.fract() == 0.0 && (x as i64).rem_euclid(2) != 0
+    })
+}
+
+fn b_fl_max(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err(arity_err("flmax", "at least 1", 0));
+    }
+    let mut acc = as_fl("flmax", &args[0])?;
+    for a in &args[1..] {
+        let v = as_fl("flmax", a)?;
+        acc = acc.max(v);
+    }
+    Ok(Value::Number(Number::Flonum(acc)))
+}
+
+fn b_fl_min(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err(arity_err("flmin", "at least 1", 0));
+    }
+    let mut acc = as_fl("flmin", &args[0])?;
+    for a in &args[1..] {
+        let v = as_fl("flmin", a)?;
+        acc = acc.min(v);
+    }
+    Ok(Value::Number(Number::Flonum(acc)))
+}
+
+fn fl_unary(name: &str, args: &[Value], op: impl Fn(f64) -> f64) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err(name, "1", args.len()));
+    }
+    Ok(Value::Number(Number::Flonum(op(as_fl(name, &args[0])?))))
+}
+
+fn b_fl_abs(args: &[Value]) -> Result<Value, String> {
+    fl_unary("flabs", args, f64::abs)
+}
+fn b_fl_floor(args: &[Value]) -> Result<Value, String> {
+    fl_unary("flfloor", args, f64::floor)
+}
+fn b_fl_ceiling(args: &[Value]) -> Result<Value, String> {
+    fl_unary("flceiling", args, f64::ceil)
+}
+fn b_fl_truncate(args: &[Value]) -> Result<Value, String> {
+    fl_unary("fltruncate", args, f64::trunc)
+}
+fn b_fl_round(args: &[Value]) -> Result<Value, String> {
+    // R6RS round: banker's rounding (half to even) — match the generic
+    // round builtin's semantics.
+    fl_unary("flround", args, |x| {
+        let r = x.round();
+        // f64::round is half-away-from-zero; convert to banker's.
+        if (x - x.trunc()).abs() == 0.5 {
+            let t = x.trunc();
+            if (t as i64).rem_euclid(2) == 0 {
+                t
+            } else {
+                r
+            }
+        } else {
+            r
+        }
+    })
+}
+fn b_fl_sqrt(args: &[Value]) -> Result<Value, String> {
+    fl_unary("flsqrt", args, f64::sqrt)
+}
+fn b_fl_exp(args: &[Value]) -> Result<Value, String> {
+    fl_unary("flexp", args, f64::exp)
+}
+fn b_fl_log(args: &[Value]) -> Result<Value, String> {
+    if args.len() == 1 {
+        return fl_unary("fllog", args, f64::ln);
+    }
+    if args.len() == 2 {
+        let x = as_fl("fllog", &args[0])?;
+        let base = as_fl("fllog", &args[1])?;
+        return Ok(Value::Number(Number::Flonum(x.log(base))));
+    }
+    Err(arity_err("fllog", "1 or 2", args.len()))
+}
+fn b_fl_sin(args: &[Value]) -> Result<Value, String> {
+    fl_unary("flsin", args, f64::sin)
+}
+fn b_fl_cos(args: &[Value]) -> Result<Value, String> {
+    fl_unary("flcos", args, f64::cos)
+}
+fn b_fl_tan(args: &[Value]) -> Result<Value, String> {
+    fl_unary("fltan", args, f64::tan)
+}
+
+fn b_fixnum_to_flonum(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("fixnum->flonum", "1", args.len()));
+    }
+    let n = as_fx("fixnum->flonum", &args[0])?;
+    Ok(Value::Number(Number::Flonum(n as f64)))
 }
 
 fn b_expt(args: &[Value]) -> Result<Value, String> {

@@ -544,3 +544,11 @@ fn vm_conformance_bigint_div0_mod0() {
     println!("bigint_div0_mod0: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_fx_fl_ops() {
+    let walker = pass_count_walker("fx_fl_ops.scm");
+    let vm = pass_count_vm("fx_fl_ops.scm").expect("vm should run fx_fl_ops.scm");
+    println!("fx_fl_ops: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

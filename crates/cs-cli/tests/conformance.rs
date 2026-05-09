@@ -359,6 +359,11 @@ fn conformance_bigint_div0_mod0() {
 }
 
 #[test]
+fn conformance_fx_fl_ops() {
+    run_conformance_file("fx_fl_ops.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -435,6 +440,7 @@ fn conformance_aggregate_count() {
                 "bigint_expt.scm",
                 "bigint_division.scm",
                 "bigint_div0_mod0.scm",
+                "fx_fl_ops.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
