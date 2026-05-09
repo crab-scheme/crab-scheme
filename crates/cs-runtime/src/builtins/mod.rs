@@ -1775,7 +1775,7 @@ fn b_list_p(args: &[Value]) -> Result<Value, String> {
         let f2 = step(&f1).unwrap();
         let s1 = step(&slow).unwrap();
         if let (Value::Pair(s), Value::Pair(f)) = (&s1, &f2) {
-            if std::rc::Rc::ptr_eq(s, f) {
+            if cs_core::Gc::ptr_eq(s, f) {
                 return Ok(Value::Boolean(false));
             }
         }
@@ -4299,7 +4299,7 @@ fn ht_eq_ctx(
     Ok(r.is_truthy())
 }
 
-fn as_ht<'a>(name: &str, v: &'a Value) -> Result<&'a std::rc::Rc<Hashtable>, String> {
+fn as_ht<'a>(name: &str, v: &'a Value) -> Result<&'a cs_core::Gc<Hashtable>, String> {
     match v {
         Value::Hashtable(h) => Ok(h),
         other => Err(type_err(name, "hashtable", other)),

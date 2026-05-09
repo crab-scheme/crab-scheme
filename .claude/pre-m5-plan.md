@@ -94,14 +94,14 @@ but doing it before M5 keeps the runtime/env story stable.
 
 **4.C — Migrate Value variants** ← IN PROGRESS
 
-✅ `Value::String`     (commit pending)
-✅ `Value::ByteVector` (commit pending)
-✅ `Value::Vector`     (commit pending)
-⬜ `Value::Pair`       — next; trickier because `Pair` has its own struct
-⬜ `Value::Hashtable`  — `Rc<Hashtable>`
-⬜ `Value::Port`       — `Rc<Port>`
+✅ `Value::String`
+✅ `Value::ByteVector`
+✅ `Value::Vector`
+✅ `Value::Pair`       (this iter)
+✅ `Value::Hashtable`  (this iter)
+⬜ `Value::Port`       — `Rc<Port>`; needs Trace impl on Port (leaf)
 ⬜ `Value::Procedure`  — `Rc<dyn Procedure>` (DST; unsized Slot needs care)
-⬜ `Value::Promise`    — `Rc<Promise>`
+⬜ `Value::Promise`    — `Rc<Promise>`; needs Trace on PromiseState
 
 Each variant adds a `marker.mark(...)` call in the `Trace for Value`
 match; non-migrated variants stay no-op until they migrate.

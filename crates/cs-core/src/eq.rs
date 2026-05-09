@@ -21,11 +21,11 @@ pub fn eq(a: &Value, b: &Value) -> bool {
             _ => false, // Other number types: eq? is implementation-defined; we say false unless identity.
         },
         (Value::String(x), Value::String(y)) => crate::Gc::ptr_eq(x, y),
-        (Value::Pair(x), Value::Pair(y)) => Rc::ptr_eq(x, y),
+        (Value::Pair(x), Value::Pair(y)) => crate::Gc::ptr_eq(x, y),
         (Value::Vector(x), Value::Vector(y)) => crate::Gc::ptr_eq(x, y),
         (Value::ByteVector(x), Value::ByteVector(y)) => crate::Gc::ptr_eq(x, y),
         (Value::Procedure(x), Value::Procedure(y)) => Rc::ptr_eq(x, y),
-        (Value::Hashtable(x), Value::Hashtable(y)) => Rc::ptr_eq(x, y),
+        (Value::Hashtable(x), Value::Hashtable(y)) => crate::Gc::ptr_eq(x, y),
         (Value::Port(x), Value::Port(y)) => Rc::ptr_eq(x, y),
         (Value::Promise(x), Value::Promise(y)) => Rc::ptr_eq(x, y),
         _ => false,
@@ -53,10 +53,7 @@ fn equal_rec(a: &Value, b: &Value, visited: &mut HashSet<(usize, usize)>, fuel: 
     match (a, b) {
         (Value::String(x), Value::String(y)) => *x.borrow() == *y.borrow(),
         (Value::Pair(x), Value::Pair(y)) => {
-            let key = (
-                Rc::as_ptr(x) as *const Pair as usize,
-                Rc::as_ptr(y) as *const Pair as usize,
-            );
+            let key = (crate::Gc::as_addr(x), crate::Gc::as_addr(y));
             if fuel == 0 {
                 if !visited.insert(key) {
                     return true;

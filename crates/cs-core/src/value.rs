@@ -16,11 +16,18 @@ pub struct Pair {
 }
 
 impl Pair {
-    pub fn new(car: Value, cdr: Value) -> Rc<Self> {
-        Rc::new(Pair {
+    pub fn new(car: Value, cdr: Value) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Pair {
             car: RefCell::new(car),
             cdr: RefCell::new(cdr),
         })
+    }
+}
+
+impl cs_gc::Trace for Pair {
+    fn trace(&self, marker: &mut cs_gc::Marker) {
+        self.car.borrow().trace(marker);
+        self.cdr.borrow().trace(marker);
     }
 }
 
@@ -59,8 +66,8 @@ pub struct Hashtable {
 }
 
 impl Hashtable {
-    pub fn new(eq_kind: HtEqKind) -> Rc<Self> {
-        Rc::new(Hashtable {
+    pub fn new(eq_kind: HtEqKind) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Hashtable {
             items: RefCell::new(Vec::new()),
             eq_kind,
             custom: None,
@@ -70,12 +77,25 @@ impl Hashtable {
     /// Construct a hashtable with user-supplied hash + equiv procedures.
     /// `eq_kind` is set to `Custom`; the runtime is responsible for
     /// dispatching the stored procs on every key comparison.
-    pub fn new_custom(hash: Value, equiv: Value) -> Rc<Self> {
-        Rc::new(Hashtable {
+    pub fn new_custom(hash: Value, equiv: Value) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Hashtable {
             items: RefCell::new(Vec::new()),
             eq_kind: HtEqKind::Custom,
             custom: Some(CustomHashFns { hash, equiv }),
         })
+    }
+}
+
+impl cs_gc::Trace for Hashtable {
+    fn trace(&self, marker: &mut cs_gc::Marker) {
+        for (k, v) in self.items.borrow().iter() {
+            k.trace(marker);
+            v.trace(marker);
+        }
+        if let Some(c) = &self.custom {
+            c.hash.trace(marker);
+            c.equiv.trace(marker);
+        }
     }
 }
 
@@ -238,11 +258,11 @@ pub enum Value {
     Number(Number),
     String(crate::Gc<RefCell<String>>),
     Symbol(Symbol),
-    Pair(Rc<Pair>),
+    Pair(crate::Gc<Pair>),
     Vector(crate::Gc<RefCell<Vec<Value>>>),
     ByteVector(crate::Gc<RefCell<Vec<u8>>>),
     Procedure(Rc<dyn Procedure>),
-    Hashtable(Rc<Hashtable>),
+    Hashtable(crate::Gc<Hashtable>),
     Port(Rc<Port>),
     Promise(Rc<Promise>),
 }
@@ -270,12 +290,10 @@ impl cs_gc::Trace for Value {
             Value::String(s) => s.trace(marker),
             Value::ByteVector(v) => v.trace(marker),
             Value::Vector(v) => v.trace(marker),
+            Value::Pair(p) => p.trace(marker),
+            Value::Hashtable(h) => h.trace(marker),
             // Not yet migrated — Rc-backed, no trace needed.
-            Value::Pair(_)
-            | Value::Procedure(_)
-            | Value::Hashtable(_)
-            | Value::Port(_)
-            | Value::Promise(_) => {}
+            Value::Procedure(_) | Value::Port(_) | Value::Promise(_) => {}
             // Leaf variants — no heap pointers.
             Value::Null
             | Value::Unspecified
@@ -469,7 +487,7 @@ fn write_pair_inner(
         match cur_cdr {
             Value::Null => break,
             Value::Pair(next) => {
-                let next_ptr = Rc::as_ptr(&next) as *const Pair as usize;
+                let next_ptr = crate::Gc::as_addr(&next);
                 if !visited.insert(next_ptr) {
                     write!(out, " . #<cycle>")?;
                     break;
