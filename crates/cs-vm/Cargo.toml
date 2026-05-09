@@ -8,4 +8,5 @@ license.workspace = true
 [dependencies]
 cs-core = { workspace = true }
 cs-diag = { workspace = true }
+cs-gc = { workspace = true }
 cs-ir = { workspace = true }

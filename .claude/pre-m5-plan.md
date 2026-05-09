@@ -101,13 +101,23 @@ but doing it before M5 keeps the runtime/env story stable.
 ✅ `Value::Hashtable`
 ✅ `Value::Port`       (this iter)
 ✅ `Value::Promise`    (this iter)
-⬜ `Value::Procedure`  — last one; `Rc<dyn Procedure>` is a DST so
-                        either (a) add Trace as a supertrait of
-                        Procedure (forcing impls in every concrete
-                        proc type) or (b) keep Procedure on Rc and
-                        accept that Phase 1 leaks closures-in-cycles.
-                        Pick (a) — the right architectural call —
-                        when this lands.
+⚠️ `Value::Procedure` — Trace supertrait + every concrete-proc
+                        Trace impl landed (this iter), but the actual
+                        `Rc<dyn Procedure>` → `Gc<dyn Procedure>`
+                        swap requires `CoerceUnsized` for `Gc<T>`,
+                        which is unstable on stable Rust. Stays on
+                        Rc until cs-gc gets a manual unsizing path
+                        or the project moves to nightly.
+
+                        Phase 1 implication: closures + parameters
+                        held only behind `Rc<dyn Procedure>` are
+                        traced through (because their Trace impls
+                        recurse into env / cell), but the Rc<dyn>
+                        wrapper itself isn't a Gc allocation, so its
+                        slot doesn't appear in Heap.slots. This is
+                        functionally fine for Phase 1 (refcount
+                        handles it; cycles via dyn Procedure leak as
+                        documented in the M5 spec).
 
 Each variant adds a `marker.mark(...)` call in the `Trace for Value`
 match; non-migrated variants stay no-op until they migrate.

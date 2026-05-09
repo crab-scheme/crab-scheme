@@ -232,7 +232,12 @@ impl cs_gc::Trace for Promise {
 
 /// Type-erased procedure dispatch. Concrete builtin and closure types live in
 /// `cs-runtime`; eval downcasts via [`as_any`].
-pub trait Procedure: fmt::Debug + 'static {
+///
+/// Procedure has `cs_gc::Trace` as a supertrait so closure environments
+/// (and any `Value` fields stored inside concrete procedure types)
+/// participate in GC tracing. Most builtins are leaves (their `trace` is
+/// empty); closures and parameters mark their captured Values.
+pub trait Procedure: fmt::Debug + cs_gc::Trace + 'static {
     fn as_any(&self) -> &dyn Any;
     fn name(&self) -> Option<&str> {
         None
@@ -253,6 +258,12 @@ impl Procedure for Parameter {
     }
     fn name(&self) -> Option<&str> {
         Some("parameter")
+    }
+}
+
+impl cs_gc::Trace for Parameter {
+    fn trace(&self, marker: &mut cs_gc::Marker) {
+        self.cell.borrow().trace(marker);
     }
 }
 

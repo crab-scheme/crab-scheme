@@ -41,6 +41,12 @@ impl Procedure for Builtin {
     }
 }
 
+impl cs_core::Trace for Builtin {
+    fn trace(&self, _marker: &mut cs_core::Marker) {
+        // Leaf — Builtin holds only a fn pointer and a static name.
+    }
+}
+
 #[derive(Debug)]
 pub struct Closure {
     pub params: Params,
@@ -56,6 +62,15 @@ impl Procedure for Closure {
     }
     fn name(&self) -> Option<&str> {
         self.display_name.as_deref()
+    }
+}
+
+impl cs_core::Trace for Closure {
+    fn trace(&self, marker: &mut cs_core::Marker) {
+        // Trace the captured environment chain. The body is a shared
+        // immutable IR pointer (`Rc<CoreExpr>`) carrying only Symbols
+        // and span info — no Values to trace.
+        self.env.trace(marker);
     }
 }
 
@@ -78,6 +93,12 @@ impl Procedure for Continuation {
     }
     fn name(&self) -> Option<&str> {
         Some("continuation")
+    }
+}
+
+impl cs_core::Trace for Continuation {
+    fn trace(&self, _marker: &mut cs_core::Marker) {
+        // Leaf — escape continuations carry only a u64 id.
     }
 }
 

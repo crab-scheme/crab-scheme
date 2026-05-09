@@ -54,3 +54,14 @@ impl Frame {
         self.bindings.borrow_mut().insert(name, value);
     }
 }
+
+impl cs_core::Trace for Frame {
+    fn trace(&self, marker: &mut cs_core::Marker) {
+        for (_, val) in self.bindings.borrow().iter() {
+            val.trace(marker);
+        }
+        if let Some(p) = &self.parent {
+            p.trace(marker);
+        }
+    }
+}

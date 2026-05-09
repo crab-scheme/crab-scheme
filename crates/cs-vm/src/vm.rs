@@ -211,6 +211,15 @@ impl Procedure for VmClosure {
     }
 }
 
+impl cs_gc::Trace for VmClosure {
+    fn trace(&self, marker: &mut cs_gc::Marker) {
+        // Trace the captured environment chain. Bytecode is immutable
+        // shared `Rc<Bytecode>` containing only Symbols and opcodes —
+        // no Values to trace.
+        self.env.trace(marker);
+    }
+}
+
 /// Hybrid binding storage: small frames (the overwhelming majority — function
 /// params, letrec bindings, let bindings) live in a `Vec<(Symbol, Value)>`
 /// with linear scan, which beats HashMap overhead for ≤~12 entries. Once a
@@ -227,6 +236,32 @@ enum Bindings {
 impl Default for Bindings {
     fn default() -> Self {
         Bindings::Small(Vec::new())
+    }
+}
+
+impl cs_gc::Trace for Bindings {
+    fn trace(&self, marker: &mut cs_gc::Marker) {
+        match self {
+            Bindings::Small(v) => {
+                for (_, val) in v {
+                    val.trace(marker);
+                }
+            }
+            Bindings::Large(m) => {
+                for (_, val) in m {
+                    val.trace(marker);
+                }
+            }
+        }
+    }
+}
+
+impl cs_gc::Trace for Env {
+    fn trace(&self, marker: &mut cs_gc::Marker) {
+        self.bindings.borrow().trace(marker);
+        if let Some(p) = &self.parent {
+            p.trace(marker);
+        }
     }
 }
 
@@ -3796,6 +3831,74 @@ fn sort_with_predicate(
     }
     Ok(())
 }
+
+// Empty `Trace` impl for VM-tier procedure types that hold no Values.
+// Builtins, marker types like VmApply/VmMap, and continuation handles
+// (which carry only an i64 id) all carry no reachable Values inside.
+// VmClosure has its own non-empty Trace impl elsewhere because it
+// captures an Env; everything else listed here is a leaf.
+macro_rules! trace_leaf_proc {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl cs_gc::Trace for $t {
+                fn trace(&self, _marker: &mut cs_gc::Marker) {}
+            }
+        )*
+    };
+}
+
+trace_leaf_proc!(
+    VmBuiltin,
+    VmBuiltinSyms,
+    VmApply,
+    VmMap,
+    VmForEach,
+    VmFilter,
+    VmFind,
+    VmAny,
+    VmEvery,
+    VmFoldLeft,
+    VmFoldRight,
+    VmReduce,
+    VmCount,
+    VmPartition,
+    VmValues,
+    VmCallWithValues,
+    VmVectorMap,
+    VmVectorForEach,
+    VmVectorFold,
+    VmVectorFilter,
+    VmStringMap,
+    VmStringForEach,
+    VmHashtableWalk,
+    VmHashtableForEach,
+    VmHashtableFold,
+    VmHashtableUpdate,
+    VmUnfold,
+    VmListSort,
+    VmVectorSort,
+    VmVectorSortBang,
+    VmTabulate,
+    VmRemove,
+    VmForce,
+    VmEval,
+    VmDisplay,
+    VmWrite,
+    VmNewline,
+    VmWithOutputToString,
+    VmWithInputFromString,
+    VmWithOutputToFile,
+    VmWithInputFromFile,
+    VmCurrentInputPort,
+    VmCurrentOutputPort,
+    VmRaise,
+    VmErrorFn,
+    VmAssertionViolation,
+    VmWithExceptionHandler,
+    VmCallCc,
+    VmDynamicWind,
+    VmContinuation,
+);
 
 #[cfg(test)]
 mod tests {
