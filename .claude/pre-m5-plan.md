@@ -237,12 +237,13 @@ Iters 117+ are filling R7RS gaps one per iter:
 - 135 R7RS string-copy + bytevector-copy with optional [start [end]];
   added missing string-set!
 - 136 R7RS string->list, vector->list, string->vector, vector->string
-  with optional [start [end]] (this iter)
+  with optional [start [end]]
+- 137 R7RS bytevector-fill! with optional [start [end]] (this iter)
 
 Current totals:
-- 90 conformance test files (cli)
-- VM tier: 92 tests
-- Aggregate: 1834 individual Scheme tests passing
+- 91 conformance test files (cli)
+- VM tier: 93 tests
+- Aggregate: 1848 individual Scheme tests passing
 
 ## Loop cadence
 

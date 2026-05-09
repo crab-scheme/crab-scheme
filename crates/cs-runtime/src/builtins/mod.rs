@@ -6500,8 +6500,9 @@ fn b_bytevector_append(args: &[Value]) -> Result<Value, String> {
 
 /// `(bytevector-fill! bv byte)` — write `byte` to every slot of `bv`.
 fn b_bytevector_fill(args: &[Value]) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(arity_err("bytevector-fill!", "2", args.len()));
+    // R7RS: (bytevector-fill! bv fill [start [end]]).
+    if args.len() < 2 || args.len() > 4 {
+        return Err(arity_err("bytevector-fill!", "2..4", args.len()));
     }
     let byte = as_int_i64("bytevector-fill!", &args[1])?;
     if !(0..=255).contains(&byte) {
@@ -6512,7 +6513,26 @@ fn b_bytevector_fill(args: &[Value]) -> Result<Value, String> {
         other => return Err(type_err("bytevector-fill!", "bytevector", other)),
     };
     let mut v = bv.borrow_mut();
-    for slot in v.iter_mut() {
+    let len = v.len();
+    let start = if args.len() >= 3 {
+        let i = as_int_i64("bytevector-fill!", &args[2])?;
+        if i < 0 || (i as usize) > len {
+            return Err(format!("bytevector-fill!: start out of range: {}", i));
+        }
+        i as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 4 {
+        let i = as_int_i64("bytevector-fill!", &args[3])?;
+        if i < 0 || (i as usize) > len || (i as usize) < start {
+            return Err(format!("bytevector-fill!: end out of range: {}", i));
+        }
+        i as usize
+    } else {
+        len
+    };
+    for slot in &mut v[start..end] {
         *slot = byte as u8;
     }
     Ok(Value::Unspecified)
