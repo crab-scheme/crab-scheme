@@ -657,3 +657,11 @@ fn vm_conformance_r7rs_define_library() {
     println!("r7rs_define_library: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_exact_integer_sqrt() {
+    let walker = pass_count_walker("exact_integer_sqrt.scm");
+    let vm = pass_count_vm("exact_integer_sqrt.scm").expect("vm should run exact_integer_sqrt.scm");
+    println!("exact_integer_sqrt: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

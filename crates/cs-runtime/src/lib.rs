@@ -246,6 +246,19 @@ impl Runtime {
                 Ok(Value::Unspecified)
             }),
         );
+        let eis_sym = syms.intern("exact-integer-sqrt");
+        vm_env.define(
+            eis_sym,
+            cs_vm::vm::make_vm_builtin("exact-integer-sqrt", |args| {
+                if args.len() != 1 {
+                    return Err("exact-integer-sqrt: 1 arg".into());
+                }
+                let (s, r) = builtins::exact_integer_sqrt_num(&args[0])
+                    .map_err(|e| format!("exact-integer-sqrt: {}", e))?;
+                cs_vm::vm::vm_set_pending_values(vec![s, r]);
+                Ok(Value::Unspecified)
+            }),
+        );
         let truncdiv_sym = syms.intern("truncate/");
         vm_env.define(
             truncdiv_sym,

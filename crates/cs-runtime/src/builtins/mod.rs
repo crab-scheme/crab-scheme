@@ -55,7 +55,6 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("even?", b_even_p),
         ("odd?", b_odd_p),
         ("square", b_square),
-        ("exact-integer-sqrt", b_exact_integer_sqrt),
         // transcendental
         ("sqrt", b_sqrt),
         ("exp", b_exp),
@@ -545,6 +544,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("interaction-environment", b_interaction_environment),
         ("div-and-mod", b_div_and_mod),
         ("div0-and-mod0", b_div0_and_mod0),
+        ("exact-integer-sqrt", b_exact_integer_sqrt),
         ("truncate/", b_truncate_div),
         ("floor/", b_floor_div),
         ("features", b_features),
@@ -6665,31 +6665,26 @@ fn b_bitwise_bit_set_p(args: &[Value]) -> Result<Value, String> {
 
 // ---- exact-integer-sqrt ----
 
-fn b_exact_integer_sqrt(args: &[Value]) -> Result<Value, String> {
-    // Returns two values: the integer square root and the remainder.
+fn b_exact_integer_sqrt(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    // R6RS multi-value return: (s r) such that s² ≤ n < (s+1)², r = n - s².
     if args.len() != 1 {
         return Err(arity_err("exact-integer-sqrt", "1", args.len()));
     }
-    let n = as_int_i64("exact-integer-sqrt", &args[0])?;
-    if n < 0 {
-        return Err("exact-integer-sqrt: negative argument".into());
-    }
-    let s = (n as f64).sqrt() as i64;
-    // Adjust in case of float rounding error.
-    let mut s = s;
-    while s * s > n {
-        s -= 1;
-    }
-    while (s + 1) * (s + 1) <= n {
-        s += 1;
-    }
-    let rem = n - s * s;
-    // Multi-value return — but pure builtins don't have ctx access; do it
-    // differently: return a list. R6RS spec wants multi-values via values.
-    // For our simplified impl we return them as a 2-element list and tell users
-    // to use call-with-values via a wrapper later. (Actually return as list
-    // for now; real multi-value lands when this becomes higher-order.)
-    Ok(Value::list([Value::fixnum(s), Value::fixnum(rem)]))
+    let n = as_integer_num("exact-integer-sqrt", &args[0])?;
+    let (s, r) = n
+        .exact_integer_sqrt()
+        .ok_or_else(|| "exact-integer-sqrt: negative or non-integer argument".to_string())?;
+    ctx.pending_values = Some(vec![Value::Number(s), Value::Number(r)]);
+    Ok(Value::Unspecified)
+}
+
+/// Public for VM-tier shim — mirrors div_and_mod_num.
+pub fn exact_integer_sqrt_num(x: &Value) -> Result<(Value, Value), String> {
+    let n = as_integer_num("exact-integer-sqrt", x)?;
+    let (s, r) = n
+        .exact_integer_sqrt()
+        .ok_or_else(|| "exact-integer-sqrt: negative or non-integer argument".to_string())?;
+    Ok((Value::Number(s), Value::Number(r)))
 }
 
 // ---- environments ----

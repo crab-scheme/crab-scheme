@@ -429,6 +429,11 @@ fn conformance_r7rs_define_library() {
 }
 
 #[test]
+fn conformance_exact_integer_sqrt() {
+    run_conformance_file("exact_integer_sqrt.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -519,6 +524,7 @@ fn conformance_aggregate_count() {
                 "library_imports.scm",
                 "library_validate.scm",
                 "r7rs_define_library.scm",
+                "exact_integer_sqrt.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

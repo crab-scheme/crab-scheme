@@ -266,6 +266,35 @@ impl Number {
         Ok(simplify_bigint(result))
     }
 
+    /// R6RS `exact-integer-sqrt`: returns `(s, r)` such that
+    /// `s² ≤ n` and `n = s² + r` with `r < 2s + 1`. Bignum-correct
+    /// via Newton's method on the BigInt directly. Raises on negative
+    /// inputs (R6RS &assertion).
+    pub fn exact_integer_sqrt(&self) -> Option<(Number, Number)> {
+        // Coerce to BigInt; non-integer inputs return None.
+        let n = self.to_bigint()?;
+        if n.is_negative() {
+            return None;
+        }
+        if n.is_zero() {
+            return Some((Number::Fixnum(0), Number::Fixnum(0)));
+        }
+        // Newton's method on BigInt.
+        // Initial guess: 2^(bit_length / 2).
+        let bits = n.bits();
+        let mut x = BigInt::from(1u64) << ((bits / 2) + 1);
+        loop {
+            let y = (&x + &n / &x) >> 1;
+            if y >= x {
+                break;
+            }
+            x = y;
+        }
+        // Now x is floor(sqrt(n)).
+        let r = &n - &x * &x;
+        Some((simplify_bigint(x), simplify_bigint(r)))
+    }
+
     /// R7RS `floor-quotient`: floor(x/y), i.e. rounded toward -∞.
     /// Differs from R5RS `quotient` (truncated) for negative operands.
     /// Identity: `x = y · floor-quotient + floor-remainder`, where

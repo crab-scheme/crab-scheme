@@ -27,10 +27,19 @@
 (test-true  "bit-set-yes" (bitwise-bit-set? 4 2))   ; 4 = b100, bit 2 set
 (test-false "bit-set-no"  (bitwise-bit-set? 4 1))   ; 4 = b100, bit 1 not set
 
-; exact-integer-sqrt returns (sqrt remainder) as a list
-(test-equal "sqrt-16"   '(4 0)  (exact-integer-sqrt 16))
-(test-equal "sqrt-17"   '(4 1)  (exact-integer-sqrt 17))
-(test-equal "sqrt-100"  '(10 0) (exact-integer-sqrt 100))
+; exact-integer-sqrt returns (sqrt remainder) via 2 values (R6RS)
+(call-with-values (lambda () (exact-integer-sqrt 16))
+  (lambda (s r)
+    (test-eqv "sqrt-16-s" 4 s)
+    (test-eqv "sqrt-16-r" 0 r)))
+(call-with-values (lambda () (exact-integer-sqrt 17))
+  (lambda (s r)
+    (test-eqv "sqrt-17-s" 4 s)
+    (test-eqv "sqrt-17-r" 1 r)))
+(call-with-values (lambda () (exact-integer-sqrt 100))
+  (lambda (s r)
+    (test-eqv "sqrt-100-s" 10 s)
+    (test-eqv "sqrt-100-r" 0 r)))
 
 ; eval
 (test-eqv   "eval-add"      10  (eval '(+ 1 2 3 4)))
