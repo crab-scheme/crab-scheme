@@ -237,6 +237,15 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // ports
         ("open-string-input-port", b_open_string_input_port),
         ("open-string-output-port", b_open_string_output_port),
+        ("open-bytevector-input-port", b_open_bytevector_input_port),
+        ("open-bytevector-output-port", b_open_bytevector_output_port),
+        ("get-bytevector-output-port", b_get_bytevector_output_port),
+        ("get-u8", b_get_u8),
+        ("lookahead-u8", b_lookahead_u8),
+        ("put-u8", b_put_u8),
+        ("get-bytevector-n", b_get_bytevector_n),
+        ("binary-port?", b_binary_port_p),
+        ("textual-port?", b_textual_port_p),
         ("get-output-string", b_get_output_string),
         ("read-char", b_read_char),
         ("peek-char", b_peek_char),
@@ -3322,6 +3331,178 @@ fn b_open_string_output_port(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Port(Port::string_output()))
 }
 
+// ---- bytevector-backed ports (R6RS binary I/O) ----
+
+fn b_open_bytevector_input_port(args: &[Value]) -> Result<Value, String> {
+    // R6RS allows an optional transcoder; we don't have transcoders yet.
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_err(
+            "open-bytevector-input-port",
+            "1 or 2",
+            args.len(),
+        ));
+    }
+    let bytes = match &args[0] {
+        Value::ByteVector(b) => b.borrow().clone(),
+        v => return Err(type_err("open-bytevector-input-port", "bytevector", v)),
+    };
+    Ok(Value::Port(Port::bytevector_input(bytes)))
+}
+
+fn b_open_bytevector_output_port(args: &[Value]) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err(
+            "open-bytevector-output-port",
+            "0 or 1",
+            args.len(),
+        ));
+    }
+    // Optional transcoder argument is ignored at the foundation milestone.
+    Ok(Value::Port(Port::bytevector_output()))
+}
+
+fn b_get_bytevector_output_port(args: &[Value]) -> Result<Value, String> {
+    // R6RS shape: `(get-bytevector-output-port port)` returns the
+    // accumulated bytevector AND clears the buffer (the port stays open
+    // and continues to be writable, starting fresh).
+    if args.len() != 1 {
+        return Err(arity_err("get-bytevector-output-port", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorOutput(buf) => {
+                let bytes = buf.borrow().clone();
+                buf.borrow_mut().clear();
+                Ok(Value::ByteVector(std::rc::Rc::new(
+                    std::cell::RefCell::new(bytes),
+                )))
+            }
+            _ => Err("get-bytevector-output-port: not a bytevector output port".into()),
+        },
+        v => Err(type_err("get-bytevector-output-port", "output-port", v)),
+    }
+}
+
+/// `(get-u8 port)` — read one byte from a binary input port. Returns the
+/// EOF object at end of stream.
+fn b_get_u8(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("get-u8", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorInput(state) => {
+                let mut s = state.borrow_mut();
+                if s.pos < s.bytes.len() {
+                    let b = s.bytes[s.pos];
+                    s.pos += 1;
+                    Ok(Value::fixnum(b as i64))
+                } else {
+                    Ok(Value::Eof)
+                }
+            }
+            _ => Err("get-u8: not a binary input port".into()),
+        },
+        v => Err(type_err("get-u8", "binary-input-port", v)),
+    }
+}
+
+/// `(lookahead-u8 port)` — peek one byte without consuming it.
+fn b_lookahead_u8(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("lookahead-u8", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorInput(state) => {
+                let s = state.borrow();
+                if s.pos < s.bytes.len() {
+                    Ok(Value::fixnum(s.bytes[s.pos] as i64))
+                } else {
+                    Ok(Value::Eof)
+                }
+            }
+            _ => Err("lookahead-u8: not a binary input port".into()),
+        },
+        v => Err(type_err("lookahead-u8", "binary-input-port", v)),
+    }
+}
+
+/// `(put-u8 port byte)` — append one byte to a binary output port.
+fn b_put_u8(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("put-u8", "2", args.len()));
+    }
+    let byte = as_int_i64("put-u8", &args[1])?;
+    if !(0..=255).contains(&byte) {
+        return Err("put-u8: byte out of u8 range".into());
+    }
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorOutput(buf) => {
+                buf.borrow_mut().push(byte as u8);
+                Ok(Value::Unspecified)
+            }
+            _ => Err("put-u8: not a binary output port".into()),
+        },
+        v => Err(type_err("put-u8", "binary-output-port", v)),
+    }
+}
+
+/// `(get-bytevector-n port count)` — read up to `count` bytes into a
+/// fresh bytevector. Returns the EOF object when no bytes can be read
+/// (i.e., already at end of stream); otherwise returns whatever was
+/// available, which may be shorter than `count`.
+fn b_get_bytevector_n(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("get-bytevector-n", "2", args.len()));
+    }
+    let n = as_int_i64("get-bytevector-n", &args[1])?;
+    if n < 0 {
+        return Err("get-bytevector-n: negative count".into());
+    }
+    let n = n as usize;
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorInput(state) => {
+                let mut s = state.borrow_mut();
+                if s.pos >= s.bytes.len() {
+                    return Ok(Value::Eof);
+                }
+                let avail = s.bytes.len() - s.pos;
+                let take = n.min(avail);
+                let bytes = s.bytes[s.pos..s.pos + take].to_vec();
+                s.pos += take;
+                Ok(Value::ByteVector(std::rc::Rc::new(
+                    std::cell::RefCell::new(bytes),
+                )))
+            }
+            _ => Err("get-bytevector-n: not a binary input port".into()),
+        },
+        v => Err(type_err("get-bytevector-n", "binary-input-port", v)),
+    }
+}
+
+fn b_binary_port_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("binary-port?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(
+        &args[0],
+        Value::Port(p) if p.is_binary()
+    )))
+}
+
+fn b_textual_port_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("textual-port?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(
+        &args[0],
+        Value::Port(p) if p.is_textual()
+    )))
+}
+
 fn b_get_output_string(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("get-output-string", "1", args.len()));
@@ -4663,6 +4844,10 @@ fn b_port_eof_p(args: &[Value]) -> Result<Value, String> {
             Port::StringInput(state) => {
                 let s = state.borrow();
                 Ok(Value::Boolean(s.pos >= s.chars.len()))
+            }
+            Port::ByteVectorInput(state) => {
+                let s = state.borrow();
+                Ok(Value::Boolean(s.pos >= s.bytes.len()))
             }
             _ => Ok(Value::Boolean(false)),
         },

@@ -471,3 +471,11 @@ fn vm_conformance_eval_environment() {
     println!("eval_environment: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_bytevector_ports() {
+    let walker = pass_count_walker("bytevector_ports.scm");
+    let vm = pass_count_vm("bytevector_ports.scm").expect("vm should run bytevector_ports.scm");
+    println!("bytevector_ports: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

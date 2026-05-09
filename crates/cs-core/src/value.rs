@@ -52,17 +52,25 @@ impl Hashtable {
     }
 }
 
-/// A port: foundation supports string-input and string-output ports only.
+/// A port: foundation supports string and bytevector backed ports.
 /// File ports land in a later milestone.
 #[derive(Debug)]
 pub enum Port {
     StringInput(RefCell<StringInputState>),
     StringOutput(RefCell<String>),
+    ByteVectorInput(RefCell<ByteVectorInputState>),
+    ByteVectorOutput(RefCell<Vec<u8>>),
 }
 
 #[derive(Debug)]
 pub struct StringInputState {
     pub chars: Vec<char>,
+    pub pos: usize,
+}
+
+#[derive(Debug)]
+pub struct ByteVectorInputState {
+    pub bytes: Vec<u8>,
     pub pos: usize,
 }
 
@@ -78,12 +86,31 @@ impl Port {
         Rc::new(Port::StringOutput(RefCell::new(String::new())))
     }
 
+    pub fn bytevector_input(bytes: Vec<u8>) -> Rc<Self> {
+        Rc::new(Port::ByteVectorInput(RefCell::new(ByteVectorInputState {
+            bytes,
+            pos: 0,
+        })))
+    }
+
+    pub fn bytevector_output() -> Rc<Self> {
+        Rc::new(Port::ByteVectorOutput(RefCell::new(Vec::new())))
+    }
+
     pub fn is_input(&self) -> bool {
-        matches!(self, Port::StringInput(_))
+        matches!(self, Port::StringInput(_) | Port::ByteVectorInput(_))
     }
 
     pub fn is_output(&self) -> bool {
-        matches!(self, Port::StringOutput(_))
+        matches!(self, Port::StringOutput(_) | Port::ByteVectorOutput(_))
+    }
+
+    pub fn is_textual(&self) -> bool {
+        matches!(self, Port::StringInput(_) | Port::StringOutput(_))
+    }
+
+    pub fn is_binary(&self) -> bool {
+        matches!(self, Port::ByteVectorInput(_) | Port::ByteVectorOutput(_))
     }
 }
 
@@ -298,6 +325,8 @@ impl Value {
             Value::Port(p) => match &**p {
                 Port::StringInput(_) => write!(out, "#<input-port>"),
                 Port::StringOutput(_) => write!(out, "#<output-port>"),
+                Port::ByteVectorInput(_) => write!(out, "#<binary-input-port>"),
+                Port::ByteVectorOutput(_) => write!(out, "#<binary-output-port>"),
             },
             Value::Promise(_) => write!(out, "#<promise>"),
         }
@@ -425,6 +454,8 @@ impl fmt::Display for Value {
             Value::Port(p) => match &**p {
                 Port::StringInput(_) => write!(f, "#<input-port>"),
                 Port::StringOutput(_) => write!(f, "#<output-port>"),
+                Port::ByteVectorInput(_) => write!(f, "#<binary-input-port>"),
+                Port::ByteVectorOutput(_) => write!(f, "#<binary-output-port>"),
             },
             Value::Promise(_) => write!(f, "#<promise>"),
         }

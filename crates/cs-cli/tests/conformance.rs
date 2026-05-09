@@ -309,6 +309,11 @@ fn conformance_eval_environment() {
 }
 
 #[test]
+fn conformance_bytevector_ports() {
+    run_conformance_file("bytevector_ports.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -375,6 +380,7 @@ fn conformance_aggregate_count() {
                 "hash_functions.scm",
                 "utf8_codec.scm",
                 "eval_environment.scm",
+                "bytevector_ports.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
