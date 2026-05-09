@@ -256,6 +256,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("make-eq-hashtable", b_make_eq_hashtable),
         ("make-eqv-hashtable", b_make_eqv_hashtable),
         ("make-hashtable", b_make_hashtable),
+        ("string-hash", b_string_hash),
+        ("symbol-hash", b_symbol_hash_pure),
+        ("equal-hash", b_equal_hash),
         ("hashtable?", b_hashtable_p),
         ("hashtable-size", b_hashtable_size),
         ("hashtable-set!", b_hashtable_set),
@@ -2654,6 +2657,100 @@ fn b_make_hashtable(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("make-hashtable", "0..2", args.len()));
     }
     Ok(Value::Hashtable(Hashtable::new(HtEqKind::Equal)))
+}
+
+// ---- R6RS standard hash functions ----
+//
+// These each return a small integer derived from their argument. The
+// hash quality only needs to be good enough for hashtable bucket
+// distribution — collisions are resolved via the equiv? function.
+// Programs that pass them to `(make-hashtable hash equiv)` resolve;
+// our `make-hashtable` itself ignores the user-provided functions and
+// uses the built-in equal? table for now.
+
+fn fnv1a_hash(bytes: &[u8]) -> i64 {
+    // 64-bit FNV-1a — small, good enough for general hashing, no deps.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    // Truncate to a positive fixnum-friendly range.
+    (h as i64).wrapping_abs()
+}
+
+fn b_string_hash(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("string-hash", "1", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        other => return Err(type_err("string-hash", "string", other)),
+    };
+    Ok(Value::fixnum(fnv1a_hash(s.as_bytes())))
+}
+
+fn b_symbol_hash_pure(args: &[Value]) -> Result<Value, String> {
+    // Symbols compare by id internally; hashing the id is uniform.
+    if args.len() != 1 {
+        return Err(arity_err("symbol-hash", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Symbol(s) => {
+            // The Symbol struct wraps a u32; hash that as 4 bytes.
+            let id = s.0 as u32;
+            Ok(Value::fixnum(fnv1a_hash(&id.to_le_bytes())))
+        }
+        other => Err(type_err("symbol-hash", "symbol", other)),
+    }
+}
+
+/// Recursive hash for `equal?` semantics: walks pairs/vectors, includes
+/// strings/symbols/numbers/booleans/chars. Cycles are not handled —
+/// hashing a cyclic structure overflows the call stack, same constraint
+/// as `equal?` itself.
+fn equal_hash_rec(v: &Value, acc: &mut u64) {
+    let mix = |h: &mut u64, x: u64| {
+        *h ^= x;
+        *h = h.wrapping_mul(0x100000001b3);
+    };
+    match v {
+        Value::Null => mix(acc, 0x01),
+        Value::Boolean(b) => mix(acc, 0x10 | (*b as u64)),
+        Value::Number(n) => mix(acc, fnv1a_hash(format!("{}", n).as_bytes()) as u64),
+        Value::Character(c) => mix(acc, 0x20 | (*c as u64)),
+        Value::String(s) => {
+            mix(acc, 0x30);
+            for b in s.borrow().as_bytes() {
+                mix(acc, *b as u64);
+            }
+        }
+        Value::Symbol(s) => {
+            mix(acc, 0x40);
+            mix(acc, s.0 as u64);
+        }
+        Value::Pair(p) => {
+            mix(acc, 0x50);
+            equal_hash_rec(&p.car.borrow(), acc);
+            equal_hash_rec(&p.cdr.borrow(), acc);
+        }
+        Value::Vector(vc) => {
+            mix(acc, 0x60);
+            for slot in vc.borrow().iter() {
+                equal_hash_rec(slot, acc);
+            }
+        }
+        _ => mix(acc, 0xff),
+    }
+}
+
+fn b_equal_hash(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("equal-hash", "1", args.len()));
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    equal_hash_rec(&args[0], &mut h);
+    Ok(Value::fixnum((h as i64).wrapping_abs()))
 }
 
 fn b_hashtable_p(args: &[Value]) -> Result<Value, String> {

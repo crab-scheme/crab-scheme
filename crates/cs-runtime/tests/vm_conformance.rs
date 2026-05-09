@@ -447,3 +447,11 @@ fn vm_conformance_define_values() {
     println!("define_values: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_hash_functions() {
+    let walker = pass_count_walker("hash_functions.scm");
+    let vm = pass_count_vm("hash_functions.scm").expect("vm should run hash_functions.scm");
+    println!("hash_functions: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

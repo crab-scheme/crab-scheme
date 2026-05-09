@@ -294,6 +294,11 @@ fn conformance_define_values() {
 }
 
 #[test]
+fn conformance_hash_functions() {
+    run_conformance_file("hash_functions.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -357,6 +362,7 @@ fn conformance_aggregate_count() {
                 "library_import.scm",
                 "display_condition.scm",
                 "define_values.scm",
+                "hash_functions.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
