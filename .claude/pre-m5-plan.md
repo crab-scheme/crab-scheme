@@ -256,13 +256,15 @@ Iters 117+ are filling R7RS gaps one per iter:
   to current-input-port (R7RS). Promoted walker tier to Higher;
   added VM tier shims via make_vm_builtin
 - 144 write-char/write-string accept optional port; default to
-  current-output-port (R7RS). Same Higher-tier promotion + VM
-  shims. (this iter)
+  current-output-port (R7RS). Same Higher-tier promotion + VM shims.
+- 145 read-u8/peek-u8/u8-ready?/char-ready?/read-bytevector +
+  write-u8/write-bytevector all accept optional port (R7RS); same
+  Higher-tier promotion + VM shims. (this iter)
 
 Current totals:
-- 98 conformance test files (cli)
-- VM tier: 100 tests (milestone)
-- Aggregate: 1977 individual Scheme tests passing
+- 99 conformance test files (cli)
+- VM tier: 101 tests
+- Aggregate: 1996 individual Scheme tests passing
 
 ## Loop cadence
 

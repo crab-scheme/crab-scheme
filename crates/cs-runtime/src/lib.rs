@@ -1064,6 +1064,237 @@ impl Runtime {
                 }
             }),
         );
+        // R7RS binary I/O with optional port (default current-* port).
+        let ru8_sym = syms.intern("read-u8");
+        vm_env.define(
+            ru8_sym,
+            cs_vm::vm::make_vm_builtin("read-u8", |args| {
+                if args.len() > 1 {
+                    return Err("read-u8: 0 or 1 arg".into());
+                }
+                let port = if args.is_empty() {
+                    cs_vm::vm::vm_current_input_port_value()
+                        .ok_or_else(|| "read-u8: no current input port".to_string())?
+                } else {
+                    args[0].clone()
+                };
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::ByteVectorInput(state) => {
+                            let mut s = state.borrow_mut();
+                            if s.pos < s.bytes.len() {
+                                let b = s.bytes[s.pos];
+                                s.pos += 1;
+                                Ok(Value::fixnum(b as i64))
+                            } else {
+                                Ok(Value::Eof)
+                            }
+                        }
+                        _ => Err("read-u8: not a binary input port".into()),
+                    },
+                    _ => Err("read-u8: not a port".into()),
+                }
+            }),
+        );
+        let pu8_sym = syms.intern("peek-u8");
+        vm_env.define(
+            pu8_sym,
+            cs_vm::vm::make_vm_builtin("peek-u8", |args| {
+                if args.len() > 1 {
+                    return Err("peek-u8: 0 or 1 arg".into());
+                }
+                let port = if args.is_empty() {
+                    cs_vm::vm::vm_current_input_port_value()
+                        .ok_or_else(|| "peek-u8: no current input port".to_string())?
+                } else {
+                    args[0].clone()
+                };
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::ByteVectorInput(state) => {
+                            let s = state.borrow();
+                            if s.pos < s.bytes.len() {
+                                Ok(Value::fixnum(s.bytes[s.pos] as i64))
+                            } else {
+                                Ok(Value::Eof)
+                            }
+                        }
+                        _ => Err("peek-u8: not a binary input port".into()),
+                    },
+                    _ => Err("peek-u8: not a port".into()),
+                }
+            }),
+        );
+        let cr_sym = syms.intern("char-ready?");
+        vm_env.define(
+            cr_sym,
+            cs_vm::vm::make_vm_builtin("char-ready?", |args| {
+                if args.len() > 1 {
+                    return Err("char-ready?: 0 or 1 arg".into());
+                }
+                let port = if args.is_empty() {
+                    cs_vm::vm::vm_current_input_port_value()
+                        .ok_or_else(|| "char-ready?: no current input port".to_string())?
+                } else {
+                    args[0].clone()
+                };
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::StringInput(_) => Ok(Value::Boolean(true)),
+                        _ => Err("char-ready?: not a textual input port".into()),
+                    },
+                    _ => Err("char-ready?: not a port".into()),
+                }
+            }),
+        );
+        let u8r_sym = syms.intern("u8-ready?");
+        vm_env.define(
+            u8r_sym,
+            cs_vm::vm::make_vm_builtin("u8-ready?", |args| {
+                if args.len() > 1 {
+                    return Err("u8-ready?: 0 or 1 arg".into());
+                }
+                let port = if args.is_empty() {
+                    cs_vm::vm::vm_current_input_port_value()
+                        .ok_or_else(|| "u8-ready?: no current input port".to_string())?
+                } else {
+                    args[0].clone()
+                };
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::ByteVectorInput(_) => Ok(Value::Boolean(true)),
+                        _ => Err("u8-ready?: not a binary input port".into()),
+                    },
+                    _ => Err("u8-ready?: not a port".into()),
+                }
+            }),
+        );
+        let rbv_sym = syms.intern("read-bytevector");
+        vm_env.define(
+            rbv_sym,
+            cs_vm::vm::make_vm_builtin("read-bytevector", |args| {
+                if args.is_empty() || args.len() > 2 {
+                    return Err("read-bytevector: 1 or 2 args".into());
+                }
+                let k = match &args[0] {
+                    Value::Number(n) => match n.to_f64() as i64 {
+                        i if i >= 0 => i as usize,
+                        _ => return Err("read-bytevector: negative count".into()),
+                    },
+                    _ => return Err("read-bytevector: count must be integer".into()),
+                };
+                let port = if args.len() == 1 {
+                    cs_vm::vm::vm_current_input_port_value()
+                        .ok_or_else(|| "read-bytevector: no current input port".to_string())?
+                } else {
+                    args[1].clone()
+                };
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::ByteVectorInput(state) => {
+                            let mut s = state.borrow_mut();
+                            if s.pos >= s.bytes.len() {
+                                return Ok(Value::Eof);
+                            }
+                            let end = (s.pos + k).min(s.bytes.len());
+                            let bytes = s.bytes[s.pos..end].to_vec();
+                            s.pos = end;
+                            Ok(Value::ByteVector(cs_core::Gc::new(
+                                std::cell::RefCell::new(bytes),
+                            )))
+                        }
+                        _ => Err("read-bytevector: not a binary input port".into()),
+                    },
+                    _ => Err("read-bytevector: not a port".into()),
+                }
+            }),
+        );
+        let wu8_sym = syms.intern("write-u8");
+        vm_env.define(
+            wu8_sym,
+            cs_vm::vm::make_vm_builtin("write-u8", |args| {
+                if args.is_empty() || args.len() > 2 {
+                    return Err("write-u8: 1 or 2 args".into());
+                }
+                let byte = match &args[0] {
+                    Value::Number(n) => match n.to_f64() as i64 {
+                        i if (0..=255).contains(&i) => i as u8,
+                        _ => return Err("write-u8: byte out of range".into()),
+                    },
+                    _ => return Err("write-u8: byte must be 0..255".into()),
+                };
+                let port = if args.len() == 1 {
+                    cs_vm::vm::vm_current_output_port_value()
+                        .ok_or_else(|| "write-u8: no current output port".to_string())?
+                } else {
+                    args[1].clone()
+                };
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::ByteVectorOutput(buf) => {
+                            buf.borrow_mut().push(byte);
+                            Ok(Value::Unspecified)
+                        }
+                        _ => Err("write-u8: not a binary output port".into()),
+                    },
+                    _ => Err("write-u8: not a port".into()),
+                }
+            }),
+        );
+        let wbv_sym = syms.intern("write-bytevector");
+        vm_env.define(
+            wbv_sym,
+            cs_vm::vm::make_vm_builtin("write-bytevector", |args| {
+                if args.is_empty() || args.len() > 4 {
+                    return Err("write-bytevector: 1..4 args".into());
+                }
+                let bytes = match &args[0] {
+                    Value::ByteVector(b) => b.borrow().clone(),
+                    _ => return Err("write-bytevector: arg 1 must be bytevector".into()),
+                };
+                let len = bytes.len();
+                let port = if args.len() == 1 {
+                    cs_vm::vm::vm_current_output_port_value()
+                        .ok_or_else(|| "write-bytevector: no current output port".to_string())?
+                } else {
+                    args[1].clone()
+                };
+                let start = if args.len() >= 3 {
+                    match &args[2] {
+                        Value::Number(n) => match n.to_f64() as i64 {
+                            i if i >= 0 && (i as usize) <= len => i as usize,
+                            _ => return Err("write-bytevector: start out of range".into()),
+                        },
+                        _ => return Err("write-bytevector: start must be integer".into()),
+                    }
+                } else {
+                    0
+                };
+                let end = if args.len() == 4 {
+                    match &args[3] {
+                        Value::Number(n) => match n.to_f64() as i64 {
+                            i if i >= 0 && (i as usize) <= len && (i as usize) >= start => {
+                                i as usize
+                            }
+                            _ => return Err("write-bytevector: end out of range".into()),
+                        },
+                        _ => return Err("write-bytevector: end must be integer".into()),
+                    }
+                } else {
+                    len
+                };
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::ByteVectorOutput(buf) => {
+                            buf.borrow_mut().extend_from_slice(&bytes[start..end]);
+                            Ok(Value::Unspecified)
+                        }
+                        _ => Err("write-bytevector: not a binary output port".into()),
+                    },
+                    _ => Err("write-bytevector: not a port".into()),
+                }
+            }),
+        );
         let gensym_sym = syms.intern("gensym");
         vm_env.define(
             gensym_sym,

@@ -449,11 +449,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("open-output-string", b_open_string_output_port),
         ("open-output-bytevector", b_open_bytevector_output_port),
         ("get-output-bytevector", b_get_bytevector_output_port),
-        ("char-ready?", b_char_ready_p),
-        ("read-u8", b_read_u8),
-        ("peek-u8", b_peek_u8),
-        ("u8-ready?", b_u8_ready_p),
-        ("read-bytevector", b_read_bytevector),
+        // char-ready? / read-u8 / peek-u8 / u8-ready? / read-bytevector are
+        // HIGHER (in higher_order_builtins below) so they can default to
+        // current-input-port when called with no port arg per R7RS.
         ("get-line", b_get_line),
         ("port?", b_port_p),
         ("input-port?", b_input_port_p),
@@ -466,8 +464,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // write-char / write-string are HIGHER (in higher_order_builtins
         // below) so they can default to current-output-port when called
         // with no port arg per R7RS.
-        ("write-u8", b_write_u8),
-        ("write-bytevector", b_write_bytevector),
+        // write-u8 / write-bytevector are HIGHER (default current-output-port).
         // promises
         ("promise?", b_promise_p),
         ("make-promise", b_make_promise),
@@ -604,6 +601,13 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("read-string", b_read_string_ho),
         ("write-char", b_write_char_ho),
         ("write-string", b_write_string_ho),
+        ("char-ready?", b_char_ready_p_ho),
+        ("read-u8", b_read_u8_ho),
+        ("peek-u8", b_peek_u8_ho),
+        ("u8-ready?", b_u8_ready_p_ho),
+        ("read-bytevector", b_read_bytevector_ho),
+        ("write-u8", b_write_u8_ho),
+        ("write-bytevector", b_write_bytevector_ho),
         ("read-line", b_read_line_implicit),
         ("get-string-all", b_get_string_all),
         // SRFI-1 (higher-order)
@@ -5875,6 +5879,121 @@ fn b_read_string_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> 
         args[1].clone()
     };
     b_read_string(&[args[0].clone(), port])
+}
+
+/// R7RS `(char-ready? [port])`.
+fn b_char_ready_p_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err("char-ready?", "0 or 1", args.len()));
+    }
+    let port = if args.is_empty() {
+        ctx.current_input_port
+            .clone()
+            .ok_or_else(|| "char-ready?: no current input port".to_string())?
+    } else {
+        args[0].clone()
+    };
+    b_char_ready_p(&[port])
+}
+
+/// R7RS `(read-u8 [port])`.
+fn b_read_u8_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err("read-u8", "0 or 1", args.len()));
+    }
+    let port = if args.is_empty() {
+        ctx.current_input_port
+            .clone()
+            .ok_or_else(|| "read-u8: no current input port".to_string())?
+    } else {
+        args[0].clone()
+    };
+    b_read_u8(&[port])
+}
+
+/// R7RS `(peek-u8 [port])`.
+fn b_peek_u8_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err("peek-u8", "0 or 1", args.len()));
+    }
+    let port = if args.is_empty() {
+        ctx.current_input_port
+            .clone()
+            .ok_or_else(|| "peek-u8: no current input port".to_string())?
+    } else {
+        args[0].clone()
+    };
+    b_peek_u8(&[port])
+}
+
+/// R7RS `(u8-ready? [port])`.
+fn b_u8_ready_p_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err("u8-ready?", "0 or 1", args.len()));
+    }
+    let port = if args.is_empty() {
+        ctx.current_input_port
+            .clone()
+            .ok_or_else(|| "u8-ready?: no current input port".to_string())?
+    } else {
+        args[0].clone()
+    };
+    b_u8_ready_p(&[port])
+}
+
+/// R7RS `(read-bytevector k [port])`. k required, port optional.
+fn b_read_bytevector_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_err("read-bytevector", "1 or 2", args.len()));
+    }
+    let port = if args.len() == 1 {
+        ctx.current_input_port
+            .clone()
+            .ok_or_else(|| "read-bytevector: no current input port".to_string())?
+    } else {
+        args[1].clone()
+    };
+    b_read_bytevector(&[args[0].clone(), port])
+}
+
+/// R7RS `(write-u8 byte [port])`.
+fn b_write_u8_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_err("write-u8", "1 or 2", args.len()));
+    }
+    let port = if args.len() == 1 {
+        ctx.current_output_port
+            .clone()
+            .ok_or_else(|| "write-u8: no current output port".to_string())?
+    } else {
+        args[1].clone()
+    };
+    b_write_u8(&[args[0].clone(), port])
+}
+
+/// R7RS `(write-bytevector bv [port [start [end]]])`.
+fn b_write_bytevector_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 4 {
+        return Err(arity_err("write-bytevector", "1..4", args.len()));
+    }
+    let mut full = Vec::with_capacity(4);
+    full.push(args[0].clone());
+    if args.len() == 1 {
+        let port = ctx
+            .current_output_port
+            .clone()
+            .ok_or_else(|| "write-bytevector: no current output port".to_string())?;
+        full.push(port);
+    } else {
+        full.push(args[1].clone());
+    }
+    if args.len() >= 3 {
+        full.push(args[2].clone());
+    }
+    if args.len() == 4 {
+        full.push(args[3].clone());
+    }
+    b_write_bytevector(&full)
 }
 
 fn b_read_char(args: &[Value]) -> Result<Value, String> {
