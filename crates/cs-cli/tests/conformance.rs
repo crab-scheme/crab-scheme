@@ -404,6 +404,11 @@ fn conformance_r7rs_division() {
 }
 
 #[test]
+fn conformance_vec_list_extras() {
+    run_conformance_file("vec_list_extras.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -489,6 +494,7 @@ fn conformance_aggregate_count() {
                 "r7rs_time_env.scm",
                 "hashtable_rich.scm",
                 "r7rs_division.scm",
+                "vec_list_extras.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

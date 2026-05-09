@@ -616,3 +616,11 @@ fn vm_conformance_r7rs_division() {
     println!("r7rs_division: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_vec_list_extras() {
+    let walker = pass_count_walker("vec_list_extras.scm");
+    let vm = pass_count_vm("vec_list_extras.scm").expect("vm should run vec_list_extras.scm");
+    println!("vec_list_extras: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

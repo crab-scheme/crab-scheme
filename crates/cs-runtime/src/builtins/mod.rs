@@ -350,6 +350,10 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // copy variants
         ("vector-copy", b_vector_copy),
         ("vector-copy!", b_vector_copy_bang),
+        ("vector-append", b_vector_append),
+        ("subvector", b_subvector),
+        ("make-list", b_make_list),
+        ("list-copy", b_list_copy),
         ("bytevector-copy!", b_bytevector_copy_bang),
         ("string-copy!", b_string_copy_bang),
         // bytevectors
@@ -7270,6 +7274,90 @@ fn b_vector_copy(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(
         copied,
     ))))
+}
+
+/// `vector-append` (R7RS) — concatenate any number of vectors into a fresh one.
+fn b_vector_append(args: &[Value]) -> Result<Value, String> {
+    let mut out: Vec<Value> = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        match a {
+            Value::Vector(v) => out.extend(v.borrow().iter().cloned()),
+            other => {
+                return Err(format!(
+                    "vector-append: argument {} is not a vector ({})",
+                    i + 1,
+                    other.type_name()
+                ))
+            }
+        }
+    }
+    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(
+        out,
+    ))))
+}
+
+/// `subvector` — slice a vector into a fresh one. Same shape as
+/// `(vector-copy v start end)` but spelled the way SRFI-43 / Chicken
+/// expose it.
+fn b_subvector(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("subvector", "3", args.len()));
+    }
+    let v = match &args[0] {
+        Value::Vector(v) => v.borrow().clone(),
+        other => return Err(type_err("subvector", "vector", other)),
+    };
+    let start = as_int_i64("subvector", &args[1])? as usize;
+    let end = as_int_i64("subvector", &args[2])? as usize;
+    if start > v.len() || end > v.len() || start > end {
+        return Err("subvector: indices out of range".into());
+    }
+    let copied: Vec<Value> = v[start..end].to_vec();
+    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(
+        copied,
+    ))))
+}
+
+/// `make-list` (R7RS) — `(make-list k)` or `(make-list k fill)`.
+fn b_make_list(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_err("make-list", "1 or 2", args.len()));
+    }
+    let n = as_int_i64("make-list", &args[0])?;
+    if n < 0 {
+        return Err("make-list: negative length".into());
+    }
+    let fill = if args.len() == 2 {
+        args[1].clone()
+    } else {
+        Value::Unspecified
+    };
+    let items: Vec<Value> = (0..n).map(|_| fill.clone()).collect();
+    Ok(Value::list(items))
+}
+
+/// `list-copy` (R7RS) — return a shallow copy of the spine of a list.
+/// On a cyclic or improper input, copies up through the dotted tail.
+fn b_list_copy(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("list-copy", "1", args.len()));
+    }
+    let mut elems: Vec<Value> = Vec::new();
+    let mut cur = args[0].clone();
+    let tail = loop {
+        match cur {
+            Value::Pair(p) => {
+                elems.push(p.car.borrow().clone());
+                cur = p.cdr.borrow().clone();
+            }
+            other => break other,
+        }
+    };
+    let mut acc = tail;
+    while let Some(e) = elems.pop() {
+        acc = Value::Pair(cs_core::Pair::new(e, acc));
+    }
+    Ok(acc)
 }
 
 fn b_vector_copy_bang(args: &[Value]) -> Result<Value, String> {
