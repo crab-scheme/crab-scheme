@@ -206,6 +206,16 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // strings
         ("string-length", b_string_length),
         ("string=?", b_string_eq),
+        ("string-ci=?", b_string_ci_eq),
+        ("string-ci<?", b_string_ci_lt),
+        ("string-ci<=?", b_string_ci_le),
+        ("string-ci>?", b_string_ci_gt),
+        ("string-ci>=?", b_string_ci_ge),
+        ("char-ci=?", b_char_ci_eq),
+        ("char-ci<?", b_char_ci_lt),
+        ("char-ci<=?", b_char_ci_le),
+        ("char-ci>?", b_char_ci_gt),
+        ("char-ci>=?", b_char_ci_ge),
         ("string-ref", b_string_ref),
         ("string-set!", b_string_set_bang),
         ("string->list", b_string_to_list),
@@ -2187,6 +2197,99 @@ fn b_string_eq(args: &[Value]) -> Result<Value, String> {
         }
     }
     Ok(Value::Boolean(true))
+}
+
+/// Case-insensitive helper: lowercase a single char. Matches char-foldcase
+/// behavior for the foundation milestone (Unicode-aware via Rust's
+/// to_lowercase iterator).
+fn ci_char(c: char) -> String {
+    c.to_lowercase().collect()
+}
+
+fn ci_string(s: &str) -> String {
+    s.chars().flat_map(|c| c.to_lowercase()).collect()
+}
+
+fn string_ci_chain(
+    name: &str,
+    args: &[Value],
+    pred: impl Fn(std::cmp::Ordering) -> bool,
+) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Ok(Value::Boolean(true));
+    }
+    let mut prev = match &args[0] {
+        Value::String(s) => ci_string(&s.borrow()),
+        v => return Err(type_err(name, "string", v)),
+    };
+    for a in &args[1..] {
+        let cur = match a {
+            Value::String(s) => ci_string(&s.borrow()),
+            v => return Err(type_err(name, "string", v)),
+        };
+        if !pred(prev.as_str().cmp(cur.as_str())) {
+            return Ok(Value::Boolean(false));
+        }
+        prev = cur;
+    }
+    Ok(Value::Boolean(true))
+}
+
+fn b_string_ci_eq(args: &[Value]) -> Result<Value, String> {
+    string_ci_chain("string-ci=?", args, |o| o == std::cmp::Ordering::Equal)
+}
+fn b_string_ci_lt(args: &[Value]) -> Result<Value, String> {
+    string_ci_chain("string-ci<?", args, |o| o == std::cmp::Ordering::Less)
+}
+fn b_string_ci_le(args: &[Value]) -> Result<Value, String> {
+    string_ci_chain("string-ci<=?", args, |o| o != std::cmp::Ordering::Greater)
+}
+fn b_string_ci_gt(args: &[Value]) -> Result<Value, String> {
+    string_ci_chain("string-ci>?", args, |o| o == std::cmp::Ordering::Greater)
+}
+fn b_string_ci_ge(args: &[Value]) -> Result<Value, String> {
+    string_ci_chain("string-ci>=?", args, |o| o != std::cmp::Ordering::Less)
+}
+
+fn char_ci_chain(
+    name: &str,
+    args: &[Value],
+    pred: impl Fn(std::cmp::Ordering) -> bool,
+) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Ok(Value::Boolean(true));
+    }
+    let mut prev = match &args[0] {
+        Value::Character(c) => ci_char(*c),
+        v => return Err(type_err(name, "character", v)),
+    };
+    for a in &args[1..] {
+        let cur = match a {
+            Value::Character(c) => ci_char(*c),
+            v => return Err(type_err(name, "character", v)),
+        };
+        if !pred(prev.as_str().cmp(cur.as_str())) {
+            return Ok(Value::Boolean(false));
+        }
+        prev = cur;
+    }
+    Ok(Value::Boolean(true))
+}
+
+fn b_char_ci_eq(args: &[Value]) -> Result<Value, String> {
+    char_ci_chain("char-ci=?", args, |o| o == std::cmp::Ordering::Equal)
+}
+fn b_char_ci_lt(args: &[Value]) -> Result<Value, String> {
+    char_ci_chain("char-ci<?", args, |o| o == std::cmp::Ordering::Less)
+}
+fn b_char_ci_le(args: &[Value]) -> Result<Value, String> {
+    char_ci_chain("char-ci<=?", args, |o| o != std::cmp::Ordering::Greater)
+}
+fn b_char_ci_gt(args: &[Value]) -> Result<Value, String> {
+    char_ci_chain("char-ci>?", args, |o| o == std::cmp::Ordering::Greater)
+}
+fn b_char_ci_ge(args: &[Value]) -> Result<Value, String> {
+    char_ci_chain("char-ci>=?", args, |o| o != std::cmp::Ordering::Less)
 }
 
 fn b_string_ref(args: &[Value]) -> Result<Value, String> {

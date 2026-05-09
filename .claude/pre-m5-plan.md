@@ -242,12 +242,15 @@ Iters 117+ are filling R7RS gaps one per iter:
 - 138 R7RS (string char ...) constructor — variadic char-collection
   to a new string
 - 139 R7RS string-map / string-for-each multi-string forms; both
-  tiers; VM error path now raises catchable conditions (this iter)
+  tiers; VM error path now raises catchable conditions
+- 140 R7RS char-ci=?, char-ci<?, char-ci<=?, char-ci>?, char-ci>=?
+  + string-ci variants. Variadic, Unicode-aware via to_lowercase
+  (this iter)
 
 Current totals:
-- 93 conformance test files (cli)
-- VM tier: 95 tests
-- Aggregate: 1874 individual Scheme tests passing
+- 94 conformance test files (cli)
+- VM tier: 96 tests
+- Aggregate: 1917 individual Scheme tests passing
 
 ## Loop cadence
 
