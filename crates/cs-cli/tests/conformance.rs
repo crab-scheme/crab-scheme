@@ -364,6 +364,11 @@ fn conformance_fx_fl_ops() {
 }
 
 #[test]
+fn conformance_exactness_extras() {
+    run_conformance_file("exactness_extras.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -441,6 +446,7 @@ fn conformance_aggregate_count() {
                 "bigint_division.scm",
                 "bigint_div0_mod0.scm",
                 "fx_fl_ops.scm",
+                "exactness_extras.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

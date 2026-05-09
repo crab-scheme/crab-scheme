@@ -189,6 +189,42 @@ impl Number {
         }
     }
 
+    /// R6RS `numerator`. For exact rationals, returns the numerator as
+    /// a Number (Fixnum or Big); for integers, returns the integer
+    /// itself. For inexact (flonum) inputs, computes via flonum
+    /// rationalization and returns a flonum integer.
+    pub fn numerator(&self) -> Option<Number> {
+        match self {
+            Number::Fixnum(_) | Number::Big(_) => Some(self.clone()),
+            Number::Rat(r) => Some(simplify_bigint(r.numer().clone())),
+            Number::Flonum(f) => {
+                if !f.is_finite() {
+                    return None;
+                }
+                let r = BigRational::from_float(*f)?;
+                let n = r.numer();
+                Some(Number::Flonum(n.to_f64().unwrap_or(f64::NAN)))
+            }
+        }
+    }
+
+    /// R6RS `denominator`. Returns 1 for integers, the denominator for
+    /// rationals, and a flonum integer for finite flonums.
+    pub fn denominator(&self) -> Option<Number> {
+        match self {
+            Number::Fixnum(_) | Number::Big(_) => Some(Number::Fixnum(1)),
+            Number::Rat(r) => Some(simplify_bigint(r.denom().clone())),
+            Number::Flonum(f) => {
+                if !f.is_finite() {
+                    return None;
+                }
+                let r = BigRational::from_float(*f)?;
+                let d = r.denom();
+                Some(Number::Flonum(d.to_f64().unwrap_or(f64::NAN)))
+            }
+        }
+    }
+
     /// Truncating quotient (R5RS/R6RS `quotient`). Result has the sign
     /// of x*y where (x, y) = (self, other). Errors on zero divisor.
     pub fn quotient(&self, other: &Number) -> Result<Number, NumError> {
@@ -306,6 +342,29 @@ fn simplify_bigint(b: BigInt) -> Number {
         Number::Fixnum(small)
     } else {
         Number::Big(Rc::new(b))
+    }
+}
+
+impl Number {
+    /// R6RS `exact`. Coerces a Number to its exact form. Integer-valued
+    /// flonums become Fixnum/Big; non-integral finite flonums become
+    /// Rat via BigRational::from_float (the exact bit-pattern as a
+    /// dyadic rational). Non-finite flonums (inf/NaN) cannot be
+    /// represented exactly and return None.
+    pub fn to_exact(&self) -> Option<Number> {
+        match self {
+            n if n.is_exact() => Some(n.clone()),
+            Number::Flonum(f) => {
+                if !f.is_finite() {
+                    return None;
+                }
+                if f.fract() == 0.0 && (*f as i64 as f64) == *f {
+                    return Some(Number::Fixnum(*f as i64));
+                }
+                BigRational::from_float(*f).map(simplify_rational)
+            }
+            _ => unreachable!(),
+        }
     }
 }
 

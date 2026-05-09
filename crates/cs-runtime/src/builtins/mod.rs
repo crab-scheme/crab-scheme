@@ -227,8 +227,18 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // numbers
         ("exact", b_exact),
         ("inexact", b_inexact),
+        ("exact->inexact", b_inexact),
+        ("inexact->exact", b_exact),
         ("exact?", b_exact_p),
         ("inexact?", b_inexact_p),
+        ("exact-integer?", b_exact_integer_p),
+        ("exact-nonnegative-integer?", b_exact_nonneg_int_p),
+        ("exact-rational?", b_exact_rational_p),
+        ("nan?", b_nan_p),
+        ("finite?", b_finite_p),
+        ("infinite?", b_infinite_p),
+        ("numerator", b_numerator),
+        ("denominator", b_denominator),
         // string conversions
         ("make-string", b_make_string),
         ("substring", b_substring),
@@ -1963,17 +1973,102 @@ fn b_exact(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("exact", "1", args.len()));
     }
-    match as_num("exact", &args[0])? {
-        n if n.is_exact() => Ok(Value::Number(n)),
-        Number::Flonum(f) => {
-            if f.fract() == 0.0 && f.is_finite() && (f as i64 as f64) == f {
-                Ok(Value::fixnum(f as i64))
-            } else {
-                Err("exact: cannot represent non-integral flonum exactly (rational coercion not yet supported)".into())
-            }
-        }
-        _ => unreachable!(),
+    let n = as_num("exact", &args[0])?;
+    n.to_exact()
+        .map(Value::Number)
+        .ok_or_else(|| "exact: non-finite flonum has no exact representation".into())
+}
+
+fn b_numerator(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("numerator", "1", args.len()));
     }
+    let n = as_num("numerator", &args[0])?;
+    n.numerator()
+        .map(Value::Number)
+        .ok_or_else(|| "numerator: non-finite flonum has no numerator".into())
+}
+
+fn b_denominator(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("denominator", "1", args.len()));
+    }
+    let n = as_num("denominator", &args[0])?;
+    n.denominator()
+        .map(Value::Number)
+        .ok_or_else(|| "denominator: non-finite flonum has no denominator".into())
+}
+
+fn b_nan_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("nan?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(
+        &args[0],
+        Value::Number(Number::Flonum(f)) if f.is_nan()
+    )))
+}
+
+fn b_finite_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("finite?", "1", args.len()));
+    }
+    let r = match &args[0] {
+        Value::Number(Number::Flonum(f)) => f.is_finite(),
+        Value::Number(_) => true,
+        v => return Err(type_err("finite?", "number", v)),
+    };
+    Ok(Value::Boolean(r))
+}
+
+fn b_infinite_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("infinite?", "1", args.len()));
+    }
+    let r = match &args[0] {
+        Value::Number(Number::Flonum(f)) => f.is_infinite(),
+        Value::Number(_) => false,
+        v => return Err(type_err("infinite?", "number", v)),
+    };
+    Ok(Value::Boolean(r))
+}
+
+fn b_exact_integer_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("exact-integer?", "1", args.len()));
+    }
+    let r = matches!(
+        &args[0],
+        Value::Number(Number::Fixnum(_)) | Value::Number(Number::Big(_))
+    ) || matches!(&args[0], Value::Number(Number::Rat(r)) if r.is_integer());
+    Ok(Value::Boolean(r))
+}
+
+fn b_exact_nonneg_int_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("exact-nonnegative-integer?", "1", args.len()));
+    }
+    use num_traits::Signed;
+    let r = match &args[0] {
+        Value::Number(Number::Fixnum(v)) => *v >= 0,
+        Value::Number(Number::Big(b)) => !b.is_negative(),
+        Value::Number(Number::Rat(r)) => r.is_integer() && !r.numer().is_negative(),
+        _ => false,
+    };
+    Ok(Value::Boolean(r))
+}
+
+fn b_exact_rational_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("exact-rational?", "1", args.len()));
+    }
+    let r = matches!(
+        &args[0],
+        Value::Number(Number::Fixnum(_))
+            | Value::Number(Number::Big(_))
+            | Value::Number(Number::Rat(_))
+    );
+    Ok(Value::Boolean(r))
 }
 
 fn b_inexact(args: &[Value]) -> Result<Value, String> {

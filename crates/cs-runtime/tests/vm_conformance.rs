@@ -552,3 +552,11 @@ fn vm_conformance_fx_fl_ops() {
     println!("fx_fl_ops: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_exactness_extras() {
+    let walker = pass_count_walker("exactness_extras.scm");
+    let vm = pass_count_vm("exactness_extras.scm").expect("vm should run exactness_extras.scm");
+    println!("exactness_extras: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
