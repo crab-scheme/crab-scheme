@@ -701,9 +701,10 @@ impl Runtime {
                             }
                             let file_id = cs_diag::FileId(u32::MAX - 2);
                             let mut reader = cs_parse::Reader::new(file_id, &remaining);
-                            let datum = reader
-                                .read(st)
-                                .map_err(|e| format!("read: {}", e.message()))?;
+                            let datum = reader.read(st).map_err(|e| {
+                                cs_core::stash_builtin_err_extra_tag("&read-error");
+                                format!("read: {}", e.message())
+                            })?;
                             let consumed_bytes = match &datum {
                                 Some(d) => d.span().end as usize,
                                 None => remaining.len(),

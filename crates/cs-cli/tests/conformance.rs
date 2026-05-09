@@ -484,6 +484,11 @@ fn conformance_r7rs_error_predicates() {
 }
 
 #[test]
+fn conformance_r7rs_read_error() {
+    run_conformance_file("r7rs_read_error.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -585,6 +590,7 @@ fn conformance_aggregate_count() {
                 "r7rs_pipe_identifiers.scm",
                 "r7rs_port_writes.scm",
                 "r7rs_error_predicates.scm",
+                "r7rs_read_error.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

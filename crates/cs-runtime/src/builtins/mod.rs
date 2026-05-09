@@ -8464,9 +8464,10 @@ fn b_read(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
                 }
                 let file_id = cs_diag::FileId(u32::MAX - 2);
                 let mut reader = cs_parse::Reader::new(file_id, &remaining);
-                let datum = reader
-                    .read(ctx.syms)
-                    .map_err(|e| format!("read: {}", e.message()))?;
+                let datum = reader.read(ctx.syms).map_err(|e| {
+                    cs_core::stash_builtin_err_extra_tag(TAG_READ_ERROR);
+                    format!("read: {}", e.message())
+                })?;
                 let consumed_bytes = match &datum {
                     // span.end is the byte offset within `remaining` where the
                     // datum finished parsing — exactly where to resume reading.
