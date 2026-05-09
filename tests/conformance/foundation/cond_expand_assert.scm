@@ -53,11 +53,14 @@
     (else 0)))
 
 ; assert error message includes the source form of the failed expression.
+; Uses the proper R6RS accessor — condition-message — rather than poking at
+; the raised condition's internal layout.
 (test-true "assert-message-has-form"
   (with-exception-handler
     (lambda (c)
       (and (condition? c)
-           (let ((msg (car (cdr c))))
+           (message-condition? c)
+           (let ((msg (condition-message c)))
              (and (string? msg)
                   (string-contains msg "(= 1 2)")))))
     (lambda () (assert (= 1 2)) #f)))

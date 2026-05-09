@@ -2463,11 +2463,26 @@ pub fn make_vm_continuation(id: u64) -> Value {
 }
 
 /// Build a "condition" value matching the tree-walker's `make_condition`:
-/// a list `(string("error") string(msg) irritants...)`.
+/// a compound `#("&compound-condition" #("&error") #("&message" msg)
+/// [#("&irritants" (irritants…))])`. Both tiers must produce the same shape
+/// because `with-exception-handler` callbacks observe the raw value.
 fn make_vm_condition(msg: String, irritants: Vec<Value>) -> Value {
-    let mut items = vec![Value::string("error"), Value::string(msg)];
-    items.extend(irritants);
-    Value::list(items)
+    let mk =
+        |items: Vec<Value>| -> Value { Value::Vector(Rc::new(std::cell::RefCell::new(items))) };
+    let mut simples = vec![
+        mk(vec![Value::string("&error")]),
+        mk(vec![Value::string("&message"), Value::string(msg)]),
+    ];
+    if !irritants.is_empty() {
+        simples.push(mk(vec![
+            Value::string("&irritants"),
+            Value::list(irritants),
+        ]));
+    }
+    let mut compound = Vec::with_capacity(1 + simples.len());
+    compound.push(Value::string("&compound-condition"));
+    compound.extend(simples);
+    mk(compound)
 }
 
 /// Synchronously call a VM procedure and return its result. Used by HO native

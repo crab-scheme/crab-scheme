@@ -249,6 +249,11 @@ fn conformance_copy_unfold_htfold() {
 }
 
 #[test]
+fn conformance_conditions_r6rs() {
+    run_conformance_file("conditions_r6rs.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -303,6 +308,7 @@ fn conformance_aggregate_count() {
                 "transcendental_io.scm",
                 "sorting_files.scm",
                 "copy_unfold_htfold.scm",
+                "conditions_r6rs.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

@@ -174,6 +174,35 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("error-object-message", b_error_object_message),
         ("error-object-irritants", b_error_object_irritants),
         ("assertion-violation?", b_assertion_violation_p),
+        // R6RS standard condition types — constructors
+        ("make-message-condition", b_make_message_condition),
+        ("make-irritants-condition", b_make_irritants_condition),
+        ("make-warning", b_make_warning),
+        ("make-serious-condition", b_make_serious_condition),
+        ("make-error", b_make_error),
+        ("make-violation", b_make_violation),
+        ("make-assertion-violation", b_make_assertion_violation),
+        (
+            "make-non-continuable-violation",
+            b_make_non_continuable_violation,
+        ),
+        ("make-who-condition", b_make_who_condition),
+        // R6RS standard condition types — predicates
+        ("message-condition?", b_message_condition_p),
+        ("irritants-condition?", b_irritants_condition_p),
+        ("warning?", b_warning_p),
+        ("serious-condition?", b_serious_condition_p),
+        ("error?", b_error_p),
+        ("violation?", b_violation_p),
+        ("non-continuable-violation?", b_non_continuable_violation_p),
+        ("who-condition?", b_who_condition_p),
+        // R6RS standard condition types — accessors
+        ("condition-message", b_condition_message),
+        ("condition-irritants", b_condition_irritants),
+        ("condition-who", b_condition_who),
+        // R6RS condition compounding
+        ("condition", b_condition),
+        ("simple-conditions", b_simple_conditions),
         // copy variants
         ("vector-copy", b_vector_copy),
         ("vector-copy!", b_vector_copy_bang),
@@ -1545,32 +1574,405 @@ fn b_string_ge(args: &[Value]) -> Result<Value, String> {
     string_chain("string>=?", args, |o| o != std::cmp::Ordering::Less)
 }
 
-// ---- conditions ----
+// ---- R6RS conditions ----
+//
+// Representation: every condition is a Vector tagged at slot 0 with a string.
+// A *compound* condition is `#("&compound-condition" simple1 simple2 ...)`,
+// where each `simple` is itself a vector `#("&<type>" field0 field1 ...)`.
+// A "simple" condition produced by a constructor like `make-message-condition`
+// is wrapped in a one-element compound for uniformity, so `condition?` is
+// always a single check and `simple-conditions` is always a slice.
+//
+// The standard R6RS hierarchy is hardcoded by `descendants_inclusive`. We
+// don't yet support user-defined condition types via `define-condition-type`;
+// that is a separate, larger change because our `define-record-type` doesn't
+// implement R6RS record subtyping yet.
 
-/// Construct a structured condition value: a Pair `('error message irritants...)`.
+const COND_COMPOUND_TAG: &str = "&compound-condition";
+const TAG_MESSAGE: &str = "&message";
+const TAG_IRRITANTS: &str = "&irritants";
+const TAG_WARNING: &str = "&warning";
+const TAG_SERIOUS: &str = "&serious";
+const TAG_ERROR: &str = "&error";
+const TAG_VIOLATION: &str = "&violation";
+const TAG_ASSERTION: &str = "&assertion";
+const TAG_NON_CONTINUABLE: &str = "&non-continuable";
+const TAG_WHO: &str = "&who";
+
+/// Inclusive descendants of an R6RS condition type. Used by predicates like
+/// `serious-condition?` to match any simple in `descendants_inclusive(parent)`.
+fn descendants_inclusive(parent: &str) -> &'static [&'static str] {
+    match parent {
+        TAG_SERIOUS => &[
+            TAG_SERIOUS,
+            TAG_ERROR,
+            TAG_VIOLATION,
+            TAG_ASSERTION,
+            TAG_NON_CONTINUABLE,
+        ],
+        TAG_VIOLATION => &[TAG_VIOLATION, TAG_ASSERTION, TAG_NON_CONTINUABLE],
+        TAG_ERROR => &[TAG_ERROR],
+        TAG_ASSERTION => &[TAG_ASSERTION],
+        TAG_NON_CONTINUABLE => &[TAG_NON_CONTINUABLE],
+        TAG_WARNING => &[TAG_WARNING],
+        TAG_MESSAGE => &[TAG_MESSAGE],
+        TAG_IRRITANTS => &[TAG_IRRITANTS],
+        TAG_WHO => &[TAG_WHO],
+        _ => &[],
+    }
+}
+
+fn is_known_simple_tag(s: &str) -> bool {
+    matches!(
+        s,
+        TAG_MESSAGE
+            | TAG_IRRITANTS
+            | TAG_WARNING
+            | TAG_SERIOUS
+            | TAG_ERROR
+            | TAG_VIOLATION
+            | TAG_ASSERTION
+            | TAG_NON_CONTINUABLE
+            | TAG_WHO
+    )
+}
+
+fn vec_first_tag(v: &Value) -> Option<String> {
+    if let Value::Vector(vc) = v {
+        let v = vc.borrow();
+        if let Some(Value::String(s)) = v.first() {
+            return Some(s.borrow().clone());
+        }
+    }
+    None
+}
+
+fn is_compound_cond(v: &Value) -> bool {
+    matches!(vec_first_tag(v).as_deref(), Some(COND_COMPOUND_TAG))
+}
+
+fn is_simple_cond(v: &Value) -> bool {
+    if let Some(t) = vec_first_tag(v) {
+        is_known_simple_tag(&t)
+    } else {
+        false
+    }
+}
+
+fn is_any_cond(v: &Value) -> bool {
+    is_compound_cond(v) || is_simple_cond(v)
+}
+
+/// Walk the simples of `cond`. For a compound, yields each element after
+/// slot 0. For a bare simple, yields itself once.
+fn for_each_simple(cond: &Value, mut f: impl FnMut(&Value)) {
+    if is_compound_cond(cond) {
+        if let Value::Vector(vc) = cond {
+            let v = vc.borrow();
+            for slot in v.iter().skip(1) {
+                f(slot);
+            }
+        }
+    } else if is_simple_cond(cond) {
+        f(cond);
+    }
+}
+
+fn cond_has_subtype(cond: &Value, parent: &str) -> bool {
+    let descs = descendants_inclusive(parent);
+    let mut found = false;
+    for_each_simple(cond, |s| {
+        if let Some(t) = vec_first_tag(s) {
+            if descs.iter().any(|d| *d == t) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+fn find_simple_with_tag(cond: &Value, tag: &str) -> Option<Value> {
+    let mut found: Option<Value> = None;
+    for_each_simple(cond, |s| {
+        if found.is_none() {
+            if let Some(t) = vec_first_tag(s) {
+                if t == tag {
+                    found = Some(s.clone());
+                }
+            }
+        }
+    });
+    found
+}
+
+/// Build a simple condition: `#("&<tag>" field0 field1 ...)`.
+fn make_simple(tag: &str, fields: Vec<Value>) -> Value {
+    let mut v = Vec::with_capacity(1 + fields.len());
+    v.push(Value::string(tag));
+    v.extend(fields);
+    new_vector(v)
+}
+
+/// Wrap a list of simples in a compound condition vector. Always wraps —
+/// even a single simple — so the data shape is uniform.
+fn make_compound(simples: Vec<Value>) -> Value {
+    let mut v = Vec::with_capacity(1 + simples.len());
+    v.push(Value::string(COND_COMPOUND_TAG));
+    v.extend(simples);
+    new_vector(v)
+}
+
+fn new_vector(items: Vec<Value>) -> Value {
+    Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(items)))
+}
+
+/// Append all simples of `cond` to `out`. Used by `condition` to flatten
+/// a list of conditions into one compound.
+fn flatten_simples(cond: &Value, out: &mut Vec<Value>) {
+    if is_compound_cond(cond) {
+        if let Value::Vector(vc) = cond {
+            let v = vc.borrow();
+            for slot in v.iter().skip(1) {
+                out.push(slot.clone());
+            }
+        }
+    } else if is_simple_cond(cond) {
+        out.push(cond.clone());
+    }
+}
+
+/// Internal builder used by the existing `error` / VM error path. Produces a
+/// compound condition with `&error`, `&message`, and (when non-empty) `&irritants`.
 fn make_condition(msg: String, irritants: Vec<Value>) -> Value {
-    let mut items = vec![Value::Symbol(cs_core::Symbol(0))]; // placeholder: replaced below if symbol available
-                                                             // We can't intern 'error here without a SymbolTable. The condition value
-                                                             // structure is opaque to most of the runtime — the tests check predicates,
-                                                             // not symbol identity. Use a string tag instead.
-    items[0] = Value::string("error");
-    items.push(Value::string(msg));
-    items.extend(irritants);
-    Value::list(items)
+    let mut simples = vec![
+        make_simple(TAG_ERROR, vec![]),
+        make_simple(TAG_MESSAGE, vec![Value::string(msg)]),
+    ];
+    if !irritants.is_empty() {
+        simples.push(make_simple(TAG_IRRITANTS, vec![Value::list(irritants)]));
+    }
+    make_compound(simples)
 }
 
 fn b_condition_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("condition?", "1", args.len()));
     }
-    // A condition is a non-empty pair whose first element is a string "error".
-    Ok(Value::Boolean(match &args[0] {
-        Value::Pair(p) => match &*p.car.borrow() {
-            Value::String(s) => s.borrow().as_str() == "error",
-            _ => false,
-        },
-        _ => false,
-    }))
+    Ok(Value::Boolean(is_any_cond(&args[0])))
+}
+
+// ---- standard simple-condition constructors ----
+
+fn b_make_message_condition(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("make-message-condition", "1", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(
+        TAG_MESSAGE,
+        vec![args[0].clone()],
+    )]))
+}
+
+fn b_make_irritants_condition(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("make-irritants-condition", "1", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(
+        TAG_IRRITANTS,
+        vec![args[0].clone()],
+    )]))
+}
+
+fn b_make_warning(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("make-warning", "0", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(TAG_WARNING, vec![])]))
+}
+
+fn b_make_serious_condition(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("make-serious-condition", "0", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(TAG_SERIOUS, vec![])]))
+}
+
+fn b_make_error(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("make-error", "0", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(TAG_ERROR, vec![])]))
+}
+
+fn b_make_violation(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("make-violation", "0", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(TAG_VIOLATION, vec![])]))
+}
+
+fn b_make_assertion_violation(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("make-assertion-violation", "0", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(TAG_ASSERTION, vec![])]))
+}
+
+fn b_make_non_continuable_violation(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("make-non-continuable-violation", "0", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(
+        TAG_NON_CONTINUABLE,
+        vec![],
+    )]))
+}
+
+fn b_make_who_condition(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("make-who-condition", "1", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(
+        TAG_WHO,
+        vec![args[0].clone()],
+    )]))
+}
+
+// ---- standard predicates (descendants-inclusive) ----
+
+fn b_message_condition_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("message-condition?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_MESSAGE)))
+}
+
+fn b_irritants_condition_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("irritants-condition?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_IRRITANTS)))
+}
+
+fn b_warning_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("warning?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_WARNING)))
+}
+
+fn b_serious_condition_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("serious-condition?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_SERIOUS)))
+}
+
+fn b_error_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("error?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_ERROR)))
+}
+
+fn b_violation_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("violation?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_VIOLATION)))
+}
+
+fn b_non_continuable_violation_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("non-continuable-violation?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(
+        &args[0],
+        TAG_NON_CONTINUABLE,
+    )))
+}
+
+fn b_who_condition_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("who-condition?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_WHO)))
+}
+
+// ---- standard accessors ----
+
+fn b_condition_message(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("condition-message", "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_MESSAGE)
+        .ok_or_else(|| "condition-message: not a message condition".to_string())?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() >= 2 {
+            return Ok(v[1].clone());
+        }
+    }
+    Err("condition-message: malformed".to_string())
+}
+
+fn b_condition_irritants(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("condition-irritants", "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_IRRITANTS)
+        .ok_or_else(|| "condition-irritants: not an irritants condition".to_string())?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() >= 2 {
+            return Ok(v[1].clone());
+        }
+    }
+    Err("condition-irritants: malformed".to_string())
+}
+
+fn b_condition_who(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("condition-who", "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_WHO)
+        .ok_or_else(|| "condition-who: not a who-condition".to_string())?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() >= 2 {
+            return Ok(v[1].clone());
+        }
+    }
+    Err("condition-who: malformed".to_string())
+}
+
+// ---- compound builders ----
+
+fn b_condition(args: &[Value]) -> Result<Value, String> {
+    let mut simples = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if !is_any_cond(a) {
+            return Err(format!(
+                "condition: arg {} is not a condition ({})",
+                i + 1,
+                a.type_name()
+            ));
+        }
+        flatten_simples(a, &mut simples);
+    }
+    Ok(make_compound(simples))
+}
+
+fn b_simple_conditions(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("simple-conditions", "1", args.len()));
+    }
+    if !is_any_cond(&args[0]) {
+        return Err(type_err("simple-conditions", "condition", &args[0]));
+    }
+    let mut out = Vec::new();
+    flatten_simples(&args[0], &mut out);
+    Ok(Value::list(out))
 }
 
 // ---- raise / error / with-exception-handler ----
@@ -3105,31 +3507,38 @@ fn b_eval(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
 }
 
 // ---- error-object accessors ----
-// Conditions are stored as a list `(message-string irritants...)` per our
-// `make_condition` helper. The accessors decode that shape.
+// `error-object?` is R7RS-flavored — it succeeds on any condition that
+// `error?` / `assertion-violation?` would, since both produce conditions
+// containing an `&error` simple. The message/irritants accessors decode the
+// `&message` / `&irritants` simples in the compound condition.
 
 fn b_error_object_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("error-object?", "1", args.len()));
     }
-    Ok(Value::Boolean(is_error_condition(&args[0])))
+    Ok(Value::Boolean(is_any_cond(&args[0])))
 }
 
 fn b_error_object_message(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("error-object-message", "1", args.len()));
     }
-    if !is_error_condition(&args[0]) {
+    if !is_any_cond(&args[0]) {
         return Err(type_err(
             "error-object-message",
             "error condition",
             &args[0],
         ));
     }
-    // condition shape: ("error" message irritants...). Skip "error" tag, take next.
-    if let Value::Pair(p) = &args[0] {
-        if let Value::Pair(rest) = &*p.cdr.borrow() {
-            return Ok(rest.car.borrow().clone());
+    // Empty string when the condition has no &message simple — keeps R7RS
+    // callers from blowing up on a `(error "no message")` shape we may have
+    // received from elsewhere.
+    if let Some(simple) = find_simple_with_tag(&args[0], TAG_MESSAGE) {
+        if let Value::Vector(vc) = simple {
+            let v = vc.borrow();
+            if v.len() >= 2 {
+                return Ok(v[1].clone());
+            }
         }
     }
     Ok(Value::string(""))
@@ -3139,29 +3548,22 @@ fn b_error_object_irritants(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("error-object-irritants", "1", args.len()));
     }
-    if !is_error_condition(&args[0]) {
+    if !is_any_cond(&args[0]) {
         return Err(type_err(
             "error-object-irritants",
             "error condition",
             &args[0],
         ));
     }
-    // Skip "error" tag and message; return the rest.
-    if let Value::Pair(p) = &args[0] {
-        if let Value::Pair(after_tag) = &*p.cdr.borrow() {
-            return Ok(after_tag.cdr.borrow().clone());
+    if let Some(simple) = find_simple_with_tag(&args[0], TAG_IRRITANTS) {
+        if let Value::Vector(vc) = simple {
+            let v = vc.borrow();
+            if v.len() >= 2 {
+                return Ok(v[1].clone());
+            }
         }
     }
     Ok(Value::Null)
-}
-
-fn is_error_condition(v: &Value) -> bool {
-    if let Value::Pair(p) = v {
-        if let Value::String(s) = &*p.car.borrow() {
-            return s.borrow().as_str() == "error";
-        }
-    }
-    false
 }
 
 // ---- make-parameter ----
@@ -3669,8 +4071,9 @@ fn b_assertion_violation_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("assertion-violation?", "1", args.len()));
     }
-    // For our flat condition shape, an assertion-violation is any `error` condition.
-    Ok(Value::Boolean(is_error_condition(&args[0])))
+    // R6RS: any condition containing an `&assertion` simple (or descendant —
+    // there are none in the standard hierarchy).
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_ASSERTION)))
 }
 
 // ---- copy variants ----

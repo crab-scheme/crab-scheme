@@ -68,9 +68,15 @@
 (hashtable-for-each (lambda (k v) (set! collected (cons k collected))) h)
 (test-eqv "ht-for-each-len" 3 (length collected))
 
-; assertion-violation? recognises raised conditions
-(test-true "assertion-violation-of-error"
+; error? recognises raised conditions; assertion-violation? does NOT
+; (R6RS distinguishes — `error` produces &error, not &assertion).
+(test-true "error-of-error"
+  (with-exception-handler
+    (lambda (c) (error? c))
+    (lambda () (error "oops"))))
+(test-false "assertion-violation-of-error"
   (with-exception-handler
     (lambda (c) (assertion-violation? c))
     (lambda () (error "oops"))))
 (test-false "assertion-violation-of-num" (assertion-violation? 42))
+(test-false "error-of-num" (error? 42))

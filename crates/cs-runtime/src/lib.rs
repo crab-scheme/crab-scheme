@@ -553,33 +553,87 @@ impl Runtime {
 }
 
 /// Render a raised condition value as a human-friendly error message.
-/// The condition shape produced by `error` / `make-condition` is a list
-/// `("error" "msg" irritants...)`. Other values fall back to a generic
-/// "uncaught: <value>" rendering using the runtime's symbol table.
+/// Shape produced by `error` / `make-condition` / R6RS condition constructors:
+/// a vector `#("&compound-condition" simple1 simple2 ...)` where each simple
+/// is `#("&<type>" field0 field1 ...)`. We pull the `&message` and
+/// `&irritants` simples out for display; other simples are reflected via a
+/// suffix listing their type tags so the user can see e.g. `[&assertion]`.
 fn format_condition(v: &Value, syms: &SymbolTable) -> String {
-    if let Value::Pair(p) = v {
-        // Check shape: list with first element string "error".
-        if let Value::String(tag) = &*p.car.borrow() {
-            if tag.borrow().as_str() == "error" {
-                let tail = p.cdr.borrow().clone();
-                let items: Vec<Value> = collect_list(&tail);
-                if !items.is_empty() {
-                    if let Value::String(msg) = &items[0] {
-                        let m = msg.borrow().clone();
-                        if items.len() == 1 {
-                            return format!("error: {}", m);
-                        }
-                        let irritants: Vec<String> = items[1..]
-                            .iter()
-                            .map(|i| i.format_with(syms, WriteMode::Write))
-                            .collect();
-                        return format!("error: {} ({})", m, irritants.join(" "));
+    let simples = collect_condition_simples(v);
+    if simples.is_empty() {
+        return format!("uncaught: {}", v.format_with(syms, WriteMode::Write));
+    }
+    let mut msg: Option<String> = None;
+    let mut irritants: Vec<Value> = Vec::new();
+    let mut other_tags: Vec<String> = Vec::new();
+    for simple in &simples {
+        if let Some((tag, fields)) = decompose_simple(simple) {
+            match tag.as_str() {
+                "&message" => {
+                    if let Some(Value::String(s)) = fields.first() {
+                        msg = Some(s.borrow().clone());
                     }
                 }
+                "&irritants" => {
+                    if let Some(list) = fields.first() {
+                        irritants = collect_list(list);
+                    }
+                }
+                "&error" => {} // implied by "error:" prefix
+                other => other_tags.push(format!("[{}]", other)),
             }
         }
     }
-    format!("uncaught: {}", v.format_with(syms, WriteMode::Write))
+    let mut out = String::from("error:");
+    if let Some(m) = msg {
+        out.push(' ');
+        out.push_str(&m);
+    }
+    if !irritants.is_empty() {
+        let irritant_strs: Vec<String> = irritants
+            .iter()
+            .map(|i| i.format_with(syms, WriteMode::Write))
+            .collect();
+        out.push_str(&format!(" ({})", irritant_strs.join(" ")));
+    }
+    if !other_tags.is_empty() {
+        out.push(' ');
+        out.push_str(&other_tags.join(" "));
+    }
+    out
+}
+
+/// Return the simple conditions of `v`, or an empty vec if `v` is not a
+/// condition vector. Mirrors the runtime helper `for_each_simple` but works
+/// without depending on the builtins module.
+fn collect_condition_simples(v: &Value) -> Vec<Value> {
+    let Value::Vector(vc) = v else {
+        return Vec::new();
+    };
+    let inner = vc.borrow();
+    let Some(Value::String(tag)) = inner.first() else {
+        return Vec::new();
+    };
+    let tag = tag.borrow();
+    if tag.as_str() == "&compound-condition" {
+        inner.iter().skip(1).cloned().collect()
+    } else if tag.as_str().starts_with('&') {
+        vec![v.clone()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Pull a simple condition apart into (tag, fields).
+fn decompose_simple(v: &Value) -> Option<(String, Vec<Value>)> {
+    let Value::Vector(vc) = v else { return None };
+    let inner = vc.borrow();
+    let Some(Value::String(tag)) = inner.first() else {
+        return None;
+    };
+    let tag_str = tag.borrow().clone();
+    let fields: Vec<Value> = inner.iter().skip(1).cloned().collect();
+    Some((tag_str, fields))
 }
 
 fn collect_list(v: &Value) -> Vec<Value> {

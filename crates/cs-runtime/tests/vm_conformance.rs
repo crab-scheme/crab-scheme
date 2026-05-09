@@ -374,3 +374,11 @@ fn vm_conformance_hashtables() {
     println!("hashtables: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_conditions_r6rs() {
+    let walker = pass_count_walker("conditions_r6rs.scm");
+    let vm = pass_count_vm("conditions_r6rs.scm").expect("vm should run conditions_r6rs.scm");
+    println!("conditions_r6rs: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
