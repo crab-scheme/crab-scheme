@@ -26,8 +26,8 @@ pub fn eq(a: &Value, b: &Value) -> bool {
         (Value::ByteVector(x), Value::ByteVector(y)) => crate::Gc::ptr_eq(x, y),
         (Value::Procedure(x), Value::Procedure(y)) => Rc::ptr_eq(x, y),
         (Value::Hashtable(x), Value::Hashtable(y)) => crate::Gc::ptr_eq(x, y),
-        (Value::Port(x), Value::Port(y)) => Rc::ptr_eq(x, y),
-        (Value::Promise(x), Value::Promise(y)) => Rc::ptr_eq(x, y),
+        (Value::Port(x), Value::Port(y)) => crate::Gc::ptr_eq(x, y),
+        (Value::Promise(x), Value::Promise(y)) => crate::Gc::ptr_eq(x, y),
         _ => false,
     }
 }

@@ -136,30 +136,30 @@ pub struct ByteVectorInputState {
 }
 
 impl Port {
-    pub fn string_input(s: &str) -> Rc<Self> {
-        Rc::new(Port::StringInput(RefCell::new(StringInputState {
+    pub fn string_input(s: &str) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Port::StringInput(RefCell::new(StringInputState {
             chars: s.chars().collect(),
             pos: 0,
         })))
     }
 
-    pub fn string_output() -> Rc<Self> {
-        Rc::new(Port::StringOutput(RefCell::new(String::new())))
+    pub fn string_output() -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Port::StringOutput(RefCell::new(String::new())))
     }
 
-    pub fn bytevector_input(bytes: Vec<u8>) -> Rc<Self> {
-        Rc::new(Port::ByteVectorInput(RefCell::new(ByteVectorInputState {
+    pub fn bytevector_input(bytes: Vec<u8>) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Port::ByteVectorInput(RefCell::new(ByteVectorInputState {
             bytes,
             pos: 0,
         })))
     }
 
-    pub fn bytevector_output() -> Rc<Self> {
-        Rc::new(Port::ByteVectorOutput(RefCell::new(Vec::new())))
+    pub fn bytevector_output() -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Port::ByteVectorOutput(RefCell::new(Vec::new())))
     }
 
-    pub fn file_output(path: String) -> Rc<Self> {
-        Rc::new(Port::FileOutput(RefCell::new(FileOutputState {
+    pub fn file_output(path: String) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Port::FileOutput(RefCell::new(FileOutputState {
             path,
             buf: Vec::new(),
             closed: false,
@@ -192,6 +192,14 @@ impl Port {
     }
 }
 
+impl cs_gc::Trace for Port {
+    fn trace(&self, _marker: &mut cs_gc::Marker) {
+        // Leaf: every Port variant holds either chars/bytes/Strings or a
+        // file-output buffer. None contain a Value or Gc<T>, so there's
+        // nothing to mark transitively.
+    }
+}
+
 /// A R5RS/R6RS promise. Memoized lazy value.
 #[derive(Debug)]
 pub struct Promise {
@@ -207,10 +215,18 @@ pub enum PromiseState {
 }
 
 impl Promise {
-    pub fn pending(thunk: Value) -> Rc<Self> {
-        Rc::new(Promise {
+    pub fn pending(thunk: Value) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Promise {
             state: RefCell::new(PromiseState::Pending(thunk)),
         })
+    }
+}
+
+impl cs_gc::Trace for Promise {
+    fn trace(&self, marker: &mut cs_gc::Marker) {
+        match &*self.state.borrow() {
+            PromiseState::Pending(v) | PromiseState::Forced(v) => v.trace(marker),
+        }
     }
 }
 
@@ -263,8 +279,8 @@ pub enum Value {
     ByteVector(crate::Gc<RefCell<Vec<u8>>>),
     Procedure(Rc<dyn Procedure>),
     Hashtable(crate::Gc<Hashtable>),
-    Port(Rc<Port>),
-    Promise(Rc<Promise>),
+    Port(crate::Gc<Port>),
+    Promise(crate::Gc<Promise>),
 }
 
 /// Format mode for [`Value::write_to`].
@@ -292,8 +308,10 @@ impl cs_gc::Trace for Value {
             Value::Vector(v) => v.trace(marker),
             Value::Pair(p) => p.trace(marker),
             Value::Hashtable(h) => h.trace(marker),
+            Value::Port(p) => p.trace(marker),
+            Value::Promise(p) => p.trace(marker),
             // Not yet migrated — Rc-backed, no trace needed.
-            Value::Procedure(_) | Value::Port(_) | Value::Promise(_) => {}
+            Value::Procedure(_) => {}
             // Leaf variants — no heap pointers.
             Value::Null
             | Value::Unspecified

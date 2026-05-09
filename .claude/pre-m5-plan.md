@@ -97,11 +97,17 @@ but doing it before M5 keeps the runtime/env story stable.
 ✅ `Value::String`
 ✅ `Value::ByteVector`
 ✅ `Value::Vector`
-✅ `Value::Pair`       (this iter)
-✅ `Value::Hashtable`  (this iter)
-⬜ `Value::Port`       — `Rc<Port>`; needs Trace impl on Port (leaf)
-⬜ `Value::Procedure`  — `Rc<dyn Procedure>` (DST; unsized Slot needs care)
-⬜ `Value::Promise`    — `Rc<Promise>`; needs Trace on PromiseState
+✅ `Value::Pair`
+✅ `Value::Hashtable`
+✅ `Value::Port`       (this iter)
+✅ `Value::Promise`    (this iter)
+⬜ `Value::Procedure`  — last one; `Rc<dyn Procedure>` is a DST so
+                        either (a) add Trace as a supertrait of
+                        Procedure (forcing impls in every concrete
+                        proc type) or (b) keep Procedure on Rc and
+                        accept that Phase 1 leaks closures-in-cycles.
+                        Pick (a) — the right architectural call —
+                        when this lands.
 
 Each variant adds a `marker.mark(...)` call in the `Trace for Value`
 match; non-migrated variants stay no-op until they migrate.
