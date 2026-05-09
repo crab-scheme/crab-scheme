@@ -503,3 +503,12 @@ fn vm_conformance_string_extras() {
     println!("string_extras: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_numeric_char_predicates() {
+    let walker = pass_count_walker("numeric_char_predicates.scm");
+    let vm = pass_count_vm("numeric_char_predicates.scm")
+        .expect("vm should run numeric_char_predicates.scm");
+    println!("numeric_char_predicates: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

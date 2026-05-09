@@ -78,6 +78,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // type predicates
         ("number?", b_number_p),
         ("integer?", b_integer_p),
+        ("fixnum?", b_fixnum_p),
+        ("flonum?", b_flonum_p),
+        ("rational?", b_rational_p),
         ("boolean?", b_boolean_p),
         ("pair?", b_pair_p),
         ("null?", b_null_p),
@@ -147,6 +150,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("integer->char", b_integer_to_char),
         ("char-upcase", b_char_upcase),
         ("char-downcase", b_char_downcase),
+        ("char-foldcase", b_char_foldcase),
+        ("char-titlecase", b_char_titlecase),
+        ("digit-value", b_digit_value),
         ("char-alphabetic?", b_char_alphabetic),
         ("char-numeric?", b_char_numeric),
         ("char-whitespace?", b_char_whitespace),
@@ -903,6 +909,44 @@ fn b_integer_p(args: &[Value]) -> Result<Value, String> {
     }
     Ok(Value::Boolean(match &args[0] {
         Value::Number(n) => n.is_integer(),
+        _ => false,
+    }))
+}
+
+/// `(fixnum? v)` — true iff v is an exact integer that fits in i64.
+/// R6RS-style. Bignums and rationals/flonums all return #f.
+fn b_fixnum_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("fixnum?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(
+        &args[0],
+        Value::Number(Number::Fixnum(_))
+    )))
+}
+
+/// `(flonum? v)` — true iff v is an inexact real (Number::Flonum). R6RS.
+fn b_flonum_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("flonum?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(
+        &args[0],
+        Value::Number(Number::Flonum(_))
+    )))
+}
+
+/// `(rational? v)` — true for any number except non-finite flonums.
+/// All exact integers and exact rationals qualify; finite flonums are
+/// also rational per R6RS (every finite real is exactly representable
+/// as a ratio in principle).
+fn b_rational_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("rational?", "1", args.len()));
+    }
+    Ok(Value::Boolean(match &args[0] {
+        Value::Number(Number::Flonum(f)) => f.is_finite(),
+        Value::Number(_) => true, // Fixnum / Big / Rational are all rational
         _ => false,
     }))
 }
@@ -3070,6 +3114,53 @@ fn b_char_downcase(args: &[Value]) -> Result<Value, String> {
             Ok(Value::Character(down))
         }
         v => Err(type_err("char-downcase", "character", v)),
+    }
+}
+
+/// `(char-foldcase c)` — case-folding for case-insensitive comparison.
+/// For ASCII this matches `char-downcase`; full Unicode folding (e.g.
+/// ß → ss, which produces multiple chars) is not yet implemented.
+fn b_char_foldcase(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("char-foldcase", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Character(c) => {
+            let folded = c.to_lowercase().next().unwrap_or(*c);
+            Ok(Value::Character(folded))
+        }
+        v => Err(type_err("char-foldcase", "character", v)),
+    }
+}
+
+/// `(char-titlecase c)` — uppercase the character. Title-case differs
+/// from upper-case for a few Unicode chars (e.g. ǳ vs Ǳ vs ǲ); for
+/// now we approximate with uppercase.
+fn b_char_titlecase(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("char-titlecase", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Character(c) => {
+            let up = c.to_uppercase().next().unwrap_or(*c);
+            Ok(Value::Character(up))
+        }
+        v => Err(type_err("char-titlecase", "character", v)),
+    }
+}
+
+/// `(digit-value c)` — for a numeric digit character, returns the
+/// integer it represents; for non-digits returns #f. R6RS spec.
+fn b_digit_value(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("digit-value", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Character(c) => match c.to_digit(10) {
+            Some(d) => Ok(Value::fixnum(d as i64)),
+            None => Ok(Value::Boolean(false)),
+        },
+        v => Err(type_err("digit-value", "character", v)),
     }
 }
 

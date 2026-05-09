@@ -334,6 +334,11 @@ fn conformance_string_extras() {
 }
 
 #[test]
+fn conformance_numeric_char_predicates() {
+    run_conformance_file("numeric_char_predicates.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -405,6 +410,7 @@ fn conformance_aggregate_count() {
                 "cxxr_accessors.scm",
                 "srfi1_extras.scm",
                 "string_extras.scm",
+                "numeric_char_predicates.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
