@@ -384,6 +384,11 @@ fn conformance_endianness_macro() {
 }
 
 #[test]
+fn conformance_string_search() {
+    run_conformance_file("string_search.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -465,6 +470,7 @@ fn conformance_aggregate_count() {
                 "bytevector_typed.scm",
                 "ho_dispatch_hoist.scm",
                 "endianness_macro.scm",
+                "string_search.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

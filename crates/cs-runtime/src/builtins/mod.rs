@@ -284,6 +284,11 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("string-trim-right", b_string_trim_right),
         ("string-contains", b_string_contains),
         ("string-index", b_string_index),
+        ("string-index-right", b_string_index_right),
+        ("string-contains-right", b_string_contains_right),
+        ("string-replace", b_string_replace),
+        ("string-replace-all", b_string_replace_all),
+        ("string-count", b_string_count),
         ("string-split", b_string_split),
         ("string-join", b_string_join),
         ("string->vector", b_string_to_vector),
@@ -7262,6 +7267,131 @@ fn b_string_index(args: &[Value]) -> Result<Value, String> {
         Some(i) => Value::fixnum(i as i64),
         None => Value::Boolean(false),
     })
+}
+
+/// SRFI-13 `string-index-right` — find the rightmost char (or rightmost
+/// substring char index) matching the target. Returns #f on no match.
+fn b_string_index_right(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("string-index-right", "2", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-index-right", "string", v)),
+    };
+    let target = match &args[1] {
+        Value::Character(c) => *c,
+        v => return Err(type_err("string-index-right", "character", v)),
+    };
+    let chars: Vec<char> = s.chars().collect();
+    Ok(match chars.iter().rposition(|c| *c == target) {
+        Some(i) => Value::fixnum(i as i64),
+        None => Value::Boolean(false),
+    })
+}
+
+/// SRFI-13-flavored `string-contains-right` — find the last char-index
+/// where the needle starts within the haystack, or #f.
+fn b_string_contains_right(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("string-contains-right", "2", args.len()));
+    }
+    let haystack = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-contains-right", "string", v)),
+    };
+    let needle = match &args[1] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-contains-right", "string", v)),
+    };
+    Ok(match haystack.rfind(&needle) {
+        Some(byte_idx) => {
+            let char_idx = haystack[..byte_idx].chars().count() as i64;
+            Value::fixnum(char_idx)
+        }
+        None => Value::Boolean(false),
+    })
+}
+
+/// `string-replace` — replace the first occurrence of `from` with `to`.
+/// Returns the original string when there's no match.
+fn b_string_replace(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("string-replace", "3", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-replace", "string", v)),
+    };
+    let from = match &args[1] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-replace", "string", v)),
+    };
+    let to = match &args[2] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-replace", "string", v)),
+    };
+    if from.is_empty() {
+        return Err("string-replace: empty pattern".into());
+    }
+    let out = match s.find(&from) {
+        Some(idx) => {
+            let mut result = String::with_capacity(s.len() + to.len());
+            result.push_str(&s[..idx]);
+            result.push_str(&to);
+            result.push_str(&s[idx + from.len()..]);
+            result
+        }
+        None => s,
+    };
+    Ok(Value::string(out))
+}
+
+/// `string-replace-all` — replace every occurrence of `from` with `to`.
+fn b_string_replace_all(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("string-replace-all", "3", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-replace-all", "string", v)),
+    };
+    let from = match &args[1] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-replace-all", "string", v)),
+    };
+    let to = match &args[2] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-replace-all", "string", v)),
+    };
+    if from.is_empty() {
+        return Err("string-replace-all: empty pattern".into());
+    }
+    Ok(Value::string(s.replace(&from, &to)))
+}
+
+/// `string-count` — count occurrences of a character or substring.
+fn b_string_count(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("string-count", "2", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-count", "string", v)),
+    };
+    let count = match &args[1] {
+        Value::Character(c) => s.chars().filter(|x| x == c).count() as i64,
+        Value::String(needle) => {
+            let needle = needle.borrow();
+            if needle.is_empty() {
+                0
+            } else {
+                s.matches(needle.as_str()).count() as i64
+            }
+        }
+        v => return Err(type_err("string-count", "character or string", v)),
+    };
+    Ok(Value::fixnum(count))
 }
 
 fn b_string_split(args: &[Value]) -> Result<Value, String> {

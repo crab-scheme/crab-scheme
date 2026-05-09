@@ -584,3 +584,11 @@ fn vm_conformance_endianness_macro() {
     println!("endianness_macro: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_string_search() {
+    let walker = pass_count_walker("string_search.scm");
+    let vm = pass_count_vm("string_search.scm").expect("vm should run string_search.scm");
+    println!("string_search: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
