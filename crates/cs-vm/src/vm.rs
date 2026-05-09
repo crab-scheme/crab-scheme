@@ -1551,7 +1551,196 @@ fn run_dispatch(
                         .ok_or_else(|| VmError::new("empty stack on Return"));
                 }
             }
+            // ---- 2-arg fixnum primops (specialized fast paths) ----
+            // Each pops b then a; on a Fixnum/Fixnum match runs the fast
+            // path; otherwise falls back to the generic Number arithmetic
+            // (which handles bignum/rational/flonum + reports type errors).
+            Inst::AddFx2 => {
+                fixnum_binop2(stack, &mut |a: i64, b: i64| a.checked_add(b)).or_else(|args| {
+                    let r = generic_arith2(args, GenericArith::Add, inst_ip, &frame.spans, syms)?;
+                    stack.push(r);
+                    Ok::<(), VmError>(())
+                })?;
+            }
+            Inst::SubFx2 => {
+                fixnum_binop2(stack, &mut |a: i64, b: i64| a.checked_sub(b)).or_else(|args| {
+                    let r = generic_arith2(args, GenericArith::Sub, inst_ip, &frame.spans, syms)?;
+                    stack.push(r);
+                    Ok::<(), VmError>(())
+                })?;
+            }
+            Inst::MulFx2 => {
+                fixnum_binop2(stack, &mut |a: i64, b: i64| a.checked_mul(b)).or_else(|args| {
+                    let r = generic_arith2(args, GenericArith::Mul, inst_ip, &frame.spans, syms)?;
+                    stack.push(r);
+                    Ok::<(), VmError>(())
+                })?;
+            }
+            Inst::LtFx2 => {
+                fixnum_cmp2(stack, &mut |a: i64, b: i64| a < b).or_else(|args| {
+                    let r = generic_cmp2(args, GenericCmp::Lt, inst_ip, &frame.spans, syms)?;
+                    stack.push(r);
+                    Ok::<(), VmError>(())
+                })?;
+            }
+            Inst::LeFx2 => {
+                fixnum_cmp2(stack, &mut |a: i64, b: i64| a <= b).or_else(|args| {
+                    let r = generic_cmp2(args, GenericCmp::Le, inst_ip, &frame.spans, syms)?;
+                    stack.push(r);
+                    Ok::<(), VmError>(())
+                })?;
+            }
+            Inst::GtFx2 => {
+                fixnum_cmp2(stack, &mut |a: i64, b: i64| a > b).or_else(|args| {
+                    let r = generic_cmp2(args, GenericCmp::Gt, inst_ip, &frame.spans, syms)?;
+                    stack.push(r);
+                    Ok::<(), VmError>(())
+                })?;
+            }
+            Inst::GeFx2 => {
+                fixnum_cmp2(stack, &mut |a: i64, b: i64| a >= b).or_else(|args| {
+                    let r = generic_cmp2(args, GenericCmp::Ge, inst_ip, &frame.spans, syms)?;
+                    stack.push(r);
+                    Ok::<(), VmError>(())
+                })?;
+            }
+            Inst::EqFx2 => {
+                fixnum_cmp2(stack, &mut |a: i64, b: i64| a == b).or_else(|args| {
+                    let r = generic_cmp2(args, GenericCmp::Eq, inst_ip, &frame.spans, syms)?;
+                    stack.push(r);
+                    Ok::<(), VmError>(())
+                })?;
+            }
         }
+    }
+}
+
+/// Fast-path arithmetic on two fixnums. On (Fixnum, Fixnum) where the op
+/// produces no overflow, pushes the result and returns Ok(()). Otherwise
+/// returns Err((a, b)) with the original values for the slow path.
+fn fixnum_binop2(
+    stack: &mut Vec<Value>,
+    op: &mut dyn FnMut(i64, i64) -> Option<i64>,
+) -> Result<(), (Value, Value)> {
+    let b = stack.pop().expect("stack underflow on fxop");
+    let a = stack.pop().expect("stack underflow on fxop");
+    if let (
+        Value::Number(cs_core::Number::Fixnum(av)),
+        Value::Number(cs_core::Number::Fixnum(bv)),
+    ) = (&a, &b)
+    {
+        if let Some(r) = op(*av, *bv) {
+            stack.push(Value::fixnum(r));
+            return Ok(());
+        }
+    }
+    Err((a, b))
+}
+
+fn fixnum_cmp2(
+    stack: &mut Vec<Value>,
+    op: &mut dyn FnMut(i64, i64) -> bool,
+) -> Result<(), (Value, Value)> {
+    let b = stack.pop().expect("stack underflow on fxcmp");
+    let a = stack.pop().expect("stack underflow on fxcmp");
+    if let (
+        Value::Number(cs_core::Number::Fixnum(av)),
+        Value::Number(cs_core::Number::Fixnum(bv)),
+    ) = (&a, &b)
+    {
+        stack.push(Value::Boolean(op(*av, *bv)));
+        return Ok(());
+    }
+    Err((a, b))
+}
+
+#[derive(Clone, Copy)]
+enum GenericArith {
+    Add,
+    Sub,
+    Mul,
+}
+
+#[derive(Clone, Copy)]
+enum GenericCmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+}
+
+fn generic_arith2(
+    (a, b): (Value, Value),
+    op: GenericArith,
+    inst_ip: usize,
+    spans: &[Span],
+    _syms: &mut SymbolTable,
+) -> Result<Value, VmError> {
+    let an = as_number(&a, op_arith_name(op)).map_err(|m| {
+        VmError::new(m).with_span(spans.get(inst_ip).copied().unwrap_or(Span::DUMMY))
+    })?;
+    let bn = as_number(&b, op_arith_name(op)).map_err(|m| {
+        VmError::new(m).with_span(spans.get(inst_ip).copied().unwrap_or(Span::DUMMY))
+    })?;
+    let r = match op {
+        GenericArith::Add => an.add(&bn),
+        GenericArith::Sub => an.sub(&bn),
+        GenericArith::Mul => an.mul(&bn),
+    };
+    Ok(Value::Number(r))
+}
+
+fn generic_cmp2(
+    (a, b): (Value, Value),
+    op: GenericCmp,
+    inst_ip: usize,
+    spans: &[Span],
+    _syms: &mut SymbolTable,
+) -> Result<Value, VmError> {
+    let an = as_number(&a, op_cmp_name(op)).map_err(|m| {
+        VmError::new(m).with_span(spans.get(inst_ip).copied().unwrap_or(Span::DUMMY))
+    })?;
+    let bn = as_number(&b, op_cmp_name(op)).map_err(|m| {
+        VmError::new(m).with_span(spans.get(inst_ip).copied().unwrap_or(Span::DUMMY))
+    })?;
+    let ord = an.cmp(&bn);
+    let result = match op {
+        GenericCmp::Lt => ord == std::cmp::Ordering::Less,
+        GenericCmp::Le => ord != std::cmp::Ordering::Greater,
+        GenericCmp::Gt => ord == std::cmp::Ordering::Greater,
+        GenericCmp::Ge => ord != std::cmp::Ordering::Less,
+        GenericCmp::Eq => an.eq_value(&bn),
+    };
+    Ok(Value::Boolean(result))
+}
+
+fn as_number(v: &Value, name: &str) -> Result<cs_core::Number, String> {
+    match v {
+        Value::Number(n) => Ok(n.clone()),
+        other => Err(format!(
+            "{}: expected number, got {}",
+            name,
+            other.type_name()
+        )),
+    }
+}
+
+fn op_arith_name(op: GenericArith) -> &'static str {
+    match op {
+        GenericArith::Add => "+",
+        GenericArith::Sub => "-",
+        GenericArith::Mul => "*",
+    }
+}
+
+fn op_cmp_name(op: GenericCmp) -> &'static str {
+    match op {
+        GenericCmp::Lt => "<",
+        GenericCmp::Le => "<=",
+        GenericCmp::Gt => ">",
+        GenericCmp::Ge => ">=",
+        GenericCmp::Eq => "=",
     }
 }
 

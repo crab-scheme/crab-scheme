@@ -35,6 +35,28 @@ pub enum Inst {
     MakeClosure(usize),
     /// Return from current call frame; top of stack is the return value.
     Return,
+
+    // ---- 2-arg fixnum primops (specialized fast paths for common
+    // arithmetic). The compiler emits these when the App's function is
+    // an unshadowed reference to a standard primitive in the runtime's
+    // globals snapshot. The VM checks both operands at runtime; on a
+    // type / overflow miss, falls back to the generic Number arithmetic.
+    /// `(+  a b)` — pop b, pop a, push result.
+    AddFx2,
+    /// `(-  a b)`
+    SubFx2,
+    /// `(*  a b)`
+    MulFx2,
+    /// `(<  a b)` — pushes #t / #f.
+    LtFx2,
+    /// `(<= a b)`
+    LeFx2,
+    /// `(>  a b)`
+    GtFx2,
+    /// `(>= a b)`
+    GeFx2,
+    /// `(=  a b)` — pushes #t / #f.
+    EqFx2,
 }
 
 /// A compiled program: instructions plus a table of nested compiled lambdas.

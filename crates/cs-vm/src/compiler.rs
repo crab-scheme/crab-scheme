@@ -31,6 +31,23 @@ pub fn compile(expr: &CoreExpr) -> Result<Bytecode, CompileError> {
     compile_with_globals(expr, &HashMap::new())
 }
 
+/// Standard 2-arg primops that the compiler can specialize when the App's
+/// function references the matching name AND that name is in `globals`
+/// AND it's not shadowed by any enclosing scope. The runtime supplies the
+/// Symbol-keyed map; we never compare value identity so the runtime can
+/// regenerate the map cheaply each compile.
+#[derive(Clone, Copy, Debug)]
+pub enum PrimOp {
+    Add,
+    Sub,
+    Mul,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+}
+
 /// Compile with a snapshot of immutable global bindings. Refs that resolve to
 /// names in `globals` AND aren't shadowed by any enclosing lambda/letrec
 /// binding are folded to `Inst::Const(value)` — saving an env-chain HashMap
@@ -39,10 +56,29 @@ pub fn compile_with_globals(
     expr: &CoreExpr,
     globals: &HashMap<Symbol, Value>,
 ) -> Result<Bytecode, CompileError> {
+    compile_with_globals_and_primops(expr, globals, &HashMap::new())
+}
+
+/// Like [`compile_with_globals`] but also takes a primop dispatch map. The
+/// compiler emits specialized opcodes (AddFx2, LtFx2, ...) for 2-arg calls
+/// whose function is an unshadowed Ref to a name in the map.
+pub fn compile_with_globals_and_primops(
+    expr: &CoreExpr,
+    globals: &HashMap<Symbol, Value>,
+    primops: &HashMap<Symbol, PrimOp>,
+) -> Result<Bytecode, CompileError> {
     let mut buf = InstBuf::new();
     let mut lambdas: Vec<CompiledLambda> = Vec::new();
     let mut scope: Vec<HashSet<Symbol>> = Vec::new();
-    compile_expr(expr, &mut buf, &mut lambdas, true, globals, &mut scope)?;
+    compile_expr(
+        expr,
+        &mut buf,
+        &mut lambdas,
+        true,
+        globals,
+        primops,
+        &mut scope,
+    )?;
     let (insts, spans) = buf.finish();
     Ok(Bytecode {
         insts: Rc::new(insts),
@@ -88,12 +124,26 @@ fn is_locally_bound(scope: &[HashSet<Symbol>], name: Symbol) -> bool {
     scope.iter().any(|s| s.contains(&name))
 }
 
+fn primop_to_inst(op: PrimOp) -> Inst {
+    match op {
+        PrimOp::Add => Inst::AddFx2,
+        PrimOp::Sub => Inst::SubFx2,
+        PrimOp::Mul => Inst::MulFx2,
+        PrimOp::Lt => Inst::LtFx2,
+        PrimOp::Le => Inst::LeFx2,
+        PrimOp::Gt => Inst::GtFx2,
+        PrimOp::Ge => Inst::GeFx2,
+        PrimOp::Eq => Inst::EqFx2,
+    }
+}
+
 fn compile_expr(
     expr: &CoreExpr,
     out: &mut InstBuf,
     lambdas: &mut Vec<CompiledLambda>,
     is_tail: bool,
     globals: &HashMap<Symbol, Value>,
+    primops: &HashMap<Symbol, PrimOp>,
     scope: &mut Vec<HashSet<Symbol>>,
 ) -> Result<(), CompileError> {
     let span = expr.span();
@@ -119,7 +169,7 @@ fn compile_expr(
             value,
             span: s,
         } => {
-            compile_expr(value, out, lambdas, false, globals, scope)?;
+            compile_expr(value, out, lambdas, false, globals, primops, scope)?;
             out.push(Inst::SetVar(*name), *s);
             out.push(Inst::Const(Value::Unspecified), *s);
             Ok(())
@@ -130,15 +180,15 @@ fn compile_expr(
             alt,
             span: s,
         } => {
-            compile_expr(cond, out, lambdas, false, globals, scope)?;
+            compile_expr(cond, out, lambdas, false, globals, primops, scope)?;
             let jif_idx = out.len();
             out.push(Inst::JumpIfFalse(usize::MAX), *s);
-            compile_expr(then, out, lambdas, is_tail, globals, scope)?;
+            compile_expr(then, out, lambdas, is_tail, globals, primops, scope)?;
             let jmp_idx = out.len();
             out.push(Inst::Jump(usize::MAX), *s);
             let alt_start = out.len();
             out.replace(jif_idx, Inst::JumpIfFalse(alt_start));
-            compile_expr(alt, out, lambdas, is_tail, globals, scope)?;
+            compile_expr(alt, out, lambdas, is_tail, globals, primops, scope)?;
             let after = out.len();
             out.replace(jmp_idx, Inst::Jump(after));
             Ok(())
@@ -150,7 +200,7 @@ fn compile_expr(
             }
             for (i, e) in exprs.iter().enumerate() {
                 let last = i + 1 == exprs.len();
-                compile_expr(e, out, lambdas, is_tail && last, globals, scope)?;
+                compile_expr(e, out, lambdas, is_tail && last, globals, primops, scope)?;
                 if !last {
                     out.push(Inst::Pop, e.span());
                 }
@@ -162,9 +212,23 @@ fn compile_expr(
             args,
             span: s,
         } => {
-            compile_expr(func, out, lambdas, false, globals, scope)?;
+            // Specialize 2-arg calls whose function is an unshadowed Ref
+            // to a known primop name (e.g. (+ a b) -> AddFx2).
+            if args.len() == 2 {
+                if let CoreExpr::Ref { name, .. } = &**func {
+                    if !is_locally_bound(scope, *name) {
+                        if let Some(op) = primops.get(name).copied() {
+                            compile_expr(&args[0], out, lambdas, false, globals, primops, scope)?;
+                            compile_expr(&args[1], out, lambdas, false, globals, primops, scope)?;
+                            out.push(primop_to_inst(op), *s);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            compile_expr(func, out, lambdas, false, globals, primops, scope)?;
             for a in args {
-                compile_expr(a, out, lambdas, false, globals, scope)?;
+                compile_expr(a, out, lambdas, false, globals, primops, scope)?;
             }
             if is_tail {
                 out.push(Inst::TailCall(args.len()), *s);
@@ -185,7 +249,7 @@ fn compile_expr(
             }
             scope.push(frame);
             let mut body_buf = InstBuf::new();
-            compile_expr(body, &mut body_buf, lambdas, true, globals, scope)?;
+            compile_expr(body, &mut body_buf, lambdas, true, globals, primops, scope)?;
             body_buf.push(Inst::Return, body.span());
             scope.pop();
             let (fixed, rest) = match params {
@@ -215,10 +279,10 @@ fn compile_expr(
                 body_buf.push(Inst::DefineLocal(*name), *s);
             }
             for (name, expr) in bindings {
-                compile_expr(expr, &mut body_buf, lambdas, false, globals, scope)?;
+                compile_expr(expr, &mut body_buf, lambdas, false, globals, primops, scope)?;
                 body_buf.push(Inst::DefineLocal(*name), expr.span());
             }
-            compile_expr(body, &mut body_buf, lambdas, true, globals, scope)?;
+            compile_expr(body, &mut body_buf, lambdas, true, globals, primops, scope)?;
             body_buf.push(Inst::Return, body.span());
             scope.pop();
             let (body_insts, body_spans) = body_buf.finish();

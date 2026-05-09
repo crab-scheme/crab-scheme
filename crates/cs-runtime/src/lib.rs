@@ -492,7 +492,8 @@ impl Runtime {
         // foundation we accept that semantic: the speedup on builtins is the
         // dominant case, and tests don't (re)set! the captured snapshot.
         let globals = self.vm_env.snapshot_bindings();
-        let bc = cs_vm::compile_with_globals(&core, &globals)
+        let primops = primop_table(&mut self.syms);
+        let bc = cs_vm::compile_with_globals_and_primops(&core, &globals, &primops)
             .map_err(|e| Diagnostic::error(e.message, e.span))?;
         // Install the `eval` hook + root env so VmEval can call back into us.
         let prev_hook = cs_vm::vm::install_eval_hook(Some(vm_eval_callback));
@@ -623,9 +624,28 @@ fn vm_eval_callback(v: &Value, syms: &mut SymbolTable) -> Result<Value, String> 
         .map_err(|e| format!("eval: expand error: {}", e.message()))?;
     drop(expander);
     let globals = env.snapshot_bindings();
-    let bc = cs_vm::compile_with_globals(&core, &globals)
+    let primops = primop_table(syms);
+    let bc = cs_vm::compile_with_globals_and_primops(&core, &globals, &primops)
         .map_err(|e| format!("eval: compile error: {}", e.message))?;
     cs_vm::run(&bc, env, syms).map_err(|e| format!("eval: {}", e.message))
+}
+
+/// Build the symbol→PrimOp map for the VM compiler. The set is small and
+/// the lookup is per-compile, so we just rebuild it each time.
+fn primop_table(
+    syms: &mut SymbolTable,
+) -> std::collections::HashMap<cs_core::Symbol, cs_vm::compiler::PrimOp> {
+    use cs_vm::compiler::PrimOp;
+    let mut m = std::collections::HashMap::new();
+    m.insert(syms.intern("+"), PrimOp::Add);
+    m.insert(syms.intern("-"), PrimOp::Sub);
+    m.insert(syms.intern("*"), PrimOp::Mul);
+    m.insert(syms.intern("<"), PrimOp::Lt);
+    m.insert(syms.intern("<="), PrimOp::Le);
+    m.insert(syms.intern(">"), PrimOp::Gt);
+    m.insert(syms.intern(">="), PrimOp::Ge);
+    m.insert(syms.intern("="), PrimOp::Eq);
+    m
 }
 
 // Helper so cs-runtime can look up symbols by name without intern.
