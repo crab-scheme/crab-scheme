@@ -451,13 +451,17 @@ pub fn run_with_entry(
                 // slice into the stack — no per-Call Vec<Value> allocation.
                 // Covers closure / builtin / builtinSyms / parameter (the
                 // overwhelming majority of Call sites).
+                // Capture the call-site span up front so error paths can
+                // attach it cheaply (one Rc deref + indexed read per Call).
+                let call_span = frame.spans.get(inst_ip).copied().unwrap_or(Span::DUMMY);
                 let func_proc = match &stack[func_idx] {
                     Value::Procedure(p) => p.clone(),
                     other => {
                         return Err(VmError::new(format!(
                             "call to non-procedure ({})",
                             other.type_name()
-                        )));
+                        ))
+                        .with_span(call_span));
                     }
                 };
                 {
@@ -465,7 +469,14 @@ pub fn run_with_entry(
                     if let Some(closure) = any.downcast_ref::<VmClosure>() {
                         let lam = &closure.bc.lambdas[closure.lambda_idx];
                         if !lambda_arity_ok(lam, n) {
-                            return Err(VmError::new("arity mismatch"));
+                            return Err(VmError::new(format!(
+                                "arity mismatch: {} expected {}{}, got {}",
+                                closure.name().unwrap_or("procedure"),
+                                lam.params.len(),
+                                if lam.rest.is_some() { "+" } else { "" },
+                                n
+                            ))
+                            .with_span(call_span));
                         }
                         let new_env = Env::child(closure.env.clone());
                         for (i, name) in lam.params.iter().enumerate() {
@@ -495,8 +506,9 @@ pub fn run_with_entry(
                         continue;
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltin>() {
-                        let r = (b.f)(&stack[args_start..stack_len])
-                            .map_err(|e| VmError::new(format!("{}: {}", b.name, e)))?;
+                        let r = (b.f)(&stack[args_start..stack_len]).map_err(|e| {
+                            VmError::new(prefix_builtin_err(b.name, &e)).with_span(call_span)
+                        })?;
                         stack.truncate(func_idx);
                         stack.push(r);
                         if is_tail {
@@ -510,8 +522,9 @@ pub fn run_with_entry(
                         continue;
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltinSyms>() {
-                        let r = (b.f)(&stack[args_start..stack_len], syms)
-                            .map_err(|e| VmError::new(format!("{}: {}", b.name, e)))?;
+                        let r = (b.f)(&stack[args_start..stack_len], syms).map_err(|e| {
+                            VmError::new(prefix_builtin_err(b.name, &e)).with_span(call_span)
+                        })?;
                         stack.truncate(func_idx);
                         stack.push(r);
                         if is_tail {
@@ -2707,6 +2720,19 @@ fn ho_apply(func: &Value, args: &[Value], syms: &mut SymbolTable) -> Result<Valu
         }
     }
     Err(VmError::new("ho_apply: unrecognized HO marker"))
+}
+
+/// If the builtin error message already begins with `name:` (e.g. `+: expected
+/// number, got string` from b_add), return it unchanged. Otherwise prepend
+/// `name: ` so the caller knows which builtin failed. Avoids the doubled-
+/// prefix `+: +: expected...` we used to produce.
+fn prefix_builtin_err(name: &str, msg: &str) -> String {
+    let leader = format!("{}: ", name);
+    if msg.starts_with(&leader) || msg.starts_with(name) && msg[name.len()..].starts_with(':') {
+        msg.to_string()
+    } else {
+        format!("{}: {}", name, msg)
+    }
 }
 
 fn collect_proper_list(v: &Value) -> Result<Vec<Value>, VmError> {

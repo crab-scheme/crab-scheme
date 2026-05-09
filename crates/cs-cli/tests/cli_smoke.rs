@@ -269,6 +269,56 @@ fn run_metacircular_vm() {
 }
 
 #[test]
+fn vm_arity_mismatch_has_source_span_and_no_dup_prefix() {
+    // Arity mismatch: span on the offending call site + descriptive
+    // expected/got message. No duplicate "+: +: ..." builtin prefix.
+    let out = cli()
+        .args(["--tier", "vm", "-e", "(define (sq x) (* x x)) (sq 1 2 3)"])
+        .output()
+        .expect("vm");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("arity mismatch"), "{}", err);
+    assert!(err.contains("expected 1"), "{}", err);
+    assert!(err.contains("got 3"), "{}", err);
+    assert!(err.contains(":1:"), "should have span: {}", err);
+}
+
+#[test]
+fn vm_builtin_type_error_has_no_doubled_prefix() {
+    // Builtin error path used to render as "+: +: expected ..." because
+    // the VM dispatch added one prefix while the builtin already had its
+    // own. Now we strip the duplicate. Walker output is the reference.
+    let walker = cli().args(["-e", r#"(+ 1 "two")"#]).output().unwrap();
+    let walker_err = String::from_utf8_lossy(&walker.stderr).into_owned();
+    let vm = cli()
+        .args(["--tier", "vm", "-e", r#"(+ 1 "two")"#])
+        .output()
+        .unwrap();
+    let vm_err = String::from_utf8_lossy(&vm.stderr).into_owned();
+    // Both should contain the leading "+: expected ..." part.
+    assert!(walker_err.contains("+: expected"), "{}", walker_err);
+    assert!(vm_err.contains("+: expected"), "{}", vm_err);
+    // Critical: the VM error must not include the "+: +:" double prefix
+    // we used to produce.
+    assert!(
+        !vm_err.contains("+: +:"),
+        "double prefix in VM error: {}",
+        vm_err
+    );
+}
+
+#[test]
+fn vm_call_to_non_procedure_has_source_span() {
+    let out = cli()
+        .args(["--tier", "vm", "-e", "(42 1 2)"])
+        .output()
+        .expect("vm");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("non-procedure"), "{}", err);
+    assert!(err.contains(":1:"), "should have span: {}", err);
+}
+
+#[test]
 fn vm_undefined_variable_has_source_span() {
     // Both tiers should report a source location for an undefined-variable
     // error. The VM tier didn't carry source spans through the bytecode
