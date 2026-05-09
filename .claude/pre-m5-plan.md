@@ -125,9 +125,22 @@ match; non-migrated variants stay no-op until they migrate.
 Also added `Gc::as_addr` for cycle-detection visited-sets (replaces
 `Rc::as_ptr`).
 
-**4.D — Per-Runtime root set wired**
-Hook the Runtime's top-level `Frame` chain and the VM's value/frame
-stacks into `Heap::add_root`. Add a `pending_values` root closure.
+**4.D — Per-Runtime root set wired** ✅ DONE (commit pending)
+- Runtime now owns a `cs_gc::Heap`.
+- Two persistent roots registered at `Runtime::new` time: the walker
+  top `Frame` chain and the VM-tier root `Env`. Both clone an Rc
+  into their root closure so the heap has a stable handle to walk.
+- `Runtime::collect()` and `Runtime::heap()` accessors exposed.
+- 6 smoke tests in `crates/cs-runtime/tests/gc_smoke.rs` exercise:
+  alloc-free collect doesn't panic; defined globals survive collect
+  on both walker and VM tiers; vector mutations are visible after
+  collect; multiple back-to-back collects are idempotent.
+
+The VM's per-call value/frame stacks are *not* yet registered —
+they're transient stack-locals inside `run()`, not persisted on the
+Runtime. Phase 1's collect() can run only "between" VM calls. Phase
+2 + multi-shot continuations may move stack frames to the heap (per
+the M5 spec) at which point they become root candidates.
 
 **4.E — Drop the `Rc` import from `value.rs`**
 Acceptance: `grep "Rc<" crates/cs-core/src/value.rs` returns no

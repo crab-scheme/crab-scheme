@@ -24,6 +24,12 @@ pub struct Runtime {
     macros: std::collections::HashMap<cs_core::Symbol, cs_expand::Macro>,
     /// VM-tier persistent root env (lazily populated with pure builtins at construction).
     vm_env: Rc<cs_vm::vm::Env>,
+    /// GC heap. M5 milestone: pre-registered with the walker top frame
+    /// and the VM root env as persistent roots. Phase 1 collect() walks
+    /// these roots transitively but the underlying allocations are
+    /// still Rc-backed, so collect() has no observable side effect on
+    /// existing programs — it's the seam Phase 2 swaps to a real arena.
+    heap: cs_gc::Heap,
 }
 
 impl Default for Runtime {
@@ -607,13 +613,47 @@ impl Runtime {
                 Ok(Value::list(list))
             }),
         );
+        // Set up the GC root set: the walker's top frame chain and the
+        // VM-tier root env. Cloning Rc<Frame> / Rc<Env> into the closure
+        // gives the heap a stable handle to walk on every collect().
+        let heap = cs_gc::Heap::new();
+        {
+            let top_root = Rc::clone(&top);
+            heap.add_root(move |marker| {
+                use cs_gc::Trace;
+                top_root.trace(marker);
+            });
+        }
+        {
+            let vm_root = Rc::clone(&vm_env);
+            heap.add_root(move |marker| {
+                use cs_gc::Trace;
+                vm_root.trace(marker);
+            });
+        }
+
         Self {
             syms,
             sources: SourceMap::new(),
             top,
             macros: std::collections::HashMap::new(),
             vm_env,
+            heap,
         }
+    }
+
+    /// Run a stop-the-world GC pass. Phase 1 walks the registered root
+    /// set (top frame + VM env) and prunes unreachable allocations from
+    /// `Heap`'s bookkeeping vec. Because Phase 1's `Gc<T>` is still
+    /// Rc-backed, this has no observable behavioural effect on programs
+    /// — it's the seam Phase 2 swaps to a real arena.
+    pub fn collect(&self) {
+        self.heap.collect();
+    }
+
+    /// Read-only access to the GC heap (for tests and tooling).
+    pub fn heap(&self) -> &cs_gc::Heap {
+        &self.heap
     }
 
     pub fn symbols(&self) -> &SymbolTable {
