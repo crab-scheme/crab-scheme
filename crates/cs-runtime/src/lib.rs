@@ -961,6 +961,109 @@ impl Runtime {
                 }
             }),
         );
+        // R7RS write-char / write-string with optional port. No-arg form
+        // falls back to vm_current_output_port_value().
+        let wc_sym = syms.intern("write-char");
+        vm_env.define(
+            wc_sym,
+            cs_vm::vm::make_vm_builtin("write-char", |args| {
+                if args.is_empty() || args.len() > 2 {
+                    return Err("write-char: 1 or 2 args".into());
+                }
+                let c = match &args[0] {
+                    Value::Character(c) => *c,
+                    other => {
+                        return Err(format!(
+                            "write-char: expected char, got {}",
+                            other.type_name()
+                        ));
+                    }
+                };
+                let port = if args.len() == 1 {
+                    cs_vm::vm::vm_current_output_port_value()
+                        .ok_or_else(|| "write-char: no current output port".to_string())?
+                } else {
+                    args[1].clone()
+                };
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::StringOutput(buf) => {
+                            buf.borrow_mut().push(c);
+                            Ok(Value::Unspecified)
+                        }
+                        _ => Err("write-char: not an output port".into()),
+                    },
+                    other => Err(format!(
+                        "write-char: expected port, got {}",
+                        other.type_name()
+                    )),
+                }
+            }),
+        );
+        let ws_sym = syms.intern("write-string");
+        vm_env.define(
+            ws_sym,
+            cs_vm::vm::make_vm_builtin("write-string", |args| {
+                if args.is_empty() || args.len() > 4 {
+                    return Err("write-string: 1..4 args".into());
+                }
+                let s = match &args[0] {
+                    Value::String(s) => s.borrow().clone(),
+                    other => {
+                        return Err(format!(
+                            "write-string: expected string, got {}",
+                            other.type_name()
+                        ));
+                    }
+                };
+                let chars: Vec<char> = s.chars().collect();
+                let len = chars.len();
+                let port = if args.len() == 1 {
+                    cs_vm::vm::vm_current_output_port_value()
+                        .ok_or_else(|| "write-string: no current output port".to_string())?
+                } else {
+                    args[1].clone()
+                };
+                let start = if args.len() >= 3 {
+                    match &args[2] {
+                        Value::Number(n) => match n.to_f64() as i64 {
+                            i if i >= 0 && (i as usize) <= len => i as usize,
+                            _ => return Err(format!("write-string: start out of range")),
+                        },
+                        _ => return Err("write-string: start must be integer".into()),
+                    }
+                } else {
+                    0
+                };
+                let end = if args.len() == 4 {
+                    match &args[3] {
+                        Value::Number(n) => match n.to_f64() as i64 {
+                            i if i >= 0 && (i as usize) <= len && (i as usize) >= start => {
+                                i as usize
+                            }
+                            _ => return Err("write-string: end out of range".into()),
+                        },
+                        _ => return Err("write-string: end must be integer".into()),
+                    }
+                } else {
+                    len
+                };
+                let slice: String = chars[start..end].iter().collect();
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::StringOutput(buf) => {
+                            buf.borrow_mut().push_str(&slice);
+                            Ok(Value::Unspecified)
+                        }
+                        _ => Err("write-string: not an output port".into()),
+                    },
+                    other => Err(format!(
+                        "write-string: expected port, got {}",
+                        other.type_name()
+                    )),
+                }
+            }),
+        );
         let gensym_sym = syms.intern("gensym");
         vm_env.define(
             gensym_sym,

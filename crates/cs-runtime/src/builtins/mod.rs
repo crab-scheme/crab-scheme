@@ -463,8 +463,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("flush-output-port", b_flush_output_port),
         ("input-port-open?", b_input_port_open_p),
         ("output-port-open?", b_output_port_open_p),
-        ("write-char", b_write_char),
-        ("write-string", b_write_string),
+        // write-char / write-string are HIGHER (in higher_order_builtins
+        // below) so they can default to current-output-port when called
+        // with no port arg per R7RS.
         ("write-u8", b_write_u8),
         ("write-bytevector", b_write_bytevector),
         // promises
@@ -601,6 +602,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("read-char", b_read_char_ho),
         ("peek-char", b_peek_char_ho),
         ("read-string", b_read_string_ho),
+        ("write-char", b_write_char_ho),
+        ("write-string", b_write_string_ho),
         ("read-line", b_read_line_implicit),
         ("get-string-all", b_get_string_all),
         // SRFI-1 (higher-order)
@@ -6108,6 +6111,47 @@ fn b_output_port_p(args: &[Value]) -> Result<Value, String> {
         Value::Port(p) => p.is_output(),
         _ => false,
     }))
+}
+
+/// R7RS `(write-char char [port])` — port defaults to current-output-port.
+fn b_write_char_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_err("write-char", "1 or 2", args.len()));
+    }
+    let port = if args.len() == 1 {
+        ctx.current_output_port
+            .clone()
+            .ok_or_else(|| "write-char: no current output port".to_string())?
+    } else {
+        args[1].clone()
+    };
+    b_write_char(&[args[0].clone(), port])
+}
+
+/// R7RS `(write-string string [port [start [end]]])` — port defaults to
+/// current-output-port. Slice indices are forwarded to the Pure impl.
+fn b_write_string_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 4 {
+        return Err(arity_err("write-string", "1..4", args.len()));
+    }
+    let mut full = Vec::with_capacity(4);
+    full.push(args[0].clone());
+    if args.len() == 1 {
+        let port = ctx
+            .current_output_port
+            .clone()
+            .ok_or_else(|| "write-string: no current output port".to_string())?;
+        full.push(port);
+    } else {
+        full.push(args[1].clone());
+    }
+    if args.len() >= 3 {
+        full.push(args[2].clone());
+    }
+    if args.len() == 4 {
+        full.push(args[3].clone());
+    }
+    b_write_string(&full)
 }
 
 fn b_write_char(args: &[Value]) -> Result<Value, String> {
