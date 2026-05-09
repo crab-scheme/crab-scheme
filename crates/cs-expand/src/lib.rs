@@ -1059,6 +1059,10 @@ impl<'a> Expander<'a> {
                 value: d.to_value(),
                 span: *span,
             }),
+            Datum::ByteVector(_, span) => Ok(CoreExpr::Const {
+                value: d.to_value(),
+                span: *span,
+            }),
         }
     }
 
@@ -2436,6 +2440,10 @@ impl<'a> Expander<'a> {
                     span: *vspan,
                 })
             }
+            Datum::ByteVector(_, vspan) => Ok(CoreExpr::Const {
+                value: template.to_value(),
+                span: *vspan,
+            }),
         }
     }
 

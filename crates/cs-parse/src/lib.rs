@@ -20,6 +20,10 @@ pub enum Datum {
     Null(Span),
     Pair(Rc<Datum>, Rc<Datum>, Span),
     Vector(Vec<Datum>, Span),
+    /// R7RS bytevector literal `#u8(b0 b1 ...)`. Each element is an
+    /// integer in 0..=255 at parse time; the reader validates the
+    /// range and emits the byte sequence directly.
+    ByteVector(Vec<u8>, Span),
 }
 
 impl Datum {
@@ -32,7 +36,8 @@ impl Datum {
             | Datum::Symbol(_, s)
             | Datum::Null(s)
             | Datum::Pair(_, _, s)
-            | Datum::Vector(_, s) => *s,
+            | Datum::Vector(_, s)
+            | Datum::ByteVector(_, s) => *s,
         }
     }
 
@@ -62,6 +67,9 @@ impl Datum {
             Datum::Vector(items, _) => {
                 let v: Vec<Value> = items.iter().map(|d| d.to_value()).collect();
                 Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(v)))
+            }
+            Datum::ByteVector(bytes, _) => {
+                Value::ByteVector(cs_core::Gc::new(std::cell::RefCell::new(bytes.clone())))
             }
         }
     }
@@ -113,6 +121,16 @@ fn format_datum(d: &Datum, syms: &SymbolTable, out: &mut String) {
                     out.push(' ');
                 }
                 format_datum(it, syms, out);
+            }
+            out.push(')');
+        }
+        Datum::ByteVector(bytes, _) => {
+            out.push_str("#u8(");
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                let _ = write!(out, "{}", b);
             }
             out.push(')');
         }
@@ -219,6 +237,7 @@ impl<'src> Reader<'src> {
             Token::Identifier(s) => Ok(Datum::Symbol(s, span)),
             Token::LParen | Token::LBracket => self.read_list(span, syms),
             Token::HashLParen => self.read_vector(span, syms),
+            Token::HashU8LParen => self.read_bytevector(span, syms),
             Token::Quote => self.read_quote_form("quote", span, syms),
             Token::QuasiQuote => self.read_quote_form("quasiquote", span, syms),
             Token::Unquote => self.read_quote_form("unquote", span, syms),
@@ -289,6 +308,55 @@ impl<'src> Reader<'src> {
                         None => return Err(ReaderError::UnclosedList { span: open_span }),
                     };
                     items.push(item);
+                }
+            }
+        }
+    }
+
+    /// R7RS `#u8(b0 b1 ... bN)` — each element must be an exact integer
+    /// in 0..=255 at parse time.
+    fn read_bytevector(
+        &mut self,
+        open_span: Span,
+        syms: &mut SymbolTable,
+    ) -> Result<Datum, ReaderError> {
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let (tok, span) = match self.peek_tok(syms) {
+                Ok(t) => (t.0.clone(), t.1),
+                Err(e) => return Err(e),
+            };
+            match tok {
+                Token::RParen | Token::RBracket => {
+                    self.next_tok(syms)?;
+                    let full_span = open_span.merge(span);
+                    return Ok(Datum::ByteVector(bytes, full_span));
+                }
+                Token::Eof => return Err(ReaderError::UnclosedList { span: open_span }),
+                Token::Number(n) => {
+                    self.next_tok(syms)?;
+                    let v = match &n {
+                        Number::Fixnum(v) => *v,
+                        _ => {
+                            return Err(ReaderError::UnexpectedToken {
+                                span,
+                                what: "bytevector element must be an exact byte (0..=255)".into(),
+                            })
+                        }
+                    };
+                    if !(0..=255).contains(&v) {
+                        return Err(ReaderError::UnexpectedToken {
+                            span,
+                            what: format!("byte literal {} out of 0..=255", v),
+                        });
+                    }
+                    bytes.push(v as u8);
+                }
+                _ => {
+                    return Err(ReaderError::UnexpectedToken {
+                        span,
+                        what: "bytevector element must be a byte literal".into(),
+                    })
                 }
             }
         }

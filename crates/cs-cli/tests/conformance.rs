@@ -454,6 +454,11 @@ fn conformance_r7rs_port_reads() {
 }
 
 #[test]
+fn conformance_r7rs_bytevector_literal() {
+    run_conformance_file("r7rs_bytevector_literal.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -549,6 +554,7 @@ fn conformance_aggregate_count() {
                 "r7rs_define_record_type.scm",
                 "r7rs_case_arrow.scm",
                 "r7rs_port_reads.scm",
+                "r7rs_bytevector_literal.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

@@ -20,8 +20,9 @@ pub enum Token {
     Unquote,
     UnquoteSplicing,
     Dot,
-    HashLParen, // #(
-    HashSemi,   // #;
+    HashLParen,   // #(
+    HashU8LParen, // #u8(  — R7RS bytevector literal opener
+    HashSemi,     // #;
     Boolean(bool),
     Number(Number),
     String(String),
@@ -321,6 +322,18 @@ impl<'src> Lexer<'src> {
                 // #d means decimal — consume the prefix then read number normally.
                 self.bump();
                 self.read_number(start)
+            }
+            // R7RS `#u8(` opens a bytevector literal. The lexer just
+            // emits the open-paren token; the parser collects the
+            // following u8 datums and builds a ByteVector.
+            Some(b'u')
+                if self.bytes.get(self.pos + 1).copied() == Some(b'8')
+                    && self.bytes.get(self.pos + 2).copied() == Some(b'(') =>
+            {
+                self.bump(); // u
+                self.bump(); // 8
+                self.bump(); // (
+                Ok((Token::HashU8LParen, self.span(start, self.pos)))
             }
             _ => Err(LexError::UnexpectedChar {
                 c: '#',

@@ -699,3 +699,12 @@ fn vm_conformance_r7rs_port_reads() {
     println!("r7rs_port_reads: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_bytevector_literal() {
+    let walker = pass_count_walker("r7rs_bytevector_literal.scm");
+    let vm = pass_count_vm("r7rs_bytevector_literal.scm")
+        .expect("vm should run r7rs_bytevector_literal.scm");
+    println!("r7rs_bytevector_literal: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
