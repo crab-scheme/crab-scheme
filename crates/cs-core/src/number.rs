@@ -89,7 +89,12 @@ impl Number {
     }
 
     pub fn div(&self, other: &Number) -> Result<Number, NumError> {
+        // Flonum (inexact) division by zero yields IEEE-754 infinities or
+        // NaN per R6RS — only exact division by exact zero raises.
         if other.is_zero() {
+            if !self.is_exact() || !other.is_exact() {
+                return Ok(Number::Flonum(self.to_f64() / other.to_f64()));
+            }
             return Err(NumError::DivisionByZero);
         }
         if !self.is_exact() || !other.is_exact() {

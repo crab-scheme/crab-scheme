@@ -20,8 +20,16 @@
 (test-equal "inf*-1"  -inf.0 (* +inf.0 -1))
 ; nan compares unequal to itself per IEEE-754
 (test-false "nan-eq-nan" (= +nan.0 +nan.0))
-; Floating-point divide-by-zero giving +inf.0 isn't yet supported —
-; our `/` raises on any zero divisor. That's tracked separately.
+; Float divide-by-zero produces IEEE-754 infinities / NaN per R6RS.
+(test-equal "1.0/0.0"  +inf.0 (/ 1.0 0.0))
+(test-equal "-1.0/0.0" -inf.0 (/ -1.0 0.0))
+; 0.0 / 0.0 produces a NaN; compare via display roundtrip.
+(test-equal "0.0/0.0"
+  "+nan.0"
+  (let ((p (open-string-output-port))) (display (/ 0.0 0.0) p) (get-output-string p)))
+; Exact division by exact zero still raises (catchable).
+(test-true "1/0-exact-raises"
+  (with-exception-handler (lambda (c) (error? c)) (lambda () (/ 1 0))))
 
 ; --- bare + and - still parse as identifiers ---
 (test-true "plus-is-procedure"  (procedure? +))
