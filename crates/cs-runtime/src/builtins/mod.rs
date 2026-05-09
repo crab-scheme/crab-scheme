@@ -2618,12 +2618,12 @@ fn b_make_vector(args: &[Value]) -> Result<Value, String> {
         Value::Unspecified
     };
     let v: Vec<Value> = std::iter::repeat(fill).take(n as usize).collect();
-    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(v))))
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(v))))
 }
 
 fn b_vector(args: &[Value]) -> Result<Value, String> {
     let v: Vec<Value> = args.to_vec();
-    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(v))))
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(v))))
 }
 
 fn b_vector_length(args: &[Value]) -> Result<Value, String> {
@@ -2706,7 +2706,7 @@ fn b_list_to_vector(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("list->vector", "1", args.len()));
     }
     let items = collect_proper_list("list->vector", &args[0])?;
-    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(
         items,
     ))))
 }
@@ -3281,7 +3281,7 @@ fn make_compound(simples: Vec<Value>) -> Value {
 }
 
 fn new_vector(items: Vec<Value>) -> Value {
-    Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(items)))
+    Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(items)))
 }
 
 /// Append all simples of `cond` to `out`. Used by `condition` to flatten
@@ -4421,7 +4421,7 @@ fn b_hashtable_keys(args: &[Value]) -> Result<Value, String> {
     let h = as_ht("hashtable-keys", &args[0])?;
     let items = h.items.borrow();
     let v: Vec<Value> = items.iter().map(|(k, _)| k.clone()).collect();
-    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(v))))
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(v))))
 }
 
 fn b_hashtable_values(args: &[Value]) -> Result<Value, String> {
@@ -4431,7 +4431,7 @@ fn b_hashtable_values(args: &[Value]) -> Result<Value, String> {
     let h = as_ht("hashtable-values", &args[0])?;
     let items = h.items.borrow();
     let v: Vec<Value> = items.iter().map(|(_, v)| v.clone()).collect();
-    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(v))))
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(v))))
 }
 
 /// `hashtable-copy` (R6RS) — return a fresh hashtable with the same
@@ -4574,8 +4574,8 @@ fn b_hashtable_entries(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Strin
     let items = h.items.borrow();
     let keys: Vec<Value> = items.iter().map(|(k, _)| k.clone()).collect();
     let vals: Vec<Value> = items.iter().map(|(_, v)| v.clone()).collect();
-    let kv = Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(keys)));
-    let vv = Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(vals)));
+    let kv = Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(keys)));
+    let vv = Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(vals)));
     ctx.pending_values = Some(vec![kv, vv]);
     Ok(Value::Unspecified)
 }
@@ -5213,7 +5213,7 @@ fn b_get_bytevector_output_port(args: &[Value]) -> Result<Value, String> {
             Port::ByteVectorOutput(buf) => {
                 let bytes = buf.borrow().clone();
                 buf.borrow_mut().clear();
-                Ok(Value::ByteVector(std::rc::Rc::new(
+                Ok(Value::ByteVector(cs_core::Gc::new(
                     std::cell::RefCell::new(bytes),
                 )))
             }
@@ -5313,7 +5313,7 @@ fn b_get_bytevector_n(args: &[Value]) -> Result<Value, String> {
                 let take = n.min(avail);
                 let bytes = s.bytes[s.pos..s.pos + take].to_vec();
                 s.pos += take;
-                Ok(Value::ByteVector(std::rc::Rc::new(
+                Ok(Value::ByteVector(cs_core::Gc::new(
                     std::cell::RefCell::new(bytes),
                 )))
             }
@@ -5695,7 +5695,7 @@ fn b_make_bytevector(args: &[Value]) -> Result<Value, String> {
         0u8
     };
     let bv: Vec<u8> = std::iter::repeat(fill).take(n as usize).collect();
-    Ok(Value::ByteVector(std::rc::Rc::new(
+    Ok(Value::ByteVector(cs_core::Gc::new(
         std::cell::RefCell::new(bv),
     )))
 }
@@ -5709,7 +5709,7 @@ fn b_bytevector(args: &[Value]) -> Result<Value, String> {
         }
         bv.push(v as u8);
     }
-    Ok(Value::ByteVector(std::rc::Rc::new(
+    Ok(Value::ByteVector(cs_core::Gc::new(
         std::cell::RefCell::new(bv),
     )))
 }
@@ -5759,7 +5759,7 @@ fn b_string_to_utf8(args: &[Value]) -> Result<Value, String> {
         byte_end = s.len();
     }
     let bytes = s.as_bytes()[byte_start..byte_end].to_vec();
-    Ok(Value::ByteVector(std::rc::Rc::new(
+    Ok(Value::ByteVector(cs_core::Gc::new(
         std::cell::RefCell::new(bytes),
     )))
 }
@@ -5813,7 +5813,7 @@ fn b_bytevector_append(args: &[Value]) -> Result<Value, String> {
             }
         }
     }
-    Ok(Value::ByteVector(std::rc::Rc::new(
+    Ok(Value::ByteVector(cs_core::Gc::new(
         std::cell::RefCell::new(out),
     )))
 }
@@ -6445,7 +6445,7 @@ fn b_bytevector_copy(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("bytevector-copy", "1", args.len()));
     }
     match &args[0] {
-        Value::ByteVector(bv) => Ok(Value::ByteVector(std::rc::Rc::new(
+        Value::ByteVector(bv) => Ok(Value::ByteVector(cs_core::Gc::new(
             std::cell::RefCell::new(bv.borrow().clone()),
         ))),
         v => Err(type_err("bytevector-copy", "bytevector", v)),
@@ -6477,7 +6477,7 @@ fn b_u8_list_to_bytevector(args: &[Value]) -> Result<Value, String> {
         }
         bv.push(n as u8);
     }
-    Ok(Value::ByteVector(std::rc::Rc::new(
+    Ok(Value::ByteVector(cs_core::Gc::new(
         std::cell::RefCell::new(bv),
     )))
 }
@@ -7150,7 +7150,7 @@ fn b_vector_filter(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             out.push(item);
         }
     }
-    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(
         out,
     ))))
 }
@@ -7195,7 +7195,7 @@ fn b_vector_sort(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         v => return Err(type_err("vector-sort", "vector", v)),
     };
     sort_with_predicate(&mut items, &cmp, ctx)?;
-    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(
         items,
     ))))
 }
@@ -7380,7 +7380,7 @@ fn b_vector_copy(args: &[Value]) -> Result<Value, String> {
         return Err("vector-copy: indices out of range".into());
     }
     let copied: Vec<Value> = v[start..end].to_vec();
-    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(
         copied,
     ))))
 }
@@ -7400,7 +7400,7 @@ fn b_vector_append(args: &[Value]) -> Result<Value, String> {
             }
         }
     }
-    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(
         out,
     ))))
 }
@@ -7422,7 +7422,7 @@ fn b_subvector(args: &[Value]) -> Result<Value, String> {
         return Err("subvector: indices out of range".into());
     }
     let copied: Vec<Value> = v[start..end].to_vec();
-    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(
         copied,
     ))))
 }
@@ -7986,7 +7986,7 @@ fn b_string_to_vector(args: &[Value]) -> Result<Value, String> {
     match &args[0] {
         Value::String(s) => {
             let v: Vec<Value> = s.borrow().chars().map(Value::Character).collect();
-            Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(v))))
+            Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(v))))
         }
         v => Err(type_err("string->vector", "string", v)),
     }
@@ -8048,7 +8048,7 @@ fn b_vector_map(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
         out.push(r);
     }
-    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(
         out,
     ))))
 }

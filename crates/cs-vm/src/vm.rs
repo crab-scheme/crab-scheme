@@ -2891,8 +2891,9 @@ pub fn make_vm_continuation(id: u64) -> Value {
 /// produce the same shape because `with-exception-handler` callbacks
 /// observe the raw value.
 pub fn make_vm_error_condition(who: Option<Value>, msg: String, irritants: Vec<Value>) -> Value {
-    let mk =
-        |items: Vec<Value>| -> Value { Value::Vector(Rc::new(std::cell::RefCell::new(items))) };
+    let mk = |items: Vec<Value>| -> Value {
+        Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(items)))
+    };
     let mut simples = vec![mk(vec![Value::string("&error")])];
     if let Some(w) = who {
         simples.push(mk(vec![Value::string("&who"), w]));
@@ -2919,8 +2920,9 @@ pub fn make_vm_assertion_violation_condition(
     msg: String,
     irritants: Vec<Value>,
 ) -> Value {
-    let mk =
-        |items: Vec<Value>| -> Value { Value::Vector(Rc::new(std::cell::RefCell::new(items))) };
+    let mk = |items: Vec<Value>| -> Value {
+        Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(items)))
+    };
     let mut simples = vec![
         mk(vec![Value::string("&assertion")]),
         mk(vec![Value::string("&who"), who]),
@@ -3298,7 +3300,7 @@ fn ho_apply(func: &Value, args: &[Value], syms: &mut SymbolTable) -> Result<Valu
             let row: Vec<Value> = vectors.iter().map(|v| v[i].clone()).collect();
             out.push(vm_call_sync(&proc_val, &row, syms)?);
         }
-        return Ok(Value::Vector(Rc::new(RefCell::new(out))));
+        return Ok(Value::Vector(cs_core::Gc::new(RefCell::new(out))));
     }
     if any.downcast_ref::<VmVectorForEach>().is_some() {
         if args.len() < 2 {
@@ -3363,7 +3365,7 @@ fn ho_apply(func: &Value, args: &[Value], syms: &mut SymbolTable) -> Result<Valu
                 out.push(item);
             }
         }
-        return Ok(Value::Vector(Rc::new(RefCell::new(out))));
+        return Ok(Value::Vector(cs_core::Gc::new(RefCell::new(out))));
     }
     if any.downcast_ref::<VmStringMap>().is_some() {
         if args.len() != 2 {
@@ -3554,7 +3556,7 @@ fn ho_apply(func: &Value, args: &[Value], syms: &mut SymbolTable) -> Result<Valu
             }
         };
         sort_with_predicate(&mut items, &cmp, syms)?;
-        return Ok(Value::Vector(Rc::new(RefCell::new(items))));
+        return Ok(Value::Vector(cs_core::Gc::new(RefCell::new(items))));
     }
     if any.downcast_ref::<VmVectorSortBang>().is_some() {
         if args.len() != 2 {

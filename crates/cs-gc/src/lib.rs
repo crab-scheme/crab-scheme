@@ -93,6 +93,14 @@ impl<T: ?Sized> Gc<T> {
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         Rc::ptr_eq(&a.inner, &b.inner)
     }
+
+    /// Return the underlying allocation address as a stable opaque
+    /// integer. Useful for cycle-detection visited-sets and `eq?`-style
+    /// identity hashing where you need a `Hash + Eq` key for a
+    /// reference. Phase 2 (arena-backed) will retain this signature.
+    pub fn as_addr(this: &Self) -> usize {
+        Rc::as_ptr(&this.inner) as *const () as usize
+    }
 }
 
 impl<T: Trace + 'static> Gc<T> {

@@ -236,11 +236,11 @@ pub enum Value {
     Boolean(bool),
     Character(char),
     Number(Number),
-    String(Rc<RefCell<String>>),
+    String(crate::Gc<RefCell<String>>),
     Symbol(Symbol),
     Pair(Rc<Pair>),
-    Vector(Rc<RefCell<Vec<Value>>>),
-    ByteVector(Rc<RefCell<Vec<u8>>>),
+    Vector(crate::Gc<RefCell<Vec<Value>>>),
+    ByteVector(crate::Gc<RefCell<Vec<u8>>>),
     Procedure(Rc<dyn Procedure>),
     Hashtable(Rc<Hashtable>),
     Port(Rc<Port>),
@@ -256,6 +256,38 @@ pub enum WriteMode {
     Display,
 }
 
+/// `Trace` impl for Value enumerates the heap-pointer variants so the
+/// GC can reach every transitively-reachable allocation during a mark
+/// pass. As the M5 migration progresses (step 4.C), each variant that
+/// switches from `Rc<T>` to `Gc<T>` adds a `marker.mark(...)` call here.
+/// Variants still backed by `Rc<T>` are no-ops for now — the Rc-shaped
+/// reachability is handled by the refcount, and the variants migrate
+/// onto the trace path one at a time.
+impl cs_gc::Trace for Value {
+    fn trace(&self, marker: &mut cs_gc::Marker) {
+        match self {
+            // Migrated variants — Gc<T>-backed and trace through.
+            Value::String(s) => s.trace(marker),
+            Value::ByteVector(v) => v.trace(marker),
+            Value::Vector(v) => v.trace(marker),
+            // Not yet migrated — Rc-backed, no trace needed.
+            Value::Pair(_)
+            | Value::Procedure(_)
+            | Value::Hashtable(_)
+            | Value::Port(_)
+            | Value::Promise(_) => {}
+            // Leaf variants — no heap pointers.
+            Value::Null
+            | Value::Unspecified
+            | Value::Eof
+            | Value::Boolean(_)
+            | Value::Character(_)
+            | Value::Symbol(_)
+            | Value::Number(_) => {}
+        }
+    }
+}
+
 impl Value {
     pub fn fixnum(v: i64) -> Self {
         Value::Number(Number::Fixnum(v))
@@ -266,7 +298,7 @@ impl Value {
     }
 
     pub fn string(s: impl Into<String>) -> Self {
-        Value::String(Rc::new(RefCell::new(s.into())))
+        Value::String(crate::Gc::new(RefCell::new(s.into())))
     }
 
     pub fn list(items: impl IntoIterator<Item = Value>) -> Self {
@@ -346,7 +378,7 @@ impl Value {
             Value::Symbol(s) => write!(out, "{}", syms.name(*s)),
             Value::Pair(p) => write_pair(out, p, syms, mode, visited),
             Value::Vector(v) => {
-                let ptr = Rc::as_ptr(v) as usize;
+                let ptr = crate::Gc::as_addr(v);
                 if !visited.insert(ptr) {
                     return write!(out, "#(...)");
                 }

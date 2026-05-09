@@ -20,10 +20,10 @@ pub fn eq(a: &Value, b: &Value) -> bool {
             (crate::Number::Fixnum(a), crate::Number::Fixnum(b)) => a == b,
             _ => false, // Other number types: eq? is implementation-defined; we say false unless identity.
         },
-        (Value::String(x), Value::String(y)) => Rc::ptr_eq(x, y),
+        (Value::String(x), Value::String(y)) => crate::Gc::ptr_eq(x, y),
         (Value::Pair(x), Value::Pair(y)) => Rc::ptr_eq(x, y),
-        (Value::Vector(x), Value::Vector(y)) => Rc::ptr_eq(x, y),
-        (Value::ByteVector(x), Value::ByteVector(y)) => Rc::ptr_eq(x, y),
+        (Value::Vector(x), Value::Vector(y)) => crate::Gc::ptr_eq(x, y),
+        (Value::ByteVector(x), Value::ByteVector(y)) => crate::Gc::ptr_eq(x, y),
         (Value::Procedure(x), Value::Procedure(y)) => Rc::ptr_eq(x, y),
         (Value::Hashtable(x), Value::Hashtable(y)) => Rc::ptr_eq(x, y),
         (Value::Port(x), Value::Port(y)) => Rc::ptr_eq(x, y),
@@ -161,8 +161,8 @@ mod write_cycle_tests {
     #[test]
     fn write_does_not_loop_on_self_cycle_vector() {
         let syms = SymbolTable::new();
-        let v_inner: std::rc::Rc<std::cell::RefCell<Vec<Value>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(vec![Value::Boolean(false)]));
+        let v_inner: crate::Gc<std::cell::RefCell<Vec<Value>>> =
+            crate::Gc::new(std::cell::RefCell::new(vec![Value::Boolean(false)]));
         v_inner.borrow_mut()[0] = Value::Vector(v_inner.clone());
         let v = Value::Vector(v_inner);
         let s = v.format_with(&syms, WriteMode::Write);

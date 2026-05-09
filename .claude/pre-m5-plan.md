@@ -92,15 +92,22 @@ but doing it before M5 keeps the runtime/env story stable.
   via shared cell, RefCell<Vec> shared view, ptr_eq) all work
   identically with `Gc<T>`.
 
-**4.C — Migrate Value variants** ← NEXT
-One variant at a time, swap `Rc<T>` → `Gc<T>`. Run conformance after
-each variant to catch regressions cleanly. Suggested order (small
-leaves first): `String` → `ByteVector` → `Vector` → `Pair` →
-`Hashtable` → `Record` → `Port` → `Procedure` → `Closure` →
-`Promise` → `Parameter` → `Continuation`.
+**4.C — Migrate Value variants** ← IN PROGRESS
 
-Each variant migration is itself a discrete iter that finishes with
-"workspace test green; conformance unchanged."
+✅ `Value::String`     (commit pending)
+✅ `Value::ByteVector` (commit pending)
+✅ `Value::Vector`     (commit pending)
+⬜ `Value::Pair`       — next; trickier because `Pair` has its own struct
+⬜ `Value::Hashtable`  — `Rc<Hashtable>`
+⬜ `Value::Port`       — `Rc<Port>`
+⬜ `Value::Procedure`  — `Rc<dyn Procedure>` (DST; unsized Slot needs care)
+⬜ `Value::Promise`    — `Rc<Promise>`
+
+Each variant adds a `marker.mark(...)` call in the `Trace for Value`
+match; non-migrated variants stay no-op until they migrate.
+
+Also added `Gc::as_addr` for cycle-detection visited-sets (replaces
+`Rc::as_ptr`).
 
 **4.D — Per-Runtime root set wired**
 Hook the Runtime's top-level `Frame` chain and the VM's value/frame

@@ -304,8 +304,8 @@ impl Runtime {
                 let items = h.items.borrow();
                 let keys: Vec<Value> = items.iter().map(|(k, _)| k.clone()).collect();
                 let vals: Vec<Value> = items.iter().map(|(_, v)| v.clone()).collect();
-                let kv = Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(keys)));
-                let vv = Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(vals)));
+                let kv = Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(keys)));
+                let vv = Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(vals)));
                 cs_vm::vm::vm_set_pending_values(vec![kv, vv]);
                 Ok(Value::Unspecified)
             }),

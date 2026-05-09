@@ -61,7 +61,7 @@ impl Datum {
             }
             Datum::Vector(items, _) => {
                 let v: Vec<Value> = items.iter().map(|d| d.to_value()).collect();
-                Value::Vector(Rc::new(std::cell::RefCell::new(v)))
+                Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(v)))
             }
         }
     }
