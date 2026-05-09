@@ -379,7 +379,13 @@ impl<'src> Lexer<'src> {
     fn read_character(&mut self, start: usize) -> Result<(Token, Span), LexError> {
         self.bump(); // consume backslash
         let name_start = self.pos;
-        // Read until delimiter
+        // Always consume at least one character — even if it's a
+        // delimiter (e.g. `#\(`, `#\ `, `#\)`). After that, keep
+        // consuming non-delimiters for multi-char names like
+        // `#\space`, `#\xFF`.
+        if self.peek().is_some() {
+            self.bump();
+        }
         while let Some(b) = self.peek() {
             if is_delimiter(b) {
                 break;
@@ -387,12 +393,37 @@ impl<'src> Lexer<'src> {
             self.bump();
         }
         let name = &self.src[name_start..self.pos];
+        // R7RS named characters + R6RS xHHHH; hex form.
         let ch = match name {
             "space" => ' ',
             "newline" => '\n',
             "tab" => '\t',
             "return" => '\r',
             "nul" | "null" => '\0',
+            "alarm" => '\u{07}',
+            "backspace" => '\u{08}',
+            "delete" => '\u{7F}',
+            "escape" => '\u{1B}',
+            // R7RS `#\xH...` hex literal (no semicolon required).
+            // R6RS `#\xH...;` hex literal — we accept either.
+            s if s.starts_with('x') && s.len() > 1 => {
+                let hex = s[1..].trim_end_matches(';');
+                match u32::from_str_radix(hex, 16) {
+                    Ok(cp) => match char::from_u32(cp) {
+                        Some(c) => c,
+                        None => {
+                            return Err(LexError::BadCharacter {
+                                span: self.span(start, self.pos),
+                            });
+                        }
+                    },
+                    Err(_) => {
+                        return Err(LexError::BadCharacter {
+                            span: self.span(start, self.pos),
+                        });
+                    }
+                }
+            }
             s if s.chars().count() == 1 => s.chars().next().unwrap(),
             _ => {
                 return Err(LexError::BadCharacter {
