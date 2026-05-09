@@ -304,6 +304,11 @@ fn conformance_utf8_codec() {
 }
 
 #[test]
+fn conformance_eval_environment() {
+    run_conformance_file("eval_environment.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -369,6 +374,7 @@ fn conformance_aggregate_count() {
                 "define_values.scm",
                 "hash_functions.scm",
                 "utf8_codec.scm",
+                "eval_environment.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

@@ -206,6 +206,27 @@ impl Runtime {
         // VmEval can call back into the runtime without a direct cycle.
         let eval_sym = syms.intern("eval");
         vm_env.define(eval_sym, cs_vm::vm::make_vm_eval());
+        // Foundation environments: same opaque sentinel from both
+        // `environment` and `interaction-environment` since every binding
+        // is global. The VM-tier `eval` already ignores its 2nd arg, so
+        // this just unblocks the names being looked up.
+        let env_sym = syms.intern("environment");
+        vm_env.define(
+            env_sym,
+            cs_vm::vm::make_vm_builtin_syms("environment", |_args, st| {
+                Ok(Value::Symbol(st.intern("__top-level-env__")))
+            }),
+        );
+        let ienv_sym = syms.intern("interaction-environment");
+        vm_env.define(
+            ienv_sym,
+            cs_vm::vm::make_vm_builtin_syms("interaction-environment", |args, st| {
+                if !args.is_empty() {
+                    return Err("interaction-environment: 0 args".into());
+                }
+                Ok(Value::Symbol(st.intern("__top-level-env__")))
+            }),
+        );
         // get-string-all does not need ctx; install as pure VM builtin.
         let gsa_sym = syms.intern("get-string-all");
         vm_env.define(

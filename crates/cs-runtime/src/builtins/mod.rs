@@ -340,6 +340,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("current-output-port", b_current_output_port),
         ("gensym", b_gensym),
         ("eval", b_eval),
+        ("environment", b_environment),
+        ("interaction-environment", b_interaction_environment),
         ("features", b_features),
         // vector higher-order
         ("vector-map", b_vector_map),
@@ -4065,6 +4067,22 @@ fn b_exact_integer_sqrt(args: &[Value]) -> Result<Value, String> {
     // to use call-with-values via a wrapper later. (Actually return as list
     // for now; real multi-value lands when this becomes higher-order.)
     Ok(Value::list([Value::fixnum(s), Value::fixnum(rem)]))
+}
+
+// ---- environments ----
+//
+// Foundation: every binding is global, so all `environment` /
+// `interaction-environment` calls return the same opaque sentinel.
+// `eval` accepts and ignores the env argument. Real per-import
+// environments will land alongside library namespace filtering.
+
+fn b_environment(_args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    // R6RS allows any number of import-specs; we accept and ignore.
+    Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
+}
+
+fn b_interaction_environment(_args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
 }
 
 // ---- eval ----

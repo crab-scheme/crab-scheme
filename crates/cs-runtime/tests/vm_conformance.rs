@@ -463,3 +463,11 @@ fn vm_conformance_utf8_codec() {
     println!("utf8_codec: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_eval_environment() {
+    let walker = pass_count_walker("eval_environment.scm");
+    let vm = pass_count_vm("eval_environment.scm").expect("vm should run eval_environment.scm");
+    println!("eval_environment: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
