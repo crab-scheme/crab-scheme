@@ -187,6 +187,16 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // strings (case)
         ("string-upcase", b_string_upcase),
         ("string-downcase", b_string_downcase),
+        ("string-foldcase", b_string_foldcase),
+        ("string-titlecase", b_string_titlecase),
+        ("string-prefix?", b_string_prefix_p),
+        ("string-suffix?", b_string_suffix_p),
+        ("string-take", b_string_take),
+        ("string-drop", b_string_drop),
+        ("string-take-right", b_string_take_right),
+        ("string-drop-right", b_string_drop_right),
+        ("string-pad", b_string_pad),
+        ("string-pad-right", b_string_pad_right),
         ("string<?", b_string_lt),
         ("string<=?", b_string_le),
         ("string>?", b_string_gt),
@@ -1871,6 +1881,222 @@ fn b_string_downcase(args: &[Value]) -> Result<Value, String> {
     match &args[0] {
         Value::String(s) => Ok(Value::string(s.borrow().to_lowercase())),
         v => Err(type_err("string-downcase", "string", v)),
+    }
+}
+
+/// `(string-foldcase s)` — R6RS case-folding for case-insensitive
+/// comparison. For ASCII this matches `string-downcase`; full Unicode
+/// folding (e.g. ß → ss) is not yet implemented.
+fn b_string_foldcase(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("string-foldcase", "1", args.len()));
+    }
+    match &args[0] {
+        Value::String(s) => Ok(Value::string(s.borrow().to_lowercase())),
+        v => Err(type_err("string-foldcase", "string", v)),
+    }
+}
+
+/// `(string-titlecase s)` — uppercase the first character of every
+/// run of word characters, lowercase the rest.
+fn b_string_titlecase(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("string-titlecase", "1", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-titlecase", "string", v)),
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut prev_alphabetic = false;
+    for c in s.chars() {
+        if c.is_alphabetic() {
+            if !prev_alphabetic {
+                for u in c.to_uppercase() {
+                    out.push(u);
+                }
+            } else {
+                for u in c.to_lowercase() {
+                    out.push(u);
+                }
+            }
+            prev_alphabetic = true;
+        } else {
+            out.push(c);
+            prev_alphabetic = false;
+        }
+    }
+    Ok(Value::string(out))
+}
+
+/// `(string-prefix? prefix s)` — true iff `s` starts with `prefix`.
+fn b_string_prefix_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("string-prefix?", "2", args.len()));
+    }
+    let pre = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-prefix?", "string", v)),
+    };
+    let s = match &args[1] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-prefix?", "string", v)),
+    };
+    Ok(Value::Boolean(s.starts_with(&pre)))
+}
+
+/// `(string-suffix? suffix s)` — true iff `s` ends with `suffix`.
+fn b_string_suffix_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("string-suffix?", "2", args.len()));
+    }
+    let suf = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-suffix?", "string", v)),
+    };
+    let s = match &args[1] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-suffix?", "string", v)),
+    };
+    Ok(Value::Boolean(s.ends_with(&suf)))
+}
+
+/// `(string-take s n)` — first `n` characters of `s` as a fresh string.
+fn b_string_take(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("string-take", "2", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-take", "string", v)),
+    };
+    let n = as_int_i64("string-take", &args[1])?;
+    if n < 0 {
+        return Err("string-take: negative count".into());
+    }
+    let out: String = s.chars().take(n as usize).collect();
+    Ok(Value::string(out))
+}
+
+/// `(string-drop s n)` — drop the first `n` characters; return the rest.
+fn b_string_drop(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("string-drop", "2", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-drop", "string", v)),
+    };
+    let n = as_int_i64("string-drop", &args[1])?;
+    if n < 0 {
+        return Err("string-drop: negative count".into());
+    }
+    let out: String = s.chars().skip(n as usize).collect();
+    Ok(Value::string(out))
+}
+
+/// `(string-take-right s n)` — last `n` characters of `s`.
+fn b_string_take_right(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("string-take-right", "2", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-take-right", "string", v)),
+    };
+    let n = as_int_i64("string-take-right", &args[1])?;
+    if n < 0 {
+        return Err("string-take-right: negative count".into());
+    }
+    let total: usize = s.chars().count();
+    let n = (n as usize).min(total);
+    let out: String = s.chars().skip(total - n).collect();
+    Ok(Value::string(out))
+}
+
+/// `(string-drop-right s n)` — drop the last `n` characters.
+fn b_string_drop_right(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("string-drop-right", "2", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-drop-right", "string", v)),
+    };
+    let n = as_int_i64("string-drop-right", &args[1])?;
+    if n < 0 {
+        return Err("string-drop-right: negative count".into());
+    }
+    let total: usize = s.chars().count();
+    let keep = total.saturating_sub(n as usize);
+    let out: String = s.chars().take(keep).collect();
+    Ok(Value::string(out))
+}
+
+/// `(string-pad s width [char])` — left-pad `s` with `char` (default
+/// space) so the result has exactly `width` characters. Truncates from
+/// the LEFT when `s` is longer than `width`, matching SRFI-13.
+fn b_string_pad(args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(arity_err("string-pad", "2 or 3", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-pad", "string", v)),
+    };
+    let width = as_int_i64("string-pad", &args[1])?;
+    if width < 0 {
+        return Err("string-pad: negative width".into());
+    }
+    let pad_char = if args.len() == 3 {
+        match &args[2] {
+            Value::Character(c) => *c,
+            v => return Err(type_err("string-pad", "character", v)),
+        }
+    } else {
+        ' '
+    };
+    let total = s.chars().count();
+    let width = width as usize;
+    if total >= width {
+        // Truncate from left (SRFI-13 padding semantics keep right side).
+        let drop = total - width;
+        Ok(Value::string(s.chars().skip(drop).collect::<String>()))
+    } else {
+        let pad: String = std::iter::repeat(pad_char).take(width - total).collect();
+        Ok(Value::string(format!("{}{}", pad, s)))
+    }
+}
+
+/// `(string-pad-right s width [char])` — right-pad with `char`. Truncates
+/// from the RIGHT when `s` is longer than `width`.
+fn b_string_pad_right(args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(arity_err("string-pad-right", "2 or 3", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-pad-right", "string", v)),
+    };
+    let width = as_int_i64("string-pad-right", &args[1])?;
+    if width < 0 {
+        return Err("string-pad-right: negative width".into());
+    }
+    let pad_char = if args.len() == 3 {
+        match &args[2] {
+            Value::Character(c) => *c,
+            v => return Err(type_err("string-pad-right", "character", v)),
+        }
+    } else {
+        ' '
+    };
+    let total = s.chars().count();
+    let width = width as usize;
+    if total >= width {
+        Ok(Value::string(s.chars().take(width).collect::<String>()))
+    } else {
+        let pad: String = std::iter::repeat(pad_char).take(width - total).collect();
+        Ok(Value::string(format!("{}{}", s, pad)))
     }
 }
 

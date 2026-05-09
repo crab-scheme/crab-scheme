@@ -329,6 +329,11 @@ fn conformance_srfi1_extras() {
 }
 
 #[test]
+fn conformance_string_extras() {
+    run_conformance_file("string_extras.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -399,6 +404,7 @@ fn conformance_aggregate_count() {
                 "r6rs_division.scm",
                 "cxxr_accessors.scm",
                 "srfi1_extras.scm",
+                "string_extras.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

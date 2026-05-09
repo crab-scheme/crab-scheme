@@ -495,3 +495,11 @@ fn vm_conformance_cxxr_accessors() {
     println!("cxxr_accessors: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_string_extras() {
+    let walker = pass_count_walker("string_extras.scm");
+    let vm = pass_count_vm("string_extras.scm").expect("vm should run string_extras.scm");
+    println!("string_extras: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
