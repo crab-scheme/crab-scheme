@@ -342,12 +342,28 @@ impl Runtime {
                 return Err(Diagnostic::error(e.message(), e.span()));
             }
         };
-        let mut expander = Expander::new(&mut self.syms, &mut self.macros);
+        // Split off the fields the include resolver needs (`sources`) and the
+        // ones the Expander itself takes (`syms`, `macros`) so they don't
+        // overlap. This lets `(include "path")` register the file's source
+        // with the SourceMap so error spans render correctly.
+        let Self {
+            sources,
+            syms,
+            macros,
+            ..
+        } = self;
+        let mut resolver = |path: &str| -> Option<(FileId, String)> {
+            let src = std::fs::read_to_string(path).ok()?;
+            let id = sources.add(path, &src);
+            Some((id, src))
+        };
+        let mut expander = Expander::new(syms, macros).with_include_resolver(&mut resolver);
         let core = match expander.expand_program(&data) {
             Ok(c) => c,
             Err(e) => return Err(Diagnostic::error(e.message(), e.span())),
         };
         drop(expander);
+        drop(resolver);
         let mut ctx = EvalCtx::new(self.top.clone(), &mut self.syms, &mut self.macros);
         let result = eval(&core, self.top.clone(), &mut ctx);
         // Drain pending side-channels before ctx drops so we can render
@@ -409,7 +425,18 @@ impl Runtime {
                 return Err(Diagnostic::error(e.message(), e.span()));
             }
         };
-        let mut expander = Expander::new(&mut self.syms, &mut self.macros);
+        let Self {
+            sources,
+            syms,
+            macros,
+            ..
+        } = self;
+        let mut resolver = |path: &str| -> Option<(FileId, String)> {
+            let src = std::fs::read_to_string(path).ok()?;
+            let id = sources.add(path, &src);
+            Some((id, src))
+        };
+        let mut expander = Expander::new(syms, macros).with_include_resolver(&mut resolver);
         let core = match expander.expand_program(&data) {
             Ok(c) => c,
             Err(e) => return Err(Diagnostic::error(e.message(), e.span())),

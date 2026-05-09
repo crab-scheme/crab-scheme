@@ -37,6 +37,13 @@ impl ExpandError {
     }
 }
 
+/// Callback the expander invokes for each `(include "path")` form. Returns
+/// `Some((file_id, source))` if the file was found, or `None` to signal a
+/// missing-file error. The host (cs-runtime / CLI) supplies this so the
+/// expander avoids a direct std::fs dependency and the SourceMap stays
+/// owned by a single layer.
+pub type IncludeResolver<'a> = dyn FnMut(&str) -> Option<(cs_diag::FileId, String)> + 'a;
+
 pub struct Expander<'a> {
     pub syms: &'a mut SymbolTable,
     pub macros: &'a mut std::collections::HashMap<Symbol, Macro>,
@@ -46,6 +53,8 @@ pub struct Expander<'a> {
     /// (so each `eval_str` call resets, but macros across calls work because
     /// the macros table is in the Runtime).
     gensym_counter: u32,
+    /// Hook for `(include "path")` forms.
+    include_resolver: Option<&'a mut IncludeResolver<'a>>,
 }
 
 /// A user-defined macro, parsed from `(syntax-rules ...)`.
@@ -98,6 +107,7 @@ struct Keywords {
     assert_: Symbol,
     case_lambda: Symbol,
     cond_expand: Symbol,
+    include: Symbol,
 }
 
 impl Keywords {
@@ -142,6 +152,7 @@ impl Keywords {
             assert_: syms.intern("assert"),
             case_lambda: syms.intern("case-lambda"),
             cond_expand: syms.intern("cond-expand"),
+            include: syms.intern("include"),
         }
     }
 }
@@ -157,7 +168,15 @@ impl<'a> Expander<'a> {
             macros,
             keywords,
             gensym_counter: 0,
+            include_resolver: None,
         }
+    }
+
+    /// Install an `include` resolver. Calls to `(include "path")` will
+    /// invoke this callback with the literal path string from the form.
+    pub fn with_include_resolver(mut self, resolver: &'a mut IncludeResolver<'a>) -> Self {
+        self.include_resolver = Some(resolver);
+        self
     }
 
     /// Expand a top-level program (sequence of definitions and expressions)
@@ -184,7 +203,8 @@ impl<'a> Expander<'a> {
     }
 
     fn expand_top(&mut self, d: &Datum) -> Result<CoreExpr, ExpandError> {
-        // Recognize top-level `define`, `define-record-type`, `define-syntax`.
+        // Recognize top-level `define`, `define-record-type`, `define-syntax`,
+        // and `include`.
         if let Some((head, tail)) = list_head(d) {
             if let Datum::Symbol(s, _) = &*head {
                 if *s == self.keywords.define {
@@ -196,9 +216,70 @@ impl<'a> Expander<'a> {
                 if *s == self.keywords.define_syntax {
                     return self.expand_define_syntax(&tail, d.span());
                 }
+                if *s == self.keywords.include {
+                    return self.expand_include(&tail, d.span());
+                }
             }
         }
         self.expand(d)
+    }
+
+    /// `(include "path1" "path2" ...)` — at expand time, read each named
+    /// file via the installed `IncludeResolver` callback, parse it to
+    /// datums, and return the concatenation as a `(begin ...)` so any
+    /// top-level forms in the included files participate in the program.
+    fn expand_include(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        if items.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "include needs at least one path".into(),
+                span,
+            });
+        }
+        // Eagerly parse every path argument up front so the dispatch is
+        // borrow-clean before we touch the resolver / syms.
+        let paths: Vec<(String, Span)> = items
+            .iter()
+            .map(|d| match d {
+                Datum::String(s, sp) => Ok(((**s).clone(), *sp)),
+                other => Err(ExpandError::BadSyntax {
+                    what: "include path must be a string literal".into(),
+                    span: other.span(),
+                }),
+            })
+            .collect::<Result<_, _>>()?;
+        let mut all_data: Vec<Datum> = Vec::new();
+        for (path, p_span) in paths {
+            let (file_id, src) = match &mut self.include_resolver {
+                Some(resolver) => resolver(&path).ok_or_else(|| ExpandError::BadSyntax {
+                    what: format!("include: cannot read {}", path),
+                    span: p_span,
+                })?,
+                None => {
+                    return Err(ExpandError::BadSyntax {
+                        what: format!("include: no resolver installed (needed for {})", path),
+                        span: p_span,
+                    });
+                }
+            };
+            // Parse the included source with a fresh reader, attributing
+            // datum spans to file_id supplied by the resolver.
+            let included = cs_parse::read_all(file_id, &src, self.syms).map_err(|errs| {
+                let e = errs.into_iter().next().unwrap();
+                ExpandError::BadSyntax {
+                    what: format!("include: parse error in {}: {}", path, e.message()),
+                    span: p_span,
+                }
+            })?;
+            all_data.extend(included);
+        }
+        // Expand each included datum as a top-level form so its defines
+        // / define-record-type / define-syntax / nested includes work
+        // correctly.
+        let mut exprs: Vec<CoreExpr> = Vec::with_capacity(all_data.len());
+        for d in &all_data {
+            exprs.push(self.expand_top(d)?);
+        }
+        Ok(CoreExpr::Begin { exprs, span })
     }
 
     /// `(let-syntax ((name spec) ...) body ...)` and

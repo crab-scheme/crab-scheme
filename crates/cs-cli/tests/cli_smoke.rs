@@ -269,6 +269,53 @@ fn run_metacircular_vm() {
 }
 
 #[test]
+fn include_form_splices_a_file_inline() {
+    // (include "path") at expand time reads the file's contents and
+    // inlines them as if typed at that position. Verifies on both tiers.
+    let lib = std::env::temp_dir().join("crabscheme_incl_lib_smoke.scm");
+    let main = std::env::temp_dir().join("crabscheme_incl_main_smoke.scm");
+    std::fs::write(&lib, "(define (sq x) (* x x))\n").unwrap();
+    std::fs::write(
+        &main,
+        format!("(include {:?})\n(sq 9)\n", lib.to_str().unwrap()),
+    )
+    .unwrap();
+
+    let walker_out = cli()
+        .args(["run", main.to_str().unwrap()])
+        .output()
+        .expect("walker");
+    assert!(
+        walker_out.status.success(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&walker_out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&walker_out.stdout).trim(), "81");
+
+    let vm_out = cli()
+        .args(["--tier", "vm", "run", main.to_str().unwrap()])
+        .output()
+        .expect("vm");
+    assert!(
+        vm_out.status.success(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&vm_out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&vm_out.stdout).trim(), "81");
+
+    let _ = std::fs::remove_file(lib);
+    let _ = std::fs::remove_file(main);
+}
+
+#[test]
+fn include_missing_file_reports_error() {
+    let (_, err, code) = run_eval(r#"(include "/no/such/file.scm")"#);
+    assert_eq!(code, 2);
+    assert!(err.contains("include"), "stderr: {:?}", err);
+    assert!(err.contains("cannot read"), "stderr: {:?}", err);
+}
+
+#[test]
 fn repl_load_command_brings_definitions_into_scope() {
     // :load <path> reads a file and runs it in the current REPL session.
     // Definitions made by the loaded file should remain visible to
