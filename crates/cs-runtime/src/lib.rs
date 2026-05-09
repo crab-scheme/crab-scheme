@@ -847,6 +847,120 @@ impl Runtime {
                 }
             }),
         );
+        // R7RS read-char / peek-char / read-string with optional port.
+        // No-arg form falls back to vm_current_input_port_value().
+        let rc_sym = syms.intern("read-char");
+        vm_env.define(
+            rc_sym,
+            cs_vm::vm::make_vm_builtin("read-char", |args| {
+                if args.len() > 1 {
+                    return Err("read-char: 0 or 1 arg".into());
+                }
+                let port = if args.is_empty() {
+                    cs_vm::vm::vm_current_input_port_value()
+                        .ok_or_else(|| "read-char: no current input port".to_string())?
+                } else {
+                    args[0].clone()
+                };
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::StringInput(state) => {
+                            let mut s = state.borrow_mut();
+                            if s.pos < s.chars.len() {
+                                let c = s.chars[s.pos];
+                                s.pos += 1;
+                                Ok(Value::Character(c))
+                            } else {
+                                Ok(Value::Eof)
+                            }
+                        }
+                        _ => Err("read-char: not an input port".into()),
+                    },
+                    other => Err(format!(
+                        "read-char: expected port, got {}",
+                        other.type_name()
+                    )),
+                }
+            }),
+        );
+        let pc_sym = syms.intern("peek-char");
+        vm_env.define(
+            pc_sym,
+            cs_vm::vm::make_vm_builtin("peek-char", |args| {
+                if args.len() > 1 {
+                    return Err("peek-char: 0 or 1 arg".into());
+                }
+                let port = if args.is_empty() {
+                    cs_vm::vm::vm_current_input_port_value()
+                        .ok_or_else(|| "peek-char: no current input port".to_string())?
+                } else {
+                    args[0].clone()
+                };
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::StringInput(state) => {
+                            let s = state.borrow();
+                            if s.pos < s.chars.len() {
+                                Ok(Value::Character(s.chars[s.pos]))
+                            } else {
+                                Ok(Value::Eof)
+                            }
+                        }
+                        _ => Err("peek-char: not an input port".into()),
+                    },
+                    other => Err(format!(
+                        "peek-char: expected port, got {}",
+                        other.type_name()
+                    )),
+                }
+            }),
+        );
+        let rs_sym = syms.intern("read-string");
+        vm_env.define(
+            rs_sym,
+            cs_vm::vm::make_vm_builtin("read-string", |args| {
+                if args.is_empty() || args.len() > 2 {
+                    return Err("read-string: 1 or 2 args".into());
+                }
+                let k = match &args[0] {
+                    Value::Number(n) => match n.to_f64() as i64 {
+                        i if i >= 0 => i as usize,
+                        _ => return Err("read-string: negative count".into()),
+                    },
+                    other => {
+                        return Err(format!(
+                            "read-string: expected count, got {}",
+                            other.type_name()
+                        ))
+                    }
+                };
+                let port = if args.len() == 1 {
+                    cs_vm::vm::vm_current_input_port_value()
+                        .ok_or_else(|| "read-string: no current input port".to_string())?
+                } else {
+                    args[1].clone()
+                };
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::StringInput(state) => {
+                            let mut s = state.borrow_mut();
+                            if s.pos >= s.chars.len() {
+                                return Ok(Value::Eof);
+                            }
+                            let end = (s.pos + k).min(s.chars.len());
+                            let chars: String = s.chars[s.pos..end].iter().collect();
+                            s.pos = end;
+                            Ok(Value::string(chars))
+                        }
+                        _ => Err("read-string: not an input port".into()),
+                    },
+                    other => Err(format!(
+                        "read-string: expected port, got {}",
+                        other.type_name()
+                    )),
+                }
+            }),
+        );
         let gensym_sym = syms.intern("gensym");
         vm_env.define(
             gensym_sym,

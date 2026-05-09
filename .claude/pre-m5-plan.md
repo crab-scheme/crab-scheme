@@ -251,12 +251,15 @@ Iters 117+ are filling R7RS gaps one per iter:
   unknown names cleanly fall through to else
 - 142 R7RS bytevector->list / list->bytevector aliases with
   optional [start [end]] on the bytevector->list path. R6RS
-  bytevector->u8-list / u8-list->bytevector remain. (this iter)
+  bytevector->u8-list / u8-list->bytevector remain.
+- 143 read-char/peek-char/read-string accept optional port; default
+  to current-input-port (R7RS). Promoted walker tier to Higher;
+  added VM tier shims via make_vm_builtin (this iter)
 
 Current totals:
-- 96 conformance test files (cli)
-- VM tier: 98 tests
-- Aggregate: 1946 individual Scheme tests passing
+- 97 conformance test files (cli)
+- VM tier: 99 tests
+- Aggregate: 1964 individual Scheme tests passing
 
 ## Loop cadence
 

@@ -440,9 +440,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("binary-port?", b_binary_port_p),
         ("textual-port?", b_textual_port_p),
         ("get-output-string", b_get_output_string),
-        ("read-char", b_read_char),
-        ("peek-char", b_peek_char),
-        ("read-string", b_read_string),
+        // read-char / peek-char / read-string are HIGHER (in higher_order_builtins
+        // below) so they can default to current-input-port when called with
+        // no port arg per R7RS.
         // R7RS aliases for the R6RS open-{string,bytevector}-input-port forms.
         ("open-input-string", b_open_string_input_port),
         ("open-input-bytevector", b_open_bytevector_input_port),
@@ -598,6 +598,9 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("vector-for-each", b_vector_for_each),
         // port-aware read
         ("read", b_read),
+        ("read-char", b_read_char_ho),
+        ("peek-char", b_peek_char_ho),
+        ("read-string", b_read_string_ho),
         ("read-line", b_read_line_implicit),
         ("get-string-all", b_get_string_all),
         // SRFI-1 (higher-order)
@@ -5823,6 +5826,52 @@ fn b_get_output_string(args: &[Value]) -> Result<Value, String> {
         },
         v => Err(type_err("get-output-string", "output-port", v)),
     }
+}
+
+/// R7RS `(read-char [port])`. Defaults to current-input-port.
+fn b_read_char_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err("read-char", "0 or 1", args.len()));
+    }
+    let port = if args.is_empty() {
+        ctx.current_input_port
+            .clone()
+            .ok_or_else(|| "read-char: no current input port".to_string())?
+    } else {
+        args[0].clone()
+    };
+    b_read_char(&[port])
+}
+
+/// R7RS `(peek-char [port])`. Defaults to current-input-port.
+fn b_peek_char_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err("peek-char", "0 or 1", args.len()));
+    }
+    let port = if args.is_empty() {
+        ctx.current_input_port
+            .clone()
+            .ok_or_else(|| "peek-char: no current input port".to_string())?
+    } else {
+        args[0].clone()
+    };
+    b_peek_char(&[port])
+}
+
+/// R7RS `(read-string k [port])`. k is required; port defaults to
+/// current-input-port.
+fn b_read_string_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_err("read-string", "1 or 2", args.len()));
+    }
+    let port = if args.len() == 1 {
+        ctx.current_input_port
+            .clone()
+            .ok_or_else(|| "read-string: no current input port".to_string())?
+    } else {
+        args[1].clone()
+    };
+    b_read_string(&[args[0].clone(), port])
 }
 
 fn b_read_char(args: &[Value]) -> Result<Value, String> {
