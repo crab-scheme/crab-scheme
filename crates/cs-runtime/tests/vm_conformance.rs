@@ -479,3 +479,11 @@ fn vm_conformance_bytevector_ports() {
     println!("bytevector_ports: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r6rs_division() {
+    let walker = pass_count_walker("r6rs_division.scm");
+    let vm = pass_count_vm("r6rs_division.scm").expect("vm should run r6rs_division.scm");
+    println!("r6rs_division: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

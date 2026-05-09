@@ -36,6 +36,10 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("modulo", b_modulo),
         ("quotient", b_quotient),
         ("remainder", b_remainder),
+        ("div", b_div_op),
+        ("mod", b_mod_op),
+        ("div0", b_div0_op),
+        ("mod0", b_mod0_op),
         ("expt", b_expt),
         ("gcd", b_gcd),
         ("lcm", b_lcm),
@@ -351,6 +355,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("eval", b_eval),
         ("environment", b_environment),
         ("interaction-environment", b_interaction_environment),
+        ("div-and-mod", b_div_and_mod),
+        ("div0-and-mod0", b_div0_and_mod0),
         ("features", b_features),
         // vector higher-order
         ("vector-map", b_vector_map),
@@ -661,6 +667,153 @@ fn b_modulo(args: &[Value]) -> Result<Value, String> {
         r
     };
     Ok(Value::fixnum(m))
+}
+
+// ---- R6RS Euclidean division (div / mod / div-and-mod / div0 / mod0) ----
+//
+// `(div x y)` returns nd such that 0 ≤ x − y·nd < |y|. So `mod` is always
+// non-negative regardless of the signs of x and y. `div0`/`mod0` use
+// centered division: mod0 is in [−|y|/2, |y|/2). `*-and-*` versions
+// return both via `(values d m)`.
+
+/// Public so `Runtime::new` can plumb VM-tier shims that need to
+/// compute Euclidean div/mod and stash the (d, m) pair via the VM's
+/// pending-values channel.
+pub fn div_and_mod_i64(x: &Value, y: &Value) -> Result<(i64, i64), String> {
+    let xi = as_int_i64("div-and-mod", x)?;
+    let yi = as_int_i64("div-and-mod", y)?;
+    let d = r6rs_div_i64(xi, yi)?;
+    let m = xi - d * yi;
+    Ok((d, m))
+}
+
+pub fn div0_and_mod0_i64(x: &Value, y: &Value) -> Result<(i64, i64), String> {
+    let xi = as_int_i64("div0-and-mod0", x)?;
+    let yi = as_int_i64("div0-and-mod0", y)?;
+    let d = r6rs_div0_i64(xi, yi)?;
+    let m = xi - d * yi;
+    Ok((d, m))
+}
+
+fn r6rs_div_i64(x: i64, y: i64) -> Result<i64, String> {
+    if y == 0 {
+        return Err("division by zero".into());
+    }
+    let q = x.wrapping_div(y);
+    let r = x.wrapping_sub(q.wrapping_mul(y));
+    let q = if r < 0 {
+        if y > 0 {
+            q - 1
+        } else {
+            q + 1
+        }
+    } else {
+        q
+    };
+    Ok(q)
+}
+
+fn r6rs_mod_i64(x: i64, y: i64) -> Result<i64, String> {
+    let q = r6rs_div_i64(x, y)?;
+    Ok(x - q * y)
+}
+
+fn r6rs_div0_i64(x: i64, y: i64) -> Result<i64, String> {
+    let d = r6rs_div_i64(x, y)?;
+    let m = x - d * y;
+    // Centered: shift by 1 if m exceeds |y|/2 (ties broken downward to
+    // match the half-open interval [-|y|/2, |y|/2)).
+    let abs_y = y.unsigned_abs() as i128;
+    let twice_m = (m as i128) * 2;
+    let shift = if twice_m > abs_y as i128 {
+        1
+    } else if twice_m == abs_y as i128 && abs_y % 2 == 0 {
+        1
+    } else {
+        0
+    };
+    if shift == 1 {
+        if y > 0 {
+            Ok(d + 1)
+        } else {
+            Ok(d - 1)
+        }
+    } else {
+        Ok(d)
+    }
+}
+
+fn r6rs_mod0_i64(x: i64, y: i64) -> Result<i64, String> {
+    let d0 = r6rs_div0_i64(x, y)?;
+    Ok(x - d0 * y)
+}
+
+fn b_div_op(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("div", "2", args.len()));
+    }
+    let x = as_int_i64("div", &args[0])?;
+    let y = as_int_i64("div", &args[1])?;
+    Ok(Value::fixnum(
+        r6rs_div_i64(x, y).map_err(|m| format!("div: {}", m))?,
+    ))
+}
+
+fn b_mod_op(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("mod", "2", args.len()));
+    }
+    let x = as_int_i64("mod", &args[0])?;
+    let y = as_int_i64("mod", &args[1])?;
+    Ok(Value::fixnum(
+        r6rs_mod_i64(x, y).map_err(|m| format!("mod: {}", m))?,
+    ))
+}
+
+fn b_div0_op(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("div0", "2", args.len()));
+    }
+    let x = as_int_i64("div0", &args[0])?;
+    let y = as_int_i64("div0", &args[1])?;
+    Ok(Value::fixnum(
+        r6rs_div0_i64(x, y).map_err(|m| format!("div0: {}", m))?,
+    ))
+}
+
+fn b_mod0_op(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("mod0", "2", args.len()));
+    }
+    let x = as_int_i64("mod0", &args[0])?;
+    let y = as_int_i64("mod0", &args[1])?;
+    Ok(Value::fixnum(
+        r6rs_mod0_i64(x, y).map_err(|m| format!("mod0: {}", m))?,
+    ))
+}
+
+fn b_div_and_mod(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("div-and-mod", "2", args.len()));
+    }
+    let x = as_int_i64("div-and-mod", &args[0])?;
+    let y = as_int_i64("div-and-mod", &args[1])?;
+    let d = r6rs_div_i64(x, y).map_err(|m| format!("div-and-mod: {}", m))?;
+    let m = x - d * y;
+    ctx.pending_values = Some(vec![Value::fixnum(d), Value::fixnum(m)]);
+    Ok(Value::Unspecified)
+}
+
+fn b_div0_and_mod0(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("div0-and-mod0", "2", args.len()));
+    }
+    let x = as_int_i64("div0-and-mod0", &args[0])?;
+    let y = as_int_i64("div0-and-mod0", &args[1])?;
+    let d = r6rs_div0_i64(x, y).map_err(|m| format!("div0-and-mod0: {}", m))?;
+    let m = x - d * y;
+    ctx.pending_values = Some(vec![Value::fixnum(d), Value::fixnum(m)]);
+    Ok(Value::Unspecified)
 }
 
 fn b_expt(args: &[Value]) -> Result<Value, String> {

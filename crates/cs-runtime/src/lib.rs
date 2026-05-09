@@ -217,6 +217,34 @@ impl Runtime {
                 Ok(Value::Symbol(st.intern("__top-level-env__")))
             }),
         );
+        // R6RS multi-value division ops. Both stash the (d, m) pair via
+        // the VM's pending-values channel so call-with-values picks it up.
+        let dam_sym = syms.intern("div-and-mod");
+        vm_env.define(
+            dam_sym,
+            cs_vm::vm::make_vm_builtin("div-and-mod", |args| {
+                if args.len() != 2 {
+                    return Err("div-and-mod: 2 args".into());
+                }
+                let (d, m) = builtins::div_and_mod_i64(&args[0], &args[1])
+                    .map_err(|e| format!("div-and-mod: {}", e))?;
+                cs_vm::vm::vm_set_pending_values(vec![Value::fixnum(d), Value::fixnum(m)]);
+                Ok(Value::Unspecified)
+            }),
+        );
+        let dam0_sym = syms.intern("div0-and-mod0");
+        vm_env.define(
+            dam0_sym,
+            cs_vm::vm::make_vm_builtin("div0-and-mod0", |args| {
+                if args.len() != 2 {
+                    return Err("div0-and-mod0: 2 args".into());
+                }
+                let (d, m) = builtins::div0_and_mod0_i64(&args[0], &args[1])
+                    .map_err(|e| format!("div0-and-mod0: {}", e))?;
+                cs_vm::vm::vm_set_pending_values(vec![Value::fixnum(d), Value::fixnum(m)]);
+                Ok(Value::Unspecified)
+            }),
+        );
         let ienv_sym = syms.intern("interaction-environment");
         vm_env.define(
             ienv_sym,

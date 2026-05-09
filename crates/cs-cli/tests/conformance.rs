@@ -314,6 +314,11 @@ fn conformance_bytevector_ports() {
 }
 
 #[test]
+fn conformance_r6rs_division() {
+    run_conformance_file("r6rs_division.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -381,6 +386,7 @@ fn conformance_aggregate_count() {
                 "utf8_codec.scm",
                 "eval_environment.scm",
                 "bytevector_ports.scm",
+                "r6rs_division.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

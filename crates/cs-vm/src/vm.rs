@@ -38,6 +38,14 @@ fn set_pending_values(vs: Vec<Value>) {
     VM_PENDING_VALUES.with(|cell| *cell.borrow_mut() = Some(vs));
 }
 
+/// Public hook for cs-runtime: builtins that produce multiple values
+/// (e.g. `div-and-mod`) stash them here, and the VM dispatch machinery
+/// drains via `take_pending_values` on `Inst::Call` return so
+/// `call-with-values` sees them.
+pub fn vm_set_pending_values(vs: Vec<Value>) {
+    set_pending_values(vs);
+}
+
 fn take_pending_raise() -> Option<Value> {
     VM_PENDING_RAISE.with(|cell| cell.borrow_mut().take())
 }
