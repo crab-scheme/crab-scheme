@@ -172,35 +172,77 @@ impl Diagnostic {
 
 /// Render a diagnostic to plain text using the provided source map.
 pub fn render(diag: &Diagnostic, sm: &SourceMap) -> String {
-    let mut out = String::new();
-    let label = match diag.severity {
-        Severity::Error => "error",
-        Severity::Warning => "warning",
-        Severity::Note => "note",
+    render_with(diag, sm, false)
+}
+
+/// Like [`render`] but with an explicit color toggle. Set `color = true`
+/// to wrap severity, file location, and caret in ANSI escape codes.
+pub fn render_with(diag: &Diagnostic, sm: &SourceMap, color: bool) -> String {
+    // ANSI sequences. When `color` is false, all of these expand to "".
+    let reset = if color { "\x1b[0m" } else { "" };
+    let bold = if color { "\x1b[1m" } else { "" };
+    let red = if color { "\x1b[31m" } else { "" };
+    let yellow = if color { "\x1b[33m" } else { "" };
+    let cyan = if color { "\x1b[36m" } else { "" };
+    let blue = if color { "\x1b[34m" } else { "" };
+
+    let (sev_label, sev_color) = match diag.severity {
+        Severity::Error => ("error", red),
+        Severity::Warning => ("warning", yellow),
+        Severity::Note => ("note", cyan),
     };
-    if let Some(code) = diag.code {
-        out.push_str(&format!("{label}[{code}]: {}\n", diag.message));
+
+    let mut out = String::new();
+    let header = if let Some(code) = diag.code {
+        format!(
+            "{sev_label}[{code}]: {msg}",
+            sev_label = sev_label,
+            code = code,
+            msg = diag.message
+        )
     } else {
-        out.push_str(&format!("{label}: {}\n", diag.message));
-    }
+        format!(
+            "{sev_label}: {msg}",
+            sev_label = sev_label,
+            msg = diag.message
+        )
+    };
+    out.push_str(&format!("{}{}{}{}\n", bold, sev_color, header, reset));
 
     if !diag.primary.is_dummy() {
         let (line, col) = sm.line_col(diag.primary);
         let name = sm.name(diag.primary.file);
-        out.push_str(&format!(" --> {name}:{line}:{col}\n"));
+        out.push_str(&format!(
+            " {bold}--> {blue}{name}:{line}:{col}{reset}\n",
+            bold = bold,
+            blue = blue,
+            reset = reset,
+            name = name,
+            line = line,
+            col = col,
+        ));
 
         let f_contents = sm.contents(diag.primary.file);
         if let Some(line_text) = f_contents.lines().nth((line as usize).saturating_sub(1)) {
-            out.push_str(&format!("  | \n"));
+            out.push_str("  | \n");
             out.push_str(&format!("{:>3} | {}\n", line, line_text));
             let span_len = (diag.primary.end - diag.primary.start).max(1) as usize;
-            let caret: String = " ".repeat(col as usize - 1) + &"^".repeat(span_len);
-            out.push_str(&format!("  | {}\n", caret));
+            let caret_str: String = "^".repeat(span_len);
+            let pad: String = " ".repeat(col as usize - 1);
+            out.push_str(&format!(
+                "  | {}{}{}{}{}\n",
+                pad, bold, sev_color, caret_str, reset
+            ));
         }
     }
 
     for note in &diag.notes {
-        out.push_str(&format!("  = note: {note}\n"));
+        out.push_str(&format!(
+            "  = {bold}note{reset}: {note}\n",
+            bold = bold,
+            reset = reset,
+            note = note
+        ));
     }
     out
 }

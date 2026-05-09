@@ -66,6 +66,10 @@ cargo run --release -- repl
 
 # Same, on the bytecode VM tier.
 cargo run --release -- --tier vm repl
+
+# Force colored or plain diagnostics (default `auto` colors when stderr is a TTY).
+cargo run --release -- --color always -e '(foo 1 2)'
+cargo run --release -- --color never -e '(foo 1 2)'
 ```
 
 ### REPL commands

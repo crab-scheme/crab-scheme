@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use cs_core::{Value, WriteMode};
-use cs_diag::render;
+use cs_diag::{render_with, Diagnostic, SourceMap};
 use cs_runtime::Runtime;
 
 #[derive(Parser, Debug)]
@@ -24,8 +24,30 @@ struct Cli {
     #[arg(long = "tier", value_name = "TIER", default_value = "walker")]
     tier: String,
 
+    /// When to color diagnostics: auto (TTY-dependent), always, or never.
+    #[arg(long = "color", value_name = "WHEN", default_value = "auto")]
+    color: String,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
+}
+
+/// Resolve the `--color` flag: 'auto' inspects whether stderr is a TTY.
+fn color_enabled(flag: &str) -> bool {
+    match flag {
+        "always" => true,
+        "never" => false,
+        _ => is_stderr_tty(),
+    }
+}
+
+fn is_stderr_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal()
+}
+
+fn render_diag(diag: &Diagnostic, sm: &SourceMap, color: bool) -> String {
+    render_with(diag, sm, color)
 }
 
 #[derive(Subcommand, Debug)]
@@ -42,14 +64,15 @@ enum Cmd {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let via_vm = cli.tier == "vm";
+    let color = color_enabled(&cli.color);
 
     if let Some(expr) = cli.expr {
-        return run_eval(&expr, via_vm);
+        return run_eval(&expr, via_vm, color);
     }
 
     match cli.cmd {
-        Some(Cmd::Run { file }) => run_file(&file, via_vm),
-        Some(Cmd::Repl) | None => run_repl(via_vm),
+        Some(Cmd::Run { file }) => run_file(&file, via_vm, color),
+        Some(Cmd::Repl) | None => run_repl(via_vm, color),
     }
 }
 
@@ -66,7 +89,7 @@ fn eval_with_tier(
     }
 }
 
-fn run_eval(src: &str, via_vm: bool) -> ExitCode {
+fn run_eval(src: &str, via_vm: bool, color: bool) -> ExitCode {
     let mut rt = Runtime::new();
     match eval_with_tier(&mut rt, "<command-line>", src, via_vm) {
         Ok(v) => {
@@ -76,14 +99,14 @@ fn run_eval(src: &str, via_vm: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(diag) => {
-            let s = render(&diag, rt.source_map());
+            let s = render_diag(&diag, rt.source_map(), color);
             eprintln!("{}", s);
             ExitCode::from(2)
         }
     }
 }
 
-fn run_file(path: &str, via_vm: bool) -> ExitCode {
+fn run_file(path: &str, via_vm: bool, color: bool) -> ExitCode {
     let src = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -100,14 +123,14 @@ fn run_file(path: &str, via_vm: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(diag) => {
-            let s = render(&diag, rt.source_map());
+            let s = render_diag(&diag, rt.source_map(), color);
             eprintln!("{}", s);
             ExitCode::from(2)
         }
     }
 }
 
-fn run_repl(start_via_vm: bool) -> ExitCode {
+fn run_repl(start_via_vm: bool, color: bool) -> ExitCode {
     let mut rt = Runtime::new();
     let mut counter: u32 = 0;
     let mut via_vm = start_via_vm;
@@ -138,7 +161,7 @@ fn run_repl(start_via_vm: bool) -> ExitCode {
         // REPL command: line starts with `:` and we're not mid-expression.
         let trimmed = line.trim();
         if buffer.is_empty() && trimmed.starts_with(':') {
-            match handle_repl_cmd(trimmed, &mut via_vm, &mut rt) {
+            match handle_repl_cmd(trimmed, &mut via_vm, &mut rt, color) {
                 ReplCmdResult::Continue => {}
                 ReplCmdResult::Quit => return ExitCode::SUCCESS,
             }
@@ -163,7 +186,7 @@ fn run_repl(start_via_vm: bool) -> ExitCode {
                 }
             }
             Err(diag) => {
-                let s = render(&diag, rt.source_map());
+                let s = render_diag(&diag, rt.source_map(), color);
                 eprint!("{}", s);
             }
         }
@@ -175,7 +198,7 @@ enum ReplCmdResult {
     Quit,
 }
 
-fn handle_repl_cmd(line: &str, via_vm: &mut bool, rt: &mut Runtime) -> ReplCmdResult {
+fn handle_repl_cmd(line: &str, via_vm: &mut bool, rt: &mut Runtime, color: bool) -> ReplCmdResult {
     let mut parts = line.splitn(2, char::is_whitespace);
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim();
@@ -230,7 +253,7 @@ fn handle_repl_cmd(line: &str, via_vm: &mut bool, rt: &mut Runtime) -> ReplCmdRe
                     println!("; {:.3?}", dt);
                 }
                 Err(diag) => {
-                    let s = render(&diag, rt.source_map());
+                    let s = render_diag(&diag, rt.source_map(), color);
                     eprint!("{}", s);
                 }
             }
@@ -256,7 +279,7 @@ fn handle_repl_cmd(line: &str, via_vm: &mut bool, rt: &mut Runtime) -> ReplCmdRe
                             println!("; loaded {}", arg);
                         }
                         Err(diag) => {
-                            let s = render(&diag, rt.source_map());
+                            let s = render_diag(&diag, rt.source_map(), color);
                             eprint!("{}", s);
                         }
                     }

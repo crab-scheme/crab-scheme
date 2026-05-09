@@ -269,6 +269,46 @@ fn run_metacircular_vm() {
 }
 
 #[test]
+fn color_never_produces_plain_text() {
+    // --color never: no ANSI escape codes regardless of TTY.
+    let out = cli()
+        .args(["--color", "never", "-e", "(foo 1 2)"])
+        .output()
+        .expect("spawn");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("undefined variable: foo"), "{}", err);
+    assert!(
+        !err.contains("\x1b["),
+        "stderr unexpectedly has escape codes: {:?}",
+        err
+    );
+}
+
+#[test]
+fn color_always_emits_ansi_escapes() {
+    // --color always: emits ANSI codes for severity/file/caret.
+    let out = cli()
+        .args(["--color", "always", "-e", "(foo 1 2)"])
+        .output()
+        .expect("spawn");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("undefined variable: foo"), "{}", err);
+    // Bold (\x1b[1m) and red (\x1b[31m) must both appear.
+    assert!(err.contains("\x1b[1m"), "missing bold escape: {:?}", err);
+    assert!(err.contains("\x1b[31m"), "missing red escape: {:?}", err);
+}
+
+#[test]
+fn color_auto_off_when_stderr_is_pipe() {
+    // Default --color auto: stderr captured by Command is not a TTY,
+    // so output should be plain (no ANSI codes).
+    let out = cli().args(["-e", "(foo 1 2)"]).output().expect("spawn");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("undefined variable"), "{}", err);
+    assert!(!err.contains("\x1b["), "{}", err);
+}
+
+#[test]
 fn include_form_splices_a_file_inline() {
     // (include "path") at expand time reads the file's contents and
     // inlines them as if typed at that position. Verifies on both tiers.
