@@ -434,6 +434,11 @@ fn conformance_exact_integer_sqrt() {
 }
 
 #[test]
+fn conformance_r7rs_assoc_member_compare() {
+    run_conformance_file("r7rs_assoc_member_compare.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -525,6 +530,7 @@ fn conformance_aggregate_count() {
                 "library_validate.scm",
                 "r7rs_define_library.scm",
                 "exact_integer_sqrt.scm",
+                "r7rs_assoc_member_compare.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

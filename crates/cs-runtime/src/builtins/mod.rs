@@ -260,11 +260,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("vector->list", b_vector_to_list),
         ("list->vector", b_list_to_vector),
         // assoc lists
-        ("assoc", b_assoc),
         ("assv", b_assv),
         ("assq", b_assq),
         // member family
-        ("member", b_member),
         ("memv", b_memv),
         ("memq", b_memq),
         // strings (case)
@@ -545,6 +543,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("div-and-mod", b_div_and_mod),
         ("div0-and-mod0", b_div0_and_mod0),
         ("exact-integer-sqrt", b_exact_integer_sqrt),
+        ("assoc", b_assoc),
+        ("member", b_member),
         ("truncate/", b_truncate_div),
         ("floor/", b_floor_div),
         ("features", b_features),
@@ -2713,11 +2713,52 @@ fn b_list_to_vector(args: &[Value]) -> Result<Value, String> {
 
 // ---- assoc / member family ----
 
-fn b_assoc(args: &[Value]) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(arity_err("assoc", "2", args.len()));
+fn b_assoc(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    // R7RS: (assoc obj alist [compare]); the 2-arg form uses equal?,
+    // the 3-arg form applies the supplied comparison procedure.
+    // (R6RS only specifies the 2-arg form.) `obj` is args[0]; the
+    // alist is args[1].
+    match args.len() {
+        2 => assoc_search("assoc", &args[0], &args[1], eq::equal),
+        3 => {
+            let cmp = args[2].clone();
+            assoc_search_with("assoc", &args[0], &args[1], ctx, &cmp)
+        }
+        n => Err(arity_err("assoc", "2 or 3", n)),
     }
-    assoc_search("assoc", &args[0], &args[1], eq::equal)
+}
+
+/// Like `assoc_search` but applies a user-supplied comparison
+/// procedure on each step. Errors propagate as builtin errors.
+fn assoc_search_with(
+    name: &str,
+    key: &Value,
+    list: &Value,
+    ctx: &mut EvalCtx,
+    cmp: &Value,
+) -> Result<Value, String> {
+    let mut cur = list.clone();
+    loop {
+        match cur {
+            Value::Null => return Ok(Value::Boolean(false)),
+            Value::Pair(p) => {
+                let head = p.car.borrow().clone();
+                match &head {
+                    Value::Pair(pair) => {
+                        let car = pair.car.borrow().clone();
+                        let r = apply_procedure(cmp, &[car, key.clone()], ctx)
+                            .map_err(|d| format!("{:?}", d))?;
+                        if r.is_truthy() {
+                            return Ok(head.clone());
+                        }
+                    }
+                    _ => return Err(type_err(name, "list of pairs", &head)),
+                }
+                cur = p.cdr.borrow().clone();
+            }
+            other => return Err(type_err(name, "proper list", &other)),
+        }
+    }
 }
 
 fn b_assv(args: &[Value]) -> Result<Value, String> {
@@ -2761,11 +2802,42 @@ fn assoc_search(
     }
 }
 
-fn b_member(args: &[Value]) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(arity_err("member", "2", args.len()));
+fn b_member(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    // R7RS: (member obj list [compare]). 2-arg uses equal?; 3-arg
+    // uses the supplied comparison procedure.
+    match args.len() {
+        2 => member_search("member", &args[0], &args[1], eq::equal),
+        3 => {
+            let cmp = args[2].clone();
+            member_search_with("member", &args[0], &args[1], ctx, &cmp)
+        }
+        n => Err(arity_err("member", "2 or 3", n)),
     }
-    member_search("member", &args[0], &args[1], eq::equal)
+}
+
+fn member_search_with(
+    name: &str,
+    obj: &Value,
+    list: &Value,
+    ctx: &mut EvalCtx,
+    cmp: &Value,
+) -> Result<Value, String> {
+    let mut cur = list.clone();
+    loop {
+        match cur {
+            Value::Null => return Ok(Value::Boolean(false)),
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                let r = apply_procedure(cmp, &[car, obj.clone()], ctx)
+                    .map_err(|d| format!("{:?}", d))?;
+                if r.is_truthy() {
+                    return Ok(Value::Pair(p.clone()));
+                }
+                cur = p.cdr.borrow().clone();
+            }
+            other => return Err(type_err(name, "proper list", &other)),
+        }
+    }
 }
 
 fn b_memv(args: &[Value]) -> Result<Value, String> {

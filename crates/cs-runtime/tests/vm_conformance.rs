@@ -665,3 +665,12 @@ fn vm_conformance_exact_integer_sqrt() {
     println!("exact_integer_sqrt: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_assoc_member_compare() {
+    let walker = pass_count_walker("r7rs_assoc_member_compare.scm");
+    let vm = pass_count_vm("r7rs_assoc_member_compare.scm")
+        .expect("vm should run r7rs_assoc_member_compare.scm");
+    println!("r7rs_assoc_member_compare: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

@@ -246,6 +246,132 @@ impl Runtime {
                 Ok(Value::Unspecified)
             }),
         );
+        // VM-tier shims for assoc / member. The 3-arg form needs to
+        // apply a user-supplied comparison procedure, so the impl uses
+        // vm_call_sync. The 2-arg form falls back to the same eq /
+        // equal predicate as the walker.
+        fn vm_assoc(args: &[Value], st: &mut cs_core::SymbolTable) -> Result<Value, String> {
+            match args.len() {
+                2 => vm_assoc_static(&args[0], &args[1], cs_core::eq::equal),
+                3 => vm_assoc_with_proc(&args[0], &args[1], &args[2], st),
+                n => Err(format!("assoc: expected 2 or 3 arguments, got {}", n)),
+            }
+        }
+        fn vm_assoc_static(
+            key: &Value,
+            list: &Value,
+            pred: fn(&Value, &Value) -> bool,
+        ) -> Result<Value, String> {
+            let mut cur = list.clone();
+            loop {
+                match cur {
+                    Value::Null => return Ok(Value::Boolean(false)),
+                    Value::Pair(p) => {
+                        let head = p.car.borrow().clone();
+                        match &head {
+                            Value::Pair(pair) => {
+                                if pred(&pair.car.borrow(), key) {
+                                    return Ok(head.clone());
+                                }
+                            }
+                            _ => return Err("assoc: list of pairs".into()),
+                        }
+                        cur = p.cdr.borrow().clone();
+                    }
+                    _ => return Err("assoc: proper list".into()),
+                }
+            }
+        }
+        fn vm_assoc_with_proc(
+            key: &Value,
+            list: &Value,
+            cmp: &Value,
+            st: &mut cs_core::SymbolTable,
+        ) -> Result<Value, String> {
+            let mut cur = list.clone();
+            loop {
+                match cur {
+                    Value::Null => return Ok(Value::Boolean(false)),
+                    Value::Pair(p) => {
+                        let head = p.car.borrow().clone();
+                        match &head {
+                            Value::Pair(pair) => {
+                                let car = pair.car.borrow().clone();
+                                let r = cs_vm::vm::vm_call_sync(cmp, &[car, key.clone()], st)
+                                    .map_err(|e| format!("{:?}", e))?;
+                                if r.is_truthy() {
+                                    return Ok(head.clone());
+                                }
+                            }
+                            _ => return Err("assoc: list of pairs".into()),
+                        }
+                        cur = p.cdr.borrow().clone();
+                    }
+                    _ => return Err("assoc: proper list".into()),
+                }
+            }
+        }
+        let assoc_sym = syms.intern("assoc");
+        vm_env.define(
+            assoc_sym,
+            cs_vm::vm::make_vm_builtin_syms("assoc", vm_assoc),
+        );
+
+        fn vm_member(args: &[Value], st: &mut cs_core::SymbolTable) -> Result<Value, String> {
+            match args.len() {
+                2 => vm_member_static(&args[0], &args[1], cs_core::eq::equal),
+                3 => vm_member_with_proc(&args[0], &args[1], &args[2], st),
+                n => Err(format!("member: expected 2 or 3 arguments, got {}", n)),
+            }
+        }
+        fn vm_member_static(
+            obj: &Value,
+            list: &Value,
+            pred: fn(&Value, &Value) -> bool,
+        ) -> Result<Value, String> {
+            let mut cur = list.clone();
+            loop {
+                match cur.clone() {
+                    Value::Null => return Ok(Value::Boolean(false)),
+                    Value::Pair(p) => {
+                        if pred(&p.car.borrow(), obj) {
+                            return Ok(cur);
+                        }
+                        cur = p.cdr.borrow().clone();
+                    }
+                    _ => return Err("member: proper list".into()),
+                }
+            }
+        }
+        fn vm_member_with_proc(
+            obj: &Value,
+            list: &Value,
+            cmp: &Value,
+            st: &mut cs_core::SymbolTable,
+        ) -> Result<Value, String> {
+            let mut cur = list.clone();
+            loop {
+                match cur.clone() {
+                    Value::Null => return Ok(Value::Boolean(false)),
+                    Value::Pair(p) => {
+                        let car = p.car.borrow().clone();
+                        let r = cs_vm::vm::vm_call_sync(cmp, &[car, obj.clone()], st)
+                            .map_err(|e| format!("{:?}", e))?;
+                        if r.is_truthy() {
+                            return Ok(cur);
+                        }
+                        cur = p.cdr.borrow().clone();
+                    }
+                    _ => return Err("member: proper list".into()),
+                }
+            }
+        }
+        let member_sym = syms.intern("member");
+        vm_env.define(
+            member_sym,
+            cs_vm::vm::make_vm_builtin_syms("member", vm_member),
+        );
+
         let eis_sym = syms.intern("exact-integer-sqrt");
         vm_env.define(
             eis_sym,
