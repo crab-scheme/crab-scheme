@@ -90,6 +90,35 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("cons", b_cons),
         ("car", b_car),
         ("cdr", b_cdr),
+        // cXXr compositional accessors, depths 2..4
+        ("caar", b_caar),
+        ("cadr", b_cadr),
+        ("cdar", b_cdar),
+        ("cddr", b_cddr),
+        ("caaar", b_caaar),
+        ("caadr", b_caadr),
+        ("cadar", b_cadar),
+        ("caddr", b_caddr),
+        ("cdaar", b_cdaar),
+        ("cdadr", b_cdadr),
+        ("cddar", b_cddar),
+        ("cdddr", b_cdddr),
+        ("caaaar", b_caaaar),
+        ("caaadr", b_caaadr),
+        ("caadar", b_caadar),
+        ("caaddr", b_caaddr),
+        ("cadaar", b_cadaar),
+        ("cadadr", b_cadadr),
+        ("caddar", b_caddar),
+        ("cadddr", b_cadddr),
+        ("cdaaar", b_cdaaar),
+        ("cdaadr", b_cdaadr),
+        ("cdadar", b_cdadar),
+        ("cdaddr", b_cdaddr),
+        ("cddaar", b_cddaar),
+        ("cddadr", b_cddadr),
+        ("cdddar", b_cdddar),
+        ("cddddr", b_cddddr),
         ("set-car!", b_set_car),
         ("set-cdr!", b_set_cdr),
         ("list", b_list),
@@ -939,6 +968,68 @@ fn b_cdr(args: &[Value]) -> Result<Value, String> {
         v => Err(type_err("cdr", "pair", v)),
     }
 }
+
+// ---- R6RS compositional pair accessors (cXXr depth 2..4) ----
+//
+// Each of these is a fixed sequence of car/cdr applied right-to-left.
+// `(cadr xs)` means `(car (cdr xs))`. The dispatcher walks the pattern
+// once per call. Spelled out via macro so each public name resolves
+// directly to a `fn(&[Value]) -> Result<Value, String>` for registration.
+
+fn cxr_apply(name: &str, ops: &str, mut v: Value) -> Result<Value, String> {
+    // Right-to-left: caXr means apply X first, then car at the end.
+    for c in ops.chars().rev() {
+        v = match (c, &v) {
+            ('a', Value::Pair(p)) => p.car.borrow().clone(),
+            ('d', Value::Pair(p)) => p.cdr.borrow().clone(),
+            (_, other) => return Err(type_err(name, "pair", other)),
+        };
+    }
+    Ok(v)
+}
+
+macro_rules! cxr_fn {
+    ($fname:ident, $sname:expr, $ops:expr) => {
+        fn $fname(args: &[Value]) -> Result<Value, String> {
+            if args.len() != 1 {
+                return Err(arity_err($sname, "1", args.len()));
+            }
+            cxr_apply($sname, $ops, args[0].clone())
+        }
+    };
+}
+
+// depth 2 (4)
+cxr_fn!(b_caar, "caar", "aa");
+cxr_fn!(b_cadr, "cadr", "ad");
+cxr_fn!(b_cdar, "cdar", "da");
+cxr_fn!(b_cddr, "cddr", "dd");
+// depth 3 (8)
+cxr_fn!(b_caaar, "caaar", "aaa");
+cxr_fn!(b_caadr, "caadr", "aad");
+cxr_fn!(b_cadar, "cadar", "ada");
+cxr_fn!(b_caddr, "caddr", "add");
+cxr_fn!(b_cdaar, "cdaar", "daa");
+cxr_fn!(b_cdadr, "cdadr", "dad");
+cxr_fn!(b_cddar, "cddar", "dda");
+cxr_fn!(b_cdddr, "cdddr", "ddd");
+// depth 4 (16)
+cxr_fn!(b_caaaar, "caaaar", "aaaa");
+cxr_fn!(b_caaadr, "caaadr", "aaad");
+cxr_fn!(b_caadar, "caadar", "aada");
+cxr_fn!(b_caaddr, "caaddr", "aadd");
+cxr_fn!(b_cadaar, "cadaar", "adaa");
+cxr_fn!(b_cadadr, "cadadr", "adad");
+cxr_fn!(b_caddar, "caddar", "adda");
+cxr_fn!(b_cadddr, "cadddr", "addd");
+cxr_fn!(b_cdaaar, "cdaaar", "daaa");
+cxr_fn!(b_cdaadr, "cdaadr", "daad");
+cxr_fn!(b_cdadar, "cdadar", "dada");
+cxr_fn!(b_cdaddr, "cdaddr", "dadd");
+cxr_fn!(b_cddaar, "cddaar", "ddaa");
+cxr_fn!(b_cddadr, "cddadr", "ddad");
+cxr_fn!(b_cdddar, "cdddar", "ddda");
+cxr_fn!(b_cddddr, "cddddr", "dddd");
 
 fn b_set_car(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {

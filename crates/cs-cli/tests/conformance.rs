@@ -319,6 +319,11 @@ fn conformance_r6rs_division() {
 }
 
 #[test]
+fn conformance_cxxr_accessors() {
+    run_conformance_file("cxxr_accessors.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -387,6 +392,7 @@ fn conformance_aggregate_count() {
                 "eval_environment.scm",
                 "bytevector_ports.scm",
                 "r6rs_division.scm",
+                "cxxr_accessors.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

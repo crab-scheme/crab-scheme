@@ -487,3 +487,11 @@ fn vm_conformance_r6rs_division() {
     println!("r6rs_division: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_cxxr_accessors() {
+    let walker = pass_count_walker("cxxr_accessors.scm");
+    let vm = pass_count_vm("cxxr_accessors.scm").expect("vm should run cxxr_accessors.scm");
+    println!("cxxr_accessors: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
