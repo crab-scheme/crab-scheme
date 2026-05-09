@@ -423,3 +423,11 @@ fn vm_conformance_cond_guard_arrow() {
     println!("cond_guard_arrow: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_library_import() {
+    let walker = pass_count_walker("library_import.scm");
+    let vm = pass_count_vm("library_import.scm").expect("vm should run library_import.scm");
+    println!("library_import: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

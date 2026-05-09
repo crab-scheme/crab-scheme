@@ -279,6 +279,11 @@ fn conformance_cond_guard_arrow() {
 }
 
 #[test]
+fn conformance_library_import() {
+    run_conformance_file("library_import.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -339,6 +344,7 @@ fn conformance_aggregate_count() {
                 "error_who.scm",
                 "builtin_errors.scm",
                 "cond_guard_arrow.scm",
+                "library_import.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

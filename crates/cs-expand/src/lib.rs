@@ -142,6 +142,9 @@ struct Keywords {
     arrow: Symbol,
     define_record_type: Symbol,
     define_condition_type: Symbol,
+    library: Symbol,
+    import: Symbol,
+    export: Symbol,
     fields: Symbol,
     parent: Symbol,
     immutable: Symbol,
@@ -190,6 +193,9 @@ impl Keywords {
             arrow: syms.intern("=>"),
             define_record_type: syms.intern("define-record-type"),
             define_condition_type: syms.intern("define-condition-type"),
+            library: syms.intern("library"),
+            import: syms.intern("import"),
+            export: syms.intern("export"),
             fields: syms.intern("fields"),
             parent: syms.intern("parent"),
             immutable: syms.intern("immutable"),
@@ -264,7 +270,7 @@ impl<'a> Expander<'a> {
 
     fn expand_top(&mut self, d: &Datum) -> Result<CoreExpr, ExpandError> {
         // Recognize top-level `define`, `define-record-type`, `define-syntax`,
-        // and `include`.
+        // `include`, and the R6RS module prologue forms `library` / `import`.
         if let Some((head, tail)) = list_head(d) {
             if let Datum::Symbol(s, _) = &*head {
                 if *s == self.keywords.define {
@@ -282,9 +288,89 @@ impl<'a> Expander<'a> {
                 if *s == self.keywords.include {
                     return self.expand_include(&tail, d.span());
                 }
+                if *s == self.keywords.library {
+                    return self.expand_library(&tail, d.span());
+                }
+                if *s == self.keywords.import {
+                    return self.expand_import(&tail, d.span());
+                }
             }
         }
         self.expand(d)
+    }
+
+    /// `(library (<name> ...) (export ...) (import ...) <body> ...)`
+    /// Foundation: we don't have a real library system yet, so the form
+    /// is recognized purely so R6RS programs that wrap their code in a
+    /// library declaration can run. The library's body is spliced in
+    /// place as a `begin`. Imports and exports are accepted but ignored
+    /// — every binding is global at this milestone.
+    fn expand_library(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        if items.len() < 3 {
+            return Err(ExpandError::BadSyntax {
+                what: "library needs (name) (export ...) (import ...) body...".into(),
+                span,
+            });
+        }
+        // items[0] = (name ...) — accepted, not validated beyond shape.
+        let _name = collect_proper_list_strict(&items[0]).ok_or(ExpandError::BadSyntax {
+            what: "library: name spec must be a list".into(),
+            span: items[0].span(),
+        })?;
+        // items[1] = (export ...) — accepted, ignored.
+        let export_parts = collect_proper_list_strict(&items[1]).ok_or(ExpandError::BadSyntax {
+            what: "library: missing (export ...) clause".into(),
+            span: items[1].span(),
+        })?;
+        if !matches!(export_parts.first(), Some(Datum::Symbol(s, _)) if *s == self.keywords.export)
+        {
+            return Err(ExpandError::BadSyntax {
+                what: "library: second clause must be (export ...)".into(),
+                span: items[1].span(),
+            });
+        }
+        // items[2] = (import ...) — accepted, ignored.
+        let import_parts = collect_proper_list_strict(&items[2]).ok_or(ExpandError::BadSyntax {
+            what: "library: missing (import ...) clause".into(),
+            span: items[2].span(),
+        })?;
+        if !matches!(import_parts.first(), Some(Datum::Symbol(s, _)) if *s == self.keywords.import)
+        {
+            return Err(ExpandError::BadSyntax {
+                what: "library: third clause must be (import ...)".into(),
+                span: items[2].span(),
+            });
+        }
+        // Splice the body in as if it were top-level forms — define,
+        // define-record-type etc. all need their top-level handling.
+        let body = &items[3..];
+        let mut exprs: Vec<CoreExpr> = Vec::with_capacity(body.len());
+        for d in body {
+            exprs.push(self.expand_top(d)?);
+        }
+        Ok(CoreExpr::Begin { exprs, span })
+    }
+
+    /// `(import <import-spec> ...)` at top level. Foundation: we don't
+    /// resolve names yet — every builtin and every user definition is
+    /// already global — so this is a structural no-op. We do verify the
+    /// argument shape so a malformed import yields a clear error.
+    fn expand_import(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        for spec in items {
+            // Each import-spec must be a list. We don't otherwise inspect
+            // its contents at this milestone; real name resolution will
+            // be added when the library system lands.
+            if collect_proper_list_strict(spec).is_none() {
+                return Err(ExpandError::BadSyntax {
+                    what: "import spec must be a list".into(),
+                    span: spec.span(),
+                });
+            }
+        }
+        Ok(CoreExpr::Const {
+            value: Value::Unspecified,
+            span,
+        })
     }
 
     /// `(include "path1" "path2" ...)` — at expand time, read each named
