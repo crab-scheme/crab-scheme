@@ -640,3 +640,11 @@ fn vm_conformance_library_imports() {
     println!("library_imports: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_library_validate() {
+    let walker = pass_count_walker("library_validate.scm");
+    let vm = pass_count_vm("library_validate.scm").expect("vm should run library_validate.scm");
+    println!("library_validate: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

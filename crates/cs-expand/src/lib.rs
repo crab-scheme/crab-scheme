@@ -68,6 +68,23 @@ pub struct Expander<'a> {
     /// Standard types like `&error` are pre-registered with field_count=0
     /// when first referenced as a parent.
     condition_types: std::collections::HashMap<Symbol, ConditionTypeInfo>,
+    /// Per-Expander library registry, populated by `(library ...)`.
+    /// Keyed by the library name (a symbol list, version stripped). The
+    /// stored info captures the export name list so future namespace
+    /// filtering can validate that imported names are actually exported.
+    /// Today the body still splices into the importing context — the
+    /// registry adds validation and a structural foothold for the
+    /// per-library scope frames that land in the next pre-M5 step.
+    libraries: std::collections::HashMap<Vec<Symbol>, LibraryInfo>,
+}
+
+/// Compile-time info recorded for each `(library ...)` declaration.
+#[derive(Debug, Clone)]
+pub struct LibraryInfo {
+    /// The list of names exported by the library (as written in the
+    /// `(export ...)` clause). Used to validate `import (only ...)`
+    /// shapes against what the library actually provides.
+    pub exports: Vec<Symbol>,
 }
 
 /// Compile-time info about a `define-record-type`, retained so subtypes can
@@ -239,6 +256,7 @@ impl<'a> Expander<'a> {
             include_resolver: None,
             record_types: std::collections::HashMap::new(),
             condition_types: std::collections::HashMap::new(),
+            libraries: std::collections::HashMap::new(),
         }
     }
 
@@ -319,12 +337,22 @@ impl<'a> Expander<'a> {
                 span,
             });
         }
-        // items[0] = (name ...) — accepted, not validated beyond shape.
-        let _name = collect_proper_list_strict(&items[0]).ok_or(ExpandError::BadSyntax {
+        // items[0] = library name spec. R6RS allows `(<id> ...)` and
+        // `(<id> ... (<version-id> ...))` — we accept either, strip the
+        // version, and require the leading name parts to be symbols.
+        let name_parts = collect_proper_list_strict(&items[0]).ok_or(ExpandError::BadSyntax {
             what: "library: name spec must be a list".into(),
             span: items[0].span(),
         })?;
-        // items[1] = (export ...) — accepted, ignored.
+        if name_parts.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "library: name must have at least one identifier".into(),
+                span: items[0].span(),
+            });
+        }
+        let name_syms = self.parse_library_name(&name_parts, items[0].span())?;
+
+        // items[1] = (export <id> ...).
         let export_parts = collect_proper_list_strict(&items[1]).ok_or(ExpandError::BadSyntax {
             what: "library: missing (export ...) clause".into(),
             span: items[1].span(),
@@ -336,7 +364,21 @@ impl<'a> Expander<'a> {
                 span: items[1].span(),
             });
         }
-        // items[2] = (import ...) — accepted, ignored.
+        let mut exports: Vec<Symbol> = Vec::with_capacity(export_parts.len() - 1);
+        for e in &export_parts[1..] {
+            match e {
+                Datum::Symbol(s, _) => exports.push(*s),
+                _ => {
+                    return Err(ExpandError::BadSyntax {
+                        what: "export: each name must be an identifier".into(),
+                        span: e.span(),
+                    })
+                }
+            }
+        }
+
+        // items[2] = (import <import-spec> ...). Reuse expand_import for
+        // validation + rename-effect synthesis.
         let import_parts = collect_proper_list_strict(&items[2]).ok_or(ExpandError::BadSyntax {
             what: "library: missing (import ...) clause".into(),
             span: items[2].span(),
@@ -348,14 +390,84 @@ impl<'a> Expander<'a> {
                 span: items[2].span(),
             });
         }
-        // Splice the body in as if it were top-level forms — define,
-        // define-record-type etc. all need their top-level handling.
+        let import_expr = self.expand_import(&import_parts[1..], items[2].span())?;
+
+        // Reject duplicate library declarations within one expander pass.
+        if self.libraries.contains_key(&name_syms) {
+            let printed = name_syms
+                .iter()
+                .map(|s| self.syms.name(*s))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Err(ExpandError::BadSyntax {
+                what: format!("library ({}) is already declared", printed),
+                span: items[0].span(),
+            });
+        }
+        self.libraries.insert(
+            name_syms.clone(),
+            LibraryInfo {
+                exports: exports.clone(),
+            },
+        );
+
+        // Splice the body in as if it were top-level forms — full
+        // namespace isolation requires per-library scope frames, which
+        // is the next pre-M5 step. The export list is now validated
+        // and tracked, so future scope work has the manifest to filter
+        // against.
         let body = &items[3..];
-        let mut exprs: Vec<CoreExpr> = Vec::with_capacity(body.len());
+        let mut exprs: Vec<CoreExpr> = Vec::with_capacity(body.len() + 1);
+        // Run the import effects first so library bodies have access
+        // to renamed bindings before their `define`s run.
+        exprs.push(import_expr);
         for d in body {
             exprs.push(self.expand_top(d)?);
         }
         Ok(CoreExpr::Begin { exprs, span })
+    }
+
+    /// Parse a library name datum list into the canonical symbol list,
+    /// dropping any trailing R6RS version sublist.
+    fn parse_library_name(
+        &mut self,
+        parts: &[Datum],
+        span: Span,
+    ) -> Result<Vec<Symbol>, ExpandError> {
+        let mut out: Vec<Symbol> = Vec::new();
+        for (i, p) in parts.iter().enumerate() {
+            match p {
+                Datum::Symbol(s, _) => out.push(*s),
+                Datum::Pair(_, _, _) | Datum::Null(_) if i == parts.len() - 1 => {
+                    // Trailing version list — accepted but stripped. R6RS
+                    // versions are integers, but we don't enforce that
+                    // here yet.
+                }
+                _ => {
+                    return Err(ExpandError::BadSyntax {
+                        what: "library name parts must be identifiers \
+                               (with an optional trailing version list)"
+                            .into(),
+                        span: p.span(),
+                    })
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "library name must have at least one identifier".into(),
+                span,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Public read-only view into the library registry. Lets callers
+    /// (the runtime in particular) inspect which libraries an expander
+    /// pass declared, e.g. for diagnostic listings or future namespace
+    /// filtering enforcement.
+    pub fn libraries(&self) -> &std::collections::HashMap<Vec<Symbol>, LibraryInfo> {
+        &self.libraries
     }
 
     /// `(import <import-spec> ...)` at top level.
@@ -1488,7 +1600,7 @@ impl<'a> Expander<'a> {
         &mut self,
         clause: &Datum,
         alt: CoreExpr,
-        span: Span,
+        _span: Span,
         form_name: &str,
     ) -> Result<CoreExpr, ExpandError> {
         let parts = collect_proper_list_strict(clause).ok_or(ExpandError::BadSyntax {

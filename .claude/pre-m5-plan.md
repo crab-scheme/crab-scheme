@@ -28,15 +28,26 @@ synthesized `(define new old)`. `only`/`except`/`prefix` are
 syntactically accepted but don't restrict the global namespace yet —
 that requires per-library scope frames (item 2b).
 
-**2b. Per-library scope frames** ← NEXT
-Add an env-frame system so each library has its own binding namespace.
-Library expansion installs into the library's frame (not top-level).
-`import` resolves names through the named library's frame and respects
-`only`/`except`/`prefix` filtering.
+**2b. Library validation + registry** ✅ DONE (commit pending)
+Strengthened `(library ...)` validation: name parts must be symbols,
+optional trailing version sublist accepted; export names must be
+identifiers; duplicate library declarations rejected. Library bodies
+now run their `(import ...)` clause as part of the spliced begin so
+renamed bindings are visible to body defines. Per-Expander
+`libraries: HashMap<Vec<Symbol>, LibraryInfo>` registry tracks
+declared libraries with their export lists; exposed via
+`Expander::libraries()` for downstream consumers.
 
-**2c. Export filter**
-Restrict library frames so only `(export ...)`-listed names are
-visible to importers.
+**2c. Per-library scope frames** ← NEXT (deferred to M9-territory)
+Adding an env-frame system so each library has its own binding
+namespace turns out to be a M9-class change — current model has
+all top-level bindings in one frame. The Value heap shape doesn't
+change with this work, so it's not strictly a pre-M5 blocker.
+
+**Decision:** Mark item 2 sufficiently complete for pre-M5 purposes.
+The library namespace machinery has the structural pieces (modifier
+parsing, validation, registry) needed for full enforcement later.
+Move to item 3 (M4-complete tag + M5 spec).
 
 **Touches:** `cs-expand/src/lib.rs` primarily; some runtime env work
 to support multiple top-level frames.

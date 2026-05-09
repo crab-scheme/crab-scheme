@@ -419,6 +419,11 @@ fn conformance_library_imports() {
 }
 
 #[test]
+fn conformance_library_validate() {
+    run_conformance_file("library_validate.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -507,6 +512,7 @@ fn conformance_aggregate_count() {
                 "vec_list_extras.scm",
                 "hashtable_custom.scm",
                 "library_imports.scm",
+                "library_validate.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
