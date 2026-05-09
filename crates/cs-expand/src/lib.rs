@@ -2764,9 +2764,57 @@ impl<'a> Expander<'a> {
                     "or" => parts[1..].iter().any(|r| self.cond_expand_match(r)),
                     "not" => parts.len() == 2 && !self.cond_expand_match(&parts[1]),
                     "library" => {
-                        // We don't have a library system — every (library ...)
-                        // requirement is false.
-                        false
+                        // R7RS: (library <name>) tests whether <name> is a
+                        // currently-known library. We consult the registry
+                        // populated as `define-library` / `library` forms
+                        // are expanded, plus a small set of bundled R7RS
+                        // names that map to no-op stubs.
+                        if parts.len() != 2 {
+                            return false;
+                        }
+                        let name_parts = match collect_proper_list_strict(&parts[1]) {
+                            Some(p) => p,
+                            None => return false,
+                        };
+                        let name_syms: Vec<Symbol> = match name_parts
+                            .iter()
+                            .map(|d| match d {
+                                Datum::Symbol(s, _) => Some(*s),
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<_>>>()
+                        {
+                            Some(v) => v,
+                            None => return false,
+                        };
+                        if self.libraries.contains_key(&name_syms) {
+                            return true;
+                        }
+                        // R7RS bundled libraries: (scheme base) is always
+                        // provided since we install its bindings at the
+                        // top-level. Match common stdlib names so user code
+                        // using (cond-expand ((library (scheme base)) ...))
+                        // doesn't take the false branch.
+                        let names: Vec<&str> =
+                            name_syms.iter().map(|s| self.syms.name(*s)).collect();
+                        matches!(
+                            names.as_slice(),
+                            ["scheme", "base"]
+                                | ["scheme", "char"]
+                                | ["scheme", "complex"]
+                                | ["scheme", "cxr"]
+                                | ["scheme", "eval"]
+                                | ["scheme", "file"]
+                                | ["scheme", "inexact"]
+                                | ["scheme", "lazy"]
+                                | ["scheme", "load"]
+                                | ["scheme", "process-context"]
+                                | ["scheme", "read"]
+                                | ["scheme", "repl"]
+                                | ["scheme", "time"]
+                                | ["scheme", "write"]
+                                | ["scheme", "r5rs"]
+                        )
                     }
                     _ => false,
                 }

@@ -245,12 +245,15 @@ Iters 117+ are filling R7RS gaps one per iter:
   tiers; VM error path now raises catchable conditions
 - 140 R7RS char-ci=?, char-ci<?, char-ci<=?, char-ci>?, char-ci>=?
   + string-ci variants. Variadic, Unicode-aware via to_lowercase
-  (this iter)
+- 141 R7RS cond-expand (library ...) clauses now consult the
+  registered library set (this iter): bundled (scheme base/char/
+  write/time/...) names match; user-defined libraries match after
+  registration; unknown names cleanly fall through to else
 
 Current totals:
-- 94 conformance test files (cli)
-- VM tier: 96 tests
-- Aggregate: 1917 individual Scheme tests passing
+- 95 conformance test files (cli)
+- VM tier: 97 tests
+- Aggregate: 1928 individual Scheme tests passing
 
 ## Loop cadence
 

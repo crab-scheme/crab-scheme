@@ -865,3 +865,12 @@ fn vm_conformance_r7rs_ci_compare() {
     println!("r7rs_ci_compare: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_cond_expand_lib() {
+    let walker = pass_count_walker("r7rs_cond_expand_lib.scm");
+    let vm =
+        pass_count_vm("r7rs_cond_expand_lib.scm").expect("vm should run r7rs_cond_expand_lib.scm");
+    println!("r7rs_cond_expand_lib: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
