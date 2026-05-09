@@ -557,9 +557,58 @@ impl<'a> Expander<'a> {
             } else if head == include_kw || head == include_ci_kw {
                 // Reuse the existing include resolver path.
                 body_exprs.push(self.expand_include(&parts[1..], clause.span())?);
-            } else if head == cond_expand_kw || head == incl_lib_decls_kw {
-                // Accepted but not yet evaluated. M9 wires these to the
-                // proper conditional-include semantics.
+            } else if head == cond_expand_kw {
+                // Inside define-library, cond-expand selects feature-
+                // matching body clauses. The clause body is at
+                // top-level (defines, define-record-type, etc. are
+                // all valid), so we walk clauses ourselves with
+                // `expand_top` rather than dispatching to
+                // expand_cond_expand which uses expand_body.
+                let mut taken = false;
+                for cclause in &parts[1..] {
+                    let cparts =
+                        collect_proper_list_strict(cclause).ok_or(ExpandError::BadSyntax {
+                            what: "cond-expand clause must be a list".into(),
+                            span: cclause.span(),
+                        })?;
+                    if cparts.is_empty() {
+                        return Err(ExpandError::BadSyntax {
+                            what: "cond-expand: empty clause".into(),
+                            span: cclause.span(),
+                        });
+                    }
+                    if self.cond_expand_match(&cparts[0]) {
+                        for d in &cparts[1..] {
+                            // R7RS spells the matched-clause body as a
+                            // single `(begin <forms>...)` so the body
+                            // can carry multiple top-level forms. We
+                            // splice such begins; otherwise the form
+                            // is treated as a single top-level form.
+                            if let Some((head, tail)) = list_head(d) {
+                                if let Datum::Symbol(bh, _) = &*head {
+                                    if *bh == self.keywords.begin {
+                                        for inner in &tail {
+                                            body_exprs.push(self.expand_top(inner)?);
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            body_exprs.push(self.expand_top(d)?);
+                        }
+                        taken = true;
+                        break;
+                    }
+                }
+                if !taken {
+                    return Err(ExpandError::BadSyntax {
+                        what: "cond-expand: no matching clause".into(),
+                        span: clause.span(),
+                    });
+                }
+            } else if head == incl_lib_decls_kw {
+                // M9: accepted but not yet evaluated. Library-decls
+                // inclusion requires a more substantial loader.
             } else {
                 return Err(ExpandError::BadSyntax {
                     what: format!("define-library: unknown clause '{}'", self.syms.name(head)),

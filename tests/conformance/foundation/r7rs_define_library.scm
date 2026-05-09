@@ -37,11 +37,27 @@
   (import (rnrs base)))
 (test-eqv "after-empty-dl" 1 1)
 
-; --- include-library-declarations and cond-expand are accepted (no-op for now) ---
+; --- cond-expand inside define-library now dispatches per feature ---
+(define-library (test r7rs cond-expand-pos)
+  (export feat-result)
+  (import (rnrs base))
+  (cond-expand
+    (crabscheme (begin (define feat-result 'crab)))
+    (else (begin (define feat-result 'fallback)))))
+(test-equal "dl-cond-expand-crabscheme" 'crab feat-result)
+
+(define-library (test r7rs cond-expand-else)
+  (export else-result)
+  (import (rnrs base))
+  (cond-expand
+    (some-other-impl (begin (define else-result 'other)))
+    (else (begin (define else-result 'taken-else)))))
+(test-equal "dl-cond-expand-else" 'taken-else else-result)
+
+; --- include-library-declarations is still accepted (no-op for now) ---
 (define-library (test r7rs accept-clauses)
   (export ok)
   (import (rnrs base))
-  (cond-expand (else))
   (begin
     (define ok 'ok)))
 (test-equal "dl-accept-ok" 'ok ok)
