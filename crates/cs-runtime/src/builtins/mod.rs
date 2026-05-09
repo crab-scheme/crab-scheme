@@ -292,6 +292,15 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("display", b_display),
         ("write", b_write),
         ("raise", b_raise),
+        // raise-continuable: in proper R6RS, the current exception handler
+        // is invoked synchronously and its return value becomes the value
+        // of the call to raise-continuable. Our `raise` already routes the
+        // handler's return through `with-exception-handler`, so for the
+        // foundation milestone we expose raise-continuable as an alias.
+        // True per-handler continuable semantics (with the previous
+        // handler being current during the called handler's body) is a
+        // future iteration once a handler stack lands.
+        ("raise-continuable", b_raise),
         ("error", b_error_ho),
         ("assertion-violation", b_assertion_violation),
         ("with-exception-handler", b_with_exception_handler),
@@ -384,7 +393,31 @@ fn arity_err(name: &str, expected: &str, got: usize) -> String {
 }
 
 fn type_err(name: &str, expected: &str, got: &Value) -> String {
-    format!("{}: expected {}, got {}", name, expected, got.type_name())
+    // Include a short display of the offending value where it can be
+    // rendered without a SymbolTable handle. Symbols print as their
+    // internal handle via Display, which is unhelpful — leave them out.
+    // Cap the rendered length so giant values don't blow up the message.
+    let extra = match got {
+        Value::String(_) | Value::Number(_) | Value::Boolean(_) | Value::Character(_) => {
+            let display = format!("{}", got);
+            let cap = 60;
+            let trimmed: String = if display.chars().count() > cap {
+                let head: String = display.chars().take(cap - 1).collect();
+                format!("{}…", head)
+            } else {
+                display
+            };
+            format!(" {}", trimmed)
+        }
+        _ => String::new(),
+    };
+    format!(
+        "{}: expected {}, got {}{}",
+        name,
+        expected,
+        got.type_name(),
+        extra
+    )
 }
 
 fn as_num(name: &str, v: &Value) -> Result<Number, String> {

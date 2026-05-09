@@ -244,6 +244,10 @@ impl Runtime {
         // Exception support.
         let raise_sym = syms.intern("raise");
         vm_env.define(raise_sym, cs_vm::vm::make_vm_raise());
+        // raise-continuable shares the VmRaise marker — see the matching
+        // walker-tier alias in builtins/mod.rs for the rationale.
+        let raise_cont_sym = syms.intern("raise-continuable");
+        vm_env.define(raise_cont_sym, cs_vm::vm::make_vm_raise());
         let error_sym = syms.intern("error");
         vm_env.define(error_sym, cs_vm::vm::make_vm_error_fn());
         let av_sym = syms.intern("assertion-violation");

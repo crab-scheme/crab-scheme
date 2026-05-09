@@ -1996,11 +1996,31 @@ fn generic_cmp2(
 fn as_number(v: &Value, name: &str) -> Result<cs_core::Number, String> {
     match v {
         Value::Number(n) => Ok(n.clone()),
-        other => Err(format!(
-            "{}: expected number, got {}",
-            name,
-            other.type_name()
-        )),
+        other => {
+            // Include a short display of the offending value where it can
+            // render without a SymbolTable. Symbols print as their handle
+            // via Display, which is unhelpful — leave them off.
+            let extra = match other {
+                Value::String(_) | Value::Number(_) | Value::Boolean(_) | Value::Character(_) => {
+                    let display = format!("{}", other);
+                    let cap = 60;
+                    let trimmed: String = if display.chars().count() > cap {
+                        let head: String = display.chars().take(cap - 1).collect();
+                        format!("{}…", head)
+                    } else {
+                        display
+                    };
+                    format!(" {}", trimmed)
+                }
+                _ => String::new(),
+            };
+            Err(format!(
+                "{}: expected number, got {}{}",
+                name,
+                other.type_name(),
+                extra
+            ))
+        }
     }
 }
 
