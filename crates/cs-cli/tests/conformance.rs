@@ -274,6 +274,11 @@ fn conformance_builtin_errors() {
 }
 
 #[test]
+fn conformance_cond_guard_arrow() {
+    run_conformance_file("cond_guard_arrow.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -333,6 +338,7 @@ fn conformance_aggregate_count() {
                 "define_condition_type.scm",
                 "error_who.scm",
                 "builtin_errors.scm",
+                "cond_guard_arrow.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

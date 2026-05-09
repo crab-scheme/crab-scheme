@@ -415,3 +415,11 @@ fn vm_conformance_builtin_errors() {
     println!("builtin_errors: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_cond_guard_arrow() {
+    let walker = pass_count_walker("cond_guard_arrow.scm");
+    let vm = pass_count_vm("cond_guard_arrow.scm").expect("vm should run cond_guard_arrow.scm");
+    println!("cond_guard_arrow: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

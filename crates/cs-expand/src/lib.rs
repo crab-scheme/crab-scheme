@@ -139,6 +139,7 @@ struct Keywords {
     do_: Symbol,
     guard: Symbol,
     else_: Symbol,
+    arrow: Symbol,
     define_record_type: Symbol,
     define_condition_type: Symbol,
     fields: Symbol,
@@ -186,6 +187,7 @@ impl Keywords {
             do_: syms.intern("do"),
             guard: syms.intern("guard"),
             else_: syms.intern("else"),
+            arrow: syms.intern("=>"),
             define_record_type: syms.intern("define-record-type"),
             define_condition_type: syms.intern("define-condition-type"),
             fields: syms.intern("fields"),
@@ -1130,40 +1132,117 @@ impl<'a> Expander<'a> {
     }
 
     fn expand_cond(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
-        // (cond (test body...) ... (else body...))
+        // (cond <clause>...) where each clause is one of:
+        //   (else body...)             — fallback, must be last
+        //   (test => consumer)         — call (consumer test-value) when truthy
+        //   (test)                     — yield test-value when truthy
+        //   (test body...)             — evaluate body when truthy
         let mut acc = CoreExpr::Const {
             value: Value::Unspecified,
             span,
         };
         for clause in items.iter().rev() {
-            let (head, body_items) = collect_list(clause).ok_or(ExpandError::BadSyntax {
-                what: "cond clause must be a list".into(),
-                span: clause.span(),
-            })?;
-            let body = if body_items.is_empty() {
-                CoreExpr::Const {
-                    value: Value::Unspecified,
-                    span: clause.span(),
-                }
-            } else {
-                self.expand_body(&body_items, clause.span())?
-            };
-            // else clause
-            if let Datum::Symbol(s, _) = &*head {
-                if *s == self.keywords.else_ {
-                    acc = body;
-                    continue;
-                }
-            }
-            let test = self.expand(&head)?;
-            acc = CoreExpr::If {
-                cond: Rc::new(test),
-                then: Rc::new(body),
-                alt: Rc::new(acc),
-                span: clause.span(),
-            };
+            acc = self.expand_clause_with_alt(clause, acc, span, "cond")?;
         }
         Ok(acc)
+    }
+
+    /// Expand one cond/guard clause given the alternative branch (next
+    /// clause's expansion) — handles `else`, `=>`, single-test, and
+    /// multi-body shapes uniformly so `cond` and `guard` share the logic.
+    fn expand_clause_with_alt(
+        &mut self,
+        clause: &Datum,
+        alt: CoreExpr,
+        span: Span,
+        form_name: &str,
+    ) -> Result<CoreExpr, ExpandError> {
+        let parts = collect_proper_list_strict(clause).ok_or(ExpandError::BadSyntax {
+            what: format!("{} clause must be a proper list", form_name),
+            span: clause.span(),
+        })?;
+        if parts.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: format!("{} clause is empty", form_name),
+                span: clause.span(),
+            });
+        }
+        let head = &parts[0];
+        // else clause: collapses to its body, with alt discarded.
+        if let Datum::Symbol(s, _) = head {
+            if *s == self.keywords.else_ {
+                return self.expand_body(&parts[1..], clause.span());
+            }
+        }
+        let test_expr = self.expand(head)?;
+        // (test => consumer)
+        if parts.len() == 3 {
+            if let Datum::Symbol(s, _) = &parts[1] {
+                if *s == self.keywords.arrow {
+                    let consumer_expr = self.expand(&parts[2])?;
+                    let tmp_sym = self.syms.intern("__cond-arrow-tmp__");
+                    // ((lambda (t) (if t (consumer t) <alt>)) <test>)
+                    let lam_body = CoreExpr::If {
+                        cond: Rc::new(CoreExpr::Ref {
+                            name: tmp_sym,
+                            span: clause.span(),
+                        }),
+                        then: Rc::new(CoreExpr::App {
+                            func: Rc::new(consumer_expr),
+                            args: vec![CoreExpr::Ref {
+                                name: tmp_sym,
+                                span: clause.span(),
+                            }],
+                            span: clause.span(),
+                        }),
+                        alt: Rc::new(alt),
+                        span: clause.span(),
+                    };
+                    return Ok(CoreExpr::App {
+                        func: Rc::new(CoreExpr::Lambda {
+                            params: Params::fixed(vec![tmp_sym]),
+                            body: Rc::new(lam_body),
+                            span: clause.span(),
+                        }),
+                        args: vec![test_expr],
+                        span: clause.span(),
+                    });
+                }
+            }
+        }
+        // (test) — yield test value when truthy
+        if parts.len() == 1 {
+            let tmp_sym = self.syms.intern("__cond-test-tmp__");
+            let lam_body = CoreExpr::If {
+                cond: Rc::new(CoreExpr::Ref {
+                    name: tmp_sym,
+                    span: clause.span(),
+                }),
+                then: Rc::new(CoreExpr::Ref {
+                    name: tmp_sym,
+                    span: clause.span(),
+                }),
+                alt: Rc::new(alt),
+                span: clause.span(),
+            };
+            return Ok(CoreExpr::App {
+                func: Rc::new(CoreExpr::Lambda {
+                    params: Params::fixed(vec![tmp_sym]),
+                    body: Rc::new(lam_body),
+                    span: clause.span(),
+                }),
+                args: vec![test_expr],
+                span: clause.span(),
+            });
+        }
+        // (test body...) — evaluate body when truthy
+        let body = self.expand_body(&parts[1..], clause.span())?;
+        Ok(CoreExpr::If {
+            cond: Rc::new(test_expr),
+            then: Rc::new(body),
+            alt: Rc::new(alt),
+            span: clause.span(),
+        })
     }
 
     /// `(case key (datum-list body ...) ... (else body ...))`
@@ -1469,31 +1548,7 @@ impl<'a> Expander<'a> {
             }
         };
         for clause in cond_clauses.iter().rev() {
-            let (head, body_items) = collect_list(clause).ok_or(ExpandError::BadSyntax {
-                what: "guard clause must be a list".into(),
-                span: clause.span(),
-            })?;
-            let body = if body_items.is_empty() {
-                CoreExpr::Const {
-                    value: Value::Unspecified,
-                    span: clause.span(),
-                }
-            } else {
-                self.expand_body(&body_items, clause.span())?
-            };
-            if let Datum::Symbol(s, _) = &*head {
-                if *s == self.keywords.else_ {
-                    acc = body;
-                    continue;
-                }
-            }
-            let test = self.expand(&head)?;
-            acc = CoreExpr::If {
-                cond: Rc::new(test),
-                then: Rc::new(body),
-                alt: Rc::new(acc),
-                span: clause.span(),
-            };
+            acc = self.expand_clause_with_alt(clause, acc, span, "guard")?;
         }
         let handler_lambda = CoreExpr::Lambda {
             params: Params::fixed(vec![cond_var]),
