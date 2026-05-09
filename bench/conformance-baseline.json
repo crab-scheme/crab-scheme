@@ -1,0 +1,18 @@
+{
+  "milestone": "m4-complete",
+  "captured_at": "2026-05-09",
+  "aggregate_pass_count": 1460,
+  "cli_conformance_files": 68,
+  "vm_conformance_files": 70,
+  "test_corpus_root": "tests/conformance/foundation/",
+  "harness_files": [
+    "crates/cs-cli/tests/conformance.rs",
+    "crates/cs-runtime/tests/vm_conformance.rs"
+  ],
+  "regression_check": "conformance_aggregate_count test in crates/cs-cli/tests/conformance.rs asserts total_pass >= prior baseline",
+  "notes": [
+    "Walker (tree-walker) and VM (bytecode) tiers run differential parity on every shared test file.",
+    "vm_conformance.rs has 2 more files than cli (e.g. extra perf-flavored tests).",
+    "Aggregate count is summed across the 'aggregate_count' subset which excludes a few files that need a >2MB stack."
+  ]
+}

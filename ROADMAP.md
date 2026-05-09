@@ -7,20 +7,20 @@ This roadmap is a living document. Per-milestone work products are tracked as
 specs under `.spec-workflow/specs/`; this page is the index that says *which
 spec, in which order, with what exit criteria*.
 
-| Milestone | Theme                                | Spec slug              | Exit gate                                                  |
-| --------- | ------------------------------------ | ---------------------- | ---------------------------------------------------------- |
-| M0        | Bootstrap workspace + value type     | `foundation`           | `cargo build --workspace` green; CI gates wired            |
-| M1        | Lexer + reader + diagnostics         | `foundation`           | round-trip property holds; ≥ 80 lexer/parser tests pass    |
-| M2        | Tree-walker + REPL + CLI             | `foundation`           | ≥ 100 conformance tests pass; golden tests green           |
-| M3        | Hygienic macro expander              | `expander`             | Larceny macro tests ≥ 80% pass; bootstrap stdlib in Scheme |
-| M4        | Bytecode VM (warm tier)              | `vm`                   | differential tests pass tree-walker vs VM on ≥ 1k corpus   |
-| M5        | Precise tracing GC                   | `gc`                   | 24-hour fuzz no leaks; sub-1ms GC pause p99 on stdlib load |
-| M6        | JIT abstraction + Cranelift backend  | `jit-cranelift`        | JIT speedup ≥ 5× over interpreter on Gabriel benchmarks    |
-| M7        | HolyJIT backend (primary)            | `jit-holy`             | JIT differential parity with Cranelift backend             |
-| M8        | First-class continuations + CWCC     | `continuations`        | Larceny cont tests ≥ 95% pass                              |
-| M9        | R6RS standard library completion     | `stdlib`               | R6RS conformance ≥ 99%; Larceny suite ≥ 95%                |
-| M10       | AOT compiler + WASM target           | `aot`, `wasm`          | Static binaries from Scheme; WASM bytecode tier shipping   |
-| M11       | Verified core (stretch)              | `verification`         | Mechanized eval semantics with extracted reference         |
+| Milestone | Theme                                | Spec slug              | Exit gate                                                  | Status |
+| --------- | ------------------------------------ | ---------------------- | ---------------------------------------------------------- | ------ |
+| M0        | Bootstrap workspace + value type     | `foundation`           | `cargo build --workspace` green; CI gates wired            | ✅ done |
+| M1        | Lexer + reader + diagnostics         | `foundation`           | round-trip property holds; ≥ 80 lexer/parser tests pass    | ✅ done |
+| M2        | Tree-walker + REPL + CLI             | `foundation`           | ≥ 100 conformance tests pass; golden tests green           | ✅ done |
+| M3        | Hygienic macro expander              | `expander`             | Larceny macro tests ≥ 80% pass; bootstrap stdlib in Scheme | ✅ done |
+| M4        | Bytecode VM (warm tier)              | `vm`                   | differential tests pass tree-walker vs VM on ≥ 1k corpus   | ✅ tagged `m4-complete` (1460 tests) |
+| M5        | Precise tracing GC                   | `gc`                   | 24-hour fuzz no leaks; sub-1ms GC pause p99 on stdlib load | 🚧 next |
+| M6        | JIT abstraction + Cranelift backend  | `jit-cranelift`        | JIT speedup ≥ 5× over interpreter on Gabriel benchmarks    | — |
+| M7        | HolyJIT backend (primary)            | `jit-holy`             | JIT differential parity with Cranelift backend             | — |
+| M8        | First-class continuations + CWCC     | `continuations`        | Larceny cont tests ≥ 95% pass                              | — |
+| M9        | R6RS standard library completion     | `stdlib`               | R6RS conformance ≥ 99%; Larceny suite ≥ 95%                | — |
+| M10       | AOT compiler + WASM target           | `aot`, `wasm`          | Static binaries from Scheme; WASM bytecode tier shipping   | — |
+| M11       | Verified core (stretch)              | `verification`         | Mechanized eval semantics with extracted reference         | — |
 
 Each milestone produces a tagged release (`milestone-N-complete`) and a written
 exit report under `docs/milestones/Mx-exit.md` capturing what shipped, what was

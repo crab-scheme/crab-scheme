@@ -55,12 +55,19 @@ to support multiple top-level frames.
 Doesn't affect `Value` layout — can technically land in any order,
 but doing it before M5 keeps the runtime/env story stable.
 
-### 3. Tag M4 complete + write M5 spec  [milestone gate]
-Retroactively tag the current commit `m4-complete` and write
-`docs/milestones/m4-exit.md`. Create the M5 spec under
-`.spec-workflow/specs/gc/`.
+### 3. Tag M4 complete + write M5 spec  ✅ DONE (commit pending)
+- `docs/milestones/m4-exit.md` written summarizing M0–M4 + pre-M5
+  prerequisites (1460 aggregate pass count, 68 cli files, 70 vm
+  files, walker↔VM parity).
+- ROADMAP.md updated with status column; M0–M4 marked done, M5
+  marked next.
+- `.spec-workflow/specs/gc/requirements.md` and
+  `.spec-workflow/specs/gc/design.md` drafted.
+- `bench/conformance-baseline.json` captures pre-M5 baseline.
+- `m4-complete` annotated tag created at the commit (see
+  `git tag m4-complete`).
 
-### 4. M5 — Precise tracing GC  [the milestone]
+### 4. M5 — Precise tracing GC  [the milestone]  ← NEXT
 Per ROADMAP.md:
 - New `cs-gc` crate
 - Swap `Rc<T>` → `Gc<T>` in `Value`
