@@ -215,3 +215,55 @@ fn vm_raised_renders_as_error_msg() {
     assert!(err.contains("error: x"), "stderr: {:?}", err);
     assert!(!err.contains("__raised__"), "stderr: {:?}", err);
 }
+
+/// Run examples/metacircular.scm — a metacircular Scheme evaluator that
+/// runs three small programs (factorial 10, sum 1..100, mutable counter)
+/// through itself. Stresses closures, env lookup, multi-body lambdas, and
+/// the apply primitive — a good integration test on both tiers.
+fn assert_metacircular_output(out: &[u8]) {
+    let s = String::from_utf8_lossy(out);
+    assert!(s.contains("metacircular: 3628800"), "stdout: {:?}", s);
+    assert!(
+        s.contains("metacircular sum 1..100: 5050"),
+        "stdout: {:?}",
+        s
+    );
+    assert!(
+        s.contains("metacircular counter (3 calls): 3"),
+        "stdout: {:?}",
+        s
+    );
+}
+
+#[test]
+fn run_metacircular_walker() {
+    let out = cli()
+        .args(["run", &workspace_path("examples/metacircular.scm")])
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_metacircular_output(&out.stdout);
+}
+
+#[test]
+fn run_metacircular_vm() {
+    let out = cli()
+        .args([
+            "--tier",
+            "vm",
+            "run",
+            &workspace_path("examples/metacircular.scm"),
+        ])
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_metacircular_output(&out.stdout);
+}
