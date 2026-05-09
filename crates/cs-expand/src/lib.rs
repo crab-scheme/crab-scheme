@@ -97,6 +97,7 @@ struct Keywords {
     unquote_splicing: Symbol,
     assert_: Symbol,
     case_lambda: Symbol,
+    cond_expand: Symbol,
 }
 
 impl Keywords {
@@ -140,6 +141,7 @@ impl Keywords {
             unquote_splicing: syms.intern("unquote-splicing"),
             assert_: syms.intern("assert"),
             case_lambda: syms.intern("case-lambda"),
+            cond_expand: syms.intern("cond-expand"),
         }
     }
 }
@@ -474,6 +476,9 @@ impl<'a> Expander<'a> {
             }
             if s == self.keywords.case_lambda {
                 return self.expand_case_lambda(&tail_items, span);
+            }
+            if s == self.keywords.cond_expand {
+                return self.expand_cond_expand(&tail_items, span);
             }
             if s == self.keywords.delay {
                 return self.expand_delay(&tail_items, span);
@@ -1857,6 +1862,84 @@ impl<'a> Expander<'a> {
     }
 
     /// `(delay expr)` desugars to `(make-promise (lambda () expr))`.
+    /// Builtin features advertised by `cond-expand`.
+    fn supported_features(&self) -> &'static [&'static str] {
+        &["crabscheme", "r6rs-subset", "r7rs-subset", "exact-closed"]
+    }
+
+    /// Evaluate a `cond-expand` feature requirement at expansion time.
+    fn cond_expand_match(&self, req: &Datum) -> bool {
+        match req {
+            Datum::Symbol(s, _) => {
+                let name = self.syms.name(*s);
+                if name == "else" {
+                    return true;
+                }
+                self.supported_features().contains(&name)
+            }
+            Datum::Pair(_, _, _) => {
+                let parts = match collect_proper_list_strict(req) {
+                    Some(p) => p,
+                    None => return false,
+                };
+                if parts.is_empty() {
+                    return false;
+                }
+                let head = match &parts[0] {
+                    Datum::Symbol(s, _) => *s,
+                    _ => return false,
+                };
+                let head_name = self.syms.name(head);
+                match head_name {
+                    "and" => parts[1..].iter().all(|r| self.cond_expand_match(r)),
+                    "or" => parts[1..].iter().any(|r| self.cond_expand_match(r)),
+                    "not" => parts.len() == 2 && !self.cond_expand_match(&parts[1]),
+                    "library" => {
+                        // We don't have a library system — every (library ...)
+                        // requirement is false.
+                        false
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `(cond-expand (<req> <body>...) (<req> <body>...) ... (else <body>...))`
+    /// Picks the first clause whose feature requirement is satisfied and
+    /// inlines its body as a (begin ...). Always selects exactly one
+    /// clause; if none match and there's no else, raises a syntax error.
+    fn expand_cond_expand(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        for clause in items {
+            let parts = collect_proper_list_strict(clause).ok_or(ExpandError::BadSyntax {
+                what: "cond-expand clause must be a list".into(),
+                span: clause.span(),
+            })?;
+            if parts.is_empty() {
+                return Err(ExpandError::BadSyntax {
+                    what: "cond-expand clause needs a feature requirement".into(),
+                    span: clause.span(),
+                });
+            }
+            let req = &parts[0];
+            if self.cond_expand_match(req) {
+                let body = &parts[1..];
+                if body.is_empty() {
+                    return Ok(CoreExpr::Const {
+                        value: Value::Unspecified,
+                        span: clause.span(),
+                    });
+                }
+                return self.expand_body(body, clause.span());
+            }
+        }
+        Err(ExpandError::BadSyntax {
+            what: "cond-expand: no matching clause".into(),
+            span,
+        })
+    }
+
     /// `(case-lambda (formals1 body1) (formals2 body2) ...)` — arity-
     /// dispatched procedure. Lowered to a single rest-arg lambda that
     /// inspects (length args) and re-applies the matching clause.
@@ -1998,9 +2081,10 @@ impl<'a> Expander<'a> {
     }
 
     /// `(assert <expr>)` — evaluates `<expr>`; if truthy, yields unspecified;
-    /// otherwise raises an error. R6RS spec calls for an
-    /// `&assertion-violation` condition; we use the existing string-tagged
-    /// condition shape since the test surface checks via predicates only.
+    /// otherwise raises an error containing the source form of the failed
+    /// expression. R6RS spec calls for an `&assertion-violation` condition;
+    /// we use the existing string-tagged condition shape since the test
+    /// surface checks via predicates only.
     fn expand_assert(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
         if items.len() != 1 {
             return Err(ExpandError::BadSyntax {
@@ -2008,11 +2092,11 @@ impl<'a> Expander<'a> {
                 span,
             });
         }
+        // Render the offending datum BEFORE expanding so symbols print by
+        // their original name (the expander may rename them via hygiene).
+        let datum_src = items[0].format_with(self.syms);
         let test = self.expand(&items[0])?;
-        // Render the source expression for the error message. We use the
-        // datum's span position rather than recursively printing it to keep
-        // the expander reader-independent.
-        let err_msg = format!("assertion failed at byte {}", span.start);
+        let err_msg = format!("assertion failed: {}", datum_src);
         let error_call = CoreExpr::App {
             func: Rc::new(CoreExpr::Ref {
                 name: self.syms.intern("error"),

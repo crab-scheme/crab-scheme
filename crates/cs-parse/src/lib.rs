@@ -36,6 +36,15 @@ impl Datum {
         }
     }
 
+    /// Render this datum as Scheme-source-like text with symbol names
+    /// resolved through `syms`. Used by the expander to include the
+    /// offending form in error messages (e.g. `assert`'s failure).
+    pub fn format_with(&self, syms: &SymbolTable) -> String {
+        let mut out = String::new();
+        format_datum(self, syms, &mut out);
+        out
+    }
+
     /// Convert this datum into a runtime [`Value`]. Used by `quote` lowering.
     pub fn to_value(&self) -> Value {
         match self {
@@ -54,6 +63,58 @@ impl Datum {
                 let v: Vec<Value> = items.iter().map(|d| d.to_value()).collect();
                 Value::Vector(Rc::new(std::cell::RefCell::new(v)))
             }
+        }
+    }
+}
+
+fn format_datum(d: &Datum, syms: &SymbolTable, out: &mut String) {
+    use std::fmt::Write;
+    match d {
+        Datum::Boolean(b, _) => out.push_str(if *b { "#t" } else { "#f" }),
+        Datum::Number(n, _) => {
+            let _ = write!(out, "{}", n);
+        }
+        Datum::Character(c, _) => {
+            let _ = write!(out, "#\\{}", c);
+        }
+        Datum::String(s, _) => {
+            let _ = write!(out, "\"{}\"", s);
+        }
+        Datum::Symbol(s, _) => out.push_str(syms.name(*s)),
+        Datum::Null(_) => out.push_str("()"),
+        Datum::Pair(_, _, _) => {
+            out.push('(');
+            let mut cur = d.clone();
+            let mut first = true;
+            loop {
+                match &cur {
+                    Datum::Pair(car, cdr, _) => {
+                        if !first {
+                            out.push(' ');
+                        }
+                        format_datum(car, syms, out);
+                        first = false;
+                        cur = (**cdr).clone();
+                    }
+                    Datum::Null(_) => break,
+                    other => {
+                        out.push_str(" . ");
+                        format_datum(other, syms, out);
+                        break;
+                    }
+                }
+            }
+            out.push(')');
+        }
+        Datum::Vector(items, _) => {
+            out.push_str("#(");
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                format_datum(it, syms, out);
+            }
+            out.push(')');
         }
     }
 }
