@@ -11,11 +11,13 @@ use crate::eval::EvalCtx;
 
 pub type PureBuiltinFn = fn(&[Value]) -> Result<Value, String>;
 pub type HoBuiltinFn = fn(&[Value], &mut EvalCtx) -> Result<Value, String>;
+pub type SymsBuiltinFn = fn(&[Value], &mut SymbolTable) -> Result<Value, String>;
 
 #[derive(Clone, Copy)]
 pub enum BuiltinFn {
     Pure(PureBuiltinFn),
     Higher(HoBuiltinFn),
+    Syms(SymsBuiltinFn),
 }
 
 #[derive(Clone, Copy)]
@@ -96,6 +98,14 @@ pub fn make_builtin_higher(name: &'static str, f: HoBuiltinFn) -> Value {
     let p: Rc<dyn Procedure> = Rc::new(Builtin {
         name,
         f: BuiltinFn::Higher(f),
+    });
+    Value::Procedure(p)
+}
+
+pub fn make_builtin_syms(name: &'static str, f: SymsBuiltinFn) -> Value {
+    let p: Rc<dyn Procedure> = Rc::new(Builtin {
+        name,
+        f: BuiltinFn::Syms(f),
     });
     Value::Procedure(p)
 }

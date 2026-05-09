@@ -181,6 +181,9 @@ pub fn apply_procedure(
                     BuiltinFn::Higher(f) => {
                         f(args, ctx).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY))
                     }
+                    BuiltinFn::Syms(f) => {
+                        f(args, ctx.syms).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY))
+                    }
                 };
             }
             if let Some(c) = any.downcast_ref::<Closure>() {
@@ -321,6 +324,7 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
                             let res = match b.f {
                                 BuiltinFn::Pure(f) => f(&arg_vals),
                                 BuiltinFn::Higher(f) => f(&arg_vals, ctx),
+                                BuiltinFn::Syms(f) => f(&arg_vals, ctx.syms),
                             };
                             return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
                         }

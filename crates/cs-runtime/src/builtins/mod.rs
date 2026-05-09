@@ -341,6 +341,39 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("bytevector-length", b_bytevector_length),
         ("bytevector-u8-ref", b_bytevector_u8_ref),
         ("bytevector-u8-set!", b_bytevector_u8_set),
+        ("bytevector-s8-ref", b_bytevector_s8_ref),
+        ("bytevector-s8-set!", b_bytevector_s8_set),
+        // R6RS (rnrs bytevectors): native-endian variants are pure
+        // (no symbol arg). Explicit-endianness variants need ctx for
+        // symbol inspection — see higher_order_builtins below.
+        ("bytevector-u16-native-ref", b_bytevector_u16_native_ref),
+        ("bytevector-u16-native-set!", b_bytevector_u16_native_set),
+        ("bytevector-s16-native-ref", b_bytevector_s16_native_ref),
+        ("bytevector-s16-native-set!", b_bytevector_s16_native_set),
+        ("bytevector-u32-native-ref", b_bytevector_u32_native_ref),
+        ("bytevector-u32-native-set!", b_bytevector_u32_native_set),
+        ("bytevector-s32-native-ref", b_bytevector_s32_native_ref),
+        ("bytevector-s32-native-set!", b_bytevector_s32_native_set),
+        ("bytevector-u64-native-ref", b_bytevector_u64_native_ref),
+        ("bytevector-u64-native-set!", b_bytevector_u64_native_set),
+        ("bytevector-s64-native-ref", b_bytevector_s64_native_ref),
+        ("bytevector-s64-native-set!", b_bytevector_s64_native_set),
+        (
+            "bytevector-ieee-single-native-ref",
+            b_bytevector_ieee_single_native_ref,
+        ),
+        (
+            "bytevector-ieee-single-native-set!",
+            b_bytevector_ieee_single_native_set,
+        ),
+        (
+            "bytevector-ieee-double-native-ref",
+            b_bytevector_ieee_double_native_ref,
+        ),
+        (
+            "bytevector-ieee-double-native-set!",
+            b_bytevector_ieee_double_native_set,
+        ),
         ("bytevector-copy", b_bytevector_copy),
         ("bytevector->u8-list", b_bytevector_to_u8_list),
         ("u8-list->bytevector", b_u8_list_to_bytevector),
@@ -514,6 +547,38 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
     ]
 }
 
+type SymsEntry = (
+    &'static str,
+    fn(&[Value], &mut SymbolTable) -> Result<Value, String>,
+);
+
+/// Builtins that need read-write access to the symbol table but not the
+/// full EvalCtx (no application of user procedures, no port I/O). Both
+/// the walker (`install_into`) and the VM tier register from this list.
+pub fn syms_builtins() -> Vec<SymsEntry> {
+    vec![
+        // R6RS bytevector typed accessors with explicit endianness — need
+        // to inspect a Symbol arg ('big | 'little) via the symbol table.
+        ("bytevector-u16-ref", b_bytevector_u16_ref),
+        ("bytevector-u16-set!", b_bytevector_u16_set),
+        ("bytevector-s16-ref", b_bytevector_s16_ref),
+        ("bytevector-s16-set!", b_bytevector_s16_set),
+        ("bytevector-u32-ref", b_bytevector_u32_ref),
+        ("bytevector-u32-set!", b_bytevector_u32_set),
+        ("bytevector-s32-ref", b_bytevector_s32_ref),
+        ("bytevector-s32-set!", b_bytevector_s32_set),
+        ("bytevector-u64-ref", b_bytevector_u64_ref),
+        ("bytevector-u64-set!", b_bytevector_u64_set),
+        ("bytevector-s64-ref", b_bytevector_s64_ref),
+        ("bytevector-s64-set!", b_bytevector_s64_set),
+        ("bytevector-ieee-single-ref", b_bytevector_ieee_single_ref),
+        ("bytevector-ieee-single-set!", b_bytevector_ieee_single_set),
+        ("bytevector-ieee-double-ref", b_bytevector_ieee_double_ref),
+        ("bytevector-ieee-double-set!", b_bytevector_ieee_double_set),
+        ("native-endianness", b_native_endianness),
+    ]
+}
+
 pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
     // Reset the thread-local condition registry so this Runtime starts from
     // a clean standard hierarchy. User-defined condition types from earlier
@@ -526,6 +591,10 @@ pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
     for (name, f) in higher_order_builtins() {
         let sym = syms.intern(name);
         env.define(sym, make_builtin_higher(name, f));
+    }
+    for (name, f) in syms_builtins() {
+        let sym = syms.intern(name);
+        env.define(sym, crate::proc::make_builtin_syms(name, f));
     }
     // Global record-type ancestor registry. The expander emits
     // (hashtable-set! __record-parents__ '<my-tag> '(<parent-tag> ...))
@@ -5448,6 +5517,548 @@ fn b_bytevector_u8_set(args: &[Value]) -> Result<Value, String> {
         }
         v => Err(type_err("bytevector-u8-set!", "bytevector", v)),
     }
+}
+
+// =====================================================================
+// R6RS (rnrs bytevectors) — multi-byte signed/unsigned and IEEE-754
+// accessors. Endianness comes in as a Scheme symbol ('big or 'little).
+// All ops bounds-check (offset + width) against the bytevector length.
+
+#[derive(Copy, Clone)]
+enum Endian {
+    Big,
+    Little,
+}
+
+fn parse_endian(name: &str, v: &Value, syms: &SymbolTable) -> Result<Endian, String> {
+    match v {
+        Value::Symbol(s) => match syms.name(*s) {
+            "big" => Ok(Endian::Big),
+            "little" => Ok(Endian::Little),
+            _ => Err(format!("{}: endianness must be 'big or 'little", name)),
+        },
+        _ => Err(type_err(name, "endianness symbol", v)),
+    }
+}
+
+fn native_endian() -> Endian {
+    if cfg!(target_endian = "big") {
+        Endian::Big
+    } else {
+        Endian::Little
+    }
+}
+
+fn bv_read_bytes<const N: usize>(name: &str, args: &[Value]) -> Result<(usize, [u8; N]), String> {
+    let i = as_int_i64(name, &args[1])?;
+    if i < 0 {
+        return Err(format!("{}: negative index", name));
+    }
+    let i = i as usize;
+    match &args[0] {
+        Value::ByteVector(bv) => {
+            let bv = bv.borrow();
+            if i + N > bv.len() {
+                return Err(format!("{}: index out of range", name));
+            }
+            let mut buf = [0u8; N];
+            buf.copy_from_slice(&bv[i..i + N]);
+            Ok((i, buf))
+        }
+        v => Err(type_err(name, "bytevector", v)),
+    }
+}
+
+fn bv_write_bytes<const N: usize>(
+    name: &str,
+    args: &[Value],
+    bytes: [u8; N],
+) -> Result<Value, String> {
+    let i = as_int_i64(name, &args[1])?;
+    if i < 0 {
+        return Err(format!("{}: negative index", name));
+    }
+    let i = i as usize;
+    match &args[0] {
+        Value::ByteVector(bv) => {
+            let mut bv = bv.borrow_mut();
+            if i + N > bv.len() {
+                return Err(format!("{}: index out of range", name));
+            }
+            bv[i..i + N].copy_from_slice(&bytes);
+            Ok(Value::Unspecified)
+        }
+        v => Err(type_err(name, "bytevector", v)),
+    }
+}
+
+fn b_bytevector_s8_ref(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("bytevector-s8-ref", "2", args.len()));
+    }
+    let (_, buf) = bv_read_bytes::<1>("bytevector-s8-ref", args)?;
+    Ok(Value::fixnum(buf[0] as i8 as i64))
+}
+
+fn b_bytevector_s8_set(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("bytevector-s8-set!", "3", args.len()));
+    }
+    let v = as_int_i64("bytevector-s8-set!", &args[2])?;
+    if !(-128..=127).contains(&v) {
+        return Err("bytevector-s8-set!: value out of s8 range".into());
+    }
+    bv_write_bytes::<1>("bytevector-s8-set!", args, [v as i8 as u8])
+}
+
+// Macro to generate {u,s}{16,32,64} ref / set / native variants. The
+// per-width logic is identical except for the int width and signed
+// extension on read; using a macro keeps the surface area small.
+macro_rules! bv_int_ops {
+    (
+        $width:expr, $bytes:expr,
+        $name_uref:literal, $fn_uref:ident,
+        $name_uset:literal, $fn_uset:ident,
+        $name_sref:literal, $fn_sref:ident,
+        $name_sset:literal, $fn_sset:ident,
+        $name_nuref:literal, $fn_nuref:ident,
+        $name_nuset:literal, $fn_nuset:ident,
+        $name_nsref:literal, $fn_nsref:ident,
+        $name_nsset:literal, $fn_nsset:ident,
+        $u_ty:ty, $s_ty:ty
+    ) => {
+        fn $fn_uref(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+            if args.len() != 3 {
+                return Err(arity_err($name_uref, "3", args.len()));
+            }
+            let endian = parse_endian($name_uref, &args[2], syms)?;
+            let (_, buf) = bv_read_bytes::<$bytes>($name_uref, args)?;
+            let v = match endian {
+                Endian::Big => <$u_ty>::from_be_bytes(buf),
+                Endian::Little => <$u_ty>::from_le_bytes(buf),
+            };
+            Ok(Value::Number(Number::from_i64(v as i64)))
+        }
+
+        fn $fn_uset(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+            if args.len() != 4 {
+                return Err(arity_err($name_uset, "4", args.len()));
+            }
+            let endian = parse_endian($name_uset, &args[3], syms)?;
+            let v = as_int_i64($name_uset, &args[2])?;
+            let max: i128 = (<$u_ty>::MAX as u128) as i128;
+            if (v as i128) < 0 || (v as i128) > max {
+                return Err(format!(
+                    "{}: value out of {}-bit unsigned range",
+                    $name_uset, $width
+                ));
+            }
+            let bytes = match endian {
+                Endian::Big => (v as $u_ty).to_be_bytes(),
+                Endian::Little => (v as $u_ty).to_le_bytes(),
+            };
+            bv_write_bytes::<$bytes>($name_uset, args, bytes)
+        }
+
+        fn $fn_sref(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+            if args.len() != 3 {
+                return Err(arity_err($name_sref, "3", args.len()));
+            }
+            let endian = parse_endian($name_sref, &args[2], syms)?;
+            let (_, buf) = bv_read_bytes::<$bytes>($name_sref, args)?;
+            let v = match endian {
+                Endian::Big => <$s_ty>::from_be_bytes(buf),
+                Endian::Little => <$s_ty>::from_le_bytes(buf),
+            };
+            Ok(Value::Number(Number::from_i64(v as i64)))
+        }
+
+        fn $fn_sset(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+            if args.len() != 4 {
+                return Err(arity_err($name_sset, "4", args.len()));
+            }
+            let endian = parse_endian($name_sset, &args[3], syms)?;
+            let v = as_int_i64($name_sset, &args[2])?;
+            let lo: i128 = <$s_ty>::MIN as i128;
+            let hi: i128 = <$s_ty>::MAX as i128;
+            if (v as i128) < lo || (v as i128) > hi {
+                return Err(format!(
+                    "{}: value out of {}-bit signed range",
+                    $name_sset, $width
+                ));
+            }
+            let bytes = match endian {
+                Endian::Big => (v as $s_ty).to_be_bytes(),
+                Endian::Little => (v as $s_ty).to_le_bytes(),
+            };
+            bv_write_bytes::<$bytes>($name_sset, args, bytes)
+        }
+
+        fn $fn_nuref(args: &[Value]) -> Result<Value, String> {
+            if args.len() != 2 {
+                return Err(arity_err($name_nuref, "2", args.len()));
+            }
+            let (_, buf) = bv_read_bytes::<$bytes>($name_nuref, args)?;
+            let v = match native_endian() {
+                Endian::Big => <$u_ty>::from_be_bytes(buf),
+                Endian::Little => <$u_ty>::from_le_bytes(buf),
+            };
+            Ok(Value::Number(Number::from_i64(v as i64)))
+        }
+
+        fn $fn_nuset(args: &[Value]) -> Result<Value, String> {
+            if args.len() != 3 {
+                return Err(arity_err($name_nuset, "3", args.len()));
+            }
+            let v = as_int_i64($name_nuset, &args[2])?;
+            let max: i128 = (<$u_ty>::MAX as u128) as i128;
+            if (v as i128) < 0 || (v as i128) > max {
+                return Err(format!(
+                    "{}: value out of {}-bit unsigned range",
+                    $name_nuset, $width
+                ));
+            }
+            let bytes = match native_endian() {
+                Endian::Big => (v as $u_ty).to_be_bytes(),
+                Endian::Little => (v as $u_ty).to_le_bytes(),
+            };
+            bv_write_bytes::<$bytes>($name_nuset, args, bytes)
+        }
+
+        fn $fn_nsref(args: &[Value]) -> Result<Value, String> {
+            if args.len() != 2 {
+                return Err(arity_err($name_nsref, "2", args.len()));
+            }
+            let (_, buf) = bv_read_bytes::<$bytes>($name_nsref, args)?;
+            let v = match native_endian() {
+                Endian::Big => <$s_ty>::from_be_bytes(buf),
+                Endian::Little => <$s_ty>::from_le_bytes(buf),
+            };
+            Ok(Value::Number(Number::from_i64(v as i64)))
+        }
+
+        fn $fn_nsset(args: &[Value]) -> Result<Value, String> {
+            if args.len() != 3 {
+                return Err(arity_err($name_nsset, "3", args.len()));
+            }
+            let v = as_int_i64($name_nsset, &args[2])?;
+            let lo: i128 = <$s_ty>::MIN as i128;
+            let hi: i128 = <$s_ty>::MAX as i128;
+            if (v as i128) < lo || (v as i128) > hi {
+                return Err(format!(
+                    "{}: value out of {}-bit signed range",
+                    $name_nsset, $width
+                ));
+            }
+            let bytes = match native_endian() {
+                Endian::Big => (v as $s_ty).to_be_bytes(),
+                Endian::Little => (v as $s_ty).to_le_bytes(),
+            };
+            bv_write_bytes::<$bytes>($name_nsset, args, bytes)
+        }
+    };
+}
+
+bv_int_ops!(
+    16,
+    2,
+    "bytevector-u16-ref",
+    b_bytevector_u16_ref,
+    "bytevector-u16-set!",
+    b_bytevector_u16_set,
+    "bytevector-s16-ref",
+    b_bytevector_s16_ref,
+    "bytevector-s16-set!",
+    b_bytevector_s16_set,
+    "bytevector-u16-native-ref",
+    b_bytevector_u16_native_ref,
+    "bytevector-u16-native-set!",
+    b_bytevector_u16_native_set,
+    "bytevector-s16-native-ref",
+    b_bytevector_s16_native_ref,
+    "bytevector-s16-native-set!",
+    b_bytevector_s16_native_set,
+    u16,
+    i16
+);
+
+bv_int_ops!(
+    32,
+    4,
+    "bytevector-u32-ref",
+    b_bytevector_u32_ref,
+    "bytevector-u32-set!",
+    b_bytevector_u32_set,
+    "bytevector-s32-ref",
+    b_bytevector_s32_ref,
+    "bytevector-s32-set!",
+    b_bytevector_s32_set,
+    "bytevector-u32-native-ref",
+    b_bytevector_u32_native_ref,
+    "bytevector-u32-native-set!",
+    b_bytevector_u32_native_set,
+    "bytevector-s32-native-ref",
+    b_bytevector_s32_native_ref,
+    "bytevector-s32-native-set!",
+    b_bytevector_s32_native_set,
+    u32,
+    i32
+);
+
+// 64-bit unsigned can exceed i64::MAX → fall back to BigInt via parse.
+fn b_bytevector_u64_ref(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("bytevector-u64-ref", "3", args.len()));
+    }
+    let endian = parse_endian("bytevector-u64-ref", &args[2], syms)?;
+    let (_, buf) = bv_read_bytes::<8>("bytevector-u64-ref", args)?;
+    let v = match endian {
+        Endian::Big => u64::from_be_bytes(buf),
+        Endian::Little => u64::from_le_bytes(buf),
+    };
+    Ok(u64_to_value(v))
+}
+
+fn b_bytevector_u64_set(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err(arity_err("bytevector-u64-set!", "4", args.len()));
+    }
+    let endian = parse_endian("bytevector-u64-set!", &args[3], syms)?;
+    let v = value_to_u64("bytevector-u64-set!", &args[2])?;
+    let bytes = match endian {
+        Endian::Big => v.to_be_bytes(),
+        Endian::Little => v.to_le_bytes(),
+    };
+    bv_write_bytes::<8>("bytevector-u64-set!", args, bytes)
+}
+
+fn b_bytevector_s64_ref(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("bytevector-s64-ref", "3", args.len()));
+    }
+    let endian = parse_endian("bytevector-s64-ref", &args[2], syms)?;
+    let (_, buf) = bv_read_bytes::<8>("bytevector-s64-ref", args)?;
+    let v = match endian {
+        Endian::Big => i64::from_be_bytes(buf),
+        Endian::Little => i64::from_le_bytes(buf),
+    };
+    Ok(Value::Number(Number::from_i64(v)))
+}
+
+fn b_bytevector_s64_set(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err(arity_err("bytevector-s64-set!", "4", args.len()));
+    }
+    let endian = parse_endian("bytevector-s64-set!", &args[3], syms)?;
+    let v = as_int_i64("bytevector-s64-set!", &args[2])?;
+    let bytes = match endian {
+        Endian::Big => v.to_be_bytes(),
+        Endian::Little => v.to_le_bytes(),
+    };
+    bv_write_bytes::<8>("bytevector-s64-set!", args, bytes)
+}
+
+fn b_bytevector_u64_native_ref(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("bytevector-u64-native-ref", "2", args.len()));
+    }
+    let (_, buf) = bv_read_bytes::<8>("bytevector-u64-native-ref", args)?;
+    let v = match native_endian() {
+        Endian::Big => u64::from_be_bytes(buf),
+        Endian::Little => u64::from_le_bytes(buf),
+    };
+    Ok(u64_to_value(v))
+}
+
+fn b_bytevector_u64_native_set(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("bytevector-u64-native-set!", "3", args.len()));
+    }
+    let v = value_to_u64("bytevector-u64-native-set!", &args[2])?;
+    let bytes = match native_endian() {
+        Endian::Big => v.to_be_bytes(),
+        Endian::Little => v.to_le_bytes(),
+    };
+    bv_write_bytes::<8>("bytevector-u64-native-set!", args, bytes)
+}
+
+fn b_bytevector_s64_native_ref(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("bytevector-s64-native-ref", "2", args.len()));
+    }
+    let (_, buf) = bv_read_bytes::<8>("bytevector-s64-native-ref", args)?;
+    let v = match native_endian() {
+        Endian::Big => i64::from_be_bytes(buf),
+        Endian::Little => i64::from_le_bytes(buf),
+    };
+    Ok(Value::Number(Number::from_i64(v)))
+}
+
+fn b_bytevector_s64_native_set(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("bytevector-s64-native-set!", "3", args.len()));
+    }
+    let v = as_int_i64("bytevector-s64-native-set!", &args[2])?;
+    let bytes = match native_endian() {
+        Endian::Big => v.to_be_bytes(),
+        Endian::Little => v.to_le_bytes(),
+    };
+    bv_write_bytes::<8>("bytevector-s64-native-set!", args, bytes)
+}
+
+fn u64_to_value(v: u64) -> Value {
+    if v <= i64::MAX as u64 {
+        Value::Number(Number::from_i64(v as i64))
+    } else {
+        // Need a BigInt for values > i64::MAX. Use parse_decimal_integer.
+        let s = v.to_string();
+        Value::Number(Number::parse_decimal_integer(&s).expect("u64 to bigint"))
+    }
+}
+
+fn value_to_u64(name: &str, v: &Value) -> Result<u64, String> {
+    use num_traits::ToPrimitive;
+    match v {
+        Value::Number(Number::Fixnum(n)) => {
+            if *n < 0 {
+                Err(format!("{}: value negative for u64", name))
+            } else {
+                Ok(*n as u64)
+            }
+        }
+        Value::Number(Number::Big(b)) => b
+            .to_u64()
+            .ok_or_else(|| format!("{}: value out of u64 range", name)),
+        _ => Err(type_err(name, "non-negative integer", v)),
+    }
+}
+
+// IEEE-754 single (f32) and double (f64) accessors.
+fn b_bytevector_ieee_single_ref(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("bytevector-ieee-single-ref", "3", args.len()));
+    }
+    let endian = parse_endian("bytevector-ieee-single-ref", &args[2], syms)?;
+    let (_, buf) = bv_read_bytes::<4>("bytevector-ieee-single-ref", args)?;
+    let v = match endian {
+        Endian::Big => f32::from_be_bytes(buf),
+        Endian::Little => f32::from_le_bytes(buf),
+    };
+    Ok(Value::Number(Number::Flonum(v as f64)))
+}
+
+fn b_bytevector_ieee_single_set(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err(arity_err("bytevector-ieee-single-set!", "4", args.len()));
+    }
+    let endian = parse_endian("bytevector-ieee-single-set!", &args[3], syms)?;
+    let v = as_num("bytevector-ieee-single-set!", &args[2])?.to_f64() as f32;
+    let bytes = match endian {
+        Endian::Big => v.to_be_bytes(),
+        Endian::Little => v.to_le_bytes(),
+    };
+    bv_write_bytes::<4>("bytevector-ieee-single-set!", args, bytes)
+}
+
+fn b_bytevector_ieee_double_ref(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("bytevector-ieee-double-ref", "3", args.len()));
+    }
+    let endian = parse_endian("bytevector-ieee-double-ref", &args[2], syms)?;
+    let (_, buf) = bv_read_bytes::<8>("bytevector-ieee-double-ref", args)?;
+    let v = match endian {
+        Endian::Big => f64::from_be_bytes(buf),
+        Endian::Little => f64::from_le_bytes(buf),
+    };
+    Ok(Value::Number(Number::Flonum(v)))
+}
+
+fn b_bytevector_ieee_double_set(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err(arity_err("bytevector-ieee-double-set!", "4", args.len()));
+    }
+    let endian = parse_endian("bytevector-ieee-double-set!", &args[3], syms)?;
+    let v = as_num("bytevector-ieee-double-set!", &args[2])?.to_f64();
+    let bytes = match endian {
+        Endian::Big => v.to_be_bytes(),
+        Endian::Little => v.to_le_bytes(),
+    };
+    bv_write_bytes::<8>("bytevector-ieee-double-set!", args, bytes)
+}
+
+fn b_bytevector_ieee_single_native_ref(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err(
+            "bytevector-ieee-single-native-ref",
+            "2",
+            args.len(),
+        ));
+    }
+    let (_, buf) = bv_read_bytes::<4>("bytevector-ieee-single-native-ref", args)?;
+    let v = match native_endian() {
+        Endian::Big => f32::from_be_bytes(buf),
+        Endian::Little => f32::from_le_bytes(buf),
+    };
+    Ok(Value::Number(Number::Flonum(v as f64)))
+}
+
+fn b_bytevector_ieee_single_native_set(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err(
+            "bytevector-ieee-single-native-set!",
+            "3",
+            args.len(),
+        ));
+    }
+    let v = as_num("bytevector-ieee-single-native-set!", &args[2])?.to_f64() as f32;
+    let bytes = match native_endian() {
+        Endian::Big => v.to_be_bytes(),
+        Endian::Little => v.to_le_bytes(),
+    };
+    bv_write_bytes::<4>("bytevector-ieee-single-native-set!", args, bytes)
+}
+
+fn b_bytevector_ieee_double_native_ref(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err(
+            "bytevector-ieee-double-native-ref",
+            "2",
+            args.len(),
+        ));
+    }
+    let (_, buf) = bv_read_bytes::<8>("bytevector-ieee-double-native-ref", args)?;
+    let v = match native_endian() {
+        Endian::Big => f64::from_be_bytes(buf),
+        Endian::Little => f64::from_le_bytes(buf),
+    };
+    Ok(Value::Number(Number::Flonum(v)))
+}
+
+fn b_bytevector_ieee_double_native_set(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err(
+            "bytevector-ieee-double-native-set!",
+            "3",
+            args.len(),
+        ));
+    }
+    let v = as_num("bytevector-ieee-double-native-set!", &args[2])?.to_f64();
+    let bytes = match native_endian() {
+        Endian::Big => v.to_be_bytes(),
+        Endian::Little => v.to_le_bytes(),
+    };
+    bv_write_bytes::<8>("bytevector-ieee-double-native-set!", args, bytes)
+}
+
+fn b_native_endianness(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("native-endianness", "0", args.len()));
+    }
+    let s = match native_endian() {
+        Endian::Big => syms.intern("big"),
+        Endian::Little => syms.intern("little"),
+    };
+    Ok(Value::Symbol(s))
 }
 
 fn b_bytevector_copy(args: &[Value]) -> Result<Value, String> {

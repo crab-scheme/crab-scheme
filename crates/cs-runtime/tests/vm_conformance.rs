@@ -560,3 +560,11 @@ fn vm_conformance_exactness_extras() {
     println!("exactness_extras: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_bytevector_typed() {
+    let walker = pass_count_walker("bytevector_typed.scm");
+    let vm = pass_count_vm("bytevector_typed.scm").expect("vm should run bytevector_typed.scm");
+    println!("bytevector_typed: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
