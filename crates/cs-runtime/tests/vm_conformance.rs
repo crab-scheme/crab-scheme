@@ -919,3 +919,11 @@ fn vm_conformance_r7rs_current_error_port() {
     println!("r7rs_current_error_port: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_write_aliases() {
+    let walker = pass_count_walker("r7rs_write_aliases.scm");
+    let vm = pass_count_vm("r7rs_write_aliases.scm").expect("vm should run r7rs_write_aliases.scm");
+    println!("r7rs_write_aliases: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

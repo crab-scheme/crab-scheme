@@ -584,6 +584,11 @@ fn conformance_r7rs_current_error_port() {
 }
 
 #[test]
+fn conformance_r7rs_write_aliases() {
+    run_conformance_file("r7rs_write_aliases.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -705,6 +710,7 @@ fn conformance_aggregate_count() {
                 "r7rs_write_default_port.scm",
                 "r7rs_binary_default_port.scm",
                 "r7rs_current_error_port.scm",
+                "r7rs_write_aliases.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

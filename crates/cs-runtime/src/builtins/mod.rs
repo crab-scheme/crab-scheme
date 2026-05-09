@@ -518,6 +518,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("for-each", b_for_each),
         ("display", b_display),
         ("write", b_write),
+        ("write-simple", b_write),
+        ("write-shared", b_write),
         ("newline", b_newline),
         ("raise", b_raise),
         ("display-condition", b_display_condition),

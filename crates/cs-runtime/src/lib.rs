@@ -168,6 +168,12 @@ impl Runtime {
         vm_env.define(display_sym, cs_vm::vm::make_vm_display());
         let write_sym = syms.intern("write");
         vm_env.define(write_sym, cs_vm::vm::make_vm_write());
+        // R7RS aliases — we don't yet generate shared notation, so both
+        // map to the same VM write marker as `write` itself.
+        let ws_sym = syms.intern("write-simple");
+        vm_env.define(ws_sym, cs_vm::vm::make_vm_write());
+        let wsh_sym = syms.intern("write-shared");
+        vm_env.define(wsh_sym, cs_vm::vm::make_vm_write());
         let newline_sym = syms.intern("newline");
         vm_env.define(newline_sym, cs_vm::vm::make_vm_newline());
         // display-condition: a builtin-syms that piggybacks on
