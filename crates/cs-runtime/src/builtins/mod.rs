@@ -292,6 +292,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("display", b_display),
         ("write", b_write),
         ("raise", b_raise),
+        ("display-condition", b_display_condition),
         // raise-continuable: in proper R6RS, the current exception handler
         // is invoked synchronously and its return value becomes the value
         // of the call to raise-continuable. Our `raise` already routes the
@@ -2065,6 +2066,115 @@ fn b_simple_conditions(args: &[Value]) -> Result<Value, String> {
     let mut out = Vec::new();
     flatten_simples(&args[0], &mut out);
     Ok(Value::list(out))
+}
+
+/// Render a condition into the same human-friendly string format used by
+/// the top-level uncaught-condition path. Returns the rendered string —
+/// callers print it via the appropriate port.
+pub fn render_condition(c: &Value, syms: &SymbolTable) -> String {
+    let simples: Vec<Value> = if is_compound_cond(c) {
+        if let Value::Vector(vc) = c {
+            vc.borrow().iter().skip(1).cloned().collect()
+        } else {
+            Vec::new()
+        }
+    } else if is_simple_cond(c) {
+        vec![c.clone()]
+    } else {
+        return format!("non-condition: {}", c.format_with(syms, WriteMode::Write));
+    };
+
+    let mut msg: Option<String> = None;
+    let mut irritants: Vec<Value> = Vec::new();
+    let mut who: Option<Value> = None;
+    let mut is_assertion = false;
+    let mut other_tags: Vec<String> = Vec::new();
+    for simple in &simples {
+        if let Some(tag) = vec_first_tag(simple) {
+            let fields: Vec<Value> = if let Value::Vector(vc) = simple {
+                vc.borrow().iter().skip(1).cloned().collect()
+            } else {
+                Vec::new()
+            };
+            match tag.as_str() {
+                "&message" => {
+                    if let Some(Value::String(s)) = fields.first() {
+                        msg = Some(s.borrow().clone());
+                    }
+                }
+                "&irritants" => {
+                    if let Some(list) = fields.first() {
+                        let mut cur = list.clone();
+                        loop {
+                            match cur {
+                                Value::Null => break,
+                                Value::Pair(p) => {
+                                    irritants.push(p.car.borrow().clone());
+                                    cur = p.cdr.borrow().clone();
+                                }
+                                other => {
+                                    irritants.push(other);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                "&who" => {
+                    who = fields.into_iter().next();
+                }
+                "&error" | "&serious" | "&violation" => {}
+                "&assertion" => {
+                    is_assertion = true;
+                }
+                other => other_tags.push(format!("[{}]", other)),
+            }
+        }
+    }
+    let prefix = if is_assertion {
+        "assertion-violation"
+    } else {
+        "error"
+    };
+    let mut out = String::from(prefix);
+    if let Some(w) = &who {
+        if !matches!(w, Value::Boolean(false)) {
+            out.push_str(" in ");
+            out.push_str(&w.format_with(syms, WriteMode::Display));
+        }
+    }
+    out.push(':');
+    if let Some(m) = msg {
+        out.push(' ');
+        out.push_str(&m);
+    }
+    if !irritants.is_empty() {
+        let irritant_strs: Vec<String> = irritants
+            .iter()
+            .map(|i| i.format_with(syms, WriteMode::Write))
+            .collect();
+        out.push_str(&format!(" ({})", irritant_strs.join(" ")));
+    }
+    if !other_tags.is_empty() {
+        out.push(' ');
+        out.push_str(&other_tags.join(" "));
+    }
+    out
+}
+
+/// `(display-condition <cond> [<port>])` — write a textual representation
+/// of a condition to the given port (or the current output port when
+/// omitted). Newline included so successive calls render cleanly.
+fn b_display_condition(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_err("display-condition", "1 or 2", args.len()));
+    }
+    if !is_any_cond(&args[0]) {
+        return Err(type_err("display-condition", "condition", &args[0]));
+    }
+    let mut s = render_condition(&args[0], ctx.syms);
+    s.push('\n');
+    write_output(&s, args.get(1).cloned(), ctx)
 }
 
 // ---- helpers for define-condition-type-generated code ----

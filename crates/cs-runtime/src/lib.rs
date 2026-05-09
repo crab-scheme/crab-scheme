@@ -160,6 +160,40 @@ impl Runtime {
         vm_env.define(write_sym, cs_vm::vm::make_vm_write());
         let newline_sym = syms.intern("newline");
         vm_env.define(newline_sym, cs_vm::vm::make_vm_newline());
+        // display-condition: a builtin-syms that piggybacks on
+        // builtins::render_condition so both tiers produce identical
+        // output. Output goes via the VM's current output port (or
+        // stdout when none is installed) the same way `display` does.
+        let dcon_sym = syms.intern("display-condition");
+        vm_env.define(
+            dcon_sym,
+            cs_vm::vm::make_vm_builtin_syms("display-condition", |args, st| {
+                if args.is_empty() || args.len() > 2 {
+                    return Err("display-condition: 1 or 2 args".into());
+                }
+                let mut s = builtins::render_condition(&args[0], st);
+                s.push('\n');
+                let port = if args.len() == 2 {
+                    Some(args[1].clone())
+                } else {
+                    cs_vm::vm::vm_current_output_port_value()
+                };
+                match port {
+                    Some(Value::Port(p)) => match &*p {
+                        cs_core::Port::StringOutput(buf) => {
+                            buf.borrow_mut().push_str(&s);
+                            Ok(Value::Unspecified)
+                        }
+                        _ => Err("display-condition: not an output port".into()),
+                    },
+                    Some(_) => Err("display-condition: not a port".into()),
+                    None => {
+                        print!("{}", s);
+                        Ok(Value::Unspecified)
+                    }
+                }
+            }),
+        );
         let wos_sym = syms.intern("with-output-to-string");
         vm_env.define(wos_sym, cs_vm::vm::make_vm_with_output_to_string());
         let wis_sym = syms.intern("with-input-from-string");

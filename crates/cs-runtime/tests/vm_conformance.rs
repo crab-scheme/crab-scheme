@@ -431,3 +431,11 @@ fn vm_conformance_library_import() {
     println!("library_import: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_display_condition() {
+    let walker = pass_count_walker("display_condition.scm");
+    let vm = pass_count_vm("display_condition.scm").expect("vm should run display_condition.scm");
+    println!("display_condition: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

@@ -284,6 +284,11 @@ fn conformance_library_import() {
 }
 
 #[test]
+fn conformance_display_condition() {
+    run_conformance_file("display_condition.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -345,6 +350,7 @@ fn conformance_aggregate_count() {
                 "builtin_errors.scm",
                 "cond_guard_arrow.scm",
                 "library_import.scm",
+                "display_condition.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
