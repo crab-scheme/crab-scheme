@@ -238,12 +238,14 @@ Iters 117+ are filling R7RS gaps one per iter:
   added missing string-set!
 - 136 R7RS string->list, vector->list, string->vector, vector->string
   with optional [start [end]]
-- 137 R7RS bytevector-fill! with optional [start [end]] (this iter)
+- 137 R7RS bytevector-fill! with optional [start [end]]
+- 138 R7RS (string char ...) constructor — variadic char-collection
+  to a new string (this iter)
 
 Current totals:
-- 91 conformance test files (cli)
-- VM tier: 93 tests
-- Aggregate: 1848 individual Scheme tests passing
+- 92 conformance test files (cli)
+- VM tier: 94 tests
+- Aggregate: 1860 individual Scheme tests passing
 
 ## Loop cadence
 

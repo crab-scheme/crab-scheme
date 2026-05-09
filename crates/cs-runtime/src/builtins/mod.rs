@@ -254,6 +254,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // vectors
         ("make-vector", b_make_vector),
         ("vector", b_vector),
+        ("string", b_string_ctor),
         ("vector-length", b_vector_length),
         ("vector-ref", b_vector_ref),
         ("vector-set!", b_vector_set),
@@ -2792,6 +2793,20 @@ fn b_make_vector(args: &[Value]) -> Result<Value, String> {
 fn b_vector(args: &[Value]) -> Result<Value, String> {
     let v: Vec<Value> = args.to_vec();
     Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(v))))
+}
+
+/// R7RS `(string char ...)` — return a string composed of the given chars.
+/// Variadic, including 0 args (empty string). Errors if any arg isn't a
+/// character.
+fn b_string_ctor(args: &[Value]) -> Result<Value, String> {
+    let mut s = String::new();
+    for a in args {
+        match a {
+            Value::Character(c) => s.push(*c),
+            v => return Err(type_err("string", "character", v)),
+        }
+    }
+    Ok(Value::string(s))
 }
 
 fn b_vector_length(args: &[Value]) -> Result<Value, String> {
