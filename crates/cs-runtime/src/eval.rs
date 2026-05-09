@@ -127,12 +127,36 @@ fn call_parameter(param: &Parameter, args: &[Value]) -> Value {
 
 fn builtin_err_to_eval(ctx: &mut EvalCtx, msg: String, span: Span) -> EvalError {
     if let Some(cond) = ctx.pending_raise.take() {
-        EvalError::raised(cond, span)
-    } else if let Some((id, v)) = ctx.pending_escape.take() {
-        EvalError::escape(id, v, span)
-    } else {
-        EvalError::new(msg, span)
+        return EvalError::raised(cond, span);
     }
+    if let Some((id, v)) = ctx.pending_escape.take() {
+        return EvalError::escape(id, v, span);
+    }
+    // Internal sentinels — these aren't real builtin failures, they're
+    // protocol markers between builtins and the dispatcher.
+    if matches!(
+        msg.as_str(),
+        "__raised__" | "__escape__" | "__stack-overflow__"
+    ) {
+        return EvalError::new(msg, span);
+    }
+    // Build a proper R6RS condition so user code can catch builtin
+    // failures with `with-exception-handler` / `guard`. Most builtins
+    // format their errors as "<who>: <message>" — split on the first
+    // colon and surface the prefix as &who.
+    let (who, message) = match msg.find(": ") {
+        Some(idx) => {
+            let who_str = &msg[..idx];
+            let rest = &msg[idx + 2..];
+            (
+                Some(Value::Symbol(ctx.syms.intern(who_str))),
+                rest.to_string(),
+            )
+        }
+        None => (None, msg.clone()),
+    };
+    let cond = crate::builtins::make_error_condition(who, message, Vec::new());
+    EvalError::raised(cond, span)
 }
 
 /// Apply `proc_val` to `args`. Used by higher-order builtins (`apply`, `map`,

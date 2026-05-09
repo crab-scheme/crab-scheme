@@ -407,3 +407,11 @@ fn vm_conformance_error_who() {
     println!("error_who: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_builtin_errors() {
+    let walker = pass_count_walker("builtin_errors.scm");
+    let vm = pass_count_vm("builtin_errors.scm").expect("vm should run builtin_errors.scm");
+    println!("builtin_errors: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

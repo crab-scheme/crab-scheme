@@ -556,9 +556,14 @@ fn run_dispatch(
                         continue;
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltin>() {
-                        let r = (b.f)(&stack[args_start..stack_len]).map_err(|e| {
-                            VmError::new(prefix_builtin_err(b.name, &e)).with_span(call_span)
-                        })?;
+                        let name = b.name;
+                        let raw = (b.f)(&stack[args_start..stack_len]);
+                        let r = match raw {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return Err(builtin_err_to_raised(name, &e, syms, call_span));
+                            }
+                        };
                         stack.truncate(func_idx);
                         stack.push(r);
                         if is_tail {
@@ -572,9 +577,14 @@ fn run_dispatch(
                         continue;
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltinSyms>() {
-                        let r = (b.f)(&stack[args_start..stack_len], syms).map_err(|e| {
-                            VmError::new(prefix_builtin_err(b.name, &e)).with_span(call_span)
-                        })?;
+                        let name = b.name;
+                        let raw = (b.f)(&stack[args_start..stack_len], syms);
+                        let r = match raw {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return Err(builtin_err_to_raised(name, &e, syms, call_span));
+                            }
+                        };
                         stack.truncate(func_idx);
                         stack.push(r);
                         if is_tail {
@@ -1935,14 +1945,18 @@ fn generic_arith2(
     op: GenericArith,
     inst_ip: usize,
     spans: &[Span],
-    _syms: &mut SymbolTable,
+    syms: &mut SymbolTable,
 ) -> Result<Value, VmError> {
-    let an = as_number(&a, op_arith_name(op)).map_err(|m| {
-        VmError::new(m).with_span(spans.get(inst_ip).copied().unwrap_or(Span::DUMMY))
-    })?;
-    let bn = as_number(&b, op_arith_name(op)).map_err(|m| {
-        VmError::new(m).with_span(spans.get(inst_ip).copied().unwrap_or(Span::DUMMY))
-    })?;
+    let span = spans.get(inst_ip).copied().unwrap_or(Span::DUMMY);
+    let name = op_arith_name(op);
+    let an = match as_number(&a, name) {
+        Ok(n) => n,
+        Err(m) => return Err(builtin_err_to_raised(name, &m, syms, span)),
+    };
+    let bn = match as_number(&b, name) {
+        Ok(n) => n,
+        Err(m) => return Err(builtin_err_to_raised(name, &m, syms, span)),
+    };
     let r = match op {
         GenericArith::Add => an.add(&bn),
         GenericArith::Sub => an.sub(&bn),
@@ -1956,14 +1970,18 @@ fn generic_cmp2(
     op: GenericCmp,
     inst_ip: usize,
     spans: &[Span],
-    _syms: &mut SymbolTable,
+    syms: &mut SymbolTable,
 ) -> Result<Value, VmError> {
-    let an = as_number(&a, op_cmp_name(op)).map_err(|m| {
-        VmError::new(m).with_span(spans.get(inst_ip).copied().unwrap_or(Span::DUMMY))
-    })?;
-    let bn = as_number(&b, op_cmp_name(op)).map_err(|m| {
-        VmError::new(m).with_span(spans.get(inst_ip).copied().unwrap_or(Span::DUMMY))
-    })?;
+    let span = spans.get(inst_ip).copied().unwrap_or(Span::DUMMY);
+    let name = op_cmp_name(op);
+    let an = match as_number(&a, name) {
+        Ok(n) => n,
+        Err(m) => return Err(builtin_err_to_raised(name, &m, syms, span)),
+    };
+    let bn = match as_number(&b, name) {
+        Ok(n) => n,
+        Err(m) => return Err(builtin_err_to_raised(name, &m, syms, span)),
+    };
     let ord = an.cmp(&bn);
     let result = match op {
         GenericCmp::Lt => ord == std::cmp::Ordering::Less,
@@ -3268,6 +3286,35 @@ fn prefix_builtin_err(name: &str, msg: &str) -> String {
     } else {
         format!("{}: {}", name, msg)
     }
+}
+
+/// Convert a builtin error result into the `__raised__` protocol so that
+/// `with-exception-handler` can catch type errors / arity mismatches /
+/// etc. as proper R6RS conditions. Returns a VmError that the dispatch
+/// loop will treat like an explicit `(raise ...)`.
+///
+/// Sentinel strings (`__raised__`, `__escape__`) pass through unchanged
+/// — those are protocol markers, not real failures.
+pub fn builtin_err_to_raised(name: &str, e: &str, syms: &mut SymbolTable, span: Span) -> VmError {
+    if e == "__raised__" || e == "__escape__" || e == "__stack-overflow__" {
+        return VmError::new(e).with_span(span);
+    }
+    let prefixed = prefix_builtin_err(name, e);
+    // Split on the first ": " so the part before becomes &who (interned
+    // as a symbol) and the rest becomes the &message body. This matches
+    // the walker tier's `builtin_err_to_eval`.
+    let (who, message) = match prefixed.find(": ") {
+        Some(idx) => {
+            let who_sym = syms.intern(&prefixed[..idx]);
+            (
+                Some(Value::Symbol(who_sym)),
+                prefixed[idx + 2..].to_string(),
+            )
+        }
+        None => (None, prefixed),
+    };
+    set_pending_raise(make_vm_error_condition(who, message, Vec::new()));
+    VmError::new("__raised__").with_span(span)
 }
 
 fn collect_proper_list(v: &Value) -> Result<Vec<Value>, VmError> {

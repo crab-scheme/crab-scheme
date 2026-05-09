@@ -269,6 +269,11 @@ fn conformance_error_who() {
 }
 
 #[test]
+fn conformance_builtin_errors() {
+    run_conformance_file("builtin_errors.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -327,6 +332,7 @@ fn conformance_aggregate_count() {
                 "records_parent.scm",
                 "define_condition_type.scm",
                 "error_who.scm",
+                "builtin_errors.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

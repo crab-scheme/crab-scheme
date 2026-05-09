@@ -2202,7 +2202,7 @@ fn b_assertion_violation(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
 /// Helper used by `error` and the VM-tier error path. Builds a compound
 /// condition with `&error`, optional `&who`, `&message`, and (if non-empty)
 /// `&irritants`. Centralized so both tiers produce the same shape.
-fn make_error_condition(who: Option<Value>, msg: String, irritants: Vec<Value>) -> Value {
+pub fn make_error_condition(who: Option<Value>, msg: String, irritants: Vec<Value>) -> Value {
     let mut simples = vec![make_simple(TAG_ERROR, vec![])];
     if let Some(w) = who {
         simples.push(make_simple(TAG_WHO, vec![w]));
