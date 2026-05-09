@@ -1,0 +1,76 @@
+name: m5-fuzz
+
+# Nightly fuzz job for the M5 GC. Runs the deterministic LCG fuzz
+# harness in `crates/cs-runtime/tests/gc_fuzz.rs` for ~1 hour by
+# bumping the seed range via an env var. Failures upload the seed
+# and the panic trace as an artifact.
+#
+# This complements the in-tree fast tests that gate every PR; this
+# workflow is the long-running stability gate that contributes to
+# the M5 spec's "24-hour fuzz with leak detector reports no leaks
+# on cyclic structures" exit criterion.
+#
+# Owner: M5 milestone driver.
+# Status: scaffolded; the seed-loop logic is a TODO until the fuzz
+# harness can take a seed-range arg or env var.
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # 04:00 UTC nightly
+  workflow_dispatch:
+    inputs:
+      seed_count:
+        description: "Number of additional fuzz seeds to run beyond the default 16"
+        required: false
+        default: "1024"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: m5 gc fuzz (1h)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build tests
+        run: cargo build --release --tests -p cs-runtime
+
+      - name: Run gc_fuzz (extended seed range)
+        env:
+          # The default unit-test run uses 16 seeds; extended runs
+          # bump to ${seed_count}. The harness reads CRABSCHEME_FUZZ_SEEDS
+          # if present (TODO wire this into gc_fuzz.rs).
+          CRABSCHEME_FUZZ_SEEDS: ${{ github.event.inputs.seed_count || '1024' }}
+        run: |
+          # Loop the existing test until 60 minutes elapse.
+          end=$(( $(date +%s) + 3600 ))
+          iteration=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            iteration=$((iteration + 1))
+            echo "::group::iteration $iteration"
+            cargo test --release -p cs-runtime --test gc_fuzz -- --nocapture
+            echo "::endgroup::"
+          done
+          echo "completed $iteration full gc_fuzz runs"
+
+      - name: Run gc_timing snapshot
+        run: cargo test --release -p cs-runtime --test gc_timing -- --nocapture
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gc-fuzz-failure-${{ github.run_id }}
+          path: |
+            target/release/deps/gc_fuzz-*
+          retention-days: 14

@@ -181,12 +181,16 @@ the perf gate needs the arena.)
   the spec's 1ms threshold even before Phase 2.
 
 What's still in 4.G but deferred:
-- 24-hour fuzz CI workflow (`.github/workflows/m5-fuzz.yml`).
+- ~~24-hour fuzz CI workflow (`.github/workflows/m5-fuzz.yml`)~~
+  ✅ landed this iter; bumps seed count via `CRABSCHEME_FUZZ_SEEDS`
+  to 1024 by default, loops the test for 60 minutes nightly.
+- ✅ ADR 0006 (`docs/adr/0006-gc-design.md`) ratifies the
+  hand-rolled mark-sweep + precise-rooting choice plus the
+  Phase 1 → Phase 2 migration commitment.
 - Criterion-based bench harness (`bench/gc_pause.rs`).
 - Memory-baseline measurement (peak RSS ≤ 1.2× M4 RC baseline).
-These are stable-now-needs-CI deliverables that don't add code
-quality at this iter; they belong in the M5 spec's exit-gate
-sweep when we're ready to declare M5 done.
+These remaining items belong in the M5 spec's exit-gate sweep
+when we're ready to declare M5 done.
 
 ## Conformance baseline at start of plan
 

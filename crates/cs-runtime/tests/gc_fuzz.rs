@@ -170,9 +170,22 @@ fn run_seed(seed: u64, op_count: usize, force_collect_each_step: bool) {
     }
 }
 
+/// Number of seeds to exercise per fuzz test.
+///
+/// Defaults to 16 for unit-test runtime. The CI workflow
+/// `.github/workflows/m5-fuzz.yml` overrides via `CRABSCHEME_FUZZ_SEEDS`
+/// to crank the count for nightly runs (default in CI: 1024).
+fn fuzz_seed_count() -> u64 {
+    std::env::var("CRABSCHEME_FUZZ_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16)
+}
+
 #[test]
 fn collect_never_panics_random_workloads() {
-    for seed in 0..16 {
+    let n = fuzz_seed_count();
+    for seed in 0..n {
         run_seed(seed, 32, false);
     }
 }
@@ -180,7 +193,8 @@ fn collect_never_panics_random_workloads() {
 #[test]
 fn collect_after_each_op_never_panics() {
     // Worst-case for tracing bugs: collect between every op.
-    for seed in 0..16 {
+    let n = fuzz_seed_count();
+    for seed in 0..n {
         run_seed(seed, 16, true);
     }
 }
