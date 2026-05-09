@@ -310,6 +310,129 @@ impl Runtime {
                 Ok(Value::Unspecified)
             }),
         );
+        // VM-tier shims for hashtable-set!/-ref/-contains?/-delete!
+        // These were moved from pure_builtins to higher-order on the
+        // walker side so Custom-equiv tables can apply user procs. The
+        // VM tier needs equivalent tier-aware dispatch via vm_call_sync.
+        fn vm_ht_equiv(
+            h: &cs_core::Hashtable,
+            a: &Value,
+            b: &Value,
+            syms: &mut cs_core::SymbolTable,
+        ) -> Result<bool, String> {
+            use cs_core::HtEqKind;
+            if h.eq_kind != HtEqKind::Custom {
+                return Ok(match h.eq_kind {
+                    HtEqKind::Eq => cs_core::eq::eq(a, b),
+                    HtEqKind::Eqv => cs_core::eq::eqv(a, b),
+                    HtEqKind::Equal => cs_core::eq::equal(a, b),
+                    HtEqKind::Custom => unreachable!(),
+                });
+            }
+            let equiv = h
+                .custom
+                .as_ref()
+                .expect("custom kind has procs")
+                .equiv
+                .clone();
+            let r = cs_vm::vm::vm_call_sync(&equiv, &[a.clone(), b.clone()], syms)
+                .map_err(|e| format!("{:?}", e))?;
+            Ok(r.is_truthy())
+        }
+
+        let hset_sym = syms.intern("hashtable-set!");
+        vm_env.define(
+            hset_sym,
+            cs_vm::vm::make_vm_builtin_syms("hashtable-set!", |args, st| {
+                if args.len() != 3 {
+                    return Err("hashtable-set!: 3 args".into());
+                }
+                let h = match &args[0] {
+                    Value::Hashtable(h) => h.clone(),
+                    _ => return Err("hashtable-set!: not a hashtable".into()),
+                };
+                let len = h.items.borrow().len();
+                for i in 0..len {
+                    let k = h.items.borrow()[i].0.clone();
+                    if vm_ht_equiv(&h, &k, &args[1], st)? {
+                        h.items.borrow_mut()[i].1 = args[2].clone();
+                        return Ok(Value::Unspecified);
+                    }
+                }
+                h.items
+                    .borrow_mut()
+                    .push((args[1].clone(), args[2].clone()));
+                Ok(Value::Unspecified)
+            }),
+        );
+
+        let href_sym = syms.intern("hashtable-ref");
+        vm_env.define(
+            href_sym,
+            cs_vm::vm::make_vm_builtin_syms("hashtable-ref", |args, st| {
+                if args.len() != 3 {
+                    return Err("hashtable-ref: 3 args".into());
+                }
+                let h = match &args[0] {
+                    Value::Hashtable(h) => h.clone(),
+                    _ => return Err("hashtable-ref: not a hashtable".into()),
+                };
+                let len = h.items.borrow().len();
+                for i in 0..len {
+                    let k = h.items.borrow()[i].0.clone();
+                    if vm_ht_equiv(&h, &k, &args[1], st)? {
+                        return Ok(h.items.borrow()[i].1.clone());
+                    }
+                }
+                Ok(args[2].clone())
+            }),
+        );
+
+        let hcon_sym = syms.intern("hashtable-contains?");
+        vm_env.define(
+            hcon_sym,
+            cs_vm::vm::make_vm_builtin_syms("hashtable-contains?", |args, st| {
+                if args.len() != 2 {
+                    return Err("hashtable-contains?: 2 args".into());
+                }
+                let h = match &args[0] {
+                    Value::Hashtable(h) => h.clone(),
+                    _ => return Err("hashtable-contains?: not a hashtable".into()),
+                };
+                let len = h.items.borrow().len();
+                for i in 0..len {
+                    let k = h.items.borrow()[i].0.clone();
+                    if vm_ht_equiv(&h, &k, &args[1], st)? {
+                        return Ok(Value::Boolean(true));
+                    }
+                }
+                Ok(Value::Boolean(false))
+            }),
+        );
+
+        let hdel_sym = syms.intern("hashtable-delete!");
+        vm_env.define(
+            hdel_sym,
+            cs_vm::vm::make_vm_builtin_syms("hashtable-delete!", |args, st| {
+                if args.len() != 2 {
+                    return Err("hashtable-delete!: 2 args".into());
+                }
+                let h = match &args[0] {
+                    Value::Hashtable(h) => h.clone(),
+                    _ => return Err("hashtable-delete!: not a hashtable".into()),
+                };
+                let len = h.items.borrow().len();
+                for i in 0..len {
+                    let k = h.items.borrow()[i].0.clone();
+                    if vm_ht_equiv(&h, &k, &args[1], st)? {
+                        h.items.borrow_mut().swap_remove(i);
+                        return Ok(Value::Unspecified);
+                    }
+                }
+                Ok(Value::Unspecified)
+            }),
+        );
+
         let ienv_sym = syms.intern("interaction-environment");
         vm_env.define(
             ienv_sym,

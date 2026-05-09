@@ -624,3 +624,11 @@ fn vm_conformance_vec_list_extras() {
     println!("vec_list_extras: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_hashtable_custom() {
+    let walker = pass_count_walker("hashtable_custom.scm");
+    let vm = pass_count_vm("hashtable_custom.scm").expect("vm should run hashtable_custom.scm");
+    println!("hashtable_custom: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

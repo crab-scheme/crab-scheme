@@ -3735,6 +3735,9 @@ fn ht_eq_local(kind: cs_core::HtEqKind, a: &Value, b: &Value) -> bool {
         cs_core::HtEqKind::Eq => cs_core::eq::eq(a, b),
         cs_core::HtEqKind::Eqv => cs_core::eq::eqv(a, b),
         cs_core::HtEqKind::Equal => cs_core::eq::equal(a, b),
+        cs_core::HtEqKind::Custom => {
+            unreachable!("custom-equiv hashtables route through tier-aware ops")
+        }
     }
 }
 

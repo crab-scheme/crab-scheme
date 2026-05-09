@@ -34,6 +34,19 @@ pub enum HtEqKind {
     Eqv,
     /// `equal?` — structural equality.
     Equal,
+    /// User-supplied (hash, equiv) procedures stored on the Hashtable.
+    /// The procedures live in `Hashtable::custom`.
+    Custom,
+}
+
+/// User-supplied hash and equivalence procedures attached to a hashtable
+/// created with the 2-arg form of `(make-hashtable hash equiv)`. The
+/// runtime calls these via the standard procedure-application path on
+/// every set!/ref/contains?/delete!.
+#[derive(Debug)]
+pub struct CustomHashFns {
+    pub hash: Value,
+    pub equiv: Value,
 }
 
 /// R6RS hashtable.
@@ -41,6 +54,8 @@ pub enum HtEqKind {
 pub struct Hashtable {
     pub items: RefCell<Vec<(Value, Value)>>,
     pub eq_kind: HtEqKind,
+    /// Populated only when `eq_kind == Custom`.
+    pub custom: Option<CustomHashFns>,
 }
 
 impl Hashtable {
@@ -48,6 +63,18 @@ impl Hashtable {
         Rc::new(Hashtable {
             items: RefCell::new(Vec::new()),
             eq_kind,
+            custom: None,
+        })
+    }
+
+    /// Construct a hashtable with user-supplied hash + equiv procedures.
+    /// `eq_kind` is set to `Custom`; the runtime is responsible for
+    /// dispatching the stored procs on every key comparison.
+    pub fn new_custom(hash: Value, equiv: Value) -> Rc<Self> {
+        Rc::new(Hashtable {
+            items: RefCell::new(Vec::new()),
+            eq_kind: HtEqKind::Custom,
+            custom: Some(CustomHashFns { hash, equiv }),
         })
     }
 }

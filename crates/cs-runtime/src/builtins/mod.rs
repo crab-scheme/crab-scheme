@@ -450,10 +450,6 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("equal-hash", b_equal_hash),
         ("hashtable?", b_hashtable_p),
         ("hashtable-size", b_hashtable_size),
-        ("hashtable-set!", b_hashtable_set),
-        ("hashtable-ref", b_hashtable_ref),
-        ("hashtable-contains?", b_hashtable_contains),
-        ("hashtable-delete!", b_hashtable_delete),
         ("hashtable-keys", b_hashtable_keys),
         ("hashtable-values", b_hashtable_values),
         ("hashtable-clear!", b_hashtable_clear),
@@ -507,6 +503,10 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("hashtable-update!", b_hashtable_update_ho),
         ("hashtable-walk", b_hashtable_walk),
         ("hashtable-entries", b_hashtable_entries),
+        ("hashtable-set!", b_hashtable_set),
+        ("hashtable-ref", b_hashtable_ref),
+        ("hashtable-contains?", b_hashtable_contains),
+        ("hashtable-delete!", b_hashtable_delete),
         ("values", b_values),
         ("call-with-values", b_call_with_values),
         ("call/cc", b_call_cc),
@@ -4143,12 +4143,27 @@ fn b_make_eqv_hashtable(_args: &[Value]) -> Result<Value, String> {
 }
 
 fn b_make_hashtable(args: &[Value]) -> Result<Value, String> {
-    // R6RS make-hashtable takes (hash-fn equiv-fn). We don't support custom
-    // hash/equiv yet; treat as `equal?`-based.
-    if args.len() > 2 {
-        return Err(arity_err("make-hashtable", "0..2", args.len()));
+    // R6RS `(make-hashtable)` defaults to `equal?`. Two-arg form
+    // `(make-hashtable hash equiv)` stores user procedures and routes
+    // through them on every key comparison; the storage is still a
+    // linear-search Vec, so the supplied hash is held for inspection
+    // (returned by `hashtable-hash-function`) but doesn't speed up
+    // lookup at this milestone.
+    match args.len() {
+        0 => Ok(Value::Hashtable(Hashtable::new(HtEqKind::Equal))),
+        2 => {
+            let hash = args[0].clone();
+            let equiv = args[1].clone();
+            if !matches!(hash, Value::Procedure(_)) {
+                return Err(type_err("make-hashtable", "procedure", &hash));
+            }
+            if !matches!(equiv, Value::Procedure(_)) {
+                return Err(type_err("make-hashtable", "procedure", &equiv));
+            }
+            Ok(Value::Hashtable(Hashtable::new_custom(hash, equiv)))
+        }
+        n => Err(arity_err("make-hashtable", "0 or 2", n)),
     }
-    Ok(Value::Hashtable(Hashtable::new(HtEqKind::Equal)))
 }
 
 // ---- R6RS standard hash functions ----
@@ -4257,7 +4272,31 @@ fn ht_eq(kind: HtEqKind, a: &Value, b: &Value) -> bool {
         HtEqKind::Eq => eq::eq(a, b),
         HtEqKind::Eqv => eq::eqv(a, b),
         HtEqKind::Equal => eq::equal(a, b),
+        HtEqKind::Custom => unreachable!("custom-equiv hashtables route through ht_eq_ctx"),
     }
+}
+
+/// Context-aware equality dispatch for hashtable lookups. Built-in
+/// kinds (Eq/Eqv/Equal) short-circuit to the host comparator; the
+/// Custom kind applies the user-supplied equiv procedure via the
+/// walker's apply_procedure.
+fn ht_eq_ctx(
+    h: &Hashtable,
+    key_a: &Value,
+    key_b: &Value,
+    ctx: &mut EvalCtx,
+) -> Result<bool, String> {
+    if h.eq_kind != HtEqKind::Custom {
+        return Ok(ht_eq(h.eq_kind, key_a, key_b));
+    }
+    let equiv = h
+        .custom
+        .as_ref()
+        .map(|c| c.equiv.clone())
+        .ok_or_else(|| "hashtable: custom kind without procs".to_string())?;
+    let r = apply_procedure(&equiv, &[key_a.clone(), key_b.clone()], ctx)
+        .map_err(|d| format!("{:?}", d))?;
+    Ok(r.is_truthy())
 }
 
 fn as_ht<'a>(name: &str, v: &'a Value) -> Result<&'a std::rc::Rc<Hashtable>, String> {
@@ -4275,11 +4314,26 @@ fn b_hashtable_size(args: &[Value]) -> Result<Value, String> {
     Ok(Value::fixnum(h.items.borrow().len() as i64))
 }
 
-fn b_hashtable_set(args: &[Value]) -> Result<Value, String> {
+fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 3 {
         return Err(arity_err("hashtable-set!", "3", args.len()));
     }
-    let h = as_ht("hashtable-set!", &args[0])?;
+    let h = as_ht("hashtable-set!", &args[0])?.clone();
+    if h.eq_kind == HtEqKind::Custom {
+        // Linear search applying the user's equiv proc each step.
+        let len = h.items.borrow().len();
+        for i in 0..len {
+            let k = h.items.borrow()[i].0.clone();
+            if ht_eq_ctx(&h, &k, &args[1], ctx)? {
+                h.items.borrow_mut()[i].1 = args[2].clone();
+                return Ok(Value::Unspecified);
+            }
+        }
+        h.items
+            .borrow_mut()
+            .push((args[1].clone(), args[2].clone()));
+        return Ok(Value::Unspecified);
+    }
     let kind = h.eq_kind;
     let mut items = h.items.borrow_mut();
     if let Some(slot) = items.iter_mut().find(|(k, _)| ht_eq(kind, k, &args[1])) {
@@ -4290,11 +4344,21 @@ fn b_hashtable_set(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unspecified)
 }
 
-fn b_hashtable_ref(args: &[Value]) -> Result<Value, String> {
+fn b_hashtable_ref(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 3 {
         return Err(arity_err("hashtable-ref", "3", args.len()));
     }
-    let h = as_ht("hashtable-ref", &args[0])?;
+    let h = as_ht("hashtable-ref", &args[0])?.clone();
+    if h.eq_kind == HtEqKind::Custom {
+        let len = h.items.borrow().len();
+        for i in 0..len {
+            let k = h.items.borrow()[i].0.clone();
+            if ht_eq_ctx(&h, &k, &args[1], ctx)? {
+                return Ok(h.items.borrow()[i].1.clone());
+            }
+        }
+        return Ok(args[2].clone());
+    }
     let kind = h.eq_kind;
     let items = h.items.borrow();
     if let Some((_, v)) = items.iter().find(|(k, _)| ht_eq(kind, k, &args[1])) {
@@ -4304,11 +4368,21 @@ fn b_hashtable_ref(args: &[Value]) -> Result<Value, String> {
     }
 }
 
-fn b_hashtable_contains(args: &[Value]) -> Result<Value, String> {
+fn b_hashtable_contains(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("hashtable-contains?", "2", args.len()));
     }
-    let h = as_ht("hashtable-contains?", &args[0])?;
+    let h = as_ht("hashtable-contains?", &args[0])?.clone();
+    if h.eq_kind == HtEqKind::Custom {
+        let len = h.items.borrow().len();
+        for i in 0..len {
+            let k = h.items.borrow()[i].0.clone();
+            if ht_eq_ctx(&h, &k, &args[1], ctx)? {
+                return Ok(Value::Boolean(true));
+            }
+        }
+        return Ok(Value::Boolean(false));
+    }
     let kind = h.eq_kind;
     let items = h.items.borrow();
     Ok(Value::Boolean(
@@ -4316,11 +4390,22 @@ fn b_hashtable_contains(args: &[Value]) -> Result<Value, String> {
     ))
 }
 
-fn b_hashtable_delete(args: &[Value]) -> Result<Value, String> {
+fn b_hashtable_delete(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("hashtable-delete!", "2", args.len()));
     }
-    let h = as_ht("hashtable-delete!", &args[0])?;
+    let h = as_ht("hashtable-delete!", &args[0])?.clone();
+    if h.eq_kind == HtEqKind::Custom {
+        let len = h.items.borrow().len();
+        for i in 0..len {
+            let k = h.items.borrow()[i].0.clone();
+            if ht_eq_ctx(&h, &k, &args[1], ctx)? {
+                h.items.borrow_mut().swap_remove(i);
+                return Ok(Value::Unspecified);
+            }
+        }
+        return Ok(Value::Unspecified);
+    }
     let kind = h.eq_kind;
     let mut items = h.items.borrow_mut();
     if let Some(idx) = items.iter().position(|(k, _)| ht_eq(kind, k, &args[1])) {
@@ -4359,7 +4444,13 @@ fn b_hashtable_copy(args: &[Value]) -> Result<Value, String> {
     }
     let h = as_ht("hashtable-copy", &args[0])?;
     let items = h.items.borrow().clone();
-    let new_ht = Hashtable::new(h.eq_kind);
+    let new_ht = match h.eq_kind {
+        HtEqKind::Custom => {
+            let c = h.custom.as_ref().expect("custom kind has procs");
+            Hashtable::new_custom(c.hash.clone(), c.equiv.clone())
+        }
+        kind => Hashtable::new(kind),
+    };
     *new_ht.items.borrow_mut() = items;
     Ok(Value::Hashtable(new_ht))
 }
@@ -4387,13 +4478,19 @@ pub fn b_hashtable_equivalence_function(args: &[Value]) -> Result<Value, String>
         HtEqKind::Eq => make_builtin_pure("eq?", b_eq),
         HtEqKind::Eqv => make_builtin_pure("eqv?", b_eqv),
         HtEqKind::Equal => make_builtin_pure("equal?", b_equal),
+        HtEqKind::Custom => h
+            .custom
+            .as_ref()
+            .expect("custom kind has procs")
+            .equiv
+            .clone(),
     })
 }
 
 /// VM-tier `hashtable-equivalence-function`: returns a VM-shape builtin
-/// (Walker tier returns a Builtin via `b_hashtable_equivalence_function`).
-/// Both delegate to the same fn pointer (b_eq, b_eqv, or b_equal); only
-/// the procedure-object wrapper differs so the right tier can dispatch.
+/// for built-in kinds (Walker returns a Builtin). For Custom tables we
+/// hand back the user-supplied procedure verbatim — it's already
+/// callable on whichever tier created it.
 pub fn vm_hashtable_equivalence_function(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("hashtable-equivalence-function: 1 arg".into());
@@ -4403,19 +4500,31 @@ pub fn vm_hashtable_equivalence_function(args: &[Value]) -> Result<Value, String
         HtEqKind::Eq => cs_vm::vm::make_vm_builtin("eq?", b_eq),
         HtEqKind::Eqv => cs_vm::vm::make_vm_builtin("eqv?", b_eqv),
         HtEqKind::Equal => cs_vm::vm::make_vm_builtin("equal?", b_equal),
+        HtEqKind::Custom => h
+            .custom
+            .as_ref()
+            .expect("custom kind has procs")
+            .equiv
+            .clone(),
     })
 }
 
 /// `hashtable-hash-function` (R6RS) — returns the hash function for
 /// custom-hash tables, or #f for built-in eq/eqv/equal hashtables.
-/// Until we support user-supplied hash functions in make-hashtable,
-/// this always returns #f.
 fn b_hashtable_hash_function(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("hashtable-hash-function", "1", args.len()));
     }
-    let _ = as_ht("hashtable-hash-function", &args[0])?;
-    Ok(Value::Boolean(false))
+    let h = as_ht("hashtable-hash-function", &args[0])?;
+    Ok(match h.eq_kind {
+        HtEqKind::Custom => h
+            .custom
+            .as_ref()
+            .expect("custom kind has procs")
+            .hash
+            .clone(),
+        _ => Value::Boolean(false),
+    })
 }
 
 fn b_hashtable_clear(args: &[Value]) -> Result<Value, String> {
