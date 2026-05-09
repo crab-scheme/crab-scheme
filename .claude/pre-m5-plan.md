@@ -80,16 +80,27 @@ but doing it before M5 keeps the runtime/env story stable.
   mark within a pass, and visited count.
 - Workspace member registered; `cs-gc` builds clean.
 
-**4.B — `Gc<T>` alias in `cs-core`** ← NEXT
-Add a feature-flagged type alias in `cs-core`: under `feature = "gc"`,
-`Heap-pointer` types use `Gc<T>`; otherwise fall back to `Rc<T>`. No
-behavior change yet, just the seam.
+**4.B — `Gc<T>` re-export in `cs-core`** ✅ DONE (commit pending)
+- `Gc::new(value)` constructor added to cs-gc — heap-less migration
+  bridge that lives by refcount alone (mirrors `Rc::new`).
+- `cs-gc` added as a non-optional dependency of `cs-core`.
+- `Gc`, `Heap`, `Marker`, `Trace` re-exported from `cs-core` so the
+  rest of the workspace refers to `cs_core::Gc<T>` without a
+  cs-gc direct dep.
+- 4 smoke tests in `crates/cs-core/tests/gc_smoke.rs` confirm the
+  `Rc<T>` patterns the runtime uses (clone-shares, RefCell mutability
+  via shared cell, RefCell<Vec> shared view, ptr_eq) all work
+  identically with `Gc<T>`.
 
-**4.C — Migrate Value variants**
-One variant at a time, swap `Rc<T>` → `Gc<T>`. Run conformance under
-both flags; verify parity. Order: `Pair` → `Vector` → `String` →
-`ByteVector` → `Hashtable` → `Port` → `Procedure` → `Record` →
-`Closure` → `Continuation` → `Promise` → `Parameter`.
+**4.C — Migrate Value variants** ← NEXT
+One variant at a time, swap `Rc<T>` → `Gc<T>`. Run conformance after
+each variant to catch regressions cleanly. Suggested order (small
+leaves first): `String` → `ByteVector` → `Vector` → `Pair` →
+`Hashtable` → `Record` → `Port` → `Procedure` → `Closure` →
+`Promise` → `Parameter` → `Continuation`.
+
+Each variant migration is itself a discrete iter that finishes with
+"workspace test green; conformance unchanged."
 
 **4.D — Per-Runtime root set wired**
 Hook the Runtime's top-level `Frame` chain and the VM's value/frame

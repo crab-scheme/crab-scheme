@@ -18,6 +18,19 @@ pub use value::{
     Promise, PromiseState, StringInputState, Value, WriteMode,
 };
 
+/// Re-export `Gc<T>` from `cs-gc` so the rest of the workspace can refer
+/// to it as `cs_core::Gc<T>` without depending on `cs-gc` directly. M5
+/// migrates `Value`'s heap-pointer variants from `Rc<T>` to `Gc<T>` one
+/// at a time; until that migration completes, `Gc<T>` is backed by an
+/// `Rc<Slot<T>>` so the ergonomic surface (Clone + Deref) lines up
+/// exactly with the existing `Rc<T>` call sites.
+///
+/// The `Trace` trait is also re-exported because every `T` placed
+/// behind a `Gc<T>` must implement it — leaf types satisfy this with
+/// an empty trace (and `cs-gc` provides blanket impls for primitives,
+/// `Vec`, `Option`, `RefCell`).
+pub use cs_gc::{Gc, Heap, Marker, Trace};
+
 thread_local! {
     /// One-element cache of the value most recently passed to a builtin's
     /// `type_err`-style helper. The walker and VM dispatchers drain it

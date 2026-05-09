@@ -95,6 +95,26 @@ impl<T: ?Sized> Gc<T> {
     }
 }
 
+impl<T: Trace + 'static> Gc<T> {
+    /// Construct an unregistered `Gc<T>` — i.e. one not associated with
+    /// any `Heap`. The slot lives by reference counting alone, exactly
+    /// like `Rc::new`. Use this as the migration bridge while we swap
+    /// `Rc<T>` call sites to `Gc<T>` without yet threading a `Heap`
+    /// through every constructor.
+    ///
+    /// Once the migration completes (M5 step 4.E), prefer
+    /// `Heap::alloc(value)` so the slot participates in tracing and
+    /// can be reclaimed across cycles.
+    pub fn new(value: T) -> Self {
+        Gc {
+            inner: Rc::new(Slot {
+                mark: Cell::new(false),
+                value: SlotValue { inner: value },
+            }),
+        }
+    }
+}
+
 /// A heap object's per-allocation header.
 ///
 /// Held alongside the value inside the `Slot` so the heap's bookkeeping
@@ -445,6 +465,18 @@ mod tests {
             root(&mut marker);
         }
         assert_eq!(marker.visited(), 2);
+    }
+
+    #[test]
+    fn gc_new_unregistered_drops_naturally() {
+        // Gc::new doesn't register with any heap; the slot lives by
+        // refcount and drops when the last clone is released.
+        let g = Gc::new(Leaf { n: 99 });
+        assert_eq!(g.n, 99);
+        let g2 = g.clone();
+        drop(g);
+        assert_eq!(g2.n, 99);
+        // No assertion against a heap — Gc::new is heap-less.
     }
 
     #[test]
