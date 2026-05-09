@@ -61,6 +61,13 @@ pub struct Expander<'a> {
     /// field count. This is *expansion-time* state, separate from the
     /// runtime `__record-parents__` hashtable that powers predicate checks.
     record_types: std::collections::HashMap<Symbol, RecordTypeInfo>,
+    /// Per-Expander condition-type registry, populated by
+    /// `define-condition-type`. Tracks the total field count of each user
+    /// condition type so that subtype expansions can compute the offset
+    /// of their own fields (inherited fields come first in the vector).
+    /// Standard types like `&error` are pre-registered with field_count=0
+    /// when first referenced as a parent.
+    condition_types: std::collections::HashMap<Symbol, ConditionTypeInfo>,
 }
 
 /// Compile-time info about a `define-record-type`, retained so subtypes can
@@ -76,6 +83,30 @@ pub struct RecordTypeInfo {
     /// Number of fields stored in instance vectors at slot index ≥ 1
     /// (inclusive of inherited fields).
     pub field_count: usize,
+}
+
+/// Compile-time info about a `define-condition-type`. Each user-defined
+/// condition type stores its inherited+own fields together in a single
+/// simple vector (slot 0 = tag, slots 1.. = fields with parent fields
+/// first), matching R6RS default-protocol semantics: a constructor takes
+/// every ancestor's fields followed by the type's own.
+#[derive(Clone, Debug)]
+struct ConditionTypeInfo {
+    /// Total number of fields stored in this condition's simple vector
+    /// (slot 0 is the tag, slots 1..=field_count are fields).
+    field_count: usize,
+}
+
+/// Field count of a standard R6RS condition type by tag string. Used when
+/// a `define-condition-type` parents on a standard type that hasn't been
+/// explicitly tracked in `condition_types`. Mirrors the runtime simple
+/// constructors in `cs_runtime`: `&message`, `&irritants`, `&who` each
+/// carry one field; everything else carries none.
+fn standard_condition_field_count(tag: &str) -> usize {
+    match tag {
+        "&message" | "&irritants" | "&who" => 1,
+        _ => 0,
+    }
 }
 
 /// A user-defined macro, parsed from `(syntax-rules ...)`.
@@ -109,6 +140,7 @@ struct Keywords {
     guard: Symbol,
     else_: Symbol,
     define_record_type: Symbol,
+    define_condition_type: Symbol,
     fields: Symbol,
     parent: Symbol,
     immutable: Symbol,
@@ -155,6 +187,7 @@ impl Keywords {
             guard: syms.intern("guard"),
             else_: syms.intern("else"),
             define_record_type: syms.intern("define-record-type"),
+            define_condition_type: syms.intern("define-condition-type"),
             fields: syms.intern("fields"),
             parent: syms.intern("parent"),
             immutable: syms.intern("immutable"),
@@ -193,6 +226,7 @@ impl<'a> Expander<'a> {
             gensym_counter: 0,
             include_resolver: None,
             record_types: std::collections::HashMap::new(),
+            condition_types: std::collections::HashMap::new(),
         }
     }
 
@@ -236,6 +270,9 @@ impl<'a> Expander<'a> {
                 }
                 if *s == self.keywords.define_record_type {
                     return self.expand_define_record_type(&tail, d.span());
+                }
+                if *s == self.keywords.define_condition_type {
+                    return self.expand_define_condition_type(&tail, d.span());
                 }
                 if *s == self.keywords.define_syntax {
                     return self.expand_define_syntax(&tail, d.span());
@@ -2873,6 +2910,250 @@ impl<'a> Expander<'a> {
                 tag: tag_sym,
                 ancestors: ancestors.clone(),
                 field_count: inherited_field_count + fields.len(),
+            },
+        );
+
+        Ok(CoreExpr::Begin { exprs: out, span })
+    }
+
+    /// `(define-condition-type <type-name> <parent-name> <ctor> <pred>
+    ///    (<field> <accessor>) ...)`
+    ///
+    /// Desugars to one runtime registration call (so the parent chain is
+    /// visible to predicate lookups) plus three lambda-bound bindings:
+    /// constructor, predicate, and one accessor per field. We use the
+    /// symbol name as the runtime tag string; standard types like
+    /// `&error` already match this convention, so a user can extend any
+    /// standard or previously-defined user type as a parent.
+    ///
+    /// The expansion does NOT use `define-record-type` because conditions
+    /// have flat (compound-of-simples) semantics — `condition?` and the
+    /// predicate-walking is registry-based, not record-based.
+    fn expand_define_condition_type(
+        &mut self,
+        items: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        if items.len() < 4 {
+            return Err(ExpandError::BadSyntax {
+                what: "define-condition-type needs <type> <parent> <ctor> <pred> [(field accessor) ...]"
+                    .into(),
+                span,
+            });
+        }
+        let type_sym = match &items[0] {
+            Datum::Symbol(s, _) => *s,
+            _ => {
+                return Err(ExpandError::BadSyntax {
+                    what: "define-condition-type: type name must be a symbol".into(),
+                    span: items[0].span(),
+                });
+            }
+        };
+        let parent_sym = match &items[1] {
+            Datum::Symbol(s, _) => *s,
+            _ => {
+                return Err(ExpandError::BadSyntax {
+                    what: "define-condition-type: parent must be a symbol".into(),
+                    span: items[1].span(),
+                });
+            }
+        };
+        let ctor_sym = match &items[2] {
+            Datum::Symbol(s, _) => *s,
+            _ => {
+                return Err(ExpandError::BadSyntax {
+                    what: "define-condition-type: constructor name must be a symbol".into(),
+                    span: items[2].span(),
+                });
+            }
+        };
+        let pred_sym = match &items[3] {
+            Datum::Symbol(s, _) => *s,
+            _ => {
+                return Err(ExpandError::BadSyntax {
+                    what: "define-condition-type: predicate name must be a symbol".into(),
+                    span: items[3].span(),
+                });
+            }
+        };
+        // Each remaining item is `(<field-name> <accessor-name>)`. Field
+        // count is the total (positional) — we don't yet support inherited
+        // fields appearing as parameters; the constructor here only takes
+        // own fields, matching the existing simple-condition shape where
+        // each simple holds only its own type's fields.
+        let mut field_accessors: Vec<Symbol> = Vec::new();
+        for spec in &items[4..] {
+            let parts = collect_proper_list_strict(spec).ok_or(ExpandError::BadSyntax {
+                what: "define-condition-type field-spec must be a list".into(),
+                span: spec.span(),
+            })?;
+            if parts.len() != 2 {
+                return Err(ExpandError::BadSyntax {
+                    what: "field-spec must be (<field-name> <accessor-name>)".into(),
+                    span: spec.span(),
+                });
+            }
+            // Field name itself is unused at expansion time — it only names
+            // the slot for documentation. The accessor symbol is what we
+            // actually bind.
+            let _field_name = match &parts[0] {
+                Datum::Symbol(s, _) => *s,
+                _ => {
+                    return Err(ExpandError::BadSyntax {
+                        what: "field name must be a symbol".into(),
+                        span: spec.span(),
+                    });
+                }
+            };
+            let accessor = match &parts[1] {
+                Datum::Symbol(s, _) => *s,
+                _ => {
+                    return Err(ExpandError::BadSyntax {
+                        what: "accessor name must be a symbol".into(),
+                        span: spec.span(),
+                    });
+                }
+            };
+            field_accessors.push(accessor);
+        }
+        let type_tag = self.syms.name(type_sym).to_string();
+        let parent_tag = self.syms.name(parent_sym).to_string();
+
+        // Resolve the parent's known field count. Standard types like
+        // `&error` carry no fields; `&message`, `&irritants`, and `&who`
+        // each carry one. User parents come from `condition_types`.
+        let inherited_field_count = if let Some(info) = self.condition_types.get(&parent_sym) {
+            info.field_count
+        } else {
+            standard_condition_field_count(&parent_tag)
+        };
+        let own_field_count = field_accessors.len();
+        let total_field_count = inherited_field_count + own_field_count;
+
+        // Helper symbols.
+        let cond_register_sym = self.syms.intern("condition-register-parent!");
+        let cond_instance_of_sym = self.syms.intern("condition-instance-of?");
+        let cond_field_ref_sym = self.syms.intern("condition-field-ref");
+        let make_simple_sym = self.syms.intern("make-simple-condition");
+        let cond_obj_sym = self.syms.intern("__cond-obj__");
+
+        let tag_const = CoreExpr::Const {
+            value: Value::string(type_tag.clone()),
+            span,
+        };
+        let parent_const = CoreExpr::Const {
+            value: Value::string(parent_tag),
+            span,
+        };
+
+        let mut out: Vec<CoreExpr> = Vec::new();
+
+        // 1. Register parent at runtime.
+        out.push(CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: cond_register_sym,
+                span,
+            }),
+            args: vec![tag_const.clone(), parent_const],
+            span,
+        });
+
+        // 2. Constructor takes inherited-then-own fields and stores them
+        // all in a single simple `#(<my-tag> if0 ... own0 ...)`. Parent
+        // accessors that look up by their tag find this simple as a
+        // descendant and read the inherited slots, which sit at the same
+        // offsets they would in a parent-tagged simple.
+        let mut ctor_params: Vec<Symbol> = Vec::with_capacity(total_field_count);
+        for i in 0..inherited_field_count {
+            ctor_params.push(self.syms.intern(&format!("__cond-pf-{}-{}__", type_tag, i)));
+        }
+        for i in 0..own_field_count {
+            ctor_params.push(self.syms.intern(&format!("__cond-of-{}-{}__", type_tag, i)));
+        }
+        let mut ctor_call_args: Vec<CoreExpr> = vec![tag_const.clone()];
+        for p in &ctor_params {
+            ctor_call_args.push(CoreExpr::Ref { name: *p, span });
+        }
+        let ctor_body = CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: make_simple_sym,
+                span,
+            }),
+            args: ctor_call_args,
+            span,
+        };
+        out.push(CoreExpr::Set {
+            name: ctor_sym,
+            value: Rc::new(CoreExpr::Lambda {
+                params: Params::fixed(ctor_params),
+                body: Rc::new(ctor_body),
+                span,
+            }),
+            span,
+        });
+
+        // 3. Predicate: (lambda (c) (condition-instance-of? c <tag>)).
+        let pred_body = CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: cond_instance_of_sym,
+                span,
+            }),
+            args: vec![
+                CoreExpr::Ref {
+                    name: cond_obj_sym,
+                    span,
+                },
+                tag_const.clone(),
+            ],
+            span,
+        };
+        out.push(CoreExpr::Set {
+            name: pred_sym,
+            value: Rc::new(CoreExpr::Lambda {
+                params: Params::fixed(vec![cond_obj_sym]),
+                body: Rc::new(pred_body),
+                span,
+            }),
+            span,
+        });
+
+        // 4. Accessors: (lambda (c) (condition-field-ref c <tag> <i>)).
+        for (i, accessor) in field_accessors.iter().enumerate() {
+            let body = CoreExpr::App {
+                func: Rc::new(CoreExpr::Ref {
+                    name: cond_field_ref_sym,
+                    span,
+                }),
+                args: vec![
+                    CoreExpr::Ref {
+                        name: cond_obj_sym,
+                        span,
+                    },
+                    tag_const.clone(),
+                    CoreExpr::Const {
+                        value: Value::fixnum((inherited_field_count + i) as i64),
+                        span,
+                    },
+                ],
+                span,
+            };
+            out.push(CoreExpr::Set {
+                name: *accessor,
+                value: Rc::new(CoreExpr::Lambda {
+                    params: Params::fixed(vec![cond_obj_sym]),
+                    body: Rc::new(body),
+                    span,
+                }),
+                span,
+            });
+        }
+
+        // Register so future subtypes can resolve our inherited field count.
+        self.condition_types.insert(
+            type_sym,
+            ConditionTypeInfo {
+                field_count: total_field_count,
             },
         );
 

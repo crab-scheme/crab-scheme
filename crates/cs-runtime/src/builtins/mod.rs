@@ -203,6 +203,11 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // R6RS condition compounding
         ("condition", b_condition),
         ("simple-conditions", b_simple_conditions),
+        // helpers used by code generated from `define-condition-type`
+        ("condition-register-parent!", b_condition_register_parent),
+        ("condition-instance-of?", b_condition_instance_of),
+        ("condition-field-ref", b_condition_field_ref),
+        ("make-simple-condition", b_make_simple_condition),
         // copy variants
         ("vector-copy", b_vector_copy),
         ("vector-copy!", b_vector_copy_bang),
@@ -346,6 +351,10 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
 }
 
 pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
+    // Reset the thread-local condition registry so this Runtime starts from
+    // a clean standard hierarchy. User-defined condition types from earlier
+    // Runtimes on the same thread won't leak into this one.
+    init_condition_registry();
     for (name, f) in pure_builtins() {
         let sym = syms.intern(name);
         env.define(sym, make_builtin_pure(name, f));
@@ -1595,10 +1604,10 @@ fn b_string_ge(args: &[Value]) -> Result<Value, String> {
 // is wrapped in a one-element compound for uniformity, so `condition?` is
 // always a single check and `simple-conditions` is always a slice.
 //
-// The standard R6RS hierarchy is hardcoded by `descendants_inclusive`. We
-// don't yet support user-defined condition types via `define-condition-type`;
-// that is a separate, larger change because our `define-record-type` doesn't
-// implement R6RS record subtyping yet.
+// The standard hierarchy is wired up by `init_condition_registry` at
+// runtime startup. User-defined condition types (`define-condition-type`)
+// register themselves by calling `condition-register-parent!` in their
+// expansion, so user types and standard types share one registry.
 
 const COND_COMPOUND_TAG: &str = "&compound-condition";
 const TAG_MESSAGE: &str = "&message";
@@ -1610,43 +1619,90 @@ const TAG_VIOLATION: &str = "&violation";
 const TAG_ASSERTION: &str = "&assertion";
 const TAG_NON_CONTINUABLE: &str = "&non-continuable";
 const TAG_WHO: &str = "&who";
+const TAG_CONDITION: &str = "&condition";
 
-/// Inclusive descendants of an R6RS condition type. Used by predicates like
-/// `serious-condition?` to match any simple in `descendants_inclusive(parent)`.
-fn descendants_inclusive(parent: &str) -> &'static [&'static str] {
-    match parent {
-        TAG_SERIOUS => &[
+thread_local! {
+    /// Map from condition tag → its parent tag. Walked by predicates to
+    /// decide R6RS subtype relationships. Pre-populated with the standard
+    /// hierarchy at every `Runtime::new` (idempotent), and extended by
+    /// user-defined types via `(condition-register-parent! tag parent)`.
+    ///
+    /// `&condition` (the root) is intentionally absent from the map so
+    /// the chain walker terminates there.
+    static COND_PARENTS: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Set of registered "simple condition" tag strings (i.e. types that
+    /// appear in the parent registry, plus `&condition` itself).
+    /// `condition?` uses this to decide whether an arbitrary vector with a
+    /// `&...` tag is actually a condition or just a vector that happens to
+    /// start with the same character.
+    static COND_KNOWN_TAGS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Populate the registry with the standard R6RS condition hierarchy.
+/// Called from `Runtime::new` so each runtime starts from a clean state
+/// (idempotent — calling twice has no observable effect).
+pub fn init_condition_registry() {
+    COND_PARENTS.with(|reg| {
+        let mut m = reg.borrow_mut();
+        m.clear();
+        m.insert(TAG_WARNING.into(), TAG_CONDITION.into());
+        m.insert(TAG_SERIOUS.into(), TAG_CONDITION.into());
+        m.insert(TAG_MESSAGE.into(), TAG_CONDITION.into());
+        m.insert(TAG_IRRITANTS.into(), TAG_CONDITION.into());
+        m.insert(TAG_WHO.into(), TAG_CONDITION.into());
+        m.insert(TAG_ERROR.into(), TAG_SERIOUS.into());
+        m.insert(TAG_VIOLATION.into(), TAG_SERIOUS.into());
+        m.insert(TAG_ASSERTION.into(), TAG_VIOLATION.into());
+        m.insert(TAG_NON_CONTINUABLE.into(), TAG_VIOLATION.into());
+    });
+    COND_KNOWN_TAGS.with(|reg| {
+        let mut s = reg.borrow_mut();
+        s.clear();
+        for t in [
+            TAG_CONDITION,
+            TAG_WARNING,
             TAG_SERIOUS,
+            TAG_MESSAGE,
+            TAG_IRRITANTS,
+            TAG_WHO,
             TAG_ERROR,
             TAG_VIOLATION,
             TAG_ASSERTION,
             TAG_NON_CONTINUABLE,
-        ],
-        TAG_VIOLATION => &[TAG_VIOLATION, TAG_ASSERTION, TAG_NON_CONTINUABLE],
-        TAG_ERROR => &[TAG_ERROR],
-        TAG_ASSERTION => &[TAG_ASSERTION],
-        TAG_NON_CONTINUABLE => &[TAG_NON_CONTINUABLE],
-        TAG_WARNING => &[TAG_WARNING],
-        TAG_MESSAGE => &[TAG_MESSAGE],
-        TAG_IRRITANTS => &[TAG_IRRITANTS],
-        TAG_WHO => &[TAG_WHO],
-        _ => &[],
+        ] {
+            s.insert(t.into());
+        }
+    });
+}
+
+/// True if `child` is `ancestor` or has `ancestor` somewhere in its parent
+/// chain. Walks the registry; terminates at `&condition` (the root) or at
+/// an unregistered tag.
+fn is_descendant_of(child: &str, ancestor: &str) -> bool {
+    if child == ancestor {
+        return true;
     }
+    COND_PARENTS.with(|reg| {
+        let map = reg.borrow();
+        let mut cur = child.to_string();
+        loop {
+            match map.get(&cur) {
+                Some(p) => {
+                    if p == ancestor {
+                        return true;
+                    }
+                    cur = p.clone();
+                }
+                None => return false,
+            }
+        }
+    })
 }
 
 fn is_known_simple_tag(s: &str) -> bool {
-    matches!(
-        s,
-        TAG_MESSAGE
-            | TAG_IRRITANTS
-            | TAG_WARNING
-            | TAG_SERIOUS
-            | TAG_ERROR
-            | TAG_VIOLATION
-            | TAG_ASSERTION
-            | TAG_NON_CONTINUABLE
-            | TAG_WHO
-    )
+    COND_KNOWN_TAGS.with(|reg| reg.borrow().contains(s))
 }
 
 fn vec_first_tag(v: &Value) -> Option<String> {
@@ -1690,12 +1746,15 @@ fn for_each_simple(cond: &Value, mut f: impl FnMut(&Value)) {
     }
 }
 
+/// True if `cond` contains any simple whose type is `parent` or a
+/// descendant of it. Walks the runtime registry, so user-defined condition
+/// types registered via `define-condition-type` are matched alongside the
+/// standard hierarchy.
 fn cond_has_subtype(cond: &Value, parent: &str) -> bool {
-    let descs = descendants_inclusive(parent);
     let mut found = false;
     for_each_simple(cond, |s| {
         if let Some(t) = vec_first_tag(s) {
-            if descs.iter().any(|d| *d == t) {
+            if is_descendant_of(&t, parent) {
                 found = true;
             }
         }
@@ -1985,6 +2044,94 @@ fn b_simple_conditions(args: &[Value]) -> Result<Value, String> {
     let mut out = Vec::new();
     flatten_simples(&args[0], &mut out);
     Ok(Value::list(out))
+}
+
+// ---- helpers for define-condition-type-generated code ----
+//
+// `define-condition-type` desugars to a `condition-register-parent!` call
+// at runtime startup plus three lambda-bound bindings (constructor,
+// predicate, accessors) that consume the next two helpers. Splitting the
+// type-walking and field-fetching into builtin primitives keeps the
+// generated code small and avoids re-implementing the registry walk in
+// macro-expanded scheme.
+
+fn b_condition_register_parent(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("condition-register-parent!", "2", args.len()));
+    }
+    let child = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        other => return Err(type_err("condition-register-parent!", "string", other)),
+    };
+    let parent = match &args[1] {
+        Value::String(s) => s.borrow().clone(),
+        other => return Err(type_err("condition-register-parent!", "string", other)),
+    };
+    COND_PARENTS.with(|reg| reg.borrow_mut().insert(child.clone(), parent));
+    COND_KNOWN_TAGS.with(|reg| reg.borrow_mut().insert(child));
+    Ok(Value::Unspecified)
+}
+
+fn b_condition_instance_of(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("condition-instance-of?", "2", args.len()));
+    }
+    let tag = match &args[1] {
+        Value::String(s) => s.borrow().clone(),
+        other => return Err(type_err("condition-instance-of?", "string", other)),
+    };
+    Ok(Value::Boolean(cond_has_subtype(&args[0], &tag)))
+}
+
+/// Find the first simple in `cond` whose tag is `child` or a descendant of
+/// `child`, then return slot `field-index + 1` of that simple (slot 0 is
+/// the tag). Used by accessors generated for `define-condition-type`.
+fn b_condition_field_ref(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("condition-field-ref", "3", args.len()));
+    }
+    let tag = match &args[1] {
+        Value::String(s) => s.borrow().clone(),
+        other => return Err(type_err("condition-field-ref", "string", other)),
+    };
+    let idx = as_int_i64("condition-field-ref", &args[2])? as usize;
+    let mut found: Option<Value> = None;
+    for_each_simple(&args[0], |s| {
+        if found.is_none() {
+            if let Some(t) = vec_first_tag(s) {
+                if is_descendant_of(&t, &tag) {
+                    found = Some(s.clone());
+                }
+            }
+        }
+    });
+    let simple =
+        found.ok_or_else(|| format!("condition-field-ref: condition has no '{}' simple", tag))?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if let Some(slot) = v.get(idx + 1) {
+            return Ok(slot.clone());
+        }
+    }
+    Err(format!(
+        "condition-field-ref: simple '{}' has no field {}",
+        tag, idx
+    ))
+}
+
+/// Build a simple condition value from a string tag and field values, then
+/// wrap it in a one-slot compound. The expansion of `define-condition-type`
+/// emits a call to this for each constructor.
+fn b_make_simple_condition(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("make-simple-condition: needs at least a tag".into());
+    }
+    let tag = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        other => return Err(type_err("make-simple-condition", "string", other)),
+    };
+    let fields: Vec<Value> = args[1..].to_vec();
+    Ok(make_compound(vec![make_simple(&tag, fields)]))
 }
 
 // ---- raise / error / with-exception-handler ----

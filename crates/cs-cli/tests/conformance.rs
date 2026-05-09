@@ -259,6 +259,11 @@ fn conformance_records_parent() {
 }
 
 #[test]
+fn conformance_define_condition_type() {
+    run_conformance_file("define_condition_type.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -315,6 +320,7 @@ fn conformance_aggregate_count() {
                 "copy_unfold_htfold.scm",
                 "conditions_r6rs.scm",
                 "records_parent.scm",
+                "define_condition_type.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

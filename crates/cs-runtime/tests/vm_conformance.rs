@@ -390,3 +390,12 @@ fn vm_conformance_records_parent() {
     println!("records_parent: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_define_condition_type() {
+    let walker = pass_count_walker("define_condition_type.scm");
+    let vm = pass_count_vm("define_condition_type.scm")
+        .expect("vm should run define_condition_type.scm");
+    println!("define_condition_type: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
