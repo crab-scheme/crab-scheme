@@ -670,6 +670,61 @@ impl Runtime {
         vm_env.define(av_sym, cs_vm::vm::make_vm_assertion_violation());
         let weh_sym = syms.intern("with-exception-handler");
         vm_env.define(weh_sym, cs_vm::vm::make_vm_with_exception_handler());
+        // R7RS exit / emergency-exit raise an &exit-requested condition.
+        // Uses the same shape as the walker tier.
+        let exit_sym = syms.intern("exit");
+        vm_env.define(
+            exit_sym,
+            cs_vm::vm::make_vm_builtin("exit", |args| {
+                if args.len() > 1 {
+                    return Err("exit: 0 or 1 arg".into());
+                }
+                let val = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(cs_core::Value::Boolean(true));
+                let mk = |items: Vec<cs_core::Value>| -> cs_core::Value {
+                    cs_core::Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(items)))
+                };
+                let cond = mk(vec![
+                    cs_core::Value::string("&compound-condition"),
+                    mk(vec![cs_core::Value::string("&exit-requested"), val]),
+                    mk(vec![
+                        cs_core::Value::string("&message"),
+                        cs_core::Value::string(""),
+                    ]),
+                ]);
+                cs_vm::vm::vm_set_pending_raise(cond);
+                Err("__raised__".into())
+            }),
+        );
+        let eexit_sym = syms.intern("emergency-exit");
+        vm_env.define(
+            eexit_sym,
+            cs_vm::vm::make_vm_builtin("emergency-exit", |args| {
+                if args.len() > 1 {
+                    return Err("emergency-exit: 0 or 1 arg".into());
+                }
+                let val = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(cs_core::Value::Boolean(true));
+                let mk = |items: Vec<cs_core::Value>| -> cs_core::Value {
+                    cs_core::Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(items)))
+                };
+                let cond = mk(vec![
+                    cs_core::Value::string("&compound-condition"),
+                    mk(vec![cs_core::Value::string("&exit-requested"), val]),
+                    mk(vec![cs_core::Value::string("&emergency")]),
+                    mk(vec![
+                        cs_core::Value::string("&message"),
+                        cs_core::Value::string(""),
+                    ]),
+                ]);
+                cs_vm::vm::vm_set_pending_raise(cond);
+                Err("__raised__".into())
+            }),
+        );
         let dwind_sym = syms.intern("dynamic-wind");
         vm_env.define(dwind_sym, cs_vm::vm::make_vm_dynamic_wind());
         let cc_sym = syms.intern("call/cc");

@@ -217,14 +217,15 @@ Iters 117+ are filling R7RS gaps one per iter:
   open-output-string/bytevector aliases, get-output-bytevector
 - 126 R7RS file-error?, read-error? predicates + tagged conditions
   (open-input-file/open-output-file failures get &file-error tag)
-- 127 wire &read-error tag into b_read on both walker and VM tiers,
-  so (read-error? c) returns #t for malformed reader input
+- 127 wire &read-error tag into b_read on both walker and VM tiers
+- 128 R7RS (exit) and (emergency-exit) — raise &exit-requested
+  catchable condition with the value as a field; both tiers
   (this iter)
 
 Current totals:
-- 81 conformance test files (cli)
-- VM tier: 83 tests
-- Aggregate: 1690 individual Scheme tests passing
+- 82 conformance test files (cli)
+- VM tier: 84 tests
+- Aggregate: 1701 individual Scheme tests passing
 
 ## Loop cadence
 

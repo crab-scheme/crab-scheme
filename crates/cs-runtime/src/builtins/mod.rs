@@ -511,6 +511,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("error", b_error_ho),
         ("assertion-violation", b_assertion_violation),
         ("with-exception-handler", b_with_exception_handler),
+        ("exit", b_exit),
+        ("emergency-exit", b_emergency_exit),
         ("symbol->string", b_symbol_to_string_ho),
         ("string->symbol", b_string_to_symbol_ho),
         ("hashtable-update!", b_hashtable_update_ho),
@@ -3197,6 +3199,7 @@ const TAG_WHO: &str = "&who";
 const TAG_CONDITION: &str = "&condition";
 const TAG_FILE_ERROR: &str = "&file-error";
 const TAG_READ_ERROR: &str = "&read-error";
+const TAG_EXIT_REQUESTED: &str = "&exit-requested";
 
 thread_local! {
     /// Map from condition tag → its parent tag. Walked by predicates to
@@ -3235,6 +3238,7 @@ pub fn init_condition_registry() {
         m.insert(TAG_NON_CONTINUABLE.into(), TAG_VIOLATION.into());
         m.insert(TAG_FILE_ERROR.into(), TAG_ERROR.into());
         m.insert(TAG_READ_ERROR.into(), TAG_ERROR.into());
+        m.insert(TAG_EXIT_REQUESTED.into(), TAG_CONDITION.into());
     });
     COND_KNOWN_TAGS.with(|reg| {
         let mut s = reg.borrow_mut();
@@ -3252,6 +3256,7 @@ pub fn init_condition_registry() {
             TAG_NON_CONTINUABLE,
             TAG_FILE_ERROR,
             TAG_READ_ERROR,
+            TAG_EXIT_REQUESTED,
         ] {
             s.insert(t.into());
         }
@@ -3833,6 +3838,46 @@ fn b_raise(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         return Err(arity_err("raise", "1", args.len()));
     }
     ctx.pending_raise = Some(args[0].clone());
+    Err("__raised__".to_string())
+}
+
+/// R7RS `(exit)` and `(exit obj)` — terminate the program normally,
+/// communicating obj as the exit value. We implement this as raising a
+/// catchable `&exit-requested` condition; the value is stored as a single
+/// field on the simple. The CLI's top-level recognizes this tag and maps
+/// it to a process exit code; embedded use can catch it via
+/// with-exception-handler.
+fn b_exit(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err("exit", "0 or 1", args.len()));
+    }
+    let val = args.first().cloned().unwrap_or(Value::Boolean(true));
+    let cond = make_compound(vec![
+        make_simple(TAG_EXIT_REQUESTED, vec![val]),
+        // Empty &message simple so error-object-message returns "" instead
+        // of erroring out — keeps catchers that introspect via
+        // error-object-message uniform.
+        make_simple(TAG_MESSAGE, vec![Value::string("")]),
+    ]);
+    ctx.pending_raise = Some(cond);
+    Err("__raised__".to_string())
+}
+
+/// R7RS `(emergency-exit)` and `(emergency-exit obj)` — terminate without
+/// running any pending dynamic-wind after-procedures. Same condition shape
+/// as `exit`, with an extra `&emergency` marker so a top-level catcher can
+/// distinguish the two and skip cleanup.
+fn b_emergency_exit(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err("emergency-exit", "0 or 1", args.len()));
+    }
+    let val = args.first().cloned().unwrap_or(Value::Boolean(true));
+    let cond = make_compound(vec![
+        make_simple(TAG_EXIT_REQUESTED, vec![val]),
+        make_simple("&emergency", vec![]),
+        make_simple(TAG_MESSAGE, vec![Value::string("")]),
+    ]);
+    ctx.pending_raise = Some(cond);
     Err("__raised__".to_string())
 }
 

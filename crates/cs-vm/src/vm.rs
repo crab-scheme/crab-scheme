@@ -67,6 +67,12 @@ fn set_pending_raise(v: Value) {
     VM_PENDING_RAISE.with(|cell| *cell.borrow_mut() = Some(v));
 }
 
+/// External entry point for setting `pending_raise` from a `make_vm_builtin`
+/// that needs to raise a condition (e.g. `exit`, `emergency-exit`).
+pub fn vm_set_pending_raise(v: Value) {
+    set_pending_raise(v);
+}
+
 fn take_pending_escape() -> Option<(u64, Value)> {
     VM_PENDING_ESCAPE.with(|cell| cell.borrow_mut().take())
 }
