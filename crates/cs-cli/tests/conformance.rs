@@ -424,6 +424,11 @@ fn conformance_library_validate() {
 }
 
 #[test]
+fn conformance_r7rs_define_library() {
+    run_conformance_file("r7rs_define_library.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -513,6 +518,7 @@ fn conformance_aggregate_count() {
                 "hashtable_custom.scm",
                 "library_imports.scm",
                 "library_validate.scm",
+                "r7rs_define_library.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

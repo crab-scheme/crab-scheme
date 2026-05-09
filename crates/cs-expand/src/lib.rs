@@ -161,6 +161,7 @@ struct Keywords {
     define_condition_type: Symbol,
     define_values: Symbol,
     library: Symbol,
+    define_library: Symbol,
     import: Symbol,
     export: Symbol,
     fields: Symbol,
@@ -214,6 +215,7 @@ impl Keywords {
             define_condition_type: syms.intern("define-condition-type"),
             define_values: syms.intern("define-values"),
             library: syms.intern("library"),
+            define_library: syms.intern("define-library"),
             import: syms.intern("import"),
             export: syms.intern("export"),
             fields: syms.intern("fields"),
@@ -315,6 +317,9 @@ impl<'a> Expander<'a> {
                 }
                 if *s == self.keywords.library {
                     return self.expand_library(&tail, d.span());
+                }
+                if *s == self.keywords.define_library {
+                    return self.expand_define_library(&tail, d.span());
                 }
                 if *s == self.keywords.import {
                     return self.expand_import(&tail, d.span());
@@ -468,6 +473,125 @@ impl<'a> Expander<'a> {
     /// filtering enforcement.
     pub fn libraries(&self) -> &std::collections::HashMap<Vec<Symbol>, LibraryInfo> {
         &self.libraries
+    }
+
+    /// R7RS `(define-library <name> <library-decl>...)`.
+    ///
+    /// Recognized library-decl shapes:
+    ///   `(export <id>...)`
+    ///   `(import <import-spec>...)`
+    ///   `(begin <body-expr>...)`
+    ///   `(include "path"...)`           — same semantics as top-level include
+    ///   `(include-ci "path"...)`        — accepted, treated as include (we
+    ///                                    don't case-fold)
+    ///   `(cond-expand <clause>...)`     — accepted; not yet evaluated against
+    ///                                    R7RS feature set at library time
+    ///   `(include-library-declarations ...)` — accepted; ignored for now
+    ///
+    /// As with `library`, the body forms are spliced as a `begin` into
+    /// the importing context; full namespace isolation is M9 work.
+    fn expand_define_library(
+        &mut self,
+        items: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        if items.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "define-library: missing name spec".into(),
+                span,
+            });
+        }
+        // items[0] = library name spec, same shape as `library`.
+        let name_parts = collect_proper_list_strict(&items[0]).ok_or(ExpandError::BadSyntax {
+            what: "define-library: name spec must be a list".into(),
+            span: items[0].span(),
+        })?;
+        let name_syms = self.parse_library_name(&name_parts, items[0].span())?;
+
+        let mut exports: Vec<Symbol> = Vec::new();
+        let mut import_exprs: Vec<CoreExpr> = Vec::new();
+        let mut body_exprs: Vec<CoreExpr> = Vec::new();
+
+        // Cache the clause-head keywords once — the head check is symbol
+        // identity, so interning happens on the first hit.
+        let export_kw = self.syms.intern("export");
+        let begin_kw = self.syms.intern("begin");
+        let include_kw = self.syms.intern("include");
+        let include_ci_kw = self.syms.intern("include-ci");
+        let cond_expand_kw = self.syms.intern("cond-expand");
+        let incl_lib_decls_kw = self.syms.intern("include-library-declarations");
+
+        for clause in &items[1..] {
+            let parts = collect_proper_list_strict(clause).ok_or(ExpandError::BadSyntax {
+                what: "define-library: clause must be a list".into(),
+                span: clause.span(),
+            })?;
+            let head = match parts.first() {
+                Some(Datum::Symbol(s, _)) => *s,
+                _ => {
+                    return Err(ExpandError::BadSyntax {
+                        what: "define-library: clause head must be a keyword".into(),
+                        span: clause.span(),
+                    })
+                }
+            };
+            if head == export_kw {
+                for e in &parts[1..] {
+                    match e {
+                        Datum::Symbol(s, _) => exports.push(*s),
+                        _ => {
+                            return Err(ExpandError::BadSyntax {
+                                what: "define-library export: each name must be an identifier"
+                                    .into(),
+                                span: e.span(),
+                            })
+                        }
+                    }
+                }
+            } else if head == self.keywords.import {
+                import_exprs.push(self.expand_import(&parts[1..], clause.span())?);
+            } else if head == begin_kw {
+                for d in &parts[1..] {
+                    body_exprs.push(self.expand_top(d)?);
+                }
+            } else if head == include_kw || head == include_ci_kw {
+                // Reuse the existing include resolver path.
+                body_exprs.push(self.expand_include(&parts[1..], clause.span())?);
+            } else if head == cond_expand_kw || head == incl_lib_decls_kw {
+                // Accepted but not yet evaluated. M9 wires these to the
+                // proper conditional-include semantics.
+            } else {
+                return Err(ExpandError::BadSyntax {
+                    what: format!("define-library: unknown clause '{}'", self.syms.name(head)),
+                    span: clause.span(),
+                });
+            }
+        }
+
+        // Reject duplicate library declarations within one expander pass.
+        if self.libraries.contains_key(&name_syms) {
+            let printed = name_syms
+                .iter()
+                .map(|s| self.syms.name(*s))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Err(ExpandError::BadSyntax {
+                what: format!("library ({}) is already declared", printed),
+                span: items[0].span(),
+            });
+        }
+        self.libraries.insert(
+            name_syms.clone(),
+            LibraryInfo {
+                exports: exports.clone(),
+            },
+        );
+
+        // Splice imports first, then body. Same model as `expand_library`.
+        let mut exprs: Vec<CoreExpr> = Vec::with_capacity(import_exprs.len() + body_exprs.len());
+        exprs.extend(import_exprs);
+        exprs.extend(body_exprs);
+        Ok(CoreExpr::Begin { exprs, span })
     }
 
     /// `(import <import-spec> ...)` at top level.
