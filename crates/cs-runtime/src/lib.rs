@@ -564,9 +564,15 @@ impl Runtime {
 /// Render a raised condition value as a human-friendly error message.
 /// Shape produced by `error` / `make-condition` / R6RS condition constructors:
 /// a vector `#("&compound-condition" simple1 simple2 ...)` where each simple
-/// is `#("&<type>" field0 field1 ...)`. We pull the `&message` and
-/// `&irritants` simples out for display; other simples are reflected via a
-/// suffix listing their type tags so the user can see e.g. `[&assertion]`.
+/// is `#("&<type>" field0 field1 ...)`.
+///
+/// The output reads like:
+///   error in <who>: <message> (<irritant ...>) [<other tags>]
+/// or:
+///   assertion-violation in <who>: <message> ...
+/// with each section omitted when not present. `who` is rendered with
+/// `display` semantics (no quotes for symbols/strings); irritants use
+/// `write` semantics so the reader can disambiguate types.
 fn format_condition(v: &Value, syms: &SymbolTable) -> String {
     let simples = collect_condition_simples(v);
     if simples.is_empty() {
@@ -574,6 +580,8 @@ fn format_condition(v: &Value, syms: &SymbolTable) -> String {
     }
     let mut msg: Option<String> = None;
     let mut irritants: Vec<Value> = Vec::new();
+    let mut who: Option<Value> = None;
+    let mut is_assertion = false;
     let mut other_tags: Vec<String> = Vec::new();
     for simple in &simples {
         if let Some((tag, fields)) = decompose_simple(simple) {
@@ -588,12 +596,37 @@ fn format_condition(v: &Value, syms: &SymbolTable) -> String {
                         irritants = collect_list(list);
                     }
                 }
-                "&error" => {} // implied by "error:" prefix
+                "&who" => {
+                    who = fields.into_iter().next();
+                }
+                // Implied by the prefix we'll emit; not surfaced separately.
+                "&error" | "&serious" | "&violation" => {}
+                "&assertion" => {
+                    is_assertion = true;
+                }
                 other => other_tags.push(format!("[{}]", other)),
             }
         }
     }
-    let mut out = String::from("error:");
+    let prefix = if is_assertion {
+        "assertion-violation"
+    } else {
+        "error"
+    };
+    let mut out = String::from(prefix);
+    if let Some(w) = &who {
+        // `who` may be a symbol, string, or `#f`. Skip the false case
+        // — it explicitly means "no who" — but render the others.
+        let render = match w {
+            Value::Boolean(false) => None,
+            other => Some(other.format_with(syms, WriteMode::Display)),
+        };
+        if let Some(s) = render {
+            out.push_str(" in ");
+            out.push_str(&s);
+        }
+    }
+    out.push(':');
     if let Some(m) = msg {
         out.push(' ');
         out.push_str(&m);

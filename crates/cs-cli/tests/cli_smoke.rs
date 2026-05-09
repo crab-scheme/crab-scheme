@@ -216,6 +216,32 @@ fn vm_raised_renders_as_error_msg() {
     assert!(!err.contains("__raised__"), "stderr: {:?}", err);
 }
 
+#[test]
+fn raised_with_who_renders_in_clause() {
+    // (error 'fn "msg" ...) should render `error in fn: msg ...`,
+    // exposing the &who simple to the user instead of swallowing it.
+    let (_, err, code) = run_eval(r#"(error 'my-fn "bad arg" 42)"#);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains("error in my-fn: bad arg (42)"),
+        "stderr: {:?}",
+        err
+    );
+}
+
+#[test]
+fn assertion_violation_renders_friendly() {
+    // assertion-violation's renderer uses the "assertion-violation" prefix
+    // (not "error") since R6RS distinguishes the two.
+    let (_, err, code) = run_eval(r#"(assertion-violation 'check "broke" 'detail)"#);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains("assertion-violation in check: broke (detail)"),
+        "stderr: {:?}",
+        err
+    );
+}
+
 /// Run examples/metacircular.scm — a metacircular Scheme evaluator that
 /// runs three small programs (factorial 10, sum 1..100, mutable counter)
 /// through itself. Stresses closures, env lookup, multi-body lambdas, and
