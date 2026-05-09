@@ -231,15 +231,16 @@ Iters 117+ are filling R7RS gaps one per iter:
 - 133 R7RS delay-force + iterative force on both tiers; make-promise
   now wraps a value as Forced (R7RS); delay/delay-force expansion
   uses internal __make-pending-promise to wrap a thunk
-- 134 R7RS syntax-error special form (this iter): raises
-  ExpandError::BadSyntax with message + irritants. Fires whenever
-  the template is expanded — only "matched" branches in syntax-rules
-  reach it.
+- 134 R7RS syntax-error special form: raises ExpandError::BadSyntax
+  with message + irritants. Fires whenever the template is expanded —
+  only "matched" branches in syntax-rules reach it.
+- 135 R7RS string-copy + bytevector-copy with optional [start [end]];
+  added missing string-set! (this iter)
 
 Current totals:
-- 88 conformance test files (cli)
-- VM tier: 90 tests
-- Aggregate: 1792 individual Scheme tests passing
+- 89 conformance test files (cli)
+- VM tier: 91 tests
+- Aggregate: 1815 individual Scheme tests passing
 
 ## Loop cadence
 

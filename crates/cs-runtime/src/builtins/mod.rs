@@ -207,6 +207,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("string-length", b_string_length),
         ("string=?", b_string_eq),
         ("string-ref", b_string_ref),
+        ("string-set!", b_string_set_bang),
         ("string->list", b_string_to_list),
         ("list->string", b_list_to_string),
         ("string-append", b_string_append),
@@ -2207,6 +2208,34 @@ fn b_string_ref(args: &[Value]) -> Result<Value, String> {
     }
 }
 
+/// R7RS `(string-set! str k char)` — destructively replace the kth char.
+/// Indices are character (not byte) positions.
+fn b_string_set_bang(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("string-set!", "3", args.len()));
+    }
+    let i = as_int_i64("string-set!", &args[1])?;
+    if i < 0 {
+        return Err("string-set!: negative index".into());
+    }
+    let new_ch = match &args[2] {
+        Value::Character(c) => *c,
+        v => return Err(type_err("string-set!", "character", v)),
+    };
+    match &args[0] {
+        Value::String(s) => {
+            let mut chars: Vec<char> = s.borrow().chars().collect();
+            if (i as usize) >= chars.len() {
+                return Err("string-set!: index out of range".into());
+            }
+            chars[i as usize] = new_ch;
+            *s.borrow_mut() = chars.into_iter().collect();
+            Ok(Value::Unspecified)
+        }
+        v => Err(type_err("string-set!", "string", v)),
+    }
+}
+
 fn b_string_to_list(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("string->list", "1", args.len()));
@@ -2638,13 +2667,35 @@ fn b_substring(args: &[Value]) -> Result<Value, String> {
 }
 
 fn b_string_copy(args: &[Value]) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(arity_err("string-copy", "1", args.len()));
+    // R7RS: (string-copy s [start [end]]). Indices are character (not byte)
+    // positions so multibyte UTF-8 strings work correctly.
+    if args.is_empty() || args.len() > 3 {
+        return Err(arity_err("string-copy", "1..3", args.len()));
     }
-    match &args[0] {
-        Value::String(s) => Ok(Value::string(s.borrow().clone())),
-        v => Err(type_err("string-copy", "string", v)),
-    }
+    let chars: Vec<char> = match &args[0] {
+        Value::String(s) => s.borrow().chars().collect(),
+        v => return Err(type_err("string-copy", "string", v)),
+    };
+    let len = chars.len();
+    let start = if args.len() >= 2 {
+        let i = as_int_i64("string-copy", &args[1])?;
+        if i < 0 || (i as usize) > len {
+            return Err(format!("string-copy: start out of range: {}", i));
+        }
+        i as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 3 {
+        let i = as_int_i64("string-copy", &args[2])?;
+        if i < 0 || (i as usize) > len || (i as usize) < start {
+            return Err(format!("string-copy: end out of range: {}", i));
+        }
+        i as usize
+    } else {
+        len
+    };
+    Ok(Value::string(chars[start..end].iter().collect::<String>()))
 }
 
 fn b_number_to_string(args: &[Value]) -> Result<Value, String> {
@@ -7025,15 +7076,36 @@ fn b_native_endianness(args: &[Value], syms: &mut SymbolTable) -> Result<Value, 
 }
 
 fn b_bytevector_copy(args: &[Value]) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(arity_err("bytevector-copy", "1", args.len()));
+    // R7RS: (bytevector-copy bv [start [end]]).
+    if args.is_empty() || args.len() > 3 {
+        return Err(arity_err("bytevector-copy", "1..3", args.len()));
     }
-    match &args[0] {
-        Value::ByteVector(bv) => Ok(Value::ByteVector(cs_core::Gc::new(
-            std::cell::RefCell::new(bv.borrow().clone()),
-        ))),
-        v => Err(type_err("bytevector-copy", "bytevector", v)),
-    }
+    let bytes = match &args[0] {
+        Value::ByteVector(bv) => bv.borrow().clone(),
+        v => return Err(type_err("bytevector-copy", "bytevector", v)),
+    };
+    let len = bytes.len();
+    let start = if args.len() >= 2 {
+        let i = as_int_i64("bytevector-copy", &args[1])?;
+        if i < 0 || (i as usize) > len {
+            return Err(format!("bytevector-copy: start out of range: {}", i));
+        }
+        i as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 3 {
+        let i = as_int_i64("bytevector-copy", &args[2])?;
+        if i < 0 || (i as usize) > len || (i as usize) < start {
+            return Err(format!("bytevector-copy: end out of range: {}", i));
+        }
+        i as usize
+    } else {
+        len
+    };
+    Ok(Value::ByteVector(cs_core::Gc::new(
+        std::cell::RefCell::new(bytes[start..end].to_vec()),
+    )))
 }
 
 fn b_bytevector_to_u8_list(args: &[Value]) -> Result<Value, String> {
