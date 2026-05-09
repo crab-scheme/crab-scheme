@@ -227,12 +227,16 @@ Iters 117+ are filling R7RS gaps one per iter:
 - 131 R7RS variadic eq predicates + list-set!: boolean=?, symbol=?,
   list-set!
 - 132 R7RS vector-fill! optional start/end + new string-fill!
-  with same R7RS arity (this iter)
+  with same R7RS arity
+- 133 R7RS delay-force + iterative force on both tiers; make-promise
+  now wraps a value as Forced (R7RS); delay/delay-force expansion
+  uses internal __make-pending-promise to wrap a thunk
+  (this iter)
 
 Current totals:
-- 86 conformance test files (cli)
-- VM tier: 88 tests
-- Aggregate: 1771 individual Scheme tests passing
+- 87 conformance test files (cli)
+- VM tier: 89 tests
+- Aggregate: 1785 individual Scheme tests passing
 
 ## Loop cadence
 

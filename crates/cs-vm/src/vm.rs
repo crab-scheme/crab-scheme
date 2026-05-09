@@ -3661,24 +3661,43 @@ fn ho_apply(func: &Value, args: &[Value], syms: &mut SymbolTable) -> Result<Valu
         if args.len() != 1 {
             return Err(VmError::new("force: 1 arg"));
         }
-        let arg = args.remove(0);
-        match arg {
-            Value::Promise(p) => {
-                {
-                    let state = p.state.borrow();
-                    if let cs_core::PromiseState::Forced(v) = &*state {
-                        return Ok(v.clone());
+        // Iterative force: matches cs-runtime's b_force. Walks lazy
+        // promise chains without growing the host stack so R7RS
+        // delay-force can express iterative tail calls.
+        let original = args.remove(0);
+        let mut cur = original.clone();
+        loop {
+            match cur {
+                Value::Promise(p) => {
+                    {
+                        let state = p.state.borrow();
+                        if let cs_core::PromiseState::Forced(v) = &*state {
+                            let v = v.clone();
+                            if let Value::Promise(orig) = &original {
+                                if !std::ptr::eq(&**orig as *const _, &*p as *const _) {
+                                    *orig.state.borrow_mut() =
+                                        cs_core::PromiseState::Forced(v.clone());
+                                }
+                            }
+                            return Ok(v);
+                        }
                     }
+                    let thunk = match &*p.state.borrow() {
+                        cs_core::PromiseState::Pending(t) => t.clone(),
+                        cs_core::PromiseState::Forced(_) => unreachable!(),
+                    };
+                    let v = vm_call_sync(&thunk, &[], syms)?;
+                    if matches!(v, Value::Promise(_)) {
+                        cur = v;
+                        continue;
+                    }
+                    if let Value::Promise(orig) = &original {
+                        *orig.state.borrow_mut() = cs_core::PromiseState::Forced(v.clone());
+                    }
+                    return Ok(v);
                 }
-                let thunk = match &*p.state.borrow() {
-                    cs_core::PromiseState::Pending(t) => t.clone(),
-                    cs_core::PromiseState::Forced(_) => unreachable!(),
-                };
-                let v = vm_call_sync(&thunk, &[], syms)?;
-                *p.state.borrow_mut() = cs_core::PromiseState::Forced(v.clone());
-                return Ok(v);
+                other => return Ok(other),
             }
-            other => return Ok(other),
         }
     }
     Err(VmError::new("ho_apply: unrecognized HO marker"))

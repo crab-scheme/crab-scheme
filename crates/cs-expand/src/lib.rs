@@ -175,6 +175,7 @@ struct Keywords {
     ellipsis: Symbol,
     underscore: Symbol,
     delay: Symbol,
+    delay_force: Symbol,
     let_values: Symbol,
     let_star_values: Symbol,
     parameterize: Symbol,
@@ -229,6 +230,7 @@ impl Keywords {
             ellipsis: syms.intern("..."),
             underscore: syms.intern("_"),
             delay: syms.intern("delay"),
+            delay_force: syms.intern("delay-force"),
             let_values: syms.intern("let-values"),
             let_star_values: syms.intern("let*-values"),
             parameterize: syms.intern("parameterize"),
@@ -1142,6 +1144,13 @@ impl<'a> Expander<'a> {
                 return self.expand_cond_expand(&tail_items, span);
             }
             if s == self.keywords.delay {
+                return self.expand_delay(&tail_items, span);
+            }
+            if s == self.keywords.delay_force {
+                // R7RS delay-force: same expansion as delay (a thunk-wrapping
+                // promise). Force is the half that distinguishes them — it
+                // iterates when the thunk returns another promise, achieving
+                // proper iterative tail calls in lazy code.
                 return self.expand_delay(&tail_items, span);
             }
             if s == self.keywords.let_values {
@@ -3020,10 +3029,12 @@ impl<'a> Expander<'a> {
             body: Rc::new(body),
             span,
         };
-        let make_promise = self.syms.intern("make-promise");
+        // Use the internal Pending-wrapping constructor so we don't clash
+        // with R7RS make-promise (which takes a value, not a thunk).
+        let make_pending = self.syms.intern("__make-pending-promise");
         Ok(CoreExpr::App {
             func: Rc::new(CoreExpr::Ref {
-                name: make_promise,
+                name: make_pending,
                 span,
             }),
             args: vec![thunk],

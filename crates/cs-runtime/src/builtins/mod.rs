@@ -456,6 +456,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // promises
         ("promise?", b_promise_p),
         ("make-promise", b_make_promise),
+        ("__make-pending-promise", b_make_pending_promise),
         // simple list ops (no procedure callback)
         ("iota", b_iota),
         ("last", b_last),
@@ -5996,9 +5997,23 @@ fn b_promise_p(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Boolean(matches!(args[0], Value::Promise(_))))
 }
 
+/// R7RS `(make-promise obj)` — returns a promise already in the forced
+/// state holding `obj`. Forcing it returns `obj` immediately.
 fn b_make_promise(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("make-promise", "1", args.len()));
+    }
+    let p = Promise::pending(args[0].clone());
+    *p.state.borrow_mut() = PromiseState::Forced(args[0].clone());
+    Ok(Value::Promise(p))
+}
+
+/// Internal: wraps a thunk as a Pending promise. Used by the expansion of
+/// `delay` and `delay-force`. Not part of R7RS — distinct from
+/// `make-promise` which takes a value, not a thunk.
+fn b_make_pending_promise(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("__make-pending-promise", "1", args.len()));
     }
     Ok(Value::Promise(Promise::pending(args[0].clone())))
 }
@@ -6191,26 +6206,56 @@ fn b_force(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("force", "1", args.len()));
     }
-    match &args[0] {
-        Value::Promise(p) => {
-            // Check if already forced
-            {
-                let state = p.state.borrow();
-                if let PromiseState::Forced(v) = &*state {
-                    return Ok(v.clone());
+    // Iterative force loop. R7RS `delay-force` requires that a promise
+    // whose thunk returns another promise can be unwound without growing
+    // the stack — otherwise (define-rec (loop p) (delay-force (loop ...)))
+    // would crash. We don't grow the Rust stack here; we walk until we
+    // hit a Forced state or a non-promise value.
+    //
+    // The original (outer) promise is the one we eventually memoize. Any
+    // intermediate lazy promises encountered along the way leak — that's
+    // OK for the foundation; the spec-recommended state-aliasing
+    // optimization can land in a later iter.
+    let original = args[0].clone();
+    let mut cur = original.clone();
+    loop {
+        match cur {
+            Value::Promise(p) => {
+                // Already forced? Memoize on the original and return.
+                {
+                    let state = p.state.borrow();
+                    if let PromiseState::Forced(v) = &*state {
+                        let v = v.clone();
+                        if let Value::Promise(orig) = &original {
+                            if !std::ptr::eq(&**orig as *const _, &*p as *const _) {
+                                *orig.state.borrow_mut() = PromiseState::Forced(v.clone());
+                            }
+                        }
+                        return Ok(v);
+                    }
                 }
+                // Pending: run the thunk.
+                let thunk = match &*p.state.borrow() {
+                    PromiseState::Pending(t) => t.clone(),
+                    PromiseState::Forced(_) => unreachable!(),
+                };
+                let v = apply_procedure(&thunk, &[], ctx).map_err(|e| e.message())?;
+                if matches!(v, Value::Promise(_)) {
+                    // Thunk returned another promise — iterate. The
+                    // intermediate promise `p` stays pending; the loop
+                    // continues with the new promise as `cur`.
+                    cur = v;
+                    continue;
+                }
+                // Non-promise value: memoize on the original and return.
+                if let Value::Promise(orig) = &original {
+                    *orig.state.borrow_mut() = PromiseState::Forced(v.clone());
+                }
+                return Ok(v);
             }
-            // Pending: invoke thunk and memoize.
-            let thunk = match &*p.state.borrow() {
-                PromiseState::Pending(t) => t.clone(),
-                PromiseState::Forced(_) => unreachable!(),
-            };
-            let v = apply_procedure(&thunk, &[], ctx).map_err(|e| e.message())?;
-            *p.state.borrow_mut() = PromiseState::Forced(v.clone());
-            Ok(v)
+            // Non-promise input: R6RS-style passthrough.
+            v => return Ok(v),
         }
-        // R6RS-style: force on a non-promise just returns the value.
-        v => Ok(v.clone()),
     }
 }
 

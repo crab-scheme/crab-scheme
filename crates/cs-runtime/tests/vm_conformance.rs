@@ -800,3 +800,11 @@ fn vm_conformance_r7rs_fill() {
     println!("r7rs_fill: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_delay_force() {
+    let walker = pass_count_walker("r7rs_delay_force.scm");
+    let vm = pass_count_vm("r7rs_delay_force.scm").expect("vm should run r7rs_delay_force.scm");
+    println!("r7rs_delay_force: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
