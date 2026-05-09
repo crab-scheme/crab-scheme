@@ -358,26 +358,158 @@ impl<'a> Expander<'a> {
         Ok(CoreExpr::Begin { exprs, span })
     }
 
-    /// `(import <import-spec> ...)` at top level. Foundation: we don't
-    /// resolve names yet — every builtin and every user definition is
-    /// already global — so this is a structural no-op. We do verify the
-    /// argument shape so a malformed import yields a clear error.
+    /// `(import <import-spec> ...)` at top level.
+    ///
+    /// R6RS import-spec shapes recognized here:
+    ///   `<library-ref>`                     bare reference, no filter
+    ///   `(only <import-spec> id ...)`       restrict to listed ids
+    ///   `(except <import-spec> id ...)`     all but the listed ids
+    ///   `(prefix <import-spec> <prefix>)`   add a prefix to every id
+    ///   `(rename <import-spec> (old new) ...)`  rename selected bindings
+    ///
+    /// At this milestone we don't track per-library export manifests, so
+    /// `only`, `except`, and `prefix` are accepted syntactically but
+    /// don't restrict the global namespace (the listed names remain
+    /// directly accessible). `rename` does have effect: each
+    /// `(<old> <new>)` pair synthesizes a `(define <new> <old>)` so the
+    /// renamed binding becomes available alongside the original.
+    ///
+    /// When library namespace isolation lands the same parser runs but
+    /// `only`/`except`/`prefix` start enforcing what's importable and the
+    /// library scope filters out non-imported names.
     fn expand_import(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        let mut renames: Vec<(Symbol, Symbol)> = Vec::new();
         for spec in items {
-            // Each import-spec must be a list. We don't otherwise inspect
-            // its contents at this milestone; real name resolution will
-            // be added when the library system lands.
-            if collect_proper_list_strict(spec).is_none() {
-                return Err(ExpandError::BadSyntax {
-                    what: "import spec must be a list".into(),
-                    span: spec.span(),
-                });
+            self.collect_import_renames(spec, &mut renames)?;
+        }
+        if renames.is_empty() {
+            return Ok(CoreExpr::Const {
+                value: Value::Unspecified,
+                span,
+            });
+        }
+        // Synthesize `(define <new> <old>)` for each rename. The
+        // expander lowers top-level define to CoreExpr::Set, which the
+        // runtime treats as a top-level binding (auto-defined on first
+        // assignment), so the renamed name becomes a fresh global.
+        let mut exprs: Vec<CoreExpr> = Vec::with_capacity(renames.len());
+        for (old, new) in renames {
+            exprs.push(CoreExpr::Set {
+                name: new,
+                value: Rc::new(CoreExpr::Ref { name: old, span }),
+                span,
+            });
+        }
+        Ok(CoreExpr::Begin { exprs, span })
+    }
+
+    /// Walk an import-spec shape and accumulate any `rename` pairs into
+    /// `out`. Other modifier shapes (`only`/`except`/`prefix`) are
+    /// validated for syntactic well-formedness but contribute nothing —
+    /// they become enforceable when we have per-library scopes.
+    fn collect_import_renames(
+        &mut self,
+        spec: &Datum,
+        out: &mut Vec<(Symbol, Symbol)>,
+    ) -> Result<(), ExpandError> {
+        let parts = collect_proper_list_strict(spec).ok_or(ExpandError::BadSyntax {
+            what: "import spec must be a list".into(),
+            span: spec.span(),
+        })?;
+        if parts.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "import spec must not be empty".into(),
+                span: spec.span(),
+            });
+        }
+        // Modifier dispatch: head must be a symbol to match a modifier.
+        if let Datum::Symbol(head, _) = &parts[0] {
+            let only_sym = self.syms.intern("only");
+            let except_sym = self.syms.intern("except");
+            let prefix_sym = self.syms.intern("prefix");
+            let rename_sym = self.syms.intern("rename");
+            if *head == only_sym || *head == except_sym {
+                if parts.len() < 2 {
+                    return Err(ExpandError::BadSyntax {
+                        what: format!(
+                            "{} import-spec needs inner spec and at least one id",
+                            self.syms.name(*head)
+                        ),
+                        span: spec.span(),
+                    });
+                }
+                self.collect_import_renames(&parts[1], out)?;
+                for id in &parts[2..] {
+                    if !matches!(id, Datum::Symbol(_, _)) {
+                        return Err(ExpandError::BadSyntax {
+                            what: "only/except expects identifier names".into(),
+                            span: id.span(),
+                        });
+                    }
+                }
+                return Ok(());
+            }
+            if *head == prefix_sym {
+                if parts.len() != 3 {
+                    return Err(ExpandError::BadSyntax {
+                        what: "prefix needs (prefix <import-spec> <id>)".into(),
+                        span: spec.span(),
+                    });
+                }
+                self.collect_import_renames(&parts[1], out)?;
+                if !matches!(&parts[2], Datum::Symbol(_, _)) {
+                    return Err(ExpandError::BadSyntax {
+                        what: "prefix: third element must be an identifier".into(),
+                        span: parts[2].span(),
+                    });
+                }
+                return Ok(());
+            }
+            if *head == rename_sym {
+                if parts.len() < 2 {
+                    return Err(ExpandError::BadSyntax {
+                        what: "rename needs (rename <import-spec> (old new) ...)".into(),
+                        span: spec.span(),
+                    });
+                }
+                self.collect_import_renames(&parts[1], out)?;
+                for pair in &parts[2..] {
+                    let pair_items =
+                        collect_proper_list_strict(pair).ok_or(ExpandError::BadSyntax {
+                            what: "rename pair must be (old new)".into(),
+                            span: pair.span(),
+                        })?;
+                    if pair_items.len() != 2 {
+                        return Err(ExpandError::BadSyntax {
+                            what: "rename pair must have exactly two ids".into(),
+                            span: pair.span(),
+                        });
+                    }
+                    let old = match &pair_items[0] {
+                        Datum::Symbol(s, _) => *s,
+                        _ => {
+                            return Err(ExpandError::BadSyntax {
+                                what: "rename: old name must be an identifier".into(),
+                                span: pair_items[0].span(),
+                            })
+                        }
+                    };
+                    let new = match &pair_items[1] {
+                        Datum::Symbol(s, _) => *s,
+                        _ => {
+                            return Err(ExpandError::BadSyntax {
+                                what: "rename: new name must be an identifier".into(),
+                                span: pair_items[1].span(),
+                            })
+                        }
+                    };
+                    out.push((old, new));
+                }
+                return Ok(());
             }
         }
-        Ok(CoreExpr::Const {
-            value: Value::Unspecified,
-            span,
-        })
+        // Bare library reference — no rename effect.
+        Ok(())
     }
 
     /// `(include "path1" "path2" ...)` — at expand time, read each named

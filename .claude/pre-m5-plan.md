@@ -19,10 +19,24 @@ to HO on the walker (use `apply_procedure` for Custom). VM tier got
 matching `make_vm_builtin_syms` shims using `vm_call_sync`.
 Conformance: `hashtable_custom.scm` (cli 66, vm 68).
 
-### 2. Library namespace filtering  [pre-M5]  ← NEXT
-The expander recognizes `library` / `import` shape but doesn't enforce
-namespace boundaries. Add proper scope frames per library and filter
-imports.
+### 2. Library namespace filtering  [pre-M5]  ← IN PROGRESS
+
+**2a. Import-spec modifier syntax** ✅ DONE (commit pending)
+Recognize `only`, `except`, `prefix`, `rename` shapes in `import`,
+validate structure at expand time. `rename` is fully effective via
+synthesized `(define new old)`. `only`/`except`/`prefix` are
+syntactically accepted but don't restrict the global namespace yet —
+that requires per-library scope frames (item 2b).
+
+**2b. Per-library scope frames** ← NEXT
+Add an env-frame system so each library has its own binding namespace.
+Library expansion installs into the library's frame (not top-level).
+`import` resolves names through the named library's frame and respects
+`only`/`except`/`prefix` filtering.
+
+**2c. Export filter**
+Restrict library frames so only `(export ...)`-listed names are
+visible to importers.
 
 **Touches:** `cs-expand/src/lib.rs` primarily; some runtime env work
 to support multiple top-level frames.

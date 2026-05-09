@@ -632,3 +632,11 @@ fn vm_conformance_hashtable_custom() {
     println!("hashtable_custom: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_library_imports() {
+    let walker = pass_count_walker("library_imports.scm");
+    let vm = pass_count_vm("library_imports.scm").expect("vm should run library_imports.scm");
+    println!("library_imports: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
