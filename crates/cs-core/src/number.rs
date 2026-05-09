@@ -169,6 +169,104 @@ impl Number {
             Number::Flonum(f) => f.is_finite() && f.fract() == 0.0,
         }
     }
+
+    /// Promote any integer-shaped Number to a BigInt. Useful for paths
+    /// that need uniform i64-or-Big arithmetic (quotient/remainder/etc.)
+    /// without quadratic dispatch on the four enum variants.
+    /// Returns None for non-integer Numbers (rationals, non-int flonums).
+    pub fn to_bigint(&self) -> Option<BigInt> {
+        match self {
+            Number::Fixnum(v) => Some(BigInt::from(*v)),
+            Number::Big(b) => Some(b.as_ref().clone()),
+            Number::Rat(r) if r.is_integer() => Some(r.numer().clone()),
+            Number::Flonum(f) if f.is_finite() && f.fract() == 0.0 => {
+                // Flonums with integer values up to ~2^53 round-trip cleanly.
+                // We approximate by truncating; callers should already have
+                // checked is_integer() before calling.
+                Some(BigInt::from(*f as i64))
+            }
+            _ => None,
+        }
+    }
+
+    /// Truncating quotient (R5RS/R6RS `quotient`). Result has the sign
+    /// of x*y where (x, y) = (self, other). Errors on zero divisor.
+    pub fn quotient(&self, other: &Number) -> Result<Number, NumError> {
+        if other.is_zero() {
+            return Err(NumError::DivisionByZero);
+        }
+        let a = self.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let b = other.to_bigint().ok_or(NumError::DivisionByZero)?;
+        Ok(simplify_bigint(&a / &b))
+    }
+
+    /// Truncating remainder (R5RS/R6RS `remainder`). Result has the sign
+    /// of x. `(remainder x y) = x - y * (quotient x y)`.
+    pub fn remainder(&self, other: &Number) -> Result<Number, NumError> {
+        if other.is_zero() {
+            return Err(NumError::DivisionByZero);
+        }
+        let a = self.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let b = other.to_bigint().ok_or(NumError::DivisionByZero)?;
+        Ok(simplify_bigint(&a % &b))
+    }
+
+    /// Floor modulo (R5RS/R6RS `modulo`). Result has the sign of y.
+    /// `(modulo x y) = (remainder x y) + y` when signs differ.
+    pub fn modulo(&self, other: &Number) -> Result<Number, NumError> {
+        if other.is_zero() {
+            return Err(NumError::DivisionByZero);
+        }
+        let a = self.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let b = other.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let r = &a % &b;
+        let result = if (r.sign() == num_bigint::Sign::Minus && b.sign() == num_bigint::Sign::Plus)
+            || (r.sign() == num_bigint::Sign::Plus && b.sign() == num_bigint::Sign::Minus)
+        {
+            &r + &b
+        } else {
+            r
+        };
+        Ok(simplify_bigint(result))
+    }
+
+    /// R6RS Euclidean div: `nd` such that `0 ≤ x − y·nd < |y|`.
+    pub fn euclid_div(&self, other: &Number) -> Result<Number, NumError> {
+        if other.is_zero() {
+            return Err(NumError::DivisionByZero);
+        }
+        let a = self.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let b = other.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let q_trunc = &a / &b;
+        let r = &a - &q_trunc * &b;
+        let q_eucl = if r.sign() == num_bigint::Sign::Minus {
+            if b.sign() == num_bigint::Sign::Plus {
+                q_trunc - 1
+            } else {
+                q_trunc + 1
+            }
+        } else {
+            q_trunc
+        };
+        Ok(simplify_bigint(q_eucl))
+    }
+
+    /// R6RS Euclidean mod: always non-negative remainder.
+    pub fn euclid_mod(&self, other: &Number) -> Result<Number, NumError> {
+        let d = self.euclid_div(other)?;
+        let a = self.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let b = other.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let dn = d.to_bigint().ok_or(NumError::DivisionByZero)?;
+        Ok(simplify_bigint(&a - &dn * &b))
+    }
+}
+
+fn simplify_bigint(b: BigInt) -> Number {
+    if let Some(small) = b.to_i64() {
+        Number::Fixnum(small)
+    } else {
+        Number::Big(Rc::new(b))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

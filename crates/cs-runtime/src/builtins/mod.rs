@@ -684,46 +684,45 @@ fn b_max(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Number(acc))
 }
 
+fn as_integer_num(name: &str, v: &Value) -> Result<Number, String> {
+    match v {
+        Value::Number(n) if n.is_integer() => Ok(n.clone()),
+        Value::Number(_) => Err(format!("{}: expected integer, got non-integer", name)),
+        other => Err(type_err(name, "integer", other)),
+    }
+}
+
 fn b_quotient(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("quotient", "2", args.len()));
     }
-    let a = as_int_i64("quotient", &args[0])?;
-    let b = as_int_i64("quotient", &args[1])?;
-    if b == 0 {
-        return Err("quotient: division by zero".into());
-    }
-    Ok(Value::fixnum(a.wrapping_div(b)))
+    let a = as_integer_num("quotient", &args[0])?;
+    let b = as_integer_num("quotient", &args[1])?;
+    a.quotient(&b)
+        .map(Value::Number)
+        .map_err(|_| "quotient: division by zero".into())
 }
 
 fn b_remainder(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("remainder", "2", args.len()));
     }
-    let a = as_int_i64("remainder", &args[0])?;
-    let b = as_int_i64("remainder", &args[1])?;
-    if b == 0 {
-        return Err("remainder: division by zero".into());
-    }
-    Ok(Value::fixnum(a.wrapping_rem(b)))
+    let a = as_integer_num("remainder", &args[0])?;
+    let b = as_integer_num("remainder", &args[1])?;
+    a.remainder(&b)
+        .map(Value::Number)
+        .map_err(|_| "remainder: division by zero".into())
 }
 
 fn b_modulo(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("modulo", "2", args.len()));
     }
-    let a = as_int_i64("modulo", &args[0])?;
-    let b = as_int_i64("modulo", &args[1])?;
-    if b == 0 {
-        return Err("modulo: division by zero".into());
-    }
-    let r = a.wrapping_rem(b);
-    let m = if (r > 0 && b < 0) || (r < 0 && b > 0) {
-        r + b
-    } else {
-        r
-    };
-    Ok(Value::fixnum(m))
+    let a = as_integer_num("modulo", &args[0])?;
+    let b = as_integer_num("modulo", &args[1])?;
+    a.modulo(&b)
+        .map(Value::Number)
+        .map_err(|_| "modulo: division by zero".into())
 }
 
 // ---- R6RS Euclidean division (div / mod / div-and-mod / div0 / mod0) ----
@@ -735,13 +734,18 @@ fn b_modulo(args: &[Value]) -> Result<Value, String> {
 
 /// Public so `Runtime::new` can plumb VM-tier shims that need to
 /// compute Euclidean div/mod and stash the (d, m) pair via the VM's
-/// pending-values channel.
-pub fn div_and_mod_i64(x: &Value, y: &Value) -> Result<(i64, i64), String> {
-    let xi = as_int_i64("div-and-mod", x)?;
-    let yi = as_int_i64("div-and-mod", y)?;
-    let d = r6rs_div_i64(xi, yi)?;
-    let m = xi - d * yi;
-    Ok((d, m))
+/// pending-values channel. Returns `(d, m)` as Numbers so bignum
+/// operands flow through cleanly.
+pub fn div_and_mod_num(x: &Value, y: &Value) -> Result<(Value, Value), String> {
+    let xi = as_integer_num("div-and-mod", x)?;
+    let yi = as_integer_num("div-and-mod", y)?;
+    let d = xi
+        .euclid_div(&yi)
+        .map_err(|_| "div-and-mod: division by zero".to_string())?;
+    let m = xi
+        .euclid_mod(&yi)
+        .map_err(|_| "div-and-mod: division by zero".to_string())?;
+    Ok((Value::Number(d), Value::Number(m)))
 }
 
 pub fn div0_and_mod0_i64(x: &Value, y: &Value) -> Result<(i64, i64), String> {
@@ -809,22 +813,22 @@ fn b_div_op(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("div", "2", args.len()));
     }
-    let x = as_int_i64("div", &args[0])?;
-    let y = as_int_i64("div", &args[1])?;
-    Ok(Value::fixnum(
-        r6rs_div_i64(x, y).map_err(|m| format!("div: {}", m))?,
-    ))
+    let x = as_integer_num("div", &args[0])?;
+    let y = as_integer_num("div", &args[1])?;
+    x.euclid_div(&y)
+        .map(Value::Number)
+        .map_err(|_| "div: division by zero".into())
 }
 
 fn b_mod_op(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("mod", "2", args.len()));
     }
-    let x = as_int_i64("mod", &args[0])?;
-    let y = as_int_i64("mod", &args[1])?;
-    Ok(Value::fixnum(
-        r6rs_mod_i64(x, y).map_err(|m| format!("mod: {}", m))?,
-    ))
+    let x = as_integer_num("mod", &args[0])?;
+    let y = as_integer_num("mod", &args[1])?;
+    x.euclid_mod(&y)
+        .map(Value::Number)
+        .map_err(|_| "mod: division by zero".into())
 }
 
 fn b_div0_op(args: &[Value]) -> Result<Value, String> {
@@ -853,11 +857,15 @@ fn b_div_and_mod(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("div-and-mod", "2", args.len()));
     }
-    let x = as_int_i64("div-and-mod", &args[0])?;
-    let y = as_int_i64("div-and-mod", &args[1])?;
-    let d = r6rs_div_i64(x, y).map_err(|m| format!("div-and-mod: {}", m))?;
-    let m = x - d * y;
-    ctx.pending_values = Some(vec![Value::fixnum(d), Value::fixnum(m)]);
+    let x = as_integer_num("div-and-mod", &args[0])?;
+    let y = as_integer_num("div-and-mod", &args[1])?;
+    let d = x
+        .euclid_div(&y)
+        .map_err(|_| "div-and-mod: division by zero".to_string())?;
+    let m = x
+        .euclid_mod(&y)
+        .map_err(|_| "div-and-mod: division by zero".to_string())?;
+    ctx.pending_values = Some(vec![Value::Number(d), Value::Number(m)]);
     Ok(Value::Unspecified)
 }
 

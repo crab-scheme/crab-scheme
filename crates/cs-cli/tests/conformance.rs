@@ -349,6 +349,11 @@ fn conformance_bigint_expt() {
 }
 
 #[test]
+fn conformance_bigint_division() {
+    run_conformance_file("bigint_division.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -423,6 +428,7 @@ fn conformance_aggregate_count() {
                 "numeric_char_predicates.scm",
                 "ieee_literals.scm",
                 "bigint_expt.scm",
+                "bigint_division.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
