@@ -1,0 +1,36 @@
+{
+  "phase": "M5 Phase 1 (Rc-backed Gc<T>)",
+  "captured_at": "2026-05-09",
+  "captured_by": "crates/cs-runtime/tests/gc_memory.rs and gc_timing.rs",
+  "host": {
+    "platform": "macos-arm64",
+    "note": "Numbers are reference values from a development host. Phase 2 must compare against these on the same host shape."
+  },
+  "memory_peak_rss": {
+    "factorial_200_after_collect_mib": 4.38,
+    "list_10000_after_collect_mib": 6.08,
+    "ten_fresh_runtimes_after_collect_mib": 4.33,
+    "ceiling_assertion_mib": 80,
+    "phase2_target_ratio": "≤ 1.2× of these values per M5 spec NFR"
+  },
+  "gc_pause_microseconds": {
+    "modest_heap_p50_us": 2.3,
+    "modest_heap_p99_us": 4.3,
+    "modest_heap_max_us": 4.3,
+    "empty_runtime_p99_us_ceiling": 1000,
+    "spec_target_p99_us": 1000,
+    "note": "Phase 1 pause time is bookkeeping-only (Rc backing). Phase 2 arena will replace this with a real mark-sweep cycle."
+  },
+  "test_counts": {
+    "cs_gc_unit": 8,
+    "cs_core_smoke": 4,
+    "cli_conformance_files": 68,
+    "vm_conformance_files": 70,
+    "gc_smoke": 6,
+    "gc_stress": 5,
+    "gc_fuzz": 3,
+    "gc_timing": 2,
+    "gc_memory": 3,
+    "aggregate_conformance": 1460
+  }
+}

@@ -181,16 +181,18 @@ the perf gate needs the arena.)
   the spec's 1ms threshold even before Phase 2.
 
 What's still in 4.G but deferred:
-- ~~24-hour fuzz CI workflow (`.github/workflows/m5-fuzz.yml`)~~
-  ✅ landed this iter; bumps seed count via `CRABSCHEME_FUZZ_SEEDS`
-  to 1024 by default, loops the test for 60 minutes nightly.
-- ✅ ADR 0006 (`docs/adr/0006-gc-design.md`) ratifies the
-  hand-rolled mark-sweep + precise-rooting choice plus the
-  Phase 1 → Phase 2 migration commitment.
-- Criterion-based bench harness (`bench/gc_pause.rs`).
-- Memory-baseline measurement (peak RSS ≤ 1.2× M4 RC baseline).
-These remaining items belong in the M5 spec's exit-gate sweep
-when we're ready to declare M5 done.
+- ✅ 24-hour fuzz CI workflow (`.github/workflows/m5-fuzz.yml`)
+- ✅ ADR 0006 (`docs/adr/0006-gc-design.md`)
+- ✅ Memory-baseline measurement (`gc_memory.rs`, this iter):
+  factorial(200) → 4.38 MiB, 10k list → 6.08 MiB,
+  10 fresh Runtimes → 4.33 MiB. All comfortably under the 80 MiB
+  test ceiling. Captured in `bench/m5-phase1-baseline.json` for
+  Phase 2 to compare against (≤ 1.2× target per M5 spec).
+- Criterion-based bench harness (`bench/gc_pause.rs`) — only
+  remaining 4.G item. The existing `gc_timing.rs` already records
+  durations + p99; converting to criterion adds statistical analysis
+  but no new coverage. Defer until Phase 2 makes the numbers
+  meaningfully change.
 
 ## Conformance baseline at start of plan
 

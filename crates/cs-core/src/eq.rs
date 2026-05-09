@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
+#[cfg_attr(not(test), allow(unused_imports))]
 use crate::value::{Pair, Value};
 
 /// R6RS `eq?`: identity for heap values, value equality for immediates.
