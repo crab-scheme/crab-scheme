@@ -187,6 +187,7 @@ fn handle_repl_cmd(line: &str, via_vm: &mut bool, rt: &mut Runtime) -> ReplCmdRe
                  :quit                  exit (also ^D)\n\
                  :tier walker|vm        switch execution tier (current: {})\n\
                  :time <expr>           evaluate <expr> and report wall time\n\
+                 :load <path>           load and run a Scheme file in this session\n\
                  :reset                 reinitialize runtime, dropping definitions",
                 if *via_vm { "vm" } else { "walker" }
             );
@@ -232,6 +233,35 @@ fn handle_repl_cmd(line: &str, via_vm: &mut bool, rt: &mut Runtime) -> ReplCmdRe
                     let s = render(&diag, rt.source_map());
                     eprint!("{}", s);
                 }
+            }
+            ReplCmdResult::Continue
+        }
+        ":load" => {
+            if arg.is_empty() {
+                println!(":load needs a file path");
+                return ReplCmdResult::Continue;
+            }
+            match fs::read_to_string(arg) {
+                Ok(src) => {
+                    let r = if *via_vm {
+                        rt.eval_str_via_vm(arg, &src)
+                    } else {
+                        rt.eval_str(arg, &src)
+                    };
+                    match r {
+                        Ok(v) => {
+                            if !matches!(v, Value::Unspecified) {
+                                println!("{}", rt.format_value(&v, WriteMode::Write));
+                            }
+                            println!("; loaded {}", arg);
+                        }
+                        Err(diag) => {
+                            let s = render(&diag, rt.source_map());
+                            eprint!("{}", s);
+                        }
+                    }
+                }
+                Err(e) => println!(":load {}: {}", arg, e),
             }
             ReplCmdResult::Continue
         }

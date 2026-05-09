@@ -269,6 +269,31 @@ fn run_metacircular_vm() {
 }
 
 #[test]
+fn repl_load_command_brings_definitions_into_scope() {
+    // :load <path> reads a file and runs it in the current REPL session.
+    // Definitions made by the loaded file should remain visible to
+    // subsequent REPL input.
+    let load_path = workspace_path("examples/factorial.scm");
+    let session = format!(":load {}\n(define foo 41)\nfoo\n:quit\n", load_path);
+    let (out, _err, code) = run_repl_session(&session, &["repl"]);
+    assert_eq!(code, 0);
+    // factorial.scm prints 479001600 and then the REPL reports it loaded.
+    assert!(out.contains("479001600"), "{}", out);
+    assert!(out.contains("; loaded"), "{}", out);
+    // Definitions made AFTER the :load also work — confirms the REPL
+    // didn't reset state.
+    assert!(out.contains("41"), "{}", out);
+}
+
+#[test]
+fn repl_load_missing_file_prints_error_continues() {
+    let (_out, _err, code) = run_repl_session(":load /no/such/file.scm\n42\n:quit\n", &["repl"]);
+    assert_eq!(code, 0);
+    // Nothing else asserted — just that the REPL stayed alive past the
+    // failed load and still evaluated the trailing 42.
+}
+
+#[test]
 fn vm_arity_mismatch_has_source_span_and_no_dup_prefix() {
     // Arity mismatch: span on the offending call site + descriptive
     // expected/got message. No duplicate "+: +: ..." builtin prefix.

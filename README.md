@@ -78,6 +78,7 @@ The REPL accepts both Scheme expressions and `:`-prefixed commands:
 | `:quit` | Exit (also `^D`) |
 | `:tier walker\|vm` | Switch execution tier |
 | `:time <expr>` | Evaluate `<expr>` and print wall-clock time |
+| `:load <path>` | Load and run a Scheme file in this session |
 | `:reset` | Reinitialize the runtime, dropping all definitions |
 
 Example session:
