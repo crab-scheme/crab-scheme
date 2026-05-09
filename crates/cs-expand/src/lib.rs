@@ -142,6 +142,7 @@ struct Keywords {
     arrow: Symbol,
     define_record_type: Symbol,
     define_condition_type: Symbol,
+    define_values: Symbol,
     library: Symbol,
     import: Symbol,
     export: Symbol,
@@ -193,6 +194,7 @@ impl Keywords {
             arrow: syms.intern("=>"),
             define_record_type: syms.intern("define-record-type"),
             define_condition_type: syms.intern("define-condition-type"),
+            define_values: syms.intern("define-values"),
             library: syms.intern("library"),
             import: syms.intern("import"),
             export: syms.intern("export"),
@@ -281,6 +283,9 @@ impl<'a> Expander<'a> {
                 }
                 if *s == self.keywords.define_condition_type {
                     return self.expand_define_condition_type(&tail, d.span());
+                }
+                if *s == self.keywords.define_values {
+                    return self.expand_define_values(&tail, d.span());
                 }
                 if *s == self.keywords.define_syntax {
                     return self.expand_define_syntax(&tail, d.span());
@@ -1009,6 +1014,112 @@ impl<'a> Expander<'a> {
                 span: other.span(),
             }),
         }
+    }
+
+    /// `(define-values <formals> <expression>)` — R6RS multiple-value
+    /// binding at top level. `<formals>` matches lambda formals: a fixed
+    /// list, a single rest symbol, or a fixed list with a dotted rest tail.
+    /// Desugars to declarations that initialize each name to Unspecified
+    /// followed by a `call-with-values` that mutates them in place.
+    fn expand_define_values(
+        &mut self,
+        items: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        if items.len() != 2 {
+            return Err(ExpandError::BadSyntax {
+                what: "define-values needs <formals> and <expression>".into(),
+                span,
+            });
+        }
+        let params = build_params_from_datums_loose(&items[0])?;
+        let expr = self.expand(&items[1])?;
+
+        // Synthesize lambda parameter names so we can shadow user names
+        // inside the call-with-values consumer (the consumer just forwards
+        // each into the right top-level binding via `set!`).
+        let mut consumer_fixed: Vec<Symbol> = Vec::with_capacity(params.fixed.len());
+        for (i, _) in params.fixed.iter().enumerate() {
+            consumer_fixed.push(self.syms.intern(&format!("__dv-arg-{}__", i)));
+        }
+        let consumer_rest: Option<Symbol> = params.rest.map(|_| self.syms.intern("__dv-rest__"));
+
+        let mut out: Vec<CoreExpr> = Vec::new();
+        // 1. Pre-declare each name with Unspecified so subsequent code can
+        // see the binding even before the call-with-values runs.
+        for name in &params.fixed {
+            out.push(CoreExpr::Set {
+                name: *name,
+                value: Rc::new(CoreExpr::Const {
+                    value: Value::Unspecified,
+                    span,
+                }),
+                span,
+            });
+        }
+        if let Some(rest_name) = params.rest {
+            out.push(CoreExpr::Set {
+                name: rest_name,
+                value: Rc::new(CoreExpr::Const {
+                    value: Value::Unspecified,
+                    span,
+                }),
+                span,
+            });
+        }
+        // 2. Build the consumer body: a sequence of `(set! <user-name> <synth-arg>)`.
+        let mut sets: Vec<CoreExpr> = Vec::with_capacity(params.fixed.len() + 1);
+        for (user_name, synth) in params.fixed.iter().zip(consumer_fixed.iter()) {
+            sets.push(CoreExpr::Set {
+                name: *user_name,
+                value: Rc::new(CoreExpr::Ref { name: *synth, span }),
+                span,
+            });
+        }
+        if let (Some(user_rest), Some(synth_rest)) = (params.rest, consumer_rest) {
+            sets.push(CoreExpr::Set {
+                name: user_rest,
+                value: Rc::new(CoreExpr::Ref {
+                    name: synth_rest,
+                    span,
+                }),
+                span,
+            });
+        }
+        let consumer_body = if sets.len() == 1 {
+            sets.pop().unwrap()
+        } else if sets.is_empty() {
+            CoreExpr::Const {
+                value: Value::Unspecified,
+                span,
+            }
+        } else {
+            CoreExpr::Begin { exprs: sets, span }
+        };
+        let consumer = CoreExpr::Lambda {
+            params: Params {
+                fixed: consumer_fixed,
+                rest: consumer_rest,
+            },
+            body: Rc::new(consumer_body),
+            span,
+        };
+        let producer = CoreExpr::Lambda {
+            params: Params::fixed(Vec::new()),
+            body: Rc::new(expr),
+            span,
+        };
+        let cwv_sym = self.syms.intern("call-with-values");
+        out.push(CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: cwv_sym,
+                span,
+            }),
+            args: vec![producer, consumer],
+            span,
+        });
+
+        Ok(CoreExpr::Begin { exprs: out, span })
     }
 
     fn expand_let(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
@@ -4153,6 +4264,44 @@ fn build_params_from_datums(items: &[Datum]) -> Result<Params, ExpandError> {
         }
     }
     Ok(Params::fixed(fixed))
+}
+
+/// Like `build_params_from_datums` but accepts a single datum that can be
+/// any of the lambda formals shapes: a proper list `(a b c)`, an improper
+/// list `(a b . rest)`, a bare symbol `rest`, or `()` (empty fixed).
+/// Used by `define-values` where the formals appear as one form.
+fn build_params_from_datums_loose(d: &Datum) -> Result<Params, ExpandError> {
+    let mut fixed: Vec<Symbol> = Vec::new();
+    let mut rest: Option<Symbol> = None;
+    let mut cur = d.clone();
+    loop {
+        match cur {
+            Datum::Null(_) => break,
+            Datum::Symbol(s, _) => {
+                rest = Some(s);
+                break;
+            }
+            Datum::Pair(car, cdr, _) => {
+                match &*car {
+                    Datum::Symbol(s, _) => fixed.push(*s),
+                    other => {
+                        return Err(ExpandError::BadSyntax {
+                            what: "formals: param must be a symbol".into(),
+                            span: other.span(),
+                        });
+                    }
+                }
+                cur = (*cdr).clone();
+            }
+            other => {
+                return Err(ExpandError::BadSyntax {
+                    what: "formals: must be a list, dotted pair, or symbol".into(),
+                    span: other.span(),
+                });
+            }
+        }
+    }
+    Ok(Params { fixed, rest })
 }
 
 #[cfg(test)]

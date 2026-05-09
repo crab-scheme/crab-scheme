@@ -439,3 +439,11 @@ fn vm_conformance_display_condition() {
     println!("display_condition: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_define_values() {
+    let walker = pass_count_walker("define_values.scm");
+    let vm = pass_count_vm("define_values.scm").expect("vm should run define_values.scm");
+    println!("define_values: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

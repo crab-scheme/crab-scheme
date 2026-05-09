@@ -289,6 +289,11 @@ fn conformance_display_condition() {
 }
 
 #[test]
+fn conformance_define_values() {
+    run_conformance_file("define_values.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -351,6 +356,7 @@ fn conformance_aggregate_count() {
                 "cond_guard_arrow.scm",
                 "library_import.scm",
                 "display_condition.scm",
+                "define_values.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
