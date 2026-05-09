@@ -305,15 +305,23 @@ pub enum WriteMode {
 
 /// `Trace` impl for Value enumerates the heap-pointer variants so the
 /// GC can reach every transitively-reachable allocation during a mark
-/// pass. As the M5 migration progresses (step 4.C), each variant that
-/// switches from `Rc<T>` to `Gc<T>` adds a `marker.mark(...)` call here.
-/// Variants still backed by `Rc<T>` are no-ops for now — the Rc-shaped
-/// reachability is handled by the refcount, and the variants migrate
-/// onto the trace path one at a time.
+/// pass.
+///
+/// All standard heap-data variants (Pair / Vector / String / ByteVector
+/// / Hashtable / Port / Promise) are `Gc<T>`-backed and trace through.
+/// `Procedure` is the one exception: it stays on `Rc<dyn Procedure>`
+/// in Phase 1 because `Gc<dyn Procedure>` requires the unstable
+/// `CoerceUnsized` trait. Closure environments and parameter cells
+/// still participate in tracing because the concrete `Procedure` impls
+/// in cs-runtime / cs-vm provide non-trivial `Trace` impls; we just
+/// don't reach them through this entry — they're reachable via the
+/// walker top frame and the VM root env, both of which are root closures.
+/// True cycles that go *through* `Rc<dyn Procedure>` would leak in
+/// Phase 1; the M5 spec's exit gate calls this out explicitly.
 impl cs_gc::Trace for Value {
     fn trace(&self, marker: &mut cs_gc::Marker) {
         match self {
-            // Migrated variants — Gc<T>-backed and trace through.
+            // Gc<T>-backed heap variants.
             Value::String(s) => s.trace(marker),
             Value::ByteVector(v) => v.trace(marker),
             Value::Vector(v) => v.trace(marker),
@@ -321,7 +329,7 @@ impl cs_gc::Trace for Value {
             Value::Hashtable(h) => h.trace(marker),
             Value::Port(p) => p.trace(marker),
             Value::Promise(p) => p.trace(marker),
-            // Not yet migrated — Rc-backed, no trace needed.
+            // Rc-backed (Phase 1 limitation, see doc above).
             Value::Procedure(_) => {}
             // Leaf variants — no heap pointers.
             Value::Null

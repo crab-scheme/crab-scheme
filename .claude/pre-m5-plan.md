@@ -142,10 +142,22 @@ Runtime. Phase 1's collect() can run only "between" VM calls. Phase
 2 + multi-shot continuations may move stack frames to the heap (per
 the M5 spec) at which point they become root candidates.
 
-**4.E — Drop the `Rc` import from `value.rs`**
-Acceptance: `grep "Rc<" crates/cs-core/src/value.rs` returns no
-heap-data uses. Symbol-table `Rc<str>` interning may stay (it's
-immortal once interned).
+**4.E — Drop the `Rc` import from `value.rs`** ✅ partial
+- All migratable variants are off Rc (7 of 8). Trace-impl docstring
+  in value.rs updated to reflect the final state and the rationale
+  for `Procedure` staying on Rc (CoerceUnsized is unstable).
+- `Rc<str>` symbol interning stays — it's immortal once interned.
+- `Rc<dyn Procedure>` stays — the documented Phase 1 limitation.
+
+`grep "Rc<" crates/cs-core/src/value.rs` shows 2 remaining:
+the Procedure variant + the make_parameter constructor. Removing
+these is a Phase 2 ADR decision (manual unsize via small `unsafe`,
+or move to nightly).
+
+Also added 5 stress tests in `crates/cs-runtime/tests/gc_stress.rs`
+that interleave program evaluation with `collect()` calls across
+strings, vectors, hashtables, closures (with captured cells), and
+the VM tier — all green.
 
 **4.F — Phase 2 swap**
 Replace `Rc<Slot<T>>` backing with a hand-rolled arena. Same `Gc<T>`
