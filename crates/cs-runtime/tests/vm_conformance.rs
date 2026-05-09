@@ -520,3 +520,11 @@ fn vm_conformance_ieee_literals() {
     println!("ieee_literals: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_bigint_expt() {
+    let walker = pass_count_walker("bigint_expt.scm");
+    let vm = pass_count_vm("bigint_expt.scm").expect("vm should run bigint_expt.scm");
+    println!("bigint_expt: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

@@ -27,6 +27,16 @@ impl Number {
         Number::Flonum(v)
     }
 
+    /// Parse a base-10 integer literal, returning Fixnum when it fits in
+    /// i64 or Big otherwise. Used by the lexer; returns None on bad input.
+    pub fn parse_decimal_integer(s: &str) -> Option<Self> {
+        if let Ok(v) = s.parse::<i64>() {
+            return Some(Number::Fixnum(v));
+        }
+        // Out of i64 range — try BigInt.
+        s.parse::<BigInt>().ok().map(|b| Number::Big(Rc::new(b)))
+    }
+
     pub fn is_exact(&self) -> bool {
         !matches!(self, Number::Flonum(_))
     }

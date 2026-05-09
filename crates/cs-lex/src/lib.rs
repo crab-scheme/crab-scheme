@@ -505,11 +505,8 @@ fn parse_number(s: &str) -> Option<Number> {
     }
     if s.contains('.') || s.contains('e') || s.contains('E') {
         s.parse::<f64>().ok().map(Number::Flonum)
-    } else if let Ok(v) = s.parse::<i64>() {
-        Some(Number::Fixnum(v))
     } else {
-        // Fall back to bigint via decimal parse — out of scope for foundation MVP
-        None
+        Number::parse_decimal_integer(s)
     }
 }
 

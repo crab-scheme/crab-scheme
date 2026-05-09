@@ -344,6 +344,11 @@ fn conformance_ieee_literals() {
 }
 
 #[test]
+fn conformance_bigint_expt() {
+    run_conformance_file("bigint_expt.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -417,6 +422,7 @@ fn conformance_aggregate_count() {
                 "string_extras.scm",
                 "numeric_char_predicates.scm",
                 "ieee_literals.scm",
+                "bigint_expt.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

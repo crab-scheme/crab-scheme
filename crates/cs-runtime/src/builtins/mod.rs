@@ -879,16 +879,30 @@ fn b_expt(args: &[Value]) -> Result<Value, String> {
     }
     let base = as_num("expt", &args[0])?;
     let exp = as_num("expt", &args[1])?;
-    // Integer power case via repeated multiplication if exp is non-negative integer.
-    if let (Number::Fixnum(_), Number::Fixnum(e)) = (&base, &exp) {
-        if *e >= 0 && *e < 64 {
-            let mut acc = Number::Fixnum(1);
-            let mut i = 0;
-            while i < *e {
-                acc = acc.mul(&base);
-                i += 1;
+    // Exact integer base + non-negative integer exponent: stay exact.
+    // Number::mul promotes Fixnum overflow to Big, so the loop stays
+    // correct beyond i64. Cap the exponent at 1<<20 to avoid runaway
+    // memory use on pathological inputs (`(expt 2 (expt 2 30))`).
+    if base.is_integer() && exp.is_integer() {
+        if let Number::Fixnum(e) = exp {
+            if e >= 0 && e <= (1 << 20) {
+                // Repeated-squaring keeps the loop log(e) instead of
+                // linear in e — important since `expt` on big exponents
+                // is the canonical path for building bignums.
+                let mut acc = Number::Fixnum(1);
+                let mut b = base.clone();
+                let mut k = e;
+                while k > 0 {
+                    if k & 1 == 1 {
+                        acc = acc.mul(&b);
+                    }
+                    k >>= 1;
+                    if k > 0 {
+                        b = b.mul(&b);
+                    }
+                }
+                return Ok(Value::Number(acc));
             }
-            return Ok(Value::Number(acc));
         }
     }
     // Fallback: floating point.
