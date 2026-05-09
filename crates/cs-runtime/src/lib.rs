@@ -243,9 +243,9 @@ impl Runtime {
                 if args.len() != 2 {
                     return Err("div0-and-mod0: 2 args".into());
                 }
-                let (d, m) = builtins::div0_and_mod0_i64(&args[0], &args[1])
+                let (d, m) = builtins::div0_and_mod0_num(&args[0], &args[1])
                     .map_err(|e| format!("div0-and-mod0: {}", e))?;
-                cs_vm::vm::vm_set_pending_values(vec![Value::fixnum(d), Value::fixnum(m)]);
+                cs_vm::vm::vm_set_pending_values(vec![d, m]);
                 Ok(Value::Unspecified)
             }),
         );

@@ -748,65 +748,16 @@ pub fn div_and_mod_num(x: &Value, y: &Value) -> Result<(Value, Value), String> {
     Ok((Value::Number(d), Value::Number(m)))
 }
 
-pub fn div0_and_mod0_i64(x: &Value, y: &Value) -> Result<(i64, i64), String> {
-    let xi = as_int_i64("div0-and-mod0", x)?;
-    let yi = as_int_i64("div0-and-mod0", y)?;
-    let d = r6rs_div0_i64(xi, yi)?;
-    let m = xi - d * yi;
-    Ok((d, m))
-}
-
-fn r6rs_div_i64(x: i64, y: i64) -> Result<i64, String> {
-    if y == 0 {
-        return Err("division by zero".into());
-    }
-    let q = x.wrapping_div(y);
-    let r = x.wrapping_sub(q.wrapping_mul(y));
-    let q = if r < 0 {
-        if y > 0 {
-            q - 1
-        } else {
-            q + 1
-        }
-    } else {
-        q
-    };
-    Ok(q)
-}
-
-fn r6rs_mod_i64(x: i64, y: i64) -> Result<i64, String> {
-    let q = r6rs_div_i64(x, y)?;
-    Ok(x - q * y)
-}
-
-fn r6rs_div0_i64(x: i64, y: i64) -> Result<i64, String> {
-    let d = r6rs_div_i64(x, y)?;
-    let m = x - d * y;
-    // Centered: shift by 1 if m exceeds |y|/2 (ties broken downward to
-    // match the half-open interval [-|y|/2, |y|/2)).
-    let abs_y = y.unsigned_abs() as i128;
-    let twice_m = (m as i128) * 2;
-    let shift = if twice_m > abs_y as i128 {
-        1
-    } else if twice_m == abs_y as i128 && abs_y % 2 == 0 {
-        1
-    } else {
-        0
-    };
-    if shift == 1 {
-        if y > 0 {
-            Ok(d + 1)
-        } else {
-            Ok(d - 1)
-        }
-    } else {
-        Ok(d)
-    }
-}
-
-fn r6rs_mod0_i64(x: i64, y: i64) -> Result<i64, String> {
-    let d0 = r6rs_div0_i64(x, y)?;
-    Ok(x - d0 * y)
+pub fn div0_and_mod0_num(x: &Value, y: &Value) -> Result<(Value, Value), String> {
+    let xi = as_integer_num("div0-and-mod0", x)?;
+    let yi = as_integer_num("div0-and-mod0", y)?;
+    let d = xi
+        .euclid_div0(&yi)
+        .map_err(|_| "div0-and-mod0: division by zero".to_string())?;
+    let m = xi
+        .euclid_mod0(&yi)
+        .map_err(|_| "div0-and-mod0: division by zero".to_string())?;
+    Ok((Value::Number(d), Value::Number(m)))
 }
 
 fn b_div_op(args: &[Value]) -> Result<Value, String> {
@@ -835,22 +786,22 @@ fn b_div0_op(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("div0", "2", args.len()));
     }
-    let x = as_int_i64("div0", &args[0])?;
-    let y = as_int_i64("div0", &args[1])?;
-    Ok(Value::fixnum(
-        r6rs_div0_i64(x, y).map_err(|m| format!("div0: {}", m))?,
-    ))
+    let x = as_integer_num("div0", &args[0])?;
+    let y = as_integer_num("div0", &args[1])?;
+    x.euclid_div0(&y)
+        .map(Value::Number)
+        .map_err(|_| "div0: division by zero".into())
 }
 
 fn b_mod0_op(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("mod0", "2", args.len()));
     }
-    let x = as_int_i64("mod0", &args[0])?;
-    let y = as_int_i64("mod0", &args[1])?;
-    Ok(Value::fixnum(
-        r6rs_mod0_i64(x, y).map_err(|m| format!("mod0: {}", m))?,
-    ))
+    let x = as_integer_num("mod0", &args[0])?;
+    let y = as_integer_num("mod0", &args[1])?;
+    x.euclid_mod0(&y)
+        .map(Value::Number)
+        .map_err(|_| "mod0: division by zero".into())
 }
 
 fn b_div_and_mod(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
@@ -873,11 +824,8 @@ fn b_div0_and_mod0(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("div0-and-mod0", "2", args.len()));
     }
-    let x = as_int_i64("div0-and-mod0", &args[0])?;
-    let y = as_int_i64("div0-and-mod0", &args[1])?;
-    let d = r6rs_div0_i64(x, y).map_err(|m| format!("div0-and-mod0: {}", m))?;
-    let m = x - d * y;
-    ctx.pending_values = Some(vec![Value::fixnum(d), Value::fixnum(m)]);
+    let (d, m) = div0_and_mod0_num(&args[0], &args[1])?;
+    ctx.pending_values = Some(vec![d, m]);
     Ok(Value::Unspecified)
 }
 

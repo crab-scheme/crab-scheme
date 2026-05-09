@@ -259,6 +259,46 @@ impl Number {
         let dn = d.to_bigint().ok_or(NumError::DivisionByZero)?;
         Ok(simplify_bigint(&a - &dn * &b))
     }
+
+    /// R6RS centered div0: result `nd` such that `-|y|/2 ≤ x − y·nd < |y|/2`.
+    /// Handles ties (when |y| is even and the Euclidean remainder is
+    /// exactly |y|/2) by shifting downward so the remainder lands in
+    /// the half-open interval.
+    pub fn euclid_div0(&self, other: &Number) -> Result<Number, NumError> {
+        if other.is_zero() {
+            return Err(NumError::DivisionByZero);
+        }
+        let d = self.euclid_div(other)?;
+        let a = self.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let b = other.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let dn = d.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let m = &a - &dn * &b;
+        let abs_b = b.abs();
+        // Shift if 2·m > |b| (always above the upper boundary), or
+        // 2·m == |b| AND |b| is even (boundary tie — round to land in
+        // [-|y|/2, |y|/2)).
+        let two_m = &m * 2;
+        let shift = two_m > abs_b || (two_m == abs_b && (&abs_b % 2u32).is_zero());
+        let result = if shift {
+            if b.sign() == num_bigint::Sign::Plus {
+                dn + 1
+            } else {
+                dn - 1
+            }
+        } else {
+            dn
+        };
+        Ok(simplify_bigint(result))
+    }
+
+    /// R6RS centered mod0: remainder in `[-|y|/2, |y|/2)`.
+    pub fn euclid_mod0(&self, other: &Number) -> Result<Number, NumError> {
+        let d0 = self.euclid_div0(other)?;
+        let a = self.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let b = other.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let d0n = d0.to_bigint().ok_or(NumError::DivisionByZero)?;
+        Ok(simplify_bigint(&a - &d0n * &b))
+    }
 }
 
 fn simplify_bigint(b: BigInt) -> Number {

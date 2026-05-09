@@ -536,3 +536,11 @@ fn vm_conformance_bigint_division() {
     println!("bigint_division: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_bigint_div0_mod0() {
+    let walker = pass_count_walker("bigint_div0_mod0.scm");
+    let vm = pass_count_vm("bigint_div0_mod0.scm").expect("vm should run bigint_div0_mod0.scm");
+    println!("bigint_div0_mod0: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
