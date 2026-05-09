@@ -324,6 +324,11 @@ fn conformance_cxxr_accessors() {
 }
 
 #[test]
+fn conformance_srfi1_extras() {
+    run_conformance_file("srfi1_extras.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -393,6 +398,7 @@ fn conformance_aggregate_count() {
                 "bytevector_ports.scm",
                 "r6rs_division.scm",
                 "cxxr_accessors.scm",
+                "srfi1_extras.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

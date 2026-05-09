@@ -319,6 +319,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("delete", b_delete),
         ("delete-duplicates", b_delete_duplicates),
         ("concatenate", b_concatenate),
+        ("cons*", b_cons_star),
+        ("list*", b_cons_star),
+        ("alist-copy", b_alist_copy),
         ("first", b_first),
         ("second", b_second),
         ("third", b_third),
@@ -363,6 +366,14 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("call-with-current-continuation", b_call_cc),
         // SRFI-1 higher-order list ops
         ("filter", b_filter),
+        ("take-while", b_take_while),
+        ("drop-while", b_drop_while),
+        ("span", b_span),
+        ("break", b_break),
+        ("list-index", b_list_index),
+        ("filter-map", b_filter_map),
+        ("append-map", b_append_map),
+        ("list-tabulate", b_list_tabulate),
         ("fold-left", b_fold_left),
         ("fold-right", b_fold_right),
         ("reduce", b_reduce),
@@ -3403,6 +3414,174 @@ fn b_filter(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     Ok(Value::list(out))
 }
 
+/// `(take-while pred lst)` — return the longest prefix of `lst` whose
+/// elements all satisfy `pred`.
+fn b_take_while(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("take-while", "2", args.len()));
+    }
+    let pred = args[0].clone();
+    let items = collect_proper_list("take-while", &args[1])?;
+    let mut out = Vec::new();
+    for item in items {
+        let r = apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| e.message())?;
+        if !r.is_truthy() {
+            break;
+        }
+        out.push(item);
+    }
+    Ok(Value::list(out))
+}
+
+/// `(drop-while pred lst)` — drop the longest prefix satisfying `pred`,
+/// return the rest.
+fn b_drop_while(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("drop-while", "2", args.len()));
+    }
+    let pred = args[0].clone();
+    let items = collect_proper_list("drop-while", &args[1])?;
+    let mut idx = 0;
+    while idx < items.len() {
+        let r = apply_procedure(&pred, &[items[idx].clone()], ctx).map_err(|e| e.message())?;
+        if !r.is_truthy() {
+            break;
+        }
+        idx += 1;
+    }
+    Ok(Value::list(items[idx..].to_vec()))
+}
+
+/// `(span pred lst)` — split `lst` at the first failing predicate
+/// position. Returns `(values prefix rest)` where prefix satisfies pred.
+fn b_span(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("span", "2", args.len()));
+    }
+    let pred = args[0].clone();
+    let items = collect_proper_list("span", &args[1])?;
+    let mut idx = 0;
+    while idx < items.len() {
+        let r = apply_procedure(&pred, &[items[idx].clone()], ctx).map_err(|e| e.message())?;
+        if !r.is_truthy() {
+            break;
+        }
+        idx += 1;
+    }
+    let prefix = items[..idx].to_vec();
+    let rest = items[idx..].to_vec();
+    ctx.pending_values = Some(vec![Value::list(prefix), Value::list(rest)]);
+    Ok(Value::Unspecified)
+}
+
+/// `(break pred lst)` — span with the negated predicate. Splits at the
+/// first element that satisfies pred.
+fn b_break(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("break", "2", args.len()));
+    }
+    let pred = args[0].clone();
+    let items = collect_proper_list("break", &args[1])?;
+    let mut idx = 0;
+    while idx < items.len() {
+        let r = apply_procedure(&pred, &[items[idx].clone()], ctx).map_err(|e| e.message())?;
+        if r.is_truthy() {
+            break;
+        }
+        idx += 1;
+    }
+    let prefix = items[..idx].to_vec();
+    let rest = items[idx..].to_vec();
+    ctx.pending_values = Some(vec![Value::list(prefix), Value::list(rest)]);
+    Ok(Value::Unspecified)
+}
+
+/// `(list-index pred lst1 lst2 ...)` — return the index of the first
+/// element-tuple where `(pred elt1 elt2 ...)` is truthy, or #f.
+fn b_list_index(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err(arity_err("list-index", "at least 2", args.len()));
+    }
+    let pred = args[0].clone();
+    let lists: Vec<Vec<Value>> = args[1..]
+        .iter()
+        .map(|v| collect_proper_list("list-index", v))
+        .collect::<Result<_, _>>()?;
+    let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+    for i in 0..n {
+        let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+        let r = apply_procedure(&pred, &row, ctx).map_err(|e| e.message())?;
+        if r.is_truthy() {
+            return Ok(Value::fixnum(i as i64));
+        }
+    }
+    Ok(Value::Boolean(false))
+}
+
+/// `(filter-map proc lst1 lst2 ...)` — like map, but #f results are
+/// dropped from the output. Idiomatic shape for "transform if matches".
+fn b_filter_map(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err(arity_err("filter-map", "at least 2", args.len()));
+    }
+    let proc_val = args[0].clone();
+    let lists: Vec<Vec<Value>> = args[1..]
+        .iter()
+        .map(|v| collect_proper_list("filter-map", v))
+        .collect::<Result<_, _>>()?;
+    let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+    let mut out = Vec::new();
+    for i in 0..n {
+        let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        if !matches!(r, Value::Boolean(false)) {
+            out.push(r);
+        }
+    }
+    Ok(Value::list(out))
+}
+
+/// `(append-map proc lst1 lst2 ...)` — like map but appends each
+/// list-result. Equivalent to `(apply append (map proc lst1 ...))` but
+/// avoids the intermediate list.
+fn b_append_map(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err(arity_err("append-map", "at least 2", args.len()));
+    }
+    let proc_val = args[0].clone();
+    let lists: Vec<Vec<Value>> = args[1..]
+        .iter()
+        .map(|v| collect_proper_list("append-map", v))
+        .collect::<Result<_, _>>()?;
+    let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+    let mut out = Vec::new();
+    for i in 0..n {
+        let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        let inner = collect_proper_list("append-map", &r)?;
+        out.extend(inner);
+    }
+    Ok(Value::list(out))
+}
+
+/// `(list-tabulate n proc)` — build the list `((proc 0) (proc 1) ... (proc (n-1)))`.
+fn b_list_tabulate(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("list-tabulate", "2", args.len()));
+    }
+    let n = as_int_i64("list-tabulate", &args[0])?;
+    if n < 0 {
+        return Err("list-tabulate: negative count".into());
+    }
+    let proc_val = args[1].clone();
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let r = apply_procedure(&proc_val, &[Value::fixnum(i)], ctx).map_err(|e| e.message())?;
+        out.push(r);
+    }
+    Ok(Value::list(out))
+}
+
 fn b_fold_left(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     // (fold-left proc init list1 list2 ...)
     if args.len() < 3 {
@@ -4714,6 +4893,46 @@ fn b_concatenate(args: &[Value]) -> Result<Value, String> {
         all.extend(inner);
     }
     Ok(Value::list(all))
+}
+
+/// `(cons* x1 x2 ... xn lst)` — like `list*`. Builds
+/// `(cons x1 (cons x2 (... (cons xn lst))))`. With one arg, returns it
+/// unchanged. With zero args, errors (R6RS spec — needs at least one).
+fn b_cons_star(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err(arity_err("cons*", "at least 1", 0));
+    }
+    if args.len() == 1 {
+        return Ok(args[0].clone());
+    }
+    // Build right-to-left: start with the last arg as the tail.
+    let mut acc = args[args.len() - 1].clone();
+    for v in args[..args.len() - 1].iter().rev() {
+        acc = Value::Pair(cs_core::Pair::new(v.clone(), acc));
+    }
+    Ok(acc)
+}
+
+/// `(alist-copy alist)` — deep-copies the spine and the cons cells of
+/// each entry, but leaves the keys/values themselves shared. Useful
+/// when callers need to mutate without affecting the original.
+fn b_alist_copy(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("alist-copy", "1", args.len()));
+    }
+    let entries = collect_proper_list("alist-copy", &args[0])?;
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        match &e {
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                let cdr = p.cdr.borrow().clone();
+                out.push(Value::Pair(cs_core::Pair::new(car, cdr)));
+            }
+            _ => return Err(type_err("alist-copy", "pair", &e)),
+        }
+    }
+    Ok(Value::list(out))
 }
 
 fn b_first(args: &[Value]) -> Result<Value, String> {
