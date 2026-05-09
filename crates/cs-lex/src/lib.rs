@@ -192,10 +192,25 @@ impl<'src> Lexer<'src> {
             b'#' => self.read_hash(start, syms),
             c if c.is_ascii_digit() => self.read_number(start),
             b'+' | b'-' => {
-                // Could be sign-prefixed number or symbol like + or -
+                // Could be sign-prefixed number, special infinity/NaN
+                // literal (`+inf.0`, `-nan.0`, etc.), or a bare `+`/`-`
+                // identifier.
                 if let Some(next) = self.peek2() {
                     if next.is_ascii_digit() || next == b'.' {
                         return self.read_number(start);
+                    }
+                    // Sniff for `[+-](inf|nan)\.0` literals by peeking
+                    // the next 5 bytes after the sign. Only match when
+                    // followed by a delimiter so `+inflate` etc. stay as
+                    // identifiers.
+                    let after_sign = self.pos + 1;
+                    let tail = self.bytes.get(after_sign..after_sign + 5);
+                    if matches!(tail, Some(b"inf.0") | Some(b"nan.0")) {
+                        let after_lit = after_sign + 5;
+                        let next_after = self.bytes.get(after_lit).copied();
+                        if next_after.map_or(true, is_delimiter) {
+                            return self.read_number(start);
+                        }
                     }
                 }
                 self.read_identifier(start, syms)
@@ -376,9 +391,29 @@ impl<'src> Lexer<'src> {
     }
 
     fn read_number(&mut self, start: usize) -> Result<(Token, Span), LexError> {
-        // Consume sign
-        if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+        // Consume sign (only if a number actually starts here — bare
+        // `+`/`-` were filtered out by the caller).
+        let signed = matches!(self.peek(), Some(b'+') | Some(b'-'));
+        if signed {
             self.bump();
+        }
+        // Special-case the `inf.0` / `nan.0` IEEE-754 literals. The
+        // dispatcher already verified the next 5 bytes match one of
+        // these and the byte after is a delimiter, so we just consume
+        // them.
+        if let Some(tail) = self.bytes.get(self.pos..self.pos + 5) {
+            if tail == b"inf.0" || tail == b"nan.0" {
+                for _ in 0..5 {
+                    self.bump();
+                }
+                let text = &self.src[start..self.pos];
+                let span = self.span(start, self.pos);
+                let num = parse_number(text).ok_or_else(|| LexError::BadNumber {
+                    span,
+                    src: text.into(),
+                })?;
+                return Ok((Token::Number(num), span));
+            }
         }
         let mut saw_dot = false;
         let mut saw_slash = false;
@@ -450,6 +485,14 @@ fn is_initial_ident(b: u8) -> bool {
 }
 
 fn parse_number(s: &str) -> Option<Number> {
+    // IEEE-754 special literals first — these don't fit the generic
+    // numeric grammar below. R6RS lists exactly these four.
+    match s {
+        "+inf.0" => return Some(Number::Flonum(f64::INFINITY)),
+        "-inf.0" => return Some(Number::Flonum(f64::NEG_INFINITY)),
+        "+nan.0" | "-nan.0" => return Some(Number::Flonum(f64::NAN)),
+        _ => {}
+    }
     if let Some(slash_idx) = s.find('/') {
         let num: i64 = s[..slash_idx].parse().ok()?;
         let den: i64 = s[slash_idx + 1..].parse().ok()?;

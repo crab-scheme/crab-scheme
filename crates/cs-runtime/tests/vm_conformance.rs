@@ -512,3 +512,11 @@ fn vm_conformance_numeric_char_predicates() {
     println!("numeric_char_predicates: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_ieee_literals() {
+    let walker = pass_count_walker("ieee_literals.scm");
+    let vm = pass_count_vm("ieee_literals.scm").expect("vm should run ieee_literals.scm");
+    println!("ieee_literals: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

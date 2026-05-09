@@ -339,6 +339,11 @@ fn conformance_numeric_char_predicates() {
 }
 
 #[test]
+fn conformance_ieee_literals() {
+    run_conformance_file("ieee_literals.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -411,6 +416,7 @@ fn conformance_aggregate_count() {
                 "srfi1_extras.scm",
                 "string_extras.scm",
                 "numeric_char_predicates.scm",
+                "ieee_literals.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
