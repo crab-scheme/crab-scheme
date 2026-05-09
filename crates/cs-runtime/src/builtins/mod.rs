@@ -223,6 +223,10 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("bytevector-copy", b_bytevector_copy),
         ("bytevector->u8-list", b_bytevector_to_u8_list),
         ("u8-list->bytevector", b_u8_list_to_bytevector),
+        ("bytevector-append", b_bytevector_append),
+        ("bytevector-fill!", b_bytevector_fill),
+        ("string->utf8", b_string_to_utf8),
+        ("utf8->string", b_utf8_to_string),
         // file ports (R6RS file I/O)
         ("file-exists?", b_file_exists_p),
         ("delete-file", b_delete_file),
@@ -3625,6 +3629,130 @@ fn b_bytevector(args: &[Value]) -> Result<Value, String> {
     Ok(Value::ByteVector(std::rc::Rc::new(
         std::cell::RefCell::new(bv),
     )))
+}
+
+/// `(string->utf8 string [start [end]])` — encode a string into a
+/// fresh bytevector of UTF-8 bytes. Optional [start, end) is a
+/// character-index range. Rust strings are already UTF-8, so the
+/// encoding is a slice copy after computing byte boundaries from
+/// character indices.
+fn b_string_to_utf8(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(arity_err("string->utf8", "1..3", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        other => return Err(type_err("string->utf8", "string", other)),
+    };
+    let total_chars = s.chars().count();
+    let start = if args.len() >= 2 {
+        as_int_i64("string->utf8", &args[1])? as usize
+    } else {
+        0
+    };
+    let end = if args.len() >= 3 {
+        as_int_i64("string->utf8", &args[2])? as usize
+    } else {
+        total_chars
+    };
+    if start > end || end > total_chars {
+        return Err(format!(
+            "string->utf8: bad range [{}, {}) for length {}",
+            start, end, total_chars
+        ));
+    }
+    let mut byte_start = 0usize;
+    let mut byte_end = 0usize;
+    for (i, (offset, _)) in s.char_indices().enumerate() {
+        if i == start {
+            byte_start = offset;
+        }
+        if i == end {
+            byte_end = offset;
+            break;
+        }
+    }
+    if end == total_chars {
+        byte_end = s.len();
+    }
+    let bytes = s.as_bytes()[byte_start..byte_end].to_vec();
+    Ok(Value::ByteVector(std::rc::Rc::new(
+        std::cell::RefCell::new(bytes),
+    )))
+}
+
+/// `(utf8->string bytevector [start [end]])` — decode a bytevector
+/// from UTF-8 into a string. Invalid UTF-8 sequences raise a proper
+/// condition rather than producing replacement characters.
+fn b_utf8_to_string(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(arity_err("utf8->string", "1..3", args.len()));
+    }
+    let bv = match &args[0] {
+        Value::ByteVector(b) => b.borrow().clone(),
+        other => return Err(type_err("utf8->string", "bytevector", other)),
+    };
+    let len = bv.len();
+    let start = if args.len() >= 2 {
+        as_int_i64("utf8->string", &args[1])? as usize
+    } else {
+        0
+    };
+    let end = if args.len() >= 3 {
+        as_int_i64("utf8->string", &args[2])? as usize
+    } else {
+        len
+    };
+    if start > end || end > len {
+        return Err(format!(
+            "utf8->string: bad range [{}, {}) for length {}",
+            start, end, len
+        ));
+    }
+    let s = std::str::from_utf8(&bv[start..end])
+        .map_err(|e| format!("utf8->string: invalid UTF-8 at byte {}", e.valid_up_to()))?;
+    Ok(Value::string(s.to_string()))
+}
+
+/// `(bytevector-append bv ...)` — concatenate any number of bytevectors
+/// into a fresh one (R6RS).
+fn b_bytevector_append(args: &[Value]) -> Result<Value, String> {
+    let mut out: Vec<u8> = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        match a {
+            Value::ByteVector(b) => out.extend_from_slice(&b.borrow()),
+            other => {
+                return Err(format!(
+                    "bytevector-append: arg {} expected bytevector, got {}",
+                    i + 1,
+                    other.type_name()
+                ));
+            }
+        }
+    }
+    Ok(Value::ByteVector(std::rc::Rc::new(
+        std::cell::RefCell::new(out),
+    )))
+}
+
+/// `(bytevector-fill! bv byte)` — write `byte` to every slot of `bv`.
+fn b_bytevector_fill(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("bytevector-fill!", "2", args.len()));
+    }
+    let byte = as_int_i64("bytevector-fill!", &args[1])?;
+    if !(0..=255).contains(&byte) {
+        return Err("bytevector-fill!: byte out of u8 range".into());
+    }
+    let bv = match &args[0] {
+        Value::ByteVector(b) => b.clone(),
+        other => return Err(type_err("bytevector-fill!", "bytevector", other)),
+    };
+    let mut v = bv.borrow_mut();
+    for slot in v.iter_mut() {
+        *slot = byte as u8;
+    }
+    Ok(Value::Unspecified)
 }
 
 fn b_bytevector_p(args: &[Value]) -> Result<Value, String> {

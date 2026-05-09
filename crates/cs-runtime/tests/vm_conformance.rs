@@ -455,3 +455,11 @@ fn vm_conformance_hash_functions() {
     println!("hash_functions: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_utf8_codec() {
+    let walker = pass_count_walker("utf8_codec.scm");
+    let vm = pass_count_vm("utf8_codec.scm").expect("vm should run utf8_codec.scm");
+    println!("utf8_codec: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

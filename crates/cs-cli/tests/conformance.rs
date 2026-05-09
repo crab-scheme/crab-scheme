@@ -299,6 +299,11 @@ fn conformance_hash_functions() {
 }
 
 #[test]
+fn conformance_utf8_codec() {
+    run_conformance_file("utf8_codec.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -363,6 +368,7 @@ fn conformance_aggregate_count() {
                 "display_condition.scm",
                 "define_values.scm",
                 "hash_functions.scm",
+                "utf8_codec.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
