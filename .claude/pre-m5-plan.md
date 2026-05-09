@@ -165,9 +165,28 @@ external API. (Optional for M5 exit; Phase 1's cycle handling via
 weak-ref bookkeeping is sufficient for the conformance gate, but
 the perf gate needs the arena.)
 
-**4.G — Fuzz target + criterion bench**
-24-hour fuzz target + p99 pause-time bench. Captures the M5 exit
-gates from the spec.
+**4.G — Fuzz target + pause-time harness** ✅ partial (commit pending)
+- `gc_fuzz.rs` (3 tests): hand-rolled deterministic LCG fuzzer
+  that generates random Op sequences (define-list/string/vector/
+  hashtable/counter, mutate, collect, read-length) and asserts no
+  collect-during-trace panics. 16 seeds × 32 ops, 16 seeds × 16
+  collect-after-each-step ops, plus one 256-op long run. Avoids
+  proptest because tempfile→rustix→iconv is a Nix linker problem
+  on this host; can swap to proptest later if the env supports it.
+- `gc_timing.rs` (2 tests): records `collect()` durations on a
+  modest heap (100 lists + 10 vectors + 10 hashtable-like
+  structures) and on an empty Runtime. Asserts p99 < 10ms (loose
+  Phase 1 bound; Phase 2 spec requires < 1ms). Phase 1 measured:
+  p50 ≈ 2.3μs, p99 ≈ 4.3μs on this hardware — comfortably under
+  the spec's 1ms threshold even before Phase 2.
+
+What's still in 4.G but deferred:
+- 24-hour fuzz CI workflow (`.github/workflows/m5-fuzz.yml`).
+- Criterion-based bench harness (`bench/gc_pause.rs`).
+- Memory-baseline measurement (peak RSS ≤ 1.2× M4 RC baseline).
+These are stable-now-needs-CI deliverables that don't add code
+quality at this iter; they belong in the M5 spec's exit-gate
+sweep when we're ready to declare M5 done.
 
 ## Conformance baseline at start of plan
 
