@@ -257,6 +257,16 @@ pub struct Heap {
     alloc_count: Cell<usize>,
     threshold: Cell<usize>,
 
+    /// Auto-collect enabled. When true, `alloc` runs `collect` whenever
+    /// `alloc_count` crosses `threshold`. Default false in Phase 1
+    /// because the runtime makes no GC commitments yet — Phase 2 flips
+    /// this on by default once the arena lands.
+    auto_collect: Cell<bool>,
+
+    /// Total number of `collect()` calls since heap creation. Useful
+    /// telemetry for tooling and test assertions.
+    collect_count: Cell<usize>,
+
     /// Roots — closures that mark their reachable set when called.
     /// Each closure is invoked once per `collect()`.
     roots: RefCell<Vec<Box<dyn Fn(&mut Marker)>>>,
@@ -270,23 +280,30 @@ impl Default for Heap {
 
 impl Heap {
     /// New empty heap. Default auto-collect threshold: 4096 allocs.
+    /// `auto_collect` defaults to `false` in Phase 1; set it via
+    /// [`Heap::set_auto_collect`] when the embedding runtime is ready
+    /// to commit to GC-triggered allocation pauses.
     pub fn new() -> Self {
         Heap {
             slots: RefCell::new(Vec::new()),
             alloc_count: Cell::new(0),
             threshold: Cell::new(4096),
+            auto_collect: Cell::new(false),
+            collect_count: Cell::new(0),
             roots: RefCell::new(Vec::new()),
         }
     }
 
     /// Allocate `value` on the heap and return a `Gc<T>` to it.
     ///
-    /// Allocation may trigger a collection if more than `threshold`
-    /// allocations have happened since the last sweep. We currently
-    /// only collect on explicit `collect()` calls — auto-collect is
-    /// hooked up in a follow-up iter once root registration is wired
-    /// to the runtime.
+    /// Triggers a `collect()` if [`set_auto_collect`] is enabled AND
+    /// `alloc_count` has crossed `threshold` since the last collection.
+    /// In Phase 1 the default is auto-collect off; the embedding
+    /// runtime opts in.
     pub fn alloc<T: Trace + 'static>(&self, value: T) -> Gc<T> {
+        if self.auto_collect.get() && self.alloc_count.get() >= self.threshold.get() {
+            self.collect();
+        }
         let slot = Rc::new(Slot {
             mark: Cell::new(false),
             value: SlotValue { inner: value },
@@ -295,6 +312,21 @@ impl Heap {
         self.slots.borrow_mut().push(weak);
         self.alloc_count.set(self.alloc_count.get() + 1);
         Gc { inner: slot }
+    }
+
+    /// Enable or disable auto-collect on allocation.
+    pub fn set_auto_collect(&self, enabled: bool) {
+        self.auto_collect.set(enabled);
+    }
+
+    /// Whether auto-collect is currently enabled.
+    pub fn auto_collect_enabled(&self) -> bool {
+        self.auto_collect.get()
+    }
+
+    /// Number of `collect()` calls since heap creation.
+    pub fn collect_count(&self) -> usize {
+        self.collect_count.get()
     }
 
     /// Register a root-set closure. The closure will be invoked on
@@ -358,6 +390,7 @@ impl Heap {
         //    is gone (Rc strong count fell to 0 after roots dropped).
         self.slots.borrow_mut().retain(|w| w.strong_count() > 0);
         self.alloc_count.set(0);
+        self.collect_count.set(self.collect_count.get() + 1);
     }
 
     /// Set the auto-collect threshold (number of allocations between
@@ -485,6 +518,46 @@ mod tests {
         drop(g);
         assert_eq!(g2.n, 99);
         // No assertion against a heap — Gc::new is heap-less.
+    }
+
+    #[test]
+    fn auto_collect_off_by_default() {
+        let h = Heap::new();
+        assert!(!h.auto_collect_enabled());
+        h.set_threshold(2);
+        for _ in 0..10 {
+            let _ = h.alloc(Leaf { n: 0 });
+        }
+        // Default: auto-collect off → no collects despite crossing
+        // threshold many times.
+        assert_eq!(h.collect_count(), 0);
+        assert_eq!(h.alloc_count(), 10);
+    }
+
+    #[test]
+    fn auto_collect_on_triggers_when_threshold_crossed() {
+        let h = Heap::new();
+        h.set_auto_collect(true);
+        h.set_threshold(3);
+        // No roots → every slot is unreachable; the auto-collect
+        // sweep prunes them, alloc_count resets.
+        for _ in 0..10 {
+            let _ = h.alloc(Leaf { n: 0 });
+        }
+        // alloc_count crossed 3 multiple times; expect at least 3
+        // collections.
+        assert!(h.collect_count() >= 3, "{}", h.collect_count());
+    }
+
+    #[test]
+    fn collect_count_increments_per_call() {
+        let h = Heap::new();
+        assert_eq!(h.collect_count(), 0);
+        h.collect();
+        assert_eq!(h.collect_count(), 1);
+        h.collect();
+        h.collect();
+        assert_eq!(h.collect_count(), 3);
     }
 
     #[test]
