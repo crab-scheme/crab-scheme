@@ -579,6 +579,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("with-input-from-file", b_with_input_from_file),
         ("current-input-port", b_current_input_port),
         ("current-output-port", b_current_output_port),
+        ("current-error-port", b_current_error_port),
         ("gensym", b_gensym),
         ("eval", b_eval),
         ("environment", b_environment),
@@ -7586,6 +7587,21 @@ fn b_current_output_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
         .current_output_port
         .clone()
         .unwrap_or(Value::Unspecified))
+}
+
+/// R7RS `(current-error-port)` — returns a port for error output.
+/// Foundation: lazily creates a string output port the first time it's
+/// queried per Runtime, then returns the same port for subsequent calls.
+/// User code can write to it via display/write/newline; the buffer is
+/// observable via get-output-string.
+fn b_current_error_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("current-error-port", "0", args.len()));
+    }
+    if ctx.current_error_port.is_none() {
+        ctx.current_error_port = Some(Value::Port(Port::string_output()));
+    }
+    Ok(ctx.current_error_port.clone().unwrap())
 }
 
 /// `(gensym [prefix])` returns a freshly-interned symbol whose name is

@@ -259,12 +259,14 @@ Iters 117+ are filling R7RS gaps one per iter:
   current-output-port (R7RS). Same Higher-tier promotion + VM shims.
 - 145 read-u8/peek-u8/u8-ready?/char-ready?/read-bytevector +
   write-u8/write-bytevector all accept optional port (R7RS); same
-  Higher-tier promotion + VM shims. (this iter)
+  Higher-tier promotion + VM shims.
+- 146 R7RS (current-error-port). Lazy string output port per Runtime
+  on walker; per thread on VM via VM_CURRENT_ERROR_PORT. (this iter)
 
 Current totals:
-- 99 conformance test files (cli)
-- VM tier: 101 tests
-- Aggregate: 1996 individual Scheme tests passing
+- 100 conformance test files (cli) — milestone
+- VM tier: 102 tests
+- Aggregate: 2003 individual Scheme tests passing — past 2000
 
 ## Loop cadence
 

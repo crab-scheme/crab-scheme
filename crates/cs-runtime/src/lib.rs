@@ -286,6 +286,16 @@ impl Runtime {
         vm_env.define(cip_sym, cs_vm::vm::make_vm_current_input_port());
         let cop_sym = syms.intern("current-output-port");
         vm_env.define(cop_sym, cs_vm::vm::make_vm_current_output_port());
+        let cep_sym = syms.intern("current-error-port");
+        vm_env.define(
+            cep_sym,
+            cs_vm::vm::make_vm_builtin("current-error-port", |args| {
+                if !args.is_empty() {
+                    return Err("current-error-port: 0 args".into());
+                }
+                Ok(cs_vm::vm::vm_current_error_port_value())
+            }),
+        );
         // eval: thread-local hook installed at entry to eval_str_via_vm so
         // VmEval can call back into the runtime without a direct cycle.
         let eval_sym = syms.intern("eval");

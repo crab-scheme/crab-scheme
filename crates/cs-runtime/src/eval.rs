@@ -88,6 +88,10 @@ pub struct EvalCtx<'a> {
     pub current_input_port: Option<Value>,
     /// Current output port (per-dynamic-extent).
     pub current_output_port: Option<Value>,
+    /// Current error port (per-dynamic-extent). R7RS: returned by
+    /// (current-error-port). Foundation: lazily created as a string
+    /// output port the first time it's queried.
+    pub current_error_port: Option<Value>,
     /// User-level call sites pushed as we enter App forms and truncated on
     /// successful eval() return. On error the residue is the call chain
     /// that led to the failing site, used for backtraces.
@@ -112,6 +116,7 @@ impl<'a> EvalCtx<'a> {
             call_stack: Vec::new(),
             current_input_port: None,
             current_output_port: None,
+            current_error_port: None,
         }
     }
 }

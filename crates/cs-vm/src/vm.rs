@@ -28,6 +28,9 @@ thread_local! {
     /// Current output port (R6RS dynamic `current-output-port`). Set by
     /// `with-output-to-string`; read by `display`/`write`/`newline` etc.
     static VM_CURRENT_OUTPUT_PORT: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// Current error port (R7RS `current-error-port`). Lazily initialized
+    /// to a string output port on first query.
+    static VM_CURRENT_ERROR_PORT: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 fn take_pending_values() -> Option<Vec<Value>> {
@@ -104,6 +107,19 @@ pub fn vm_current_input_port_value() -> Option<Value> {
 /// Public accessor for cs-runtime to read the current VM output port.
 pub fn vm_current_output_port_value() -> Option<Value> {
     current_output_port()
+}
+
+/// Public accessor for cs-runtime to read or lazily-init the VM error
+/// port. R7RS `(current-error-port)` returns a port that user code can
+/// write error output to; defaults to a string output port.
+pub fn vm_current_error_port_value() -> Value {
+    VM_CURRENT_ERROR_PORT.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Value::Port(cs_core::Port::string_output()));
+        }
+        slot.clone().unwrap()
+    })
 }
 
 /// Function-pointer hook for `eval`: cs-runtime installs this before driving
