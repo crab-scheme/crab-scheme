@@ -658,24 +658,54 @@ fn run_dispatch(
                             .collect::<Result<_, _>>()?;
                         let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
                         let mut out = Vec::with_capacity(n);
+                        // Hoist the dispatch: when proc is a plain VmBuiltin,
+                        // call its fn pointer directly per element instead of
+                        // re-doing the match/downcast inside vm_call_sync each
+                        // iteration.
+                        let direct_fn: Option<VmBuiltinFn> = match &proc_val {
+                            Value::Procedure(p) => {
+                                p.as_any().downcast_ref::<VmBuiltin>().map(|b| b.f)
+                            }
+                            _ => None,
+                        };
                         if lists.len() == 1 {
-                            // Single-list fast path: avoid per-element row Vec
-                            // allocation by passing a slice view.
                             let list = &lists[0];
-                            for item in list {
-                                let r = vm_call_sync(&proc_val, std::slice::from_ref(item), syms)?;
-                                out.push(r);
+                            if let Some(f) = direct_fn {
+                                for item in list {
+                                    let r = f(std::slice::from_ref(item)).map_err(|e| {
+                                        builtin_err_to_raised("map", &e, syms, call_span)
+                                    })?;
+                                    out.push(r);
+                                }
+                            } else {
+                                for item in list {
+                                    let r =
+                                        vm_call_sync(&proc_val, std::slice::from_ref(item), syms)?;
+                                    out.push(r);
+                                }
                             }
                         } else {
-                            // Multi-list: reuse one row buffer across iterations.
                             let mut row: Vec<Value> = Vec::with_capacity(lists.len());
-                            for i in 0..n {
-                                row.clear();
-                                for l in &lists {
-                                    row.push(l[i].clone());
+                            if let Some(f) = direct_fn {
+                                for i in 0..n {
+                                    row.clear();
+                                    for l in &lists {
+                                        row.push(l[i].clone());
+                                    }
+                                    let r = f(&row).map_err(|e| {
+                                        builtin_err_to_raised("map", &e, syms, call_span)
+                                    })?;
+                                    out.push(r);
                                 }
-                                let r = vm_call_sync(&proc_val, &row, syms)?;
-                                out.push(r);
+                            } else {
+                                for i in 0..n {
+                                    row.clear();
+                                    for l in &lists {
+                                        row.push(l[i].clone());
+                                    }
+                                    let r = vm_call_sync(&proc_val, &row, syms)?;
+                                    out.push(r);
+                                }
                             }
                         }
                         let result = Value::list(out);
@@ -846,24 +876,56 @@ fn run_dispatch(
                             .map(collect_proper_list)
                             .collect::<Result<_, _>>()?;
                         let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+                        // Hoist the dispatch: when proc is a known plain
+                        // VmBuiltin like `+`, grab the fn pointer once and
+                        // skip the per-iteration vm_call_sync match/downcast.
+                        let direct_fn: Option<VmBuiltinFn> = match &proc_val {
+                            Value::Procedure(p) => {
+                                p.as_any().downcast_ref::<VmBuiltin>().map(|b| b.f)
+                            }
+                            _ => None,
+                        };
                         if lists.len() == 1 {
                             // Fast path: single list. Reuse a 2-slot row buf.
                             let list = &lists[0];
                             let mut row: [Value; 2] = [Value::Unspecified, Value::Unspecified];
-                            for item in list {
-                                row[0] = acc;
-                                row[1] = item.clone();
-                                acc = vm_call_sync(&proc_val, &row, syms)?;
+                            if let Some(f) = direct_fn {
+                                for item in list {
+                                    row[0] = acc;
+                                    row[1] = item.clone();
+                                    acc = f(&row).map_err(|e| {
+                                        builtin_err_to_raised("fold-left", &e, syms, call_span)
+                                    })?;
+                                }
+                            } else {
+                                for item in list {
+                                    row[0] = acc;
+                                    row[1] = item.clone();
+                                    acc = vm_call_sync(&proc_val, &row, syms)?;
+                                }
                             }
                         } else {
                             let mut row: Vec<Value> = Vec::with_capacity(lists.len() + 1);
-                            for i in 0..n {
-                                row.clear();
-                                row.push(acc.clone());
-                                for l in &lists {
-                                    row.push(l[i].clone());
+                            if let Some(f) = direct_fn {
+                                for i in 0..n {
+                                    row.clear();
+                                    row.push(acc.clone());
+                                    for l in &lists {
+                                        row.push(l[i].clone());
+                                    }
+                                    acc = f(&row).map_err(|e| {
+                                        builtin_err_to_raised("fold-left", &e, syms, call_span)
+                                    })?;
                                 }
-                                acc = vm_call_sync(&proc_val, &row, syms)?;
+                            } else {
+                                for i in 0..n {
+                                    row.clear();
+                                    row.push(acc.clone());
+                                    for l in &lists {
+                                        row.push(l[i].clone());
+                                    }
+                                    acc = vm_call_sync(&proc_val, &row, syms)?;
+                                }
                             }
                         }
                         stack.push(acc);
