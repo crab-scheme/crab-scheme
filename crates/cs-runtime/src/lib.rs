@@ -198,6 +198,10 @@ impl Runtime {
         vm_env.define(wos_sym, cs_vm::vm::make_vm_with_output_to_string());
         let wis_sym = syms.intern("with-input-from-string");
         vm_env.define(wis_sym, cs_vm::vm::make_vm_with_input_from_string());
+        let wof_sym = syms.intern("with-output-to-file");
+        vm_env.define(wof_sym, cs_vm::vm::make_vm_with_output_to_file());
+        let wiff_sym = syms.intern("with-input-from-file");
+        vm_env.define(wiff_sym, cs_vm::vm::make_vm_with_input_from_file());
         let cip_sym = syms.intern("current-input-port");
         vm_env.define(cip_sym, cs_vm::vm::make_vm_current_input_port());
         let cop_sym = syms.intern("current-output-port");

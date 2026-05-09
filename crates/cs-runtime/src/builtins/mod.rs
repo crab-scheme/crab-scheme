@@ -348,6 +348,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("dynamic-wind", b_dynamic_wind),
         ("with-input-from-string", b_with_input_from_string),
         ("with-output-to-string", b_with_output_to_string),
+        ("with-output-to-file", b_with_output_to_file),
+        ("with-input-from-file", b_with_input_from_file),
         ("current-input-port", b_current_input_port),
         ("current-output-port", b_current_output_port),
         ("gensym", b_gensym),
@@ -3905,6 +3907,66 @@ fn b_with_output_to_string(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, S
         Port::StringOutput(buf) => Ok(Value::string(buf.borrow().clone())),
         _ => unreachable!(),
     }
+}
+
+/// `(with-output-to-file path thunk)` — open `path` for output, run
+/// `thunk` with `current-output-port` redirected to it, then close the
+/// file (which flushes the buffer to disk). Returns the thunk's value.
+/// Errors raised inside the thunk still close the file.
+fn b_with_output_to_file(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("with-output-to-file", "2", args.len()));
+    }
+    let path = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("with-output-to-file", "string", v)),
+    };
+    // Eager check: surface I/O errors before running the thunk.
+    std::fs::write(&path, "")
+        .map_err(|e| format!("with-output-to-file: cannot create {}: {}", path, e))?;
+    let port = Port::file_output(path.clone());
+    let port_val = Value::Port(port.clone());
+    let prev = ctx.current_output_port.take();
+    ctx.current_output_port = Some(port_val);
+    let result = apply_procedure(&args[1], &[], ctx);
+    ctx.current_output_port = prev;
+    // Always flush+close the port, even if the thunk raised — programs
+    // that catch the condition can rely on partial output landing on
+    // disk before the propagation continues.
+    if let Port::FileOutput(state) = &*port {
+        let mut s = state.borrow_mut();
+        if !s.closed {
+            let buf = std::mem::take(&mut s.buf);
+            s.closed = true;
+            drop(s);
+            std::fs::write(&path, &buf)
+                .map_err(|e| format!("with-output-to-file: write {} failed: {}", path, e))?;
+        }
+    }
+    result.map_err(|e| e.message())
+}
+
+/// `(with-input-from-file path thunk)` — read `path` into a string-input
+/// port, run `thunk` with `current-input-port` redirected to it, then
+/// restore. Returns the thunk's value. The file is read in full at
+/// open time; streaming file input is a future iteration.
+fn b_with_input_from_file(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("with-input-from-file", "2", args.len()));
+    }
+    let path = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("with-input-from-file", "string", v)),
+    };
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| format!("with-input-from-file: cannot read {}: {}", path, e))?;
+    let port = Port::string_input(&contents);
+    let port_val = Value::Port(port);
+    let prev = ctx.current_input_port.take();
+    ctx.current_input_port = Some(port_val);
+    let result = apply_procedure(&args[1], &[], ctx).map_err(|e| e.message());
+    ctx.current_input_port = prev;
+    result
 }
 
 fn b_force(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {

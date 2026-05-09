@@ -261,6 +261,43 @@ fn open_output_file_writes_then_close_flushes() {
 }
 
 #[test]
+fn with_output_to_file_then_with_input_from_file() {
+    // R7RS round-trip: write via with-output-to-file, then read back via
+    // with-input-from-file using read-line.
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "crabscheme-test-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path_s = path.to_string_lossy().replace('\\', "\\\\");
+    let prog = format!(
+        r#"
+(with-output-to-file "{0}"
+  (lambda ()
+    (display "alpha")
+    (newline)
+    (display "beta")
+    (newline)
+    (display "gamma")))
+(define lines
+  (with-input-from-file "{0}"
+    (lambda () (list (read-line) (read-line) (read-line)))))
+(display (length lines))
+(display " ")
+(display (car (cdr lines)))"#,
+        path_s
+    );
+    let (out, err, code) = run_eval(&prog);
+    assert_eq!(code, 0, "stderr: {:?}", err);
+    assert_eq!(out.trim(), "3 beta");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn write_after_close_raises_catchable_condition() {
     let dir = std::env::temp_dir();
     let path = dir.join(format!(

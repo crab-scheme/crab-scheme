@@ -1335,6 +1335,96 @@ fn run_dispatch(
                         }
                         continue;
                     }
+                    if p.as_any().downcast_ref::<VmWithOutputToFile>().is_some() {
+                        if args.len() != 2 {
+                            return Err(VmError::new("with-output-to-file: 2 args"));
+                        }
+                        let path = match &args[0] {
+                            Value::String(s) => s.borrow().clone(),
+                            other => {
+                                return Err(VmError::new(format!(
+                                    "with-output-to-file: expected string, got {}",
+                                    other.type_name()
+                                )));
+                            }
+                        };
+                        // Eager creation surfaces I/O errors before the
+                        // thunk runs.
+                        std::fs::write(&path, "").map_err(|e| {
+                            VmError::new(format!(
+                                "with-output-to-file: cannot create {}: {}",
+                                path, e
+                            ))
+                        })?;
+                        let thunk = args.remove(1);
+                        let port = cs_core::Port::file_output(path.clone());
+                        let port_val = Value::Port(port.clone());
+                        let prev = swap_output_port(Some(port_val));
+                        let res = vm_call_sync(&thunk, &[], syms);
+                        swap_output_port(prev);
+                        // Always flush, even on error.
+                        if let cs_core::Port::FileOutput(state) = &*port {
+                            let mut s = state.borrow_mut();
+                            if !s.closed {
+                                let buf = std::mem::take(&mut s.buf);
+                                s.closed = true;
+                                drop(s);
+                                std::fs::write(&path, &buf).map_err(|e| {
+                                    VmError::new(format!(
+                                        "with-output-to-file: write {} failed: {}",
+                                        path, e
+                                    ))
+                                })?;
+                            }
+                        }
+                        let v = res?;
+                        stack.push(v);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack.pop().ok_or_else(|| {
+                                    VmError::new("empty stack at tail-with-output-to-file")
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    if p.as_any().downcast_ref::<VmWithInputFromFile>().is_some() {
+                        if args.len() != 2 {
+                            return Err(VmError::new("with-input-from-file: 2 args"));
+                        }
+                        let path = match &args[0] {
+                            Value::String(s) => s.borrow().clone(),
+                            other => {
+                                return Err(VmError::new(format!(
+                                    "with-input-from-file: expected string, got {}",
+                                    other.type_name()
+                                )));
+                            }
+                        };
+                        let contents = std::fs::read_to_string(&path).map_err(|e| {
+                            VmError::new(format!(
+                                "with-input-from-file: cannot read {}: {}",
+                                path, e
+                            ))
+                        })?;
+                        let thunk = args.remove(1);
+                        let port = Value::Port(cs_core::Port::string_input(&contents));
+                        let prev = swap_input_port(Some(port));
+                        let res = vm_call_sync(&thunk, &[], syms);
+                        swap_input_port(prev);
+                        let v = res?;
+                        stack.push(v);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack.pop().ok_or_else(|| {
+                                    VmError::new("empty stack at tail-with-input-from-file")
+                                });
+                            }
+                        }
+                        continue;
+                    }
                     if p.as_any().downcast_ref::<VmCallCc>().is_some() {
                         if args.len() != 1 {
                             return Err(VmError::new("call/cc: 1 arg"));
@@ -2403,6 +2493,10 @@ pub struct VmWithOutputToString;
 #[derive(Debug)]
 pub struct VmWithInputFromString;
 #[derive(Debug)]
+pub struct VmWithOutputToFile;
+#[derive(Debug)]
+pub struct VmWithInputFromFile;
+#[derive(Debug)]
 pub struct VmCurrentInputPort;
 #[derive(Debug)]
 pub struct VmCurrentOutputPort;
@@ -2411,6 +2505,8 @@ impl_proc_named!(VmWrite, "write");
 impl_proc_named!(VmNewline, "newline");
 impl_proc_named!(VmWithOutputToString, "with-output-to-string");
 impl_proc_named!(VmWithInputFromString, "with-input-from-string");
+impl_proc_named!(VmWithOutputToFile, "with-output-to-file");
+impl_proc_named!(VmWithInputFromFile, "with-input-from-file");
 impl_proc_named!(VmCurrentInputPort, "current-input-port");
 impl_proc_named!(VmCurrentOutputPort, "current-output-port");
 pub fn make_vm_display() -> Value {
@@ -2424,6 +2520,12 @@ pub fn make_vm_newline() -> Value {
 }
 pub fn make_vm_with_output_to_string() -> Value {
     Value::Procedure(Rc::new(VmWithOutputToString) as Rc<dyn Procedure>)
+}
+pub fn make_vm_with_output_to_file() -> Value {
+    Value::Procedure(Rc::new(VmWithOutputToFile) as Rc<dyn Procedure>)
+}
+pub fn make_vm_with_input_from_file() -> Value {
+    Value::Procedure(Rc::new(VmWithInputFromFile) as Rc<dyn Procedure>)
 }
 pub fn make_vm_with_input_from_string() -> Value {
     Value::Procedure(Rc::new(VmWithInputFromString) as Rc<dyn Procedure>)
