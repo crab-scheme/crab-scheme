@@ -212,12 +212,14 @@ Iters 117+ are filling R7RS gaps one per iter:
 - 121 `#u8(...)` literal end-to-end (lex/parse/expand/eval)
 - 122 `#\alarm`, `#\backspace`, `#\delete`, `#\escape` named chars + `#\xHH...`
 - 123 string escapes `\v`, `\f`, `\|`, `\xHH;`, line continuation
-- 124 `|pipe-quoted|` identifiers (this iter)
+- 124 `|pipe-quoted|` identifiers
+- 125 R7RS port-output: write-string slicing, write-u8, write-bytevector,
+  open-output-string/bytevector aliases, get-output-bytevector (this iter)
 
 Current totals:
-- 78 conformance test files (cli)
-- VM tier: 80 tests
-- Aggregate: 1643 individual Scheme tests passing
+- 79 conformance test files (cli)
+- VM tier: 81 tests
+- Aggregate: 1659 individual Scheme tests passing
 
 ## Loop cadence
 

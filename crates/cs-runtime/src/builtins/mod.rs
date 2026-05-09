@@ -426,6 +426,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // R7RS aliases for the R6RS open-{string,bytevector}-input-port forms.
         ("open-input-string", b_open_string_input_port),
         ("open-input-bytevector", b_open_bytevector_input_port),
+        ("open-output-string", b_open_string_output_port),
+        ("open-output-bytevector", b_open_bytevector_output_port),
+        ("get-output-bytevector", b_get_bytevector_output_port),
         ("char-ready?", b_char_ready_p),
         ("read-u8", b_read_u8),
         ("peek-u8", b_peek_u8),
@@ -437,6 +440,8 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("output-port?", b_output_port_p),
         ("write-char", b_write_char),
         ("write-string", b_write_string),
+        ("write-u8", b_write_u8),
+        ("write-bytevector", b_write_bytevector),
         // promises
         ("promise?", b_promise_p),
         ("make-promise", b_make_promise),
@@ -5698,22 +5703,125 @@ fn b_write_char(args: &[Value]) -> Result<Value, String> {
 }
 
 fn b_write_string(args: &[Value]) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(arity_err("write-string", "2", args.len()));
+    // R7RS: (write-string string port [start [end]])
+    if args.len() < 2 || args.len() > 4 {
+        return Err(arity_err("write-string", "2..4", args.len()));
     }
     let s = match &args[0] {
         Value::String(s) => s.borrow().clone(),
         v => return Err(type_err("write-string", "string", v)),
     };
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let start = if args.len() >= 3 {
+        match &args[2] {
+            Value::Number(n) => match n.to_f64() as i64 {
+                i if i >= 0 && (i as usize) <= len => i as usize,
+                _ => return Err(format!("write-string: start out of range: {}", n.to_f64())),
+            },
+            v => return Err(type_err("write-string", "exact integer start", v)),
+        }
+    } else {
+        0
+    };
+    let end = if args.len() == 4 {
+        match &args[3] {
+            Value::Number(n) => match n.to_f64() as i64 {
+                i if i >= 0 && (i as usize) <= len && (i as usize) >= start => i as usize,
+                _ => return Err(format!("write-string: end out of range: {}", n.to_f64())),
+            },
+            v => return Err(type_err("write-string", "exact integer end", v)),
+        }
+    } else {
+        len
+    };
+    let slice: String = chars[start..end].iter().collect();
     match &args[1] {
         Value::Port(p) => match &**p {
             Port::StringOutput(buf) => {
-                buf.borrow_mut().push_str(&s);
+                buf.borrow_mut().push_str(&slice);
                 Ok(Value::Unspecified)
             }
             _ => Err("write-string: not an output port".into()),
         },
         v => Err(type_err("write-string", "output-port", v)),
+    }
+}
+
+fn b_write_u8(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("write-u8", "2", args.len()));
+    }
+    let byte = match &args[0] {
+        Value::Number(n) => match n.to_f64() as i64 {
+            i if (0..=255).contains(&i) => i as u8,
+            _ => return Err(format!("write-u8: byte out of range: {}", n.to_f64())),
+        },
+        v => return Err(type_err("write-u8", "byte (0..255)", v)),
+    };
+    match &args[1] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorOutput(buf) => {
+                buf.borrow_mut().push(byte);
+                Ok(Value::Unspecified)
+            }
+            _ => Err("write-u8: not a binary output port".into()),
+        },
+        v => Err(type_err("write-u8", "output-port", v)),
+    }
+}
+
+fn b_write_bytevector(args: &[Value]) -> Result<Value, String> {
+    // R7RS: (write-bytevector bv port [start [end]])
+    if args.len() < 2 || args.len() > 4 {
+        return Err(arity_err("write-bytevector", "2..4", args.len()));
+    }
+    let bytes = match &args[0] {
+        Value::ByteVector(b) => b.borrow().clone(),
+        v => return Err(type_err("write-bytevector", "bytevector", v)),
+    };
+    let len = bytes.len();
+    let start = if args.len() >= 3 {
+        match &args[2] {
+            Value::Number(n) => match n.to_f64() as i64 {
+                i if i >= 0 && (i as usize) <= len => i as usize,
+                _ => {
+                    return Err(format!(
+                        "write-bytevector: start out of range: {}",
+                        n.to_f64()
+                    ))
+                }
+            },
+            v => return Err(type_err("write-bytevector", "exact integer start", v)),
+        }
+    } else {
+        0
+    };
+    let end = if args.len() == 4 {
+        match &args[3] {
+            Value::Number(n) => match n.to_f64() as i64 {
+                i if i >= 0 && (i as usize) <= len && (i as usize) >= start => i as usize,
+                _ => {
+                    return Err(format!(
+                        "write-bytevector: end out of range: {}",
+                        n.to_f64()
+                    ))
+                }
+            },
+            v => return Err(type_err("write-bytevector", "exact integer end", v)),
+        }
+    } else {
+        len
+    };
+    match &args[1] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorOutput(buf) => {
+                buf.borrow_mut().extend_from_slice(&bytes[start..end]);
+                Ok(Value::Unspecified)
+            }
+            _ => Err("write-bytevector: not a binary output port".into()),
+        },
+        v => Err(type_err("write-bytevector", "output-port", v)),
     }
 }
 
