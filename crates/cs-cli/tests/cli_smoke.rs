@@ -269,6 +269,42 @@ fn run_metacircular_vm() {
 }
 
 #[test]
+fn walker_runtime_error_includes_call_stack_backtrace() {
+    // Same fixture as the VM test, but on the walker tier. The walker
+    // pushes App spans onto ctx.call_stack regardless of tail-call
+    // status, so even tail-call chains contribute backtrace entries
+    // (the VM only shows non-tail Frames).
+    let bt_test = std::env::temp_dir().join("crabscheme_walker_bt_smoke.scm");
+    std::fs::write(
+        &bt_test,
+        "(define (deep-error)\n  (foo 1 2)\n  'unreachable)\n\
+         (define (middle)\n  (deep-error)\n  'unreachable)\n\
+         (define (outer)\n  (middle)\n  'unreachable)\n\
+         (outer)\n",
+    )
+    .unwrap();
+    let out = cli()
+        .args(["run", bt_test.to_str().unwrap()])
+        .output()
+        .expect("walker");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("undefined variable: foo"), "{}", err);
+    assert!(
+        err.contains("called from [1]"),
+        "innermost-frame note missing: {}",
+        err
+    );
+    let count = err.matches("called from").count();
+    assert!(
+        count >= 2,
+        "expected ≥2 backtrace lines, got {}: {}",
+        count,
+        err
+    );
+    let _ = std::fs::remove_file(&bt_test);
+}
+
+#[test]
 fn vm_runtime_error_includes_call_stack_backtrace() {
     // Three nested non-tail calls; deepest one references an undefined
     // variable. The VM walks frames at error time and emits one note per

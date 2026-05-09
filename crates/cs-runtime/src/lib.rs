@@ -372,6 +372,11 @@ impl Runtime {
         // higher builtin).
         let pending_raise = ctx.pending_raise.take();
         let pending_escape = ctx.pending_escape.take();
+        // The eval Err path leaves ctx.call_stack intact — copy out for the
+        // diagnostic before ctx drops. Innermost-last; we'll render in
+        // reverse so the deepest "called from" appears first under the
+        // primary error site.
+        let walker_backtrace = ctx.call_stack.clone();
         result.map_err(|e: EvalError| {
             let msg = match &e.kind {
                 crate::eval::EvalErrorKind::Raised(v) => format_condition(v, &self.syms),
@@ -396,7 +401,31 @@ impl Runtime {
                     other => other.to_string(),
                 },
             };
-            Diagnostic::error(msg, e.span).with_code("E_RUNTIME")
+            let mut diag = Diagnostic::error(msg, e.span).with_code("E_RUNTIME");
+            // Render call sites innermost-first. Drop the deepest entry
+            // (it's the App whose evaluation directly produced the error;
+            // its span overlaps the primary error span and would be
+            // redundant in the trace).
+            let trace = if walker_backtrace.is_empty() {
+                &[][..]
+            } else {
+                &walker_backtrace[..walker_backtrace.len() - 1]
+            };
+            for (i, bt_span) in trace.iter().rev().enumerate() {
+                if bt_span.is_dummy() {
+                    continue;
+                }
+                let (line, col) = self.sources.line_col(*bt_span);
+                let name = self.sources.name(bt_span.file);
+                diag = diag.with_note(format!(
+                    "called from {}({}:{}:{})",
+                    if i == 0 { "[1] " } else { "    " },
+                    name,
+                    line,
+                    col
+                ));
+            }
+            diag
         })
     }
 

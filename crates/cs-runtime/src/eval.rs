@@ -24,6 +24,11 @@ pub enum EvalErrorKind {
 pub struct EvalError {
     pub kind: EvalErrorKind,
     pub span: Span,
+    /// Call-site spans captured from `EvalCtx.call_stack` at the moment
+    /// the error was raised. Innermost-last (the deepest still-pending
+    /// App is at the end). Populated by the runtime when constructing a
+    /// Diagnostic from the error.
+    pub backtrace: Vec<Span>,
 }
 
 impl EvalError {
@@ -31,6 +36,7 @@ impl EvalError {
         Self {
             kind: EvalErrorKind::Message(message.into()),
             span,
+            backtrace: Vec::new(),
         }
     }
 
@@ -38,6 +44,7 @@ impl EvalError {
         Self {
             kind: EvalErrorKind::Raised(condition),
             span,
+            backtrace: Vec::new(),
         }
     }
 
@@ -55,6 +62,7 @@ impl EvalError {
         Self {
             kind: EvalErrorKind::Escape(id, v),
             span,
+            backtrace: Vec::new(),
         }
     }
 }
@@ -80,6 +88,10 @@ pub struct EvalCtx<'a> {
     pub current_input_port: Option<Value>,
     /// Current output port (per-dynamic-extent).
     pub current_output_port: Option<Value>,
+    /// User-level call sites pushed as we enter App forms and truncated on
+    /// successful eval() return. On error the residue is the call chain
+    /// that led to the failing site, used for backtraces.
+    pub call_stack: Vec<Span>,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -97,6 +109,7 @@ impl<'a> EvalCtx<'a> {
             pending_raise: None,
             pending_escape: None,
             pending_values: None,
+            call_stack: Vec::new(),
             current_input_port: None,
             current_output_port: None,
         }
@@ -190,6 +203,15 @@ pub fn apply_procedure(
 }
 
 pub fn eval(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+    let stack_snapshot = ctx.call_stack.len();
+    let r = eval_inner(expr, env, ctx);
+    if r.is_ok() {
+        ctx.call_stack.truncate(stack_snapshot);
+    }
+    r
+}
+
+fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let mut cur_expr = expr.clone();
     let mut cur_env = env;
 
@@ -258,6 +280,7 @@ pub fn eval(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Value,
                 continue;
             }
             CoreExpr::App { func, args, span } => {
+                ctx.call_stack.push(span);
                 let func_val = eval(&func, cur_env.clone(), ctx)?;
                 let mut arg_vals = Vec::with_capacity(args.len());
                 for a in &args {
