@@ -353,6 +353,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("subvector", b_subvector),
         ("make-list", b_make_list),
         ("list-copy", b_list_copy),
+        ("list-set!", b_list_set_bang),
+        ("boolean=?", b_boolean_eq),
+        ("symbol=?", b_symbol_eq),
         ("bytevector-copy!", b_bytevector_copy_bang),
         ("string-copy!", b_string_copy_bang),
         // bytevectors
@@ -2059,6 +2062,68 @@ fn b_list_ref(args: &[Value]) -> Result<Value, String> {
         Value::Pair(p) => Ok(p.car.borrow().clone()),
         _ => Err("list-ref: index out of range".into()),
     }
+}
+
+/// R7RS `(list-set! list k obj)` — destructively replace the element at
+/// index k. Walks k cdrs and uses set-car! on the resulting pair.
+fn b_list_set_bang(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("list-set!", "3", args.len()));
+    }
+    let tail = b_list_tail(&args[..2])?;
+    match tail {
+        Value::Pair(p) => {
+            *p.car.borrow_mut() = args[2].clone();
+            Ok(Value::Unspecified)
+        }
+        _ => Err("list-set!: index out of range".into()),
+    }
+}
+
+/// R7RS `(boolean=? bool1 bool2 bool3 ...)` — true iff all booleans are
+/// the same. Requires at least two args; all must be booleans.
+fn b_boolean_eq(args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err(arity_err("boolean=?", "2 or more", args.len()));
+    }
+    let first = match &args[0] {
+        Value::Boolean(b) => *b,
+        v => return Err(type_err("boolean=?", "boolean", v)),
+    };
+    for v in &args[1..] {
+        match v {
+            Value::Boolean(b) => {
+                if *b != first {
+                    return Ok(Value::Boolean(false));
+                }
+            }
+            other => return Err(type_err("boolean=?", "boolean", other)),
+        }
+    }
+    Ok(Value::Boolean(true))
+}
+
+/// R7RS `(symbol=? sym1 sym2 sym3 ...)` — true iff all symbols are the
+/// same (uses Symbol identity, which equals interned-name equality).
+fn b_symbol_eq(args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err(arity_err("symbol=?", "2 or more", args.len()));
+    }
+    let first = match &args[0] {
+        Value::Symbol(s) => *s,
+        v => return Err(type_err("symbol=?", "symbol", v)),
+    };
+    for v in &args[1..] {
+        match v {
+            Value::Symbol(s) => {
+                if *s != first {
+                    return Ok(Value::Boolean(false));
+                }
+            }
+            other => return Err(type_err("symbol=?", "symbol", other)),
+        }
+    }
+    Ok(Value::Boolean(true))
 }
 
 fn b_eq(args: &[Value]) -> Result<Value, String> {

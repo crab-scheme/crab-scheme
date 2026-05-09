@@ -784,3 +784,11 @@ fn vm_conformance_r7rs_port_mgmt() {
     println!("r7rs_port_mgmt: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_eq_predicates() {
+    let walker = pass_count_walker("r7rs_eq_predicates.scm");
+    let vm = pass_count_vm("r7rs_eq_predicates.scm").expect("vm should run r7rs_eq_predicates.scm");
+    println!("r7rs_eq_predicates: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

@@ -224,12 +224,13 @@ Iters 117+ are filling R7RS gaps one per iter:
   call-with-output-string. Both tiers via vm_call_sync shims
 - 130 R7RS port management: close-input-port, close-output-port,
   flush-output-port, input-port-open?, output-port-open?
-  (this iter)
+- 131 R7RS variadic eq predicates + list-set!: boolean=?, symbol=?,
+  list-set! (this iter)
 
 Current totals:
-- 84 conformance test files (cli)
-- VM tier: 86 tests
-- Aggregate: 1732 individual Scheme tests passing
+- 85 conformance test files (cli)
+- VM tier: 87 tests
+- Aggregate: 1757 individual Scheme tests passing
 
 ## Loop cadence
 
