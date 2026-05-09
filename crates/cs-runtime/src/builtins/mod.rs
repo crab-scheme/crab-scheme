@@ -146,6 +146,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("boolean?", b_boolean_p),
         ("pair?", b_pair_p),
         ("null?", b_null_p),
+        ("list?", b_list_p),
         ("symbol?", b_symbol_p),
         ("string?", b_string_p),
         ("procedure?", b_procedure_p),
@@ -289,6 +290,13 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("string-replace", b_string_replace),
         ("string-replace-all", b_string_replace_all),
         ("string-count", b_string_count),
+        // R7RS time / process / environment.
+        ("current-second", b_current_second),
+        ("current-jiffy", b_current_jiffy),
+        ("jiffies-per-second", b_jiffies_per_second),
+        ("get-environment-variable", b_get_environment_variable),
+        ("get-environment-variables", b_get_environment_variables),
+        ("command-line", b_command_line),
         ("string-split", b_string_split),
         ("string-join", b_string_join),
         ("string->vector", b_string_to_vector),
@@ -1603,6 +1611,45 @@ fn b_null_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("null?", "1", args.len()));
     }
     Ok(Value::Boolean(matches!(args[0], Value::Null)))
+}
+
+/// `list?` (R7RS): true iff the argument is a proper list (terminates
+/// in '()). Walks the spine; returns #f on any improper tail and on
+/// any infinite cycle (detected via Floyd's tortoise/hare).
+fn b_list_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("list?", "1", args.len()));
+    }
+    fn step(v: &Value) -> Option<Value> {
+        match v {
+            Value::Pair(p) => Some(p.cdr.borrow().clone()),
+            _ => None,
+        }
+    }
+    let mut slow = args[0].clone();
+    let mut fast = args[0].clone();
+    loop {
+        match &fast {
+            Value::Null => return Ok(Value::Boolean(true)),
+            Value::Pair(_) => {}
+            _ => return Ok(Value::Boolean(false)),
+        }
+        let f1 = step(&fast).unwrap();
+        match &f1 {
+            Value::Null => return Ok(Value::Boolean(true)),
+            Value::Pair(_) => {}
+            _ => return Ok(Value::Boolean(false)),
+        }
+        let f2 = step(&f1).unwrap();
+        let s1 = step(&slow).unwrap();
+        if let (Value::Pair(s), Value::Pair(f)) = (&s1, &f2) {
+            if std::rc::Rc::ptr_eq(s, f) {
+                return Ok(Value::Boolean(false));
+            }
+        }
+        slow = s1;
+        fast = f2;
+    }
 }
 
 fn b_symbol_p(args: &[Value]) -> Result<Value, String> {
@@ -7392,6 +7439,87 @@ fn b_string_count(args: &[Value]) -> Result<Value, String> {
         v => return Err(type_err("string-count", "character or string", v)),
     };
     Ok(Value::fixnum(count))
+}
+
+// =====================================================================
+// R7RS time + process + environment builtins.
+
+/// `current-second` — fractional seconds since the Unix epoch (R7RS).
+/// Returns an inexact (flonum) per the spec; clock skews/leap-seconds
+/// inherit whatever the OS clock provides.
+fn b_current_second(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("current-second", "0", args.len()));
+    }
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("current-second: clock error: {}", e))?;
+    Ok(Value::flonum(dur.as_secs_f64()))
+}
+
+/// `current-jiffy` — monotonic counter as exact integer (R7RS).
+/// We tick at nanosecond resolution → `jiffies-per-second` is 1e9.
+fn b_current_jiffy(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("current-jiffy", "0", args.len()));
+    }
+    use std::time::Instant;
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    let elapsed = epoch.elapsed().as_nanos();
+    if elapsed <= i64::MAX as u128 {
+        Ok(Value::fixnum(elapsed as i64))
+    } else {
+        // Overflow path — once we've been running >292 years.
+        Ok(Value::Number(
+            Number::parse_decimal_integer(&elapsed.to_string())
+                .ok_or_else(|| "current-jiffy: bigint format failure".to_string())?,
+        ))
+    }
+}
+
+/// `jiffies-per-second` — constant 10^9 (we tick in nanoseconds).
+fn b_jiffies_per_second(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("jiffies-per-second", "0", args.len()));
+    }
+    Ok(Value::fixnum(1_000_000_000))
+}
+
+/// `get-environment-variable` — returns the value as a string, or #f if unset.
+fn b_get_environment_variable(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("get-environment-variable", "1", args.len()));
+    }
+    let name = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("get-environment-variable", "string", v)),
+    };
+    Ok(match std::env::var(&name) {
+        Ok(v) => Value::string(v),
+        Err(_) => Value::Boolean(false),
+    })
+}
+
+/// `get-environment-variables` — returns an alist `((name . value) ...)`.
+fn b_get_environment_variables(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("get-environment-variables", "0", args.len()));
+    }
+    let pairs: Vec<Value> = std::env::vars()
+        .map(|(k, v)| Value::Pair(cs_core::Pair::new(Value::string(k), Value::string(v))))
+        .collect();
+    Ok(Value::list(pairs))
+}
+
+/// `command-line` — returns process argv as a list of strings.
+fn b_command_line(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("command-line", "0", args.len()));
+    }
+    let argv: Vec<Value> = std::env::args().map(Value::string).collect();
+    Ok(Value::list(argv))
 }
 
 fn b_string_split(args: &[Value]) -> Result<Value, String> {

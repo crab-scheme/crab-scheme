@@ -592,3 +592,11 @@ fn vm_conformance_string_search() {
     println!("string_search: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_time_env() {
+    let walker = pass_count_walker("r7rs_time_env.scm");
+    let vm = pass_count_vm("r7rs_time_env.scm").expect("vm should run r7rs_time_env.scm");
+    println!("r7rs_time_env: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

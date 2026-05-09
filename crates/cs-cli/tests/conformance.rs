@@ -389,6 +389,11 @@ fn conformance_string_search() {
 }
 
 #[test]
+fn conformance_r7rs_time_env() {
+    run_conformance_file("r7rs_time_env.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -471,6 +476,7 @@ fn conformance_aggregate_count() {
                 "ho_dispatch_hoist.scm",
                 "endianness_macro.scm",
                 "string_search.scm",
+                "r7rs_time_env.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
