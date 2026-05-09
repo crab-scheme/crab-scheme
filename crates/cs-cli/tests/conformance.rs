@@ -379,6 +379,11 @@ fn conformance_ho_dispatch_hoist() {
 }
 
 #[test]
+fn conformance_endianness_macro() {
+    run_conformance_file("endianness_macro.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -459,6 +464,7 @@ fn conformance_aggregate_count() {
                 "exactness_extras.scm",
                 "bytevector_typed.scm",
                 "ho_dispatch_hoist.scm",
+                "endianness_macro.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

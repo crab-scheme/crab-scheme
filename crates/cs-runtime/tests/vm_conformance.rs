@@ -576,3 +576,11 @@ fn vm_conformance_ho_dispatch_hoist() {
     println!("ho_dispatch_hoist: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_endianness_macro() {
+    let walker = pass_count_walker("endianness_macro.scm");
+    let vm = pass_count_vm("endianness_macro.scm").expect("vm should run endianness_macro.scm");
+    println!("endianness_macro: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

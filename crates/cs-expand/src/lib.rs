@@ -167,6 +167,7 @@ struct Keywords {
     case_lambda: Symbol,
     cond_expand: Symbol,
     include: Symbol,
+    endianness: Symbol,
 }
 
 impl Keywords {
@@ -219,6 +220,7 @@ impl Keywords {
             case_lambda: syms.intern("case-lambda"),
             cond_expand: syms.intern("cond-expand"),
             include: syms.intern("include"),
+            endianness: syms.intern("endianness"),
         }
     }
 }
@@ -708,6 +710,9 @@ impl<'a> Expander<'a> {
             }
             if s == self.keywords.assert_ {
                 return self.expand_assert(&tail_items, span);
+            }
+            if s == self.keywords.endianness {
+                return self.expand_endianness(&tail_items, span);
             }
             if s == self.keywords.case_lambda {
                 return self.expand_case_lambda(&tail_items, span);
@@ -2515,6 +2520,39 @@ impl<'a> Expander<'a> {
             alt: Rc::new(error_call),
             span,
         })
+    }
+
+    /// R6RS `(endianness <symbol>)` macro. Expands to a quoted symbol; only
+    /// the literal identifiers `big` and `little` are accepted (anything
+    /// else is a syntax error). The result is consumed by the typed
+    /// bytevector accessors in (rnrs bytevectors).
+    fn expand_endianness(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        if items.len() != 1 {
+            return Err(ExpandError::BadSyntax {
+                what: "endianness expects exactly one identifier".into(),
+                span,
+            });
+        }
+        match &items[0] {
+            Datum::Symbol(s, _) => {
+                let name = self.syms.name(*s);
+                if name == "big" || name == "little" {
+                    Ok(CoreExpr::Const {
+                        value: Value::Symbol(*s),
+                        span,
+                    })
+                } else {
+                    Err(ExpandError::BadSyntax {
+                        what: format!("endianness: unknown endianness '{}", name),
+                        span,
+                    })
+                }
+            }
+            _ => Err(ExpandError::BadSyntax {
+                what: "endianness: expected an identifier (big or little)".into(),
+                span,
+            }),
+        }
     }
 
     fn expand_delay(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
