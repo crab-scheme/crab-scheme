@@ -29,10 +29,10 @@
 ; --- char-ready? on non-textual port raises ---
 (test-true "cr-on-binary-raises"
   (with-exception-handler (lambda (c) (error? c))
-    (lambda () (char-ready? (open-input-bytevector (u8-list->bytevector '(1 2 3)))))))
+    (lambda () (char-ready? (open-input-bytevector #u8(1 2 3))))))
 
 ; --- read-u8 / peek-u8 on bytevector input ---
-(let ((p (open-input-bytevector (u8-list->bytevector '(10 20 30)))))
+(let ((p (open-input-bytevector #u8(10 20 30))))
   (test-eqv "ru8-peek1" 10 (peek-u8 p))
   (test-eqv "ru8-peek2-still-10" 10 (peek-u8 p))
   (test-eqv "ru8-read1" 10 (read-u8 p))
@@ -42,26 +42,26 @@
   (test-equal "ru8-peek-eof" (eof-object) (peek-u8 p)))
 
 ; --- u8-ready? on a binary port ---
-(let ((p (open-input-bytevector (u8-list->bytevector '(1 2)))))
+(let ((p (open-input-bytevector #u8(1 2))))
   (test-true "u8r-pre"  (u8-ready? p))
   (read-u8 p)
   (read-u8 p)
   (test-true "u8r-eof" (u8-ready? p)))
 
 ; --- read-bytevector reads up to k bytes ---
-(let ((p (open-input-bytevector (u8-list->bytevector '(1 2 3 4 5)))))
-  (test-equal "rbv-3"   (u8-list->bytevector '(1 2 3)) (read-bytevector 3 p))
-  (test-equal "rbv-rest" (u8-list->bytevector '(4 5))   (read-bytevector 100 p))
+(let ((p (open-input-bytevector #u8(1 2 3 4 5))))
+  (test-equal "rbv-3"   #u8(1 2 3) (read-bytevector 3 p))
+  (test-equal "rbv-rest" #u8(4 5)   (read-bytevector 100 p))
   (test-equal "rbv-eof"  (eof-object) (read-bytevector 1 p)))
 
-(let ((p (open-input-bytevector (u8-list->bytevector '(99)))))
-  (test-equal "rbv-zero" (u8-list->bytevector '()) (read-bytevector 0 p))
-  (test-equal "rbv-1"    (u8-list->bytevector '(99)) (read-bytevector 1 p)))
+(let ((p (open-input-bytevector #u8(99))))
+  (test-equal "rbv-zero" #u8() (read-bytevector 0 p))
+  (test-equal "rbv-1"    #u8(99) (read-bytevector 1 p)))
 
 ; --- read-string on binary port raises ---
 (test-true "rs-on-binary-raises"
   (with-exception-handler (lambda (c) (error? c))
-    (lambda () (read-string 1 (open-input-bytevector (u8-list->bytevector '(1 2)))))))
+    (lambda () (read-string 1 (open-input-bytevector #u8(1 2))))))
 
 ; --- read-u8 on textual port raises ---
 (test-true "ru8-on-textual-raises"
@@ -74,4 +74,4 @@
     (lambda () (read-string -1 (sip "abc")))))
 (test-true "rbv-neg-raises"
   (with-exception-handler (lambda (c) (error? c))
-    (lambda () (read-bytevector -1 (open-input-bytevector (u8-list->bytevector '(1)))))))
+    (lambda () (read-bytevector -1 (open-input-bytevector #u8(1))))))
