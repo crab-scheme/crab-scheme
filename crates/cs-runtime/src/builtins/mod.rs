@@ -297,8 +297,6 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("hashtable->alist", b_hashtable_to_alist),
         ("alist->hashtable", b_alist_to_hashtable),
         // (hashtable-update! is higher-order — see below)
-        // i/o (no syms — those are HO below)
-        ("newline", b_newline),
         // R7RS portability
         ("crabscheme-version", b_crabscheme_version),
     ]
@@ -311,6 +309,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("for-each", b_for_each),
         ("display", b_display),
         ("write", b_write),
+        ("newline", b_newline),
         ("raise", b_raise),
         ("display-condition", b_display_condition),
         // raise-continuable: in proper R6RS, the current exception handler
@@ -1322,12 +1321,11 @@ fn b_crabscheme_version(args: &[Value]) -> Result<Value, String> {
     Ok(Value::string(env!("CARGO_PKG_VERSION")))
 }
 
-fn b_newline(args: &[Value]) -> Result<Value, String> {
-    if !args.is_empty() {
-        return Err(arity_err("newline", "0", args.len()));
+fn b_newline(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err("newline", "0 or 1", args.len()));
     }
-    println!();
-    Ok(Value::Unspecified)
+    write_output("\n", args.first().cloned(), ctx)
 }
 
 // ---- higher-order builtins ----
@@ -1426,6 +1424,14 @@ fn write_output(s: &str, explicit_port: Option<Value>, ctx: &mut EvalCtx) -> Res
         Some(Value::Port(p)) => match &*p {
             Port::StringOutput(buf) => {
                 buf.borrow_mut().push_str(s);
+                Ok(Value::Unspecified)
+            }
+            Port::FileOutput(state) => {
+                let mut st = state.borrow_mut();
+                if st.closed {
+                    return Err("write/display: port is closed".into());
+                }
+                st.buf.extend_from_slice(s.as_bytes());
                 Ok(Value::Unspecified)
             }
             _ => Err("write/display: not an output port".into()),
@@ -4957,25 +4963,15 @@ fn b_open_output_file(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("open-output-file", "1", args.len()));
     }
-    // Open output port — for now string-buffered. close-port flushes to disk.
-    // We tag the buffer with the path so close-port can write it.
     let path = match &args[0] {
         Value::String(s) => s.borrow().clone(),
         v => return Err(type_err("open-output-file", "string", v)),
     };
-    // Side-effect: ensure the file is creatable (truncate to empty so close can append).
-    std::fs::write(&path, "").map_err(|e| format!("open-output-file: {}", e))?;
-    // We use a string-output port; close-port detects file-port via a path marker
-    // stored in the first character... too clever. Simpler: just return a
-    // string output port. close-port's job here is no-op for foundation.
-    // For real file output, expect users to call (with-output-to-file ...) once we have it.
-    // For now, we just provide write-and-flush-on-close by storing the path
-    // in a side table. To keep things simple, file output ports are NOT yet
-    // distinct — return an error for now and ship file input only.
-    // Drop the empty file we just created.
-    let _ = std::fs::remove_file(&path);
-    let _ = path;
-    Err("open-output-file: not yet implemented (use open-output-string-port)".into())
+    // Eagerly check that the file is openable so users see permission /
+    // missing-directory errors at open time, not at close-port time.
+    std::fs::write(&path, "")
+        .map_err(|e| format!("open-output-file: cannot create {}: {}", path, e))?;
+    Ok(Value::Port(Port::file_output(path)))
 }
 
 fn b_close_port(args: &[Value]) -> Result<Value, String> {
@@ -4983,7 +4979,25 @@ fn b_close_port(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("close-port", "1", args.len()));
     }
     match &args[0] {
-        Value::Port(_) => Ok(Value::Unspecified),
+        Value::Port(p) => match &**p {
+            // File output ports flush their buffer to disk on close. The
+            // `closed` flag prevents subsequent writes.
+            Port::FileOutput(state) => {
+                let mut s = state.borrow_mut();
+                if !s.closed {
+                    let path = s.path.clone();
+                    let buf = std::mem::take(&mut s.buf);
+                    s.closed = true;
+                    drop(s);
+                    std::fs::write(&path, &buf)
+                        .map_err(|e| format!("close-port: write {} failed: {}", path, e))?;
+                }
+                Ok(Value::Unspecified)
+            }
+            // Other port kinds are no-op on close at this milestone — they
+            // hold no OS resources.
+            _ => Ok(Value::Unspecified),
+        },
         v => Err(type_err("close-port", "port", v)),
     }
 }

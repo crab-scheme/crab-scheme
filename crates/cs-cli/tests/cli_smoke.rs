@@ -230,6 +230,68 @@ fn raised_with_who_renders_in_clause() {
 }
 
 #[test]
+fn open_output_file_writes_then_close_flushes() {
+    // Round-trip: write a known string to a temp file via open-output-file
+    // + display + newline + close-port, then read it back via std::fs and
+    // verify the bytes.
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "crabscheme-test-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path_s = path.to_string_lossy().replace('\\', "\\\\");
+    let prog = format!(
+        r#"
+(define p (open-output-file "{}"))
+(display "hello, world" p)
+(newline p)
+(display "line 2" p)
+(close-port p)"#,
+        path_s
+    );
+    let (_, err, code) = run_eval(&prog);
+    assert_eq!(code, 0, "stderr: {:?}", err);
+    let written = std::fs::read_to_string(&path).expect("file should exist");
+    assert_eq!(written, "hello, world\nline 2");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn write_after_close_raises_catchable_condition() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "crabscheme-test-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path_s = path.to_string_lossy().replace('\\', "\\\\");
+    let prog = format!(
+        r#"
+(define p (open-output-file "{}"))
+(display "first" p)
+(close-port p)
+(define c
+  (with-exception-handler (lambda (c) c)
+    (lambda () (display "after-close" p))))
+;; string-contains returns a number (the match index) or #f, not #t/#f.
+;; Coerce via `if` so the test sees a boolean.
+(display (if (and (condition? c) (string-contains (condition-message c) "closed")) #t #f))"#,
+        path_s
+    );
+    let (out, _, code) = run_eval(&prog);
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "#t");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn assertion_violation_renders_friendly() {
     // assertion-violation's renderer uses the "assertion-violation" prefix
     // (not "error") since R6RS distinguishes the two.

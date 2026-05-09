@@ -52,14 +52,28 @@ impl Hashtable {
     }
 }
 
-/// A port: foundation supports string and bytevector backed ports.
-/// File ports land in a later milestone.
+/// A port: foundation supports string-, bytevector-, and file-backed
+/// ports. File output ports buffer in memory and flush on `close-port`.
+/// File input is currently slurped as a string-input-port at open time
+/// (see `b_open_input_file` in cs-runtime); a streaming file-input
+/// variant lands in a later milestone.
 #[derive(Debug)]
 pub enum Port {
     StringInput(RefCell<StringInputState>),
     StringOutput(RefCell<String>),
     ByteVectorInput(RefCell<ByteVectorInputState>),
     ByteVectorOutput(RefCell<Vec<u8>>),
+    /// File output port. `buf` accumulates writes; `close-port` writes
+    /// the buffer to `path`. `closed` flips true on close so subsequent
+    /// writes are rejected.
+    FileOutput(RefCell<FileOutputState>),
+}
+
+#[derive(Debug)]
+pub struct FileOutputState {
+    pub path: String,
+    pub buf: Vec<u8>,
+    pub closed: bool,
 }
 
 #[derive(Debug)]
@@ -97,16 +111,33 @@ impl Port {
         Rc::new(Port::ByteVectorOutput(RefCell::new(Vec::new())))
     }
 
+    pub fn file_output(path: String) -> Rc<Self> {
+        Rc::new(Port::FileOutput(RefCell::new(FileOutputState {
+            path,
+            buf: Vec::new(),
+            closed: false,
+        })))
+    }
+
     pub fn is_input(&self) -> bool {
         matches!(self, Port::StringInput(_) | Port::ByteVectorInput(_))
     }
 
     pub fn is_output(&self) -> bool {
-        matches!(self, Port::StringOutput(_) | Port::ByteVectorOutput(_))
+        matches!(
+            self,
+            Port::StringOutput(_) | Port::ByteVectorOutput(_) | Port::FileOutput(_)
+        )
     }
 
     pub fn is_textual(&self) -> bool {
-        matches!(self, Port::StringInput(_) | Port::StringOutput(_))
+        // Files can carry either, but the typical R6RS use of file output
+        // is textual via `display`/`write`. Classify as textual; binary
+        // file ports would be a separate variant.
+        matches!(
+            self,
+            Port::StringInput(_) | Port::StringOutput(_) | Port::FileOutput(_)
+        )
     }
 
     pub fn is_binary(&self) -> bool {
@@ -327,6 +358,9 @@ impl Value {
                 Port::StringOutput(_) => write!(out, "#<output-port>"),
                 Port::ByteVectorInput(_) => write!(out, "#<binary-input-port>"),
                 Port::ByteVectorOutput(_) => write!(out, "#<binary-output-port>"),
+                Port::FileOutput(s) => {
+                    write!(out, "#<file-output-port {:?}>", s.borrow().path)
+                }
             },
             Value::Promise(_) => write!(out, "#<promise>"),
         }
@@ -456,6 +490,9 @@ impl fmt::Display for Value {
                 Port::StringOutput(_) => write!(f, "#<output-port>"),
                 Port::ByteVectorInput(_) => write!(f, "#<binary-input-port>"),
                 Port::ByteVectorOutput(_) => write!(f, "#<binary-output-port>"),
+                Port::FileOutput(s) => {
+                    write!(f, "#<file-output-port {:?}>", s.borrow().path)
+                }
             },
             Value::Promise(_) => write!(f, "#<promise>"),
         }

@@ -2443,6 +2443,14 @@ fn write_to_current_output(s: &str, explicit_port: Option<Value>) -> Result<Valu
                 buf.borrow_mut().push_str(s);
                 Ok(Value::Unspecified)
             }
+            cs_core::Port::FileOutput(state) => {
+                let mut st = state.borrow_mut();
+                if st.closed {
+                    return Err(VmError::new("write/display: port is closed"));
+                }
+                st.buf.extend_from_slice(s.as_bytes());
+                Ok(Value::Unspecified)
+            }
             _ => Err(VmError::new("write/display: not an output port")),
         },
         Some(other) => Err(VmError::new(format!(

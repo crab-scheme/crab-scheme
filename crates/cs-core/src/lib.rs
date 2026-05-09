@@ -14,8 +14,8 @@ pub mod value;
 pub use number::{NumError, Number};
 pub use symbol::{Symbol, SymbolTable};
 pub use value::{
-    make_parameter, Hashtable, HtEqKind, Pair, Parameter, Port, Procedure, Promise, PromiseState,
-    StringInputState, Value, WriteMode,
+    make_parameter, FileOutputState, Hashtable, HtEqKind, Pair, Parameter, Port, Procedure,
+    Promise, PromiseState, StringInputState, Value, WriteMode,
 };
 
 thread_local! {
