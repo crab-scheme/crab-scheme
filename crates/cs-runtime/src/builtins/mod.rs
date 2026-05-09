@@ -414,6 +414,8 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("bytevector-copy", b_bytevector_copy),
         ("bytevector->u8-list", b_bytevector_to_u8_list),
         ("u8-list->bytevector", b_u8_list_to_bytevector),
+        ("bytevector->list", b_bytevector_to_list_r7rs),
+        ("list->bytevector", b_u8_list_to_bytevector),
         ("bytevector-append", b_bytevector_append),
         ("bytevector-fill!", b_bytevector_fill),
         ("string->utf8", b_string_to_utf8),
@@ -7301,6 +7303,40 @@ fn b_bytevector_to_u8_list(args: &[Value]) -> Result<Value, String> {
         )),
         v => Err(type_err("bytevector->u8-list", "bytevector", v)),
     }
+}
+
+/// R7RS `(bytevector->list bv [start [end]])` — convert (a slice of) the
+/// bytevector to a list of integers.
+fn b_bytevector_to_list_r7rs(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(arity_err("bytevector->list", "1..3", args.len()));
+    }
+    let bytes = match &args[0] {
+        Value::ByteVector(bv) => bv.borrow().clone(),
+        v => return Err(type_err("bytevector->list", "bytevector", v)),
+    };
+    let len = bytes.len();
+    let start = if args.len() >= 2 {
+        let i = as_int_i64("bytevector->list", &args[1])?;
+        if i < 0 || (i as usize) > len {
+            return Err(format!("bytevector->list: start out of range: {}", i));
+        }
+        i as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 3 {
+        let i = as_int_i64("bytevector->list", &args[2])?;
+        if i < 0 || (i as usize) > len || (i as usize) < start {
+            return Err(format!("bytevector->list: end out of range: {}", i));
+        }
+        i as usize
+    } else {
+        len
+    };
+    Ok(Value::list(
+        bytes[start..end].iter().map(|b| Value::fixnum(*b as i64)),
+    ))
 }
 
 fn b_u8_list_to_bytevector(args: &[Value]) -> Result<Value, String> {

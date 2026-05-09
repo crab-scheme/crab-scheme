@@ -559,6 +559,11 @@ fn conformance_r7rs_cond_expand_lib() {
 }
 
 #[test]
+fn conformance_r7rs_bytevector_list() {
+    run_conformance_file("r7rs_bytevector_list.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -675,6 +680,7 @@ fn conformance_aggregate_count() {
                 "r7rs_string_map.scm",
                 "r7rs_ci_compare.scm",
                 "r7rs_cond_expand_lib.scm",
+                "r7rs_bytevector_list.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

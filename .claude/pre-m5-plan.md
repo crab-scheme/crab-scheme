@@ -246,14 +246,17 @@ Iters 117+ are filling R7RS gaps one per iter:
 - 140 R7RS char-ci=?, char-ci<?, char-ci<=?, char-ci>?, char-ci>=?
   + string-ci variants. Variadic, Unicode-aware via to_lowercase
 - 141 R7RS cond-expand (library ...) clauses now consult the
-  registered library set (this iter): bundled (scheme base/char/
-  write/time/...) names match; user-defined libraries match after
-  registration; unknown names cleanly fall through to else
+  registered library set: bundled (scheme base/char/write/time/...)
+  names match; user-defined libraries match after registration;
+  unknown names cleanly fall through to else
+- 142 R7RS bytevector->list / list->bytevector aliases with
+  optional [start [end]] on the bytevector->list path. R6RS
+  bytevector->u8-list / u8-list->bytevector remain. (this iter)
 
 Current totals:
-- 95 conformance test files (cli)
-- VM tier: 97 tests
-- Aggregate: 1928 individual Scheme tests passing
+- 96 conformance test files (cli)
+- VM tier: 98 tests
+- Aggregate: 1946 individual Scheme tests passing
 
 ## Loop cadence
 
