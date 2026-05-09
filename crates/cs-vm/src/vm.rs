@@ -507,6 +507,27 @@ fn run_dispatch(
                             ))
                             .with_span(call_span));
                         }
+                        // Fast path: lambda body is a single 2-arg primop on
+                        // params/consts. Skip Env+Frame allocation; just run
+                        // the primop directly on the args sitting on the stack.
+                        if let Some(fp) = &lam.fast {
+                            let result = apply_fast_primop(fp, &stack[args_start..stack_len], syms)
+                                .map_err(|e| e.with_span(call_span))?;
+                            stack.truncate(func_idx);
+                            stack.push(result);
+                            if is_tail {
+                                // Tail-call into a fast-primop body: result is
+                                // the return value of the *current* frame too,
+                                // so pop the frame just like Inst::Return would.
+                                frames.pop();
+                                if frames.is_empty() {
+                                    return stack
+                                        .pop()
+                                        .ok_or_else(|| VmError::new("empty stack at exit"));
+                                }
+                            }
+                            continue;
+                        }
                         let new_env = Env::child(closure.env.clone());
                         for (i, name) in lam.params.iter().enumerate() {
                             new_env.define(*name, stack[args_start + i].clone());
@@ -1470,6 +1491,19 @@ fn run_dispatch(
                             if !lambda_arity_ok(lam, args.len()) {
                                 return Err(VmError::new("arity mismatch"));
                             }
+                            if let Some(fp) = &lam.fast {
+                                let result = apply_fast_primop(fp, &args, syms)?;
+                                stack.push(result);
+                                if is_tail {
+                                    frames.pop();
+                                    if frames.is_empty() {
+                                        return stack.pop().ok_or_else(|| {
+                                            VmError::new("empty stack at tail-fastclosure")
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
                             let new_env = Env::child(closure.env.clone());
                             for (name, v) in lam.params.iter().zip(args.iter()) {
                                 new_env.define(*name, v.clone());
@@ -1743,6 +1777,74 @@ fn fallback_branch(
 /// Fast-path arithmetic on two fixnums. On (Fixnum, Fixnum) where the op
 /// produces no overflow, pushes the result and returns Ok(()). Otherwise
 /// returns Err((a, b)) with the original values for the slow path.
+/// Run a fast-primop body directly on `args`, without allocating an Env or
+/// Frame. Mirrors the inline AddFx2/.../EqFx2 dispatch arms: tries a fixnum
+/// fast path; on miss, falls back to generic arith / cmp. Used by the call
+/// sites whose lambda's body is a single primop on params/consts (very
+/// common for map/fold callbacks).
+fn apply_fast_primop(
+    fp: &crate::opcode::FastPrimopBody,
+    args: &[Value],
+    syms: &mut SymbolTable,
+) -> Result<Value, VmError> {
+    use crate::opcode::FastArg;
+    let resolve = |fa: &FastArg| -> Value {
+        match fa {
+            FastArg::Param(i) => args[*i as usize].clone(),
+            FastArg::Const(v) => v.clone(),
+        }
+    };
+    let a = resolve(&fp.args[0]);
+    let b = resolve(&fp.args[1]);
+    // Fast path: both Fixnum. Mirrors the inline arms in the main dispatch.
+    if let (
+        Value::Number(cs_core::Number::Fixnum(av)),
+        Value::Number(cs_core::Number::Fixnum(bv)),
+    ) = (&a, &b)
+    {
+        let av = *av;
+        let bv = *bv;
+        match &fp.op {
+            Inst::AddFx2 => {
+                if let Some(r) = av.checked_add(bv) {
+                    return Ok(Value::fixnum(r));
+                }
+            }
+            Inst::SubFx2 => {
+                if let Some(r) = av.checked_sub(bv) {
+                    return Ok(Value::fixnum(r));
+                }
+            }
+            Inst::MulFx2 => {
+                if let Some(r) = av.checked_mul(bv) {
+                    return Ok(Value::fixnum(r));
+                }
+            }
+            Inst::LtFx2 => return Ok(Value::Boolean(av < bv)),
+            Inst::LeFx2 => return Ok(Value::Boolean(av <= bv)),
+            Inst::GtFx2 => return Ok(Value::Boolean(av > bv)),
+            Inst::GeFx2 => return Ok(Value::Boolean(av >= bv)),
+            Inst::EqFx2 => return Ok(Value::Boolean(av == bv)),
+            _ => unreachable!("apply_fast_primop: non-primop op slot"),
+        }
+        // Fixnum overflow on Add/Sub/Mul: fall through to generic arith.
+    }
+    // Generic path: 1-element ad-hoc spans buffer so we can reuse the
+    // existing helpers without faking a span vec.
+    let spans = [fp.span];
+    match &fp.op {
+        Inst::AddFx2 => generic_arith2((a, b), GenericArith::Add, 0, &spans, syms),
+        Inst::SubFx2 => generic_arith2((a, b), GenericArith::Sub, 0, &spans, syms),
+        Inst::MulFx2 => generic_arith2((a, b), GenericArith::Mul, 0, &spans, syms),
+        Inst::LtFx2 => generic_cmp2((a, b), GenericCmp::Lt, 0, &spans, syms),
+        Inst::LeFx2 => generic_cmp2((a, b), GenericCmp::Le, 0, &spans, syms),
+        Inst::GtFx2 => generic_cmp2((a, b), GenericCmp::Gt, 0, &spans, syms),
+        Inst::GeFx2 => generic_cmp2((a, b), GenericCmp::Ge, 0, &spans, syms),
+        Inst::EqFx2 => generic_cmp2((a, b), GenericCmp::Eq, 0, &spans, syms),
+        _ => unreachable!("apply_fast_primop: non-primop op slot"),
+    }
+}
+
 fn fixnum_binop2(
     stack: &mut Vec<Value>,
     op: &mut dyn FnMut(i64, i64) -> Option<i64>,
@@ -2389,6 +2491,12 @@ pub fn vm_call_sync(
                 let lam = &c.bc.lambdas[c.lambda_idx];
                 if !lambda_arity_ok(lam, args.len()) {
                     return Err(VmError::new("arity mismatch"));
+                }
+                // Fast path: leaf primop body. Skip Env+Frame allocation
+                // (often the dominant cost on per-element HO bridge calls
+                // like map/fold/filter passing `(lambda (x) (* x x))`).
+                if let Some(fp) = &lam.fast {
+                    return apply_fast_primop(fp, args, syms);
                 }
                 let new_env = Env::child(c.env.clone());
                 for (name, v) in lam.params.iter().zip(args.iter()) {

@@ -10,7 +10,7 @@ use cs_core::{Symbol, Value};
 use cs_diag::Span;
 use cs_ir::{CoreExpr, Params};
 
-use crate::opcode::{Bytecode, CompiledLambda, Inst};
+use crate::opcode::{Bytecode, CompiledLambda, FastArg, FastPrimopBody, Inst};
 
 #[derive(Clone, Debug)]
 pub struct CompileError {
@@ -169,6 +169,49 @@ fn branch_on_not(op: PrimOp, target: usize) -> Inst {
     }
 }
 
+/// If `body` is structurally `[<arg0>, <arg1>, <Fx2 op>, Return]` where
+/// each arg is a single LoadVar(param) or Const, return a FastPrimopBody
+/// describing it. The VM's call sites use this to skip Env+Frame setup for
+/// trivially small bodies — by far the common case for lambdas passed to
+/// map/fold (`(lambda (x) (* x x))`, `(lambda (a b) (+ a b))`, etc).
+fn detect_fast_primop(body: &[Inst], spans: &[Span], params: &[Symbol]) -> Option<FastPrimopBody> {
+    if body.len() != 4 {
+        return None;
+    }
+    if !matches!(body[3], Inst::Return) {
+        return None;
+    }
+    let arg = |slot: &Inst| -> Option<FastArg> {
+        match slot {
+            Inst::LoadVar(s) => params
+                .iter()
+                .position(|p| p == s)
+                .map(|i| FastArg::Param(i as u8)),
+            Inst::Const(v) => Some(FastArg::Const(v.clone())),
+            _ => None,
+        }
+    };
+    let arg0 = arg(&body[0])?;
+    let arg1 = arg(&body[1])?;
+    let op = match &body[2] {
+        Inst::AddFx2
+        | Inst::SubFx2
+        | Inst::MulFx2
+        | Inst::LtFx2
+        | Inst::LeFx2
+        | Inst::GtFx2
+        | Inst::GeFx2
+        | Inst::EqFx2 => body[2].clone(),
+        _ => return None,
+    };
+    let span = spans.get(2).copied().unwrap_or(Span::DUMMY);
+    Some(FastPrimopBody {
+        op,
+        args: [arg0, arg1],
+        span,
+    })
+}
+
 fn primop_to_inst(op: PrimOp) -> Inst {
     match op {
         PrimOp::Add => Inst::AddFx2,
@@ -319,12 +362,14 @@ fn compile_expr(
                 Params { fixed, rest } => (fixed.clone(), *rest),
             };
             let (body_insts, body_spans) = body_buf.finish();
+            let fast = detect_fast_primop(&body_insts, &body_spans, &fixed);
             let lambda_idx = lambdas.len();
             lambdas.push(CompiledLambda {
                 params: fixed,
                 rest,
                 body: Rc::new(body_insts),
                 spans: Rc::new(body_spans),
+                fast,
             });
             out.push(Inst::MakeClosure(lambda_idx), *s);
             Ok(())
@@ -355,6 +400,7 @@ fn compile_expr(
                 rest: None,
                 body: Rc::new(body_insts),
                 spans: Rc::new(body_spans),
+                fast: None,
             });
             out.push(Inst::MakeClosure(lambda_idx), *s);
             if is_tail {

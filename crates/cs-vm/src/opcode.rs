@@ -101,4 +101,35 @@ pub struct CompiledLambda {
     pub body: Rc<Vec<Inst>>,
     /// Parallel to `body`. See `Bytecode::spans`.
     pub spans: Rc<Vec<Span>>,
+    /// When set, the body is structurally `[<arg0>, <arg1>, <op>, Return]`
+    /// where each arg is a single LoadVar(param) or Const, and the op is
+    /// one of the 2-arg fixnum primop opcodes. This lets the call sites
+    /// (`Call`/`TailCall` dispatch and `vm_call_sync`) skip Env+Frame
+    /// allocation and run the primop directly on the args. The body field
+    /// is still populated (kept for the no-fast-path fallback in apply,
+    /// arity errors, error spans, and future tooling).
+    pub fast: Option<FastPrimopBody>,
+}
+
+/// Either a positional reference to one of the lambda's params, or an
+/// inlined constant. Represents one operand of a fast-primop body.
+#[derive(Clone, Debug)]
+pub enum FastArg {
+    Param(u8),
+    Const(Value),
+}
+
+/// Compact description of a "leaf primop" lambda body — see
+/// [`CompiledLambda::fast`].
+#[derive(Clone, Debug)]
+pub struct FastPrimopBody {
+    /// One of: `Inst::AddFx2`, `SubFx2`, `MulFx2`, `LtFx2`, `LeFx2`,
+    /// `GtFx2`, `GeFx2`, `EqFx2`. Other variants are never produced by
+    /// the detector. Stored as `Inst` so the VM can dispatch with the
+    /// same arms it already uses for non-fast bodies.
+    pub op: Inst,
+    pub args: [FastArg; 2],
+    /// Span of the primop call site, used for error messages on
+    /// type-mismatch / overflow falling out of the fast path.
+    pub span: Span,
 }
