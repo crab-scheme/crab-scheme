@@ -3409,50 +3409,78 @@ fn ho_apply(func: &Value, args: &[Value], syms: &mut SymbolTable) -> Result<Valu
         return Ok(Value::Vector(cs_core::Gc::new(RefCell::new(out))));
     }
     if any.downcast_ref::<VmStringMap>().is_some() {
-        if args.len() != 2 {
-            return Err(VmError::new("string-map: needs proc + string"));
+        // R7RS multi-string: proc takes one char from each, output stops at
+        // the shortest input.
+        if args.len() < 2 {
+            return Err(builtin_err_to_raised(
+                "string-map",
+                "needs proc + at least one string",
+                syms,
+                Span::DUMMY,
+            ));
         }
         let proc_val = args.remove(0);
-        let chars: Vec<char> = match &args[0] {
-            Value::String(s) => s.borrow().chars().collect(),
-            other => {
-                return Err(VmError::new(format!(
-                    "string-map: expected string, got {}",
-                    other.type_name()
-                )));
+        let mut strings: Vec<Vec<char>> = Vec::with_capacity(args.len());
+        for v in &args {
+            match v {
+                Value::String(s) => strings.push(s.borrow().chars().collect()),
+                other => {
+                    return Err(builtin_err_to_raised(
+                        "string-map",
+                        &format!("expected string, got {}", other.type_name()),
+                        syms,
+                        Span::DUMMY,
+                    ));
+                }
             }
-        };
-        let mut out = String::with_capacity(chars.len());
-        for c in chars {
-            let r = vm_call_sync(&proc_val, &[Value::Character(c)], syms)?;
+        }
+        let n = strings.iter().map(|s| s.len()).min().unwrap_or(0);
+        let mut out = String::with_capacity(n);
+        for i in 0..n {
+            let row: Vec<Value> = strings.iter().map(|s| Value::Character(s[i])).collect();
+            let r = vm_call_sync(&proc_val, &row, syms)?;
             match r {
                 Value::Character(c) => out.push(c),
                 other => {
-                    return Err(VmError::new(format!(
-                        "string-map: proc must return char, got {}",
-                        other.type_name()
-                    )));
+                    return Err(builtin_err_to_raised(
+                        "string-map",
+                        &format!("proc must return char, got {}", other.type_name()),
+                        syms,
+                        Span::DUMMY,
+                    ));
                 }
             }
         }
         return Ok(Value::string(out));
     }
     if any.downcast_ref::<VmStringForEach>().is_some() {
-        if args.len() != 2 {
-            return Err(VmError::new("string-for-each: needs proc + string"));
+        if args.len() < 2 {
+            return Err(builtin_err_to_raised(
+                "string-for-each",
+                "needs proc + at least one string",
+                syms,
+                Span::DUMMY,
+            ));
         }
         let proc_val = args.remove(0);
-        let chars: Vec<char> = match &args[0] {
-            Value::String(s) => s.borrow().chars().collect(),
-            other => {
-                return Err(VmError::new(format!(
-                    "string-for-each: expected string, got {}",
-                    other.type_name()
-                )));
+        let mut strings: Vec<Vec<char>> = Vec::with_capacity(args.len());
+        for v in &args {
+            match v {
+                Value::String(s) => strings.push(s.borrow().chars().collect()),
+                other => {
+                    return Err(builtin_err_to_raised(
+                        "string-for-each",
+                        &format!("expected string, got {}", other.type_name()),
+                        syms,
+                        Span::DUMMY,
+                    ));
+                }
             }
-        };
-        for c in chars {
-            vm_call_sync(&proc_val, &[Value::Character(c)], syms)?;
+        }
+        let n = strings.iter().map(|s| s.len()).min().unwrap_or(0);
+        for i in 0..n {
+            let row: Vec<Value> = strings.iter().map(|s| Value::Character(s[i])).collect();
+            vm_call_sync(&proc_val, &row, syms)?;
         }
         return Ok(Value::Unspecified);
     }

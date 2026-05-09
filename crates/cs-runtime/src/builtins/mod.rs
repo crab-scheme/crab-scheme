@@ -7841,17 +7841,24 @@ fn b_get_string_all(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String>
 // ---- string-map / string-for-each ----
 
 fn b_string_map(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(arity_err("string-map", "2", args.len()));
+    // R7RS: (string-map proc str1 str2 ...) — proc takes one char from each
+    // string. Result terminates at the shortest input.
+    if args.len() < 2 {
+        return Err(arity_err("string-map", "at least 2", args.len()));
     }
     let proc_val = args[0].clone();
-    let s = match &args[1] {
-        Value::String(s) => s.borrow().chars().collect::<Vec<char>>(),
-        v => return Err(type_err("string-map", "string", v)),
-    };
-    let mut out = String::with_capacity(s.len());
-    for c in s {
-        let r = apply_procedure(&proc_val, &[Value::Character(c)], ctx).map_err(|e| e.message())?;
+    let strings: Vec<Vec<char>> = args[1..]
+        .iter()
+        .map(|v| match v {
+            Value::String(s) => Ok(s.borrow().chars().collect()),
+            other => Err(type_err("string-map", "string", other)),
+        })
+        .collect::<Result<_, _>>()?;
+    let n = strings.iter().map(|s| s.len()).min().unwrap_or(0);
+    let mut out = String::with_capacity(n);
+    for i in 0..n {
+        let row: Vec<Value> = strings.iter().map(|s| Value::Character(s[i])).collect();
+        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
         match r {
             Value::Character(c) => out.push(c),
             other => {
@@ -7867,16 +7874,23 @@ fn b_string_map(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
 }
 
 fn b_string_for_each(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(arity_err("string-for-each", "2", args.len()));
+    // R7RS: (string-for-each proc str1 str2 ...) — like string-map but for
+    // side effects. Iteration terminates at the shortest string.
+    if args.len() < 2 {
+        return Err(arity_err("string-for-each", "at least 2", args.len()));
     }
     let proc_val = args[0].clone();
-    let chars: Vec<char> = match &args[1] {
-        Value::String(s) => s.borrow().chars().collect(),
-        v => return Err(type_err("string-for-each", "string", v)),
-    };
-    for c in chars {
-        apply_procedure(&proc_val, &[Value::Character(c)], ctx).map_err(|e| e.message())?;
+    let strings: Vec<Vec<char>> = args[1..]
+        .iter()
+        .map(|v| match v {
+            Value::String(s) => Ok(s.borrow().chars().collect()),
+            other => Err(type_err("string-for-each", "string", other)),
+        })
+        .collect::<Result<_, _>>()?;
+    let n = strings.iter().map(|s| s.len()).min().unwrap_or(0);
+    for i in 0..n {
+        let row: Vec<Value> = strings.iter().map(|s| Value::Character(s[i])).collect();
+        apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
     }
     Ok(Value::Unspecified)
 }

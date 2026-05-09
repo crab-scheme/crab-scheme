@@ -240,12 +240,14 @@ Iters 117+ are filling R7RS gaps one per iter:
   with optional [start [end]]
 - 137 R7RS bytevector-fill! with optional [start [end]]
 - 138 R7RS (string char ...) constructor — variadic char-collection
-  to a new string (this iter)
+  to a new string
+- 139 R7RS string-map / string-for-each multi-string forms; both
+  tiers; VM error path now raises catchable conditions (this iter)
 
 Current totals:
-- 92 conformance test files (cli)
-- VM tier: 94 tests
-- Aggregate: 1860 individual Scheme tests passing
+- 93 conformance test files (cli)
+- VM tier: 95 tests
+- Aggregate: 1874 individual Scheme tests passing
 
 ## Loop cadence
 

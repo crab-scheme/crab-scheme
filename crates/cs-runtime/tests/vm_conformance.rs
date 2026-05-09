@@ -849,3 +849,11 @@ fn vm_conformance_r7rs_string_ctor() {
     println!("r7rs_string_ctor: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_string_map() {
+    let walker = pass_count_walker("r7rs_string_map.scm");
+    let vm = pass_count_vm("r7rs_string_map.scm").expect("vm should run r7rs_string_map.scm");
+    println!("r7rs_string_map: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
