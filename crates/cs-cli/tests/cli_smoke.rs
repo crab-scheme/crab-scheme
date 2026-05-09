@@ -267,3 +267,31 @@ fn run_metacircular_vm() {
     );
     assert_metacircular_output(&out.stdout);
 }
+
+#[test]
+fn vm_undefined_variable_has_source_span() {
+    // Both tiers should report a source location for an undefined-variable
+    // error. The VM tier didn't carry source spans through the bytecode
+    // before this iteration.
+    let walker_out = cli().args(["-e", "(foo 1 2)"]).output().expect("walker");
+    let walker_err = String::from_utf8_lossy(&walker_out.stderr).into_owned();
+    assert!(
+        walker_err.contains("undefined variable: foo"),
+        "{}",
+        walker_err
+    );
+    assert!(walker_err.contains(":1:"), "{}", walker_err);
+
+    let vm_out = cli()
+        .args(["--tier", "vm", "-e", "(foo 1 2)"])
+        .output()
+        .expect("vm");
+    let vm_err = String::from_utf8_lossy(&vm_out.stderr).into_owned();
+    assert!(vm_err.contains("undefined variable: foo"), "{}", vm_err);
+    // Regression guard for the new bytecode-level span tracking.
+    assert!(
+        vm_err.contains(":1:"),
+        "VM error should include line:col span: {}",
+        vm_err
+    );
+}

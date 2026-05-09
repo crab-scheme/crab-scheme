@@ -39,21 +39,49 @@ pub fn compile_with_globals(
     expr: &CoreExpr,
     globals: &HashMap<Symbol, Value>,
 ) -> Result<Bytecode, CompileError> {
-    let mut top_insts: Vec<Inst> = Vec::new();
+    let mut buf = InstBuf::new();
     let mut lambdas: Vec<CompiledLambda> = Vec::new();
     let mut scope: Vec<HashSet<Symbol>> = Vec::new();
-    compile_expr(
-        expr,
-        &mut top_insts,
-        &mut lambdas,
-        true,
-        globals,
-        &mut scope,
-    )?;
+    compile_expr(expr, &mut buf, &mut lambdas, true, globals, &mut scope)?;
+    let (insts, spans) = buf.finish();
     Ok(Bytecode {
-        insts: Rc::new(top_insts),
+        insts: Rc::new(insts),
+        spans: Rc::new(spans),
         lambdas: Rc::new(lambdas),
     })
+}
+
+/// Buffered output of compile: parallel insts + spans Vecs that grow
+/// together, ensuring spans[i] is the source span of insts[i].
+struct InstBuf {
+    insts: Vec<Inst>,
+    spans: Vec<Span>,
+}
+
+impl InstBuf {
+    fn new() -> Self {
+        Self {
+            insts: Vec::new(),
+            spans: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, inst: Inst, span: Span) {
+        self.insts.push(inst);
+        self.spans.push(span);
+    }
+
+    fn len(&self) -> usize {
+        self.insts.len()
+    }
+
+    fn replace(&mut self, idx: usize, inst: Inst) {
+        self.insts[idx] = inst;
+    }
+
+    fn finish(self) -> (Vec<Inst>, Vec<Span>) {
+        (self.insts, self.spans)
+    }
 }
 
 fn is_locally_bound(scope: &[HashSet<Symbol>], name: Symbol) -> bool {
@@ -62,15 +90,16 @@ fn is_locally_bound(scope: &[HashSet<Symbol>], name: Symbol) -> bool {
 
 fn compile_expr(
     expr: &CoreExpr,
-    out: &mut Vec<Inst>,
+    out: &mut InstBuf,
     lambdas: &mut Vec<CompiledLambda>,
     is_tail: bool,
     globals: &HashMap<Symbol, Value>,
     scope: &mut Vec<HashSet<Symbol>>,
 ) -> Result<(), CompileError> {
+    let span = expr.span();
     match expr {
         CoreExpr::Const { value, .. } => {
-            out.push(Inst::Const(value.clone()));
+            out.push(Inst::Const(value.clone()), span);
             Ok(())
         }
         CoreExpr::Ref { name, .. } => {
@@ -78,123 +107,134 @@ fn compile_expr(
             // shadowed in any enclosing scope.
             if !is_locally_bound(scope, *name) {
                 if let Some(v) = globals.get(name) {
-                    out.push(Inst::Const(v.clone()));
+                    out.push(Inst::Const(v.clone()), span);
                     return Ok(());
                 }
             }
-            out.push(Inst::LoadVar(*name));
+            out.push(Inst::LoadVar(*name), span);
             Ok(())
         }
-        CoreExpr::Set { name, value, span } => {
+        CoreExpr::Set {
+            name,
+            value,
+            span: s,
+        } => {
             compile_expr(value, out, lambdas, false, globals, scope)?;
-            out.push(Inst::SetVar(*name));
-            out.push(Inst::Const(Value::Unspecified));
-            let _ = span;
+            out.push(Inst::SetVar(*name), *s);
+            out.push(Inst::Const(Value::Unspecified), *s);
             Ok(())
         }
         CoreExpr::If {
-            cond, then, alt, ..
+            cond,
+            then,
+            alt,
+            span: s,
         } => {
             compile_expr(cond, out, lambdas, false, globals, scope)?;
             let jif_idx = out.len();
-            out.push(Inst::JumpIfFalse(usize::MAX));
+            out.push(Inst::JumpIfFalse(usize::MAX), *s);
             compile_expr(then, out, lambdas, is_tail, globals, scope)?;
             let jmp_idx = out.len();
-            out.push(Inst::Jump(usize::MAX));
+            out.push(Inst::Jump(usize::MAX), *s);
             let alt_start = out.len();
-            out[jif_idx] = Inst::JumpIfFalse(alt_start);
+            out.replace(jif_idx, Inst::JumpIfFalse(alt_start));
             compile_expr(alt, out, lambdas, is_tail, globals, scope)?;
             let after = out.len();
-            out[jmp_idx] = Inst::Jump(after);
+            out.replace(jmp_idx, Inst::Jump(after));
             Ok(())
         }
-        CoreExpr::Begin { exprs, span } => {
+        CoreExpr::Begin { exprs, span: s } => {
             if exprs.is_empty() {
-                out.push(Inst::Const(Value::Unspecified));
+                out.push(Inst::Const(Value::Unspecified), *s);
                 return Ok(());
             }
             for (i, e) in exprs.iter().enumerate() {
                 let last = i + 1 == exprs.len();
                 compile_expr(e, out, lambdas, is_tail && last, globals, scope)?;
                 if !last {
-                    out.push(Inst::Pop);
+                    out.push(Inst::Pop, e.span());
                 }
             }
-            let _ = span;
             Ok(())
         }
-        CoreExpr::App { func, args, span } => {
+        CoreExpr::App {
+            func,
+            args,
+            span: s,
+        } => {
             compile_expr(func, out, lambdas, false, globals, scope)?;
             for a in args {
                 compile_expr(a, out, lambdas, false, globals, scope)?;
             }
             if is_tail {
-                out.push(Inst::TailCall(args.len()));
+                out.push(Inst::TailCall(args.len()), *s);
             } else {
-                out.push(Inst::Call(args.len()));
+                out.push(Inst::Call(args.len()), *s);
             }
-            let _ = span;
             Ok(())
         }
         CoreExpr::Lambda {
-            params, body, span, ..
+            params,
+            body,
+            span: s,
+            ..
         } => {
-            // Track new lexical scope for locality checks during folding.
             let mut frame: HashSet<Symbol> = params.fixed.iter().copied().collect();
             if let Some(rest) = params.rest {
                 frame.insert(rest);
             }
             scope.push(frame);
-            let mut body_insts = Vec::new();
-            compile_expr(body, &mut body_insts, lambdas, true, globals, scope)?;
-            body_insts.push(Inst::Return);
+            let mut body_buf = InstBuf::new();
+            compile_expr(body, &mut body_buf, lambdas, true, globals, scope)?;
+            body_buf.push(Inst::Return, body.span());
             scope.pop();
             let (fixed, rest) = match params {
                 Params { fixed, rest } => (fixed.clone(), *rest),
             };
+            let (body_insts, body_spans) = body_buf.finish();
             let lambda_idx = lambdas.len();
             lambdas.push(CompiledLambda {
                 params: fixed,
                 rest,
                 body: Rc::new(body_insts),
+                spans: Rc::new(body_spans),
             });
-            out.push(Inst::MakeClosure(lambda_idx));
-            let _ = span;
+            out.push(Inst::MakeClosure(lambda_idx), *s);
             Ok(())
         }
         CoreExpr::Letrec {
             bindings,
             body,
-            span,
+            span: s,
         } => {
-            // letrec: all binding names are visible in their own scope.
             let frame: HashSet<Symbol> = bindings.iter().map(|(s, _)| *s).collect();
             scope.push(frame);
-            let mut body_insts = Vec::new();
+            let mut body_buf = InstBuf::new();
             for (name, _) in bindings {
-                body_insts.push(Inst::Const(Value::Unspecified));
-                body_insts.push(Inst::DefineLocal(*name));
+                body_buf.push(Inst::Const(Value::Unspecified), *s);
+                body_buf.push(Inst::DefineLocal(*name), *s);
             }
             for (name, expr) in bindings {
-                compile_expr(expr, &mut body_insts, lambdas, false, globals, scope)?;
-                body_insts.push(Inst::DefineLocal(*name));
+                compile_expr(expr, &mut body_buf, lambdas, false, globals, scope)?;
+                body_buf.push(Inst::DefineLocal(*name), expr.span());
             }
-            compile_expr(body, &mut body_insts, lambdas, true, globals, scope)?;
-            body_insts.push(Inst::Return);
+            compile_expr(body, &mut body_buf, lambdas, true, globals, scope)?;
+            body_buf.push(Inst::Return, body.span());
             scope.pop();
+            let (body_insts, body_spans) = body_buf.finish();
             let lambda_idx = lambdas.len();
             lambdas.push(CompiledLambda {
                 params: Vec::new(),
                 rest: None,
                 body: Rc::new(body_insts),
+                spans: Rc::new(body_spans),
             });
-            out.push(Inst::MakeClosure(lambda_idx));
+            out.push(Inst::MakeClosure(lambda_idx), *s);
             if is_tail {
-                out.push(Inst::TailCall(0));
+                out.push(Inst::TailCall(0), *s);
             } else {
-                out.push(Inst::Call(0));
+                out.push(Inst::Call(0), *s);
             }
-            let _ = span;
             Ok(())
         }
     }

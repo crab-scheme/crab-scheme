@@ -431,8 +431,11 @@ impl Runtime {
         let result = cs_vm::run(&bc, self.vm_env.clone(), &mut self.syms);
         cs_vm::vm::install_eval_hook(prev_hook);
         cs_vm::vm::install_eval_root_env(prev_env);
-        // Render VM errors with proper condition formatting.
+        // Render VM errors with proper condition formatting; carry the
+        // span the VM captured at the offending instruction so the
+        // diagnostic can show source line/column.
         result.map_err(|e| {
+            let span = e.span;
             let msg = match e.message.as_str() {
                 "__raised__" => match cs_vm::vm::vm_take_pending_raise() {
                     Some(cond) => format_condition(&cond, &self.syms),
@@ -448,7 +451,7 @@ impl Runtime {
                 },
                 _ => e.message,
             };
-            Diagnostic::error(msg, cs_diag::Span::DUMMY).with_code("E_RUNTIME")
+            Diagnostic::error(msg, span).with_code("E_RUNTIME")
         })
     }
 

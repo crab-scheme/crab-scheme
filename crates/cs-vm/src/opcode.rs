@@ -3,6 +3,7 @@
 use std::rc::Rc;
 
 use cs_core::{Symbol, Value};
+use cs_diag::Span;
 
 #[derive(Clone, Debug)]
 pub enum Inst {
@@ -41,9 +42,14 @@ pub enum Inst {
 /// during Call/TailCall is a refcount bump rather than a Vec clone.
 /// `lambdas` is also Rc-shared so HO bridge calls (vm_call_sync) avoid a
 /// Vec<CompiledLambda> deep-clone per invocation.
+///
+/// `spans` is parallel to `insts` and lets the runtime report
+/// source-pinned errors (undefined variables, arity mismatches, etc.) by
+/// indexing `spans[ip - 1]` when raising a VmError.
 #[derive(Clone, Debug, Default)]
 pub struct Bytecode {
     pub insts: Rc<Vec<Inst>>,
+    pub spans: Rc<Vec<Span>>,
     /// Compiled lambdas referenced by `MakeClosure` instructions.
     pub lambdas: Rc<Vec<CompiledLambda>>,
 }
@@ -53,4 +59,6 @@ pub struct CompiledLambda {
     pub params: Vec<Symbol>,
     pub rest: Option<Symbol>,
     pub body: Rc<Vec<Inst>>,
+    /// Parallel to `body`. See `Bytecode::spans`.
+    pub spans: Rc<Vec<Span>>,
 }

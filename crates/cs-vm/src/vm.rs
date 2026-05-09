@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use cs_core::{Procedure, Symbol, SymbolTable, Value};
+use cs_diag::Span;
 
 use crate::opcode::{Bytecode, CompiledLambda, Inst};
 
@@ -161,13 +162,22 @@ fn swap_output_port(new: Option<Value>) -> Option<Value> {
 #[derive(Debug, Clone)]
 pub struct VmError {
     pub message: String,
+    pub span: Span,
 }
 
 impl VmError {
     pub fn new(msg: impl Into<String>) -> Self {
         Self {
             message: msg.into(),
+            span: Span::DUMMY,
         }
+    }
+
+    pub fn with_span(mut self, span: Span) -> Self {
+        if self.span.is_dummy() {
+            self.span = span;
+        }
+        self
     }
 }
 
@@ -318,6 +328,7 @@ impl Env {
 
 struct Frame {
     insts: Rc<Vec<Inst>>,
+    spans: Rc<Vec<Span>>,
     ip: usize,
     env: Rc<Env>,
     /// Captured shared bytecode (so closures can resolve their lambda body).
@@ -325,23 +336,26 @@ struct Frame {
 }
 
 pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Value, VmError> {
-    run_with_entry(Rc::new(bc.clone()), None, top_env, syms)
+    run_with_entry(Rc::new(bc.clone()), None, None, top_env, syms)
 }
 
 /// Like [`run`] but accepts an already-shared `Rc<Bytecode>` (avoiding a
-/// heap allocation per call) and an optional `entry_insts` override for
-/// running a specific lambda body. `vm_call_sync` uses this for HO bridge
-/// calls to skip constructing a sub-Bytecode per element.
+/// heap allocation per call) and an optional `entry_insts`/`entry_spans`
+/// override for running a specific lambda body. `vm_call_sync` uses this
+/// for HO bridge calls to skip constructing a sub-Bytecode per element.
 pub fn run_with_entry(
     bc: Rc<Bytecode>,
     entry_insts: Option<Rc<Vec<Inst>>>,
+    entry_spans: Option<Rc<Vec<Span>>>,
     top_env: Rc<Env>,
     syms: &mut SymbolTable,
 ) -> Result<Value, VmError> {
     let insts = entry_insts.unwrap_or_else(|| bc.insts.clone());
+    let spans = entry_spans.unwrap_or_else(|| bc.spans.clone());
     let mut stack: Vec<Value> = Vec::new();
     let mut frames: Vec<Frame> = vec![Frame {
         insts,
+        spans,
         ip: 0,
         env: top_env,
         bc,
@@ -364,15 +378,16 @@ pub fn run_with_entry(
         // its Value payload for Const) per VM tick. Owned data is taken only
         // in the arms that need it (Const stack-push, Call/TailCall).
         let inst_ref = &frame.insts[frame.ip];
+        let inst_ip = frame.ip;
         frame.ip += 1;
         match inst_ref {
             Inst::Const(v) => stack.push(v.clone()),
             Inst::LoadVar(s) => {
                 let s = *s;
-                let v = frame
-                    .env
-                    .get(s)
-                    .ok_or_else(|| VmError::new(format!("undefined variable: {}", syms.name(s))))?;
+                let v = frame.env.get(s).ok_or_else(|| {
+                    let span = frame.spans.get(inst_ip).copied().unwrap_or(Span::DUMMY);
+                    VmError::new(format!("undefined variable: {}", syms.name(s))).with_span(span)
+                })?;
                 stack.push(v);
             }
             Inst::SetVar(s) => {
@@ -464,12 +479,14 @@ pub fn run_with_entry(
                         if is_tail {
                             let last = frames.last_mut().unwrap();
                             last.insts = lam.body.clone();
+                            last.spans = lam.spans.clone();
                             last.ip = 0;
                             last.env = new_env;
                             last.bc = closure.bc.clone();
                         } else {
                             frames.push(Frame {
                                 insts: lam.body.clone(),
+                                spans: lam.spans.clone(),
                                 ip: 0,
                                 env: new_env,
                                 bc: closure.bc.clone(),
@@ -1423,12 +1440,14 @@ pub fn run_with_entry(
                                 // Replace current frame instead of pushing.
                                 let last = frames.last_mut().unwrap();
                                 last.insts = lam.body.clone();
+                                last.spans = lam.spans.clone();
                                 last.ip = 0;
                                 last.env = new_env;
                                 last.bc = closure.bc.clone();
                             } else {
                                 frames.push(Frame {
                                     insts: lam.body.clone(),
+                                    spans: lam.spans.clone(),
                                     ip: 0,
                                     env: new_env,
                                     bc: closure.bc.clone(),
@@ -2027,7 +2046,13 @@ pub fn vm_call_sync(
                 // insts override; avoids allocating a sub-Bytecode per HO
                 // call (saves a Bytecode struct + Rc<Bytecode> heap alloc
                 // per element of map/fold/filter/...).
-                return run_with_entry(c.bc.clone(), Some(lam.body.clone()), new_env, syms);
+                return run_with_entry(
+                    c.bc.clone(),
+                    Some(lam.body.clone()),
+                    Some(lam.spans.clone()),
+                    new_env,
+                    syms,
+                );
             }
             if any.downcast_ref::<VmApply>().is_some() {
                 if args.is_empty() {
