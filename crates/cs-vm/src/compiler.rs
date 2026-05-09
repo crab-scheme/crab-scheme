@@ -124,6 +124,51 @@ fn is_locally_bound(scope: &[HashSet<Symbol>], name: Symbol) -> bool {
     scope.iter().any(|s| s.contains(&name))
 }
 
+/// If `expr` is `(<op> a b)` where `<op>` is an unshadowed PrimOp Ref,
+/// return `(op, a, b)` so an enclosing `if` can fuse the compare+branch.
+/// Otherwise return None.
+fn match_primop_2arg<'a>(
+    expr: &'a CoreExpr,
+    scope: &[HashSet<Symbol>],
+    primops: &HashMap<Symbol, PrimOp>,
+) -> Option<(PrimOp, &'a CoreExpr, &'a CoreExpr)> {
+    if let CoreExpr::App { func, args, .. } = expr {
+        if args.len() != 2 {
+            return None;
+        }
+        if let CoreExpr::Ref { name, .. } = &**func {
+            if is_locally_bound(scope, *name) {
+                return None;
+            }
+            if let Some(op) = primops.get(name).copied() {
+                // Only the comparison primops are useful as branch
+                // conditions; arithmetic ones don't produce booleans.
+                match op {
+                    PrimOp::Lt | PrimOp::Le | PrimOp::Gt | PrimOp::Ge | PrimOp::Eq => {
+                        return Some((op, &args[0], &args[1]));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Map a primop comparison to the fused "branch on negation" instruction.
+/// The branch fires when the original comparison is false (i.e., we should
+/// take the alt branch of the surrounding `if`).
+fn branch_on_not(op: PrimOp, target: usize) -> Inst {
+    match op {
+        PrimOp::Lt => Inst::BranchOnGeFx2(target),
+        PrimOp::Le => Inst::BranchOnGtFx2(target),
+        PrimOp::Gt => Inst::BranchOnLeFx2(target),
+        PrimOp::Ge => Inst::BranchOnLtFx2(target),
+        PrimOp::Eq => Inst::BranchOnNeFx2(target),
+        _ => unreachable!("branch_on_not called with non-comparison primop"),
+    }
+}
+
 fn primop_to_inst(op: PrimOp) -> Inst {
     match op {
         PrimOp::Add => Inst::AddFx2,
@@ -180,6 +225,24 @@ fn compile_expr(
             alt,
             span: s,
         } => {
+            // Try the fused compare+branch pattern: when cond is a 2-arg
+            // primop App, emit `<a> <b> BranchOn<NotOp>(alt_start)` and
+            // skip materializing the boolean.
+            if let Some((op, a, b)) = match_primop_2arg(cond, scope, primops) {
+                compile_expr(a, out, lambdas, false, globals, primops, scope)?;
+                compile_expr(b, out, lambdas, false, globals, primops, scope)?;
+                let jif_idx = out.len();
+                out.push(branch_on_not(op, usize::MAX), *s);
+                compile_expr(then, out, lambdas, is_tail, globals, primops, scope)?;
+                let jmp_idx = out.len();
+                out.push(Inst::Jump(usize::MAX), *s);
+                let alt_start = out.len();
+                out.replace(jif_idx, branch_on_not(op, alt_start));
+                compile_expr(alt, out, lambdas, is_tail, globals, primops, scope)?;
+                let after = out.len();
+                out.replace(jmp_idx, Inst::Jump(after));
+                return Ok(());
+            }
             compile_expr(cond, out, lambdas, false, globals, primops, scope)?;
             let jif_idx = out.len();
             out.push(Inst::JumpIfFalse(usize::MAX), *s);

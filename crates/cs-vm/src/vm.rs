@@ -1611,8 +1611,133 @@ fn run_dispatch(
                     Ok::<(), VmError>(())
                 })?;
             }
+            // Fused compare-and-branch. Each pops 2 args; on Fixnum/Fixnum
+            // match, branches to `target` iff the *negated* comparison is
+            // true (i.e., the original cond was false). Slow path
+            // materializes a boolean via generic_cmp2 then does a normal
+            // JumpIfFalse.
+            Inst::BranchOnGeFx2(target) => {
+                let target = *target;
+                if !fxbranch(stack, |a, b| a >= b, target, &mut frame.ip) {
+                    fallback_branch(
+                        stack,
+                        GenericCmp::Lt,
+                        target,
+                        inst_ip,
+                        &frame.spans,
+                        syms,
+                        &mut frame.ip,
+                    )?;
+                }
+            }
+            Inst::BranchOnGtFx2(target) => {
+                let target = *target;
+                if !fxbranch(stack, |a, b| a > b, target, &mut frame.ip) {
+                    fallback_branch(
+                        stack,
+                        GenericCmp::Le,
+                        target,
+                        inst_ip,
+                        &frame.spans,
+                        syms,
+                        &mut frame.ip,
+                    )?;
+                }
+            }
+            Inst::BranchOnLeFx2(target) => {
+                let target = *target;
+                if !fxbranch(stack, |a, b| a <= b, target, &mut frame.ip) {
+                    fallback_branch(
+                        stack,
+                        GenericCmp::Gt,
+                        target,
+                        inst_ip,
+                        &frame.spans,
+                        syms,
+                        &mut frame.ip,
+                    )?;
+                }
+            }
+            Inst::BranchOnLtFx2(target) => {
+                let target = *target;
+                if !fxbranch(stack, |a, b| a < b, target, &mut frame.ip) {
+                    fallback_branch(
+                        stack,
+                        GenericCmp::Ge,
+                        target,
+                        inst_ip,
+                        &frame.spans,
+                        syms,
+                        &mut frame.ip,
+                    )?;
+                }
+            }
+            Inst::BranchOnNeFx2(target) => {
+                let target = *target;
+                if !fxbranch(stack, |a, b| a != b, target, &mut frame.ip) {
+                    fallback_branch(
+                        stack,
+                        GenericCmp::Eq,
+                        target,
+                        inst_ip,
+                        &frame.spans,
+                        syms,
+                        &mut frame.ip,
+                    )?;
+                }
+            }
         }
     }
+}
+
+/// Fast-path fused branch: pop b, pop a; on (Fixnum, Fixnum), set ip to
+/// target if `op(a, b)` and return true. Returns false if either arg
+/// wasn't a fixnum — caller falls back to generic_cmp2.
+fn fxbranch(
+    stack: &mut Vec<Value>,
+    op: impl Fn(i64, i64) -> bool,
+    target: usize,
+    ip: &mut usize,
+) -> bool {
+    let b = stack.pop().expect("stack underflow on fxbranch");
+    let a = stack.pop().expect("stack underflow on fxbranch");
+    if let (
+        Value::Number(cs_core::Number::Fixnum(av)),
+        Value::Number(cs_core::Number::Fixnum(bv)),
+    ) = (&a, &b)
+    {
+        if op(*av, *bv) {
+            *ip = target;
+        }
+        return true;
+    }
+    // Non-fixnum: re-push so the slow path can recover.
+    stack.push(a);
+    stack.push(b);
+    false
+}
+
+/// Slow-path fallback for compare+branch when args aren't both fixnums.
+/// Computes the original (un-negated) comparison via generic_cmp2; if it
+/// is false, branches to target. (`op` here is the *original* comparison,
+/// not the negated branch trigger — matches the un-fused
+/// `generic_cmp2 + JumpIfFalse` semantics.)
+fn fallback_branch(
+    stack: &mut Vec<Value>,
+    op: GenericCmp,
+    target: usize,
+    inst_ip: usize,
+    spans: &[Span],
+    syms: &mut SymbolTable,
+    ip: &mut usize,
+) -> Result<(), VmError> {
+    let b = stack.pop().expect("stack underflow on fallback");
+    let a = stack.pop().expect("stack underflow on fallback");
+    let result = generic_cmp2((a, b), op, inst_ip, spans, syms)?;
+    if !result.is_truthy() {
+        *ip = target;
+    }
+    Ok(())
 }
 
 /// Fast-path arithmetic on two fixnums. On (Fixnum, Fixnum) where the op

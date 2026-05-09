@@ -57,6 +57,24 @@ pub enum Inst {
     GeFx2,
     /// `(=  a b)` — pushes #t / #f.
     EqFx2,
+
+    // ---- Fused compare+branch (one tick instead of two). The compiler
+    // emits these for `(if (PRIMOP a b) then alt)` so the boolean result
+    // is never materialized on the stack. Each pops 2 args; if the
+    // condition holds, jumps to the target (which the compiler patches to
+    // alt-start). Falls back to a generic compare when args aren't
+    // (Fixnum, Fixnum) — the boolean is then materialized and we behave
+    // like the unfused LtFx2/JumpIfFalse pair.
+    /// Fused `(if (<  a b) ...)` — branch when a >= b.
+    BranchOnGeFx2(usize),
+    /// Fused `(if (<= a b) ...)` — branch when a > b.
+    BranchOnGtFx2(usize),
+    /// Fused `(if (>  a b) ...)` — branch when a <= b.
+    BranchOnLeFx2(usize),
+    /// Fused `(if (>= a b) ...)` — branch when a < b.
+    BranchOnLtFx2(usize),
+    /// Fused `(if (=  a b) ...)` — branch when a != b.
+    BranchOnNeFx2(usize),
 }
 
 /// A compiled program: instructions plus a table of nested compiled lambdas.
