@@ -257,6 +257,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("vector-ref", b_vector_ref),
         ("vector-set!", b_vector_set),
         ("vector-fill!", b_vector_fill),
+        ("string-fill!", b_string_fill),
         ("vector->list", b_vector_to_list),
         ("list->vector", b_list_to_vector),
         // assoc lists
@@ -2767,13 +2768,33 @@ fn b_vector_set(args: &[Value]) -> Result<Value, String> {
 }
 
 fn b_vector_fill(args: &[Value]) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(arity_err("vector-fill!", "2", args.len()));
+    // R7RS: (vector-fill! v fill [start [end]])
+    if args.len() < 2 || args.len() > 4 {
+        return Err(arity_err("vector-fill!", "2..4", args.len()));
     }
     match &args[0] {
         Value::Vector(v) => {
             let mut v = v.borrow_mut();
-            for slot in v.iter_mut() {
+            let len = v.len();
+            let start = if args.len() >= 3 {
+                let i = as_int_i64("vector-fill!", &args[2])?;
+                if i < 0 || (i as usize) > len {
+                    return Err(format!("vector-fill!: start out of range: {}", i));
+                }
+                i as usize
+            } else {
+                0
+            };
+            let end = if args.len() == 4 {
+                let i = as_int_i64("vector-fill!", &args[3])?;
+                if i < 0 || (i as usize) > len || (i as usize) < start {
+                    return Err(format!("vector-fill!: end out of range: {}", i));
+                }
+                i as usize
+            } else {
+                len
+            };
+            for slot in &mut v[start..end] {
                 *slot = args[1].clone();
             }
             Ok(Value::Unspecified)
@@ -8186,6 +8207,49 @@ fn b_bytevector_copy_bang(args: &[Value]) -> Result<Value, String> {
         other => return Err(type_err("bytevector-copy!", "bytevector (dest)", other)),
     }
     Ok(Value::Unspecified)
+}
+
+/// R7RS `(string-fill! str fill [start [end]])` — destructively replaces
+/// characters in `str` with `fill`. start/end are character (not byte)
+/// indices. Defaults: start=0, end=len.
+fn b_string_fill(args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(arity_err("string-fill!", "2..4", args.len()));
+    }
+    let fill = match &args[1] {
+        Value::Character(c) => *c,
+        v => return Err(type_err("string-fill!", "character", v)),
+    };
+    match &args[0] {
+        Value::String(s) => {
+            let mut chars: Vec<char> = s.borrow().chars().collect();
+            let len = chars.len();
+            let start = if args.len() >= 3 {
+                let i = as_int_i64("string-fill!", &args[2])?;
+                if i < 0 || (i as usize) > len {
+                    return Err(format!("string-fill!: start out of range: {}", i));
+                }
+                i as usize
+            } else {
+                0
+            };
+            let end = if args.len() == 4 {
+                let i = as_int_i64("string-fill!", &args[3])?;
+                if i < 0 || (i as usize) > len || (i as usize) < start {
+                    return Err(format!("string-fill!: end out of range: {}", i));
+                }
+                i as usize
+            } else {
+                len
+            };
+            for slot in &mut chars[start..end] {
+                *slot = fill;
+            }
+            *s.borrow_mut() = chars.into_iter().collect();
+            Ok(Value::Unspecified)
+        }
+        v => Err(type_err("string-fill!", "string", v)),
+    }
 }
 
 fn b_string_copy_bang(args: &[Value]) -> Result<Value, String> {

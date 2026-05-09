@@ -225,12 +225,14 @@ Iters 117+ are filling R7RS gaps one per iter:
 - 130 R7RS port management: close-input-port, close-output-port,
   flush-output-port, input-port-open?, output-port-open?
 - 131 R7RS variadic eq predicates + list-set!: boolean=?, symbol=?,
-  list-set! (this iter)
+  list-set!
+- 132 R7RS vector-fill! optional start/end + new string-fill!
+  with same R7RS arity (this iter)
 
 Current totals:
-- 85 conformance test files (cli)
-- VM tier: 87 tests
-- Aggregate: 1757 individual Scheme tests passing
+- 86 conformance test files (cli)
+- VM tier: 88 tests
+- Aggregate: 1771 individual Scheme tests passing
 
 ## Loop cadence
 
