@@ -59,3 +59,19 @@ pub fn stash_builtin_err_irritant(v: Value) {
 pub fn take_builtin_err_irritant() -> Vec<Value> {
     BUILTIN_ERR_IRRITANT.with(|c| c.borrow_mut().take().into_iter().collect())
 }
+
+thread_local! {
+    /// Thread-local extra simple-condition tag for the next builtin Err.
+    /// Used by file-/port-/read-related builtins to mark the condition
+    /// they raise so `file-error?` / `read-error?` can recognize them.
+    static BUILTIN_ERR_EXTRA_TAG: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub fn stash_builtin_err_extra_tag(tag: &'static str) {
+    BUILTIN_ERR_EXTRA_TAG.with(|c| *c.borrow_mut() = Some(tag));
+}
+
+pub fn take_builtin_err_extra_tag() -> Option<&'static str> {
+    BUILTIN_ERR_EXTRA_TAG.with(|c| c.borrow_mut().take())
+}

@@ -3719,7 +3719,18 @@ pub fn builtin_err_to_raised(name: &str, e: &str, syms: &mut SymbolTable, span: 
         }
         None => (None, prefixed),
     };
-    set_pending_raise(make_vm_error_condition(who, message, irritants));
+    let extra_tag = cs_core::take_builtin_err_extra_tag();
+    let mut cond = make_vm_error_condition(who, message, irritants);
+    if let Some(tag) = extra_tag {
+        if let Value::Vector(vc) = &cond {
+            let mut items = vc.borrow().clone();
+            items.push(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(
+                vec![Value::string(tag)],
+            ))));
+            cond = Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(items)));
+        }
+    }
+    set_pending_raise(cond);
     VmError::new("__raised__").with_span(span)
 }
 

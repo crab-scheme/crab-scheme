@@ -214,12 +214,15 @@ Iters 117+ are filling R7RS gaps one per iter:
 - 123 string escapes `\v`, `\f`, `\|`, `\xHH;`, line continuation
 - 124 `|pipe-quoted|` identifiers
 - 125 R7RS port-output: write-string slicing, write-u8, write-bytevector,
-  open-output-string/bytevector aliases, get-output-bytevector (this iter)
+  open-output-string/bytevector aliases, get-output-bytevector
+- 126 R7RS file-error?, read-error? predicates + tagged conditions
+  (open-input-file/open-output-file failures get &file-error tag)
+  (this iter)
 
 Current totals:
-- 79 conformance test files (cli)
-- VM tier: 81 tests
-- Aggregate: 1659 individual Scheme tests passing
+- 80 conformance test files (cli)
+- VM tier: 82 tests
+- Aggregate: 1679 individual Scheme tests passing
 
 ## Loop cadence
 

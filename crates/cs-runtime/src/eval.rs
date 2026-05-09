@@ -159,7 +159,12 @@ fn builtin_err_to_eval(ctx: &mut EvalCtx, msg: String, span: Span) -> EvalError 
         }
         None => (None, msg.clone()),
     };
+    let extra_tag = cs_core::take_builtin_err_extra_tag();
     let cond = crate::builtins::make_error_condition(who, message, irritants);
+    let cond = match extra_tag {
+        Some(tag) => crate::builtins::add_simple_to_compound(cond, tag),
+        None => cond,
+    };
     EvalError::raised(cond, span)
 }
 

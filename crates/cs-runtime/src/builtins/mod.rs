@@ -309,6 +309,8 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("error-object?", b_error_object_p),
         ("error-object-message", b_error_object_message),
         ("error-object-irritants", b_error_object_irritants),
+        ("file-error?", b_file_error_p),
+        ("read-error?", b_read_error_p),
         ("assertion-violation?", b_assertion_violation_p),
         // R6RS standard condition types — constructors
         ("make-message-condition", b_make_message_condition),
@@ -3193,6 +3195,8 @@ const TAG_ASSERTION: &str = "&assertion";
 const TAG_NON_CONTINUABLE: &str = "&non-continuable";
 const TAG_WHO: &str = "&who";
 const TAG_CONDITION: &str = "&condition";
+const TAG_FILE_ERROR: &str = "&file-error";
+const TAG_READ_ERROR: &str = "&read-error";
 
 thread_local! {
     /// Map from condition tag → its parent tag. Walked by predicates to
@@ -3229,6 +3233,8 @@ pub fn init_condition_registry() {
         m.insert(TAG_VIOLATION.into(), TAG_SERIOUS.into());
         m.insert(TAG_ASSERTION.into(), TAG_VIOLATION.into());
         m.insert(TAG_NON_CONTINUABLE.into(), TAG_VIOLATION.into());
+        m.insert(TAG_FILE_ERROR.into(), TAG_ERROR.into());
+        m.insert(TAG_READ_ERROR.into(), TAG_ERROR.into());
     });
     COND_KNOWN_TAGS.with(|reg| {
         let mut s = reg.borrow_mut();
@@ -3244,6 +3250,8 @@ pub fn init_condition_registry() {
             TAG_VIOLATION,
             TAG_ASSERTION,
             TAG_NON_CONTINUABLE,
+            TAG_FILE_ERROR,
+            TAG_READ_ERROR,
         ] {
             s.insert(t.into());
         }
@@ -3364,6 +3372,21 @@ fn make_compound(simples: Vec<Value>) -> Value {
     v.push(Value::string(COND_COMPOUND_TAG));
     v.extend(simples);
     new_vector(v)
+}
+
+/// Append an empty-fielded simple of the given tag to an existing compound
+/// condition and return the updated value. Used to mark a condition with
+/// `&file-error` / `&read-error` after the base condition has been built.
+pub fn add_simple_to_compound(cond: Value, tag: &str) -> Value {
+    if !is_compound_cond(&cond) {
+        return cond;
+    }
+    if let Value::Vector(vc) = &cond {
+        let mut items = vc.borrow().clone();
+        items.push(make_simple(tag, vec![]));
+        return new_vector(items);
+    }
+    cond
 }
 
 fn new_vector(items: Vec<Value>) -> Value {
@@ -7117,6 +7140,24 @@ fn b_error_object_irritants(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Null)
 }
 
+fn b_file_error_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("file-error?", "1", args.len()));
+    }
+    Ok(Value::Boolean(
+        is_any_cond(&args[0]) && find_simple_with_tag(&args[0], TAG_FILE_ERROR).is_some(),
+    ))
+}
+
+fn b_read_error_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("read-error?", "1", args.len()));
+    }
+    Ok(Value::Boolean(
+        is_any_cond(&args[0]) && find_simple_with_tag(&args[0], TAG_READ_ERROR).is_some(),
+    ))
+}
+
 // ---- make-parameter ----
 
 fn b_make_parameter(args: &[Value]) -> Result<Value, String> {
@@ -7600,8 +7641,10 @@ fn b_open_input_file(args: &[Value]) -> Result<Value, String> {
         Value::String(s) => s.borrow().clone(),
         v => return Err(type_err("open-input-file", "string", v)),
     };
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|e| format!("open-input-file: cannot read {}: {}", path, e))?;
+    let contents = std::fs::read_to_string(&path).map_err(|e| {
+        cs_core::stash_builtin_err_extra_tag(TAG_FILE_ERROR);
+        format!("open-input-file: cannot read {}: {}", path, e)
+    })?;
     Ok(Value::Port(Port::string_input(&contents)))
 }
 
@@ -7613,10 +7656,10 @@ fn b_open_output_file(args: &[Value]) -> Result<Value, String> {
         Value::String(s) => s.borrow().clone(),
         v => return Err(type_err("open-output-file", "string", v)),
     };
-    // Eagerly check that the file is openable so users see permission /
-    // missing-directory errors at open time, not at close-port time.
-    std::fs::write(&path, "")
-        .map_err(|e| format!("open-output-file: cannot create {}: {}", path, e))?;
+    std::fs::write(&path, "").map_err(|e| {
+        cs_core::stash_builtin_err_extra_tag(TAG_FILE_ERROR);
+        format!("open-output-file: cannot create {}: {}", path, e)
+    })?;
     Ok(Value::Port(Port::file_output(path)))
 }
 
