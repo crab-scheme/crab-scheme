@@ -232,6 +232,7 @@ impl<'src> Lexer<'src> {
                 }
                 self.read_identifier(start, syms)
             }
+            b'|' => self.read_pipe_identifier(start, syms),
             c if is_initial_ident(c) => self.read_identifier(start, syms),
             c => {
                 self.bump();
@@ -239,6 +240,113 @@ impl<'src> Lexer<'src> {
                     c: c as char,
                     span: self.span(start, self.pos),
                 })
+            }
+        }
+    }
+
+    fn read_pipe_identifier(
+        &mut self,
+        start: usize,
+        syms: &mut SymbolTable,
+    ) -> Result<(Token, Span), LexError> {
+        self.bump(); // consume opening |
+        let mut out = String::new();
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(LexError::UnterminatedString {
+                        span: self.span(start, self.pos),
+                    });
+                }
+                Some(b'|') => {
+                    self.bump();
+                    let sym = syms.intern(&out);
+                    return Ok((Token::Identifier(sym), self.span(start, self.pos)));
+                }
+                Some(b'\\') => {
+                    self.bump();
+                    let esc_start = self.pos;
+                    match self.peek() {
+                        Some(b'|') => {
+                            self.bump();
+                            out.push('|');
+                        }
+                        Some(b'\\') => {
+                            self.bump();
+                            out.push('\\');
+                        }
+                        Some(b'n') => {
+                            self.bump();
+                            out.push('\n');
+                        }
+                        Some(b't') => {
+                            self.bump();
+                            out.push('\t');
+                        }
+                        Some(b'r') => {
+                            self.bump();
+                            out.push('\r');
+                        }
+                        Some(b'a') => {
+                            self.bump();
+                            out.push('\u{07}');
+                        }
+                        Some(b'b') => {
+                            self.bump();
+                            out.push('\u{08}');
+                        }
+                        Some(b'x') | Some(b'X') => {
+                            self.bump();
+                            let hex_start = self.pos;
+                            while let Some(b) = self.peek() {
+                                if b.is_ascii_hexdigit() {
+                                    self.bump();
+                                } else {
+                                    break;
+                                }
+                            }
+                            let hex_end = self.pos;
+                            if self.peek() == Some(b';') {
+                                self.bump();
+                            }
+                            if hex_start == hex_end {
+                                return Err(LexError::BadEscape {
+                                    span: self.span(esc_start, self.pos),
+                                });
+                            }
+                            let hex_str = &self.src[hex_start..hex_end];
+                            let cp = match u32::from_str_radix(hex_str, 16) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    return Err(LexError::BadEscape {
+                                        span: self.span(esc_start, self.pos),
+                                    });
+                                }
+                            };
+                            match char::from_u32(cp) {
+                                Some(c) => out.push(c),
+                                None => {
+                                    return Err(LexError::BadEscape {
+                                        span: self.span(esc_start, self.pos),
+                                    });
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(LexError::BadEscape {
+                                span: self.span(esc_start, self.pos),
+                            });
+                        }
+                    }
+                }
+                Some(_) => {
+                    let p = self.pos;
+                    self.bump();
+                    while self.pos < self.src.len() && !self.src.is_char_boundary(self.pos) {
+                        self.bump();
+                    }
+                    out.push_str(&self.src[p..self.pos]);
+                }
             }
         }
     }
@@ -849,5 +957,74 @@ mod tests {
     fn radix_negative() {
         let toks = lex("#x-ff");
         assert!(matches!(toks[0], Token::Number(Number::Fixnum(-255))));
+    }
+
+    fn lex_with_syms(src: &str) -> (Vec<Token>, SymbolTable) {
+        let mut syms = SymbolTable::new();
+        let toks = lex_all(FileId(0), src, &mut syms).unwrap();
+        (toks.into_iter().map(|(t, _)| t).collect(), syms)
+    }
+
+    #[test]
+    fn pipe_identifier_simple() {
+        let (toks, syms) = lex_with_syms("|hello world|");
+        match &toks[0] {
+            Token::Identifier(s) => assert_eq!(syms.name(*s), "hello world"),
+            other => panic!("expected identifier, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pipe_identifier_empty() {
+        let (toks, syms) = lex_with_syms("||");
+        match &toks[0] {
+            Token::Identifier(s) => assert_eq!(syms.name(*s), ""),
+            other => panic!("expected identifier, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pipe_identifier_with_special_chars() {
+        let (toks, syms) = lex_with_syms("|a+b/c=d|");
+        match &toks[0] {
+            Token::Identifier(s) => assert_eq!(syms.name(*s), "a+b/c=d"),
+            other => panic!("expected identifier, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pipe_identifier_hex_escape() {
+        let (toks, syms) = lex_with_syms("|\\x41;BC|");
+        match &toks[0] {
+            Token::Identifier(s) => assert_eq!(syms.name(*s), "ABC"),
+            other => panic!("expected identifier, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pipe_identifier_escaped_pipe() {
+        let (toks, syms) = lex_with_syms("|a\\|b|");
+        match &toks[0] {
+            Token::Identifier(s) => assert_eq!(syms.name(*s), "a|b"),
+            other => panic!("expected identifier, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pipe_identifier_unicode() {
+        let (toks, syms) = lex_with_syms("|π|");
+        match &toks[0] {
+            Token::Identifier(s) => assert_eq!(syms.name(*s), "π"),
+            other => panic!("expected identifier, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pipe_identifier_followed_by_paren() {
+        let (toks, _syms) = lex_with_syms("(|hi there| 42)");
+        assert!(matches!(toks[0], Token::LParen));
+        assert!(matches!(toks[1], Token::Identifier(_)));
+        assert!(matches!(toks[2], Token::Number(Number::Fixnum(42))));
+        assert!(matches!(toks[3], Token::RParen));
     }
 }

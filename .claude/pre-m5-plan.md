@@ -202,6 +202,23 @@ What's still in 4.G but deferred:
 - Aggregate: 1340 individual Scheme tests passing
 - Last commit: `d471f0b runtime: vector-append, subvector, make-list, list-copy`
 
+## R7RS conformance progress (post-M5)
+
+Iters 117+ are filling R7RS gaps one per iter:
+- 117 case-arrow `=>` form
+- 118 r7rs port reads (read-string, char-ready?, read-u8, peek-u8, ...)
+- 119 case-arrow else-clause
+- 120 bytevector ops via `(u8-list->bytevector ...)` + open-input-string aliases
+- 121 `#u8(...)` literal end-to-end (lex/parse/expand/eval)
+- 122 `#\alarm`, `#\backspace`, `#\delete`, `#\escape` named chars + `#\xHH...`
+- 123 string escapes `\v`, `\f`, `\|`, `\xHH;`, line continuation
+- 124 `|pipe-quoted|` identifiers (this iter)
+
+Current totals:
+- 78 conformance test files (cli)
+- VM tier: 80 tests
+- Aggregate: 1643 individual Scheme tests passing
+
 ## Loop cadence
 
 Each `/loop` iter picks the next concrete sub-task from item 1 (then 2,

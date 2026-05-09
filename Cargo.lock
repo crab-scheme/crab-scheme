@@ -125,6 +125,7 @@ name = "cs-core"
 version = "0.0.1"
 dependencies = [
  "cs-diag",
+ "cs-gc",
  "num-bigint",
  "num-rational",
  "num-traits",
@@ -143,6 +144,10 @@ dependencies = [
  "cs-ir",
  "cs-parse",
 ]
+
+[[package]]
+name = "cs-gc"
+version = "0.0.1"
 
 [[package]]
 name = "cs-ir"
@@ -178,6 +183,7 @@ dependencies = [
  "cs-core",
  "cs-diag",
  "cs-expand",
+ "cs-gc",
  "cs-ir",
  "cs-lex",
  "cs-parse",
@@ -192,6 +198,7 @@ version = "0.0.1"
 dependencies = [
  "cs-core",
  "cs-diag",
+ "cs-gc",
  "cs-ir",
 ]
 
