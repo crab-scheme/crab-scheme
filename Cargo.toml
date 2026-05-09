@@ -9,6 +9,7 @@ members = [
     "crates/cs-expand",
     "crates/cs-runtime",
     "crates/cs-vm",
+    "crates/cs-gc",
     "crates/cs-cli",
 ]
 
@@ -29,6 +30,7 @@ cs-ir = { path = "crates/cs-ir" }
 cs-expand = { path = "crates/cs-expand" }
 cs-runtime = { path = "crates/cs-runtime" }
 cs-vm = { path = "crates/cs-vm" }
+cs-gc = { path = "crates/cs-gc" }
 
 # External crates
 logos = "0.14"

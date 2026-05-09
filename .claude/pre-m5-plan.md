@@ -67,16 +67,48 @@ but doing it before M5 keeps the runtime/env story stable.
 - `m4-complete` annotated tag created at the commit (see
   `git tag m4-complete`).
 
-### 4. M5 — Precise tracing GC  [the milestone]  ← NEXT
-Per ROADMAP.md:
-- New `cs-gc` crate
-- Swap `Rc<T>` → `Gc<T>` in `Value`
-- Per-Runtime root set
-- VM stack as root set
-- Stop-the-world mark-and-sweep first; generational copying as
-  follow-up
-- 24-hour fuzz with leak detector
-- p99 GC pause < 1ms on stdlib load
+### 4. M5 — Precise tracing GC  [the milestone]  ← IN PROGRESS
+
+**4.A — `cs-gc` crate scaffold** ✅ DONE (commit pending)
+- New crate: `crates/cs-gc/`
+- Public API: `Gc<T>`, `Heap`, `Trace`, `Marker`, `Heap::collect()`
+- Phase 1 backing: `Rc<Slot<T>>` so call-site ergonomics line up
+  with the existing `Rc<RefCell<...>>` pattern in `cs-core`. Phase 2
+  swaps to a hand-rolled arena allocator without changing the API.
+- 7 isolated tests cover: alloc/deref, clone-shares, unrooted-drops,
+  rooted-stays, transitive marking through a `Trace` impl, idempotent
+  mark within a pass, and visited count.
+- Workspace member registered; `cs-gc` builds clean.
+
+**4.B — `Gc<T>` alias in `cs-core`** ← NEXT
+Add a feature-flagged type alias in `cs-core`: under `feature = "gc"`,
+`Heap-pointer` types use `Gc<T>`; otherwise fall back to `Rc<T>`. No
+behavior change yet, just the seam.
+
+**4.C — Migrate Value variants**
+One variant at a time, swap `Rc<T>` → `Gc<T>`. Run conformance under
+both flags; verify parity. Order: `Pair` → `Vector` → `String` →
+`ByteVector` → `Hashtable` → `Port` → `Procedure` → `Record` →
+`Closure` → `Continuation` → `Promise` → `Parameter`.
+
+**4.D — Per-Runtime root set wired**
+Hook the Runtime's top-level `Frame` chain and the VM's value/frame
+stacks into `Heap::add_root`. Add a `pending_values` root closure.
+
+**4.E — Drop the `Rc` import from `value.rs`**
+Acceptance: `grep "Rc<" crates/cs-core/src/value.rs` returns no
+heap-data uses. Symbol-table `Rc<str>` interning may stay (it's
+immortal once interned).
+
+**4.F — Phase 2 swap**
+Replace `Rc<Slot<T>>` backing with a hand-rolled arena. Same `Gc<T>`
+external API. (Optional for M5 exit; Phase 1's cycle handling via
+weak-ref bookkeeping is sufficient for the conformance gate, but
+the perf gate needs the arena.)
+
+**4.G — Fuzz target + criterion bench**
+24-hour fuzz target + p99 pause-time bench. Captures the M5 exit
+gates from the spec.
 
 ## Conformance baseline at start of plan
 
