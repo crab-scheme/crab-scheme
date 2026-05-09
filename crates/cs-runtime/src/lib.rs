@@ -310,6 +310,19 @@ impl Runtime {
                 Ok(Value::Symbol(st.intern(&name)))
             }),
         );
+        // (features) — same identifier list as cond-expand recognizes.
+        let features_sym = syms.intern("features");
+        vm_env.define(
+            features_sym,
+            cs_vm::vm::make_vm_builtin_syms("features", |args, st| {
+                if !args.is_empty() {
+                    return Err("features: 0 args".into());
+                }
+                let feats = ["crabscheme", "r6rs-subset", "r7rs-subset", "exact-closed"];
+                let list: Vec<Value> = feats.iter().map(|n| Value::Symbol(st.intern(n))).collect();
+                Ok(Value::list(list))
+            }),
+        );
         Self {
             syms,
             sources: SourceMap::new(),

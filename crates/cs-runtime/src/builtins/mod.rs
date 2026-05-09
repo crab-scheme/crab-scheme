@@ -245,6 +245,8 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // (hashtable-update! is higher-order — see below)
         // i/o (no syms — those are HO below)
         ("newline", b_newline),
+        // R7RS portability
+        ("crabscheme-version", b_crabscheme_version),
     ]
 }
 
@@ -286,6 +288,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("current-output-port", b_current_output_port),
         ("gensym", b_gensym),
         ("eval", b_eval),
+        ("features", b_features),
         // vector higher-order
         ("vector-map", b_vector_map),
         ("vector-for-each", b_vector_for_each),
@@ -1033,6 +1036,30 @@ fn b_inexact_p(args: &[Value]) -> Result<Value, String> {
         Value::Number(n) => Ok(Value::Boolean(!n.is_exact())),
         v => Err(type_err("inexact?", "number", v)),
     }
+}
+
+/// `(features)` — R7RS portability. Returns a list of feature symbols
+/// matching the cond-expand identifiers the expander recognizes.
+fn b_features(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("features", "0", args.len()));
+    }
+    let feats = ["crabscheme", "r6rs-subset", "r7rs-subset", "exact-closed"];
+    let syms_list: Vec<Value> = feats
+        .iter()
+        .map(|n| Value::Symbol(ctx.syms.intern(n)))
+        .collect();
+    Ok(Value::list(syms_list))
+}
+
+/// `(crabscheme-version)` — non-portable, returns the implementation's
+/// own version string. Useful for compatibility shims that only need to
+/// know they're running on CrabScheme.
+fn b_crabscheme_version(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("crabscheme-version", "0", args.len()));
+    }
+    Ok(Value::string(env!("CARGO_PKG_VERSION")))
 }
 
 fn b_newline(args: &[Value]) -> Result<Value, String> {

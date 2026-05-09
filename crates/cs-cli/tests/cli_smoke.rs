@@ -269,6 +269,25 @@ fn run_metacircular_vm() {
 }
 
 #[test]
+fn features_builtin_returns_advertised_symbols() {
+    let (out, _, code) = run_eval("(features)");
+    assert_eq!(code, 0);
+    let s = out.trim();
+    // Must contain the four known features as symbols (no quoting).
+    for f in ["crabscheme", "r6rs-subset", "r7rs-subset", "exact-closed"] {
+        assert!(s.contains(f), "missing feature {} in {:?}", f, s);
+    }
+}
+
+#[test]
+fn version_builtin_returns_string() {
+    let (out, _, code) = run_eval("(crabscheme-version)");
+    assert_eq!(code, 0);
+    // Should be a quoted string (write mode).
+    assert!(out.contains("\"0.0"), "stdout: {:?}", out);
+}
+
+#[test]
 fn walker_runtime_error_includes_call_stack_backtrace() {
     // Same fixture as the VM test, but on the walker tier. The walker
     // pushes App spans onto ctx.call_stack regardless of tail-call
