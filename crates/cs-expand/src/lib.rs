@@ -172,6 +172,7 @@ struct Keywords {
     let_syntax: Symbol,
     letrec_syntax: Symbol,
     syntax_rules: Symbol,
+    syntax_error: Symbol,
     ellipsis: Symbol,
     underscore: Symbol,
     delay: Symbol,
@@ -227,6 +228,7 @@ impl Keywords {
             let_syntax: syms.intern("let-syntax"),
             letrec_syntax: syms.intern("letrec-syntax"),
             syntax_rules: syms.intern("syntax-rules"),
+            syntax_error: syms.intern("syntax-error"),
             ellipsis: syms.intern("..."),
             underscore: syms.intern("_"),
             delay: syms.intern("delay"),
@@ -1145,6 +1147,13 @@ impl<'a> Expander<'a> {
             }
             if s == self.keywords.delay {
                 return self.expand_delay(&tail_items, span);
+            }
+            if s == self.keywords.syntax_error {
+                // R7RS (syntax-error message irritant ...) — expansion
+                // fails immediately with the supplied message. Useful
+                // for syntax-rules templates that need to reject a
+                // malformed input pattern.
+                return self.expand_syntax_error(&tail_items, span);
             }
             if s == self.keywords.delay_force {
                 // R7RS delay-force: same expansion as delay (a thunk-wrapping
@@ -3014,6 +3023,39 @@ impl<'a> Expander<'a> {
                 span,
             }),
         }
+    }
+
+    fn expand_syntax_error(
+        &mut self,
+        items: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        if items.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "syntax-error needs at least a message".into(),
+                span,
+            });
+        }
+        let message: String = match &items[0] {
+            Datum::String(s, _) => s.as_ref().clone(),
+            _ => {
+                return Err(ExpandError::BadSyntax {
+                    what: "syntax-error: first arg must be a string literal".into(),
+                    span,
+                });
+            }
+        };
+        // Build a "<message> [<irritant1> <irritant2> ...]" string for the
+        // diagnostic. Irritants render via Datum's Display impl.
+        let mut full = message;
+        if items.len() > 1 {
+            full.push(':');
+            for ir in &items[1..] {
+                full.push(' ');
+                full.push_str(&format!("{:?}", ir));
+            }
+        }
+        Err(ExpandError::BadSyntax { what: full, span })
     }
 
     fn expand_delay(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
@@ -5102,5 +5144,64 @@ mod tests {
     #[test]
     fn expand_define_fn_sugar() {
         let (_e, _) = expand_str("(define (square x) (* x x)) (square 5)");
+    }
+
+    fn try_expand(src: &str) -> Result<CoreExpr, ExpandError> {
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let data = cs_parse::read_all(FileId(0), src, &mut syms).unwrap();
+        let mut exp = Expander::new(&mut syms, &mut macros);
+        let r = exp.expand_program(&data);
+        drop(exp);
+        r
+    }
+
+    #[test]
+    fn syntax_error_fires_on_top_level() {
+        let r = try_expand("(syntax-error \"boom\")");
+        assert!(matches!(r, Err(ExpandError::BadSyntax { .. })));
+        if let Err(ExpandError::BadSyntax { what, .. }) = r {
+            assert!(what.contains("boom"), "expected 'boom' in: {}", what);
+        }
+    }
+
+    #[test]
+    fn syntax_error_with_irritants_includes_them() {
+        let r = try_expand("(syntax-error \"bad form\" foo bar)");
+        if let Err(ExpandError::BadSyntax { what, .. }) = r {
+            assert!(what.contains("bad form"), "msg in: {}", what);
+        } else {
+            panic!("expected BadSyntax");
+        }
+    }
+
+    #[test]
+    fn syntax_error_in_unmatched_rule_doesnt_fire() {
+        let r = try_expand(
+            "(define-syntax foo (syntax-rules () \
+             ((_ x) x) \
+             ((_ x y) (syntax-error \"two-arg\")))) \
+             (foo 1)",
+        );
+        assert!(r.is_ok(), "matched-branch should not trigger syntax-error");
+    }
+
+    #[test]
+    fn syntax_error_in_matched_rule_fires() {
+        let r = try_expand(
+            "(define-syntax foo (syntax-rules () \
+             ((_ x) x) \
+             ((_ x y) (syntax-error \"two-arg form forbidden\")))) \
+             (foo 1 2)",
+        );
+        if let Err(ExpandError::BadSyntax { what, .. }) = r {
+            assert!(
+                what.contains("two-arg form forbidden"),
+                "expected msg in: {}",
+                what
+            );
+        } else {
+            panic!("expected BadSyntax, got {:?}", r);
+        }
     }
 }

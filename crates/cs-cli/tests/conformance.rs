@@ -519,6 +519,11 @@ fn conformance_r7rs_delay_force() {
 }
 
 #[test]
+fn conformance_r7rs_syntax_error() {
+    run_conformance_file("r7rs_syntax_error.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -627,6 +632,7 @@ fn conformance_aggregate_count() {
                 "r7rs_eq_predicates.scm",
                 "r7rs_fill.scm",
                 "r7rs_delay_force.scm",
+                "r7rs_syntax_error.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
