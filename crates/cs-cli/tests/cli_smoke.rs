@@ -269,6 +269,42 @@ fn run_metacircular_vm() {
 }
 
 #[test]
+fn vm_runtime_error_includes_call_stack_backtrace() {
+    // Three nested non-tail calls; deepest one references an undefined
+    // variable. The VM walks frames at error time and emits one note per
+    // outer frame.
+    let bt_test = std::env::temp_dir().join("crabscheme_bt_smoke.scm");
+    std::fs::write(
+        &bt_test,
+        "(define (deep-error)\n  (foo 1 2)\n  'unreachable)\n\
+         (define (middle)\n  (deep-error)\n  'unreachable)\n\
+         (define (outer)\n  (middle)\n  'unreachable)\n\
+         (outer)\n",
+    )
+    .unwrap();
+    let out = cli()
+        .args(["--tier", "vm", "run", bt_test.to_str().unwrap()])
+        .output()
+        .expect("vm");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("undefined variable: foo"), "{}", err);
+    assert!(
+        err.contains("called from [1]"),
+        "innermost-frame note missing: {}",
+        err
+    );
+    // The outer two frames produce two more `called from` notes.
+    let count = err.matches("called from").count();
+    assert!(
+        count >= 2,
+        "expected ≥2 backtrace lines, got {}: {}",
+        count,
+        err
+    );
+    let _ = std::fs::remove_file(&bt_test);
+}
+
+#[test]
 fn color_never_produces_plain_text() {
     // --color never: no ANSI escape codes regardless of TTY.
     let out = cli()

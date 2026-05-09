@@ -463,6 +463,7 @@ impl Runtime {
         // diagnostic can show source line/column.
         result.map_err(|e| {
             let span = e.span;
+            let backtrace = e.backtrace.clone();
             let msg = match e.message.as_str() {
                 "__raised__" => match cs_vm::vm::vm_take_pending_raise() {
                     Some(cond) => format_condition(&cond, &self.syms),
@@ -478,7 +479,21 @@ impl Runtime {
                 },
                 _ => e.message,
             };
-            Diagnostic::error(msg, span).with_code("E_RUNTIME")
+            let mut diag = Diagnostic::error(msg, span).with_code("E_RUNTIME");
+            // Render each call-stack frame as a note line. Innermost-first
+            // ordering matches the bare-error site at the top of the diag.
+            for (i, bt_span) in backtrace.iter().enumerate() {
+                let (line, col) = self.sources.line_col(*bt_span);
+                let name = self.sources.name(bt_span.file);
+                diag = diag.with_note(format!(
+                    "called from {} ({}:{}:{})",
+                    if i == 0 { "[1] " } else { "    " },
+                    name,
+                    line,
+                    col
+                ));
+            }
+            diag
         })
     }
 

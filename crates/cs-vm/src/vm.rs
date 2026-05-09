@@ -163,6 +163,10 @@ fn swap_output_port(new: Option<Value>) -> Option<Value> {
 pub struct VmError {
     pub message: String,
     pub span: Span,
+    /// Caller-call-site spans, innermost first. Populated by the VM dispatch
+    /// loop when an error bubbles out: each entry is the span of a Call /
+    /// TailCall instruction in an outer frame, in stack order.
+    pub backtrace: Vec<Span>,
 }
 
 impl VmError {
@@ -170,6 +174,7 @@ impl VmError {
         Self {
             message: msg.into(),
             span: Span::DUMMY,
+            backtrace: Vec::new(),
         }
     }
 
@@ -360,6 +365,30 @@ pub fn run_with_entry(
         env: top_env,
         bc,
     }];
+    let result = run_dispatch(&mut stack, &mut frames, syms);
+    result.map_err(|mut e| {
+        // Attach a backtrace: spans of the Call/TailCall instructions in
+        // the outer frames at the point the error bubbled out. Innermost
+        // first, so callers can render "in <site> --> ...".
+        for frame in frames.iter().rev().skip(1) {
+            let ip = frame.ip.saturating_sub(1);
+            if let Some(s) = frame.spans.get(ip).copied() {
+                if !s.is_dummy() {
+                    e.backtrace.push(s);
+                }
+            }
+        }
+        e
+    })
+}
+
+/// The actual dispatch loop, factored out so `run_with_entry` can wrap
+/// its result with a frame-walking backtrace builder before returning.
+fn run_dispatch(
+    stack: &mut Vec<Value>,
+    frames: &mut Vec<Frame>,
+    syms: &mut SymbolTable,
+) -> Result<Value, VmError> {
     loop {
         let Some(frame) = frames.last_mut() else {
             return Err(VmError::new("vm stack underflow"));
