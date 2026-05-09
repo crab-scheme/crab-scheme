@@ -293,6 +293,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("write", b_write),
         ("raise", b_raise),
         ("error", b_error_ho),
+        ("assertion-violation", b_assertion_violation),
         ("with-exception-handler", b_with_exception_handler),
         ("symbol->string", b_symbol_to_string_ho),
         ("string->symbol", b_string_to_symbol_ho),
@@ -1812,19 +1813,6 @@ fn flatten_simples(cond: &Value, out: &mut Vec<Value>) {
     }
 }
 
-/// Internal builder used by the existing `error` / VM error path. Produces a
-/// compound condition with `&error`, `&message`, and (when non-empty) `&irritants`.
-fn make_condition(msg: String, irritants: Vec<Value>) -> Value {
-    let mut simples = vec![
-        make_simple(TAG_ERROR, vec![]),
-        make_simple(TAG_MESSAGE, vec![Value::string(msg)]),
-    ];
-    if !irritants.is_empty() {
-        simples.push(make_simple(TAG_IRRITANTS, vec![Value::list(irritants)]));
-    }
-    make_compound(simples)
-}
-
 fn b_condition_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("condition?", "1", args.len()));
@@ -2148,14 +2136,82 @@ fn b_error_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.is_empty() {
         return Err("error: needs at least 1 argument".into());
     }
-    let msg = match &args[0] {
+    // R6RS `(error who message irritant ...)` vs R7RS `(error message
+    // irritant ...)`. We accept both: when args[0] is a symbol, `#f`, or a
+    // string with at least one more arg AND args[1] is a string, treat
+    // args[0] as who. Otherwise treat args[0] as the message.
+    //
+    // The string-vs-string disambiguation is the only ambiguous case; we
+    // resolve it as "if there are ≥2 args and args[1] is also a string,
+    // assume R6RS-style — args[0] is who". This matches what most R6RS
+    // implementations do and keeps backward compat with single-string
+    // R7RS calls like `(error "boom")`.
+    let (who, msg_idx) = match &args[0] {
+        Value::Symbol(_) | Value::Boolean(false) => (Some(args[0].clone()), 1),
+        Value::String(_) if args.len() >= 2 && matches!(&args[1], Value::String(_)) => {
+            (Some(args[0].clone()), 1)
+        }
+        _ => (None, 0),
+    };
+    let msg = if msg_idx < args.len() {
+        match &args[msg_idx] {
+            Value::String(s) => s.borrow().clone(),
+            other => format!("{}", other),
+        }
+    } else {
+        // R7RS allows `(error <who-symbol>)` with no message — fall back
+        // to a generic placeholder.
+        "error".to_string()
+    };
+    let irritants: Vec<Value> = if msg_idx + 1 <= args.len() {
+        args[(msg_idx + 1).min(args.len())..].to_vec()
+    } else {
+        Vec::new()
+    };
+    let condition = make_error_condition(who, msg, irritants);
+    ctx.pending_raise = Some(condition);
+    Err("__raised__".to_string())
+}
+
+/// R6RS `(assertion-violation who message irritant ...)`. Always parses
+/// `who` as the first arg (R6RS spec — and there's no ambiguity since the
+/// caller is expected to pass a symbol/string/#f). Raises a compound
+/// containing `&assertion`, `&who`, `&message`, and (if any) `&irritants`.
+fn b_assertion_violation(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err("assertion-violation: needs at least <who> and <message>".into());
+    }
+    let who = args[0].clone();
+    let msg = match &args[1] {
         Value::String(s) => s.borrow().clone(),
         other => format!("{}", other),
     };
-    let irritants: Vec<Value> = args[1..].to_vec();
-    let condition = make_condition(msg, irritants);
-    ctx.pending_raise = Some(condition);
+    let irritants: Vec<Value> = args[2..].to_vec();
+    let mut simples = vec![
+        make_simple(TAG_ASSERTION, vec![]),
+        make_simple(TAG_WHO, vec![who]),
+        make_simple(TAG_MESSAGE, vec![Value::string(msg)]),
+    ];
+    if !irritants.is_empty() {
+        simples.push(make_simple(TAG_IRRITANTS, vec![Value::list(irritants)]));
+    }
+    ctx.pending_raise = Some(make_compound(simples));
     Err("__raised__".to_string())
+}
+
+/// Helper used by `error` and the VM-tier error path. Builds a compound
+/// condition with `&error`, optional `&who`, `&message`, and (if non-empty)
+/// `&irritants`. Centralized so both tiers produce the same shape.
+fn make_error_condition(who: Option<Value>, msg: String, irritants: Vec<Value>) -> Value {
+    let mut simples = vec![make_simple(TAG_ERROR, vec![])];
+    if let Some(w) = who {
+        simples.push(make_simple(TAG_WHO, vec![w]));
+    }
+    simples.push(make_simple(TAG_MESSAGE, vec![Value::string(msg)]));
+    if !irritants.is_empty() {
+        simples.push(make_simple(TAG_IRRITANTS, vec![Value::list(irritants)]));
+    }
+    make_compound(simples)
 }
 
 fn b_with_exception_handler(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {

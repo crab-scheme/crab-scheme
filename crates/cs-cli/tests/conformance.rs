@@ -264,6 +264,11 @@ fn conformance_define_condition_type() {
 }
 
 #[test]
+fn conformance_error_who() {
+    run_conformance_file("error_who.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -321,6 +326,7 @@ fn conformance_aggregate_count() {
                 "conditions_r6rs.scm",
                 "records_parent.scm",
                 "define_condition_type.scm",
+                "error_who.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

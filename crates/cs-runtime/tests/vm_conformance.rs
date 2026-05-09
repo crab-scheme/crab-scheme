@@ -399,3 +399,11 @@ fn vm_conformance_define_condition_type() {
     println!("define_condition_type: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_error_who() {
+    let walker = pass_count_walker("error_who.scm");
+    let vm = pass_count_vm("error_who.scm").expect("vm should run error_who.scm");
+    println!("error_who: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

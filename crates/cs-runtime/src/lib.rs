@@ -246,6 +246,8 @@ impl Runtime {
         vm_env.define(raise_sym, cs_vm::vm::make_vm_raise());
         let error_sym = syms.intern("error");
         vm_env.define(error_sym, cs_vm::vm::make_vm_error_fn());
+        let av_sym = syms.intern("assertion-violation");
+        vm_env.define(av_sym, cs_vm::vm::make_vm_assertion_violation());
         let weh_sym = syms.intern("with-exception-handler");
         vm_env.define(weh_sym, cs_vm::vm::make_vm_with_exception_handler());
         let dwind_sym = syms.intern("dynamic-wind");

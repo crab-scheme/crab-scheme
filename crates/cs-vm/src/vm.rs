@@ -1056,12 +1056,45 @@ fn run_dispatch(
                         if args.is_empty() {
                             return Err(VmError::new("error: needs at least 1 arg"));
                         }
+                        // Same who-detection as the walker tier: a leading
+                        // symbol/#f/string-with-string-following is `who`;
+                        // otherwise treat args[0] as the message.
+                        let take_who = matches!(&args[0], Value::Symbol(_) | Value::Boolean(false))
+                            || (matches!(&args[0], Value::String(_))
+                                && args.len() >= 2
+                                && matches!(&args[1], Value::String(_)));
+                        let who = if take_who { Some(args.remove(0)) } else { None };
+                        let msg = if !args.is_empty() {
+                            match &args[0] {
+                                Value::String(s) => s.borrow().clone(),
+                                other => format!("{}", other),
+                            }
+                        } else {
+                            "error".to_string()
+                        };
+                        let irritants: Vec<Value> = if !args.is_empty() {
+                            args.drain(1..).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        set_pending_raise(make_vm_error_condition(who, msg, irritants));
+                        return Err(VmError::new("__raised__"));
+                    }
+                    if p.as_any().downcast_ref::<VmAssertionViolation>().is_some() {
+                        if args.len() < 2 {
+                            return Err(VmError::new(
+                                "assertion-violation: needs at least <who> and <message>",
+                            ));
+                        }
+                        let who = args.remove(0);
                         let msg = match &args[0] {
                             Value::String(s) => s.borrow().clone(),
                             other => format!("{}", other),
                         };
                         let irritants: Vec<Value> = args.drain(1..).collect();
-                        set_pending_raise(make_vm_condition(msg, irritants));
+                        set_pending_raise(make_vm_assertion_violation_condition(
+                            who, msg, irritants,
+                        ));
                         return Err(VmError::new("__raised__"));
                     }
                     if p.as_any()
@@ -2422,6 +2455,8 @@ pub struct VmRaise;
 #[derive(Debug)]
 pub struct VmErrorFn;
 #[derive(Debug)]
+pub struct VmAssertionViolation;
+#[derive(Debug)]
 pub struct VmWithExceptionHandler;
 #[derive(Debug)]
 pub struct VmCallCc;
@@ -2438,6 +2473,7 @@ pub struct VmContinuation {
 
 impl_proc_named!(VmRaise, "raise");
 impl_proc_named!(VmErrorFn, "error");
+impl_proc_named!(VmAssertionViolation, "assertion-violation");
 impl_proc_named!(VmWithExceptionHandler, "with-exception-handler");
 impl_proc_named!(VmCallCc, "call/cc");
 impl_proc_named!(VmDynamicWind, "dynamic-wind");
@@ -2448,6 +2484,9 @@ pub fn make_vm_raise() -> Value {
 }
 pub fn make_vm_error_fn() -> Value {
     Value::Procedure(Rc::new(VmErrorFn) as Rc<dyn Procedure>)
+}
+pub fn make_vm_assertion_violation() -> Value {
+    Value::Procedure(Rc::new(VmAssertionViolation) as Rc<dyn Procedure>)
 }
 pub fn make_vm_with_exception_handler() -> Value {
     Value::Procedure(Rc::new(VmWithExceptionHandler) as Rc<dyn Procedure>)
@@ -2462,15 +2501,45 @@ pub fn make_vm_continuation(id: u64) -> Value {
     Value::Procedure(Rc::new(VmContinuation { id }) as Rc<dyn Procedure>)
 }
 
-/// Build a "condition" value matching the tree-walker's `make_condition`:
-/// a compound `#("&compound-condition" #("&error") #("&message" msg)
-/// [#("&irritants" (irritants…))])`. Both tiers must produce the same shape
-/// because `with-exception-handler` callbacks observe the raw value.
-fn make_vm_condition(msg: String, irritants: Vec<Value>) -> Value {
+/// Build a "condition" value matching the tree-walker's
+/// `make_error_condition`: a compound containing `&error`, optionally
+/// `&who`, `&message`, and (when non-empty) `&irritants`. Both tiers must
+/// produce the same shape because `with-exception-handler` callbacks
+/// observe the raw value.
+pub fn make_vm_error_condition(who: Option<Value>, msg: String, irritants: Vec<Value>) -> Value {
+    let mk =
+        |items: Vec<Value>| -> Value { Value::Vector(Rc::new(std::cell::RefCell::new(items))) };
+    let mut simples = vec![mk(vec![Value::string("&error")])];
+    if let Some(w) = who {
+        simples.push(mk(vec![Value::string("&who"), w]));
+    }
+    simples.push(mk(vec![Value::string("&message"), Value::string(msg)]));
+    if !irritants.is_empty() {
+        simples.push(mk(vec![
+            Value::string("&irritants"),
+            Value::list(irritants),
+        ]));
+    }
+    let mut compound = Vec::with_capacity(1 + simples.len());
+    compound.push(Value::string("&compound-condition"));
+    compound.extend(simples);
+    mk(compound)
+}
+
+/// Mirror of `make_error_condition` for assertion violations.
+/// Produces a compound with `&assertion`, `&who`, `&message`, and
+/// (when non-empty) `&irritants` — matching what `assertion-violation`
+/// produces on the tree-walker tier.
+pub fn make_vm_assertion_violation_condition(
+    who: Value,
+    msg: String,
+    irritants: Vec<Value>,
+) -> Value {
     let mk =
         |items: Vec<Value>| -> Value { Value::Vector(Rc::new(std::cell::RefCell::new(items))) };
     let mut simples = vec![
-        mk(vec![Value::string("&error")]),
+        mk(vec![Value::string("&assertion")]),
+        mk(vec![Value::string("&who"), who]),
         mk(vec![Value::string("&message"), Value::string(msg)]),
     ];
     if !irritants.is_empty() {
