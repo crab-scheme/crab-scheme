@@ -422,6 +422,15 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("get-output-string", b_get_output_string),
         ("read-char", b_read_char),
         ("peek-char", b_peek_char),
+        ("read-string", b_read_string),
+        // R7RS aliases for the R6RS open-{string,bytevector}-input-port forms.
+        ("open-input-string", b_open_string_input_port),
+        ("open-input-bytevector", b_open_bytevector_input_port),
+        ("char-ready?", b_char_ready_p),
+        ("read-u8", b_read_u8),
+        ("peek-u8", b_peek_u8),
+        ("u8-ready?", b_u8_ready_p),
+        ("read-bytevector", b_read_bytevector),
         ("get-line", b_get_line),
         ("port?", b_port_p),
         ("input-port?", b_input_port_p),
@@ -5471,6 +5480,145 @@ fn b_peek_char(args: &[Value]) -> Result<Value, String> {
             _ => Err("peek-char: not an input port".into()),
         },
         v => Err(type_err("peek-char", "input-port", v)),
+    }
+}
+
+/// `(read-string k port)` — R7RS. Read up to k chars from `port` and
+/// return them as a string. If 0 chars remain at EOF, returns the
+/// EOF object. If fewer than k are available, returns whatever's
+/// available; subsequent reads would return EOF.
+fn b_read_string(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("read-string", "2", args.len()));
+    }
+    let k = as_int_i64("read-string", &args[0])?;
+    if k < 0 {
+        return Err("read-string: negative count".into());
+    }
+    let k = k as usize;
+    match &args[1] {
+        Value::Port(p) => match &**p {
+            Port::StringInput(state) => {
+                let mut s = state.borrow_mut();
+                if s.pos >= s.chars.len() {
+                    return Ok(Value::Eof);
+                }
+                let end = std::cmp::min(s.pos + k, s.chars.len());
+                let collected: String = s.chars[s.pos..end].iter().collect();
+                s.pos = end;
+                Ok(Value::string(collected))
+            }
+            _ => Err("read-string: not a textual input port".into()),
+        },
+        v => Err(type_err("read-string", "input-port", v)),
+    }
+}
+
+/// `(char-ready? port)` — R7RS. True if a `read-char` would return
+/// without blocking. For string ports we always know the answer:
+/// true if chars remain, true at EOF (read-char returns EOF without
+/// blocking), so always true for our backing.
+fn b_char_ready_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("char-ready?", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::StringInput(_) => Ok(Value::Boolean(true)),
+            _ => Err("char-ready?: not a textual input port".into()),
+        },
+        v => Err(type_err("char-ready?", "input-port", v)),
+    }
+}
+
+/// `(read-u8 port)` — R7RS. Read one byte from a binary input port
+/// or return EOF.
+fn b_read_u8(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("read-u8", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorInput(state) => {
+                let mut s = state.borrow_mut();
+                if s.pos < s.bytes.len() {
+                    let b = s.bytes[s.pos];
+                    s.pos += 1;
+                    Ok(Value::fixnum(b as i64))
+                } else {
+                    Ok(Value::Eof)
+                }
+            }
+            _ => Err("read-u8: not a binary input port".into()),
+        },
+        v => Err(type_err("read-u8", "input-port", v)),
+    }
+}
+
+/// `(peek-u8 port)` — R7RS. Like `read-u8` but without consuming.
+fn b_peek_u8(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("peek-u8", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorInput(state) => {
+                let s = state.borrow();
+                if s.pos < s.bytes.len() {
+                    Ok(Value::fixnum(s.bytes[s.pos] as i64))
+                } else {
+                    Ok(Value::Eof)
+                }
+            }
+            _ => Err("peek-u8: not a binary input port".into()),
+        },
+        v => Err(type_err("peek-u8", "input-port", v)),
+    }
+}
+
+/// `(u8-ready? port)` — R7RS binary counterpart of char-ready?.
+fn b_u8_ready_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("u8-ready?", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorInput(_) => Ok(Value::Boolean(true)),
+            _ => Err("u8-ready?: not a binary input port".into()),
+        },
+        v => Err(type_err("u8-ready?", "input-port", v)),
+    }
+}
+
+/// `(read-bytevector k port)` — R7RS. Read up to k bytes; returns a
+/// fresh bytevector (possibly shorter than k) or EOF when no bytes
+/// remain.
+fn b_read_bytevector(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("read-bytevector", "2", args.len()));
+    }
+    let k = as_int_i64("read-bytevector", &args[0])?;
+    if k < 0 {
+        return Err("read-bytevector: negative count".into());
+    }
+    let k = k as usize;
+    match &args[1] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorInput(state) => {
+                let mut s = state.borrow_mut();
+                if s.pos >= s.bytes.len() {
+                    return Ok(Value::Eof);
+                }
+                let end = std::cmp::min(s.pos + k, s.bytes.len());
+                let bytes: Vec<u8> = s.bytes[s.pos..end].to_vec();
+                s.pos = end;
+                Ok(Value::ByteVector(cs_core::Gc::new(
+                    std::cell::RefCell::new(bytes),
+                )))
+            }
+            _ => Err("read-bytevector: not a binary input port".into()),
+        },
+        v => Err(type_err("read-bytevector", "input-port", v)),
     }
 }
 
