@@ -439,6 +439,11 @@ fn conformance_r7rs_assoc_member_compare() {
 }
 
 #[test]
+fn conformance_r7rs_define_record_type() {
+    run_conformance_file("r7rs_define_record_type.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -531,6 +536,7 @@ fn conformance_aggregate_count() {
                 "r7rs_define_library.scm",
                 "exact_integer_sqrt.scm",
                 "r7rs_assoc_member_compare.scm",
+                "r7rs_define_record_type.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

@@ -2996,12 +2996,242 @@ impl<'a> Expander<'a> {
         })
     }
 
-    /// `(define-record-type name-spec (fields field-spec ...))`
+    /// Build a proper-list `Datum::Pair` chain from a Vec of items,
+    /// terminated by `Datum::Null(span)`. Used by the R7RS DRT
+    /// transformation to synthesize R6RS-shaped clauses.
+    fn datum_list(items: Vec<Datum>, span: Span) -> Datum {
+        let mut acc = Datum::Null(span);
+        for item in items.into_iter().rev() {
+            acc = Datum::Pair(Rc::new(item), Rc::new(acc), span);
+        }
+        acc
+    }
+
+    /// R7RS shape — transforms to R6RS shape and falls through to
+    /// the main expander. R7RS:
+    ///   `(define-record-type Foo (make-foo x y) foo?
+    ///      (x foo-x) (y foo-y set-foo-y!))`
+    /// becomes R6RS:
+    ///   `(define-record-type (Foo make-foo foo?)
+    ///      (fields (immutable x foo-x) (mutable y foo-y set-foo-y!)))`
+    ///
+    /// Field ordering follows the constructor's argument order, not
+    /// the source order of the field-spec clauses (so the vector-
+    /// slot offsets match what the constructor builds). Field-specs
+    /// for fields the constructor doesn't mention are appended at
+    /// the end — those fields land at later vector slots and the
+    /// constructor takes only the constructor-argument fields.
+    /// (Phase-1 limitation: such "hidden" fields are vector-set! to
+    /// the last constructor arg's value; programs that need real
+    /// "uninitialized" behavior should use a wrapper.)
+    fn expand_define_record_type_r7rs(
+        &mut self,
+        items: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        // items[0] = type-name (bare symbol; checked by caller)
+        // items[1] = (ctor-name field...)
+        // items[2] = predicate (bare symbol)
+        // items[3..] = field-spec : (field-name accessor) | (field-name accessor mutator)
+        if items.len() < 3 {
+            return Err(ExpandError::BadSyntax {
+                what: "R7RS define-record-type needs name, constructor spec, and predicate".into(),
+                span,
+            });
+        }
+        let type_name = match &items[0] {
+            Datum::Symbol(s, sp) => (*s, *sp),
+            _ => unreachable!("caller verified bare-symbol name"),
+        };
+        let ctor_parts = collect_proper_list_strict(&items[1]).ok_or(ExpandError::BadSyntax {
+            what: "R7RS define-record-type: constructor spec must be a list".into(),
+            span: items[1].span(),
+        })?;
+        if ctor_parts.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "R7RS define-record-type: empty constructor spec".into(),
+                span: items[1].span(),
+            });
+        }
+        let ctor_name = match &ctor_parts[0] {
+            Datum::Symbol(s, sp) => (*s, *sp),
+            _ => {
+                return Err(ExpandError::BadSyntax {
+                    what: "constructor name must be a symbol".into(),
+                    span: ctor_parts[0].span(),
+                })
+            }
+        };
+        let mut ctor_fields: Vec<(Symbol, Span)> = Vec::with_capacity(ctor_parts.len() - 1);
+        for f in &ctor_parts[1..] {
+            match f {
+                Datum::Symbol(s, sp) => ctor_fields.push((*s, *sp)),
+                _ => {
+                    return Err(ExpandError::BadSyntax {
+                        what: "constructor field name must be a symbol".into(),
+                        span: f.span(),
+                    })
+                }
+            }
+        }
+        let pred_name = match &items[2] {
+            Datum::Symbol(s, sp) => (*s, *sp),
+            _ => {
+                return Err(ExpandError::BadSyntax {
+                    what: "R7RS define-record-type: predicate must be a symbol".into(),
+                    span: items[2].span(),
+                })
+            }
+        };
+
+        // Collect field-spec clauses into a map.
+        struct FldSpec {
+            accessor: Datum,
+            mutator: Option<Datum>,
+            span: Span,
+        }
+        let mut field_map: std::collections::HashMap<Symbol, FldSpec> =
+            std::collections::HashMap::new();
+        let mut field_order: Vec<Symbol> = Vec::new();
+        for fs in &items[3..] {
+            let parts = collect_proper_list_strict(fs).ok_or(ExpandError::BadSyntax {
+                what: "field-spec must be a list".into(),
+                span: fs.span(),
+            })?;
+            if parts.len() < 2 || parts.len() > 3 {
+                return Err(ExpandError::BadSyntax {
+                    what: "field-spec must be (field-name accessor) or \
+                           (field-name accessor mutator)"
+                        .into(),
+                    span: fs.span(),
+                });
+            }
+            let fname = match &parts[0] {
+                Datum::Symbol(s, _) => *s,
+                _ => {
+                    return Err(ExpandError::BadSyntax {
+                        what: "field-spec name must be a symbol".into(),
+                        span: parts[0].span(),
+                    })
+                }
+            };
+            if !matches!(parts[1], Datum::Symbol(_, _)) {
+                return Err(ExpandError::BadSyntax {
+                    what: "field-spec accessor must be a symbol".into(),
+                    span: parts[1].span(),
+                });
+            }
+            if parts.len() == 3 && !matches!(parts[2], Datum::Symbol(_, _)) {
+                return Err(ExpandError::BadSyntax {
+                    what: "field-spec mutator must be a symbol".into(),
+                    span: parts[2].span(),
+                });
+            }
+            if field_map.contains_key(&fname) {
+                return Err(ExpandError::BadSyntax {
+                    what: "duplicate field-spec".into(),
+                    span: fs.span(),
+                });
+            }
+            field_map.insert(
+                fname,
+                FldSpec {
+                    accessor: parts[1].clone(),
+                    mutator: parts.get(2).cloned(),
+                    span: fs.span(),
+                },
+            );
+            field_order.push(fname);
+        }
+        // Verify every constructor field has a matching field-spec.
+        for (cf, sp) in &ctor_fields {
+            if !field_map.contains_key(cf) {
+                return Err(ExpandError::BadSyntax {
+                    what: format!(
+                        "R7RS define-record-type: constructor field '{}' has no matching \
+                         field-spec",
+                        self.syms.name(*cf)
+                    ),
+                    span: *sp,
+                });
+            }
+        }
+
+        // Synthesize R6RS-shaped Datum:
+        //   (define-record-type (<name> <ctor> <pred>)
+        //     (fields <field-decl>...))
+        //
+        // Field-decl shape per R6RS:
+        //   (immutable <fname> <accessor>)
+        //   (mutable <fname> <accessor> <mutator>)
+        //
+        // Order fields by the constructor's argument order (so vector
+        // slots match), then append any field-specs the constructor
+        // didn't mention.
+        let mut ordered_fields: Vec<Symbol> = ctor_fields.iter().map(|(s, _)| *s).collect();
+        for f in &field_order {
+            if !ordered_fields.contains(f) {
+                ordered_fields.push(*f);
+            }
+        }
+        let immutable_kw = self.keywords.immutable;
+        let mutable_kw = self.keywords.mutable;
+        let mut field_decls: Vec<Datum> = Vec::with_capacity(ordered_fields.len());
+        for fname in &ordered_fields {
+            let spec = field_map
+                .get(fname)
+                .expect("field map has all entries we listed");
+            let mut parts: Vec<Datum> = Vec::new();
+            let head = if spec.mutator.is_some() {
+                mutable_kw
+            } else {
+                immutable_kw
+            };
+            parts.push(Datum::Symbol(head, spec.span));
+            parts.push(Datum::Symbol(*fname, spec.span));
+            parts.push(spec.accessor.clone());
+            if let Some(m) = &spec.mutator {
+                parts.push(m.clone());
+            }
+            field_decls.push(Self::datum_list(parts, spec.span));
+        }
+        let fields_clause = {
+            let mut parts: Vec<Datum> = Vec::with_capacity(1 + field_decls.len());
+            parts.push(Datum::Symbol(self.keywords.fields, span));
+            parts.extend(field_decls);
+            Self::datum_list(parts, span)
+        };
+        let name_spec = Self::datum_list(
+            vec![
+                Datum::Symbol(type_name.0, type_name.1),
+                Datum::Symbol(ctor_name.0, ctor_name.1),
+                Datum::Symbol(pred_name.0, pred_name.1),
+            ],
+            span,
+        );
+
+        let r6rs_items = vec![name_spec, fields_clause];
+        self.expand_define_record_type(&r6rs_items, span)
+    }
+
+    /// `(define-record-type name-spec ...)` — R6RS or R7RS.
+    ///
+    /// **R6RS shape:**
+    ///   `(define-record-type <name>|(<name> <ctor> <pred>) (parent <p>)? (fields ...)?)`
     /// Desugars to vector-backed records:
     /// - Constructor: `(make-NAME f1 f2 ...)` returns `#(<tag> f1 f2 ...)`
     /// - Predicate:   `(NAME? v)` checks vector? + length + tag
     /// - Accessor:    `(NAME-FIELD r)` returns `(vector-ref r <i>)`
     /// - Mutator:     `(NAME-FIELD-set! r v)` invokes `vector-set!`
+    ///
+    /// **R7RS shape:**
+    ///   `(define-record-type <name> (<ctor> <field>...) <pred> (<field> <accessor>)
+    ///    | (<field> <accessor> <mutator>) ...)`
+    ///
+    /// Detection: a bare-symbol `<name>` followed by a list whose head
+    /// is NOT `parent`/`fields` is R7RS. The R7RS branch dispatches to
+    /// `expand_define_record_type_r7rs` and reuses the same vector-
+    /// tagged record builder once it has gathered the field list.
     fn expand_define_record_type(
         &mut self,
         items: &[Datum],
@@ -3012,6 +3242,21 @@ impl<'a> Expander<'a> {
                 what: "define-record-type needs name-spec and fields-spec".into(),
                 span,
             });
+        }
+        // Detect R7RS shape: name is a bare symbol AND items[1] is a
+        // list whose head is neither `parent` nor `fields`.
+        if let Datum::Symbol(_, _) = &items[0] {
+            if let Some(parts) = collect_proper_list_strict(&items[1]) {
+                let head_is_r6rs_clause = match parts.first() {
+                    Some(Datum::Symbol(s, _)) => {
+                        *s == self.keywords.parent || *s == self.keywords.fields
+                    }
+                    _ => false,
+                };
+                if !head_is_r6rs_clause {
+                    return self.expand_define_record_type_r7rs(items, span);
+                }
+            }
         }
         // Parse name-spec: either a bare symbol or (name constructor predicate)
         let (type_name, ctor_name, pred_name) = match &items[0] {

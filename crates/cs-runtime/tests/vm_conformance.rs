@@ -674,3 +674,12 @@ fn vm_conformance_r7rs_assoc_member_compare() {
     println!("r7rs_assoc_member_compare: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_define_record_type() {
+    let walker = pass_count_walker("r7rs_define_record_type.scm");
+    let vm = pass_count_vm("r7rs_define_record_type.scm")
+        .expect("vm should run r7rs_define_record_type.scm");
+    println!("r7rs_define_record_type: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
