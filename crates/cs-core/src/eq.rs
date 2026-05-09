@@ -115,4 +115,58 @@ mod tests {
         assert!(equal(&a, &b));
         assert!(!eq(&a, &b)); // distinct heap allocations
     }
+
+    #[test]
+    fn equal_handles_self_cycle() {
+        // Build (define x (cons 1 2)) ; (set-cdr! x x)
+        let x = Pair::new(Value::fixnum(1), Value::fixnum(2));
+        *x.cdr.borrow_mut() = Value::Pair(x.clone());
+        let v = Value::Pair(x);
+        // equal? on the same cyclic value must terminate and return true.
+        assert!(equal(&v, &v));
+    }
+
+    #[test]
+    fn equal_handles_distinct_cycles_same_shape() {
+        // Two independently constructed self-cycles with the same car.
+        let a = Pair::new(Value::fixnum(7), Value::fixnum(0));
+        *a.cdr.borrow_mut() = Value::Pair(a.clone());
+        let b = Pair::new(Value::fixnum(7), Value::fixnum(0));
+        *b.cdr.borrow_mut() = Value::Pair(b.clone());
+        let va = Value::Pair(a);
+        let vb = Value::Pair(b);
+        assert!(equal(&va, &vb));
+    }
+}
+
+#[cfg(test)]
+mod write_cycle_tests {
+    use super::*;
+    use crate::value::WriteMode;
+    use crate::SymbolTable;
+
+    #[test]
+    fn write_does_not_loop_on_self_cycle() {
+        let syms = SymbolTable::new();
+        let x = Pair::new(Value::fixnum(1), Value::fixnum(2));
+        *x.cdr.borrow_mut() = Value::Pair(x.clone());
+        let v = Value::Pair(x);
+        let s = v.format_with(&syms, WriteMode::Write);
+        // Output should mention #<cycle>; just verify it terminates and is
+        // bounded.
+        assert!(s.contains("#<cycle>"), "{}", s);
+        assert!(s.len() < 64, "output unexpectedly long: {}", s);
+    }
+
+    #[test]
+    fn write_does_not_loop_on_self_cycle_vector() {
+        let syms = SymbolTable::new();
+        let v_inner: std::rc::Rc<std::cell::RefCell<Vec<Value>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(vec![Value::Boolean(false)]));
+        v_inner.borrow_mut()[0] = Value::Vector(v_inner.clone());
+        let v = Value::Vector(v_inner);
+        let s = v.format_with(&syms, WriteMode::Write);
+        assert!(s.contains("#(...)"), "{}", s);
+        assert!(s.len() < 64, "output unexpectedly long: {}", s);
+    }
 }

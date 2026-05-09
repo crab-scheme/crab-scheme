@@ -225,6 +225,17 @@ impl Value {
         syms: &SymbolTable,
         mode: WriteMode,
     ) -> fmt::Result {
+        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        self.write_to_visited(out, syms, mode, &mut visited)
+    }
+
+    fn write_to_visited(
+        &self,
+        out: &mut dyn fmt::Write,
+        syms: &SymbolTable,
+        mode: WriteMode,
+        visited: &mut std::collections::HashSet<usize>,
+    ) -> fmt::Result {
         match self {
             Value::Null => write!(out, "()"),
             Value::Unspecified => write!(out, "#<unspecified>"),
@@ -248,17 +259,25 @@ impl Value {
                 WriteMode::Display => write!(out, "{}", s.borrow()),
             },
             Value::Symbol(s) => write!(out, "{}", syms.name(*s)),
-            Value::Pair(p) => write_pair(out, p, syms, mode),
+            Value::Pair(p) => write_pair(out, p, syms, mode, visited),
             Value::Vector(v) => {
-                write!(out, "#(")?;
-                let v = v.borrow();
-                for (i, item) in v.iter().enumerate() {
-                    if i > 0 {
-                        write!(out, " ")?;
-                    }
-                    item.write_to(out, syms, mode)?;
+                let ptr = Rc::as_ptr(v) as usize;
+                if !visited.insert(ptr) {
+                    return write!(out, "#(...)");
                 }
-                write!(out, ")")
+                let res = (|| -> fmt::Result {
+                    write!(out, "#(")?;
+                    let inner = v.borrow();
+                    for (i, item) in inner.iter().enumerate() {
+                        if i > 0 {
+                            write!(out, " ")?;
+                        }
+                        item.write_to_visited(out, syms, mode, visited)?;
+                    }
+                    write!(out, ")")
+                })();
+                visited.remove(&ptr);
+                res
             }
             Value::Procedure(p) => match p.name() {
                 Some(n) => write!(out, "#<procedure {}>", n),
@@ -297,6 +316,23 @@ fn write_pair(
     p: &Pair,
     syms: &SymbolTable,
     mode: WriteMode,
+    visited: &mut std::collections::HashSet<usize>,
+) -> fmt::Result {
+    let head_ptr = p as *const Pair as usize;
+    if !visited.insert(head_ptr) {
+        return write!(out, "(...)");
+    }
+    let result = write_pair_inner(out, p, syms, mode, visited);
+    visited.remove(&head_ptr);
+    result
+}
+
+fn write_pair_inner(
+    out: &mut dyn fmt::Write,
+    p: &Pair,
+    syms: &SymbolTable,
+    mode: WriteMode,
+    visited: &mut std::collections::HashSet<usize>,
 ) -> fmt::Result {
     write!(out, "(")?;
     let mut first = true;
@@ -307,16 +343,21 @@ fn write_pair(
             write!(out, " ")?;
         }
         first = false;
-        cur_car.write_to(out, syms, mode)?;
+        cur_car.write_to_visited(out, syms, mode, visited)?;
         match cur_cdr {
             Value::Null => break,
             Value::Pair(next) => {
+                let next_ptr = Rc::as_ptr(&next) as *const Pair as usize;
+                if !visited.insert(next_ptr) {
+                    write!(out, " . #<cycle>")?;
+                    break;
+                }
                 cur_car = next.car.borrow().clone();
                 cur_cdr = next.cdr.borrow().clone();
             }
             other => {
                 write!(out, " . ")?;
-                other.write_to(out, syms, mode)?;
+                other.write_to_visited(out, syms, mode, visited)?;
                 break;
             }
         }
