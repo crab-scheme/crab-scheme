@@ -260,15 +260,131 @@ impl<'src> Lexer<'src> {
                 Some(b'\\') => {
                     self.bump();
                     let esc_start = self.pos;
-                    match self.bump() {
-                        Some(b'n') => out.push('\n'),
-                        Some(b't') => out.push('\t'),
-                        Some(b'r') => out.push('\r'),
-                        Some(b'"') => out.push('"'),
-                        Some(b'\\') => out.push('\\'),
-                        Some(b'a') => out.push('\u{07}'),
-                        Some(b'b') => out.push('\u{08}'),
-                        Some(b'0') => out.push('\0'),
+                    match self.peek() {
+                        Some(b'n') => {
+                            self.bump();
+                            out.push('\n');
+                        }
+                        Some(b't') => {
+                            self.bump();
+                            out.push('\t');
+                        }
+                        Some(b'r') => {
+                            self.bump();
+                            out.push('\r');
+                        }
+                        Some(b'"') => {
+                            self.bump();
+                            out.push('"');
+                        }
+                        Some(b'\\') => {
+                            self.bump();
+                            out.push('\\');
+                        }
+                        Some(b'|') => {
+                            // R7RS: \| is the literal pipe character.
+                            self.bump();
+                            out.push('|');
+                        }
+                        Some(b'a') => {
+                            self.bump();
+                            out.push('\u{07}');
+                        }
+                        Some(b'b') => {
+                            self.bump();
+                            out.push('\u{08}');
+                        }
+                        Some(b'v') => {
+                            // R7RS vertical tab — adopted into R6RS too.
+                            self.bump();
+                            out.push('\u{0B}');
+                        }
+                        Some(b'f') => {
+                            // Form-feed.
+                            self.bump();
+                            out.push('\u{0C}');
+                        }
+                        Some(b'0') => {
+                            self.bump();
+                            out.push('\0');
+                        }
+                        Some(b'x') | Some(b'X') => {
+                            // R6RS / R7RS `\xH...;` — hex codepoint
+                            // terminated by `;`. The semicolon is
+                            // mandatory in both specs, but we tolerate
+                            // an unterminated form by reading hex
+                            // digits to the next non-hex byte.
+                            self.bump();
+                            let hex_start = self.pos;
+                            while let Some(b) = self.peek() {
+                                if b.is_ascii_hexdigit() {
+                                    self.bump();
+                                } else {
+                                    break;
+                                }
+                            }
+                            let hex_end = self.pos;
+                            // Optional terminating semicolon.
+                            if self.peek() == Some(b';') {
+                                self.bump();
+                            }
+                            if hex_start == hex_end {
+                                return Err(LexError::BadEscape {
+                                    span: self.span(esc_start, self.pos),
+                                });
+                            }
+                            let hex_str = &self.src[hex_start..hex_end];
+                            let cp = match u32::from_str_radix(hex_str, 16) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    return Err(LexError::BadEscape {
+                                        span: self.span(esc_start, self.pos),
+                                    });
+                                }
+                            };
+                            match char::from_u32(cp) {
+                                Some(c) => out.push(c),
+                                None => {
+                                    return Err(LexError::BadEscape {
+                                        span: self.span(esc_start, self.pos),
+                                    });
+                                }
+                            }
+                        }
+                        Some(b'\n') | Some(b'\r') | Some(b' ') | Some(b'\t') => {
+                            // R7RS line continuation:
+                            //   \<intraline-whitespace>* <line-ending>
+                            //     <intraline-whitespace>*
+                            // The whole sequence (including the newline)
+                            // is consumed and contributes nothing to
+                            // the string. We accept any combination of
+                            // spaces/tabs around a newline.
+                            // Skip leading intraline whitespace.
+                            while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                                self.bump();
+                            }
+                            // Consume one line ending (CR, LF, or CRLF).
+                            match self.peek() {
+                                Some(b'\r') => {
+                                    self.bump();
+                                    if self.peek() == Some(b'\n') {
+                                        self.bump();
+                                    }
+                                }
+                                Some(b'\n') => {
+                                    self.bump();
+                                }
+                                _ => {
+                                    return Err(LexError::BadEscape {
+                                        span: self.span(esc_start, self.pos),
+                                    });
+                                }
+                            }
+                            // Skip trailing intraline whitespace.
+                            while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                                self.bump();
+                            }
+                        }
                         _ => {
                             return Err(LexError::BadEscape {
                                 span: self.span(esc_start, self.pos),
