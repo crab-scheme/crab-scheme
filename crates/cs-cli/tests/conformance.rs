@@ -394,6 +394,11 @@ fn conformance_r7rs_time_env() {
 }
 
 #[test]
+fn conformance_hashtable_rich() {
+    run_conformance_file("hashtable_rich.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -477,6 +482,7 @@ fn conformance_aggregate_count() {
                 "endianness_macro.scm",
                 "string_search.scm",
                 "r7rs_time_env.scm",
+                "hashtable_rich.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

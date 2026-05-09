@@ -600,3 +600,11 @@ fn vm_conformance_r7rs_time_env() {
     println!("r7rs_time_env: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_hashtable_rich() {
+    let walker = pass_count_walker("hashtable_rich.scm");
+    let vm = pass_count_vm("hashtable_rich.scm").expect("vm should run hashtable_rich.scm");
+    println!("hashtable_rich: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

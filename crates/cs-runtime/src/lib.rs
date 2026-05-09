@@ -253,6 +253,37 @@ impl Runtime {
                 Ok(Value::Unspecified)
             }),
         );
+        // VM-tier hashtable-equivalence-function: returns a VmBuiltin so
+        // the result is callable inside the VM. The walker side returns
+        // a Builtin via builtins::b_hashtable_equivalence_function.
+        let heqf_sym = syms.intern("hashtable-equivalence-function");
+        vm_env.define(
+            heqf_sym,
+            cs_vm::vm::make_vm_builtin(
+                "hashtable-equivalence-function",
+                builtins::vm_hashtable_equivalence_function,
+            ),
+        );
+        let hentries_sym = syms.intern("hashtable-entries");
+        vm_env.define(
+            hentries_sym,
+            cs_vm::vm::make_vm_builtin("hashtable-entries", |args| {
+                if args.len() != 1 {
+                    return Err("hashtable-entries: 1 arg".into());
+                }
+                let h = match &args[0] {
+                    Value::Hashtable(h) => h.clone(),
+                    _ => return Err("hashtable-entries: not a hashtable".into()),
+                };
+                let items = h.items.borrow();
+                let keys: Vec<Value> = items.iter().map(|(k, _)| k.clone()).collect();
+                let vals: Vec<Value> = items.iter().map(|(_, v)| v.clone()).collect();
+                let kv = Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(keys)));
+                let vv = Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(vals)));
+                cs_vm::vm::vm_set_pending_values(vec![kv, vv]);
+                Ok(Value::Unspecified)
+            }),
+        );
         let ienv_sym = syms.intern("interaction-environment");
         vm_env.define(
             ienv_sym,

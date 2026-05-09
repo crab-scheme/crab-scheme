@@ -448,6 +448,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("hashtable-keys", b_hashtable_keys),
         ("hashtable-values", b_hashtable_values),
         ("hashtable-clear!", b_hashtable_clear),
+        ("hashtable-copy", b_hashtable_copy),
+        ("hashtable-mutable?", b_hashtable_mutable_p),
+        ("hashtable-hash-function", b_hashtable_hash_function),
         ("make-parameter", b_make_parameter),
         // SRFI-1 list ops (pure)
         ("delete", b_delete),
@@ -494,6 +497,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("string->symbol", b_string_to_symbol_ho),
         ("hashtable-update!", b_hashtable_update_ho),
         ("hashtable-walk", b_hashtable_walk),
+        ("hashtable-entries", b_hashtable_entries),
         ("values", b_values),
         ("call-with-values", b_call_with_values),
         ("call/cc", b_call_cc),
@@ -609,6 +613,17 @@ pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
         let sym = syms.intern(name);
         env.define(sym, crate::proc::make_builtin_syms(name, f));
     }
+    // hashtable-equivalence-function returns a *tier-specific* procedure
+    // (a walker Builtin here, a VmBuiltin on the VM tier in lib.rs), so
+    // it can't share the pure_builtins registration loop.
+    let heqf_sym = syms.intern("hashtable-equivalence-function");
+    env.define(
+        heqf_sym,
+        make_builtin_pure(
+            "hashtable-equivalence-function",
+            b_hashtable_equivalence_function,
+        ),
+    );
     // Global record-type ancestor registry. The expander emits
     // (hashtable-set! __record-parents__ '<my-tag> '(<parent-tag> ...))
     // calls at every (define-record-type ... (parent ...) ...) site, and
@@ -4217,6 +4232,75 @@ fn b_hashtable_values(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(v))))
 }
 
+/// `hashtable-copy` (R6RS) — return a fresh hashtable with the same
+/// equivalence function and a snapshot of the entries. Optional second
+/// arg `mutable?` is accepted for compat but ignored (we don't track
+/// the immutability bit yet — copies are always mutable).
+fn b_hashtable_copy(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_err("hashtable-copy", "1 or 2", args.len()));
+    }
+    let h = as_ht("hashtable-copy", &args[0])?;
+    let items = h.items.borrow().clone();
+    let new_ht = Hashtable::new(h.eq_kind);
+    *new_ht.items.borrow_mut() = items;
+    Ok(Value::Hashtable(new_ht))
+}
+
+/// `hashtable-mutable?` (R6RS). All hashtables we hand out are mutable.
+fn b_hashtable_mutable_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("hashtable-mutable?", "1", args.len()));
+    }
+    let _ = as_ht("hashtable-mutable?", &args[0])?;
+    Ok(Value::Boolean(true))
+}
+
+/// `hashtable-equivalence-function` (R6RS) — returns the equivalence
+/// function used by the hashtable: `eq?`, `eqv?`, or `equal?`. We hand
+/// out a fresh builtin procedure value pointing at the same fn impl,
+/// so identity-comparison against the global binding may differ but
+/// applying the result behaves correctly.
+pub fn b_hashtable_equivalence_function(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("hashtable-equivalence-function", "1", args.len()));
+    }
+    let h = as_ht("hashtable-equivalence-function", &args[0])?;
+    Ok(match h.eq_kind {
+        HtEqKind::Eq => make_builtin_pure("eq?", b_eq),
+        HtEqKind::Eqv => make_builtin_pure("eqv?", b_eqv),
+        HtEqKind::Equal => make_builtin_pure("equal?", b_equal),
+    })
+}
+
+/// VM-tier `hashtable-equivalence-function`: returns a VM-shape builtin
+/// (Walker tier returns a Builtin via `b_hashtable_equivalence_function`).
+/// Both delegate to the same fn pointer (b_eq, b_eqv, or b_equal); only
+/// the procedure-object wrapper differs so the right tier can dispatch.
+pub fn vm_hashtable_equivalence_function(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("hashtable-equivalence-function: 1 arg".into());
+    }
+    let h = as_ht("hashtable-equivalence-function", &args[0])?;
+    Ok(match h.eq_kind {
+        HtEqKind::Eq => cs_vm::vm::make_vm_builtin("eq?", b_eq),
+        HtEqKind::Eqv => cs_vm::vm::make_vm_builtin("eqv?", b_eqv),
+        HtEqKind::Equal => cs_vm::vm::make_vm_builtin("equal?", b_equal),
+    })
+}
+
+/// `hashtable-hash-function` (R6RS) — returns the hash function for
+/// custom-hash tables, or #f for built-in eq/eqv/equal hashtables.
+/// Until we support user-supplied hash functions in make-hashtable,
+/// this always returns #f.
+fn b_hashtable_hash_function(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("hashtable-hash-function", "1", args.len()));
+    }
+    let _ = as_ht("hashtable-hash-function", &args[0])?;
+    Ok(Value::Boolean(false))
+}
+
 fn b_hashtable_clear(args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err(arity_err("hashtable-clear!", "1 or 2", args.len()));
@@ -4253,6 +4337,23 @@ fn b_hashtable_update_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
 }
 
 /// `(hashtable-walk ht proc)` — calls (proc key value) for each entry.
+/// `hashtable-entries` (R6RS) — returns two values via the multi-value
+/// channel: vector of keys, vector of values. Both vectors share the
+/// same indexing (entries[i] = (keys[i], values[i])).
+fn b_hashtable_entries(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("hashtable-entries", "1", args.len()));
+    }
+    let h = as_ht("hashtable-entries", &args[0])?;
+    let items = h.items.borrow();
+    let keys: Vec<Value> = items.iter().map(|(k, _)| k.clone()).collect();
+    let vals: Vec<Value> = items.iter().map(|(_, v)| v.clone()).collect();
+    let kv = Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(keys)));
+    let vv = Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(vals)));
+    ctx.pending_values = Some(vec![kv, vv]);
+    Ok(Value::Unspecified)
+}
+
 fn b_hashtable_walk(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("hashtable-walk", "2", args.len()));
