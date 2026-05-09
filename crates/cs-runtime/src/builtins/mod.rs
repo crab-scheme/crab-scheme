@@ -354,8 +354,20 @@ pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
         let sym = syms.intern(name);
         env.define(sym, make_builtin_higher(name, f));
     }
+    // Global record-type ancestor registry. The expander emits
+    // (hashtable-set! __record-parents__ '<my-tag> '(<parent-tag> ...))
+    // calls at every (define-record-type ... (parent ...) ...) site, and
+    // record predicates consult it so a `point?` test against a `cpoint`
+    // instance succeeds. See the cs-expand `expand_define_record_type`.
+    let registry_sym = syms.intern(RECORD_PARENTS_REGISTRY);
+    env.define(registry_sym, Value::Hashtable(Hashtable::new(HtEqKind::Eq)));
     let _ = BuiltinFn::Pure;
 }
+
+/// Name of the global hashtable that maps a record-type's leaf tag symbol
+/// to the list of its ancestor tag symbols (immediate parent first, root
+/// last). See `expand_define_record_type` for how it's populated.
+pub const RECORD_PARENTS_REGISTRY: &str = "__record-parents__";
 
 fn arity_err(name: &str, expected: &str, got: usize) -> String {
     format!("{}: expected {} arguments, got {}", name, expected, got)

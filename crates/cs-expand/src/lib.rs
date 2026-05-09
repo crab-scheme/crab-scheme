@@ -55,6 +55,27 @@ pub struct Expander<'a> {
     gensym_counter: u32,
     /// Hook for `(include "path")` forms.
     include_resolver: Option<&'a mut IncludeResolver<'a>>,
+    /// Per-Expander record-type registry. Populated each time
+    /// `define-record-type` expands; consulted when a child names a
+    /// `(parent <type-name>)` so we can resolve its tag chain and inherited
+    /// field count. This is *expansion-time* state, separate from the
+    /// runtime `__record-parents__` hashtable that powers predicate checks.
+    record_types: std::collections::HashMap<Symbol, RecordTypeInfo>,
+}
+
+/// Compile-time info about a `define-record-type`, retained so subtypes can
+/// chain off it. `field_count` is the *total* slot count beyond the tag —
+/// i.e. inherited + own fields — so the next subtype's accessor offsets
+/// follow naturally.
+#[derive(Clone, Debug)]
+pub struct RecordTypeInfo {
+    pub tag: Symbol,
+    /// Tag symbols of every ancestor, immediate parent first, root last.
+    /// Empty for a root record type.
+    pub ancestors: Vec<Symbol>,
+    /// Number of fields stored in instance vectors at slot index ≥ 1
+    /// (inclusive of inherited fields).
+    pub field_count: usize,
 }
 
 /// A user-defined macro, parsed from `(syntax-rules ...)`.
@@ -89,6 +110,7 @@ struct Keywords {
     else_: Symbol,
     define_record_type: Symbol,
     fields: Symbol,
+    parent: Symbol,
     immutable: Symbol,
     mutable: Symbol,
     define_syntax: Symbol,
@@ -134,6 +156,7 @@ impl Keywords {
             else_: syms.intern("else"),
             define_record_type: syms.intern("define-record-type"),
             fields: syms.intern("fields"),
+            parent: syms.intern("parent"),
             immutable: syms.intern("immutable"),
             mutable: syms.intern("mutable"),
             define_syntax: syms.intern("define-syntax"),
@@ -169,6 +192,7 @@ impl<'a> Expander<'a> {
             keywords,
             gensym_counter: 0,
             include_resolver: None,
+            record_types: std::collections::HashMap::new(),
         }
     }
 
@@ -2298,27 +2322,99 @@ impl<'a> Expander<'a> {
             }
         };
 
-        // Parse fields-spec: must be (fields field-decl ...)
-        let fields_block_parts =
-            collect_proper_list_strict(&items[1]).ok_or(ExpandError::BadSyntax {
-                what: "fields spec must be a list".into(),
-                span,
+        // Parse the remaining clauses: at most one `(parent <type-name>)` and
+        // at most one `(fields field-decl ...)`. Either may be omitted —
+        // (parent ...) is optional, and (fields ...) is optional too if the
+        // record has no own fields beyond what it inherits.
+        let mut parent_type_name: Option<Symbol> = None;
+        let mut fields_clause: Option<Vec<Datum>> = None;
+        for clause in &items[1..] {
+            let parts = collect_proper_list_strict(clause).ok_or(ExpandError::BadSyntax {
+                what: "define-record-type clause must be a list".into(),
+                span: clause.span(),
             })?;
-        if fields_block_parts.is_empty() {
-            return Err(ExpandError::BadSyntax {
-                what: "expected (fields field-decl ...)".into(),
-                span,
-            });
-        }
-        match &fields_block_parts[0] {
-            Datum::Symbol(s, _) if *s == self.keywords.fields => {}
-            _ => {
+            if parts.is_empty() {
                 return Err(ExpandError::BadSyntax {
-                    what: "expected (fields ...) clause".into(),
-                    span,
+                    what: "empty clause".into(),
+                    span: clause.span(),
                 });
             }
+            match &parts[0] {
+                Datum::Symbol(s, _) if *s == self.keywords.fields => {
+                    if fields_clause.is_some() {
+                        return Err(ExpandError::BadSyntax {
+                            what: "duplicate (fields ...) clause".into(),
+                            span: clause.span(),
+                        });
+                    }
+                    fields_clause = Some(parts);
+                }
+                Datum::Symbol(s, _) if *s == self.keywords.parent => {
+                    if parts.len() != 2 {
+                        return Err(ExpandError::BadSyntax {
+                            what: "(parent <type-name>) needs exactly one argument".into(),
+                            span: clause.span(),
+                        });
+                    }
+                    let name = match &parts[1] {
+                        Datum::Symbol(p, _) => *p,
+                        _ => {
+                            return Err(ExpandError::BadSyntax {
+                                what: "parent name must be a symbol".into(),
+                                span: clause.span(),
+                            });
+                        }
+                    };
+                    if parent_type_name.is_some() {
+                        return Err(ExpandError::BadSyntax {
+                            what: "duplicate (parent ...) clause".into(),
+                            span: clause.span(),
+                        });
+                    }
+                    parent_type_name = Some(name);
+                }
+                Datum::Symbol(s, _) => {
+                    return Err(ExpandError::BadSyntax {
+                        what: format!(
+                            "define-record-type: unknown clause '{}'",
+                            self.syms.name(*s)
+                        ),
+                        span: clause.span(),
+                    });
+                }
+                _ => {
+                    return Err(ExpandError::BadSyntax {
+                        what: "clause must start with a symbol".into(),
+                        span: clause.span(),
+                    });
+                }
+            }
         }
+        // Resolve parent info up front: we need its tag (for ancestor list)
+        // and its field count (for offsetting our own accessors).
+        let (parent_info, inherited_field_count): (Option<RecordTypeInfo>, usize) =
+            if let Some(p) = parent_type_name {
+                let info =
+                    self.record_types
+                        .get(&p)
+                        .cloned()
+                        .ok_or_else(|| ExpandError::BadSyntax {
+                            what: format!(
+                                "parent type '{}' is not a known define-record-type",
+                                self.syms.name(p)
+                            ),
+                            span,
+                        })?;
+                let fc = info.field_count;
+                (Some(info), fc)
+            } else {
+                (None, 0)
+            };
+        // Empty fields_clause means no own fields (just inherits). Synthesize
+        // a parts list with only the (fields ...) head so the existing parser
+        // below sees an empty field list. Same for explicit (fields).
+        let fields_block_parts: Vec<Datum> =
+            fields_clause.unwrap_or_else(|| vec![Datum::Symbol(self.keywords.fields, span)]);
 
         // Each field-decl is either:
         //   field-name → immutable, accessor = NAME-FIELD
@@ -2486,9 +2582,39 @@ impl<'a> Expander<'a> {
 
         let mut out: Vec<CoreExpr> = Vec::new();
 
-        // 1. Constructor: (lambda (f1 ...) (vector tag f1 f2 ...))
-        let ctor_params: Vec<cs_core::Symbol> = fields.iter().map(|f| f.name).collect();
+        // Build the ancestor tag chain at expansion time. Immediate parent
+        // first, root last. Empty for a root record type.
+        let ancestors: Vec<cs_core::Symbol> = match &parent_info {
+            Some(p) => {
+                let mut a = Vec::with_capacity(1 + p.ancestors.len());
+                a.push(p.tag);
+                a.extend(p.ancestors.iter().copied());
+                a
+            }
+            None => Vec::new(),
+        };
+
+        // Synthesize parent field-param symbols. R6RS lets the parent's
+        // constructor be customized via record protocols; we use the simple
+        // default — parent fields first, then own fields, in source order.
+        // The names here are gensym-fresh so they can't collide with user
+        // identifiers in the generated lambda body.
+        let parent_field_params: Vec<cs_core::Symbol> = (0..inherited_field_count)
+            .map(|i| {
+                self.syms
+                    .intern(&format!("__rec-pf-{}-{}__", type_name_str, i))
+            })
+            .collect();
+
+        // 1. Constructor: (lambda (pf1 ... pfN f1 ... fM) (vector tag pf1 ... f1 ...))
+        let mut ctor_params: Vec<cs_core::Symbol> =
+            Vec::with_capacity(parent_field_params.len() + fields.len());
+        ctor_params.extend(parent_field_params.iter().copied());
+        ctor_params.extend(fields.iter().map(|f| f.name));
         let mut vector_call_args: Vec<CoreExpr> = vec![tag_const.clone()];
+        for p in &parent_field_params {
+            vector_call_args.push(CoreExpr::Ref { name: *p, span });
+        }
         for f in &fields {
             vector_call_args.push(CoreExpr::Ref { name: f.name, span });
         }
@@ -2511,13 +2637,89 @@ impl<'a> Expander<'a> {
             span,
         });
 
-        // 2. Predicate: (lambda (obj)
-        //                  (and (vector? obj)
-        //                       (>= (vector-length obj) 1)
-        //                       (eq? (vector-ref obj 0) tag)))
+        // 2. Predicate. Generated form:
+        //   (lambda (obj)
+        //     (and (vector? obj) (>= (vector-length obj) 1)
+        //          (let ((t (vector-ref obj 0)))
+        //            (or (eq? t '<my-tag>)
+        //                (memq '<my-tag>
+        //                      (hashtable-ref __record-parents__ t '()))))))
+        // The OR-with-memq accepts descendant tags. We don't need to know
+        // the descendants at expansion time — children register themselves
+        // in the registry as they're defined, so a parent's predicate
+        // automatically picks up new subtypes.
         let obj_sym = self.syms.intern("__rec-obj__");
         let obj_ref = CoreExpr::Ref {
             name: obj_sym,
+            span,
+        };
+        let registry_sym = self.syms.intern("__record-parents__");
+        let hashtable_ref_sym = self.syms.intern("hashtable-ref");
+        let memq_sym = self.syms.intern("memq");
+        let t_sym = self.syms.intern("__rec-t__");
+        let t_ref = CoreExpr::Ref { name: t_sym, span };
+        let direct_eq = CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: eq_p_sym,
+                span,
+            }),
+            args: vec![t_ref.clone(), tag_const.clone()],
+            span,
+        };
+        let registry_lookup = CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: hashtable_ref_sym,
+                span,
+            }),
+            args: vec![
+                CoreExpr::Ref {
+                    name: registry_sym,
+                    span,
+                },
+                t_ref.clone(),
+                CoreExpr::Const {
+                    value: Value::Null,
+                    span,
+                },
+            ],
+            span,
+        };
+        let memq_check = CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: memq_sym,
+                span,
+            }),
+            args: vec![tag_const.clone(), registry_lookup],
+            span,
+        };
+        let or_check = CoreExpr::If {
+            cond: Rc::new(direct_eq),
+            then: Rc::new(CoreExpr::Const {
+                value: Value::Boolean(true),
+                span,
+            }),
+            alt: Rc::new(memq_check),
+            span,
+        };
+        let tag_check_with_let = CoreExpr::Letrec {
+            bindings: vec![(
+                t_sym,
+                CoreExpr::App {
+                    func: Rc::new(CoreExpr::Ref {
+                        name: vector_ref_sym,
+                        span,
+                    }),
+                    args: vec![
+                        obj_ref.clone(),
+                        CoreExpr::Const {
+                            value: Value::fixnum(0),
+                            span,
+                        },
+                    ],
+                    span,
+                },
+            )],
+            body: Rc::new(or_check),
             span,
         };
         let pred_body = and_chain(vec![
@@ -2547,30 +2749,7 @@ impl<'a> Expander<'a> {
                 ],
                 span,
             },
-            CoreExpr::App {
-                func: Rc::new(CoreExpr::Ref {
-                    name: eq_p_sym,
-                    span,
-                }),
-                args: vec![
-                    CoreExpr::App {
-                        func: Rc::new(CoreExpr::Ref {
-                            name: vector_ref_sym,
-                            span,
-                        }),
-                        args: vec![
-                            obj_ref.clone(),
-                            CoreExpr::Const {
-                                value: Value::fixnum(0),
-                                span,
-                            },
-                        ],
-                        span,
-                    },
-                    tag_const.clone(),
-                ],
-                span,
-            },
+            tag_check_with_let,
         ]);
         let pred_lambda = CoreExpr::Lambda {
             params: Params::fixed(vec![obj_sym]),
@@ -2583,11 +2762,15 @@ impl<'a> Expander<'a> {
             span,
         });
 
-        // 3. Accessors and mutators (one per field)
+        // 3. Accessors and mutators (one per *own* field). Inherited fields
+        // already have accessors emitted by the parent's expansion that read
+        // slots `1..=inherited_field_count`, and our instance vectors keep
+        // those same slots for parent fields, so the parent's accessors work
+        // unchanged on us. Our own fields start at slot `1 + inherited`.
         let rec_sym = self.syms.intern("__rec-rec__");
         let val_sym = self.syms.intern("__rec-val__");
         for (i, field) in fields.iter().enumerate() {
-            let idx = (i + 1) as i64;
+            let idx = (1 + inherited_field_count + i) as i64;
             // Accessor: (lambda (rec) (vector-ref rec idx))
             let accessor_lambda = CoreExpr::Lambda {
                 params: Params::fixed(vec![rec_sym]),
@@ -2649,6 +2832,49 @@ impl<'a> Expander<'a> {
                 });
             }
         }
+
+        // 4. Register our ancestor list at runtime, so any parent's
+        // predicate (or any future ancestor's predicate) can match us:
+        //   (hashtable-set! __record-parents__ '<my-tag> '(<ancestors>))
+        // Skipped when there are no ancestors AND the type is final-by-shape
+        // — wait, we don't know finality, so always emit. The cost is one
+        // hashtable insert at definition time, paid once.
+        let hashtable_set_sym = self.syms.intern("hashtable-set!");
+        let ancestors_value = Value::list(
+            ancestors
+                .iter()
+                .map(|a| Value::Symbol(*a))
+                .collect::<Vec<_>>(),
+        );
+        out.push(CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: hashtable_set_sym,
+                span,
+            }),
+            args: vec![
+                CoreExpr::Ref {
+                    name: registry_sym,
+                    span,
+                },
+                tag_const.clone(),
+                CoreExpr::Const {
+                    value: ancestors_value,
+                    span,
+                },
+            ],
+            span,
+        });
+
+        // Track in expander state so subsequent (parent <type-name>) clauses
+        // can resolve us.
+        self.record_types.insert(
+            type_name,
+            RecordTypeInfo {
+                tag: tag_sym,
+                ancestors: ancestors.clone(),
+                field_count: inherited_field_count + fields.len(),
+            },
+        );
 
         Ok(CoreExpr::Begin { exprs: out, span })
     }

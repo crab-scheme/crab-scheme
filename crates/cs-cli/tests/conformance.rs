@@ -254,6 +254,11 @@ fn conformance_conditions_r6rs() {
 }
 
 #[test]
+fn conformance_records_parent() {
+    run_conformance_file("records_parent.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -309,6 +314,7 @@ fn conformance_aggregate_count() {
                 "sorting_files.scm",
                 "copy_unfold_htfold.scm",
                 "conditions_r6rs.scm",
+                "records_parent.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

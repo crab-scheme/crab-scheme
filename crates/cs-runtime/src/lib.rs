@@ -42,6 +42,13 @@ impl Runtime {
             let sym = syms.intern(name);
             vm_env.define(sym, cs_vm::vm::make_vm_builtin(name, f));
         }
+        // Mirror the walker tier's record-parent registry so define-record-type
+        // works the same on both tiers (predicates look it up at runtime).
+        let registry_sym = syms.intern(builtins::RECORD_PARENTS_REGISTRY);
+        vm_env.define(
+            registry_sym,
+            Value::Hashtable(cs_core::Hashtable::new(cs_core::HtEqKind::Eq)),
+        );
         // Register symbol-aware VM builtins.
         let symbol_to_string_sym = syms.intern("symbol->string");
         vm_env.define(

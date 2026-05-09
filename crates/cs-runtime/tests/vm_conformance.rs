@@ -382,3 +382,11 @@ fn vm_conformance_conditions_r6rs() {
     println!("conditions_r6rs: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_records_parent() {
+    let walker = pass_count_walker("records_parent.scm");
+    let vm = pass_count_vm("records_parent.scm").expect("vm should run records_parent.scm");
+    println!("records_parent: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
