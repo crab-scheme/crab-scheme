@@ -266,6 +266,30 @@ impl Number {
         Ok(simplify_bigint(result))
     }
 
+    /// R7RS `floor-quotient`: floor(x/y), i.e. rounded toward -∞.
+    /// Differs from R5RS `quotient` (truncated) for negative operands.
+    /// Identity: `x = y · floor-quotient + floor-remainder`, where
+    /// `floor-remainder` has the same sign as the divisor (== `modulo`).
+    pub fn floor_quotient(&self, other: &Number) -> Result<Number, NumError> {
+        if other.is_zero() {
+            return Err(NumError::DivisionByZero);
+        }
+        let a = self.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let b = other.to_bigint().ok_or(NumError::DivisionByZero)?;
+        let r = &a % &b;
+        // floor-remainder follows the divisor's sign.
+        let fr = if (r.sign() == num_bigint::Sign::Minus && b.sign() == num_bigint::Sign::Plus)
+            || (r.sign() == num_bigint::Sign::Plus && b.sign() == num_bigint::Sign::Minus)
+        {
+            &r + &b
+        } else {
+            r
+        };
+        // (x - fr) / y is exact integer division.
+        let q = (&a - &fr) / &b;
+        Ok(simplify_bigint(q))
+    }
+
     /// R6RS Euclidean div: `nd` such that `0 ≤ x − y·nd < |y|`.
     pub fn euclid_div(&self, other: &Number) -> Result<Number, NumError> {
         if other.is_zero() {

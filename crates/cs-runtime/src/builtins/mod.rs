@@ -40,6 +40,11 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("mod", b_mod_op),
         ("div0", b_div0_op),
         ("mod0", b_mod0_op),
+        // R7RS division aliases (single-value forms).
+        ("truncate-quotient", b_truncate_quotient),
+        ("truncate-remainder", b_truncate_remainder),
+        ("floor-quotient", b_floor_quotient),
+        ("floor-remainder", b_floor_remainder),
         ("expt", b_expt),
         ("gcd", b_gcd),
         ("lcm", b_lcm),
@@ -536,6 +541,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("interaction-environment", b_interaction_environment),
         ("div-and-mod", b_div_and_mod),
         ("div0-and-mod0", b_div0_and_mod0),
+        ("truncate/", b_truncate_div),
+        ("floor/", b_floor_div),
         ("features", b_features),
         // vector higher-order
         ("vector-map", b_vector_map),
@@ -996,6 +1003,112 @@ fn b_div0_and_mod0(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let (d, m) = div0_and_mod0_num(&args[0], &args[1])?;
     ctx.pending_values = Some(vec![d, m]);
     Ok(Value::Unspecified)
+}
+
+// =====================================================================
+// R7RS division aliases. R7RS standardizes both truncated (R5RS) and
+// floored division families, plus combined `truncate/` and `floor/`
+// that return both quotient and remainder via multiple values.
+
+fn b_truncate_quotient(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("truncate-quotient", "2", args.len()));
+    }
+    let x = as_integer_num("truncate-quotient", &args[0])?;
+    let y = as_integer_num("truncate-quotient", &args[1])?;
+    x.quotient(&y)
+        .map(Value::Number)
+        .map_err(|_| "truncate-quotient: division by zero".into())
+}
+
+fn b_truncate_remainder(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("truncate-remainder", "2", args.len()));
+    }
+    let x = as_integer_num("truncate-remainder", &args[0])?;
+    let y = as_integer_num("truncate-remainder", &args[1])?;
+    x.remainder(&y)
+        .map(Value::Number)
+        .map_err(|_| "truncate-remainder: division by zero".into())
+}
+
+fn b_floor_quotient(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("floor-quotient", "2", args.len()));
+    }
+    let x = as_integer_num("floor-quotient", &args[0])?;
+    let y = as_integer_num("floor-quotient", &args[1])?;
+    x.floor_quotient(&y)
+        .map(Value::Number)
+        .map_err(|_| "floor-quotient: division by zero".into())
+}
+
+fn b_floor_remainder(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("floor-remainder", "2", args.len()));
+    }
+    let x = as_integer_num("floor-remainder", &args[0])?;
+    let y = as_integer_num("floor-remainder", &args[1])?;
+    x.modulo(&y)
+        .map(Value::Number)
+        .map_err(|_| "floor-remainder: division by zero".into())
+}
+
+fn b_truncate_div(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("truncate/", "2", args.len()));
+    }
+    let x = as_integer_num("truncate/", &args[0])?;
+    let y = as_integer_num("truncate/", &args[1])?;
+    let q = x
+        .quotient(&y)
+        .map_err(|_| "truncate/: division by zero".to_string())?;
+    let r = x
+        .remainder(&y)
+        .map_err(|_| "truncate/: division by zero".to_string())?;
+    ctx.pending_values = Some(vec![Value::Number(q), Value::Number(r)]);
+    Ok(Value::Unspecified)
+}
+
+fn b_floor_div(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("floor/", "2", args.len()));
+    }
+    let x = as_integer_num("floor/", &args[0])?;
+    let y = as_integer_num("floor/", &args[1])?;
+    let q = x
+        .floor_quotient(&y)
+        .map_err(|_| "floor/: division by zero".to_string())?;
+    let r = x
+        .modulo(&y)
+        .map_err(|_| "floor/: division by zero".to_string())?;
+    ctx.pending_values = Some(vec![Value::Number(q), Value::Number(r)]);
+    Ok(Value::Unspecified)
+}
+
+/// Public for VM-tier shim that mirrors div_and_mod_num.
+pub fn truncate_div_num(x: &Value, y: &Value) -> Result<(Value, Value), String> {
+    let xi = as_integer_num("truncate/", x)?;
+    let yi = as_integer_num("truncate/", y)?;
+    let q = xi
+        .quotient(&yi)
+        .map_err(|_| "truncate/: division by zero".to_string())?;
+    let r = xi
+        .remainder(&yi)
+        .map_err(|_| "truncate/: division by zero".to_string())?;
+    Ok((Value::Number(q), Value::Number(r)))
+}
+
+pub fn floor_div_num(x: &Value, y: &Value) -> Result<(Value, Value), String> {
+    let xi = as_integer_num("floor/", x)?;
+    let yi = as_integer_num("floor/", y)?;
+    let q = xi
+        .floor_quotient(&yi)
+        .map_err(|_| "floor/: division by zero".to_string())?;
+    let r = xi
+        .modulo(&yi)
+        .map_err(|_| "floor/: division by zero".to_string())?;
+    Ok((Value::Number(q), Value::Number(r)))
 }
 
 // =====================================================================

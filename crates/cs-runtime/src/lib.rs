@@ -240,6 +240,32 @@ impl Runtime {
                 Ok(Value::Unspecified)
             }),
         );
+        let truncdiv_sym = syms.intern("truncate/");
+        vm_env.define(
+            truncdiv_sym,
+            cs_vm::vm::make_vm_builtin("truncate/", |args| {
+                if args.len() != 2 {
+                    return Err("truncate/: 2 args".into());
+                }
+                let (q, r) = builtins::truncate_div_num(&args[0], &args[1])
+                    .map_err(|e| format!("truncate/: {}", e))?;
+                cs_vm::vm::vm_set_pending_values(vec![q, r]);
+                Ok(Value::Unspecified)
+            }),
+        );
+        let floordiv_sym = syms.intern("floor/");
+        vm_env.define(
+            floordiv_sym,
+            cs_vm::vm::make_vm_builtin("floor/", |args| {
+                if args.len() != 2 {
+                    return Err("floor/: 2 args".into());
+                }
+                let (q, r) = builtins::floor_div_num(&args[0], &args[1])
+                    .map_err(|e| format!("floor/: {}", e))?;
+                cs_vm::vm::vm_set_pending_values(vec![q, r]);
+                Ok(Value::Unspecified)
+            }),
+        );
         let dam0_sym = syms.intern("div0-and-mod0");
         vm_env.define(
             dam0_sym,

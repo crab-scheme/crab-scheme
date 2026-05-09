@@ -608,3 +608,11 @@ fn vm_conformance_hashtable_rich() {
     println!("hashtable_rich: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_division() {
+    let walker = pass_count_walker("r7rs_division.scm");
+    let vm = pass_count_vm("r7rs_division.scm").expect("vm should run r7rs_division.scm");
+    println!("r7rs_division: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

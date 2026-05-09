@@ -399,6 +399,11 @@ fn conformance_hashtable_rich() {
 }
 
 #[test]
+fn conformance_r7rs_division() {
+    run_conformance_file("r7rs_division.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -483,6 +488,7 @@ fn conformance_aggregate_count() {
                 "string_search.scm",
                 "r7rs_time_env.scm",
                 "hashtable_rich.scm",
+                "r7rs_division.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
