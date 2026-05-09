@@ -762,10 +762,29 @@ fn run_dispatch(
                         let pred = args.remove(0);
                         let items = collect_proper_list(&args[0])?;
                         let mut kept = Vec::new();
-                        for item in items {
-                            let r = vm_call_sync(&pred, std::slice::from_ref(&item), syms)?;
-                            if r.is_truthy() {
-                                kept.push(item);
+                        let direct_fn: Option<VmBuiltinFn> = match &pred {
+                            Value::Procedure(p) => {
+                                p.as_any().downcast_ref::<VmBuiltin>().map(|b| b.f)
+                            }
+                            _ => None,
+                        };
+                        if let Some(f) = direct_fn {
+                            let mut row = [Value::Unspecified];
+                            for item in items {
+                                row[0] = item.clone();
+                                let r = f(&row).map_err(|e| {
+                                    builtin_err_to_raised("filter", &e, syms, call_span)
+                                })?;
+                                if r.is_truthy() {
+                                    kept.push(item);
+                                }
+                            }
+                        } else {
+                            for item in items {
+                                let r = vm_call_sync(&pred, std::slice::from_ref(&item), syms)?;
+                                if r.is_truthy() {
+                                    kept.push(item);
+                                }
                             }
                         }
                         stack.push(Value::list(kept));
@@ -786,11 +805,31 @@ fn run_dispatch(
                         let pred = args.remove(0);
                         let items = collect_proper_list(&args[0])?;
                         let mut found = Value::Boolean(false);
-                        for item in items {
-                            let r = vm_call_sync(&pred, std::slice::from_ref(&item), syms)?;
-                            if r.is_truthy() {
-                                found = item;
-                                break;
+                        let direct_fn: Option<VmBuiltinFn> = match &pred {
+                            Value::Procedure(p) => {
+                                p.as_any().downcast_ref::<VmBuiltin>().map(|b| b.f)
+                            }
+                            _ => None,
+                        };
+                        if let Some(f) = direct_fn {
+                            let mut row = [Value::Unspecified];
+                            for item in items {
+                                row[0] = item.clone();
+                                let r = f(&row).map_err(|e| {
+                                    builtin_err_to_raised("find", &e, syms, call_span)
+                                })?;
+                                if r.is_truthy() {
+                                    found = item;
+                                    break;
+                                }
+                            }
+                        } else {
+                            for item in items {
+                                let r = vm_call_sync(&pred, std::slice::from_ref(&item), syms)?;
+                                if r.is_truthy() {
+                                    found = item;
+                                    break;
+                                }
                             }
                         }
                         stack.push(found);
@@ -815,12 +854,35 @@ fn run_dispatch(
                             .collect::<Result<_, _>>()?;
                         let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
                         let mut result = Value::Boolean(false);
-                        for i in 0..n {
-                            let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-                            let r = vm_call_sync(&pred, &row, syms)?;
-                            if r.is_truthy() {
-                                result = r;
-                                break;
+                        let direct_fn: Option<VmBuiltinFn> = match &pred {
+                            Value::Procedure(p) => {
+                                p.as_any().downcast_ref::<VmBuiltin>().map(|b| b.f)
+                            }
+                            _ => None,
+                        };
+                        if let Some(f) = direct_fn {
+                            let mut row: Vec<Value> = Vec::with_capacity(lists.len());
+                            for i in 0..n {
+                                row.clear();
+                                for l in &lists {
+                                    row.push(l[i].clone());
+                                }
+                                let r = f(&row).map_err(|e| {
+                                    builtin_err_to_raised("any", &e, syms, call_span)
+                                })?;
+                                if r.is_truthy() {
+                                    result = r;
+                                    break;
+                                }
+                            }
+                        } else {
+                            for i in 0..n {
+                                let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                                let r = vm_call_sync(&pred, &row, syms)?;
+                                if r.is_truthy() {
+                                    result = r;
+                                    break;
+                                }
                             }
                         }
                         stack.push(result);
@@ -845,14 +907,38 @@ fn run_dispatch(
                             .collect::<Result<_, _>>()?;
                         let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
                         let mut result = Value::Boolean(true);
-                        for i in 0..n {
-                            let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-                            let r = vm_call_sync(&pred, &row, syms)?;
-                            if !r.is_truthy() {
-                                result = Value::Boolean(false);
-                                break;
+                        let direct_fn: Option<VmBuiltinFn> = match &pred {
+                            Value::Procedure(p) => {
+                                p.as_any().downcast_ref::<VmBuiltin>().map(|b| b.f)
                             }
-                            result = r;
+                            _ => None,
+                        };
+                        if let Some(f) = direct_fn {
+                            let mut row: Vec<Value> = Vec::with_capacity(lists.len());
+                            for i in 0..n {
+                                row.clear();
+                                for l in &lists {
+                                    row.push(l[i].clone());
+                                }
+                                let r = f(&row).map_err(|e| {
+                                    builtin_err_to_raised("every", &e, syms, call_span)
+                                })?;
+                                if !r.is_truthy() {
+                                    result = Value::Boolean(false);
+                                    break;
+                                }
+                                result = r;
+                            }
+                        } else {
+                            for i in 0..n {
+                                let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                                let r = vm_call_sync(&pred, &row, syms)?;
+                                if !r.is_truthy() {
+                                    result = Value::Boolean(false);
+                                    break;
+                                }
+                                result = r;
+                            }
                         }
                         stack.push(result);
                         if is_tail {
@@ -951,23 +1037,56 @@ fn run_dispatch(
                             .collect::<Result<_, _>>()?;
                         let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
                         let mut acc = init;
+                        // Hoist the dispatch (matches fold-left). When the
+                        // proc is a known plain VmBuiltin like `cons`, grab
+                        // the fn pointer once and skip the per-iteration
+                        // vm_call_sync match/downcast.
+                        let direct_fn: Option<VmBuiltinFn> = match &proc_val {
+                            Value::Procedure(p) => {
+                                p.as_any().downcast_ref::<VmBuiltin>().map(|b| b.f)
+                            }
+                            _ => None,
+                        };
                         if lists.len() == 1 {
                             let list = &lists[0];
                             let mut row: [Value; 2] = [Value::Unspecified, Value::Unspecified];
-                            for item in list.iter().take(n).rev() {
-                                row[0] = item.clone();
-                                row[1] = acc;
-                                acc = vm_call_sync(&proc_val, &row, syms)?;
+                            if let Some(f) = direct_fn {
+                                for item in list.iter().take(n).rev() {
+                                    row[0] = item.clone();
+                                    row[1] = acc;
+                                    acc = f(&row).map_err(|e| {
+                                        builtin_err_to_raised("fold-right", &e, syms, call_span)
+                                    })?;
+                                }
+                            } else {
+                                for item in list.iter().take(n).rev() {
+                                    row[0] = item.clone();
+                                    row[1] = acc;
+                                    acc = vm_call_sync(&proc_val, &row, syms)?;
+                                }
                             }
                         } else {
                             let mut row: Vec<Value> = Vec::with_capacity(lists.len() + 1);
-                            for i in (0..n).rev() {
-                                row.clear();
-                                for l in &lists {
-                                    row.push(l[i].clone());
+                            if let Some(f) = direct_fn {
+                                for i in (0..n).rev() {
+                                    row.clear();
+                                    for l in &lists {
+                                        row.push(l[i].clone());
+                                    }
+                                    row.push(acc);
+                                    acc = f(&row).map_err(|e| {
+                                        builtin_err_to_raised("fold-right", &e, syms, call_span)
+                                    })?;
                                 }
-                                row.push(acc);
-                                acc = vm_call_sync(&proc_val, &row, syms)?;
+                            } else {
+                                for i in (0..n).rev() {
+                                    row.clear();
+                                    for l in &lists {
+                                        row.push(l[i].clone());
+                                    }
+                                    row.push(acc);
+                                    acc = vm_call_sync(&proc_val, &row, syms)?;
+                                }
                             }
                         }
                         stack.push(acc);
@@ -1019,11 +1138,33 @@ fn run_dispatch(
                             .collect::<Result<_, _>>()?;
                         let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
                         let mut total: i64 = 0;
-                        for i in 0..n {
-                            let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-                            let r = vm_call_sync(&pred, &row, syms)?;
-                            if r.is_truthy() {
-                                total += 1;
+                        let direct_fn: Option<VmBuiltinFn> = match &pred {
+                            Value::Procedure(p) => {
+                                p.as_any().downcast_ref::<VmBuiltin>().map(|b| b.f)
+                            }
+                            _ => None,
+                        };
+                        if let Some(f) = direct_fn {
+                            let mut row: Vec<Value> = Vec::with_capacity(lists.len());
+                            for i in 0..n {
+                                row.clear();
+                                for l in &lists {
+                                    row.push(l[i].clone());
+                                }
+                                let r = f(&row).map_err(|e| {
+                                    builtin_err_to_raised("count", &e, syms, call_span)
+                                })?;
+                                if r.is_truthy() {
+                                    total += 1;
+                                }
+                            }
+                        } else {
+                            for i in 0..n {
+                                let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                                let r = vm_call_sync(&pred, &row, syms)?;
+                                if r.is_truthy() {
+                                    total += 1;
+                                }
                             }
                         }
                         stack.push(Value::fixnum(total));
@@ -1045,12 +1186,33 @@ fn run_dispatch(
                         let items = collect_proper_list(&args[0])?;
                         let mut yes = Vec::new();
                         let mut no = Vec::new();
-                        for item in items {
-                            let r = vm_call_sync(&pred, std::slice::from_ref(&item), syms)?;
-                            if r.is_truthy() {
-                                yes.push(item);
-                            } else {
-                                no.push(item);
+                        let direct_fn: Option<VmBuiltinFn> = match &pred {
+                            Value::Procedure(p) => {
+                                p.as_any().downcast_ref::<VmBuiltin>().map(|b| b.f)
+                            }
+                            _ => None,
+                        };
+                        if let Some(f) = direct_fn {
+                            let mut row = [Value::Unspecified];
+                            for item in items {
+                                row[0] = item.clone();
+                                let r = f(&row).map_err(|e| {
+                                    builtin_err_to_raised("partition", &e, syms, call_span)
+                                })?;
+                                if r.is_truthy() {
+                                    yes.push(item);
+                                } else {
+                                    no.push(item);
+                                }
+                            }
+                        } else {
+                            for item in items {
+                                let r = vm_call_sync(&pred, std::slice::from_ref(&item), syms)?;
+                                if r.is_truthy() {
+                                    yes.push(item);
+                                } else {
+                                    no.push(item);
+                                }
                             }
                         }
                         set_pending_values(vec![Value::list(yes), Value::list(no)]);

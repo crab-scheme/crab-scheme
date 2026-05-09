@@ -374,6 +374,11 @@ fn conformance_bytevector_typed() {
 }
 
 #[test]
+fn conformance_ho_dispatch_hoist() {
+    run_conformance_file("ho_dispatch_hoist.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -453,6 +458,7 @@ fn conformance_aggregate_count() {
                 "fx_fl_ops.scm",
                 "exactness_extras.scm",
                 "bytevector_typed.scm",
+                "ho_dispatch_hoist.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

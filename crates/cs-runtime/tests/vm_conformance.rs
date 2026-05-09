@@ -568,3 +568,11 @@ fn vm_conformance_bytevector_typed() {
     println!("bytevector_typed: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_ho_dispatch_hoist() {
+    let walker = pass_count_walker("ho_dispatch_hoist.scm");
+    let vm = pass_count_vm("ho_dispatch_hoist.scm").expect("vm should run ho_dispatch_hoist.scm");
+    println!("ho_dispatch_hoist: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
