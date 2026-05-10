@@ -1,0 +1,196 @@
+//! M6 iter 8 — JIT differential test.
+//!
+//! Each test runs the same Scheme program on three tiers and
+//! asserts the results agree:
+//!
+//! 1. Walker (`Runtime::eval_str`)
+//! 2. VM with no JIT (`Runtime::eval_str_via_vm` on a runtime that
+//!    has not called `install_jit`)
+//! 3. VM with JIT (`Runtime::eval_str_via_vm` on a runtime that
+//!    has called `install_jit`; programs are warmed past the
+//!    threshold so hot closures actually dispatch through native
+//!    code).
+//!
+//! This is the spec's iter-N+1 deliverable scaled to a focused
+//! initial set of programs. Broader 10k+ coverage will follow once
+//! the existing conformance harness is wired through the JIT
+//! runtime as a third tier.
+
+use cs_core::Value;
+use cs_runtime::Runtime;
+
+/// Define a procedure on a runtime, warm it by computing
+/// `(<name> <warmup-arg>)` once, then evaluate `expr` and return
+/// the result.
+fn define_warm_eval(
+    install_jit: bool,
+    defines: &[&str],
+    warmup_call: Option<&str>,
+    expr: &str,
+) -> Value {
+    let mut rt = Runtime::new();
+    if install_jit {
+        rt.install_jit().unwrap();
+    }
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    if let Some(w) = warmup_call {
+        rt.eval_str_via_vm("<diff>", w).unwrap();
+    }
+    rt.eval_str_via_vm("<diff>", expr).unwrap()
+}
+
+/// Walker tier: evaluate every define + the final expression on
+/// the walker (eval_str). No warmup.
+fn walker_eval(defines: &[&str], expr: &str) -> Value {
+    let mut rt = Runtime::new();
+    for d in defines {
+        rt.eval_str("<diff>", d).unwrap();
+    }
+    rt.eval_str("<diff>", expr).unwrap()
+}
+
+fn assert_three_tier_agreement(defines: &[&str], warmup: Option<&str>, expr: &str) {
+    let walker = walker_eval(defines, expr);
+    let vm_no_jit = define_warm_eval(false, defines, warmup, expr);
+    let vm_jit = define_warm_eval(true, defines, warmup, expr);
+
+    match (&walker, &vm_no_jit, &vm_jit) {
+        (Value::Number(a), Value::Number(b), Value::Number(c)) => {
+            assert_eq!(a.to_f64(), b.to_f64(), "walker vs vm-no-jit");
+            assert_eq!(b.to_f64(), c.to_f64(), "vm-no-jit vs vm-jit");
+        }
+        _ => panic!(
+            "expected numbers; walker={:?} vm={:?} jit={:?}",
+            walker, vm_no_jit, vm_jit
+        ),
+    }
+}
+
+#[test]
+fn diff_fib_20() {
+    let defines = &["(define fib (lambda (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))"];
+    // Warm with (fib 15) -> 1597 recursive calls, well past the
+    // default tier threshold of 1024.
+    assert_three_tier_agreement(defines, Some("(fib 15)"), "(fib 20)");
+}
+
+#[test]
+fn diff_fact_12() {
+    let defines = &["(define fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))"];
+    // (fact 12) recurses 12 times; not enough for tier-up. Loop
+    // many calls before checking the final value.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (fact 8) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    let jit_result = rt.eval_str_via_vm("<diff>", "(fact 12)").unwrap();
+
+    let walker = walker_eval(defines, "(fact 12)");
+    match (&walker, &jit_result) {
+        (Value::Number(a), Value::Number(b)) => {
+            assert_eq!(a.to_f64(), b.to_f64());
+            assert_eq!(a.to_f64(), 479001600.0);
+        }
+        other => panic!("expected numbers, got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_ack_3_5() {
+    // Ackermann's function — many recursive calls, tier-up
+    // guaranteed.
+    let defines = &["(define ack (lambda (m n) \
+            (if (= m 0) (+ n 1) \
+                (if (= n 0) (ack (- m 1) 1) \
+                    (ack (- m 1) (ack m (- n 1)))))))"];
+    // Stay small: (ack 3 4) is plenty of recursion to trigger
+    // tier-up but doesn't overflow the test thread's debug-build
+    // stack. (ack 3 6) blows the debug-build stack frame budget.
+    assert_three_tier_agreement(defines, Some("(ack 3 3)"), "(ack 3 4)");
+}
+
+#[test]
+fn diff_loop_sum_1_to_n() {
+    // Iterative-style sum via tail recursion.
+    let defines = &["(define loop-sum (lambda (n) \
+            (let helper ((i 0) (acc 0)) \
+              (if (> i n) acc (helper (+ i 1) (+ acc i))))))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    // Warm with a sum that itself triggers tier-up.
+    rt.eval_str_via_vm("<diff>", "(loop-sum 2000)").unwrap();
+    let jit_result = rt.eval_str_via_vm("<diff>", "(loop-sum 100)").unwrap();
+    let walker = walker_eval(defines, "(loop-sum 100)");
+    match (&walker, &jit_result) {
+        (Value::Number(a), Value::Number(b)) => {
+            assert_eq!(a.to_f64(), b.to_f64());
+            assert_eq!(a.to_f64(), 5050.0);
+        }
+        other => panic!("expected numbers, got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_gcd() {
+    let defines =
+        &["(define gcd (lambda (a b) (if (= b 0) a (gcd b (- a (* (quotient a b) b))))))"];
+    // Warm with a hot loop that exercises gcd many times.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (gcd 48 18) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    let jit_result = rt.eval_str_via_vm("<diff>", "(gcd 48 18)").unwrap();
+    let walker = walker_eval(defines, "(gcd 48 18)");
+    match (&walker, &jit_result) {
+        (Value::Number(a), Value::Number(b)) => {
+            assert_eq!(a.to_f64(), b.to_f64());
+            assert_eq!(a.to_f64(), 6.0);
+        }
+        other => panic!("expected numbers, got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_pure_arithmetic_fast_path() {
+    // Closures that the JIT translator handles trivially.
+    let defines = &[
+        "(define triple (lambda (x) (* x 3)))",
+        "(define dist2 (lambda (a b) (* (- a b) (- a b))))",
+    ];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (triple i) (dist2 i 5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let triple_jit = rt.eval_str_via_vm("<diff>", "(triple 14)").unwrap();
+    let dist2_jit = rt.eval_str_via_vm("<diff>", "(dist2 10 3)").unwrap();
+
+    let triple_walker = walker_eval(defines, "(triple 14)");
+    let dist2_walker = walker_eval(defines, "(dist2 10 3)");
+
+    let extract = |v: &Value| match v {
+        Value::Number(n) => n.to_f64(),
+        other => panic!("expected number, got {:?}", other),
+    };
+    assert_eq!(extract(&triple_jit), extract(&triple_walker));
+    assert_eq!(extract(&triple_walker), 42.0);
+    assert_eq!(extract(&dist2_jit), extract(&dist2_walker));
+    assert_eq!(extract(&dist2_walker), 49.0);
+}
