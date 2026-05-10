@@ -274,6 +274,11 @@ fn conformance_srfi1_more() {
 }
 
 #[test]
+fn conformance_srfi1_ho_walker() {
+    run_conformance_file("srfi1_ho_walker.scm");
+}
+
+#[test]
 fn conformance_define_condition_type() {
     run_conformance_file("define_condition_type.scm");
 }
@@ -693,6 +698,7 @@ fn conformance_aggregate_count() {
                 "records_procedural.scm",
                 "r6rs_misc.scm",
                 "srfi1_more.scm",
+                "srfi1_ho_walker.scm",
                 "define_condition_type.scm",
                 "error_who.scm",
                 "builtin_errors.scm",

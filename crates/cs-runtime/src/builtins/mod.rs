@@ -672,6 +672,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("circular-list?", b_circular_list_p),
         ("append-reverse", b_append_reverse),
         ("reverse!", b_reverse_bang),
+        ("circular-list", b_circular_list),
         // R6RS numeric "shape" predicates / converters.
         ("real-valued?", b_real_valued_p),
         ("rational-valued?", b_rational_valued_p),
@@ -733,6 +734,18 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("span", b_span),
         ("break", b_break),
         ("split-at", b_split_at),
+        ("unzip", b_unzip),
+        ("unzip2", b_unzip),
+        ("find-tail", b_find_tail),
+        ("reduce-right", b_reduce_right),
+        ("pair-fold", b_pair_fold),
+        ("pair-fold-right", b_pair_fold_right),
+        ("pair-for-each", b_pair_for_each),
+        ("string-fold", b_string_fold),
+        ("string-fold-right", b_string_fold_right),
+        ("string-tabulate", b_string_tabulate),
+        ("vector-fold-right", b_vector_fold_right),
+        ("unfold-right", b_unfold_right),
         ("list-index", b_list_index),
         ("filter-map", b_filter_map),
         ("append-map", b_append_map),
@@ -6400,6 +6413,257 @@ fn b_find(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     Ok(Value::Boolean(false))
 }
 
+/// SRFI-1 `(find-tail pred list)` — like `find`, but returns the
+/// tail starting at the first matching element instead of the
+/// element itself. #f if no match.
+fn b_find_tail(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("find-tail", "2", args.len()));
+    }
+    let pred = args[0].clone();
+    let mut cur = args[1].clone();
+    loop {
+        match cur.clone() {
+            Value::Null => return Ok(Value::Boolean(false)),
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                let r = apply_procedure(&pred, &[car], ctx).map_err(|e| e.message())?;
+                if r.is_truthy() {
+                    return Ok(cur);
+                }
+                cur = p.cdr.borrow().clone();
+            }
+            _ => return Err("find-tail: improper list".into()),
+        }
+    }
+}
+
+/// SRFI-1 `(reduce-right proc default list)` — right-associative
+/// counterpart to `reduce`. Returns `default` if the list is empty,
+/// the only element if length 1, otherwise folds from the right.
+fn b_reduce_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("reduce-right", "3", args.len()));
+    }
+    let proc_val = args[0].clone();
+    let default = args[1].clone();
+    let items = collect_proper_list("reduce-right", &args[2])?;
+    if items.is_empty() {
+        return Ok(default);
+    }
+    let mut acc = items[items.len() - 1].clone();
+    for item in items[..items.len() - 1].iter().rev() {
+        acc = apply_procedure(&proc_val, &[item.clone(), acc], ctx).map_err(|e| e.message())?;
+    }
+    Ok(acc)
+}
+
+/// SRFI-1 `(pair-fold kons knil list)` — like fold but applies
+/// kons to successive pairs (sublists), not their cars.
+fn b_pair_fold(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("pair-fold", "3", args.len()));
+    }
+    let kons = args[0].clone();
+    let mut acc = args[1].clone();
+    let mut cur = args[2].clone();
+    loop {
+        match cur.clone() {
+            Value::Null => return Ok(acc),
+            Value::Pair(p) => {
+                let next = p.cdr.borrow().clone();
+                acc = apply_procedure(&kons, &[cur.clone(), acc], ctx).map_err(|e| e.message())?;
+                cur = next;
+            }
+            _ => return Err("pair-fold: improper list".into()),
+        }
+    }
+}
+
+/// SRFI-1 `(pair-fold-right kons knil list)` — right-associative.
+fn b_pair_fold_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("pair-fold-right", "3", args.len()));
+    }
+    let kons = args[0].clone();
+    let knil = args[1].clone();
+    // Collect all the sublists (each successive cdr) first.
+    let mut subs: Vec<Value> = Vec::new();
+    let mut cur = args[2].clone();
+    loop {
+        match cur.clone() {
+            Value::Null => break,
+            Value::Pair(_) => {
+                subs.push(cur.clone());
+                if let Value::Pair(p) = cur {
+                    cur = p.cdr.borrow().clone();
+                }
+            }
+            _ => return Err("pair-fold-right: improper list".into()),
+        }
+    }
+    let mut acc = knil;
+    for sub in subs.into_iter().rev() {
+        acc = apply_procedure(&kons, &[sub, acc], ctx).map_err(|e| e.message())?;
+    }
+    Ok(acc)
+}
+
+/// SRFI-1 `(pair-for-each proc list)` — apply proc to each successive
+/// sublist; result is unspecified.
+fn b_pair_for_each(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("pair-for-each", "2", args.len()));
+    }
+    let proc_val = args[0].clone();
+    let mut cur = args[1].clone();
+    loop {
+        match cur.clone() {
+            Value::Null => return Ok(Value::Unspecified),
+            Value::Pair(p) => {
+                let next = p.cdr.borrow().clone();
+                apply_procedure(&proc_val, &[cur.clone()], ctx).map_err(|e| e.message())?;
+                cur = next;
+            }
+            _ => return Err("pair-for-each: improper list".into()),
+        }
+    }
+}
+
+/// SRFI-13 `(string-fold kons knil str [start [end]])` — left-associative
+/// fold over chars.
+fn b_string_fold(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if !(3..=5).contains(&args.len()) {
+        return Err(arity_err("string-fold", "3..5", args.len()));
+    }
+    let kons = args[0].clone();
+    let mut acc = args[1].clone();
+    let s = match &args[2] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-fold", "string", v)),
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let start = if args.len() >= 4 {
+        as_int_i64("string-fold", &args[3])?.max(0) as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 5 {
+        as_int_i64("string-fold", &args[4])?.max(0) as usize
+    } else {
+        len
+    };
+    if start > end || end > len {
+        return Err("string-fold: range out of bounds".into());
+    }
+    for c in &chars[start..end] {
+        acc = apply_procedure(&kons, &[Value::Character(*c), acc], ctx).map_err(|e| e.message())?;
+    }
+    Ok(acc)
+}
+
+/// SRFI-13 `(string-fold-right kons knil str [start [end]])`.
+fn b_string_fold_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if !(3..=5).contains(&args.len()) {
+        return Err(arity_err("string-fold-right", "3..5", args.len()));
+    }
+    let kons = args[0].clone();
+    let knil = args[1].clone();
+    let s = match &args[2] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string-fold-right", "string", v)),
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let start = if args.len() >= 4 {
+        as_int_i64("string-fold-right", &args[3])?.max(0) as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 5 {
+        as_int_i64("string-fold-right", &args[4])?.max(0) as usize
+    } else {
+        len
+    };
+    if start > end || end > len {
+        return Err("string-fold-right: range out of bounds".into());
+    }
+    let mut acc = knil;
+    for c in chars[start..end].iter().rev() {
+        acc = apply_procedure(&kons, &[Value::Character(*c), acc], ctx).map_err(|e| e.message())?;
+    }
+    Ok(acc)
+}
+
+/// SRFI-13 `(string-tabulate proc len)` — build a string of length
+/// `len` whose i-th char is `(proc i)`.
+fn b_string_tabulate(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("string-tabulate", "2", args.len()));
+    }
+    let proc_val = args[0].clone();
+    let n = as_int_i64("string-tabulate", &args[1])?;
+    if n < 0 {
+        return Err("string-tabulate: negative length".into());
+    }
+    let mut out = String::with_capacity(n as usize);
+    for i in 0..n {
+        let r = apply_procedure(&proc_val, &[Value::fixnum(i)], ctx).map_err(|e| e.message())?;
+        match r {
+            Value::Character(c) => out.push(c),
+            v => return Err(type_err("string-tabulate", "character (proc result)", &v)),
+        }
+    }
+    Ok(Value::string(out))
+}
+
+/// R6RS `(vector-fold-right kons knil vec)` — right-associative
+/// counterpart to `vector-fold`.
+fn b_vector_fold_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("vector-fold-right", "3", args.len()));
+    }
+    let kons = args[0].clone();
+    let knil = args[1].clone();
+    let v = match &args[2] {
+        Value::Vector(vc) => vc.borrow().clone(),
+        v => return Err(type_err("vector-fold-right", "vector", v)),
+    };
+    let mut acc = knil;
+    for item in v.iter().rev() {
+        acc = apply_procedure(&kons, &[item.clone(), acc], ctx).map_err(|e| e.message())?;
+    }
+    Ok(acc)
+}
+
+/// SRFI-1 `(unfold-right p f g seed [tail])` — right-fold version
+/// of unfold; builds a list by walking the seed through f/g until p
+/// is satisfied, then prepending in reverse.
+fn b_unfold_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if !(4..=5).contains(&args.len()) {
+        return Err(arity_err("unfold-right", "4..5", args.len()));
+    }
+    let pred = args[0].clone();
+    let mapper = args[1].clone();
+    let advancer = args[2].clone();
+    let mut seed = args[3].clone();
+    let mut acc = if args.len() == 5 {
+        args[4].clone()
+    } else {
+        Value::Null
+    };
+    loop {
+        let stop = apply_procedure(&pred, &[seed.clone()], ctx).map_err(|e| e.message())?;
+        if stop.is_truthy() {
+            return Ok(acc);
+        }
+        let elt = apply_procedure(&mapper, &[seed.clone()], ctx).map_err(|e| e.message())?;
+        acc = Value::Pair(Pair::new(elt, acc));
+        seed = apply_procedure(&advancer, &[seed], ctx).map_err(|e| e.message())?;
+    }
+}
+
 fn b_count(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("count", "2", args.len()));
@@ -9680,6 +9944,51 @@ fn b_append_reverse(args: &[Value]) -> Result<Value, String> {
         acc = Value::Pair(Pair::new(item, acc));
     }
     Ok(acc)
+}
+
+/// SRFI-1 `(unzip pairs)` — split a list of two-element lists into
+/// two parallel lists. Returns 2 values via pending_values.
+fn b_unzip(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("unzip", "1", args.len()));
+    }
+    let items = collect_proper_list("unzip", &args[0])?;
+    let mut a: Vec<Value> = Vec::with_capacity(items.len());
+    let mut b: Vec<Value> = Vec::with_capacity(items.len());
+    for item in items {
+        let parts = collect_proper_list("unzip", &item)?;
+        if parts.len() < 2 {
+            return Err("unzip: each element must have at least 2 items".into());
+        }
+        a.push(parts[0].clone());
+        b.push(parts[1].clone());
+    }
+    ctx.pending_values = Some(vec![Value::list(a), Value::list(b)]);
+    Ok(Value::Unspecified)
+}
+
+/// SRFI-1 `(circular-list elt ...)` — build a cyclic list whose
+/// last cdr points back at the head.
+fn b_circular_list(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err(arity_err("circular-list", "at least 1", 0));
+    }
+    let head = Value::list(args.to_vec());
+    let mut cur = head.clone();
+    loop {
+        let next = match &cur {
+            Value::Pair(p) => p.cdr.borrow().clone(),
+            _ => return Err("circular-list: internal error — not a pair".into()),
+        };
+        if matches!(next, Value::Null) {
+            if let Value::Pair(p) = &cur {
+                *p.cdr.borrow_mut() = head.clone();
+            }
+            break;
+        }
+        cur = next;
+    }
+    Ok(head)
 }
 
 /// SRFI-1 `(reverse! list)` — destructive reverse. Foundation: just
