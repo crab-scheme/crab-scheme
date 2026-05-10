@@ -264,6 +264,20 @@ pub enum Inst {
     /// which consumes the operand box.
     NullP(Value, Value),
 
+    /// `dst = clone(src)` — produce a fresh Any-tagged box from a
+    /// peek of `src`. `src` remains live; `dst` is independently
+    /// owned. Lowers to the `vm_value_clone` runtime helper.
+    /// Used by the translator to support multi-use of an Any
+    /// operand (each non-final use pulls through a clone; the
+    /// original is dropped at function exit via `AnyDrop`).
+    AnyClone(Value, Value),
+
+    /// `drop(src)` — release an Any-tagged box. Lowers to
+    /// `vm_value_drop`. Inserted at every return path for
+    /// Any-typed params so the dispatch-side allocation doesn't
+    /// leak when the body never consumed it.
+    AnyDrop(Value),
+
     /// Type guard: if the value's runtime type doesn't match the
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
     /// always dispatches dynamically).

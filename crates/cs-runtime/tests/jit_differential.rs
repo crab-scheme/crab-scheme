@@ -1069,6 +1069,48 @@ fn diff_jit_cons_pair_return() {
 }
 
 #[test]
+fn diff_jit_multi_use_any_param() {
+    // M6 Phase 4 iter AV: `v` appears twice in the body — once as
+    // the predicate operand (consumes), once inside the true branch
+    // for `car` (consumes). Both uses must own independent boxes,
+    // so the translator emits AnyClone on every LoadVar(any-param).
+    // The original dispatch-allocated box is released by AnyDrop on
+    // the return path.
+    //
+    // Both branches return Any (Pair-flavored cdr / clone of the
+    // original) so the inferred return type is Type::Any.
+    let defines = &["(define (head v) (if (pair? v) (car v) v))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (head (cons i (+ i 1))) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    // Pair input: returns car (Fixnum boxed as Any).
+    let jit_pair = rt.eval_str_via_vm("<diff>", "(head (cons 7 8))").unwrap();
+    let walker_pair = walker_eval(defines, "(head (cons 7 8))");
+    match (&jit_pair, &walker_pair) {
+        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+            assert_eq!(j, w);
+            assert_eq!(*j, 7);
+        }
+        other => panic!("expected fixnum 7, got {:?}", other),
+    }
+
+    // Non-pair input: returns the operand itself (Null, an Any).
+    let jit_nil = rt.eval_str_via_vm("<diff>", "(head (quote ()))").unwrap();
+    let walker_nil = walker_eval(defines, "(head (quote ()))");
+    match (&jit_nil, &walker_nil) {
+        (Value::Null, Value::Null) => {}
+        other => panic!("expected nulls, got {:?}", other),
+    }
+}
+
+#[test]
 fn diff_jit_pair_predicate() {
     // M6 Phase 4 iter AU: heap-pointer args reach the JIT through
     // the Any param lane, and pair?/null? predicates lower to

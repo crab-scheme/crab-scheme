@@ -83,6 +83,14 @@ pub struct Lowerer {
     /// FuncId of `vm_null_p(v) -> i64`. `Inst::NullP` lowers to a
     /// Cranelift call against this.
     null_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_value_clone(v) -> i64`. `Inst::AnyClone`
+    /// lowers to a Cranelift call against this. Helper does not
+    /// consume the operand box.
+    value_clone_func: cranelift_module::FuncId,
+    /// FuncId of `vm_value_drop(v) -> ()`. `Inst::AnyDrop` lowers
+    /// to a Cranelift call against this. Helper consumes (drops)
+    /// the operand box.
+    value_drop_func: cranelift_module::FuncId,
 }
 
 impl Lowerer {
@@ -124,6 +132,8 @@ impl Lowerer {
         builder.symbol("vm_pair_cdr", cs_vm::vm::vm_pair_cdr as *const u8);
         builder.symbol("vm_pair_p", cs_vm::vm::vm_pair_p as *const u8);
         builder.symbol("vm_null_p", cs_vm::vm::vm_null_p as *const u8);
+        builder.symbol("vm_value_clone", cs_vm::vm::vm_value_clone as *const u8);
+        builder.symbol("vm_value_drop", cs_vm::vm::vm_value_drop as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -207,6 +217,26 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_null_p: {e}")))?;
 
+        // vm_value_clone — same shape as the accessors (i64 → i64).
+        let value_clone_func = module
+            .declare_function(
+                "vm_value_clone",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_value_clone: {e}")))?;
+
+        // vm_value_drop — i64 → ().
+        let mut value_drop_sig = module.make_signature();
+        value_drop_sig.params.push(AbiParam::new(I64));
+        let value_drop_func = module
+            .declare_function(
+                "vm_value_drop",
+                cranelift_module::Linkage::Import,
+                &value_drop_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_value_drop: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -220,6 +250,8 @@ impl Lowerer {
             pair_cdr_func,
             pair_p_func,
             null_p_func,
+            value_clone_func,
+            value_drop_func,
         })
     }
 
@@ -345,6 +377,12 @@ impl Lowerer {
             let null_p_fnref = self
                 .module
                 .declare_func_in_func(self.null_p_func, builder.func);
+            let value_clone_fnref = self
+                .module
+                .declare_func_in_func(self.value_clone_func, builder.func);
+            let value_drop_fnref = self
+                .module
+                .declare_func_in_func(self.value_drop_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -404,6 +442,8 @@ impl Lowerer {
                         pair_cdr_fnref,
                         pair_p_fnref,
                         null_p_fnref,
+                        value_clone_fnref,
+                        value_drop_fnref,
                         inst,
                     )?;
                 }
@@ -558,6 +598,8 @@ fn lower_inst(
     pair_cdr_fnref: cranelift_codegen::ir::FuncRef,
     pair_p_fnref: cranelift_codegen::ir::FuncRef,
     null_p_fnref: cranelift_codegen::ir::FuncRef,
+    value_clone_fnref: cranelift_codegen::ir::FuncRef,
+    value_drop_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -732,6 +774,22 @@ fn lower_inst(
                 )));
             }
             map.insert(*dst, results[0]);
+        }
+        Inst::AnyClone(dst, src) => {
+            let v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(value_clone_fnref, &[v]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "AnyClone expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::AnyDrop(src) => {
+            let v = lookup(map, *src)?;
+            b.ins().call(value_drop_fnref, &[v]);
         }
         Inst::FlonumAdd(dst, lhs, rhs) => {
             fbinop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().fadd(l, r))?

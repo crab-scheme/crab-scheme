@@ -391,6 +391,25 @@ pub unsafe extern "C" fn vm_null_p(r: i64) -> i64 {
     matches!(*boxed, Value::Null) as i64
 }
 
+/// Peek-clone an Any-tagged box: produce a fresh `Box<Value>` whose
+/// inner value is `(*r).clone()`, return its raw pointer as the new
+/// i64. The original box at `r` is left intact (the JIT body still
+/// owns it). Used by `Inst::AnyClone` to support multi-use of an
+/// Any operand.
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_clone(r: i64) -> i64 {
+    let v = unsafe { &*(r as *const Value) };
+    value_to_any_i64(v.clone())
+}
+
+/// Drop an Any-tagged box (Box::from_raw + drop). Used by
+/// `Inst::AnyDrop` at every return path to release Any-typed params
+/// that the body never otherwise consumed.
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_drop(r: i64) {
+    drop(unsafe { Box::from_raw(r as *mut Value) });
+}
+
 /// Read the per-thread JIT-dispatch count. Test/diagnostics only.
 pub fn jit_call_count() -> u64 {
     VM_JIT_CALL_COUNT.with(|c| c.get())

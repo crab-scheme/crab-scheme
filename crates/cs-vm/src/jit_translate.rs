@@ -174,6 +174,18 @@ pub fn bytecode_to_rir_with_hints(
     let mut block_params: HashMap<BlockId, Vec<(RirValue, Type)>> = HashMap::new();
     block_params.insert(BlockId(0), Vec::new());
 
+    // Snapshot of the Any-typed function-param RIR Values. At
+    // every `Term::Return` we emit `AnyDrop` for each so the
+    // dispatch-side allocation doesn't leak when the body never
+    // consumed the original. Cloned uses (from `AnyClone`) own
+    // separate boxes and are unaffected.
+    let any_params: Vec<RirValue> = func
+        .params
+        .iter()
+        .filter(|(_, t)| *t == Type::Any)
+        .map(|(v, _)| *v)
+        .collect();
+
     // Translate each block.
     for (i, &start) in block_offsets.iter().enumerate() {
         let block_id = BlockId(i as u32);
@@ -232,7 +244,21 @@ pub fn bytecode_to_rir_with_hints(
                 }
                 Inst::LoadVar(sym) => {
                     if let Some(v) = param_map.get(sym).copied() {
-                        sim_stack.push(StackEntry::Value(v));
+                        // Any-typed params live in linear-typed land:
+                        // each "use" must own a fresh box. We clone
+                        // on every load and drop the original at
+                        // function exit. Immediate-typed params
+                        // (Fixnum/Boolean/Character/Flonum) are pure
+                        // i64 — share the param value directly.
+                        let pt = value_types.get(&v).copied().unwrap_or(Type::Fixnum);
+                        if pt == Type::Any {
+                            let dst = alloc();
+                            insts.push(RirInst::AnyClone(dst, v));
+                            value_types.insert(dst, Type::Any);
+                            sim_stack.push(StackEntry::Value(dst));
+                        } else {
+                            sim_stack.push(StackEntry::Value(v));
+                        }
                     } else if Some(*sym) == self_name {
                         sim_stack.push(StackEntry::SelfRef);
                     } else {
@@ -555,6 +581,15 @@ pub fn bytecode_to_rir_with_hints(
                 }
                 Inst::Return => {
                     let v = pop_value(&mut sim_stack)?;
+                    // Drop Any-typed params on every return path
+                    // before handing control back to the dispatcher.
+                    // The return value `v` is independent (cloned
+                    // earlier via AnyClone or produced fresh by
+                    // Cons / Car / Cdr), so dropping the original
+                    // params is always safe here.
+                    for &p in &any_params {
+                        insts.push(RirInst::AnyDrop(p));
+                    }
                     term = Some(Term::Return(v));
                     break;
                 }
@@ -1177,6 +1212,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
             Type::Character => {
                 char_values.insert(*val);
             }
+            Type::Any => {
+                any_values.insert(*val);
+            }
             _ => {}
         }
     }
@@ -1195,6 +1233,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 }
                 Type::Character => {
                     char_values.insert(*val);
+                }
+                Type::Any => {
+                    any_values.insert(*val);
                 }
                 _ => {}
             }
@@ -1238,7 +1279,10 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::LoadConst(dst, Const::Flonum(_)) => {
                     flo_values.insert(*dst);
                 }
-                RirInst::Cons(dst, _, _, _, _) | RirInst::Car(dst, _) | RirInst::Cdr(dst, _) => {
+                RirInst::Cons(dst, _, _, _, _)
+                | RirInst::Car(dst, _)
+                | RirInst::Cdr(dst, _)
+                | RirInst::AnyClone(dst, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}
