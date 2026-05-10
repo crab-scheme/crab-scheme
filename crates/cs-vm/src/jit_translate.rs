@@ -403,7 +403,20 @@ pub fn bytecode_to_rir_with_hints(
                     sim_stack.push(StackEntry::Value(dst));
                 }
                 Inst::JumpIfFalse(target) => {
-                    let cond = pop_value(&mut sim_stack)?;
+                    let cond_raw = pop_value(&mut sim_stack)?;
+                    // When the condition is Any-typed (a Box pointer),
+                    // brif would always see the raw pointer (nonzero)
+                    // and pick the truthy branch even for Boolean(false).
+                    // Insert AnyTruthy to decode the box into a 0/1 i64
+                    // per R6RS truthiness (only #f is falsy).
+                    let cond = if value_types.get(&cond_raw).copied() == Some(Type::Any) {
+                        let fresh = alloc();
+                        insts.push(RirInst::AnyTruthy(fresh, cond_raw));
+                        value_types.insert(fresh, Type::Boolean);
+                        fresh
+                    } else {
+                        cond_raw
+                    };
                     let target_block = lookup_block(&offset_to_block, *target, "JumpIfFalse")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "JumpIfFalse fall")?;
                     let stack_height = sim_stack.len();

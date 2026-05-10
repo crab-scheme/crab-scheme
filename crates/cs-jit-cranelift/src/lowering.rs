@@ -109,6 +109,10 @@ pub struct Lowerer {
     /// FuncId of `vm_eq_any(a, b) -> i64`. `Inst::EqAny` lowers
     /// to this. Consumes both boxes; returns 0/1.
     eq_any_func: cranelift_module::FuncId,
+    /// FuncId of `vm_any_truthy(r) -> i64`. `Inst::AnyTruthy`
+    /// lowers to this. Consumes the box; returns 0 iff inner is
+    /// `Boolean(false)`.
+    any_truthy_func: cranelift_module::FuncId,
 }
 
 impl Lowerer {
@@ -157,6 +161,7 @@ impl Lowerer {
         builder.symbol("vm_unbox_boolean", cs_vm::vm::vm_unbox_boolean as *const u8);
         builder.symbol("vm_unbox_flonum", cs_vm::vm::vm_unbox_flonum as *const u8);
         builder.symbol("vm_eq_any", cs_vm::vm::vm_eq_any as *const u8);
+        builder.symbol("vm_any_truthy", cs_vm::vm::vm_any_truthy as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -308,6 +313,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_eq_any: {e}")))?;
 
+        // vm_any_truthy(r) -> i64 — same shape as accessors.
+        let any_truthy_func = module
+            .declare_function(
+                "vm_any_truthy",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_any_truthy: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -328,6 +342,7 @@ impl Lowerer {
             unbox_boolean_func,
             unbox_flonum_func,
             eq_any_func,
+            any_truthy_func,
         })
     }
 
@@ -474,6 +489,9 @@ impl Lowerer {
             let eq_any_fnref = self
                 .module
                 .declare_func_in_func(self.eq_any_func, builder.func);
+            let any_truthy_fnref = self
+                .module
+                .declare_func_in_func(self.any_truthy_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -540,6 +558,7 @@ impl Lowerer {
                         unbox_boolean_fnref,
                         unbox_flonum_fnref,
                         eq_any_fnref,
+                        any_truthy_fnref,
                         inst,
                     )?;
                 }
@@ -701,6 +720,7 @@ fn lower_inst(
     unbox_boolean_fnref: cranelift_codegen::ir::FuncRef,
     unbox_flonum_fnref: cranelift_codegen::ir::FuncRef,
     eq_any_fnref: cranelift_codegen::ir::FuncRef,
+    any_truthy_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -953,6 +973,18 @@ fn lower_inst(
             if results.len() != 1 {
                 return Err(JitError::Codegen(format!(
                     "EqAny expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::AnyTruthy(dst, src) => {
+            let v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(any_truthy_fnref, &[v]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "AnyTruthy expected 1 result, got {}",
                     results.len()
                 )));
             }

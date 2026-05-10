@@ -462,6 +462,20 @@ pub unsafe extern "C" fn vm_unbox_flonum(r: i64) -> i64 {
     }
 }
 
+/// Consume an Any-tagged box and return 1 if the inner Value is
+/// truthy per R6RS (anything other than `Value::Boolean(false)`),
+/// else 0. Used by `Inst::AnyTruthy` so that a `JumpIfFalse` /
+/// `Term::Branch` on an Any operand decodes the box rather than
+/// branching on the raw pointer (which is always nonzero).
+#[no_mangle]
+pub unsafe extern "C" fn vm_any_truthy(r: i64) -> i64 {
+    let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
+    match *boxed {
+        Value::Boolean(false) => 0,
+        _ => 1,
+    }
+}
+
 /// R6RS `(eq? a b)` on two Any-tagged boxes. Consumes both boxes
 /// (Box::from_raw on each) and returns 1 if eq?, else 0.
 ///

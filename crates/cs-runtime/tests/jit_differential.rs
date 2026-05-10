@@ -1671,3 +1671,54 @@ fn diff_jit_unbox_flonum_via_car() {
         other => panic!("expected flonums, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_truthiness_on_any() {
+    // M6 Phase 4 iter BC: `(if any-value ...)` must treat
+    // Boolean(false) as falsy even when boxed as Any. Pre-fix,
+    // brif on a Box pointer (always nonzero) always took the
+    // truthy branch.
+    //
+    // The translator now emits Inst::AnyTruthy(fresh, cond)
+    // when cond is Type::Any at JumpIfFalse, and brif consumes
+    // the decoded 0/1.
+    let defines = &["(define (selector v) (if v (quote got-truthy) (quote got-falsy)))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+         (if (= i 1500) 'done (begin (selector (cons i i)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    cs_vm::vm::reset_jit_call_count();
+    let jit_false = rt.eval_str_via_vm("<diff>", "(selector #f)").unwrap();
+    let jit_true = rt
+        .eval_str_via_vm("<diff>", "(selector (cons 1 2))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(after >= 2, "selector never JITted (count = {})", after);
+
+    let walker_false = walker_eval(defines, "(selector #f)");
+    let walker_true = walker_eval(defines, "(selector (cons 1 2))");
+    match (&jit_false, &walker_false) {
+        (Value::Symbol(j), Value::Symbol(w)) => {
+            assert_eq!(j, w, "tier mismatch on #f branch")
+        }
+        other => panic!("expected matching symbols on #f branch, got {:?}", other),
+    }
+    match (&jit_true, &walker_true) {
+        (Value::Symbol(j), Value::Symbol(w)) => {
+            assert_eq!(j, w, "tier mismatch on truthy branch")
+        }
+        other => panic!(
+            "expected matching symbols on truthy branch, got {:?}",
+            other
+        ),
+    }
+    // (Per-branch matches above already verified each path returned
+    // the matching walker symbol; that implicitly confirms the
+    // branches are distinct.)
+}

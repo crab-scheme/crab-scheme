@@ -322,6 +322,15 @@ pub enum Inst {
     /// types).
     EqAny(Value, Value, Value),
 
+    /// `dst = truthy(src)` — consume an Any-tagged box and
+    /// produce a 0/1 i64 that reflects R6RS truthiness (only
+    /// `Boolean(false)` is falsy). Lowers to `vm_any_truthy`.
+    /// Inserted before `Term::Branch` when the condition is
+    /// `Type::Any` — otherwise the brif would compare the raw
+    /// Box pointer (always nonzero) and always take the truthy
+    /// branch.
+    AnyTruthy(Value, Value),
+
     /// Type guard: if the value's runtime type doesn't match the
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
     /// always dispatches dynamically).
