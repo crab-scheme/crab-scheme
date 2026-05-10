@@ -27,8 +27,11 @@
 //!   stay on the VM.
 
 use cs_jit_cranelift::Lowerer;
-use cs_vm::jit_translate::bytecode_to_rir;
+use cs_vm::jit_translate::bytecode_to_rir_with_hints;
 use cs_vm::vm::{install_tier_up_hook, VmClosure};
+use cs_vm::RirType;
+
+use cs_core::{Number, Value};
 
 use crate::Runtime;
 
@@ -66,7 +69,7 @@ impl Runtime {
 ///
 /// Silent on failure: any unsupported opcode, env access, or
 /// translation error leaves the closure on the bytecode VM.
-fn jit_tier_up_hook(closure: &VmClosure) {
+fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     // SAFETY: The hook fires only inside the closure-call dispatch,
     // which runs inside `Runtime::with_active` (set by `eval_str` /
     // `eval_str_via_vm`). The active back-pointer is the unique
@@ -80,10 +83,40 @@ fn jit_tier_up_hook(closure: &VmClosure) {
         None => return,
     };
     let lam = &closure.bc.lambdas[closure.lambda_idx];
+    // Type-feedback signature: derive each param's type from the
+    // value passed at the triggering call. The translator uses this
+    // to seed value_types so flonum-arg bodies dispatch through
+    // FlonumAdd/Mul/etc. directly. Args that don't match any of our
+    // immediate types (heap-pointer Values) fall back to Fixnum,
+    // and the dispatcher type-guard will reject them anyway.
+    let param_hints: Vec<RirType> = args
+        .iter()
+        .map(|v| match v {
+            Value::Number(Number::Fixnum(_)) => RirType::Fixnum,
+            Value::Number(Number::Flonum(_)) => RirType::Flonum,
+            Value::Boolean(_) => RirType::Boolean,
+            Value::Character(_) => RirType::Character,
+            _ => RirType::Fixnum,
+        })
+        .collect();
+    let param_tags: Vec<u8> = param_hints
+        .iter()
+        .map(|t| match t {
+            RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
+            RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,
+            RirType::Flonum => cs_vm::vm::JIT_RT_FLONUM,
+            _ => cs_vm::vm::JIT_RT_FIXNUM,
+        })
+        .collect();
     // Self-name flows from VmClosure::self_name (set by the Define
     // / Set call sites in cs-vm), letting the translator recognize
     // recursive `LoadVar(self) ... Call N` patterns.
-    let rir = match bytecode_to_rir(lam, "anon-jit", closure.self_name()) {
+    let rir = match bytecode_to_rir_with_hints(
+        lam,
+        "anon-jit",
+        closure.self_name(),
+        Some(&param_hints),
+    ) {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -92,13 +125,14 @@ fn jit_tier_up_hook(closure: &VmClosure) {
         Err(_) => return,
     };
     closure.set_jit_ptr(ptr, lam.params.len() as u32);
+    closure.set_jit_param_types(&param_tags);
     // Phase-2 ABI generalization: tell the dispatcher how to decode
     // the i64 return. Defaults to Fixnum; flip to Boolean when the
     // RIR's inferred return type says so.
     let rt_tag = match rir.return_type {
-        cs_vm::RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
-        cs_vm::RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,
-        cs_vm::RirType::Flonum => cs_vm::vm::JIT_RT_FLONUM,
+        RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
+        RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,
+        RirType::Flonum => cs_vm::vm::JIT_RT_FLONUM,
         _ => cs_vm::vm::JIT_RT_FIXNUM,
     };
     closure.set_jit_return_type(rt_tag);

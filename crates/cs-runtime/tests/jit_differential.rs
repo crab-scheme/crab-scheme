@@ -682,3 +682,53 @@ fn diff_multi_arg_arith() {
         );
     }
 }
+
+#[test]
+fn diff_arg_side_flonum_passthrough() {
+    // M6 Phase 2 iter AF: closures called with flonum args at
+    // tier-up time get a JIT body whose params are typed Flonum,
+    // and the dispatch type-guard accepts flonum-encoded i64s.
+    // Without iter AF, this body would either tier up with all-
+    // Fixnum params (and silently produce nonsense via i64 imul)
+    // or stay on bytecode forever.
+    let defines = &["(define sqr (lambda (n) (* n n)))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    // Warm with FLONUM args so the tier-up hook records Flonum
+    // signatures and JITs accordingly.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (sqr 3.5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, f64)] = &[
+        ("(sqr 3.5)", 12.25),
+        ("(sqr 2.0)", 4.0),
+        ("(sqr -4.0)", 16.0),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Flonum(j)),
+                Value::Number(cs_core::Number::Flonum(w)),
+            ) => {
+                assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
+                assert_eq!(*j, *expected, "value mismatch on {}", expr);
+            }
+            other => panic!("{}: expected flonums, got {:?}", expr, other),
+        }
+    }
+
+    // Now call the same name with fixnum args — type-guard rejects
+    // (because the closure was JIT'd with Flonum signature) and
+    // dispatch falls through to bytecode. Walker == bytecode VM
+    // here so they should still agree.
+    let fix = rt.eval_str_via_vm("<diff>", "(sqr 5)").unwrap();
+    let fix_walker = walker_eval(defines, "(sqr 5)");
+    assert_eq!(format!("{:?}", fix), format!("{:?}", fix_walker));
+}

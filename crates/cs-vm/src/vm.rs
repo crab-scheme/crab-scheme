@@ -131,11 +131,13 @@ pub type VmEvalHook = fn(&Value, &mut SymbolTable) -> Result<Value, String>;
 /// Function-pointer hook fired once per `VmClosure` whose tier
 /// counter crosses the threshold. The runtime installs this to
 /// trigger JIT compilation of the closure's lambda. Receives the
-/// closure that just crossed; the hook does whatever it likes —
-/// queue compilation, log diagnostics, etc. — and returns. The
+/// closure that just crossed plus the arg slice from the
+/// triggering call — useful for type-feedback signature inference
+/// at JIT-compile time. The hook does whatever it likes — queue
+/// compilation, log diagnostics, etc. — and returns. The
 /// closure's tier counter is reset internally before the hook
 /// fires so the hook isn't re-invoked on the very next call.
-pub type VmTierUpHook = fn(closure: &VmClosure);
+pub type VmTierUpHook = fn(closure: &VmClosure, args: &[Value]);
 
 thread_local! {
     static VM_EVAL_HOOK: RefCell<Option<VmEvalHook>> = const { RefCell::new(None) };
@@ -300,9 +302,16 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
     if args.len() > argv.len() {
         return None;
     }
+    let param_types = closure.jit_param_types();
     for (i, a) in args.iter().enumerate() {
-        match a {
-            Value::Number(cs_core::Number::Fixnum(n)) => argv[i] = *n,
+        let expected = ((param_types >> (i * 4)) & 0xF) as u8;
+        match (expected, a) {
+            (JIT_RT_FIXNUM, Value::Number(cs_core::Number::Fixnum(n))) => argv[i] = *n,
+            (JIT_RT_FLONUM, Value::Number(cs_core::Number::Flonum(f))) => {
+                argv[i] = f.to_bits() as i64
+            }
+            (JIT_RT_BOOLEAN, Value::Boolean(b)) => argv[i] = if *b { 1 } else { 0 },
+            (JIT_RT_CHARACTER, Value::Character(c)) => argv[i] = *c as u32 as i64,
             _ => return None,
         }
     }
@@ -408,11 +417,11 @@ pub fn install_tier_up_hook(hook: Option<VmTierUpHook>) -> Option<VmTierUpHook> 
 /// Independent of whether the threshold actually crossed — callers
 /// should only invoke this after [`cs_jit::Tier::bump`] returned
 /// true. Safe to call when no hook is installed.
-fn fire_tier_up_hook(closure: &VmClosure) {
+fn fire_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     VM_TIER_UP_COUNT.with(|c| c.set(c.get() + 1));
     let hook = VM_TIER_UP_HOOK.with(|cell| *cell.borrow());
     if let Some(f) = hook {
-        f(closure);
+        f(closure, args);
     }
 }
 
@@ -538,14 +547,23 @@ pub struct VmClosure {
     /// 1 = Boolean. Stored as u8 because `cs_rir::Type` lives in a
     /// crate cs-vm doesn't depend on at this layer.
     jit_return_type: Cell<u8>,
+    /// Per-param JIT-expected types, packed 4 bits per param (low
+    /// nibble = arg 0). 0xF = unset/unused. Default all-Fixnum
+    /// matches iter-W behavior. The dispatcher checks each arg
+    /// against the matching nibble before transmuting to the
+    /// `extern "C"` function pointer.
+    jit_param_types: Cell<u32>,
 }
 
-/// Encodings for [`VmClosure::jit_return_type`]. Kept as plain `u8`
-/// so the storage Cell stays Copy without pulling cs-rir into cs-vm.
+/// Encodings for [`VmClosure::jit_return_type`] and the per-nibble
+/// slots in `jit_param_types`. Kept as plain `u8` so storage stays
+/// Copy without pulling cs-rir into cs-vm.
 pub const JIT_RT_FIXNUM: u8 = 0;
 pub const JIT_RT_BOOLEAN: u8 = 1;
 pub const JIT_RT_CHARACTER: u8 = 2;
 pub const JIT_RT_FLONUM: u8 = 3;
+/// Default `jit_param_types` value: every nibble = JIT_RT_FIXNUM (0).
+pub const JIT_PARAM_TYPES_ALL_FIXNUM: u32 = 0;
 
 impl VmClosure {
     /// Install a native function pointer compiled by the JIT, with
@@ -569,6 +587,22 @@ impl VmClosure {
 
     pub fn jit_return_type(&self) -> u8 {
         self.jit_return_type.get()
+    }
+
+    /// Bake per-param type tags from a slice (low nibble = arg 0).
+    /// Caller is responsible for limiting `tags` to the same arity
+    /// the JIT'd body was compiled with — extra tags get truncated
+    /// at the 8-arg / 32-bit boundary.
+    pub fn set_jit_param_types(&self, tags: &[u8]) {
+        let mut packed: u32 = 0;
+        for (i, t) in tags.iter().take(8).enumerate() {
+            packed |= ((*t as u32) & 0xF) << (i * 4);
+        }
+        self.jit_param_types.set(packed);
+    }
+
+    pub fn jit_param_types(&self) -> u32 {
+        self.jit_param_types.get()
     }
 
     /// Currently-installed JIT pointer, if any. `None` until the
@@ -982,7 +1016,7 @@ fn run_dispatch(
                     let any = func_proc.as_any();
                     if let Some(closure) = any.downcast_ref::<VmClosure>() {
                         if closure.tier.bump() {
-                            fire_tier_up_hook(closure);
+                            fire_tier_up_hook(closure, &stack[args_start..stack_len]);
                         }
                         // JIT fast path: if a native pointer is
                         // installed and every arg is a Fixnum, run
@@ -2410,7 +2444,7 @@ fn run_dispatch(
                         }
                         if let Some(closure) = any.downcast_ref::<VmClosure>() {
                             if closure.tier.bump() {
-                                fire_tier_up_hook(closure);
+                                fire_tier_up_hook(closure, &args);
                             }
                             if !closure.jit_ptr().is_null() {
                                 if let Some(result) = try_dispatch_jit(closure, &args) {
@@ -2516,6 +2550,7 @@ fn run_dispatch(
                     jit_arity: Cell::new(0),
                     self_name: Cell::new(None),
                     jit_return_type: Cell::new(JIT_RT_FIXNUM),
+                    jit_param_types: Cell::new(JIT_PARAM_TYPES_ALL_FIXNUM),
                 };
                 let p: Rc<dyn Procedure> = Rc::new(cl);
                 stack.push(Value::Procedure(p));
@@ -3616,7 +3651,7 @@ pub fn vm_call_sync(
             }
             if let Some(c) = any.downcast_ref::<VmClosure>() {
                 if c.tier.bump() {
-                    fire_tier_up_hook(c);
+                    fire_tier_up_hook(c, args);
                 }
                 if !c.jit_ptr().is_null() {
                     if let Some(result) = try_dispatch_jit(c, args) {

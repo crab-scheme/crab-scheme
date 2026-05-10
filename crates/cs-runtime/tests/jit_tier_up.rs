@@ -46,7 +46,7 @@ fn cold_closure_below_threshold_does_not_fire_event() {
 #[test]
 fn install_tier_up_hook_fires_on_threshold_cross() {
     static COUNT: AtomicU64 = AtomicU64::new(0);
-    fn hook(_closure: &cs_vm::vm::VmClosure) {
+    fn hook(_closure: &cs_vm::vm::VmClosure, _args: &[cs_core::Value]) {
         COUNT.fetch_add(1, Ordering::SeqCst);
     }
     COUNT.store(0, Ordering::SeqCst);

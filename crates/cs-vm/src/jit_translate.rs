@@ -63,6 +63,21 @@ pub fn bytecode_to_rir(
     name: impl Into<String>,
     self_name: Option<Symbol>,
 ) -> Result<Function, TranslateError> {
+    bytecode_to_rir_with_hints(lambda, name, self_name, None)
+}
+
+/// Like `bytecode_to_rir` but accepts an optional per-param type
+/// hint. When provided, params are seeded with the given types in
+/// the per-Value type table so flonum-arg bodies emit the right
+/// arithmetic flavor without needing `real->flonum` conversion in
+/// the body. The runtime uses this for arg-side type feedback at
+/// tier-up.
+pub fn bytecode_to_rir_with_hints(
+    lambda: &CompiledLambda,
+    name: impl Into<String>,
+    self_name: Option<Symbol>,
+    param_type_hints: Option<&[Type]>,
+) -> Result<Function, TranslateError> {
     if lambda.rest.is_some() {
         return Err(TranslateError::Unsupported(
             "rest parameters not yet supported".into(),
@@ -105,9 +120,14 @@ pub fn bytecode_to_rir(
     }
 
     // Build the Function shell. Params are RIR Values 0..N-1.
+    // When the caller supplied per-param type hints (arg-side
+    // feedback), use them; else default to Fixnum.
     let mut func = Function::new(name);
     for (i, _sym) in lambda.params.iter().enumerate() {
-        func.params.push((RirValue(i as u32), Type::Fixnum));
+        let t = param_type_hints
+            .and_then(|h| h.get(i).copied())
+            .unwrap_or(Type::Fixnum);
+        func.params.push((RirValue(i as u32), t));
     }
     func.entry = BlockId(0);
 
@@ -132,7 +152,10 @@ pub fn bytecode_to_rir(
     // (the i64 ABI's only legal arg type at present).
     let mut value_types: HashMap<RirValue, Type> = HashMap::new();
     for i in 0..lambda.params.len() {
-        value_types.insert(RirValue(i as u32), Type::Fixnum);
+        let t = param_type_hints
+            .and_then(|h| h.get(i).copied())
+            .unwrap_or(Type::Fixnum);
+        value_types.insert(RirValue(i as u32), t);
     }
 
     // Per-block entry stack: the SSA values that should be on the
