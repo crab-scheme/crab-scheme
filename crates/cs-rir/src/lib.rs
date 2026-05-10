@@ -204,6 +204,11 @@ pub struct Function {
     pub params: Vec<(Value, Type)>,
     pub entry: BlockId,
     pub blocks: Vec<Block>,
+    /// Logical return type of the procedure. The Cranelift signature
+    /// is always `i64 → i64` regardless; this annotation tells the
+    /// dispatcher how to *decode* the i64 back into a `Value`. Defaults
+    /// to `Type::Fixnum` for back-compat with iter-6's i64-only ABI.
+    pub return_type: Type,
 }
 
 impl Function {
@@ -214,6 +219,7 @@ impl Function {
             params: Vec::new(),
             entry: BlockId(0),
             blocks: Vec::new(),
+            return_type: Type::Fixnum,
         }
     }
 

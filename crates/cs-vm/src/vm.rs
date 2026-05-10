@@ -335,7 +335,17 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
         }
         _ => return None,
     };
-    Some(Value::Number(cs_core::Number::Fixnum(r)))
+    Some(decode_jit_return(closure.jit_return_type(), r))
+}
+
+/// Wrap a raw i64 from a JIT'd body into the matching `Value` form
+/// based on the closure's stored return-type tag. Boolean is decoded
+/// as `r != 0` so the JIT's existing 0/1 Lt/Eq encoding works.
+fn decode_jit_return(rt: u8, r: i64) -> Value {
+    match rt {
+        JIT_RT_BOOLEAN => Value::Boolean(r != 0),
+        _ => Value::Number(cs_core::Number::Fixnum(r)),
+    }
 }
 
 /// Install the `eval` hook for the current thread. Returns the previous hook
@@ -510,7 +520,17 @@ pub struct VmClosure {
     /// `LoadVar(self_name)` patterns inside the body and emit
     /// `Inst::CallSelf` so recursive functions JIT. (M6 iter 7.)
     self_name: Cell<Option<Symbol>>,
+    /// Logical return type of the JIT'd body, encoded for the
+    /// dispatcher. 0 = Fixnum (default; back-compat with iter-6),
+    /// 1 = Boolean. Stored as u8 because `cs_rir::Type` lives in a
+    /// crate cs-vm doesn't depend on at this layer.
+    jit_return_type: Cell<u8>,
 }
+
+/// Encodings for [`VmClosure::jit_return_type`]. Kept as plain `u8`
+/// so the storage Cell stays Copy without pulling cs-rir into cs-vm.
+pub const JIT_RT_FIXNUM: u8 = 0;
+pub const JIT_RT_BOOLEAN: u8 = 1;
 
 impl VmClosure {
     /// Install a native function pointer compiled by the JIT, with
@@ -520,6 +540,20 @@ impl VmClosure {
     pub fn set_jit_ptr(&self, ptr: *const u8, arity: u32) {
         self.jit_ptr.set(ptr);
         self.jit_arity.set(arity);
+        // Default — callers that know the JIT'd body returns Boolean
+        // should call `set_jit_return_type` after this.
+        self.jit_return_type.set(JIT_RT_FIXNUM);
+    }
+
+    /// Tell the dispatcher how to decode the i64 the JIT'd body
+    /// returns. Defaults to Fixnum; predicate procedures should set
+    /// this to Boolean before the closure is dispatched.
+    pub fn set_jit_return_type(&self, rt: u8) {
+        self.jit_return_type.set(rt);
+    }
+
+    pub fn jit_return_type(&self) -> u8 {
+        self.jit_return_type.get()
     }
 
     /// Currently-installed JIT pointer, if any. `None` until the
@@ -2466,6 +2500,7 @@ fn run_dispatch(
                     jit_ptr: Cell::new(std::ptr::null()),
                     jit_arity: Cell::new(0),
                     self_name: Cell::new(None),
+                    jit_return_type: Cell::new(JIT_RT_FIXNUM),
                 };
                 let p: Rc<dyn Procedure> = Rc::new(cl);
                 stack.push(Value::Procedure(p));

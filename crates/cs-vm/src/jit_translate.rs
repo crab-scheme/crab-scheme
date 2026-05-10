@@ -678,7 +678,49 @@ pub fn bytecode_to_rir(
         });
     }
 
+    func.return_type = infer_return_type(&func);
     Ok(func)
+}
+
+/// Walk every instruction in `func` and compute a per-Value type table,
+/// then inspect each block terminator and pick the type the function
+/// will return at runtime. RIR values default to `Type::Fixnum`; only
+/// the comparison instructions and explicit Boolean LoadConsts produce
+/// Boolean. If multiple Returns disagree we conservatively fall back to
+/// `Type::Fixnum` (which is the i64-passthrough decoding) — the
+/// dispatcher's own type guards will catch a mismatch downstream.
+fn infer_return_type(func: &cs_rir::Function) -> Type {
+    use cs_rir::Const;
+    let mut bool_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            match inst {
+                RirInst::Lt(dst, _, _) | RirInst::Eq(dst, _, _) => {
+                    bool_values.insert(*dst);
+                }
+                RirInst::LoadConst(dst, Const::Boolean(_)) => {
+                    bool_values.insert(*dst);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut seen_fixnum = false;
+    let mut seen_bool = false;
+    for block in &func.blocks {
+        if let Term::Return(v) = &block.terminator {
+            if bool_values.contains(v) {
+                seen_bool = true;
+            } else {
+                seen_fixnum = true;
+            }
+        }
+    }
+    if seen_bool && !seen_fixnum {
+        Type::Boolean
+    } else {
+        Type::Fixnum
+    }
 }
 
 /// One simulated stack slot. Either an already-bound RIR Value, or

@@ -267,3 +267,50 @@ fn diff_pure_arithmetic_fast_path() {
     assert_eq!(extract(&dist2_jit), extract(&dist2_walker));
     assert_eq!(extract(&dist2_walker), 49.0);
 }
+
+#[test]
+fn diff_predicate_returns_boolean() {
+    // M6 Phase 2 iter W: predicate procedures should JIT and decode
+    // their i64 return as Boolean, not as a Number(0)/Number(1).
+    let defines = &["(define pos? (lambda (n) (positive? n)))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    // Warm past the tier threshold (default 1024).
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (pos? i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let jit_t = rt.eval_str_via_vm("<diff>", "(pos? 5)").unwrap();
+    let jit_f = rt.eval_str_via_vm("<diff>", "(pos? -3)").unwrap();
+    let jit_zero = rt.eval_str_via_vm("<diff>", "(pos? 0)").unwrap();
+
+    let walker_t = walker_eval(defines, "(pos? 5)");
+    let walker_f = walker_eval(defines, "(pos? -3)");
+    let walker_zero = walker_eval(defines, "(pos? 0)");
+
+    // The bug we're guarding against: prior to iter W the JIT'd
+    // body returned `Value::Number(Fixnum(1))` and `Number(Fixnum(0))`
+    // even though the source used `positive?`. Now the dispatcher
+    // decodes them as proper Booleans.
+    assert!(matches!(jit_t, Value::Boolean(true)), "jit_t = {:?}", jit_t);
+    assert!(matches!(jit_f, Value::Boolean(false)), "jit_f = {:?}", jit_f);
+    assert!(
+        matches!(jit_zero, Value::Boolean(false)),
+        "jit_zero = {:?}",
+        jit_zero
+    );
+    // Cross-tier agreement on every case.
+    assert_eq!(
+        format!("{:?}", jit_t),
+        format!("{:?}", walker_t),
+        "jit vs walker"
+    );
+    assert_eq!(format!("{:?}", jit_f), format!("{:?}", walker_f));
+    assert_eq!(format!("{:?}", jit_zero), format!("{:?}", walker_zero));
+}

@@ -21,3 +21,6 @@ pub mod vm;
 pub use compiler::{compile, compile_with_globals, compile_with_globals_and_primops, CompileError};
 pub use opcode::{Bytecode, Inst};
 pub use vm::{run, VmError};
+// Re-export cs-rir::Type so cs-runtime can read the RIR's
+// return_type tag without depending on cs-rir directly.
+pub use cs_rir::Type as RirType;

@@ -92,4 +92,12 @@ fn jit_tier_up_hook(closure: &VmClosure) {
         Err(_) => return,
     };
     closure.set_jit_ptr(ptr, lam.params.len() as u32);
+    // Phase-2 ABI generalization: tell the dispatcher how to decode
+    // the i64 return. Defaults to Fixnum; flip to Boolean when the
+    // RIR's inferred return type says so.
+    let rt_tag = match rir.return_type {
+        cs_vm::RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
+        _ => cs_vm::vm::JIT_RT_FIXNUM,
+    };
+    closure.set_jit_return_type(rt_tag);
 }
