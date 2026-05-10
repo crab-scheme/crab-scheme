@@ -259,6 +259,11 @@ fn conformance_records_parent() {
 }
 
 #[test]
+fn conformance_records_procedural() {
+    run_conformance_file("records_procedural.scm");
+}
+
+#[test]
 fn conformance_define_condition_type() {
     run_conformance_file("define_condition_type.scm");
 }
@@ -675,6 +680,7 @@ fn conformance_aggregate_count() {
                 "copy_unfold_htfold.scm",
                 "conditions_r6rs.scm",
                 "records_parent.scm",
+                "records_procedural.scm",
                 "define_condition_type.scm",
                 "error_who.scm",
                 "builtin_errors.scm",

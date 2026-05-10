@@ -404,6 +404,14 @@ fn vm_conformance_records_parent() {
 }
 
 #[test]
+fn vm_conformance_records_procedural() {
+    let walker = pass_count_walker("records_procedural.scm");
+    let vm = pass_count_vm("records_procedural.scm").expect("vm should run records_procedural.scm");
+    println!("records_procedural: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
+
+#[test]
 fn vm_conformance_define_condition_type() {
     let walker = pass_count_walker("define_condition_type.scm");
     let vm = pass_count_vm("define_condition_type.scm")
