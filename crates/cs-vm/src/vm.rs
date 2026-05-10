@@ -1,7 +1,7 @@
 //! Stack-based VM that interprets [`Bytecode`].
 
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -128,9 +128,29 @@ pub fn vm_current_error_port_value() -> Value {
 /// `vm_eval_root_env` to find the env in which to run the sub-program.
 pub type VmEvalHook = fn(&Value, &mut SymbolTable) -> Result<Value, String>;
 
+/// Function-pointer hook fired once per `VmClosure` whose tier
+/// counter crosses the threshold. The runtime installs this to
+/// trigger JIT compilation of the closure's lambda. Receives the
+/// closure that just crossed; the hook does whatever it likes —
+/// queue compilation, log diagnostics, etc. — and returns. The
+/// closure's tier counter is reset internally before the hook
+/// fires so the hook isn't re-invoked on the very next call.
+pub type VmTierUpHook = fn(closure: &VmClosure);
+
 thread_local! {
     static VM_EVAL_HOOK: RefCell<Option<VmEvalHook>> = const { RefCell::new(None) };
     static VM_EVAL_ROOT_ENV: RefCell<Option<Rc<Env>>> = const { RefCell::new(None) };
+    /// Optional tier-up hook fired by the closure-call dispatch when
+    /// `VmClosure::tier.bump()` returns true.
+    static VM_TIER_UP_HOOK: RefCell<Option<VmTierUpHook>> = const { RefCell::new(None) };
+    /// Diagnostic counter: incremented each time a deopt event is
+    /// recorded via [`record_deopt`]. Tests reset this to 0 with
+    /// [`reset_deopt_count`].
+    static VM_DEOPT_COUNT: Cell<u64> = const { Cell::new(0) };
+    /// Diagnostic counter: incremented each time a tier-up hook
+    /// fires. Tests use this to assert threshold-crossing behavior
+    /// without installing a real hook.
+    static VM_TIER_UP_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Install the `eval` hook for the current thread. Returns the previous hook
@@ -163,6 +183,63 @@ pub fn install_eval_root_env(env: Option<Rc<Env>>) -> Option<Rc<Env>> {
 /// against the live runtime's VM environment).
 pub fn vm_eval_root_env() -> Option<Rc<Env>> {
     VM_EVAL_ROOT_ENV.with(|cell| cell.borrow().clone())
+}
+
+/// Install the tier-up hook for the current thread. Returns the
+/// previous hook so callers can restore it after the VM run
+/// completes. Pass `None` to clear.
+pub fn install_tier_up_hook(hook: Option<VmTierUpHook>) -> Option<VmTierUpHook> {
+    VM_TIER_UP_HOOK.with(|cell| {
+        let prev = *cell.borrow();
+        *cell.borrow_mut() = hook;
+        prev
+    })
+}
+
+/// Fire the tier-up hook for the given closure if one is installed.
+/// Independent of whether the threshold actually crossed — callers
+/// should only invoke this after [`cs_jit::Tier::bump`] returned
+/// true. Safe to call when no hook is installed.
+fn fire_tier_up_hook(closure: &VmClosure) {
+    VM_TIER_UP_COUNT.with(|c| c.set(c.get() + 1));
+    let hook = VM_TIER_UP_HOOK.with(|cell| *cell.borrow());
+    if let Some(f) = hook {
+        f(closure);
+    }
+}
+
+/// Read the per-thread tier-up event count. Test/diagnostics only.
+pub fn tier_up_count() -> u64 {
+    VM_TIER_UP_COUNT.with(|c| c.get())
+}
+
+/// Reset the per-thread tier-up event count. Test/diagnostics only.
+pub fn reset_tier_up_count() {
+    VM_TIER_UP_COUNT.with(|c| c.set(0));
+}
+
+/// Record a deopt event from JIT-compiled code falling back to the
+/// VM. The runtime's deopt trampoline calls this before returning
+/// to the interpreter. Bumps `VM_DEOPT_COUNT` and (per the
+/// `cs_jit::Tier` contract) bumps the supplied tier's deopt tally;
+/// the procedure may end up blacklisted if the budget is exhausted.
+///
+/// Iter 3 ships only the bookkeeping side; the trampoline itself
+/// (saving JIT register state, restoring VM state) lands in iter
+/// 4+ once the JIT actually executes code.
+pub fn record_deopt(tier: &cs_jit::Tier) -> bool {
+    VM_DEOPT_COUNT.with(|c| c.set(c.get() + 1));
+    tier.record_deopt()
+}
+
+/// Read the per-thread deopt count. Test/diagnostics only.
+pub fn deopt_count() -> u64 {
+    VM_DEOPT_COUNT.with(|c| c.get())
+}
+
+/// Reset the per-thread deopt count. Test/diagnostics only.
+pub fn reset_deopt_count() {
+    VM_DEOPT_COUNT.with(|c| c.set(0));
 }
 
 fn run_eval_hook(v: &Value, syms: &mut SymbolTable) -> Result<Value, VmError> {
@@ -217,11 +294,21 @@ impl VmError {
 }
 
 /// VM closure: a compiled lambda + the env at the point of construction.
+///
+/// Each closure carries a [`cs_jit::Tier`] counter that bumps on
+/// every call. When the counter crosses the per-runtime tier-up
+/// threshold, the optional `VmTierUpHook` (installed by
+/// [`install_tier_up_hook`]) fires. The hook is the JIT compiler's
+/// trigger; if it's `None`, the counter still bumps but nothing
+/// happens.
 #[derive(Debug)]
 pub struct VmClosure {
     pub lambda_idx: usize,
     pub env: Rc<Env>,
     pub bc: Rc<Bytecode>,
+    /// Per-closure tier counter. Owned, not shared — each freshly
+    /// allocated closure starts at 0. (M6 iter 3.)
+    pub tier: cs_jit::Tier,
 }
 
 impl Procedure for VmClosure {
@@ -237,7 +324,8 @@ impl cs_gc::Trace for VmClosure {
     fn trace(&self, marker: &mut cs_gc::Marker) {
         // Trace the captured environment chain. Bytecode is immutable
         // shared `Rc<Bytecode>` containing only Symbols and opcodes —
-        // no Values to trace.
+        // no Values to trace. Tier is leaf data (atomics + u32) —
+        // nothing to trace.
         self.env.trace(marker);
     }
 }
@@ -561,6 +649,9 @@ fn run_dispatch(
                 {
                     let any = func_proc.as_any();
                     if let Some(closure) = any.downcast_ref::<VmClosure>() {
+                        if closure.tier.bump() {
+                            fire_tier_up_hook(closure);
+                        }
                         let lam = &closure.bc.lambdas[closure.lambda_idx];
                         if !lambda_arity_ok(lam, n) {
                             return Err(VmError::new(format!(
@@ -1930,6 +2021,9 @@ fn run_dispatch(
                             continue;
                         }
                         if let Some(closure) = any.downcast_ref::<VmClosure>() {
+                            if closure.tier.bump() {
+                                fire_tier_up_hook(closure);
+                            }
                             let lam = &closure.bc.lambdas[closure.lambda_idx];
                             if !lambda_arity_ok(lam, args.len()) {
                                 return Err(VmError::new("arity mismatch"));
@@ -2015,6 +2109,7 @@ fn run_dispatch(
                     lambda_idx: *idx,
                     env: frame.env.clone(),
                     bc: frame.bc.clone(),
+                    tier: cs_jit::Tier::default(),
                 };
                 let p: Rc<dyn Procedure> = Rc::new(cl);
                 stack.push(Value::Procedure(p));
@@ -3072,6 +3167,9 @@ pub fn vm_call_sync(
                 return (h.f)(args).map_err(|e| VmError::new(format!("{}: {}", h.name, e)));
             }
             if let Some(c) = any.downcast_ref::<VmClosure>() {
+                if c.tier.bump() {
+                    fire_tier_up_hook(c);
+                }
                 let lam = &c.bc.lambdas[c.lambda_idx];
                 if !lambda_arity_ok(lam, args.len()) {
                     return Err(VmError::new("arity mismatch"));

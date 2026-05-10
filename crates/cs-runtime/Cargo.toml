@@ -22,4 +22,5 @@ thiserror = { workspace = true }
 [dev-dependencies]
 cs-ffi-example = { workspace = true }
 cs-ffi-macros = { workspace = true }
+cs-jit = { workspace = true }
 
