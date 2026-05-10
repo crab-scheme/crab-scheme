@@ -932,10 +932,7 @@ fn diff_jit_let_loop_flonum_accumulator() {
     let jit = rt.eval_str_via_vm("<diff>", "(sumsq 5000)").unwrap();
     let walker = walker_eval(defines, "(sumsq 5000)");
     match (&jit, &walker) {
-        (
-            Value::Number(cs_core::Number::Flonum(j)),
-            Value::Number(cs_core::Number::Flonum(w)),
-        ) => {
+        (Value::Number(cs_core::Number::Flonum(j)), Value::Number(cs_core::Number::Flonum(w))) => {
             assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on (sumsq 5000)");
             // sum of i*i for i in 0..5000 = 41654167500.0
             assert_eq!(*j, 41654167500.0);

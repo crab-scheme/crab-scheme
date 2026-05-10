@@ -243,6 +243,15 @@ impl Lowerer {
                     }
                 }
 
+                // Tail-call lowering for `CallSelf` deferred — pure
+                // `return_call` requires CallConv::Tail, but the
+                // runtime dispatcher's `extern "C" fn(i64,...) -> i64`
+                // transmute is SystemV. The proper fix is the
+                // wrapper pattern from ADR 0011 D-7 follow-ups: outer
+                // SystemV entry calls inner Tail-conv body via a
+                // single regular call, and inner uses return_call for
+                // self-recursion. That's its own iter — needs two
+                // function definitions per compile.
                 for inst in &rir_block.insts {
                     lower_inst(
                         &mut builder,
@@ -253,7 +262,6 @@ impl Lowerer {
                         inst,
                     )?;
                 }
-
                 lower_terminator(&mut builder, &block_map, &value_map, &rir_block.terminator)?;
             }
 
