@@ -214,9 +214,12 @@ Components:
 
 ---
 
-## M7: HolyJIT Backend
+## M7: HolyJIT Backend ⏸ PARKED (evaluation only)
 
 **Spec slug:** `jit-holy`
+**ADR:** [`docs/adr/0009-holyjit-parked.md`](docs/adr/0009-holyjit-parked.md).
+
+> Per the ADR: HolyJIT's last upstream commit is from 2018 (~7 years stale). Integrating would mean fork-and-modernize, not "contribute to upstream." The fallback clause below was drafted into the original ROADMAP precisely for this case; we invoke it here. Cranelift remains the project's sole JIT; the `JitBackend` trait holds the seam open for a future peer backend.
 
 The headline feature. With Cranelift proven, we add HolyJIT as a peer backend
 behind the same trait. HolyJIT's value proposition: it specializes Rust
