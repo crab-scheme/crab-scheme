@@ -1,6 +1,7 @@
 //! `cs_rir::Function` → Cranelift IR lowering.
 //!
-//! Iter 4 scope: pure-Fixnum function bodies with control flow.
+//! Iter 4b scope: pure-Fixnum function bodies with control flow
+//! and self-recursion.
 //!
 //! - `LoadConst(Fixnum / Boolean / Null / Unspecified)`
 //! - `Param`
@@ -11,9 +12,13 @@
 //! - Multi-block functions (each RIR `BlockId` becomes a Cranelift
 //!   `Block`; entry block carries the function-arg params, others
 //!   carry IR-specified params).
+//! - `Inst::CallSelf(dst, args)` — recursive self-call routed
+//!   through `module.declare_func_in_func`. Lets fib / fact / any
+//!   single-recursive function JIT end-to-end.
 //!
-//! Out of scope this iter (planned for iter 4b+):
-//! - `Call` / closures / env access
+//! Out of scope (planned for later iters):
+//! - General `Call` (procedure-value callee with feedback)
+//! - Closures / env access
 //! - `DeoptCheck` (we currently trust the IR's type tags)
 //! - Flonum / Boolean arithmetic (we lower booleans via i64
 //!   representation 0/1 which is fine for `Lt`/`Eq` results but we
@@ -112,11 +117,21 @@ impl Lowerer {
         let func_name = UserFuncName::user(0, self.fresh_id() as u32);
         let mut clif = ClifFunction::with_name_signature(func_name, sig.clone());
 
+        // Declare the function up front so we can import a self-
+        // FuncRef inside the body for `CallSelf` lowering.
+        let func_id = self
+            .module
+            .declare_function(&rir.name, Linkage::Local, &sig)
+            .map_err(|e| JitError::Codegen(format!("declare_function {}: {e}", rir.name)))?;
+
         // Map RIR Value -> Cranelift Value.
         let mut value_map: HashMap<RirValue, cranelift_codegen::ir::Value> = HashMap::new();
 
         {
             let mut builder = FunctionBuilder::new(&mut clif, &mut self.func_ctx);
+
+            // Import a self-FuncRef for CallSelf to dispatch through.
+            let self_fnref = self.module.declare_func_in_func(func_id, builder.func);
 
             // Create a Cranelift block for every RIR block, with the
             // matching block params.
@@ -171,7 +186,7 @@ impl Lowerer {
                 }
 
                 for inst in &rir_block.insts {
-                    lower_inst(&mut builder, &mut value_map, inst)?;
+                    lower_inst(&mut builder, &mut value_map, self_fnref, inst)?;
                 }
 
                 lower_terminator(&mut builder, &block_map, &value_map, &rir_block.terminator)?;
@@ -182,11 +197,6 @@ impl Lowerer {
             builder.finalize();
         }
 
-        // Hand the populated function to the JIT module.
-        let func_id = self
-            .module
-            .declare_function(&rir.name, Linkage::Local, &sig)
-            .map_err(|e| JitError::Codegen(format!("declare_function {}: {e}", rir.name)))?;
         self.ctx.func = clif;
         self.module
             .define_function(func_id, &mut self.ctx)
@@ -244,6 +254,7 @@ fn lower_terminator(
 fn lower_inst(
     b: &mut FunctionBuilder,
     map: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
+    self_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -299,9 +310,24 @@ fn lower_inst(
                 "Inst::Param appears in block body — must be entry-only".into(),
             ));
         }
+        Inst::CallSelf(dst, args) => {
+            let cargs: Vec<cranelift_codegen::ir::Value> = args
+                .iter()
+                .map(|a| lookup(map, *a))
+                .collect::<Result<_, _>>()?;
+            let inst_ref = b.ins().call(self_fnref, &cargs);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "CallSelf expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
         Inst::Call(_, _, _) | Inst::DeoptCheck(_, _) => {
             return Err(JitError::Unsupported(format!(
-                "{:?} not in iter-2 scope",
+                "{:?} not in iter-4b scope",
                 inst
             )));
         }
@@ -546,6 +572,60 @@ mod tests {
         assert_eq!(func(-5), 6);
         assert_eq!(func(0), 1);
         assert_eq!(func(-100), 101);
+    }
+
+    #[test]
+    fn lower_self_recursive_fib() {
+        // fib(n) = if n < 2 then n else fib(n-1) + fib(n-2)
+        //
+        // entry: cond = n < 2; brif cond, base, rec
+        // base:  return n
+        // rec:   one = 1; n_minus_1 = n - one
+        //        a = call_self(n_minus_1)
+        //        two = 2; n_minus_2 = n - two
+        //        b = call_self(n_minus_2)
+        //        s = a + b; return s
+        let mut f = RirFunction::new("fib");
+        f.params.push((cs_rir::Value(0), cs_rir::Type::Fixnum));
+        f.entry = cs_rir::BlockId(0);
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(0),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(cs_rir::Value(1), Const::Fixnum(2)),
+                Inst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
+            ],
+            terminator: Term::Branch(cs_rir::Value(2), cs_rir::BlockId(1), cs_rir::BlockId(2)),
+        });
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(1),
+            params: vec![],
+            insts: vec![],
+            terminator: Term::Return(cs_rir::Value(0)),
+        });
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(2),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(cs_rir::Value(3), Const::Fixnum(1)),
+                Inst::Sub(cs_rir::Value(4), cs_rir::Value(0), cs_rir::Value(3)),
+                Inst::CallSelf(cs_rir::Value(5), vec![cs_rir::Value(4)]),
+                Inst::LoadConst(cs_rir::Value(6), Const::Fixnum(2)),
+                Inst::Sub(cs_rir::Value(7), cs_rir::Value(0), cs_rir::Value(6)),
+                Inst::CallSelf(cs_rir::Value(8), vec![cs_rir::Value(7)]),
+                Inst::Add(cs_rir::Value(9), cs_rir::Value(5), cs_rir::Value(8)),
+            ],
+            terminator: Term::Return(cs_rir::Value(9)),
+        });
+        let mut lowerer = Lowerer::new().unwrap();
+        let ptr = lowerer.compile_pure_fixnum(&f).unwrap();
+        let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
+        assert_eq!(func(0), 0);
+        assert_eq!(func(1), 1);
+        assert_eq!(func(2), 1);
+        assert_eq!(func(5), 5);
+        assert_eq!(func(10), 55);
+        assert_eq!(func(20), 6765);
     }
 
     #[test]

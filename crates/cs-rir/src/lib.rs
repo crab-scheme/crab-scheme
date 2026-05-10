@@ -98,6 +98,13 @@ pub enum Inst {
     /// the procedure identity if the type-feedback is monomorphic.
     Call(Value, Value, Vec<Value>),
 
+    /// `dst = call_self(args...)`. Recursive call to the function
+    /// being compiled. cs-vm: `Inst::Call` with a callee that the
+    /// monomorphic feedback resolved to "self". This dedicated form
+    /// lets iter-4b lower self-recursion (fib, fact, etc.) without
+    /// the general procedure-value lookup that lands later.
+    CallSelf(Value, Vec<Value>),
+
     /// `dst = arg<i>`. cs-vm: implicit (arguments are on the stack
     /// at the procedure entry; this names them as SSA values).
     Param(Value, u32),
