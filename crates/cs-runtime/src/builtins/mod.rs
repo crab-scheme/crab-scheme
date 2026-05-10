@@ -588,6 +588,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("interaction-environment", b_interaction_environment),
         ("null-environment", b_null_environment),
         ("scheme-report-environment", b_scheme_report_environment),
+        ("load", b_load),
         ("div-and-mod", b_div_and_mod),
         ("div0-and-mod0", b_div0_and_mod0),
         ("exact-integer-sqrt", b_exact_integer_sqrt),
@@ -6470,6 +6471,16 @@ fn b_write_char(args: &[Value]) -> Result<Value, String> {
                 buf.borrow_mut().push(c);
                 Ok(Value::Unspecified)
             }
+            Port::FileOutput(state) => {
+                let mut st = state.borrow_mut();
+                if st.closed {
+                    return Err("write-char: port is closed".into());
+                }
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                st.buf.extend_from_slice(s.as_bytes());
+                Ok(Value::Unspecified)
+            }
             _ => Err("write-char: not an output port".into()),
         },
         v => Err(type_err("write-char", "output-port", v)),
@@ -6514,6 +6525,14 @@ fn b_write_string(args: &[Value]) -> Result<Value, String> {
         Value::Port(p) => match &**p {
             Port::StringOutput(buf) => {
                 buf.borrow_mut().push_str(&slice);
+                Ok(Value::Unspecified)
+            }
+            Port::FileOutput(state) => {
+                let mut st = state.borrow_mut();
+                if st.closed {
+                    return Err("write-string: port is closed".into());
+                }
+                st.buf.extend_from_slice(slice.as_bytes());
                 Ok(Value::Unspecified)
             }
             _ => Err("write-string: not an output port".into()),
@@ -8019,6 +8038,40 @@ fn b_scheme_report_environment(args: &[Value], ctx: &mut EvalCtx) -> Result<Valu
         ));
     }
     Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
+}
+
+/// R7RS `(load filename [environment])`. Reads filename as a sequence
+/// of Scheme expressions and evaluates each in the given environment
+/// (top-level if omitted). Returns an unspecified value.
+fn b_load(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_err("load", "1 or 2", args.len()));
+    }
+    let path = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("load", "string (filename)", v)),
+    };
+    // The optional environment arg is currently a symbol sentinel; we
+    // accept and ignore it (always eval at top level).
+    let src = std::fs::read_to_string(&path).map_err(|e| {
+        cs_core::stash_builtin_err_extra_tag(TAG_FILE_ERROR);
+        format!("load: cannot read {}: {}", path, e)
+    })?;
+    let file_id = cs_diag::FileId(u32::MAX - 3);
+    let data = cs_parse::read_all(file_id, &src, ctx.syms).map_err(|errs| {
+        cs_core::stash_builtin_err_extra_tag(TAG_READ_ERROR);
+        let e = errs.into_iter().next().unwrap();
+        format!("load: parse error in {}: {}", path, e.message())
+    })?;
+    if data.is_empty() {
+        return Ok(Value::Unspecified);
+    }
+    let mut expander = cs_expand::Expander::new(ctx.syms, ctx.macros);
+    let core = expander
+        .expand_program(&data)
+        .map_err(|e| format!("load: expand error in {}: {}", path, e.message()))?;
+    drop(expander);
+    crate::eval::eval(&core, ctx.top.clone(), ctx).map_err(|e| e.message())
 }
 
 // ---- eval ----

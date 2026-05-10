@@ -609,6 +609,11 @@ fn conformance_r7rs_read_bytevector_bang() {
 }
 
 #[test]
+fn conformance_r7rs_load() {
+    run_conformance_file("r7rs_load.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -735,6 +740,7 @@ fn conformance_aggregate_count() {
                 "r7rs_number_to_string.scm",
                 "r7rs_environments.scm",
                 "r7rs_read_bytevector_bang.scm",
+                "r7rs_load.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",

@@ -275,12 +275,14 @@ Iters 117+ are filling R7RS gaps one per iter:
   retains both for compat); arity-checked; reject bad versions
 - 151 R7RS read-bytevector! — destructive in-place read into existing
   bytevector with [start [end]] range; returns count or eof-object
+- 152 R7RS (load filename [environment]); also fixed write-char and
+  write-string to handle FileOutput ports (were StringOutput-only)
   (this iter)
 
 Current totals:
-- 105 conformance test files (cli)
+- 106 conformance test files (cli)
 - VM tier: 107 tests
-- Aggregate: 2108 individual Scheme tests passing
+- Aggregate: 2116 individual Scheme tests passing
 
 ## Loop cadence
 
