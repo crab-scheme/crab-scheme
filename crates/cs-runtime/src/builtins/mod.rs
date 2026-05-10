@@ -71,6 +71,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("bitwise-xor", b_bitwise_xor),
         ("bitwise-not", b_bitwise_not),
         ("bitwise-arithmetic-shift", b_bitwise_arith_shift),
+        ("arithmetic-shift", b_bitwise_arith_shift),
         ("bitwise-arithmetic-shift-left", b_bitwise_arith_shift_left),
         (
             "bitwise-arithmetic-shift-right",
