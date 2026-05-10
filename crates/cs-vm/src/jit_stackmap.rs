@@ -19,6 +19,7 @@
 //! `raw_incref` + `from_raw_jit` + `Marker::mark` dance.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Per-JIT-compiled-function stack-map registry. Maps each safepoint
 /// PC (as an offset from the function's start address) to the list
@@ -194,5 +195,92 @@ mod tests {
         }
         assert_eq!(visited.len(), 1);
         assert_eq!(visited[0], 0xDEAD_BEEF_usize as *const ());
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Per-thread active-JIT-frames list (ADR 0012 D-2, iter BN)
+// ----------------------------------------------------------------------------
+//
+// `try_dispatch_jit` pushes the active closure's stack-map registry
+// onto a thread-local `Vec` before transmuting to the native function
+// pointer, and pops on return. At GC time, `Heap::collect` walks the
+// list to know which closures' JIT'd code is currently live on the
+// host stack. The actual frame-pointer walking + per-frame
+// `scan_frame` calls are iter BO.
+
+thread_local! {
+    /// Stack of stack-map registries for JIT bodies currently
+    /// executing on this thread. Top = most-recently-entered (a JIT
+    /// body's body may re-enter the dispatcher via CallSelf or, in
+    /// later iters, a general inline-cache call).
+    static ACTIVE_JIT_FRAMES: std::cell::RefCell<Vec<Rc<JitStackMaps>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Push `maps` onto the active-frames list. The matching `pop` must
+/// happen on the same thread before any subsequent GC. Called by
+/// `try_dispatch_jit` immediately before transmuting to the native
+/// function pointer.
+pub fn push_active_jit_frame(maps: Rc<JitStackMaps>) {
+    ACTIVE_JIT_FRAMES.with(|s| s.borrow_mut().push(maps));
+}
+
+/// Pop the most-recently-pushed entry. Called by `try_dispatch_jit`
+/// immediately after the native call returns. Returns the popped
+/// registry (or None if the stack was empty, which is a bug).
+pub fn pop_active_jit_frame() -> Option<Rc<JitStackMaps>> {
+    ACTIVE_JIT_FRAMES.with(|s| s.borrow_mut().pop())
+}
+
+/// Borrow the active-frames list and invoke `f` with a snapshot of
+/// the current entries (oldest first). Used by `Heap::collect`
+/// (iter BO) to walk JIT frames for root marking.
+pub fn with_active_jit_frames<R, F: FnOnce(&[Rc<JitStackMaps>]) -> R>(f: F) -> R {
+    ACTIVE_JIT_FRAMES.with(|s| {
+        let v = s.borrow();
+        f(v.as_slice())
+    })
+}
+
+#[cfg(test)]
+mod active_frames_tests {
+    use super::*;
+
+    #[test]
+    fn push_pop_balances() {
+        // Start from a known state.
+        while pop_active_jit_frame().is_some() {}
+        let m1 = Rc::new(JitStackMaps::new(0x1000 as *const u8));
+        let m2 = Rc::new(JitStackMaps::new(0x2000 as *const u8));
+        push_active_jit_frame(Rc::clone(&m1));
+        push_active_jit_frame(Rc::clone(&m2));
+        with_active_jit_frames(|frames| {
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[0].base(), 0x1000 as *const u8);
+            assert_eq!(frames[1].base(), 0x2000 as *const u8);
+        });
+        // Pops are LIFO.
+        let p2 = pop_active_jit_frame().unwrap();
+        assert_eq!(p2.base(), 0x2000 as *const u8);
+        let p1 = pop_active_jit_frame().unwrap();
+        assert_eq!(p1.base(), 0x1000 as *const u8);
+        assert!(pop_active_jit_frame().is_none());
+    }
+
+    #[test]
+    fn snapshot_doesnt_borrow_across_calls() {
+        while pop_active_jit_frame().is_some() {}
+        let m = Rc::new(JitStackMaps::new(0xABCD as *const u8));
+        push_active_jit_frame(Rc::clone(&m));
+        // The snapshot must complete without holding a RefCell
+        // borrow across other JIT-frame operations; verify by
+        // calling `push` from inside the snapshot's continuation.
+        let bases: Vec<*const u8> =
+            with_active_jit_frames(|frames| frames.iter().map(|f| f.base()).collect());
+        push_active_jit_frame(Rc::new(JitStackMaps::new(0xEF01 as *const u8)));
+        assert_eq!(bases, vec![0xABCD as *const u8]);
+        // Cleanup.
+        while pop_active_jit_frame().is_some() {}
     }
 }

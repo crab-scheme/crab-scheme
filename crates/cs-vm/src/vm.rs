@@ -189,6 +189,37 @@ impl Drop for JitEnvGuard {
     }
 }
 
+/// RAII guard that pushes a `JitStackMaps` onto the per-thread
+/// active-JIT-frames list on construction and pops on drop. Used by
+/// `try_dispatch_jit` to maintain the list across the native call
+/// (including panic-unwind paths). ADR 0012 D-2 (iter BN).
+struct JitFrameGuard {
+    pushed: bool,
+}
+
+impl JitFrameGuard {
+    /// Push `maps` if non-None; record whether a push occurred so
+    /// the matching pop is conditional. Closures without stack maps
+    /// (e.g. bodies that don't keep Gc handles live across calls)
+    /// simply skip the push.
+    fn install(maps: Option<std::rc::Rc<crate::jit_stackmap::JitStackMaps>>) -> Self {
+        if let Some(m) = maps {
+            crate::jit_stackmap::push_active_jit_frame(m);
+            Self { pushed: true }
+        } else {
+            Self { pushed: false }
+        }
+    }
+}
+
+impl Drop for JitFrameGuard {
+    fn drop(&mut self) {
+        if self.pushed {
+            let _ = crate::jit_stackmap::pop_active_jit_frame();
+        }
+    }
+}
+
 /// Helper called by JIT-compiled code to write a Fixnum back to a
 /// free variable's binding. Walks the env chain via `set_existing`;
 /// if no binding is found, defines at the root. Mirrors the
@@ -775,6 +806,12 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
     // guard restores the previous value (or null) on drop, even
     // on panic from inside the JIT body.
     let _env_guard = JitEnvGuard::install(&closure.env);
+    // ADR 0012 D-2 (iter BN) — register this closure's stack-map
+    // registry on the per-thread active-frames list so the GC can
+    // see its Gc<Value> roots if `collect()` fires during the
+    // native call. Pop happens on Drop (RAII), so panics inside
+    // the JIT body don't leave a stale entry.
+    let _frame_guard = JitFrameGuard::install(closure.jit_stack_maps());
     let r: i64 = match args.len() {
         0 => {
             let f: extern "C" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
