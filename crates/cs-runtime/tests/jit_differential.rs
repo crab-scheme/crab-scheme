@@ -824,13 +824,65 @@ fn diff_jit_recompile_on_arg_type_change() {
     let flo_jit = rt.eval_str_via_vm("<diff>", "(sqr 3.5)").unwrap();
     let flo_walker = walker_eval(defines, "(sqr 3.5)");
     match (&flo_jit, &flo_walker) {
-        (
-            Value::Number(cs_core::Number::Flonum(j)),
-            Value::Number(cs_core::Number::Flonum(w)),
-        ) => {
+        (Value::Number(cs_core::Number::Flonum(j)), Value::Number(cs_core::Number::Flonum(w))) => {
             assert_eq!(j.to_bits(), w.to_bits());
             assert_eq!(*j, 12.25);
         }
         other => panic!("expected flonums, got {:?}", other),
     }
+}
+
+#[test]
+fn diff_jit_introspection_and_distinct_compiles() {
+    // M6 Phase 2 iter AI: (jit-installed?) / (jit-stats) /
+    // (jit-status proc) Scheme-visible accessors.
+    //
+    // Also pins down a regression caught while writing this test:
+    // every call to compile_pure_fixnum used `declare_function` with
+    // the same module-level name "anon-jit", colliding on the
+    // second compile and silently leaving subsequent closures on
+    // bytecode. The fix appends the lowerer's fresh_id to the
+    // module name so each compile is independent.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+
+    // First closure: warm with flonum args.
+    rt.eval_str_via_vm("<diff>", "(define sqr-flo (lambda (n) (* n n)))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (sqr-flo 1.5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    // Second closure: warm with fixnum args.
+    rt.eval_str_via_vm("<diff>", "(define sqr-fix (lambda (n) (* n n)))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (sqr-fix i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let flo_status = rt
+        .eval_str_via_vm("<diff>", "(jit-status sqr-flo)")
+        .unwrap();
+    let fix_status = rt
+        .eval_str_via_vm("<diff>", "(jit-status sqr-fix)")
+        .unwrap();
+
+    // Eval everything before borrowing rt immutably for format_value.
+    let installed = rt.eval_str_via_vm("<diff>", "(jit-installed?)").unwrap();
+    let stats = rt.eval_str_via_vm("<diff>", "(jit-stats)").unwrap();
+    let flo_str = rt.format_value(&flo_status, cs_core::WriteMode::Write);
+    let fix_str = rt.format_value(&fix_status, cs_core::WriteMode::Write);
+    let stats_str = rt.format_value(&stats, cs_core::WriteMode::Write);
+    assert_eq!(flo_str, "(jit-on flonum flonum)");
+    assert_eq!(fix_str, "(jit-on fixnum fixnum)");
+    assert!(matches!(installed, Value::Boolean(true)));
+    assert!(
+        stats_str.starts_with('(') && stats_str.ends_with(')'),
+        "stats not a list: {}",
+        stats_str
+    );
 }

@@ -160,15 +160,20 @@ impl Lowerer {
         }
         sig.returns.push(AbiParam::new(I64));
 
-        let func_name = UserFuncName::user(0, self.fresh_id() as u32);
+        let id = self.fresh_id();
+        let func_name = UserFuncName::user(0, id as u32);
         let mut clif = ClifFunction::with_name_signature(func_name, sig.clone());
 
         // Declare the function up front so we can import a self-
-        // FuncRef inside the body for `CallSelf` lowering.
+        // FuncRef inside the body for `CallSelf` lowering. The name
+        // must be unique per compile — the runtime hook calls us
+        // with `rir.name = "anon-jit"` for every closure, so we
+        // append the fresh_id to disambiguate.
+        let module_name = format!("{}#{}", rir.name, id);
         let func_id = self
             .module
-            .declare_function(&rir.name, Linkage::Local, &sig)
-            .map_err(|e| JitError::Codegen(format!("declare_function {}: {e}", rir.name)))?;
+            .declare_function(&module_name, Linkage::Local, &sig)
+            .map_err(|e| JitError::Codegen(format!("declare_function {}: {e}", module_name)))?;
 
         // Map RIR Value -> Cranelift Value.
         let mut value_map: HashMap<RirValue, cranelift_codegen::ir::Value> = HashMap::new();

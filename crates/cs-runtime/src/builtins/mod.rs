@@ -327,6 +327,10 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("get-environment-variable", b_get_environment_variable),
         ("get-environment-variables", b_get_environment_variables),
         ("command-line", b_command_line),
+        // JIT introspection (Iter AI). Useful in tests/benchmarks
+        // to assert hot paths actually tier'd up.
+        ("jit-installed?", b_jit_installed_p),
+        ("jit-stats", b_jit_stats),
         ("string-split", b_string_split),
         ("string-join", b_string_join),
         ("string->vector", b_string_to_vector),
@@ -878,6 +882,9 @@ pub fn syms_builtins() -> Vec<SymsEntry> {
         ("record-field-mutable?", b_record_field_mutable_p),
         // R6RS symbol manipulation.
         ("symbol-append", b_symbol_append),
+        // JIT introspection that needs the symbol table to mint
+        // type-tag symbols.
+        ("jit-status", b_jit_status),
     ]
 }
 
@@ -11375,6 +11382,81 @@ fn b_command_line(args: &[Value]) -> Result<Value, String> {
         None => std::env::args().map(Value::string).collect(),
     };
     Ok(Value::list(argv))
+}
+
+// ---- JIT introspection ----------------------------------------------
+//
+// Scheme-visible accessors for the JIT machinery. Useful in tests and
+// benchmarks that want to assert "this hot path actually tier'd up"
+// or print a per-closure JIT signature for post-mortem of "why didn't
+// this body JIT?".
+//
+// `(jit-installed?)`         -> #t / #f
+// `(jit-stats)`              -> (tier-ups jit-calls deopts)
+// `(jit-status proc)`        -> if not a closure: 'not-a-closure
+//                               otherwise:
+//                                 'jit-off                -- never tier'd up
+//                                 (jit-on <return-tag> <param-tags>...)
+//                                                          where each tag is
+//                                                          'fixnum 'boolean
+//                                                          'character or 'flonum
+
+fn b_jit_installed_p(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("jit-installed?", "0", args.len()));
+    }
+    let installed = unsafe { crate::Runtime::active() }
+        .map(|rt| rt.jit_installed())
+        .unwrap_or(false);
+    Ok(Value::Boolean(installed))
+}
+
+fn b_jit_stats(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("jit-stats", "0", args.len()));
+    }
+    Ok(Value::list(vec![
+        Value::fixnum(cs_vm::vm::tier_up_count() as i64),
+        Value::fixnum(cs_vm::vm::jit_call_count() as i64),
+        Value::fixnum(cs_vm::vm::deopt_count() as i64),
+    ]))
+}
+
+fn b_jit_status(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("jit-status", "1", args.len()));
+    }
+    let proc_rc = match &args[0] {
+        Value::Procedure(p) => p.clone(),
+        _ => return Ok(Value::Symbol(syms.intern("not-a-closure"))),
+    };
+    let any = proc_rc.as_any();
+    let closure = match any.downcast_ref::<cs_vm::vm::VmClosure>() {
+        Some(c) => c,
+        None => return Ok(Value::Symbol(syms.intern("not-a-closure"))),
+    };
+    if closure.jit_ptr().is_null() {
+        return Ok(Value::Symbol(syms.intern("jit-off")));
+    }
+    let tag_to_sym = |t: u8, syms: &mut SymbolTable| -> Value {
+        let name = match t {
+            cs_vm::vm::JIT_RT_BOOLEAN => "boolean",
+            cs_vm::vm::JIT_RT_CHARACTER => "character",
+            cs_vm::vm::JIT_RT_FLONUM => "flonum",
+            _ => "fixnum",
+        };
+        Value::Symbol(syms.intern(name))
+    };
+    let mut out = Vec::new();
+    out.push(Value::Symbol(syms.intern("jit-on")));
+    out.push(tag_to_sym(closure.jit_return_type(), syms));
+    let arity = closure.jit_arity();
+    let packed = closure.jit_param_types();
+    for i in 0..arity {
+        let nibble = ((packed >> (i as u32 * 4)) & 0xF) as u8;
+        out.push(tag_to_sym(nibble, syms));
+    }
+    Ok(Value::list(out))
 }
 
 fn b_string_split(args: &[Value]) -> Result<Value, String> {
