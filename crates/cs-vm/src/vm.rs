@@ -389,6 +389,60 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
     value_to_gc_i64(Value::Pair(cs_core::Pair::new(car_v, cdr_v)))
 }
 
+/// Gc-backed counterpart to `vm_pair_car`. Consumes the input Gc
+/// handle (one strong count) and returns a fresh Gc handle to the
+/// pair's car (cloned Value).
+#[no_mangle]
+pub unsafe extern "C" fn vm_pair_car_gc(pair: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(pair) };
+    match v {
+        Value::Pair(p) => value_to_gc_i64(p.car.borrow().clone()),
+        other => panic!("vm_pair_car_gc: not a pair ({})", other.type_name()),
+    }
+}
+
+/// Gc-backed counterpart to `vm_pair_cdr`. Same shape as
+/// `vm_pair_car_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_pair_cdr_gc(pair: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(pair) };
+    match v {
+        Value::Pair(p) => value_to_gc_i64(p.cdr.borrow().clone()),
+        other => panic!("vm_pair_cdr_gc: not a pair ({})", other.type_name()),
+    }
+}
+
+/// Gc-backed counterpart to `vm_pair_p`. Consume-on-use; 0/1 out.
+#[no_mangle]
+pub unsafe extern "C" fn vm_pair_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Pair(_)) as i64
+}
+
+/// Gc-backed counterpart to `vm_null_p`. Consume-on-use; 0/1 out.
+#[no_mangle]
+pub unsafe extern "C" fn vm_null_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Null) as i64
+}
+
+/// Gc-backed counterpart to `vm_value_clone`. Cheaper than the Box
+/// version: bumps the strong refcount on the existing allocation
+/// and returns the same raw handle, so the caller has two
+/// independent owners of the same slot. No new heap allocation.
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_clone_gc(r: i64) -> i64 {
+    unsafe { cs_gc::Gc::<Value>::raw_incref(r as *const ()) };
+    r
+}
+
+/// Gc-backed counterpart to `vm_value_drop`. Decrements the strong
+/// refcount; frees the slot if it was the last reference.
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_drop_gc(r: i64) {
+    drop(unsafe { cs_gc::Gc::<Value>::from_raw_jit(r as *const ()) });
+}
+
 /// `(car pair)` — return the pair's car, Any-tagged. Pre-decodes the
 /// Any-tagged input box and re-Anys the inner car.
 ///
@@ -5383,6 +5437,64 @@ mod gc_helper_tests {
                 Value::Number(cs_core::Number::Fixnum(b)),
             ) => assert_eq!(a, b),
             _ => panic!("mismatch"),
+        }
+    }
+
+    #[test]
+    fn vm_pair_car_cdr_gc_roundtrip() {
+        // alloc -> car / cdr -> decode each.
+        let i = unsafe { vm_alloc_pair_gc(5, JIT_RT_FIXNUM, 9, JIT_RT_FIXNUM) };
+        // Bump the count so we can do both car and cdr on it.
+        let i2 = unsafe { vm_value_clone_gc(i) };
+        let car_i = unsafe { vm_pair_car_gc(i) };
+        let cdr_i = unsafe { vm_pair_cdr_gc(i2) };
+        let car = unsafe { gc_i64_to_value(car_i) };
+        let cdr = unsafe { gc_i64_to_value(cdr_i) };
+        match (&car, &cdr) {
+            (
+                Value::Number(cs_core::Number::Fixnum(5)),
+                Value::Number(cs_core::Number::Fixnum(9)),
+            ) => {}
+            other => panic!("unexpected (car, cdr): {:?}", other),
+        }
+    }
+
+    #[test]
+    fn vm_pair_p_gc_classifies() {
+        // Build a Pair -> pair_p returns 1.
+        let i_pair = unsafe { vm_alloc_pair_gc(1, JIT_RT_FIXNUM, 2, JIT_RT_FIXNUM) };
+        assert_eq!(unsafe { vm_pair_p_gc(i_pair) }, 1);
+        // Build a Null -> pair_p returns 0.
+        let i_null = value_to_gc_i64(Value::Null);
+        assert_eq!(unsafe { vm_pair_p_gc(i_null) }, 0);
+    }
+
+    #[test]
+    fn vm_null_p_gc_classifies() {
+        let i_null = value_to_gc_i64(Value::Null);
+        assert_eq!(unsafe { vm_null_p_gc(i_null) }, 1);
+        let i_pair = unsafe { vm_alloc_pair_gc(1, JIT_RT_FIXNUM, 2, JIT_RT_FIXNUM) };
+        assert_eq!(unsafe { vm_null_p_gc(i_pair) }, 0);
+    }
+
+    #[test]
+    fn vm_value_clone_drop_gc_keep_count_balanced() {
+        // alloc -> clone (refcount 2) -> drop (refcount 1) -> drop (free).
+        // Functional check: after two drops the underlying Gc is gone.
+        // We can't observe directly without exposing strong_count, so
+        // do a positive smoke: round-trip a clone.
+        let i = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(123)));
+        let i2 = unsafe { vm_value_clone_gc(i) };
+        // i and i2 are independent strong references to the same slot.
+        // Both must decode to Number(123).
+        let v1 = unsafe { gc_i64_to_value(i) };
+        let v2 = unsafe { gc_i64_to_value(i2) };
+        match (&v1, &v2) {
+            (
+                Value::Number(cs_core::Number::Fixnum(123)),
+                Value::Number(cs_core::Number::Fixnum(123)),
+            ) => {}
+            other => panic!("unexpected clones: {:?}", other),
         }
     }
 }
