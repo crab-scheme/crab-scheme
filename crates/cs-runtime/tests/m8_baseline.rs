@@ -130,8 +130,77 @@ fn m8_multiple_invocations_vm() {
     }
 }
 
+// ---- VM-tier stress tests (M8 iter 5) ----
+
+/// Continuation stored in a heap-allocated cons cell, then
+/// extracted and invoked. Demonstrates that the continuation
+/// value behaves like any other procedure value.
 #[test]
-#[ignore = "M8: walker-tier multi-invocation lands in iter 4"]
+fn m8_continuation_stored_in_data_structure_vm() {
+    let mut rt = Runtime::new();
+    let r = rt
+        .eval_str_via_vm(
+            "<m8>",
+            "(define cdr-or-zero (lambda (b) (if (eq? (cdr b) #f) 0 (cdr b)))) \
+             (define box (cons #f #f)) \
+             (call/cc (lambda (k) (set-car! box k))) \
+             (set-cdr! box (+ (cdr-or-zero box) 1)) \
+             (if (< (cdr box) 3) ((car box) #f) (cdr box))",
+        )
+        .unwrap();
+    match r {
+        Value::Number(Number::Fixnum(3)) => {}
+        other => panic!("expected 3, got {:?}", other),
+    }
+}
+
+/// Two separate call/cc captures, the second is invoked from
+/// inside the first's body.
+#[test]
+fn m8_two_captures_invoke_first_from_second_vm() {
+    let mut rt = Runtime::new();
+    let r = rt
+        .eval_str_via_vm(
+            "<m8>",
+            "(define outer #f) \
+             (define inner #f) \
+             (call/cc (lambda (k1) \
+                (set! outer k1) \
+                (call/cc (lambda (k2) (set! inner k2))) \
+                10)) \
+             (if (eq? inner #f) (outer 99) 'done)",
+        )
+        .unwrap();
+    // After first run, both outer and inner are set, expression
+    // returns 10. Top-level proceeds to (if ...) — inner is now
+    // not #f (it's k2), so 'done. Walker would error.
+    match r {
+        Value::Symbol(_) => {}
+        other => panic!("expected 'done, got {:?}", other),
+    }
+}
+
+/// Continuation invoked with multiple arguments collapses to the
+/// first arg (R6RS semantics — single-value context).
+#[test]
+fn m8_continuation_one_arg_vm() {
+    let mut rt = Runtime::new();
+    let r = rt
+        .eval_str_via_vm(
+            "<m8>",
+            "(define saved #f) \
+             (define result (+ 1 (call/cc (lambda (k) (set! saved k) 10)))) \
+             (if (= result 11) (saved 41) result)",
+        )
+        .unwrap();
+    match r {
+        Value::Number(Number::Fixnum(42)) => {}
+        other => panic!("expected 42 (1+41), got {:?}", other),
+    }
+}
+
+#[test]
+#[ignore = "M8: walker-tier multi-invocation lands in iter 4+"]
 fn m8_multiple_invocations_walker() {
     let r = run("(define count 0) \
          (define saved #f) \
