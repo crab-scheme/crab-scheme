@@ -82,6 +82,62 @@ fn cold_closure_runs_correctly_without_jit() {
 }
 
 #[test]
+fn recursive_fib_jits_after_warmup() {
+    // The headline iter-7 test: the Define call site stamps a
+    // self-name on the (lambda) closure; the tier-up hook flows
+    // that through bytecode_to_rir's self-recursion detection;
+    // CallSelf lowers to a Cranelift recursive call. Once the
+    // counter crosses, fib runs natively and produces the right
+    // values.
+    cs_vm::vm::reset_jit_call_count();
+    cs_vm::vm::reset_tier_up_count();
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+
+    rt.eval_str_via_vm(
+        "<test>",
+        "(define fib (lambda (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))",
+    )
+    .unwrap();
+
+    // Warmup: compute fib(15). Recursive calls drive the counter
+    // past the threshold, triggering JIT compilation.
+    let warmup = rt.eval_str_via_vm("<test>", "(fib 15)").unwrap();
+    match warmup {
+        Value::Number(Number::Fixnum(610)) => {}
+        other => panic!("fib(15): expected 610, got {:?}", other),
+    }
+
+    assert!(
+        cs_vm::vm::tier_up_count() >= 1,
+        "tier-up should have fired for fib"
+    );
+    let jit_calls_after_warmup = cs_vm::vm::jit_call_count();
+    assert!(
+        jit_calls_after_warmup > 0,
+        "fib should JIT-dispatch during warmup, jit_call_count = {jit_calls_after_warmup}"
+    );
+
+    // Post-warmup: fib(20) runs entirely on JIT. Verify the value.
+    let r = rt.eval_str_via_vm("<test>", "(fib 20)").unwrap();
+    match r {
+        Value::Number(Number::Fixnum(6765)) => {}
+        other => panic!("fib(20): expected 6765, got {:?}", other),
+    }
+
+    let final_jit_calls = cs_vm::vm::jit_call_count();
+    // Recursive calls inside JIT'd fib lower to direct native
+    // calls (Inst::CallSelf), so they don't tick the VM-side
+    // jit_call_count. Just assert the top-level entry into fib(20)
+    // dispatched through the JIT (and produced the right value).
+    assert!(
+        final_jit_calls > jit_calls_after_warmup,
+        "fib(20) should add at least one JIT dispatch: {jit_calls_after_warmup} -> {final_jit_calls}"
+    );
+}
+
+#[test]
 fn unsupported_closure_stays_on_vm_silently() {
     // A closure with non-fixnum / env-access body translates fail
     // and should silently stay on the VM.

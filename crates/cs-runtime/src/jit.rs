@@ -80,9 +80,10 @@ fn jit_tier_up_hook(closure: &VmClosure) {
         None => return,
     };
     let lam = &closure.bc.lambdas[closure.lambda_idx];
-    // Self-name detection lands later — for iter 6 we pass None,
-    // which means recursive functions don't yet JIT.
-    let rir = match bytecode_to_rir(lam, "anon-jit", None) {
+    // Self-name flows from VmClosure::self_name (set by the Define
+    // / Set call sites in cs-vm), letting the translator recognize
+    // recursive `LoadVar(self) ... Call N` patterns.
+    let rir = match bytecode_to_rir(lam, "anon-jit", closure.self_name()) {
         Ok(r) => r,
         Err(_) => return,
     };

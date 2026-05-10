@@ -75,7 +75,13 @@ pub fn bytecode_to_rir(
     starts.insert(0);
     for (i, inst) in body.iter().enumerate() {
         match inst {
-            Inst::JumpIfFalse(t) | Inst::Jump(t) => {
+            Inst::JumpIfFalse(t)
+            | Inst::Jump(t)
+            | Inst::BranchOnGeFx2(t)
+            | Inst::BranchOnGtFx2(t)
+            | Inst::BranchOnLeFx2(t)
+            | Inst::BranchOnLtFx2(t)
+            | Inst::BranchOnNeFx2(t) => {
                 starts.insert(*t);
                 if i + 1 < body.len() {
                     starts.insert(i + 1);
@@ -119,6 +125,22 @@ pub fn bytecode_to_rir(
         param_map.insert(*sym, RirValue(i as u32));
     }
 
+    // Per-block entry stack: the SSA values that should be on the
+    // simulated stack when the block starts executing. Set by the
+    // predecessor's Jump emission (the predecessor allocates fresh
+    // RIR Values to serve as block params + names them in this map
+    // for the target). The entry block starts empty (function args
+    // are bound separately via param_map).
+    let mut block_entry_stack: HashMap<BlockId, Vec<RirValue>> = HashMap::new();
+    block_entry_stack.insert(BlockId(0), Vec::new());
+
+    // Per-block declared params. Populated alongside
+    // block_entry_stack so we can emit Block { params: ... } at the
+    // end. Each entry's RirValues are the same SSA ids that the
+    // entry-stack contains.
+    let mut block_params: HashMap<BlockId, Vec<(RirValue, Type)>> = HashMap::new();
+    block_params.insert(BlockId(0), Vec::new());
+
     // Translate each block.
     for (i, &start) in block_offsets.iter().enumerate() {
         let block_id = BlockId(i as u32);
@@ -128,7 +150,17 @@ pub fn bytecode_to_rir(
             body.len()
         };
 
-        let mut sim_stack: Vec<StackEntry> = Vec::new();
+        // Initialize the simulated stack from the block-entry stack
+        // table. If a block was never targeted by a predecessor
+        // (unreachable in offset order), we default to empty — the
+        // body will catch any underflow.
+        let mut sim_stack: Vec<StackEntry> = block_entry_stack
+            .get(&block_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(StackEntry::Value)
+            .collect();
         let mut insts: Vec<RirInst> = Vec::new();
         let mut term: Option<Term> = None;
 
@@ -162,32 +194,170 @@ pub fn bytecode_to_rir(
                 Inst::EqFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Eq)?,
                 Inst::JumpIfFalse(target) => {
                     let cond = pop_value(&mut sim_stack)?;
-                    let target_block = *offset_to_block.get(target).ok_or_else(|| {
-                        TranslateError::Invalid(format!(
-                            "JumpIfFalse target {} not a block start",
-                            target
-                        ))
-                    })?;
-                    let fall_block = *offset_to_block.get(&ip).ok_or_else(|| {
-                        TranslateError::Invalid(format!(
-                            "JumpIfFalse fall-through {} not a block start",
-                            ip
-                        ))
-                    })?;
+                    let target_block = lookup_block(&offset_to_block, *target, "JumpIfFalse")?;
+                    let fall_block = lookup_block(&offset_to_block, ip, "JumpIfFalse fall")?;
+                    let stack_height = sim_stack.len();
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        target_block,
+                        stack_height,
+                    )?;
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        fall_block,
+                        stack_height,
+                    )?;
                     // JumpIfFalse jumps when cond is falsy. brif: cond truthy -> first, else second.
                     term = Some(Term::Branch(cond, fall_block, target_block));
                     break;
                 }
+                Inst::BranchOnGeFx2(target) => {
+                    let (a, b) = pop_two_values(&mut sim_stack)?;
+                    let cond = alloc();
+                    insts.push(RirInst::Lt(cond, a, b));
+                    let target_block = lookup_block(&offset_to_block, *target, "BranchOnGeFx2")?;
+                    let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGeFx2 fall")?;
+                    let height = sim_stack.len();
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        target_block,
+                        height,
+                    )?;
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        fall_block,
+                        height,
+                    )?;
+                    term = Some(Term::Branch(cond, fall_block, target_block));
+                    break;
+                }
+                Inst::BranchOnGtFx2(target) => {
+                    let (a, b) = pop_two_values(&mut sim_stack)?;
+                    let cond = alloc();
+                    insts.push(RirInst::Lt(cond, b, a));
+                    let target_block = lookup_block(&offset_to_block, *target, "BranchOnGtFx2")?;
+                    let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGtFx2 fall")?;
+                    let height = sim_stack.len();
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        target_block,
+                        height,
+                    )?;
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        fall_block,
+                        height,
+                    )?;
+                    term = Some(Term::Branch(cond, target_block, fall_block));
+                    break;
+                }
+                Inst::BranchOnLeFx2(target) => {
+                    let (a, b) = pop_two_values(&mut sim_stack)?;
+                    let cond = alloc();
+                    insts.push(RirInst::Lt(cond, b, a));
+                    let target_block = lookup_block(&offset_to_block, *target, "BranchOnLeFx2")?;
+                    let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLeFx2 fall")?;
+                    let height = sim_stack.len();
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        target_block,
+                        height,
+                    )?;
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        fall_block,
+                        height,
+                    )?;
+                    term = Some(Term::Branch(cond, fall_block, target_block));
+                    break;
+                }
+                Inst::BranchOnLtFx2(target) => {
+                    let (a, b) = pop_two_values(&mut sim_stack)?;
+                    let cond = alloc();
+                    insts.push(RirInst::Lt(cond, a, b));
+                    let target_block = lookup_block(&offset_to_block, *target, "BranchOnLtFx2")?;
+                    let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLtFx2 fall")?;
+                    let height = sim_stack.len();
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        target_block,
+                        height,
+                    )?;
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        fall_block,
+                        height,
+                    )?;
+                    term = Some(Term::Branch(cond, target_block, fall_block));
+                    break;
+                }
+                Inst::BranchOnNeFx2(target) => {
+                    let (a, b) = pop_two_values(&mut sim_stack)?;
+                    let cond = alloc();
+                    insts.push(RirInst::Eq(cond, a, b));
+                    let target_block = lookup_block(&offset_to_block, *target, "BranchOnNeFx2")?;
+                    let fall_block = lookup_block(&offset_to_block, ip, "BranchOnNeFx2 fall")?;
+                    let height = sim_stack.len();
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        target_block,
+                        height,
+                    )?;
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        fall_block,
+                        height,
+                    )?;
+                    term = Some(Term::Branch(cond, fall_block, target_block));
+                    break;
+                }
                 Inst::Jump(target) => {
-                    let target_block = *offset_to_block.get(target).ok_or_else(|| {
-                        TranslateError::Invalid(format!("Jump target {} not a block start", target))
-                    })?;
-                    if !sim_stack.is_empty() {
-                        return Err(TranslateError::Unsupported(
-                            "Jump with non-empty stack — join blocks not yet supported".into(),
-                        ));
-                    }
-                    term = Some(Term::Jump(target_block, vec![]));
+                    let target_block = lookup_block(&offset_to_block, *target, "Jump")?;
+                    // Pull the current stack out as the jump-args.
+                    // The first jump to a target seeds its block
+                    // params; subsequent jumps must match the count
+                    // (well-formed bytecode invariant).
+                    let stack_vals: Vec<RirValue> = sim_stack
+                        .iter()
+                        .map(|e| match e {
+                            StackEntry::Value(v) => Ok(*v),
+                            StackEntry::SelfRef => Err(TranslateError::Unsupported(
+                                "self-ref in Jump-arg position".into(),
+                            )),
+                        })
+                        .collect::<Result<_, _>>()?;
+                    seed_block_entry(
+                        &mut block_entry_stack,
+                        &mut block_params,
+                        &mut alloc,
+                        target_block,
+                        stack_vals.len(),
+                    )?;
+                    term = Some(Term::Jump(target_block, stack_vals));
                     break;
                 }
                 Inst::Return => {
@@ -243,21 +413,40 @@ pub fn bytecode_to_rir(
         let terminator = match term {
             Some(t) => t,
             None => {
-                // Block fell through without a terminator. Either
-                // the body is malformed or the last instruction
-                // before block end was a non-terminator. For our
-                // subset the latter shouldn't happen because all
-                // block boundaries are placed AFTER terminators.
-                return Err(TranslateError::Invalid(format!(
-                    "block at offset {} has no terminator",
-                    start
-                )));
+                // Implicit fall-through to the next block in offset
+                // order. Pull the current stack as Jump args; seed
+                // the successor's entry stack height accordingly.
+                if i + 1 >= block_offsets.len() {
+                    return Err(TranslateError::Invalid(format!(
+                        "block at offset {} falls off function end",
+                        start
+                    )));
+                }
+                let next_id = BlockId((i + 1) as u32);
+                let stack_vals: Vec<RirValue> = sim_stack
+                    .iter()
+                    .map(|e| match e {
+                        StackEntry::Value(v) => Ok(*v),
+                        StackEntry::SelfRef => Err(TranslateError::Unsupported(
+                            "self-ref in fall-through stack".into(),
+                        )),
+                    })
+                    .collect::<Result<_, _>>()?;
+                seed_block_entry(
+                    &mut block_entry_stack,
+                    &mut block_params,
+                    &mut alloc,
+                    next_id,
+                    stack_vals.len(),
+                )?;
+                Term::Jump(next_id, stack_vals)
             }
         };
 
+        let params = block_params.get(&block_id).cloned().unwrap_or_default();
         func.blocks.push(Block {
             id: block_id,
-            params: vec![],
+            params,
             insts,
             terminator,
         });
@@ -282,6 +471,50 @@ fn pop_value(stack: &mut Vec<StackEntry>) -> Result<RirValue, TranslateError> {
         )),
         None => Err(TranslateError::Invalid("stack underflow".into())),
     }
+}
+
+fn pop_two_values(stack: &mut Vec<StackEntry>) -> Result<(RirValue, RirValue), TranslateError> {
+    let b = pop_value(stack)?;
+    let a = pop_value(stack)?;
+    Ok((a, b))
+}
+
+fn lookup_block(
+    map: &HashMap<usize, BlockId>,
+    off: usize,
+    label: &str,
+) -> Result<BlockId, TranslateError> {
+    map.get(&off)
+        .copied()
+        .ok_or_else(|| TranslateError::Invalid(format!("{label}: offset {off} not a block start")))
+}
+
+/// Seed a target block's entry stack with `count` fresh RIR Values
+/// (allocated via `alloc`), or — if the target was already seeded
+/// — verify that the count matches.
+fn seed_block_entry(
+    entry_stack: &mut HashMap<BlockId, Vec<RirValue>>,
+    block_params: &mut HashMap<BlockId, Vec<(RirValue, Type)>>,
+    alloc: &mut impl FnMut() -> RirValue,
+    target: BlockId,
+    count: usize,
+) -> Result<(), TranslateError> {
+    if let Some(existing) = entry_stack.get(&target) {
+        if existing.len() != count {
+            return Err(TranslateError::Invalid(format!(
+                "block {:?} seeded with {} entries, predecessor wants {}",
+                target,
+                existing.len(),
+                count
+            )));
+        }
+        return Ok(());
+    }
+    let vals: Vec<RirValue> = (0..count).map(|_| alloc()).collect();
+    let params: Vec<(RirValue, Type)> = vals.iter().map(|v| (*v, Type::Fixnum)).collect();
+    entry_stack.insert(target, vals);
+    block_params.insert(target, params);
+    Ok(())
 }
 
 fn emit_binop<F>(

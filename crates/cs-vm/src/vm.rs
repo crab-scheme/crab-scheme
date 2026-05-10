@@ -393,6 +393,11 @@ pub struct VmClosure {
     /// Arity at which `jit_ptr` was compiled. Caller checks this
     /// before transmuting.
     jit_arity: Cell<u32>,
+    /// Symbol the closure was first bound to (via Define / Set),
+    /// if any. The bytecode→RIR translator uses this to detect
+    /// `LoadVar(self_name)` patterns inside the body and emit
+    /// `Inst::CallSelf` so recursive functions JIT. (M6 iter 7.)
+    self_name: Cell<Option<Symbol>>,
 }
 
 impl VmClosure {
@@ -416,6 +421,32 @@ impl VmClosure {
     /// [`jit_ptr`] is non-null.
     pub fn jit_arity(&self) -> u32 {
         self.jit_arity.get()
+    }
+
+    /// Stamp the closure's `self_name` if it isn't already set.
+    /// Idempotent — first definer wins so re-binding doesn't
+    /// overwrite the JIT-relevant identity.
+    pub fn set_self_name_once(&self, sym: Symbol) {
+        if self.self_name.get().is_none() {
+            self.self_name.set(Some(sym));
+        }
+    }
+
+    /// Self-name, if one was stamped. Used by the JIT tier-up hook
+    /// to drive `bytecode_to_rir`'s self-recursion detection.
+    pub fn self_name(&self) -> Option<Symbol> {
+        self.self_name.get()
+    }
+}
+
+/// If `v` is a `VmClosure` with no `self_name` yet, stamp it with
+/// `sym`. Used by the Define / Set call sites so the JIT can
+/// recognize self-recursion in the body.
+fn stamp_self_name_if_closure(v: &Value, sym: Symbol) {
+    if let Value::Procedure(p) = v {
+        if let Some(c) = p.as_any().downcast_ref::<VmClosure>() {
+            c.set_self_name_once(sym);
+        }
     }
 }
 
@@ -685,6 +716,7 @@ fn run_dispatch(
                 let v = stack
                     .pop()
                     .ok_or_else(|| VmError::new("stack underflow on Set"))?;
+                stamp_self_name_if_closure(&v, s);
                 if !frame.env.set_existing(s, v.clone()) {
                     let mut root = frame.env.clone();
                     while let Some(p) = root.parent.clone() {
@@ -698,6 +730,7 @@ fn run_dispatch(
                 let v = stack
                     .pop()
                     .ok_or_else(|| VmError::new("stack underflow on Define"))?;
+                stamp_self_name_if_closure(&v, s);
                 let mut root = frame.env.clone();
                 while let Some(p) = root.parent.clone() {
                     root = p;
@@ -709,6 +742,7 @@ fn run_dispatch(
                 let v = stack
                     .pop()
                     .ok_or_else(|| VmError::new("stack underflow on DefineLocal"))?;
+                stamp_self_name_if_closure(&v, s);
                 frame.env.define(s, v);
             }
             Inst::Pop => {
@@ -2254,6 +2288,7 @@ fn run_dispatch(
                     tier: cs_jit::Tier::default(),
                     jit_ptr: Cell::new(std::ptr::null()),
                     jit_arity: Cell::new(0),
+                    self_name: Cell::new(None),
                 };
                 let p: Rc<dyn Procedure> = Rc::new(cl);
                 stack.push(Value::Procedure(p));
