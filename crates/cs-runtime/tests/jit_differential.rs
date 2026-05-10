@@ -940,3 +940,36 @@ fn diff_jit_let_loop_flonum_accumulator() {
         other => panic!("expected flonums, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_tail_call_deep_recursion() {
+    // M6 Phase 3 iter AO: tail-call lowering via the wrapper
+    // pattern (outer SystemV trampoline + inner Tail-conv body
+    // with `return_call` for tail-CallSelf). Without this, JIT'd
+    // recursive bodies burn host stack at ~50k iters; with it,
+    // 1M+ iters are safe.
+    let defines = &["(define sumsq (lambda (n) \
+        (let loop ((i 0) (acc 0.0)) \
+          (if (= i n) acc \
+              (loop (+ i 1) (+ acc (* (real->flonum i) (real->flonum i))))))))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm("<diff>", "(sumsq 2000)").unwrap();
+
+    // 250k iters — 5x past pre-AO crash threshold. Pre-AO crashed
+    // at 1M; we cap here to keep the test fast and avoid timing
+    // dependence.
+    let jit = rt.eval_str_via_vm("<diff>", "(sumsq 250000)").unwrap();
+    let walker = walker_eval(defines, "(sumsq 250000)");
+    match (&jit, &walker) {
+        (
+            Value::Number(cs_core::Number::Flonum(j)),
+            Value::Number(cs_core::Number::Flonum(w)),
+        ) => {
+            assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on (sumsq 250000)");
+        }
+        other => panic!("expected flonums, got {:?}", other),
+    }
+}

@@ -153,37 +153,88 @@ impl Lowerer {
             return Err(JitError::Codegen("function has no blocks".into()));
         }
 
-        // Build a Cranelift signature. Every param is i64; return is i64.
-        let mut sig = Signature::new(CallConv::SystemV);
-        for _ in &rir.params {
-            sig.params.push(AbiParam::new(I64));
-        }
-        sig.returns.push(AbiParam::new(I64));
+        // Wrapper pattern (ADR 0011 D-7): every JIT'd function is
+        // emitted as a pair of Cranelift functions:
+        //
+        //   outer  — CallConv::SystemV. The runtime transmutes its
+        //            pointer as `extern "C" fn(i64,...) -> i64` and
+        //            dispatches through it. Body is a one-instruction
+        //            trampoline: `return inner(args...)`.
+        //   inner  — CallConv::Tail. Hosts the real RIR-derived body.
+        //            `Inst::CallSelf` in tail position lowers to
+        //            Cranelift `return_call` against `inner`'s
+        //            FuncRef, reusing the caller's frame. Without
+        //            this, deeply recursive bodies (`let loop` over
+        //            millions of iters) burned host stack on every
+        //            iteration.
+        //
+        // Tail position detection is done at the end of each block:
+        //   (a) Direct      — last inst is `CallSelf(dst, args)` and
+        //                     terminator is `Return(dst)`.
+        //   (b) Through join — last inst is `CallSelf(dst, args)` and
+        //                     terminator is `Jump(target, [dst])` to
+        //                     a block whose only content is
+        //                     `Return(p)` where p is its first param.
+        //                     The let-loop pattern lowers via (b).
+        let outer_sig = {
+            let mut sig = Signature::new(CallConv::SystemV);
+            for _ in &rir.params {
+                sig.params.push(AbiParam::new(I64));
+            }
+            sig.returns.push(AbiParam::new(I64));
+            sig
+        };
+        let inner_sig = {
+            let mut sig = Signature::new(CallConv::Tail);
+            for _ in &rir.params {
+                sig.params.push(AbiParam::new(I64));
+            }
+            sig.returns.push(AbiParam::new(I64));
+            sig
+        };
 
-        let id = self.fresh_id();
-        let func_name = UserFuncName::user(0, id as u32);
-        let mut clif = ClifFunction::with_name_signature(func_name, sig.clone());
-
-        // Declare the function up front so we can import a self-
-        // FuncRef inside the body for `CallSelf` lowering. The name
-        // must be unique per compile — the runtime hook calls us
-        // with `rir.name = "anon-jit"` for every closure, so we
-        // append the fresh_id to disambiguate.
-        let module_name = format!("{}#{}", rir.name, id);
-        let func_id = self
+        let outer_seq = self.fresh_id();
+        let inner_seq = self.fresh_id();
+        let outer_module_name = format!("{}#{}.outer", rir.name, outer_seq);
+        let inner_module_name = format!("{}#{}.inner", rir.name, inner_seq);
+        let outer_id = self
             .module
-            .declare_function(&module_name, Linkage::Local, &sig)
-            .map_err(|e| JitError::Codegen(format!("declare_function {}: {e}", module_name)))?;
+            .declare_function(&outer_module_name, Linkage::Local, &outer_sig)
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function {}: {e}", outer_module_name))
+            })?;
+        let inner_id = self
+            .module
+            .declare_function(&inner_module_name, Linkage::Local, &inner_sig)
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function {}: {e}", inner_module_name))
+            })?;
 
-        // Map RIR Value -> Cranelift Value.
+        // Compile inner first — the actual body. inner's CallSelf
+        // points back at inner via its own FuncRef so tail recursion
+        // self-loops on the same Tail-conv function.
+        self.compile_inner_body(rir, inner_id, inner_seq, &inner_sig)?;
+        // Compile outer — a plain SystemV trampoline that calls inner.
+        self.compile_outer_trampoline(rir, outer_id, outer_seq, &outer_sig, inner_id)?;
+        self.module
+            .finalize_definitions()
+            .map_err(|e| JitError::Codegen(format!("finalize_definitions: {e}")))?;
+        Ok(self.module.get_finalized_function(outer_id))
+    }
+
+    fn compile_inner_body(
+        &mut self,
+        rir: &RirFunction,
+        inner_id: cranelift_module::FuncId,
+        inner_seq: u64,
+        inner_sig: &Signature,
+    ) -> Result<(), JitError> {
+        let func_name = UserFuncName::user(0, inner_seq as u32);
+        let mut clif = ClifFunction::with_name_signature(func_name, inner_sig.clone());
         let mut value_map: HashMap<RirValue, cranelift_codegen::ir::Value> = HashMap::new();
-
         {
             let mut builder = FunctionBuilder::new(&mut clif, &mut self.func_ctx);
-
-            // Import a self-FuncRef for CallSelf to dispatch through.
-            let self_fnref = self.module.declare_func_in_func(func_id, builder.func);
-            // Import the env-helper functions into this function.
+            let self_fnref = self.module.declare_func_in_func(inner_id, builder.func);
             let env_lookup_fnref = self
                 .module
                 .declare_func_in_func(self.env_lookup_func, builder.func);
@@ -191,17 +242,11 @@ impl Lowerer {
                 .module
                 .declare_func_in_func(self.env_set_func, builder.func);
 
-            // Create a Cranelift block for every RIR block, with the
-            // matching block params.
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
             for rir_block in &rir.blocks {
                 let cb = builder.create_block();
                 if rir_block.id == rir.entry {
-                    // Entry block carries the function args via
-                    // append_block_params_for_function_params; skip
-                    // adding RIR-specified params (entry blocks
-                    // typically have no extra params anyway).
                     builder.append_block_params_for_function_params(cb);
                 } else {
                     for _ in &rir_block.params {
@@ -210,9 +255,6 @@ impl Lowerer {
                 }
                 block_map.insert(rir_block.id, cb);
             }
-
-            // Switch to the entry block and bind the function-arg
-            // params to RIR Value entries.
             let entry_clif = *block_map
                 .get(&rir.entry)
                 .ok_or_else(|| JitError::Codegen("entry block not in block map".into()))?;
@@ -229,13 +271,9 @@ impl Lowerer {
                 value_map.insert(*rir_v, *clif_v);
             }
 
-            // Lower each block's contents.
             for rir_block in &rir.blocks {
                 let cb = *block_map.get(&rir_block.id).unwrap();
                 builder.switch_to_block(cb);
-
-                // Bind any non-entry RIR block params to their
-                // Cranelift block params.
                 if rir_block.id != rir.entry {
                     let bps = builder.block_params(cb).to_vec();
                     for ((rir_v, _ty), clif_v) in rir_block.params.iter().zip(bps.iter()) {
@@ -243,16 +281,14 @@ impl Lowerer {
                     }
                 }
 
-                // Tail-call lowering for `CallSelf` deferred — pure
-                // `return_call` requires CallConv::Tail, but the
-                // runtime dispatcher's `extern "C" fn(i64,...) -> i64`
-                // transmute is SystemV. The proper fix is the
-                // wrapper pattern from ADR 0011 D-7 follow-ups: outer
-                // SystemV entry calls inner Tail-conv body via a
-                // single regular call, and inner uses return_call for
-                // self-recursion. That's its own iter — needs two
-                // function definitions per compile.
-                for inst in &rir_block.insts {
+                // Tail-CallSelf detection.
+                let tail = detect_tail_call_self(rir, rir_block);
+                let body_insts = if tail.is_some() {
+                    &rir_block.insts[..rir_block.insts.len() - 1]
+                } else {
+                    &rir_block.insts[..]
+                };
+                for inst in body_insts {
                     lower_inst(
                         &mut builder,
                         &mut value_map,
@@ -262,23 +298,63 @@ impl Lowerer {
                         inst,
                     )?;
                 }
-                lower_terminator(&mut builder, &block_map, &value_map, &rir_block.terminator)?;
+                if let Some(args) = tail {
+                    let cargs: Vec<cranelift_codegen::ir::Value> = args
+                        .iter()
+                        .map(|a| lookup(&value_map, *a))
+                        .collect::<Result<_, _>>()?;
+                    builder.ins().return_call(self_fnref, &cargs);
+                } else {
+                    lower_terminator(&mut builder, &block_map, &value_map, &rir_block.terminator)?;
+                }
             }
-
-            // All branches emitted; seal everything.
             builder.seal_all_blocks();
             builder.finalize();
         }
-
         self.ctx.func = clif;
         self.module
-            .define_function(func_id, &mut self.ctx)
-            .map_err(|e| JitError::Codegen(format!("define_function {}: {e}", rir.name)))?;
+            .define_function(inner_id, &mut self.ctx)
+            .map_err(|e| JitError::Codegen(format!("define_function inner: {e}")))?;
         self.module.clear_context(&mut self.ctx);
+        Ok(())
+    }
+
+    fn compile_outer_trampoline(
+        &mut self,
+        rir: &RirFunction,
+        outer_id: cranelift_module::FuncId,
+        outer_seq: u64,
+        outer_sig: &Signature,
+        inner_id: cranelift_module::FuncId,
+    ) -> Result<(), JitError> {
+        let func_name = UserFuncName::user(0, outer_seq as u32);
+        let mut clif = ClifFunction::with_name_signature(func_name, outer_sig.clone());
+        {
+            let mut builder = FunctionBuilder::new(&mut clif, &mut self.func_ctx);
+            let inner_fnref = self.module.declare_func_in_func(inner_id, builder.func);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let args_v: Vec<cranelift_codegen::ir::Value> = builder.block_params(entry).to_vec();
+            let _ = rir;
+            let inst = builder.ins().call(inner_fnref, &args_v);
+            let results = builder.inst_results(inst).to_vec();
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "trampoline expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            builder.ins().return_(&[results[0]]);
+            builder.finalize();
+        }
+        self.ctx.func = clif;
         self.module
-            .finalize_definitions()
-            .map_err(|e| JitError::Codegen(format!("finalize_definitions: {e}")))?;
-        Ok(self.module.get_finalized_function(func_id))
+            .define_function(outer_id, &mut self.ctx)
+            .map_err(|e| JitError::Codegen(format!("define_function outer: {e}")))?;
+        self.module.clear_context(&mut self.ctx);
+        Ok(())
     }
 
     /// Drain references to internal state. Used by tests that want
@@ -286,6 +362,44 @@ impl Lowerer {
     #[doc(hidden)]
     pub fn module(&self) -> &JITModule {
         &self.module
+    }
+}
+
+/// Detect whether `block`'s last instruction is a tail-position
+/// `Inst::CallSelf`. Two shapes are recognized:
+///
+/// (a) Direct: last inst is `CallSelf(dst, args)` and terminator is
+///     `Term::Return(dst)`.
+/// (b) Through trivial join: last inst is `CallSelf(dst, args)` and
+///     terminator is `Term::Jump(target, [dst])` where target is a
+///     block whose only content is `Term::Return(p)` for p its first
+///     param. The let-loop / let-named pattern always lowers via (b).
+///
+/// Returns the args slice if a tail call was detected (caller emits
+/// `return_call(self_fnref, args)` and skips the regular terminator),
+/// or `None` otherwise.
+fn detect_tail_call_self<'a>(
+    rir: &'a RirFunction,
+    block: &'a cs_rir::Block,
+) -> Option<&'a [RirValue]> {
+    let last = block.insts.last()?;
+    let (dst, args) = match last {
+        Inst::CallSelf(dst, args) => (dst, args.as_slice()),
+        _ => return None,
+    };
+    match &block.terminator {
+        Term::Return(ret_v) if ret_v == dst => Some(args),
+        Term::Jump(target, jump_args) if jump_args.len() == 1 && jump_args[0] == *dst => {
+            let target_block = rir.blocks.iter().find(|b| b.id == *target)?;
+            if !target_block.insts.is_empty() {
+                return None;
+            }
+            match (&target_block.terminator, target_block.params.first()) {
+                (Term::Return(rv), Some((p, _))) if rv == p => Some(args),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
