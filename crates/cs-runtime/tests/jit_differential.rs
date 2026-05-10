@@ -162,6 +162,79 @@ fn diff_gcd() {
 }
 
 #[test]
+fn diff_jit_with_free_var_lookup() {
+    // M6 Phase 2 iter B: free-var LoadVar lowers to Inst::EnvLookup.
+    // Walker, VM-no-JIT, and VM-with-JIT must produce identical
+    // values across the warmup-then-call pattern.
+    let defines = &[
+        "(define base 100)",
+        "(define add-base (lambda (x) (+ x base)))",
+    ];
+
+    let mut rt_walker = Runtime::new();
+    for d in defines {
+        rt_walker.eval_str("<diff>", d).unwrap();
+    }
+    let walker = rt_walker.eval_str("<diff>", "(add-base 42)").unwrap();
+
+    let mut rt_vm = Runtime::new();
+    for d in defines {
+        rt_vm.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    let vm = rt_vm.eval_str_via_vm("<diff>", "(add-base 42)").unwrap();
+
+    let mut rt_jit = Runtime::new();
+    rt_jit.install_jit().unwrap();
+    for d in defines {
+        rt_jit.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    rt_jit
+        .eval_str_via_vm(
+            "<diff>",
+            "(let loop ((i 0)) (if (= i 1500) 'done (begin (add-base i) (loop (+ i 1)))))",
+        )
+        .unwrap();
+    let jit = rt_jit.eval_str_via_vm("<diff>", "(add-base 42)").unwrap();
+
+    let unwrap = |v: &Value, label: &str| match v {
+        Value::Number(n) => n.to_f64(),
+        other => panic!("{label}: not a number, got {:?}", other),
+    };
+    assert_eq!(unwrap(&walker, "walker"), unwrap(&vm, "vm"));
+    assert_eq!(unwrap(&vm, "vm"), unwrap(&jit, "jit"));
+    assert_eq!(unwrap(&jit, "jit"), 142.0);
+}
+
+#[test]
+fn diff_jit_with_set_bang_through_env() {
+    // M6 Phase 2 iter C: free-var set! lowers to Inst::EnvSet.
+    let defines = &["(define c 0)", "(define bump (lambda () (set! c (+ c 1))))"];
+    let warmup = "(let loop ((i 0)) (if (= i 1500) 'done (begin (bump) (loop (+ i 1)))))";
+
+    let mut rt_walker = Runtime::new();
+    for d in defines {
+        rt_walker.eval_str("<diff>", d).unwrap();
+    }
+    rt_walker.eval_str("<diff>", warmup).unwrap();
+    let walker = rt_walker.eval_str("<diff>", "c").unwrap();
+
+    let mut rt_jit = Runtime::new();
+    rt_jit.install_jit().unwrap();
+    for d in defines {
+        rt_jit.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    rt_jit.eval_str_via_vm("<diff>", warmup).unwrap();
+    let jit = rt_jit.eval_str_via_vm("<diff>", "c").unwrap();
+
+    let unwrap = |v: &Value, label: &str| match v {
+        Value::Number(n) => n.to_f64(),
+        other => panic!("{label}: not a number, got {:?}", other),
+    };
+    assert_eq!(unwrap(&walker, "walker"), unwrap(&jit, "jit"));
+    assert_eq!(unwrap(&jit, "jit"), 1500.0);
+}
+
+#[test]
 fn diff_pure_arithmetic_fast_path() {
     // Closures that the JIT translator handles trivially.
     let defines = &[
