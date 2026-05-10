@@ -1,0 +1,12 @@
+# Pin the Rust toolchain. rustup picks this up automatically when you cd
+# into the repo; outside rustup, the devenv shell exposes the same
+# version via `languages.rust.channel`.
+#
+# Why pinned: cs-ffi's catch_unwind tests trigger a known bug in some
+# pre-1.90 rustc builds on macOS aarch64 ("failed to initiate panic,
+# error 5"). 1.95 is the floor we test against.
+
+[toolchain]
+channel = "1.95"
+components = ["rustc", "cargo", "rustfmt", "clippy"]
+profile = "minimal"

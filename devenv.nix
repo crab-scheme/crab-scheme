@@ -2,10 +2,16 @@
 
 {
   # ---- project toolchain ----------------------------------------------------
-  # Rust stable toolchain. cargo + rustc + rustfmt come automatically.
+  # Rust toolchain. The version is also pinned in `rust-toolchain.toml` for
+  # rustup users; both should agree. Keep them in sync on bumps.
+  #
+  # Why 1.95: cs-ffi's catch_unwind tests need a working unwind path. Some
+  # pre-1.90 builds of rustc on aarch64-darwin abort with "failed to initiate
+  # panic, error 5" inside the test runner.
   languages.rust = {
     enable = true;
     channel = "stable";
+    version = "1.95.0";
   };
 
   # ---- packages ------------------------------------------------------------
