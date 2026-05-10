@@ -623,6 +623,7 @@ impl Env {
     }
 }
 
+#[derive(Clone, Debug)]
 struct Frame {
     insts: Rc<Vec<Inst>>,
     spans: Rc<Vec<Span>>,
@@ -630,6 +631,34 @@ struct Frame {
     env: Rc<Env>,
     /// Captured shared bytecode (so closures can resolve their lambda body).
     bc: Rc<Bytecode>,
+}
+
+/// Snapshot of the VM's frame stack and value stack, captured at
+/// `call/cc` entry. Restoring it replaces the live `frames` and
+/// `stack` and resumes execution at the captured top frame.
+///
+/// Per ADR 0010 D-1: snapshots are heap-allocated and Rc-shared so
+/// capture is O(frame count) Vec-of-Rc clones rather than a deep
+/// memcpy. The runtime clones the inner Vecs on **invocation** (so
+/// the captured snapshot is reusable for re-invocation) — capture
+/// itself is just an Rc bump on this struct.
+#[derive(Debug, Clone)]
+pub struct VmContSnapshot {
+    frames: Rc<Vec<Frame>>,
+    stack: Rc<Vec<Value>>,
+}
+
+impl VmContSnapshot {
+    /// Number of captured frames. Useful for tests asserting that a
+    /// snapshot was actually taken (vs an empty placeholder).
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Captured value stack length.
+    pub fn stack_len(&self) -> usize {
+        self.stack.len()
+    }
 }
 
 pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Value, VmError> {
@@ -958,13 +987,36 @@ fn run_dispatch(
                         }
                         continue;
                     }
-                    // Continuation: stash (id, value) and unwind via Err.
+                    // Continuation invocation. Two paths:
+                    // 1. Snapshot present (M8 iter 3+): RESTORE the
+                    //    captured frames + stack, push the new value
+                    //    as the call/cc result, resume the run loop.
+                    //    Re-entry lands at the captured top frame's
+                    //    next instruction.
+                    // 2. No snapshot: fall back to the legacy
+                    //    escape-only path via pending_escape unwind.
                     if let Some(k) = any.downcast_ref::<VmContinuation>() {
                         let v = if n == 0 {
                             Value::Unspecified
                         } else {
                             stack[args_start].clone()
                         };
+                        // Snapshot-restore only fires once the
+                        // originating call/cc has returned (in_flight
+                        // false). While call/cc is still on the
+                        // stack, take the legacy escape-only path so
+                        // the handler at the call/cc unwinds via
+                        // pending_escape — this preserves correct
+                        // tear-down of with-exception-handler /
+                        // dynamic-wind frames in between.
+                        if !k.in_flight.get() {
+                            if let Some(snap) = &k.snapshot {
+                                *frames = (*snap.frames).clone();
+                                *stack = (*snap.stack).clone();
+                                stack.push(v);
+                                continue;
+                            }
+                        }
                         set_pending_escape(k.id, v);
                         return Err(VmError::new("__escape__"));
                     }
@@ -1986,8 +2038,21 @@ fn run_dispatch(
                         }
                         let proc_val = args.remove(0);
                         let id = next_continuation_id();
-                        let k = make_vm_continuation(id);
+                        // Capture frames + stack at call/cc entry. The
+                        // snapshot is what the runtime restores on
+                        // continuation invocation. (M8 iter 3.)
+                        let snapshot = Rc::new(VmContSnapshot {
+                            frames: Rc::new(frames.clone()),
+                            stack: Rc::new(stack.clone()),
+                        });
+                        let (k, k_handle) = make_vm_continuation_with_snapshot(id, snapshot);
                         let res = vm_call_sync(&proc_val, &[k], syms);
+                        // The originating call/cc has now returned
+                        // (either normally or via the escape path
+                        // below). Clear in_flight so any later
+                        // re-invocation takes the snapshot-restore
+                        // path rather than the escape path.
+                        k_handle.in_flight.set(false);
                         let v = match res {
                             Ok(v) => v,
                             Err(e) => {
@@ -3238,6 +3303,23 @@ pub struct VmDynamicWind;
 #[derive(Debug)]
 pub struct VmContinuation {
     pub id: u64,
+    /// Captured frame + value-stack snapshot. `Some` when the
+    /// continuation was created by an in-flight `call/cc` (M8 iter 3+);
+    /// `None` for the legacy escape-only path that the runtime
+    /// builds in places that don't have a snapshot at hand.
+    pub snapshot: Option<Rc<VmContSnapshot>>,
+    /// True while the originating `call/cc` is still on the call
+    /// stack. Cleared by the call/cc handler when it returns
+    /// (normal or via escape). The dispatch site uses this to
+    /// distinguish:
+    /// - **In-flight** (true): take the legacy escape-only path so
+    ///   the handler at the call/cc unwinds via `pending_escape`
+    ///   and any active `with-exception-handler` / `dynamic-wind`
+    ///   frames in between get torn down correctly.
+    /// - **After extent** (false): take the snapshot-restore path
+    ///   so the captured context resumes as a fresh continuation
+    ///   re-entry.
+    pub in_flight: Cell<bool>,
 }
 
 impl_proc_named!(VmRaise, "raise");
@@ -3267,7 +3349,32 @@ pub fn make_vm_call_cc() -> Value {
     Value::Procedure(Rc::new(VmCallCc) as Rc<dyn Procedure>)
 }
 pub fn make_vm_continuation(id: u64) -> Value {
-    Value::Procedure(Rc::new(VmContinuation { id }) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(VmContinuation {
+        id,
+        snapshot: None,
+        in_flight: Cell::new(true),
+    }) as Rc<dyn Procedure>)
+}
+
+/// Construct a continuation with a captured snapshot (M8 iter 3+).
+/// Starts with `in_flight = true`; the call/cc handler clears the
+/// flag when it returns. After clearing, dispatch routes through
+/// the snapshot-restore path.
+///
+/// Returns the `Value::Procedure` wrapping the continuation along
+/// with the `Rc<VmContinuation>` for the call site to clear
+/// in_flight on completion.
+pub fn make_vm_continuation_with_snapshot(
+    id: u64,
+    snapshot: Rc<VmContSnapshot>,
+) -> (Value, Rc<VmContinuation>) {
+    let k = Rc::new(VmContinuation {
+        id,
+        snapshot: Some(snapshot),
+        in_flight: Cell::new(true),
+    });
+    let v = Value::Procedure(k.clone() as Rc<dyn Procedure>);
+    (v, k)
 }
 
 /// Build a "condition" value matching the tree-walker's

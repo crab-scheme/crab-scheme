@@ -34,19 +34,10 @@ fn after_extent_invocation_emits_clear_diagnostic() {
     );
 }
 
-#[test]
-fn after_extent_invocation_emits_clear_diagnostic_vm() {
-    let mut rt = Runtime::new();
-    let prog = "(define saved #f) \
-                (call/cc (lambda (k) (set! saved k) 10)) \
-                (saved 100)";
-    let err = rt.eval_str_via_vm("<m8>", prog).expect_err("should error");
-    let msg = err.message;
-    assert!(
-        msg.contains("outside its dynamic extent") && msg.contains("M8"),
-        "VM diagnostic should name the M8 limitation, got: {msg}"
-    );
-}
+// VM-tier no longer errors on after-extent invocation (M8 iter 3
+// landed snapshot-based resume); see `m8_reinvocation_after_extent_vm`
+// for the positive test. Keeping this comment so the diagnostic
+// path itself is documented in the change history.
 
 // ---- Already passes (escape-only baseline) ----
 
@@ -79,16 +70,22 @@ fn baseline_escape_bypasses_outer_arithmetic() {
 
 // ---- Below: ignored until M8 lands first-class semantics ----
 
+/// VM-tier first-class re-invocation. The snapshot-based resume
+/// path landed in M8 iter 3.
 #[test]
-#[ignore = "M8: re-invocation after call/cc returns is not yet supported"]
-fn m8_reinvocation_after_extent() {
+fn m8_reinvocation_after_extent_vm() {
     // Save the continuation, escape with one value, then invoke
     // the saved continuation with a different value. Should re-run
     // the surrounding context.
-    let r = run("(define saved #f) \
-         (define result1 (+ 1 (call/cc (lambda (k) (set! saved k) 10)))) \
-         (if (< result1 50) (saved 100) 'done)")
-    .unwrap();
+    let mut rt = Runtime::new();
+    let r = rt
+        .eval_str_via_vm(
+            "<m8>",
+            "(define saved #f) \
+             (define result1 (+ 1 (call/cc (lambda (k) (set! saved k) 10)))) \
+             (if (< result1 50) (saved 100) 'done)",
+        )
+        .unwrap();
     // After re-invocation, result1 = 1 + 100 = 101, then the if
     // branch is 'done because 101 >= 50.
     match r {
@@ -98,10 +95,46 @@ fn m8_reinvocation_after_extent() {
 }
 
 #[test]
-#[ignore = "M8: multi-invocation continuations not yet supported"]
-fn m8_multiple_invocations() {
-    // The classic counter-via-call/cc pattern: each invocation of
-    // the saved continuation re-runs the body and bumps the count.
+#[ignore = "M8: walker-tier re-invocation lands in iter 4"]
+fn m8_reinvocation_after_extent_walker() {
+    let r = run("(define saved #f) \
+         (define result1 (+ 1 (call/cc (lambda (k) (set! saved k) 10)))) \
+         (if (< result1 50) (saved 100) 'done)")
+    .unwrap();
+    match r {
+        Value::Symbol(_) => {}
+        other => panic!("expected 'done after reinvocation, got {:?}", other),
+    }
+}
+
+// VM-tier multi-invocation: blocked on a pre-existing unrelated VM
+// bug with multi-form programs of the shape `(define x 0) (set! x
+// (+ x 1)) ...` — the `+` site sees `x` as a procedure rather than
+// a number. Filed as a separate iter; reinstate this test once the
+// VM compiler's name-resolution issue is fixed.
+#[test]
+#[ignore = "blocked on pre-existing VM multi-form (+ count 1) bug — separate iter"]
+fn m8_multiple_invocations_vm() {
+    let mut rt = Runtime::new();
+    let r = rt
+        .eval_str_via_vm(
+            "<m8>",
+            "(define count 0) \
+             (define saved #f) \
+             (call/cc (lambda (k) (set! saved k) #f)) \
+             (set! count (+ count 1)) \
+             (if (< count 3) (saved #f) count)",
+        )
+        .unwrap();
+    match r {
+        Value::Number(Number::Fixnum(3)) => {}
+        other => panic!("expected 3, got {:?}", other),
+    }
+}
+
+#[test]
+#[ignore = "M8: walker-tier multi-invocation lands in iter 4"]
+fn m8_multiple_invocations_walker() {
     let r = run("(define count 0) \
          (define saved #f) \
          (call/cc (lambda (k) (set! saved k) #f)) \
