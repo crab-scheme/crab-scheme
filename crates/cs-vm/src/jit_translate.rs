@@ -786,6 +786,112 @@ pub fn bytecode_to_rir(
                                         let _ = args[0];
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
                                     }
+                                    // Variadic +/-/*. The bytecode VM
+                                    // compiler only specializes 2-arg
+                                    // forms to *Fx2, so anything else
+                                    // (0, 1, or 3+ args) reaches us as a
+                                    // BuiltinRef + Call N. We chain the
+                                    // matching binary RIR op, dispatching
+                                    // to the Flonum* variants when every
+                                    // operand is statically Flonum-typed.
+                                    ("+", _) | ("-", _) | ("*", _) => {
+                                        let all_flonum = !args.is_empty()
+                                            && args.iter().all(|v| {
+                                                value_types.get(v).copied() == Some(Type::Flonum)
+                                            });
+                                        let result_t = if all_flonum {
+                                            Type::Flonum
+                                        } else {
+                                            Type::Fixnum
+                                        };
+                                        let fx_ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
+                                            match name {
+                                                "+" => RirInst::Add,
+                                                "-" => RirInst::Sub,
+                                                "*" => RirInst::Mul,
+                                                _ => unreachable!(),
+                                            };
+                                        let fl_ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
+                                            match name {
+                                                "+" => RirInst::FlonumAdd,
+                                                "-" => RirInst::FlonumSub,
+                                                "*" => RirInst::FlonumMul,
+                                                _ => unreachable!(),
+                                            };
+                                        let ctor = if all_flonum { fl_ctor } else { fx_ctor };
+                                        if args.is_empty() {
+                                            // (+) = 0; (*) = 1; (-) is
+                                            // an arity error in walker — bail.
+                                            match name {
+                                                "+" => insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Fixnum(0),
+                                                )),
+                                                "*" => insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Fixnum(1),
+                                                )),
+                                                _ => {
+                                                    return Err(TranslateError::Unsupported(
+                                                        format!("0-arg `{}` is an error", name),
+                                                    ))
+                                                }
+                                            }
+                                            value_types.insert(dst, Type::Fixnum);
+                                        } else if args.len() == 1 {
+                                            match name {
+                                                "+" | "*" => {
+                                                    // Identity.
+                                                    insts.push(RirInst::Move(dst, args[0]));
+                                                    let t = value_types
+                                                        .get(&args[0])
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    value_types.insert(dst, t);
+                                                }
+                                                "-" => {
+                                                    // (- x) = 0 - x. Same
+                                                    // operand-type rules.
+                                                    let zero = alloc();
+                                                    if all_flonum {
+                                                        insts.push(RirInst::LoadConst(
+                                                            zero,
+                                                            Const::Flonum(0.0),
+                                                        ));
+                                                        value_types.insert(zero, Type::Flonum);
+                                                        insts.push(RirInst::FlonumSub(
+                                                            dst, zero, args[0],
+                                                        ));
+                                                    } else {
+                                                        insts.push(RirInst::LoadConst(
+                                                            zero,
+                                                            Const::Fixnum(0),
+                                                        ));
+                                                        value_types.insert(zero, Type::Fixnum);
+                                                        insts
+                                                            .push(RirInst::Sub(dst, zero, args[0]));
+                                                    }
+                                                    value_types.insert(dst, result_t);
+                                                }
+                                                _ => unreachable!(),
+                                            }
+                                        } else {
+                                            // 2+: chain. The compiler folds
+                                            // 2-arg cases to *Fx2, but we
+                                            // accept them here too in case
+                                            // they reach us via a different
+                                            // path.
+                                            let mut acc = args[0];
+                                            for &x in &args[1..args.len() - 1] {
+                                                let next = alloc();
+                                                insts.push(ctor(next, acc, x));
+                                                value_types.insert(next, result_t);
+                                                acc = next;
+                                            }
+                                            insts.push(ctor(dst, acc, *args.last().unwrap()));
+                                            value_types.insert(dst, result_t);
+                                        }
+                                    }
                                     _ => {
                                         return Err(TranslateError::Unsupported(format!(
                                             "Call to builtin `{name}` (arity {}) not yet lowered",

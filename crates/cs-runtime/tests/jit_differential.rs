@@ -625,3 +625,60 @@ fn diff_flonum_unary_and_minmax() {
         }
     }
 }
+
+#[test]
+fn diff_multi_arg_arith() {
+    // M6 Phase 2 iter AE: variadic + / - / *. The cs-vm compiler
+    // only specializes 2-arg primops to *Fx2; 0/1/3+ args reach the
+    // JIT translator as a BuiltinRef + Call N. The translator now
+    // chains the matching binary RIR op, switching to the Flonum*
+    // variant when every operand is statically Flonum-typed.
+    let defines = &[
+        "(define sum3 (lambda (a b c) (+ a b c)))",
+        "(define prod4 (lambda (a b c d) (* a b c d)))",
+        "(define sub3 (lambda (a b c) (- a b c)))",
+        "(define neg-x (lambda (x) (- x)))",
+        "(define plus0 (lambda () (+)))",
+        "(define mul1  (lambda () (*)))",
+        "(define sum3-flo (lambda (a b c) \
+            (let ((fa (real->flonum a)) (fb (real->flonum b)) (fc (real->flonum c))) \
+              (+ fa fb fc))))",
+    ];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+            (if (= i 1500) 'done \
+                (begin (sum3 1 2 3) (prod4 1 2 3 4) (sub3 10 1 2) (neg-x 5) \
+                       (plus0) (mul1) (sum3-flo 1 2 3) \
+                       (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, &str)] = &[
+        ("(sum3 1 2 3)", "6"),
+        ("(prod4 1 2 3 4)", "24"),
+        ("(sub3 10 1 2)", "7"),
+        ("(neg-x 5)", "-5"),
+        ("(plus0)", "0"),
+        ("(mul1)", "1"),
+        ("(sum3-flo 1 2 3)", "6.0"),
+    ];
+    for (expr, _) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        assert_eq!(
+            format!("{:?}", jit),
+            format!("{:?}", walker),
+            "tier-disagreement on {}: jit={:?} walker={:?}",
+            expr,
+            jit,
+            walker
+        );
+    }
+}
