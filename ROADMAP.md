@@ -141,6 +141,48 @@ GC binding for precise rooting techniques.
 
 ---
 
+## M5b: Rust FFI
+
+**Spec slug:** `ffi`
+
+Rust FFI surface so CrabScheme programs can call Rust libraries and Rust
+applications can embed CrabScheme as a scripting layer. Independent of the
+JIT track (M6/M7) — can ship in parallel — but depends on M5's GC for
+correct value rooting across the boundary.
+
+Components to spec:
+
+- **`cs-ffi` crate**: `FromValue` / `IntoValue` marshaling traits, `Pinned<'rt>`
+  RAII rooting, `FfiError` uniform error type, versioned C-ABI struct for
+  shared-library plugins.
+- **`cs-ffi-macros` crate**: `#[crabscheme::host_proc]` proc-macro that wraps
+  user functions with the marshaling layer.
+- **`Runtime` API additions**: `register_host_procedure`, `pin`,
+  `load_shared_library`.
+- **Two registration paths**: compile-time (Rust crate depending on
+  `cs-runtime`) lands first; runtime dlopen via `(load-shared-library)`
+  follows.
+- **Error propagation**: every `FfiError` variant becomes a catchable Scheme
+  condition.
+
+**Exit gate:**
+- Compile-time-registered host procedures are callable from Scheme on both
+  walker and VM tiers.
+- A separately-built shared library loads via `(load-shared-library "path")`
+  and exposes its registered procedures.
+- A fuzz test that holds a `Pinned` value across 100k allocations confirms
+  GC rooting.
+- Each `FfiError` variant produces a catchable Scheme condition.
+- An `examples/embedded_runtime.rs` doctest shows the standard host pattern
+  and compiles green.
+- ADR 0008 written.
+
+**Risks:** Lifetime confusion at the boundary; panic across FFI must not
+abort; ABI drift between runtime + shared lib. All mitigated via the
+`Pinned<'rt>` borrow, `catch_unwind`, and the versioned ABI struct.
+
+---
+
 ## M6: JIT Abstraction + Cranelift Backend
 
 **Spec slug:** `jit-cranelift`
