@@ -1,0 +1,13 @@
+[package]
+name = "cs-ffi-example"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+description = "Example CrabScheme FFI plugin: builds as a cdylib with a `crabscheme_register` entry point that registers two host procedures via the versioned C-ABI."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cs-ffi = { path = "../cs-ffi" }

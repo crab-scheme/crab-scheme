@@ -15,6 +15,7 @@ members = [
     "crates/cs-jit-cranelift",
     "crates/cs-ffi",
     "crates/cs-ffi-macros",
+    "crates/cs-ffi-example",
     "crates/cs-cli",
 ]
 
