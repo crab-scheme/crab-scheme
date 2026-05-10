@@ -11,3 +11,4 @@ cs-diag = { workspace = true }
 cs-gc = { workspace = true }
 cs-ir = { workspace = true }
 cs-jit = { workspace = true }
+cs-rir = { workspace = true }

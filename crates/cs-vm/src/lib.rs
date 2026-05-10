@@ -14,6 +14,7 @@
 //!   builds its own environment chain.
 
 pub mod compiler;
+pub mod jit_translate;
 pub mod opcode;
 pub mod vm;
 

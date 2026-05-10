@@ -404,8 +404,10 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cs-core",
+ "cs-diag",
  "cs-jit",
  "cs-rir",
+ "cs-vm",
 ]
 
 [[package]]
@@ -464,6 +466,7 @@ dependencies = [
  "cs-gc",
  "cs-ir",
  "cs-jit",
+ "cs-rir",
 ]
 
 [[package]]
