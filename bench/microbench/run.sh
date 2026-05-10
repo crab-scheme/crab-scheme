@@ -36,7 +36,7 @@ for src in "$RUST_DIR"/*.rs; do
 done
 
 # --- run table ---
-BENCHES=(fib tak ack nqueens mandelbrot spectral-norm binary-trees)
+BENCHES=(fib tak ack nqueens mandelbrot spectral-norm binary-trees alloc-stress)
 
 # Optional implementations to compare against. Set RACKET=racket, CHEZ=chez, etc.
 declare -a IMPLS

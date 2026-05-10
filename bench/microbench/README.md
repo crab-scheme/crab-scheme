@@ -26,6 +26,7 @@ bench/microbench/
 | `mandelbrot`     | tight loops + flonum arithmetic                                    |
 | `spectral-norm`  | flonum + vector-ref/-set! + power iteration                        |
 | `binary-trees`   | pair allocation + GC churn (Benchmarks Game classic)               |
+| `alloc-stress`   | 200k short-lived pair allocations (M5 Phase 2 baseline)            |
 
 Five of the seven (everything except `fib` and `tak`) are direct
 adaptations of Benchmarks Game tasks. The Scheme and Rust files
@@ -72,13 +73,14 @@ tiers against Chez Scheme, Guile, Gambit, and `rustc -O`:
 
 ```
 benchmark              crabscheme-walker  crabscheme-vm   chez    guile  gambit  rust-O
-fib                            0.319s         0.033s    0.044s  0.035s  0.031s  0.010s
-tak                            0.049s         0.021s    0.041s  0.023s  0.020s  0.013s
-ack                            0.106s         0.027s    0.039s  0.021s  0.019s  0.013s
-nqueens                        0.103s         0.029s    0.040s  0.022s  0.019s  0.010s
-mandelbrot                     0.358s         0.085s    0.046s  0.039s  0.044s  0.012s
-spectral-norm                  0.310s         0.093s    0.043s  0.035s  0.036s  0.011s
-binary-trees                   0.138s         0.048s     ERR     ERR    0.026s  0.011s
+fib                            0.380s         0.031s    0.044s  0.036s  0.031s  0.009s
+tak                            0.049s         0.016s    0.046s  0.026s  0.014s  0.009s
+ack                            0.105s         0.027s    0.040s  0.022s  0.018s  0.009s
+nqueens                        0.115s         0.030s    0.048s  0.027s  0.019s  0.010s
+mandelbrot                     0.343s         0.075s    0.045s  0.038s  0.042s  0.013s
+spectral-norm                  0.312s         0.118s    0.046s  0.025s  0.038s  0.014s
+binary-trees                   0.172s         0.047s     ERR     ERR    0.028s  0.016s
+alloc-stress                   0.145s         0.037s    0.042s  0.129s  0.019s  0.143s
 ```
 
 (Apple M-series, macOS. Chez 10.3.0, Guile 3.0.11, Gambit 4.9.5,
