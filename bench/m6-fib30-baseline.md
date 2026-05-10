@@ -163,35 +163,42 @@ status verified post-warm with `(jit-status proc)` to confirm the
 native dispatch path was taken.
 
 Wall-clock results (Apple M-series, release build) for
-`square-sum-flo` warmed with 2000 calls then run at n=50000:
+`square-sum-flo` warmed with 2000 calls. After iter AO landed the
+wrapper-pattern tail-call lowering, n=1M became safe.
 
-| Tier      | wall-clock |
-|-----------|-----------:|
-| walker    | 52 ms      |
-| vm-no-jit | 11 ms      |
-| vm-jit    |  6 ms      |
+| n          | walker | vm-no-jit | vm-jit |
+|-----------:|-------:|----------:|-------:|
+| 50,000     | 52 ms  | 11 ms     |  6 ms  |
+| 1,000,000  | OOM    | 148 ms    | 10 ms  |
 
 The headline: **flonum-bound bodies that previously stayed on the
 bytecode VM now JIT through Cranelift's f64 ops, with the native
 `fadd` / `fmul` / `fsqrt` instructions doing the per-iter work.**
-At 50k iters most of the wall-clock is process startup (~5–10 ms);
-n=1M would distinguish vm-no-jit vs vm-jit more clearly but
-currently overflows the host stack on the JIT tier (the JIT'd
-`CallSelf` doesn't tail-call yet — deferred to ADR 0011 D-7's tail-
-call-lowering iter).
+At small n (50k) most of wall-clock is process startup; at 1M the
+ratio cleanly resolves to **~15× JIT-over-VM** for typed flonum
+arithmetic.
 
 Pure-arithmetic loops get the biggest win because each iter's
 per-Inst dispatch cost (bytecode) collapses to a register op (JIT).
 Loops with allocations or closure-creation are still bytecode-bound
 until the boxed-Value ABI lands (ADR 0011).
 
-### Caveat — JIT tail-call gap
+### Tail-call gap closed (iter AO)
 
-Without tail-call lowering, deeply recursive JIT'd code burns host
-stack. The bench is capped at n=50000 to stay safely under the
-default thread stack (~8 MB). Larger loops should be timed under
-`--tier vm` for now. ADR 0011 D-7 commits to Cranelift `tail_call`
-in a follow-up iter.
+Pre-AO, JIT'd `CallSelf` was a regular Cranelift `call` instruction
+that burned host stack on every recursive iter. The 50k cap was
+defensive against stack overflow.
+
+Iter AO ships the wrapper pattern from ADR 0011 D-7: every JIT'd
+function compiles as an outer SystemV trampoline + inner Tail-conv
+body. `CallSelf` in tail position lowers to Cranelift `return_call`
+against the inner FuncRef, reusing the caller's frame. The outer's
+pointer is what the runtime transmutes — transparent to all
+dispatch infrastructure.
+
+After AO, deep recursion is safe at any depth and the perf
+scoreboard finally distinguishes the JIT meaningfully from the VM
+on multi-iter typed loops.
 
 ### `(jit-status sqr-flo)` post-warm
 
