@@ -5,6 +5,8 @@ pub mod env;
 pub mod eval;
 pub mod proc;
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use cs_core::{SymbolTable, Value, WriteMode};
@@ -30,6 +32,57 @@ pub struct Runtime {
     /// still Rc-backed, so collect() has no observable side effect on
     /// existing programs — it's the seam Phase 2 swaps to a real arena.
     heap: cs_gc::Heap,
+    /// Slab of values rooted via `pin()`. Keyed by a monotonically-
+    /// increasing PinId. The shared root closure registered at
+    /// construction marks every value in here on every collect.
+    /// `Pinned<'rt>::Drop` removes its entry by id. (M5b iter 4.)
+    pinned: Rc<RefCell<HashMap<PinId, Value>>>,
+    /// Next PinId — never reused. u64 is enough for any conceivable
+    /// program lifetime (~5×10^14 pins/sec for 1000 years).
+    next_pin_id: Rc<Cell<u64>>,
+}
+
+/// Opaque handle for a [`Pinned`] slot. See [`Runtime::pin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PinId(u64);
+
+/// RAII rooting guard returned by [`Runtime::pin`].
+///
+/// While alive, the wrapped `Value` is reachable from the GC root
+/// set, surviving any number of intervening allocations and
+/// collections. On drop, the value is unrooted; if no other strong
+/// reference exists it can be swept on the next collect.
+///
+/// `Pinned` does not borrow the `Runtime`, so user code can keep
+/// calling runtime operations (eval, etc.) while a pin is alive —
+/// that's the whole point of pinning across FFI calls. Single-
+/// threaded access is enforced at runtime by the slab's `RefCell`;
+/// per ADR 0008 the concurrency story is single-threaded for now.
+pub struct Pinned {
+    id: PinId,
+    pinned: Rc<RefCell<HashMap<PinId, Value>>>,
+}
+
+impl Pinned {
+    /// The pin id (useful for debugging; equality semantics).
+    pub fn id(&self) -> PinId {
+        self.id
+    }
+
+    /// Clone of the currently-pinned value.
+    pub fn value(&self) -> Value {
+        self.pinned
+            .borrow()
+            .get(&self.id)
+            .cloned()
+            .expect("pinned value still live")
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        self.pinned.borrow_mut().remove(&self.id);
+    }
 }
 
 impl Default for Runtime {
@@ -1465,6 +1518,20 @@ impl Runtime {
             });
         }
 
+        // Pinned-value slab. The root closure traces every value in
+        // the map on every collect, so anything passed to `pin()`
+        // stays reachable until its Pinned guard drops.
+        let pinned: Rc<RefCell<HashMap<PinId, Value>>> = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let pinned_clone = Rc::clone(&pinned);
+            heap.add_root(move |marker| {
+                use cs_gc::Trace;
+                for v in pinned_clone.borrow().values() {
+                    v.trace(marker);
+                }
+            });
+        }
+
         Self {
             syms,
             sources: SourceMap::new(),
@@ -1472,7 +1539,36 @@ impl Runtime {
             macros: std::collections::HashMap::new(),
             vm_env,
             heap,
+            pinned,
+            next_pin_id: Rc::new(Cell::new(0)),
         }
+    }
+
+    /// Pin a Scheme `Value` so it survives any number of intervening
+    /// GC collections. On drop of the returned [`Pinned`] guard the
+    /// pin is released.
+    ///
+    /// Use this before holding a Value across a Scheme-level operation
+    /// that may allocate (re-entry into eval, host-procedure calls
+    /// that transitively allocate, etc.). Without pinning, the value
+    /// can be swept by the next collect.
+    ///
+    /// See `.spec-workflow/specs/ffi/{requirements,design}.md` FR-3
+    /// and ADR 0008 D-3.
+    pub fn pin(&self, v: Value) -> Pinned {
+        let id = PinId(self.next_pin_id.get());
+        self.next_pin_id.set(id.0 + 1);
+        self.pinned.borrow_mut().insert(id, v);
+        Pinned {
+            id,
+            pinned: Rc::clone(&self.pinned),
+        }
+    }
+
+    /// Number of currently-pinned values. Useful for tests and
+    /// diagnostics; should be 0 in steady state.
+    pub fn pin_count(&self) -> usize {
+        self.pinned.borrow().len()
     }
 
     /// Run a stop-the-world GC pass. Phase 1 walks the registered root
