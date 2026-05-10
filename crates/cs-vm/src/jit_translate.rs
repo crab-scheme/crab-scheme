@@ -579,7 +579,7 @@ pub fn bytecode_to_rir(
                                     | ("exact-real?", 1)
                                     | ("fixnum?", 1) => {
                                         let _ = args[0]; // load preserved for SSA correctness
-                                        insts.push(RirInst::LoadConst(dst, Const::Fixnum(1)));
+                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
                                     }
                                     ("inexact?", 1)
                                     | ("flonum?", 1)
@@ -589,7 +589,7 @@ pub fn bytecode_to_rir(
                                         // is a Fixnum, which is exact /
                                         // not a flonum / not NaN / finite.
                                         let _ = args[0];
-                                        insts.push(RirInst::LoadConst(dst, Const::Fixnum(0)));
+                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
                                     }
                                     // Identity-on-fixnum rounding ops.
                                     // (floor n), (ceiling n), etc. all
@@ -614,6 +614,53 @@ pub fn bytecode_to_rir(
                                         // decodes the i64 codepoint into a
                                         // Value::Character on the way out.
                                         insts.push(RirInst::IntCharBitcast(dst, args[0]));
+                                    }
+                                    ("char->integer", 1) => {
+                                        // Symmetric to integer->char: the i64
+                                        // *already* carries the codepoint, so
+                                        // the unboxed value is simply the
+                                        // Fixnum equivalent. dst stays Fixnum-
+                                        // typed so the default decoding wraps
+                                        // it as Number(Fixnum). This only
+                                        // fires when args[0] flowed from a
+                                        // prior integer->char in the same
+                                        // body (Fixnum→Char→Fixnum chain).
+                                        insts.push(RirInst::Move(dst, args[0]));
+                                    }
+                                    // R6RS tagged-equality on small immediates.
+                                    // For Fixnum/Boolean/Character all three
+                                    // live in the same i64 register, so an
+                                    // `Eq` instruction (which is i64 cmp)
+                                    // matches Scheme semantics. Each name
+                                    // lowers to the same RIR op; the
+                                    // type-guard at dispatch ensures both
+                                    // args are i64-shaped before we enter.
+                                    ("eq?", 2)
+                                    | ("eqv?", 2)
+                                    | ("boolean=?", 2)
+                                    | ("char=?", 2)
+                                    | ("symbol=?", 2) => {
+                                        insts.push(RirInst::Eq(dst, args[0], args[1]));
+                                    }
+                                    // Always-false predicates: JIT bodies
+                                    // are only entered when every arg is
+                                    // a Fixnum (the type guard's
+                                    // contract), so any predicate that
+                                    // discriminates "is this a non-numeric
+                                    // type?" reduces to Const(0).
+                                    ("boolean?", 1)
+                                    | ("char?", 1)
+                                    | ("pair?", 1)
+                                    | ("null?", 1)
+                                    | ("symbol?", 1)
+                                    | ("string?", 1)
+                                    | ("vector?", 1)
+                                    | ("bytevector?", 1)
+                                    | ("procedure?", 1)
+                                    | ("port?", 1)
+                                    | ("eof-object?", 1) => {
+                                        let _ = args[0];
+                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
                                     }
                                     _ => {
                                         return Err(TranslateError::Unsupported(format!(

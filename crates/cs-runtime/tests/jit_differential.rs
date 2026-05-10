@@ -356,3 +356,54 @@ fn diff_integer_to_char_returns_character() {
     assert_eq!(format!("{:?}", jit_zero), format!("{:?}", walker_zero));
     assert_eq!(format!("{:?}", jit_nine), format!("{:?}", walker_nine));
 }
+
+#[test]
+fn diff_jit_lowered_predicates_and_eq() {
+    // M6 Phase 2 iter Y: more builtins JIT-lowered. eq?/eqv?/boolean=?
+    // /char=?/symbol=? bottom out in `Eq`. Always-#f predicates
+    // (boolean?, char?, pair?, etc.) reduce to LoadConst(false) since
+    // the JIT body only runs when args are Fixnums. Always-#t
+    // (number?, fixnum?, etc.) reduce to LoadConst(true). And
+    // char->integer mirrors the iter-X integer->char path.
+    let defines = &[
+        "(define eq3 (lambda (a b c) (if (eq? a b) c 0)))",
+        "(define is-bool? (lambda (n) (boolean? n)))",
+        "(define is-num?  (lambda (n) (number? n)))",
+        "(define digit->code (lambda (n) (char->integer (integer->char (+ 48 n)))))",
+    ];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+            (if (= i 1500) 'done \
+                (begin (eq3 1 1 9) (is-bool? 7) (is-num? 7) (digit->code 3) \
+                       (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, &str)] = &[
+        ("(eq3 5 5 99)", "99"),
+        ("(eq3 5 6 99)", "0"),
+        ("(is-bool? 7)", "#f"),
+        ("(is-num? 7)", "#t"),
+        ("(digit->code 0)", "48"),
+        ("(digit->code 9)", "57"),
+    ];
+    for (expr, _) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        assert_eq!(
+            format!("{:?}", jit),
+            format!("{:?}", walker),
+            "tier-disagreement on {}: jit={:?} walker={:?}",
+            expr,
+            jit,
+            walker
+        );
+    }
+}
