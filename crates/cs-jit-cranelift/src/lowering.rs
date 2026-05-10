@@ -1,16 +1,18 @@
 //! `cs_rir::Function` → Cranelift IR lowering.
 //!
-//! Iter 2 scope: enough to JIT a Fixnum-typed pure-arithmetic
-//! function. Specifically:
+//! Iter 4 scope: pure-Fixnum function bodies with control flow.
 //!
-//! - `LoadConst(Fixnum)` and `LoadConst(Boolean)` and `LoadConst(Null)`
+//! - `LoadConst(Fixnum / Boolean / Null / Unspecified)`
 //! - `Param`
 //! - `Move`
 //! - `Add`, `Sub`, `Mul`, `Lt`, `Eq` over i64
-//! - `Term::Return`
+//! - `Term::Return`, `Term::Jump` (with block params),
+//!   `Term::Branch`
+//! - Multi-block functions (each RIR `BlockId` becomes a Cranelift
+//!   `Block`; entry block carries the function-arg params, others
+//!   carry IR-specified params).
 //!
-//! Out of scope this iter (planned for iter 3+):
-//! - `Branch` / `Jump` / blocks beyond entry
+//! Out of scope this iter (planned for iter 4b+):
 //! - `Call` / closures / env access
 //! - `DeoptCheck` (we currently trust the IR's type tags)
 //! - Flonum / Boolean arithmetic (we lower booleans via i64
@@ -20,8 +22,8 @@
 //! Calling convention: every JITted function is exposed as
 //! `extern "C" fn(i64, i64, ...) -> i64`. The runtime is responsible
 //! for unboxing Scheme `Value::Number(Fixnum)` to i64 before the
-//! call and re-boxing the i64 result. Iter 3+ extends this to
-//! richer ABIs.
+//! call and re-boxing the i64 result. Richer ABIs (closure
+//! self-reference, non-fixnum args) come once `Call` lands.
 
 use std::collections::HashMap;
 
@@ -92,17 +94,13 @@ impl Lowerer {
     /// pointer; the lowerer retains ownership of the underlying
     /// memory mapping.
     ///
-    /// Iter 2 only supports a single-block function. Multi-block
-    /// (Branch / Jump terminators) lands in iter 3.
+    /// Iter 4 supports multi-block functions with `Branch` and
+    /// `Jump` terminators. Block parameters carry per-edge values.
+    /// `Call` and `DeoptCheck` are still Unsupported (iter 4b+).
     pub fn compile_pure_fixnum(&mut self, rir: &RirFunction) -> Result<*const u8, JitError> {
-        // Validate scope.
-        if rir.blocks.len() != 1 {
-            return Err(JitError::Unsupported(format!(
-                "iter 2 lowerer accepts single-block functions only; got {}",
-                rir.blocks.len()
-            )));
+        if rir.blocks.is_empty() {
+            return Err(JitError::Codegen("function has no blocks".into()));
         }
-        let block = &rir.blocks[0];
 
         // Build a Cranelift signature. Every param is i64; return is i64.
         let mut sig = Signature::new(CallConv::SystemV);
@@ -119,16 +117,37 @@ impl Lowerer {
 
         {
             let mut builder = FunctionBuilder::new(&mut clif, &mut self.func_ctx);
-            let entry = builder.create_block();
-            builder.append_block_params_for_function_params(entry);
-            builder.switch_to_block(entry);
-            builder.seal_block(entry);
 
-            // Map RIR params to Cranelift block params.
-            let entry_params = builder.block_params(entry).to_vec();
+            // Create a Cranelift block for every RIR block, with the
+            // matching block params.
+            let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
+                HashMap::with_capacity(rir.blocks.len());
+            for rir_block in &rir.blocks {
+                let cb = builder.create_block();
+                if rir_block.id == rir.entry {
+                    // Entry block carries the function args via
+                    // append_block_params_for_function_params; skip
+                    // adding RIR-specified params (entry blocks
+                    // typically have no extra params anyway).
+                    builder.append_block_params_for_function_params(cb);
+                } else {
+                    for _ in &rir_block.params {
+                        builder.append_block_param(cb, I64);
+                    }
+                }
+                block_map.insert(rir_block.id, cb);
+            }
+
+            // Switch to the entry block and bind the function-arg
+            // params to RIR Value entries.
+            let entry_clif = *block_map
+                .get(&rir.entry)
+                .ok_or_else(|| JitError::Codegen("entry block not in block map".into()))?;
+            builder.switch_to_block(entry_clif);
+            let entry_params = builder.block_params(entry_clif).to_vec();
             if entry_params.len() != rir.params.len() {
                 return Err(JitError::Codegen(format!(
-                    "param count mismatch: rir={} clif={}",
+                    "entry param count mismatch: rir={} clif={}",
                     rir.params.len(),
                     entry_params.len()
                 )));
@@ -137,26 +156,29 @@ impl Lowerer {
                 value_map.insert(*rir_v, *clif_v);
             }
 
-            // Lower instructions.
-            for inst in &block.insts {
-                lower_inst(&mut builder, &mut value_map, inst)?;
+            // Lower each block's contents.
+            for rir_block in &rir.blocks {
+                let cb = *block_map.get(&rir_block.id).unwrap();
+                builder.switch_to_block(cb);
+
+                // Bind any non-entry RIR block params to their
+                // Cranelift block params.
+                if rir_block.id != rir.entry {
+                    let bps = builder.block_params(cb).to_vec();
+                    for ((rir_v, _ty), clif_v) in rir_block.params.iter().zip(bps.iter()) {
+                        value_map.insert(*rir_v, *clif_v);
+                    }
+                }
+
+                for inst in &rir_block.insts {
+                    lower_inst(&mut builder, &mut value_map, inst)?;
+                }
+
+                lower_terminator(&mut builder, &block_map, &value_map, &rir_block.terminator)?;
             }
 
-            // Lower terminator.
-            match &block.terminator {
-                Term::Return(v) => {
-                    let cv = value_map.get(v).copied().ok_or_else(|| {
-                        JitError::Codegen(format!("undefined return value {:?}", v))
-                    })?;
-                    builder.ins().return_(&[cv]);
-                }
-                Term::Jump(_, _) | Term::Branch(_, _, _) => {
-                    return Err(JitError::Unsupported(
-                        "Branch/Jump terminators land in iter 3".into(),
-                    ));
-                }
-            }
-
+            // All branches emitted; seal everything.
+            builder.seal_all_blocks();
             builder.finalize();
         }
 
@@ -182,6 +204,41 @@ impl Lowerer {
     pub fn module(&self) -> &JITModule {
         &self.module
     }
+}
+
+fn lower_terminator(
+    b: &mut FunctionBuilder,
+    block_map: &HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block>,
+    map: &HashMap<RirValue, cranelift_codegen::ir::Value>,
+    term: &Term,
+) -> Result<(), JitError> {
+    match term {
+        Term::Return(v) => {
+            let cv = lookup(map, *v)?;
+            b.ins().return_(&[cv]);
+        }
+        Term::Jump(target, args) => {
+            let tb = *block_map
+                .get(target)
+                .ok_or_else(|| JitError::Codegen(format!("unknown jump target {:?}", target)))?;
+            let cargs: Vec<cranelift_codegen::ir::BlockArg> = args
+                .iter()
+                .map(|a| lookup(map, *a).map(cranelift_codegen::ir::BlockArg::Value))
+                .collect::<Result<_, _>>()?;
+            b.ins().jump(tb, &cargs);
+        }
+        Term::Branch(cond, then_b, else_b) => {
+            let cv = lookup(map, *cond)?;
+            let tb = *block_map
+                .get(then_b)
+                .ok_or_else(|| JitError::Codegen(format!("unknown then target {:?}", then_b)))?;
+            let eb = *block_map
+                .get(else_b)
+                .ok_or_else(|| JitError::Codegen(format!("unknown else target {:?}", else_b)))?;
+            b.ins().brif(cv, tb, &[], eb, &[]);
+        }
+    }
+    Ok(())
 }
 
 fn lower_inst(
@@ -398,19 +455,106 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_branch_terminator_rejected() {
-        let mut f = RirFunction::new("with_branch");
+    fn lower_branch_two_arm_returns() {
+        // f(x) = if x < 10 then x else x*2
+        // entry:  cond = x < 10; brif cond, then, else
+        // then:   return x
+        // else:   t = x*2; return t
+        let mut f = RirFunction::new("clamp");
+        f.params.push((cs_rir::Value(0), cs_rir::Type::Fixnum));
         f.entry = cs_rir::BlockId(0);
         f.blocks.push(Block {
             id: cs_rir::BlockId(0),
             params: vec![],
-            insts: vec![Inst::LoadConst(cs_rir::Value(0), Const::Boolean(true))],
-            terminator: Term::Branch(cs_rir::Value(0), cs_rir::BlockId(1), cs_rir::BlockId(2)),
+            insts: vec![
+                Inst::LoadConst(cs_rir::Value(1), Const::Fixnum(10)),
+                Inst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
+            ],
+            terminator: Term::Branch(cs_rir::Value(2), cs_rir::BlockId(1), cs_rir::BlockId(2)),
+        });
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(1),
+            params: vec![],
+            insts: vec![],
+            terminator: Term::Return(cs_rir::Value(0)),
+        });
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(2),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(cs_rir::Value(3), Const::Fixnum(2)),
+                Inst::Mul(cs_rir::Value(4), cs_rir::Value(0), cs_rir::Value(3)),
+            ],
+            terminator: Term::Return(cs_rir::Value(4)),
         });
         let mut lowerer = Lowerer::new().unwrap();
+        let ptr = lowerer.compile_pure_fixnum(&f).unwrap();
+        let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
+        assert_eq!(func(5), 5);
+        assert_eq!(func(9), 9);
+        assert_eq!(func(10), 20);
+        assert_eq!(func(100), 200);
+    }
+
+    #[test]
+    fn lower_jump_with_block_param() {
+        // f(x) = let join_arg = (if x < 0 then -x else x) in join_arg + 1
+        // entry: cond = x < 0; brif cond, neg, pos
+        // neg:   t = 0 - x; jump join(t)
+        // pos:   jump join(x)
+        // join(p): r = p + 1; return r
+        let mut f = RirFunction::new("absplus1");
+        f.params.push((cs_rir::Value(0), cs_rir::Type::Fixnum));
+        f.entry = cs_rir::BlockId(0);
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(0),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(cs_rir::Value(1), Const::Fixnum(0)),
+                Inst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
+            ],
+            terminator: Term::Branch(cs_rir::Value(2), cs_rir::BlockId(1), cs_rir::BlockId(2)),
+        });
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(1),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(cs_rir::Value(3), Const::Fixnum(0)),
+                Inst::Sub(cs_rir::Value(4), cs_rir::Value(3), cs_rir::Value(0)),
+            ],
+            terminator: Term::Jump(cs_rir::BlockId(3), vec![cs_rir::Value(4)]),
+        });
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(2),
+            params: vec![],
+            insts: vec![],
+            terminator: Term::Jump(cs_rir::BlockId(3), vec![cs_rir::Value(0)]),
+        });
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(3),
+            params: vec![(cs_rir::Value(5), cs_rir::Type::Fixnum)],
+            insts: vec![
+                Inst::LoadConst(cs_rir::Value(6), Const::Fixnum(1)),
+                Inst::Add(cs_rir::Value(7), cs_rir::Value(5), cs_rir::Value(6)),
+            ],
+            terminator: Term::Return(cs_rir::Value(7)),
+        });
+        let mut lowerer = Lowerer::new().unwrap();
+        let ptr = lowerer.compile_pure_fixnum(&f).unwrap();
+        let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
+        assert_eq!(func(5), 6);
+        assert_eq!(func(-5), 6);
+        assert_eq!(func(0), 1);
+        assert_eq!(func(-100), 101);
+    }
+
+    #[test]
+    fn empty_function_rejected() {
+        let f = RirFunction::new("empty");
+        let mut lowerer = Lowerer::new().unwrap();
         match lowerer.compile_pure_fixnum(&f) {
-            Err(JitError::Unsupported(msg)) => assert!(msg.contains("Branch")),
-            other => panic!("expected Unsupported, got {:?}", other),
+            Err(JitError::Codegen(msg)) => assert!(msg.contains("no blocks")),
+            other => panic!("expected Codegen error, got {:?}", other),
         }
     }
 }

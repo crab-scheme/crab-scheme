@@ -130,18 +130,26 @@ mod tests {
     }
 
     #[test]
-    fn compile_rejects_multi_block_with_unsupported() {
+    fn compile_multi_block_with_branch_runs_natively() {
+        // Use the lowering test fixture: a 3-block function with a
+        // Branch terminator. Verifies the JitBackend trait path
+        // accepts multi-block IR (iter 4 wired this in).
         let mut b = CraneliftBackend::default();
-        let mut f = cs_rir::Function::new("multi");
+        let mut f = cs_rir::Function::new("clamp");
+        f.params.push((cs_rir::Value(0), cs_rir::Type::Fixnum));
         f.entry = cs_rir::BlockId(0);
         f.blocks.push(cs_rir::Block {
             id: cs_rir::BlockId(0),
             params: vec![],
-            insts: vec![cs_rir::Inst::LoadConst(
-                cs_rir::Value(0),
-                cs_rir::Const::Fixnum(0),
-            )],
-            terminator: cs_rir::Term::Return(cs_rir::Value(0)),
+            insts: vec![
+                cs_rir::Inst::LoadConst(cs_rir::Value(1), cs_rir::Const::Fixnum(10)),
+                cs_rir::Inst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
+            ],
+            terminator: cs_rir::Term::Branch(
+                cs_rir::Value(2),
+                cs_rir::BlockId(1),
+                cs_rir::BlockId(2),
+            ),
         });
         f.blocks.push(cs_rir::Block {
             id: cs_rir::BlockId(1),
@@ -149,10 +157,20 @@ mod tests {
             insts: vec![],
             terminator: cs_rir::Term::Return(cs_rir::Value(0)),
         });
-        match b.compile(&f) {
-            Err(JitError::Unsupported(_)) => {}
-            other => panic!("expected Unsupported, got {:?}", other),
-        }
+        f.blocks.push(cs_rir::Block {
+            id: cs_rir::BlockId(2),
+            params: vec![],
+            insts: vec![
+                cs_rir::Inst::LoadConst(cs_rir::Value(3), cs_rir::Const::Fixnum(2)),
+                cs_rir::Inst::Mul(cs_rir::Value(4), cs_rir::Value(0), cs_rir::Value(3)),
+            ],
+            terminator: cs_rir::Term::Return(cs_rir::Value(4)),
+        });
+        let jf = b.compile(&f).expect("compile multi-block");
+        let ptr = b.native_ptr(&jf).expect("native_ptr present");
+        let func: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+        assert_eq!(func(5), 5);
+        assert_eq!(func(15), 30);
     }
 
     #[test]
