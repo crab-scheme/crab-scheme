@@ -263,12 +263,15 @@ Iters 117+ are filling R7RS gaps one per iter:
 - 146 R7RS (current-error-port). Lazy string output port per Runtime
   on walker; per thread on VM via VM_CURRENT_ERROR_PORT.
 - 147 R7RS write-simple / write-shared aliases (foundation: same as
-  write since we don't generate shared notation yet) (this iter)
+  write since we don't generate shared notation yet)
+- 148 R7RS string->number with full prefix support: #x #b #o #d
+  radix prefixes, #e #i exactness, +inf.0 / -inf.0 / +nan.0 / -nan.0
+  tokens, rationals (1/2), sign on prefixed forms (this iter)
 
 Current totals:
-- 101 conformance test files (cli)
-- VM tier: 103 tests
-- Aggregate: 2016 individual Scheme tests passing
+- 102 conformance test files (cli)
+- VM tier: 104 tests
+- Aggregate: 2053 individual Scheme tests passing
 
 ## Loop cadence
 

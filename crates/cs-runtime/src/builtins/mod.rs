@@ -2861,32 +2861,117 @@ fn b_number_to_string(args: &[Value]) -> Result<Value, String> {
 }
 
 fn b_string_to_number(args: &[Value]) -> Result<Value, String> {
+    // R7RS: (string->number s [radix]). The string may include radix
+    // (#x #b #o #d) and exactness (#e #i) prefixes. Returns #f if not
+    // parseable.
     if args.is_empty() || args.len() > 2 {
         return Err(arity_err("string->number", "1 or 2", args.len()));
     }
-    let radix = if args.len() == 2 {
+    let mut radix = if args.len() == 2 {
         as_int_i64("string->number", &args[1])?
     } else {
         10
     };
-    let s = match &args[0] {
+    let raw = match &args[0] {
         Value::String(s) => s.borrow().clone(),
         v => return Err(type_err("string->number", "string", v)),
     };
-    let parsed = match radix {
+    // R7RS special-numeric tokens — return immediately.
+    match raw.as_str() {
+        "+inf.0" => return Ok(Value::Number(Number::Flonum(f64::INFINITY))),
+        "-inf.0" => return Ok(Value::Number(Number::Flonum(f64::NEG_INFINITY))),
+        "+nan.0" | "-nan.0" => return Ok(Value::Number(Number::Flonum(f64::NAN))),
+        _ => {}
+    }
+    // Strip prefixes — at most one radix prefix and one exactness prefix,
+    // in either order, per R7RS lexical syntax.
+    let mut force_exact: Option<bool> = None; // Some(true)=exact, Some(false)=inexact
+    let mut s = raw.as_str();
+    for _ in 0..2 {
+        if s.len() < 2 || !s.starts_with('#') {
+            break;
+        }
+        match &s[..2] {
+            "#x" | "#X" => {
+                radix = 16;
+                s = &s[2..];
+            }
+            "#b" | "#B" => {
+                radix = 2;
+                s = &s[2..];
+            }
+            "#o" | "#O" => {
+                radix = 8;
+                s = &s[2..];
+            }
+            "#d" | "#D" => {
+                radix = 10;
+                s = &s[2..];
+            }
+            "#e" | "#E" => {
+                force_exact = Some(true);
+                s = &s[2..];
+            }
+            "#i" | "#I" => {
+                force_exact = Some(false);
+                s = &s[2..];
+            }
+            _ => break,
+        }
+    }
+    let parsed: Option<Number> = match radix {
         10 => {
-            if s.contains('.') || s.contains('e') || s.contains('E') {
+            // Try rational first (a/b), then float, then int.
+            if let Some(slash) = s.find('/') {
+                let num: Option<i64> = s[..slash].parse().ok();
+                let den: Option<i64> = s[slash + 1..].parse().ok();
+                match (num, den) {
+                    (Some(n), Some(d)) if d != 0 => Number::Fixnum(n).div(&Number::Fixnum(d)).ok(),
+                    _ => None,
+                }
+            } else if s.contains('.') || s.contains('e') || s.contains('E') {
                 s.parse::<f64>().ok().map(Number::Flonum)
             } else {
                 s.parse::<i64>().ok().map(Number::Fixnum)
             }
         }
-        2 | 8 | 16 => i64::from_str_radix(&s, radix as u32)
-            .ok()
-            .map(Number::Fixnum),
+        2 | 8 | 16 => {
+            // Allow optional leading sign for non-decimal radices.
+            let (sign, body) = match s.strip_prefix('-') {
+                Some(rest) => (-1, rest),
+                None => match s.strip_prefix('+') {
+                    Some(rest) => (1, rest),
+                    None => (1, s),
+                },
+            };
+            i64::from_str_radix(body, radix as u32)
+                .ok()
+                .map(|v| Number::Fixnum(sign * v))
+        }
         _ => None,
     };
-    Ok(parsed.map(Value::Number).unwrap_or(Value::Boolean(false)))
+    let parsed = match parsed {
+        Some(n) => n,
+        None => return Ok(Value::Boolean(false)),
+    };
+    let final_n = match force_exact {
+        Some(true) => match parsed {
+            Number::Flonum(f) => {
+                if f.is_finite() {
+                    Number::Fixnum(f as i64)
+                } else {
+                    return Ok(Value::Boolean(false));
+                }
+            }
+            other => other,
+        },
+        Some(false) => match parsed {
+            Number::Fixnum(i) => Number::Flonum(i as f64),
+            other => other,
+        },
+        None => parsed,
+    };
+    Ok(Value::Number(final_n))
 }
 
 // ---- vectors ----
