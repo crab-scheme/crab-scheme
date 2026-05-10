@@ -59,6 +59,13 @@ pub struct Lowerer {
     ctx: Context,
     func_ctx: FunctionBuilderContext,
     next_id: u64,
+    /// User-stack-maps harvested from the most recently compiled
+    /// inner function. Keyed by code offset (PC from buffer start);
+    /// value is the list of SP-relative offsets that hold Gc<Value>
+    /// raw handles at that safepoint. Read once per compile by
+    /// `compile_pure_fixnum`'s caller, then overwritten by the next
+    /// compile. ADR 0012 D-2 (iter BL).
+    pub last_inner_stack_maps: HashMap<u32, Vec<i32>>,
     /// FuncId of the imported `vm_env_lookup_fixnum` helper.
     /// `Inst::EnvLookup` lowers to a Cranelift call against this.
     env_lookup_func: cranelift_module::FuncId,
@@ -344,6 +351,7 @@ impl Lowerer {
             ctx,
             func_ctx: FunctionBuilderContext::new(),
             next_id: 0,
+            last_inner_stack_maps: HashMap::new(),
             env_lookup_func,
             env_set_func,
             alloc_pair_func,
@@ -608,6 +616,26 @@ impl Lowerer {
         self.module
             .define_function(inner_id, &mut self.ctx)
             .map_err(|e| JitError::Codegen(format!("define_function inner: {e}")))?;
+        // ADR 0012 D-2 (iter BL) — harvest user_stack_maps before
+        // clear_context drops the compiled output. Each entry is
+        // (code_offset, _padding, UserStackMap); we flatten the
+        // map's entries into `(pc_offset, [sp_offset])` pairs and
+        // store in `self.last_inner_stack_maps` keyed by no key
+        // (caller reads-then-clears after each compile). The full
+        // per-closure registry plumbing lives in iter BM.
+        let mut maps: HashMap<u32, Vec<i32>> = HashMap::new();
+        if let Some(compiled) = self.ctx.compiled_code() {
+            for (code_offset, _padding, sm) in compiled.buffer.user_stack_maps() {
+                let mut offsets: Vec<i32> = Vec::new();
+                for (_ty, sp_off) in sm.entries() {
+                    offsets.push(sp_off as i32);
+                }
+                if !offsets.is_empty() {
+                    maps.insert(*code_offset, offsets);
+                }
+            }
+        }
+        self.last_inner_stack_maps = maps;
         self.module.clear_context(&mut self.ctx);
         Ok(())
     }
@@ -1500,6 +1528,59 @@ mod tests {
         match lowerer.compile_pure_fixnum(&f) {
             Err(JitError::Codegen(msg)) => assert!(msg.contains("no blocks")),
             other => panic!("expected Codegen error, got {:?}", other),
+        }
+    }
+
+    /// ADR 0012 D-2 (iter BL): compiling a body that keeps a Gc
+    /// handle live across a call should populate
+    /// `Lowerer::last_inner_stack_maps`. Cranelift's stack-map
+    /// machinery only records slots that are live AT a safepoint
+    /// (not just declared elsewhere) — so a body that does Cons +
+    /// immediate Return produces zero records (no call in between).
+    ///
+    /// We force one entry by doing two Cons calls: the first Cons's
+    /// result is live across the second's call site, so its slot
+    /// gets recorded.
+    #[test]
+    fn cons_body_produces_stack_maps() {
+        use cs_rir::Type;
+        // f(a, b) = let p1 = cons(a, b) in let p2 = cons(a, b) in
+        //           car(p1)  ;; consumes p1 — but it was live across
+        //                      the second cons call.
+        let mut f = RirFunction::new("two-cons-then-car");
+        f.params.push((cs_rir::Value(0), Type::Fixnum));
+        f.params.push((cs_rir::Value(1), Type::Fixnum));
+        f.entry = cs_rir::BlockId(0);
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(0),
+            params: vec![],
+            insts: vec![
+                Inst::Cons(cs_rir::Value(2), cs_rir::Value(0), 0, cs_rir::Value(1), 0),
+                Inst::Cons(cs_rir::Value(3), cs_rir::Value(0), 0, cs_rir::Value(1), 0),
+                // Consume p2 first so p1 (Value(2)) is what flows to
+                // Return — and p1 was live across the second Cons's
+                // call site.
+                Inst::AnyDrop(cs_rir::Value(3)),
+                Inst::Car(cs_rir::Value(4), cs_rir::Value(2)),
+            ],
+            terminator: Term::Return(cs_rir::Value(4)),
+        });
+        f.return_type = Type::Any;
+        let mut lowerer = Lowerer::new().unwrap();
+        lowerer
+            .compile_pure_fixnum(&f)
+            .expect("compile_pure_fixnum should succeed for two-cons body");
+        assert!(
+            !lowerer.last_inner_stack_maps.is_empty(),
+            "expected at least one stack-map record, got {}",
+            lowerer.last_inner_stack_maps.len()
+        );
+        for (pc, offsets) in &lowerer.last_inner_stack_maps {
+            assert!(
+                !offsets.is_empty(),
+                "stack-map record at PC {} has no slot offsets",
+                pc
+            );
         }
     }
 }
