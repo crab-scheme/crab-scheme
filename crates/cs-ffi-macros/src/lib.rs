@@ -1,0 +1,160 @@
+//! CrabScheme FFI proc-macro.
+//!
+//! Provides `#[host_proc("scheme-name")]` to wrap a user Rust
+//! function with the marshaling layer, producing an
+//! `Arc<dyn cs_ffi::HostProcedure>` constructor that
+//! `Runtime::register_host_procedure` accepts directly.
+//!
+//! Usage:
+//!
+//! ```ignore
+//! use cs_ffi_macros::host_proc;
+//!
+//! #[host_proc("rust-add")]
+//! fn rust_add(a: i64, b: i64) -> i64 {
+//!     a + b
+//! }
+//!
+//! // Now `rust_add_host_proc()` returns the Arc you can register:
+//! let mut rt = cs_runtime::Runtime::new();
+//! rt.register_host_procedure(rust_add_host_proc());
+//! ```
+//!
+//! See `.spec-workflow/specs/ffi/{requirements,design}.md` and
+//! `docs/adr/0008-ffi-design.md`.
+
+use proc_macro::TokenStream;
+use quote::{format_ident, quote};
+use syn::{parse_macro_input, FnArg, ItemFn, LitStr, Pat, ReturnType};
+
+/// Wrap a Rust function as a CrabScheme host procedure.
+///
+/// The macro emits:
+/// 1. The original function unchanged (so it's still callable as
+///    plain Rust).
+/// 2. A constructor `<fn_name>_host_proc()` returning
+///    `std::sync::Arc<dyn cs_ffi::HostProcedure>` that the user
+///    passes to `Runtime::register_host_procedure`.
+///
+/// The wrapper does:
+/// - Arity check: `args.len()` must match the function's parameter
+///   count, else `FfiError::ArityError`.
+/// - Per-arg `FromValue::from_value` conversion, returning
+///   `FfiError::TypeMismatch` on bad types.
+/// - User function call.
+/// - `IntoValue::into_value` on the return value (`-> ()` becomes
+///   `Value::Unspecified` automatically via `IntoValue` blanket impls).
+/// - `catch_unwind` on the whole body so any panic becomes
+///   `FfiError::Panic`.
+#[proc_macro_attribute]
+pub fn host_proc(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Attribute should be a single string literal: the Scheme-side
+    // procedure name. `#[host_proc("rust-add")]`.
+    let scheme_name = parse_macro_input!(attr as LitStr);
+    let scheme_name_str = scheme_name.value();
+
+    let user_fn = parse_macro_input!(item as ItemFn);
+    let fn_name = user_fn.sig.ident.clone();
+    let host_ctor = format_ident!("{}_host_proc", fn_name);
+
+    // Extract arg names + types so we can generate the FromValue calls.
+    let mut arg_idents: Vec<syn::Ident> = Vec::new();
+    let mut arg_types: Vec<syn::Type> = Vec::new();
+    for (i, arg) in user_fn.sig.inputs.iter().enumerate() {
+        match arg {
+            FnArg::Typed(pat_ty) => {
+                let ident = match &*pat_ty.pat {
+                    Pat::Ident(id) => id.ident.clone(),
+                    _ => format_ident!("__arg{}", i),
+                };
+                arg_idents.push(ident);
+                arg_types.push((*pat_ty.ty).clone());
+            }
+            FnArg::Receiver(_) => {
+                // `self` doesn't make sense on a free function;
+                // emit a compile error.
+                return syn::Error::new_spanned(
+                    arg,
+                    "#[host_proc] only works on free functions, not methods",
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+    }
+    let arity = arg_idents.len();
+    let arity_lit = arity as usize;
+
+    // Whether the function returns `Result<T, E>` (in which case we
+    // route the Err to FfiError::HostFailure) or a plain `T` that
+    // we pipe directly through IntoValue.
+    let returns_result = match &user_fn.sig.output {
+        ReturnType::Default => false,
+        ReturnType::Type(_, ty) => match &**ty {
+            syn::Type::Path(tp) => tp
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident == "Result")
+                .unwrap_or(false),
+            _ => false,
+        },
+    };
+
+    let arg_bindings =
+        arg_idents
+            .iter()
+            .zip(arg_types.iter())
+            .enumerate()
+            .map(|(i, (ident, ty))| {
+                quote! {
+                    let #ident: #ty = ::cs_ffi::FromValue::from_value(&__args[#i])?;
+                }
+            });
+
+    let call_user = if returns_result {
+        // Result<T, E: Display>: route Err to HostFailure.
+        quote! {
+            let __r = #fn_name(#(#arg_idents),*);
+            match __r {
+                ::std::result::Result::Ok(__v) => Ok(::cs_ffi::IntoValue::into_value(__v)),
+                ::std::result::Result::Err(__e) => {
+                    Err(::cs_ffi::FfiError::HostFailure(::std::format!("{}", __e)))
+                }
+            }
+        }
+    } else {
+        // Plain return type: pass through IntoValue.
+        quote! {
+            let __r = #fn_name(#(#arg_idents),*);
+            Ok(::cs_ffi::IntoValue::into_value(__r))
+        }
+    };
+
+    let scheme_name_for_arity = scheme_name_str.clone();
+
+    let expanded = quote! {
+        #user_fn
+
+        /// Constructor returning the host-procedure Arc that
+        /// `Runtime::register_host_procedure` accepts.
+        ///
+        /// Generated by `#[host_proc(...)]`.
+        #[allow(non_snake_case)]
+        pub fn #host_ctor() -> ::std::sync::Arc<dyn ::cs_ffi::HostProcedure> {
+            ::cs_ffi::UntypedProc::new(#scheme_name_str, |__args: &[::cs_core::Value]| {
+                if __args.len() != #arity_lit {
+                    return Err(::cs_ffi::FfiError::ArityError {
+                        name: #scheme_name_for_arity.to_string(),
+                        expected: #arity_lit.to_string(),
+                        got: __args.len(),
+                    });
+                }
+                #(#arg_bindings)*
+                #call_user
+            })
+        }
+    };
+
+    expanded.into()
+}

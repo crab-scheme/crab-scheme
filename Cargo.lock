@@ -153,6 +153,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-ffi-macros"
+version = "0.0.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "cs-gc"
 version = "0.0.1"
 
@@ -215,6 +224,7 @@ dependencies = [
  "cs-diag",
  "cs-expand",
  "cs-ffi",
+ "cs-ffi-macros",
  "cs-gc",
  "cs-ir",
  "cs-lex",

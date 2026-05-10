@@ -1,0 +1,15 @@
+[package]
+name = "cs-ffi-macros"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+description = "CrabScheme FFI proc-macro: #[host_proc] attribute that wraps user Rust functions with the marshaling layer."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
