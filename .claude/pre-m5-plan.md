@@ -270,12 +270,15 @@ Iters 117+ are filling R7RS gaps one per iter:
 - 149 R7RS number->string proper sign handling for non-decimal radix
   (was emitting two's-complement bit pattern); bigint support via
   BigInt::to_str_radix; clean error for unsupported radix or
-  non-integer + non-decimal radix (this iter)
+  non-integer + non-decimal radix
+- 150 R5RS-legacy null-environment / scheme-report-environment (R7RS
+  retains both for compat); arity-checked; reject bad versions
+  (this iter)
 
 Current totals:
-- 103 conformance test files (cli)
-- VM tier: 105 tests
-- Aggregate: 2078 individual Scheme tests passing
+- 104 conformance test files (cli)
+- VM tier: 106 tests
+- Aggregate: 2090 individual Scheme tests passing
 
 ## Loop cadence
 

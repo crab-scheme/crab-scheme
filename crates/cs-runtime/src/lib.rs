@@ -674,6 +674,44 @@ impl Runtime {
                 Ok(Value::Symbol(st.intern("__top-level-env__")))
             }),
         );
+        // R5RS/R7RS legacy environment-introspection procedures.
+        let nenv_sym = syms.intern("null-environment");
+        vm_env.define(
+            nenv_sym,
+            cs_vm::vm::make_vm_builtin_syms("null-environment", |args, st| {
+                if args.len() != 1 {
+                    return Err("null-environment: 1 arg".into());
+                }
+                let v = match &args[0] {
+                    Value::Number(n) => n.to_f64() as i64,
+                    _ => return Err("null-environment: version must be integer".into()),
+                };
+                if v != 5 {
+                    return Err(format!("null-environment: unsupported version: {}", v));
+                }
+                Ok(Value::Symbol(st.intern("__null-env__")))
+            }),
+        );
+        let srenv_sym = syms.intern("scheme-report-environment");
+        vm_env.define(
+            srenv_sym,
+            cs_vm::vm::make_vm_builtin_syms("scheme-report-environment", |args, st| {
+                if args.len() != 1 {
+                    return Err("scheme-report-environment: 1 arg".into());
+                }
+                let v = match &args[0] {
+                    Value::Number(n) => n.to_f64() as i64,
+                    _ => return Err("scheme-report-environment: version must be integer".into()),
+                };
+                if v != 5 && v != 7 {
+                    return Err(format!(
+                        "scheme-report-environment: unsupported version: {}",
+                        v
+                    ));
+                }
+                Ok(Value::Symbol(st.intern("__top-level-env__")))
+            }),
+        );
         // get-string-all does not need ctx; install as pure VM builtin.
         let gsa_sym = syms.intern("get-string-all");
         vm_env.define(

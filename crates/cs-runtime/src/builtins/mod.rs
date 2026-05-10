@@ -586,6 +586,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("eval", b_eval),
         ("environment", b_environment),
         ("interaction-environment", b_interaction_environment),
+        ("null-environment", b_null_environment),
+        ("scheme-report-environment", b_scheme_report_environment),
         ("div-and-mod", b_div_and_mod),
         ("div0-and-mod0", b_div0_and_mod0),
         ("exact-integer-sqrt", b_exact_integer_sqrt),
@@ -7920,6 +7922,39 @@ fn b_environment(_args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
 }
 
 fn b_interaction_environment(_args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
+}
+
+/// R5RS / R7RS legacy: `(null-environment version)`. Returns the
+/// "null environment" containing only syntactic-keyword bindings. We
+/// don't have separate environment frames at the foundation milestone,
+/// so this returns the same opaque sentinel as the others. The version
+/// arg is required and must be 5; reject other values.
+fn b_null_environment(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("null-environment", "1", args.len()));
+    }
+    let v = as_int_i64("null-environment", &args[0])?;
+    if v != 5 {
+        return Err(format!("null-environment: unsupported version: {}", v));
+    }
+    Ok(Value::Symbol(ctx.syms.intern("__null-env__")))
+}
+
+/// R5RS / R7RS legacy: `(scheme-report-environment version)`. Returns
+/// an environment for the named report version. We support 5 only at
+/// the foundation milestone; future iters can add 7.
+fn b_scheme_report_environment(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("scheme-report-environment", "1", args.len()));
+    }
+    let v = as_int_i64("scheme-report-environment", &args[0])?;
+    if v != 5 && v != 7 {
+        return Err(format!(
+            "scheme-report-environment: unsupported version: {}",
+            v
+        ));
+    }
     Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
 }
 
