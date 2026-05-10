@@ -173,6 +173,14 @@ pub enum Inst {
     /// the function's inferred return type. Used for `integer->char`.
     IntCharBitcast(Value, Value),
 
+    /// `dst = bits(f64::from(src))` — convert a Fixnum i64 to a
+    /// Flonum f64, then bitcast back to i64 so the value still fits
+    /// the i64-only ABI's lane. Tags dst as Flonum for the return-
+    /// type inference; the dispatcher decodes the i64 via
+    /// `f64::from_bits`. Used for `real->flonum` /
+    /// `exact->inexact`.
+    FixToFlo(Value, Value),
+
     /// Type guard: if the value's runtime type doesn't match the
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
     /// always dispatches dynamically).

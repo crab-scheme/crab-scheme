@@ -340,7 +340,8 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
 
 /// Wrap a raw i64 from a JIT'd body into the matching `Value` form
 /// based on the closure's stored return-type tag. Boolean uses 0/1
-/// from Lt/Eq; Character carries the codepoint in the low 32 bits.
+/// from Lt/Eq; Character carries the codepoint in the low 32 bits;
+/// Flonum reads the i64 as the bit pattern of an f64.
 fn decode_jit_return(rt: u8, r: i64) -> Value {
     match rt {
         JIT_RT_BOOLEAN => Value::Boolean(r != 0),
@@ -351,6 +352,10 @@ fn decode_jit_return(rt: u8, r: i64) -> Value {
             // panicking — this lines up with `decode_bytes` in the
             // codec layer.
             Value::Character(char::from_u32(r as u32).unwrap_or('\u{FFFD}'))
+        }
+        JIT_RT_FLONUM => {
+            let f = f64::from_bits(r as u64);
+            Value::Number(cs_core::Number::Flonum(f))
         }
         _ => Value::Number(cs_core::Number::Fixnum(r)),
     }
@@ -540,6 +545,7 @@ pub struct VmClosure {
 pub const JIT_RT_FIXNUM: u8 = 0;
 pub const JIT_RT_BOOLEAN: u8 = 1;
 pub const JIT_RT_CHARACTER: u8 = 2;
+pub const JIT_RT_FLONUM: u8 = 3;
 
 impl VmClosure {
     /// Install a native function pointer compiled by the JIT, with

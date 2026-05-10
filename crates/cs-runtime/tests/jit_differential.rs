@@ -407,3 +407,39 @@ fn diff_jit_lowered_predicates_and_eq() {
         );
     }
 }
+
+#[test]
+fn diff_real_to_flonum_returns_flonum() {
+    // M6 Phase 2 iter Z: procedures whose body ends in
+    // `(real->flonum ...)` (or `(exact->inexact ...)`) JIT and
+    // decode the i64 carrier as the bit pattern of an f64.
+    let defines = &[
+        "(define to-flo (lambda (n) (real->flonum n)))",
+        "(define to-inex (lambda (n) (exact->inexact n)))",
+    ];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (to-flo i) (to-inex i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[&str] = &["(to-flo 0)", "(to-flo 5)", "(to-flo -7)", "(to-inex 42)"];
+    for expr in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        // Flonum agreement on bit-pattern.
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Flonum(a)),
+                Value::Number(cs_core::Number::Flonum(b)),
+            ) => assert_eq!(a.to_bits(), b.to_bits(), "tier-disagreement on {}", expr),
+            other => panic!("expected flonums on {}, got {:?}", expr, other),
+        }
+    }
+}

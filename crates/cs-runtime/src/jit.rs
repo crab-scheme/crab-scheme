@@ -98,6 +98,7 @@ fn jit_tier_up_hook(closure: &VmClosure) {
     let rt_tag = match rir.return_type {
         cs_vm::RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
         cs_vm::RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,
+        cs_vm::RirType::Flonum => cs_vm::vm::JIT_RT_FLONUM,
         _ => cs_vm::vm::JIT_RT_FIXNUM,
     };
     closure.set_jit_return_type(rt_tag);

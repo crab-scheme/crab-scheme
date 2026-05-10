@@ -615,6 +615,15 @@ pub fn bytecode_to_rir(
                                         // Value::Character on the way out.
                                         insts.push(RirInst::IntCharBitcast(dst, args[0]));
                                     }
+                                    ("real->flonum", 1) | ("exact->inexact", 1) => {
+                                        // Convert the i64 Fixnum into f64
+                                        // bits via Cranelift's
+                                        // fcvt_from_sint+bitcast. The
+                                        // return-type post-pass tags dst as
+                                        // Flonum; dispatcher decodes via
+                                        // f64::from_bits.
+                                        insts.push(RirInst::FixToFlo(dst, args[0]));
+                                    }
                                     ("char->integer", 1) => {
                                         // Symmetric to integer->char: the i64
                                         // *already* carries the codepoint, so
@@ -748,6 +757,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     use cs_rir::Const;
     let mut bool_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     let mut char_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
+    let mut flo_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     for block in &func.blocks {
         for inst in &block.insts {
             match inst {
@@ -763,6 +773,12 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::LoadConst(dst, Const::Character(_)) => {
                     char_values.insert(*dst);
                 }
+                RirInst::FixToFlo(dst, _) => {
+                    flo_values.insert(*dst);
+                }
+                RirInst::LoadConst(dst, Const::Flonum(_)) => {
+                    flo_values.insert(*dst);
+                }
                 _ => {}
             }
         }
@@ -770,9 +786,12 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     let mut seen_fixnum = false;
     let mut seen_bool = false;
     let mut seen_char = false;
+    let mut seen_flo = false;
     for block in &func.blocks {
         if let Term::Return(v) = &block.terminator {
-            if char_values.contains(v) {
+            if flo_values.contains(v) {
+                seen_flo = true;
+            } else if char_values.contains(v) {
                 seen_char = true;
             } else if bool_values.contains(v) {
                 seen_bool = true;
@@ -786,9 +805,10 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     // Fixnum (the conservative default — caller will see wrapped
     // numbers; the type guard at the dispatch site catches misuse
     // downstream rather than masking it as a wrong-type Value).
-    match (seen_char, seen_bool, seen_fixnum) {
-        (true, false, false) => Type::Character,
-        (false, true, false) => Type::Boolean,
+    match (seen_flo, seen_char, seen_bool, seen_fixnum) {
+        (true, false, false, false) => Type::Flonum,
+        (false, true, false, false) => Type::Character,
+        (false, false, true, false) => Type::Boolean,
         _ => Type::Fixnum,
     }
 }

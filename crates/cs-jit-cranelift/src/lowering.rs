@@ -33,7 +33,8 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::{
-    types::I64, AbiParam, Function as ClifFunction, InstBuilder, Signature, UserFuncName,
+    types::{F64, I64},
+    AbiParam, Function as ClifFunction, InstBuilder, Signature, UserFuncName,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
@@ -325,6 +326,11 @@ fn lower_inst(
                 Const::Boolean(true) => b.ins().iconst(I64, 1),
                 Const::Boolean(false) => b.ins().iconst(I64, 0),
                 Const::Character(c) => b.ins().iconst(I64, *c as u32 as i64),
+                Const::Flonum(f) => {
+                    // Encode the f64 directly as the i64 bit pattern;
+                    // the decoder reads back via `f64::from_bits`.
+                    b.ins().iconst(I64, f.to_bits() as i64)
+                }
                 Const::Null => b.ins().iconst(I64, 0),
                 Const::Unspecified => b.ins().iconst(I64, 0),
                 other => {
@@ -394,6 +400,18 @@ fn lower_inst(
             // type tag changes for the return-type post-pass.
             let v = lookup(map, *src)?;
             map.insert(*dst, v);
+        }
+        Inst::FixToFlo(dst, src) => {
+            // Convert the Fixnum i64 to f64, then bitcast the f64
+            // back to i64 so the value still rides the i64 ABI lane.
+            // The dispatcher decodes via `f64::from_bits` based on
+            // the Flonum return-type tag.
+            let v = lookup(map, *src)?;
+            let f = b.ins().fcvt_from_sint(F64, v);
+            let bits = b
+                .ins()
+                .bitcast(I64, cranelift_codegen::ir::MemFlags::new(), f);
+            map.insert(*dst, bits);
         }
         Inst::Param(_, _) => {
             // Param entries are populated from the entry block's
