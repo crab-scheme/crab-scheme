@@ -253,9 +253,10 @@ parked with a clear postmortem ADR.
 
 ---
 
-## M8: First-class Continuations
+## M8: First-class Continuations ✅ DONE (VM tier; walker tier deferred)
 
 **Spec slug:** `continuations`
+**Exit:** [`docs/milestones/m8-exit.md`](docs/milestones/m8-exit.md), tag `m8-vm-complete`.
 
 R6RS mandates `call-with-current-continuation`. Foundation explicitly punted
 on this; the macros and JIT spec did too. M8 implements full continuations.
