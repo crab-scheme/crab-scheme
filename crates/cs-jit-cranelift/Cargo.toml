@@ -11,13 +11,11 @@ cs-core = { path = "../cs-core" }
 cs-rir = { path = "../cs-rir" }
 cs-jit = { path = "../cs-jit" }
 
-# Cranelift dependencies — pinned per ADR 0007 D-9. The codegen and JIT
-# crates evolve together; bump in lockstep.
-#
-# Wired up in iter 2 once the lowering lands. Iter 1 ships only the
-# scaffold so we can land the trait + tier-up state machine without
-# blocking on Cranelift's compile time on first use.
-# cranelift-codegen = "0.105"
-# cranelift-frontend = "0.105"
-# cranelift-jit      = "0.105"
-# cranelift-module   = "0.105"
+# Cranelift — codegen + frontend + JIT module + module trait. Bump
+# in lockstep per ADR 0007 D-9. Iter 2 picks 0.131 (latest stable
+# at the time of M5b → M6 handoff).
+cranelift-codegen = { workspace = true }
+cranelift-frontend = { workspace = true }
+cranelift-jit = { workspace = true }
+cranelift-module = { workspace = true }
+cranelift-native = { workspace = true }

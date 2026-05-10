@@ -52,6 +52,11 @@ num-traits = "0.2"
 unicode-normalization = "0.1"
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
+cranelift-codegen = "0.131"
+cranelift-frontend = "0.131"
+cranelift-jit = "0.131"
+cranelift-module = "0.131"
+cranelift-native = "0.131"
 libloading = "0.8"
 proptest = "1"
 

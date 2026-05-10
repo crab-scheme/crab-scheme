@@ -3,24 +3,50 @@
 //! Lowers `cs_rir::Function` to Cranelift `clif` IR and produces
 //! native code via `cranelift-jit`.
 //!
-//! M6 iter 1 (this iter) ships only the backend scaffolding —
-//! a struct that implements `JitBackend` but rejects every IR with
-//! `JitError::Unsupported("not yet implemented")`. Iter 2 adds the
-//! `LoadConst` and arithmetic lowerings; subsequent iters fill in
-//! the rest of the IR per the schedule in `design.md`.
+//! M6 iter 2 (this iter) lowers single-block, pure-Fixnum functions
+//! (`LoadConst` + `Add`/`Sub`/`Mul`/`Lt`/`Eq` + `Param` + `Move` +
+//! `Term::Return`). Iter 3+ adds Branch/Jump/Call.
 //!
 //! See `.spec-workflow/specs/jit-cranelift/{requirements,design}.md`
 //! and `docs/adr/0007-jit-design.md`.
 
+pub mod lowering;
+
+pub use lowering::Lowerer;
+
+use std::collections::HashMap;
+
 use cs_jit::{JitBackend, JitError, JitFn, TypeFeedback};
 
 /// Cranelift-backed JIT backend.
-#[derive(Default)]
+///
+/// Owns a single [`Lowerer`] (which owns the underlying Cranelift
+/// `JITModule`); each `compile` populates the module with one more
+/// function and stashes the resulting native pointer keyed by the
+/// returned [`JitFn::cookie`]. The runtime's tier-up code consults
+/// the cookie to retrieve the pointer for invocation.
 pub struct CraneliftBackend {
+    lowerer: Option<Lowerer>,
     next_cookie: u64,
-    // Iter 2 wires in the JIT module + isa builder here:
-    // module: cranelift_jit::JITModule,
-    // ctx: cranelift_codegen::Context,
+    /// `JitFn::cookie` -> finalized native pointer. Populated by
+    /// [`compile`]; consumed by the runtime via [`native_ptr`].
+    finalized: HashMap<u64, *const u8>,
+}
+
+// SAFETY: The native pointers in `finalized` are owned by the
+// `Lowerer`'s `JITModule`. Their lifetime is tied to the backend
+// instance and the JIT memory mapping — both single-threaded.
+// Mark Send so this can live on a Runtime that is itself Send.
+unsafe impl Send for CraneliftBackend {}
+
+impl Default for CraneliftBackend {
+    fn default() -> Self {
+        Self {
+            lowerer: None,
+            next_cookie: 0,
+            finalized: HashMap::new(),
+        }
+    }
 }
 
 impl JitBackend for CraneliftBackend {
@@ -28,17 +54,26 @@ impl JitBackend for CraneliftBackend {
         "cranelift"
     }
 
-    fn compile(&mut self, _rir: &cs_rir::Function) -> Result<JitFn, JitError> {
-        // Iter 1 stub: every compile request is rejected. The runtime
-        // falls back to the VM dispatch path. This lets us land the
-        // trait + tier-up state machine without blocking on Cranelift
-        // version pinning + lowering work.
-        Err(JitError::Unsupported(
-            "cranelift lowering scaffolded; instruction lowering lands in iter 2".into(),
-        ))
+    fn compile(&mut self, rir: &cs_rir::Function) -> Result<JitFn, JitError> {
+        if self.lowerer.is_none() {
+            self.lowerer = Some(Lowerer::new()?);
+        }
+        let lowerer = self.lowerer.as_mut().unwrap();
+        let ptr = lowerer.compile_pure_fixnum(rir)?;
+        let cookie = self.next_cookie;
+        self.next_cookie += 1;
+        self.finalized.insert(cookie, ptr);
+        Ok(JitFn {
+            backend: "cranelift",
+            cookie,
+            feedback: TypeFeedback::default(),
+        })
     }
 
     fn dump_native(&self, _jf: &JitFn) -> Vec<u8> {
+        // Iter 8 wires this to actual disassembly (`(jit-dump <proc>)`
+        // REPL primitive). Iter 2 returns empty bytes; the runtime
+        // doesn't expose dump until then.
         Vec::new()
     }
 }
@@ -63,6 +98,12 @@ impl CraneliftBackend {
             feedback: TypeFeedback::default(),
         }
     }
+
+    /// Look up the finalized native pointer for a `JitFn` cookie
+    /// previously returned by [`compile`].
+    pub fn native_ptr(&self, jf: &JitFn) -> Option<*const u8> {
+        self.finalized.get(&jf.cookie).copied()
+    }
 }
 
 #[cfg(test)]
@@ -76,9 +117,38 @@ mod tests {
     }
 
     #[test]
-    fn compile_returns_unsupported_for_now() {
+    fn compile_pure_fixnum_via_jit_backend_trait() {
         let mut b = CraneliftBackend::default();
-        let f = cs_rir::Function::new("test");
+        let f = lowering::testing::add_two_fixnums();
+        let jf = b.compile(&f).expect("compile via JitBackend");
+        assert_eq!(jf.backend, "cranelift");
+        let ptr = b.native_ptr(&jf).expect("native_ptr present");
+        // SAFETY: ptr is the address of a finalized native function
+        // with the (i64, i64) -> i64 signature we declared.
+        let func: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+        assert_eq!(func(40, 2), 42);
+    }
+
+    #[test]
+    fn compile_rejects_multi_block_with_unsupported() {
+        let mut b = CraneliftBackend::default();
+        let mut f = cs_rir::Function::new("multi");
+        f.entry = cs_rir::BlockId(0);
+        f.blocks.push(cs_rir::Block {
+            id: cs_rir::BlockId(0),
+            params: vec![],
+            insts: vec![cs_rir::Inst::LoadConst(
+                cs_rir::Value(0),
+                cs_rir::Const::Fixnum(0),
+            )],
+            terminator: cs_rir::Term::Return(cs_rir::Value(0)),
+        });
+        f.blocks.push(cs_rir::Block {
+            id: cs_rir::BlockId(1),
+            params: vec![],
+            insts: vec![],
+            terminator: cs_rir::Term::Return(cs_rir::Value(0)),
+        });
         match b.compile(&f) {
             Err(JitError::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {:?}", other),
