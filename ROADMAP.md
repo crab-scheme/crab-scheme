@@ -184,9 +184,10 @@ abort; ABI drift between runtime + shared lib. All mitigated via the
 
 ---
 
-## M6: JIT Abstraction + Cranelift Backend
+## M6: JIT Abstraction + Cranelift Backend ✅ DONE (Phase 1)
 
 **Spec slug:** `jit-cranelift`
+**Exit:** [`docs/milestones/m6-exit.md`](docs/milestones/m6-exit.md), tag `m6-complete`.
 
 Before HolyJIT, we land Cranelift as the *first* JIT backend so we have a
 known-working tier and a baseline to differentially test the HolyJIT backend
