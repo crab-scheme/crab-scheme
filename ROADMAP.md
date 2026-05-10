@@ -108,9 +108,10 @@ Components:
 
 ---
 
-## M5: Precise Tracing GC
+## M5: Precise Tracing GC ✅ DONE
 
 **Spec slug:** `gc`
+**Exit report:** [`docs/milestones/m5-exit.md`](docs/milestones/m5-exit.md) (tag `m5-complete`)
 
 Foundation/M4 use `Rc<RefCell<…>>` reference counting. That's fine for
 correctness but leaks on cycles unless we run a cycle collector, and it

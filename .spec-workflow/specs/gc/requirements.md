@@ -1,9 +1,10 @@
 # M5 GC — Requirements
 
-> Status: **Draft**
+> Status: **CLOSED**. Exit report: `docs/milestones/m5-exit.md`.
 > Spec slug: `gc`
 > Roadmap slot: M5
 > Predecessor: M4 Bytecode VM (see `docs/milestones/m4-exit.md`)
+> Phase 2 (generational copying / arena swap) tracked as M5 follow-up.
 
 This spec replaces foundation/M4's `Rc<RefCell<...>>`-based heap with
 a precise tracing garbage collector. The exit gate per the roadmap:

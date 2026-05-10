@@ -1,6 +1,10 @@
 # M5 GC — Design
 
-> Status: **Draft** — sketch only, fills out as we land Phase 1.
+> Status: **CLOSED** at `m5-complete` tag. Exit report:
+> `docs/milestones/m5-exit.md`.
+> Phase 1 (mark-sweep + Rc-backed slots) shipped per this design.
+> Phase 2 (arena swap, generational copying) is tracked as a
+> post-M5 perf-track follow-up.
 > Companion: `requirements.md`.
 
 ## Overview

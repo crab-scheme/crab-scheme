@@ -1,7 +1,11 @@
-# Pre-M5 Plan
+# Pre-M5 Plan — RETIRED
 
-> Active plan for the iterative `/loop` work. Follow this in order. Each
-> item is one or more iters; finish before starting the next.
+> **Status**: retired. M5 closed at the merge of `m5-complete`; see
+> `docs/milestones/m5-exit.md` for the exit report.
+>
+> Kept as a historical artifact of how the iterative `/loop` work
+> walked through Phase 1 of M5 plus the R7RS conformance sweep that
+> followed.
 
 ## Goal
 
