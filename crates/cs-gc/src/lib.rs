@@ -101,6 +101,58 @@ impl<T: ?Sized> Gc<T> {
     pub fn as_addr(this: &Self) -> usize {
         Rc::as_ptr(&this.inner) as *const () as usize
     }
+
+    /// Hand off this `Gc<T>` as a raw handle for ABI use (e.g. carried
+    /// as an i64 across the JIT/runtime boundary). Pair every call with
+    /// exactly one `from_raw_jit` to release ownership, or with
+    /// `raw_incref` to share without taking ownership. The returned
+    /// pointer is opaque — it carries the inner `Slot<T>` address and
+    /// retains the strong refcount the caller held.
+    ///
+    /// ADR 0012 D-2 — Cranelift stack maps will rely on this to spill
+    /// live `Gc<T>` references to the host stack as plain i64 words
+    /// without losing GC visibility.
+    pub fn into_raw_jit(this: Self) -> *const ()
+    where
+        T: Sized,
+    {
+        Rc::into_raw(this.inner) as *const ()
+    }
+
+    /// Reconstitute a `Gc<T>` from a raw handle previously produced by
+    /// [`into_raw_jit`].
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be the result of a matching `into_raw_jit` call (or a
+    /// `raw_incref` bump) for the same `T`, and ownership of one strong
+    /// count must transfer here. Calling twice on the same pointer
+    /// without an intervening `raw_incref` is a double-free.
+    pub unsafe fn from_raw_jit(ptr: *const ()) -> Self
+    where
+        T: Sized + 'static,
+    {
+        Gc {
+            inner: unsafe { Rc::from_raw(ptr as *const Slot<T>) },
+        }
+    }
+
+    /// Bump the strong count for a raw handle without consuming a
+    /// reference. Used by the Cranelift stack-map root walker when it
+    /// needs to borrow a spilled slot for tracing — the caller does
+    /// **not** own the resulting reference until it pairs the bump
+    /// with [`from_raw_jit`].
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point at a live allocation produced by
+    /// [`into_raw_jit`] on the same `T`.
+    pub unsafe fn raw_incref(ptr: *const ())
+    where
+        T: Sized + 'static,
+    {
+        unsafe { Rc::increment_strong_count(ptr as *const Slot<T>) }
+    }
 }
 
 impl<T: Trace + 'static> Gc<T> {
@@ -569,5 +621,36 @@ mod tests {
         // Second mark within the same pass is a no-op.
         assert!(!marker.mark(&g));
         assert_eq!(marker.visited(), 1);
+    }
+
+    #[test]
+    fn raw_jit_handle_roundtrips() {
+        // ADR 0012 D-2 — `Gc::into_raw_jit` / `from_raw_jit` pair
+        // must round-trip without changing strong count.
+        let g = Gc::new(Leaf { n: 42 });
+        let strong_before = Rc::strong_count(&g.inner);
+        let ptr = Gc::into_raw_jit(g);
+        // SAFETY: ptr came from the matching into_raw_jit.
+        let g2: Gc<Leaf> = unsafe { Gc::from_raw_jit(ptr) };
+        let strong_after = Rc::strong_count(&g2.inner);
+        assert_eq!(strong_before, strong_after);
+        assert_eq!(g2.n, 42);
+    }
+
+    #[test]
+    fn raw_incref_then_release() {
+        // raw_incref bumps the count by one; one extra from_raw_jit
+        // releases the bump cleanly. Both handles see the same value.
+        let g = Gc::new(Leaf { n: 7 });
+        let ptr = Gc::into_raw_jit(g.clone()); // strong count = 2
+        let strong_after_clone = Rc::strong_count(&g.inner);
+        assert_eq!(strong_after_clone, 2);
+        // Now bump via raw_incref — count = 3.
+        unsafe { Gc::<Leaf>::raw_incref(ptr) };
+        assert_eq!(Rc::strong_count(&g.inner), 3);
+        // Release both raw refs.
+        let _ = unsafe { Gc::<Leaf>::from_raw_jit(ptr) }; // drops one
+        let _ = unsafe { Gc::<Leaf>::from_raw_jit(ptr) }; // drops the other
+        assert_eq!(Rc::strong_count(&g.inner), 1);
     }
 }

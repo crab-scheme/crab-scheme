@@ -896,6 +896,18 @@ pub const JIT_RT_NULL: u8 = 14;
 /// Polymorphic slot — i64 carries `Box::into_raw(Box<Value>)`. Per
 /// ADR 0011 D-3, used at megamorphic call sites.
 pub const JIT_RT_ANY: u8 = 15;
+/// Polymorphic slot (Gc-backed) — i64 carries the raw handle from
+/// `Gc::into_raw_jit`. The GC-aware successor to `JIT_RT_ANY` per
+/// ADR 0012 D-2; the migration plan (iters BD–BG) gradually moves
+/// each Box-using helper to a Gc-using counterpart, after which
+/// `JIT_RT_ANY` is retired.
+///
+/// **Encoding note:** lives outside the 4-bit nibble space for now.
+/// While the migration is in flight, param slots continue using
+/// `JIT_RT_ANY = 15` and the `jit_return_type` u8 can carry either.
+/// Iter BG repurposes nibble 15 (`JIT_RT_ANY` → `JIT_RT_GC`) once
+/// every helper is converted.
+pub const JIT_RT_GC: u8 = 16;
 
 /// Default `jit_param_types` value: every nibble = JIT_RT_FIXNUM (0).
 pub const JIT_PARAM_TYPES_ALL_FIXNUM: u32 = 0;
