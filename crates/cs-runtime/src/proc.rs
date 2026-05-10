@@ -157,8 +157,12 @@ pub fn make_host_builtin(
     name: &'static str,
     f: std::sync::Arc<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync>,
 ) -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(HostBuiltin { name, f });
-    Value::Procedure(p)
+    // Use cs-vm's VmHostBuiltin so the same Value dispatches on both
+    // tiers. Walker tier got a VmHostBuiltin downcast in M9 iter 2;
+    // the VM tier already has it. The cs-runtime `HostBuiltin` type
+    // above stays for legacy register_host_procedure paths that
+    // build it directly; new code should call this helper.
+    cs_vm::vm::make_vm_host_builtin(name, f)
 }
 
 pub fn make_builtin_higher(name: &'static str, f: HoBuiltinFn) -> Value {

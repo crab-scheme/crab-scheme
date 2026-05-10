@@ -199,6 +199,12 @@ pub fn apply_procedure(
             if let Some(h) = any.downcast_ref::<crate::proc::HostBuiltin>() {
                 return (h.f)(args).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY));
             }
+            // Closure-bearing builtins constructed via make_host_builtin
+            // ride cs-vm's VmHostBuiltin so they dispatch on both tiers.
+            // Walker downcast added in M9 iter 2.
+            if let Some(h) = any.downcast_ref::<cs_vm::vm::VmHostBuiltin>() {
+                return (h.f)(args).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY));
+            }
             if let Some(c) = any.downcast_ref::<Closure>() {
                 if !c.params.accepts_arity(args.len()) {
                     return Err(EvalError::new(
@@ -342,6 +348,10 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
                             return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
                         }
                         if let Some(h) = any.downcast_ref::<crate::proc::HostBuiltin>() {
+                            let res = (h.f)(&arg_vals);
+                            return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
+                        }
+                        if let Some(h) = any.downcast_ref::<cs_vm::vm::VmHostBuiltin>() {
                             let res = (h.f)(&arg_vals);
                             return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
                         }

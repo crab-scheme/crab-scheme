@@ -90,6 +90,18 @@ fn vm_conformance_arithmetic() {
 }
 
 #[test]
+fn vm_conformance_enumerations() {
+    let walker = pass_count_walker("enumerations.scm");
+    let vm = pass_count_vm("enumerations.scm").expect("vm should run enumerations.scm");
+    println!("enumerations: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+    assert!(
+        walker > 20,
+        "enumerations.scm should have >20 passing assertions"
+    );
+}
+
+#[test]
 fn vm_conformance_numeric_extras() {
     let walker = pass_count_walker("numeric_extras.scm");
     let vm = pass_count_vm("numeric_extras.scm").expect("vm should run numeric_extras.scm");

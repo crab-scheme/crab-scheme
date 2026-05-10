@@ -495,6 +495,24 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("hashtable-mutable?", b_hashtable_mutable_p),
         ("hashtable-hash-function", b_hashtable_hash_function),
         ("make-parameter", b_make_parameter),
+        // (rnrs enums) — R6RS §13. Each enum-set is encoded as
+        // #("__enum-set__" #(<universe symbols>) <bits-fixnum>).
+        // M9 iter 2 limits the universe to ≤63 symbols (fixnum bitset);
+        // larger universes can land later as a follow-up.
+        ("make-enumeration", b_make_enumeration),
+        ("enum-set?", b_enum_set_p),
+        ("enum-set-universe", b_enum_set_universe),
+        ("enum-set-indexer", b_enum_set_indexer),
+        ("enum-set-constructor", b_enum_set_constructor),
+        ("enum-set->list", b_enum_set_to_list),
+        ("enum-set-member?", b_enum_set_member_p),
+        ("enum-set-subset?", b_enum_set_subset_p),
+        ("enum-set=?", b_enum_set_eq_p),
+        ("enum-set-union", b_enum_set_union),
+        ("enum-set-intersection", b_enum_set_intersection),
+        ("enum-set-difference", b_enum_set_difference),
+        ("enum-set-complement", b_enum_set_complement),
+        ("enum-set-projection", b_enum_set_projection),
         // SRFI-1 list ops (pure)
         ("delete", b_delete),
         ("delete-duplicates", b_delete_duplicates),
@@ -9736,4 +9754,360 @@ fn b_read(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         },
         v => Err(type_err("read", "input-port", v)),
     }
+}
+
+// ============================================================================
+// (rnrs enums) — R6RS §13. M9 iter 2.
+//
+// Encoding: #("__enum-set__" #(<universe symbols>) <bits-fixnum>).
+// - Slot 0: tag string (so `enum-set?` is a structural check).
+// - Slot 1: shared universe vector (Symbol values, in canonical order).
+// - Slot 2: bitset over universe positions (fixnum, 63 bits usable).
+//
+// Set operations preserve the universe; mismatched universes between
+// args are an error (R6RS specifies "same enumeration type").
+// ============================================================================
+
+const ENUMSET_TAG: &str = "__enum-set__";
+
+/// Build an enum-set Value from a universe + bits.
+fn enum_set_value(universe: Vec<Value>, bits: i64) -> Value {
+    let triple = vec![
+        Value::string(ENUMSET_TAG.to_string()),
+        Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(universe))),
+        Value::fixnum(bits),
+    ];
+    Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(triple)))
+}
+
+/// True if `v` is an enum-set value (matches the `__enum-set__`
+/// encoding).
+fn is_enum_set(v: &Value) -> bool {
+    if let Value::Vector(vec) = v {
+        let b = vec.borrow();
+        if b.len() != 3 {
+            return false;
+        }
+        if let Value::String(s) = &b[0] {
+            return *s.borrow() == ENUMSET_TAG;
+        }
+    }
+    false
+}
+
+/// Decompose an enum-set into (universe, bits). Returns Err for
+/// non-enum-set values.
+fn enum_set_parts(v: &Value) -> Result<(Vec<Value>, i64), String> {
+    if let Value::Vector(vec) = v {
+        let b = vec.borrow();
+        if b.len() == 3 {
+            if let (Value::String(_), Value::Vector(uv), Value::Number(Number::Fixnum(bits))) =
+                (&b[0], &b[1], &b[2])
+            {
+                let uv = uv.borrow().clone();
+                return Ok((uv, *bits));
+            }
+        }
+    }
+    Err("enum-set expected".to_string())
+}
+
+/// Find a symbol's 0-based index in the universe; returns None if
+/// not in the universe.
+fn enum_index_of(universe: &[Value], sym: cs_core::Symbol) -> Option<usize> {
+    universe
+        .iter()
+        .position(|v| matches!(v, Value::Symbol(s) if *s == sym))
+}
+
+fn b_make_enumeration(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("make-enumeration", "1", args.len()));
+    }
+    let mut universe: Vec<Value> = Vec::new();
+    let mut cur = args[0].clone();
+    loop {
+        match cur {
+            Value::Null => break,
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                match &car {
+                    Value::Symbol(_) => universe.push(car.clone()),
+                    other => {
+                        return Err(format!(
+                            "make-enumeration: expected symbol, got {}",
+                            other.type_name()
+                        ));
+                    }
+                }
+                cur = p.cdr.borrow().clone();
+            }
+            v => {
+                return Err(type_err("make-enumeration", "list of symbols", &v));
+            }
+        }
+    }
+    if universe.len() > 63 {
+        return Err(format!(
+            "make-enumeration: universe of {} symbols exceeds 63-symbol cap",
+            universe.len()
+        ));
+    }
+    // Universe enum-set has all bits set.
+    let bits = if universe.is_empty() {
+        0
+    } else {
+        (1i64 << universe.len()) - 1
+    };
+    Ok(enum_set_value(universe, bits))
+}
+
+fn b_enum_set_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("enum-set?", "1", args.len()));
+    }
+    Ok(Value::Boolean(is_enum_set(&args[0])))
+}
+
+fn b_enum_set_universe(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("enum-set-universe", "1", args.len()));
+    }
+    let (universe, _) = enum_set_parts(&args[0]).map_err(|e| format!("enum-set-universe: {e}"))?;
+    let n = universe.len();
+    let bits = if n == 0 { 0 } else { (1i64 << n) - 1 };
+    Ok(enum_set_value(universe, bits))
+}
+
+/// Extract universe symbols (Copy) from an enum-set Value.
+fn enum_set_symbols(v: &Value) -> Result<Vec<cs_core::Symbol>, String> {
+    let (universe, _) = enum_set_parts(v)?;
+    let mut out: Vec<cs_core::Symbol> = Vec::with_capacity(universe.len());
+    for u in &universe {
+        match u {
+            Value::Symbol(s) => out.push(*s),
+            other => {
+                return Err(format!(
+                    "enum-set: universe contains non-symbol ({})",
+                    other.type_name()
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Re-materialize a universe Vec<Value> from a Vec<Symbol>. Used
+/// by closure-bearing builtins that capture only Symbol (Send+Sync)
+/// and rebuild Value at call time.
+fn universe_from_symbols(syms: &[cs_core::Symbol]) -> Vec<Value> {
+    syms.iter().map(|s| Value::Symbol(*s)).collect()
+}
+
+fn b_enum_set_indexer(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("enum-set-indexer", "1", args.len()));
+    }
+    let symbols = enum_set_symbols(&args[0]).map_err(|e| format!("enum-set-indexer: {e}"))?;
+    // Capture Vec<Symbol> (Send + Sync because Symbol is Copy + Send).
+    let f = std::sync::Arc::new(move |args: &[Value]| -> Result<Value, String> {
+        if args.len() != 1 {
+            return Err(arity_err("indexer", "1", args.len()));
+        }
+        match &args[0] {
+            Value::Symbol(s) => match symbols.iter().position(|p| p == s) {
+                Some(i) => Ok(Value::fixnum(i as i64)),
+                None => Ok(Value::Boolean(false)),
+            },
+            v => Err(type_err("indexer", "symbol", v)),
+        }
+    });
+    Ok(crate::proc::make_host_builtin("enum-set-indexer", f))
+}
+
+fn b_enum_set_constructor(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("enum-set-constructor", "1", args.len()));
+    }
+    let symbols = enum_set_symbols(&args[0]).map_err(|e| format!("enum-set-constructor: {e}"))?;
+    let f = std::sync::Arc::new(move |args: &[Value]| -> Result<Value, String> {
+        if args.len() != 1 {
+            return Err(arity_err("constructor", "1", args.len()));
+        }
+        let mut bits: i64 = 0;
+        let mut cur = args[0].clone();
+        loop {
+            match cur {
+                Value::Null => break,
+                Value::Pair(p) => {
+                    let car = p.car.borrow().clone();
+                    match &car {
+                        Value::Symbol(s) => match symbols.iter().position(|p| p == s) {
+                            Some(i) => bits |= 1i64 << i,
+                            None => {
+                                return Err("constructor: symbol not in universe".to_string());
+                            }
+                        },
+                        v => return Err(type_err("constructor", "symbol", v)),
+                    }
+                    cur = p.cdr.borrow().clone();
+                }
+                v => return Err(type_err("constructor", "list of symbols", &v)),
+            }
+        }
+        Ok(enum_set_value(universe_from_symbols(&symbols), bits))
+    });
+    Ok(crate::proc::make_host_builtin("enum-set-constructor", f))
+}
+
+fn b_enum_set_to_list(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("enum-set->list", "1", args.len()));
+    }
+    let (universe, bits) = enum_set_parts(&args[0]).map_err(|e| format!("enum-set->list: {e}"))?;
+    let mut out: Vec<Value> = Vec::new();
+    for (i, sym) in universe.iter().enumerate() {
+        if bits & (1i64 << i) != 0 {
+            out.push(sym.clone());
+        }
+    }
+    Ok(Value::list(out))
+}
+
+fn b_enum_set_member_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("enum-set-member?", "2", args.len()));
+    }
+    let sym = match &args[0] {
+        Value::Symbol(s) => *s,
+        v => return Err(type_err("enum-set-member?", "symbol", v)),
+    };
+    let (universe, bits) =
+        enum_set_parts(&args[1]).map_err(|e| format!("enum-set-member?: {e}"))?;
+    Ok(Value::Boolean(match enum_index_of(&universe, sym) {
+        Some(i) => bits & (1i64 << i) != 0,
+        None => false,
+    }))
+}
+
+/// Verify two enum-sets share a universe (R6RS: same enumeration type).
+fn same_universe(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| match (x, y) {
+            (Value::Symbol(p), Value::Symbol(q)) => p == q,
+            _ => false,
+        })
+}
+
+fn b_enum_set_subset_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("enum-set-subset?", "2", args.len()));
+    }
+    let (au, ab) = enum_set_parts(&args[0]).map_err(|e| format!("enum-set-subset?: {e}"))?;
+    let (bu, bb) = enum_set_parts(&args[1]).map_err(|e| format!("enum-set-subset?: {e}"))?;
+    // Cross-universe subset is allowed if the smaller universe's
+    // members all appear in the larger and the bits agree on the
+    // shared positions. Same-universe is the common case.
+    if same_universe(&au, &bu) {
+        return Ok(Value::Boolean((ab & !bb) == 0));
+    }
+    // Cross-universe: a is a subset of b if every symbol present in
+    // a is also present in b (regardless of bit representation).
+    for (i, sym) in au.iter().enumerate() {
+        if ab & (1i64 << i) == 0 {
+            continue;
+        }
+        let s = match sym {
+            Value::Symbol(s) => *s,
+            _ => continue,
+        };
+        match enum_index_of(&bu, s) {
+            Some(j) => {
+                if bb & (1i64 << j) == 0 {
+                    return Ok(Value::Boolean(false));
+                }
+            }
+            None => return Ok(Value::Boolean(false)),
+        }
+    }
+    Ok(Value::Boolean(true))
+}
+
+fn b_enum_set_eq_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("enum-set=?", "2", args.len()));
+    }
+    let (au, ab) = enum_set_parts(&args[0]).map_err(|e| format!("enum-set=?: {e}"))?;
+    let (bu, bb) = enum_set_parts(&args[1]).map_err(|e| format!("enum-set=?: {e}"))?;
+    Ok(Value::Boolean(same_universe(&au, &bu) && ab == bb))
+}
+
+/// Helper: combine two same-universe enum-sets via a bit-op.
+fn enum_combine(
+    op_name: &str,
+    a: &Value,
+    b: &Value,
+    f: impl FnOnce(i64, i64) -> i64,
+) -> Result<Value, String> {
+    let (au, ab) = enum_set_parts(a).map_err(|e| format!("{op_name}: {e}"))?;
+    let (bu, bb) = enum_set_parts(b).map_err(|e| format!("{op_name}: {e}"))?;
+    if !same_universe(&au, &bu) {
+        return Err(format!("{op_name}: enum-sets must share a universe"));
+    }
+    Ok(enum_set_value(au, f(ab, bb)))
+}
+
+fn b_enum_set_union(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("enum-set-union", "2", args.len()));
+    }
+    enum_combine("enum-set-union", &args[0], &args[1], |a, b| a | b)
+}
+
+fn b_enum_set_intersection(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("enum-set-intersection", "2", args.len()));
+    }
+    enum_combine("enum-set-intersection", &args[0], &args[1], |a, b| a & b)
+}
+
+fn b_enum_set_difference(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("enum-set-difference", "2", args.len()));
+    }
+    enum_combine("enum-set-difference", &args[0], &args[1], |a, b| a & !b)
+}
+
+fn b_enum_set_complement(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("enum-set-complement", "1", args.len()));
+    }
+    let (universe, bits) =
+        enum_set_parts(&args[0]).map_err(|e| format!("enum-set-complement: {e}"))?;
+    let universe_mask = if universe.is_empty() {
+        0
+    } else {
+        (1i64 << universe.len()) - 1
+    };
+    Ok(enum_set_value(universe, !bits & universe_mask))
+}
+
+fn b_enum_set_projection(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("enum-set-projection", "2", args.len()));
+    }
+    let (au, ab) = enum_set_parts(&args[0]).map_err(|e| format!("enum-set-projection: {e}"))?;
+    let (bu, _) = enum_set_parts(&args[1]).map_err(|e| format!("enum-set-projection: {e}"))?;
+    let mut bits: i64 = 0;
+    for (i, sym) in au.iter().enumerate() {
+        if ab & (1i64 << i) == 0 {
+            continue;
+        }
+        if let Value::Symbol(s) = sym {
+            if let Some(j) = enum_index_of(&bu, *s) {
+                bits |= 1i64 << j;
+            }
+        }
+    }
+    Ok(enum_set_value(bu, bits))
 }
