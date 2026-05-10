@@ -519,6 +519,18 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("get-bytevector-n", b_get_bytevector_n),
         ("get-bytevector-all", b_get_bytevector_all),
         ("get-string-n", b_get_string_n),
+        // R6RS §8.2.5 — transcoder/codec procs that need only Value
+        // input. The factories that mint Symbol values for eol-style
+        // and error-mode are registered in `syms_builtins()` below.
+        ("transcoder-codec", b_transcoder_codec),
+        ("transcoder-eol-style", b_transcoder_eol_style),
+        (
+            "transcoder-error-handling-mode",
+            b_transcoder_error_handling_mode,
+        ),
+        ("bytevector->string", b_bytevector_to_string),
+        ("string->bytevector", b_string_to_bytevector),
+        ("transcoded-port", b_transcoded_port),
         ("binary-port?", b_binary_port_p),
         ("textual-port?", b_textual_port_p),
         ("get-output-string", b_get_output_string),
@@ -770,6 +782,15 @@ pub fn syms_builtins() -> Vec<SymsEntry> {
         ("bytevector-ieee-double-ref", b_bytevector_ieee_double_ref),
         ("bytevector-ieee-double-set!", b_bytevector_ieee_double_set),
         ("native-endianness", b_native_endianness),
+        // R6RS §8.2.5 — codec/transcoder factories. These intern
+        // symbol values for the eol-style / error-handling-mode
+        // defaults, so they need read-write SymbolTable access.
+        ("utf-8-codec", b_utf8_codec),
+        ("utf-16-codec", b_utf16_codec),
+        ("latin-1-codec", b_latin1_codec),
+        ("native-eol-style", b_native_eol_style),
+        ("make-transcoder", b_make_transcoder),
+        ("native-transcoder", b_native_transcoder),
     ]
 }
 
@@ -6490,6 +6511,241 @@ fn b_put_bytevector(args: &[Value]) -> Result<Value, String> {
             _ => Err("put-bytevector: not a binary output port".into()),
         },
         v => Err(type_err("put-bytevector", "binary-output-port", v)),
+    }
+}
+
+// ---- R6RS §8.2.5 — codecs and transcoders -----------------------
+//
+// Codecs and transcoders are opaque values stored as tagged vectors:
+//   codec      = #("&codec" <name-symbol>)
+//   transcoder = #("&transcoder" <codec> <eol-style> <error-mode>)
+//
+// Foundation supports UTF-8 and Latin-1 fully for bytevector<->string
+// conversion. UTF-16 is registered but conversions raise — programs
+// can still construct and thread UTF-16 transcoders, only the actual
+// encode/decode is gated until a follow-up iter.
+
+const TAG_CODEC: &str = "&codec";
+const TAG_TRANSCODER: &str = "&transcoder";
+
+fn codec_name(v: &Value) -> Option<String> {
+    if let Value::Vector(vc) = v {
+        let v = vc.borrow();
+        if v.len() >= 2 {
+            if let (Some(Value::String(t)), Some(Value::String(s))) = (v.first(), v.get(1)) {
+                if t.borrow().as_str() == TAG_CODEC {
+                    return Some(s.borrow().clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn make_codec(name: &str) -> Value {
+    new_vector(vec![Value::string(TAG_CODEC), Value::string(name)])
+}
+
+fn make_transcoder_v(codec: Value, eol: Value, mode: Value) -> Value {
+    new_vector(vec![Value::string(TAG_TRANSCODER), codec, eol, mode])
+}
+
+fn is_transcoder(v: &Value) -> bool {
+    if let Value::Vector(vc) = v {
+        let v = vc.borrow();
+        if let Some(Value::String(t)) = v.first() {
+            return t.borrow().as_str() == TAG_TRANSCODER;
+        }
+    }
+    false
+}
+
+fn b_utf8_codec(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("utf-8-codec", "0", args.len()));
+    }
+    let _ = syms;
+    Ok(make_codec("utf-8"))
+}
+
+fn b_utf16_codec(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("utf-16-codec", "0", args.len()));
+    }
+    let _ = syms;
+    Ok(make_codec("utf-16"))
+}
+
+fn b_latin1_codec(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("latin-1-codec", "0", args.len()));
+    }
+    let _ = syms;
+    Ok(make_codec("latin-1"))
+}
+
+fn b_native_eol_style(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("native-eol-style", "0", args.len()));
+    }
+    Ok(Value::Symbol(syms.intern("lf")))
+}
+
+fn b_make_transcoder(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if !(1..=3).contains(&args.len()) {
+        return Err(arity_err("make-transcoder", "1..3", args.len()));
+    }
+    if codec_name(&args[0]).is_none() {
+        return Err("make-transcoder: first arg must be a codec".into());
+    }
+    let eol = if args.len() >= 2 {
+        args[1].clone()
+    } else {
+        Value::Symbol(syms.intern("lf"))
+    };
+    let mode = if args.len() == 3 {
+        args[2].clone()
+    } else {
+        Value::Symbol(syms.intern("replace"))
+    };
+    Ok(make_transcoder_v(args[0].clone(), eol, mode))
+}
+
+fn b_native_transcoder(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("native-transcoder", "0", args.len()));
+    }
+    Ok(make_transcoder_v(
+        make_codec("utf-8"),
+        Value::Symbol(syms.intern("lf")),
+        Value::Symbol(syms.intern("replace")),
+    ))
+}
+
+fn transcoder_field(v: &Value, idx: usize, op: &str) -> Result<Value, String> {
+    if !is_transcoder(v) {
+        return Err(format!("{}: not a transcoder", op));
+    }
+    if let Value::Vector(vc) = v {
+        let v = vc.borrow();
+        if v.len() > idx {
+            return Ok(v[idx].clone());
+        }
+    }
+    Err(format!("{}: malformed transcoder", op))
+}
+
+fn b_transcoder_codec(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("transcoder-codec", "1", args.len()));
+    }
+    transcoder_field(&args[0], 1, "transcoder-codec")
+}
+
+fn b_transcoder_eol_style(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("transcoder-eol-style", "1", args.len()));
+    }
+    transcoder_field(&args[0], 2, "transcoder-eol-style")
+}
+
+fn b_transcoder_error_handling_mode(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("transcoder-error-handling-mode", "1", args.len()));
+    }
+    transcoder_field(&args[0], 3, "transcoder-error-handling-mode")
+}
+
+fn transcoder_codec_name(t: &Value) -> Result<String, String> {
+    let codec = transcoder_field(t, 1, "transcoder")?;
+    codec_name(&codec).ok_or_else(|| "transcoder: missing codec".to_string())
+}
+
+fn decode_bytes(bytes: &[u8], codec: &str, op: &str) -> Result<String, String> {
+    match codec {
+        "utf-8" => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        "latin-1" => Ok(bytes.iter().map(|b| *b as char).collect()),
+        other => Err(format!("{}: codec {:?} not yet supported", op, other)),
+    }
+}
+
+fn encode_string(s: &str, codec: &str, op: &str) -> Result<Vec<u8>, String> {
+    match codec {
+        "utf-8" => Ok(s.as_bytes().to_vec()),
+        "latin-1" => {
+            let mut out = Vec::with_capacity(s.len());
+            for c in s.chars() {
+                let cp = c as u32;
+                if cp > 0xFF {
+                    return Err(format!(
+                        "{}: char U+{:04X} not representable in Latin-1",
+                        op, cp
+                    ));
+                }
+                out.push(cp as u8);
+            }
+            Ok(out)
+        }
+        other => Err(format!("{}: codec {:?} not yet supported", op, other)),
+    }
+}
+
+fn b_bytevector_to_string(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("bytevector->string", "2", args.len()));
+    }
+    let bytes = match &args[0] {
+        Value::ByteVector(b) => b.borrow().clone(),
+        v => return Err(type_err("bytevector->string", "bytevector", v)),
+    };
+    let codec = transcoder_codec_name(&args[1])?;
+    let s = decode_bytes(&bytes, &codec, "bytevector->string")?;
+    Ok(Value::string(s))
+}
+
+fn b_string_to_bytevector(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("string->bytevector", "2", args.len()));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("string->bytevector", "string", v)),
+    };
+    let codec = transcoder_codec_name(&args[1])?;
+    let bytes = encode_string(&s, &codec, "string->bytevector")?;
+    Ok(Value::ByteVector(cs_core::Gc::new(
+        std::cell::RefCell::new(bytes),
+    )))
+}
+
+/// `(transcoded-port port transcoder)` — wraps a binary port with a
+/// transcoder. Foundation: for input ports we eagerly decode all
+/// remaining bytes into a string input port. For output ports we
+/// return the binary port itself with a marker — actually wrapping
+/// requires a new Port variant, which is gated to a future iter.
+fn b_transcoded_port(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("transcoded-port", "2", args.len()));
+    }
+    let codec = transcoder_codec_name(&args[1])?;
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorInput(state) => {
+                let bytes = {
+                    let mut s = state.borrow_mut();
+                    let leftover = s.bytes[s.pos..].to_vec();
+                    s.pos = s.bytes.len();
+                    leftover
+                };
+                let decoded = decode_bytes(&bytes, &codec, "transcoded-port")?;
+                Ok(Value::Port(Port::string_input(&decoded)))
+            }
+            Port::ByteVectorOutput(_) => {
+                Err("transcoded-port: binary-output-port wrapping not yet supported".into())
+            }
+            _ => Err("transcoded-port: expected a binary port".into()),
+        },
+        v => Err(type_err("transcoded-port", "port", v)),
     }
 }
 

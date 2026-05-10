@@ -92,3 +92,46 @@
 (test-true "standard-output-exists" (procedure? standard-output-port))
 (test-true "standard-error-exists"  (procedure? standard-error-port))
 (test-true "standard-error-is-port" (port? (standard-error-port)))
+
+; ---- R6RS §8.2.5 — codecs / transcoders -----------------------------
+(test-section "R6RS transcoders")
+
+(test-true "utf-8-codec-callable"  (procedure? utf-8-codec))
+(test-true "latin-1-codec-callable" (procedure? latin-1-codec))
+(test-true "utf-16-codec-callable" (procedure? utf-16-codec))
+(test-true "make-transcoder-1arg"  (vector? (make-transcoder (utf-8-codec))))
+(test-equal "native-eol-style-lf"  'lf (native-eol-style))
+
+(let ((t (native-transcoder)))
+  (test-true  "native-transcoder-vec"  (vector? t))
+  (test-equal "native-eol-style-from-t" 'lf (transcoder-eol-style t))
+  (test-equal "native-error-mode"      'replace
+              (transcoder-error-handling-mode t)))
+
+; --- bytevector<->string round-trip via UTF-8 ---
+(let* ((s "Hello, 世界!")
+       (t (native-transcoder))
+       (bv (string->bytevector s t))
+       (back (bytevector->string bv t)))
+  (test-equal "utf-8-roundtrip" s back))
+
+; --- bytevector<->string round-trip via Latin-1 ---
+(let* ((s "café")
+       (t (make-transcoder (latin-1-codec)))
+       (bv (string->bytevector s t))
+       (back (bytevector->string bv t)))
+  (test-equal "latin-1-roundtrip" s back)
+  (test-equal "latin-1-byte-length" 4 (bytevector-length bv)))
+
+; --- Latin-1 rejects code points >= 256 ---
+(test-true "latin-1-rejects-bmp"
+  (guard (c (#t #t))
+    (string->bytevector "世" (make-transcoder (latin-1-codec)))
+    #f))
+
+; --- transcoded-port wraps a binary input port for textual reads ---
+(let* ((bv (string->bytevector "abc" (native-transcoder)))
+       (binp (open-bytevector-input-port bv))
+       (txp (transcoded-port binp (native-transcoder))))
+  (test-true  "txp-textual"   (textual-port? txp))
+  (test-equal "txp-content"   "abc" (get-string-all txp)))
