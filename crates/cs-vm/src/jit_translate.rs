@@ -196,6 +196,29 @@ pub fn bytecode_to_rir(
                 Inst::Pop => {
                     pop_value(&mut sim_stack)?;
                 }
+                Inst::SetVar(sym) => {
+                    // SetVar pops one value and stores it into the
+                    // binding for `sym`. After SetVar, the cs-vm
+                    // compiler emits Const(Unspecified) so the
+                    // result of `(set! x v)` is well-defined; we
+                    // honor that by also pushing a placeholder
+                    // value here. (Const(Unspecified) appears in
+                    // the bytecode as the next instruction, which
+                    // we'll see and emit as LoadConst.)
+                    //
+                    // For free-var SetVar, lower to Inst::EnvSet.
+                    // Local-var SetVar isn't yet supported; we
+                    // never bind locals via DefineLocal in the
+                    // current translator scope, so any SetVar is a
+                    // free-var update.
+                    let val = pop_value(&mut sim_stack)?;
+                    if param_map.contains_key(sym) {
+                        return Err(TranslateError::Unsupported(
+                            "set! of a parameter (mutable params not yet supported)".into(),
+                        ));
+                    }
+                    insts.push(RirInst::EnvSet(sym.0, val));
+                }
                 Inst::AddFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Add)?,
                 Inst::SubFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Sub)?,
                 Inst::MulFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Mul)?,

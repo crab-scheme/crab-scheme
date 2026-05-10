@@ -115,6 +115,14 @@ pub enum Inst {
     /// iter adds proper deopt for type mismatch.
     EnvLookup(Value, u32),
 
+    /// `env_set(sym, value)`. Write a Fixnum back to a free
+    /// variable's binding. cs-vm: `Inst::SetVar` of a non-local
+    /// symbol (Set! to a closure-captured or top-level var). The
+    /// lowerer emits a call to `vm_env_set_fixnum(sym, value)`
+    /// which walks the env chain via `set_existing`. The Value is
+    /// just `()` (void) — no SSA result.
+    EnvSet(u32, Value),
+
     /// `dst = arg<i>`. cs-vm: implicit (arguments are on the stack
     /// at the procedure entry; this names them as SSA values).
     Param(Value, u32),

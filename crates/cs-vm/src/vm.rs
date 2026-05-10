@@ -187,6 +187,48 @@ impl Drop for JitEnvGuard {
     }
 }
 
+/// Helper called by JIT-compiled code to write a Fixnum back to a
+/// free variable's binding. Walks the env chain via `set_existing`;
+/// if no binding is found, defines at the root. Mirrors the
+/// `Inst::SetVar` handler in `run_dispatch`.
+///
+/// # Safety
+///
+/// Same contract as `vm_env_lookup_fixnum` — `JIT_CALLER_ENV` must
+/// be set by the runtime dispatch site.
+#[no_mangle]
+pub extern "C" fn vm_env_set_fixnum(sym: i64, value: i64) {
+    let env_ptr = JIT_CALLER_ENV.with(|c| c.get());
+    if env_ptr.is_null() {
+        panic!("vm_env_set_fixnum: JIT_CALLER_ENV is null");
+    }
+    // SAFETY: as in vm_env_lookup_fixnum.
+    let env = unsafe { &*env_ptr };
+    let sym = Symbol(sym as u32);
+    let v = Value::Number(cs_core::Number::Fixnum(value));
+    if !env.set_existing(sym, v.clone()) {
+        // No existing binding — define at root. Walk parent
+        // chain holding Rc clones so each step keeps the parent
+        // alive while we examine the next.
+        let mut root: Rc<Env> = unsafe {
+            // Rebuild an Rc from the raw pointer by cloning. The
+            // closure that owns the Env is still alive (held by
+            // the JIT-dispatching closure value) so the strong
+            // count is at least 1; clone bumps it.
+            let raw_rc = Rc::from_raw(env_ptr);
+            let cloned = raw_rc.clone();
+            // Don't drop the Rc we synthesized from the raw —
+            // it would decrement the original count incorrectly.
+            std::mem::forget(raw_rc);
+            cloned
+        };
+        while let Some(p) = root.parent.clone() {
+            root = p;
+        }
+        root.define(sym, v);
+    }
+}
+
 /// Helper called by JIT-compiled code to look up a free variable's
 /// fixnum value in the closure's captured env. The env pointer is
 /// pulled from `JIT_CALLER_ENV` (set by `try_dispatch_jit`).

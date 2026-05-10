@@ -61,6 +61,9 @@ pub struct Lowerer {
     /// FuncId of the imported `vm_env_lookup_fixnum` helper.
     /// `Inst::EnvLookup` lowers to a Cranelift call against this.
     env_lookup_func: cranelift_module::FuncId,
+    /// FuncId of the imported `vm_env_set_fixnum` helper.
+    /// `Inst::EnvSet` lowers to a Cranelift call against this.
+    env_set_func: cranelift_module::FuncId,
 }
 
 impl Lowerer {
@@ -89,10 +92,13 @@ impl Lowerer {
             "vm_env_lookup_fixnum",
             cs_vm::vm::vm_env_lookup_fixnum as *const u8,
         );
+        builder.symbol(
+            "vm_env_set_fixnum",
+            cs_vm::vm::vm_env_set_fixnum as *const u8,
+        );
         let mut module = JITModule::new(builder);
 
-        // Import vm_env_lookup_fixnum as a Cranelift function so
-        // the lowerer can call it. Signature: extern "C" fn(i64) -> i64.
+        // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
         let mut env_lookup_sig = module.make_signature();
         env_lookup_sig.params.push(AbiParam::new(I64));
         env_lookup_sig.returns.push(AbiParam::new(I64));
@@ -104,6 +110,18 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function env_lookup: {e}")))?;
 
+        // Import vm_env_set_fixnum: extern "C" fn(i64, i64) -> ().
+        let mut env_set_sig = module.make_signature();
+        env_set_sig.params.push(AbiParam::new(I64));
+        env_set_sig.params.push(AbiParam::new(I64));
+        let env_set_func = module
+            .declare_function(
+                "vm_env_set_fixnum",
+                cranelift_module::Linkage::Import,
+                &env_set_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function env_set: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -111,6 +129,7 @@ impl Lowerer {
             func_ctx: FunctionBuilderContext::new(),
             next_id: 0,
             env_lookup_func,
+            env_set_func,
         })
     }
 
@@ -158,10 +177,13 @@ impl Lowerer {
 
             // Import a self-FuncRef for CallSelf to dispatch through.
             let self_fnref = self.module.declare_func_in_func(func_id, builder.func);
-            // Import the env-lookup helper into this function.
+            // Import the env-helper functions into this function.
             let env_lookup_fnref = self
                 .module
                 .declare_func_in_func(self.env_lookup_func, builder.func);
+            let env_set_fnref = self
+                .module
+                .declare_func_in_func(self.env_set_func, builder.func);
 
             // Create a Cranelift block for every RIR block, with the
             // matching block params.
@@ -221,6 +243,7 @@ impl Lowerer {
                         &mut value_map,
                         self_fnref,
                         env_lookup_fnref,
+                        env_set_fnref,
                         inst,
                     )?;
                 }
@@ -292,6 +315,7 @@ fn lower_inst(
     map: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
     self_fnref: cranelift_codegen::ir::FuncRef,
     env_lookup_fnref: cranelift_codegen::ir::FuncRef,
+    env_set_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -376,6 +400,11 @@ fn lower_inst(
                 )));
             }
             map.insert(*dst, results[0]);
+        }
+        Inst::EnvSet(sym, value) => {
+            let val = lookup(map, *value)?;
+            let sym_v = b.ins().iconst(I64, *sym as i64);
+            b.ins().call(env_set_fnref, &[sym_v, val]);
         }
         Inst::Call(_, _, _) | Inst::DeoptCheck(_, _) => {
             return Err(JitError::Unsupported(format!(

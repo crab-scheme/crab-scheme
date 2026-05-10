@@ -177,6 +177,42 @@ fn jit_handles_free_var_env_lookup() {
     }
 }
 
+/// M6 Phase 2 iter C: free-var `set!` from inside JIT'd code.
+/// `(define c 0) (define (bump) (set! c (+ c 1)))` — bump's body
+/// reads c via EnvLookup and writes it back via EnvSet.
+#[test]
+fn jit_handles_free_var_set_bang() {
+    cs_vm::vm::reset_jit_call_count();
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<jit>", "(define c 0)").unwrap();
+    rt.eval_str_via_vm("<jit>", "(define bump (lambda () (set! c (+ c 1))))")
+        .unwrap();
+
+    // Warm bump past the threshold by calling it many times.
+    rt.eval_str_via_vm(
+        "<jit>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (bump) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    // After 1500 bumps, c is some value. Let's snapshot it then
+    // bump once more and check c grew by 1 (i.e., set! actually
+    // wrote back through the JIT).
+    let snap = rt.eval_str_via_vm("<jit>", "c").unwrap();
+    let snap_n = match snap {
+        Value::Number(Number::Fixnum(n)) => n,
+        other => panic!("c not a fixnum: {:?}", other),
+    };
+    rt.eval_str_via_vm("<jit>", "(bump)").unwrap();
+    let after = rt.eval_str_via_vm("<jit>", "c").unwrap();
+    let after_n = match after {
+        Value::Number(Number::Fixnum(n)) => n,
+        other => panic!("c not a fixnum after bump: {:?}", other),
+    };
+    assert_eq!(after_n, snap_n + 1, "set! should have incremented c");
+}
+
 #[test]
 fn unsupported_closure_stays_on_vm_silently() {
     // A closure with non-fixnum / env-access body translates fail
