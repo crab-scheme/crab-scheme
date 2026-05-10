@@ -1,0 +1,13 @@
+# devenv inputs.
+# `devenv update` refreshes the locks; `devenv shell` enters the env.
+
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+
+  # Pin rust-overlay so the toolchain is reproducible across machines.
+  rust-overlay:
+    url: github:oxalica/rust-overlay
+    inputs:
+      nixpkgs:
+        follows: nixpkgs

@@ -23,3 +23,8 @@ Thumbs.db
 # Spec workflow runtime artifacts (keep specs themselves)
 .spec-workflow/.cache/
 .spec-workflow/runtime/
+
+# devenv / direnv
+.devenv/
+.devenv.flake.nix
+.direnv/

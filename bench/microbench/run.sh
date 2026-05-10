@@ -43,8 +43,16 @@ declare -a IMPLS
 IMPLS=("crabscheme-walker:$CS --tier walker run")
 IMPLS+=("crabscheme-vm:$CS --tier vm run")
 if command -v racket >/dev/null 2>&1; then IMPLS+=("racket:racket"); fi
-if command -v chez >/dev/null 2>&1; then IMPLS+=("chez:chez --script"); fi
+# Chez Scheme ships its REPL binary as `scheme` (or sometimes `chez`).
+# Detection: prefer `chez` if present; otherwise check that `scheme`
+# documents a `--script` flag (a Chez idiom).
+if command -v chez >/dev/null 2>&1; then
+  IMPLS+=("chez:chez --script")
+elif command -v scheme >/dev/null 2>&1 && scheme --help 2>&1 | grep -q -- '--script'; then
+  IMPLS+=("chez:scheme --script")
+fi
 if command -v guile >/dev/null 2>&1; then IMPLS+=("guile:guile -q"); fi
+if command -v gsi >/dev/null 2>&1; then IMPLS+=("gambit:gsi"); fi
 
 # header
 printf "%-22s" "benchmark"

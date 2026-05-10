@@ -33,44 +33,76 @@ solve the same problem with the same N so results are comparable.
 
 ## Running
 
+The cleanest path is via the project's `devenv` shell, which ships
+all the comparison Schemes pinned to a known nixpkgs version:
+
+```bash
+devenv shell        # or `direnv allow` if direnv is installed
+bench-micro         # the script alias defined in devenv.nix
+```
+
+Without devenv, you can still run the suite directly:
+
 ```bash
 bench/microbench/run.sh
 ```
 
-Builds `crabscheme` once with `cargo build --release`, then `rustc -O`
-each `rust/*.rs` into `target/release-microbench/`, then runs every
-benchmark on every implementation and prints a wall-time table.
+Either way, the runner builds `crabscheme` once with `cargo build
+--release`, then `rustc -O` each `rust/*.rs` into
+`target/release-microbench/`, then runs every benchmark on every
+implementation and prints a wall-time table.
 
-To add other Scheme implementations to the table, set them on `PATH`:
-the runner auto-detects `racket`, `chez`, and `guile` and adds rows
-for any it finds.
+The runner auto-detects these comparison Schemes on `PATH` and adds
+a column for any it finds:
+
+| binary  | upstream            | provided by `devenv shell`? |
+|---------|---------------------|-----------------------------|
+| `racket`| Racket              | yes (`racket-minimal`)      |
+| `chez`  | Chez Scheme         | yes                         |
+| `guile` | GNU Guile           | yes (`guile_3_0`)           |
+| `gsi`   | Gambit Scheme       | yes (`gambit`)              |
+
+If you don't use devenv, install whichever ones you want via your
+package manager.
 
 ## Output shape
 
+Run inside the project's `devenv shell`, comparing CrabScheme's two
+tiers against Chez Scheme, Guile, Gambit, and `rustc -O`:
+
 ```
-benchmark              crabscheme-walker  crabscheme-vm         rust-O
-fib                            0.339s         0.028s         0.012s
-tak                            0.042s         0.014s         0.009s
-ack                            0.100s         0.024s         0.143s
-nqueens                        0.108s         0.027s         0.012s
-mandelbrot                     0.318s         0.075s         0.009s
-spectral-norm                  0.283s         0.094s         0.009s
-binary-trees                   0.134s         0.039s         0.013s
+benchmark              crabscheme-walker  crabscheme-vm   chez    guile  gambit  rust-O
+fib                            0.319s         0.033s    0.044s  0.035s  0.031s  0.010s
+tak                            0.049s         0.021s    0.041s  0.023s  0.020s  0.013s
+ack                            0.106s         0.027s    0.039s  0.021s  0.019s  0.013s
+nqueens                        0.103s         0.029s    0.040s  0.022s  0.019s  0.010s
+mandelbrot                     0.358s         0.085s    0.046s  0.039s  0.044s  0.012s
+spectral-norm                  0.310s         0.093s    0.043s  0.035s  0.036s  0.011s
+binary-trees                   0.138s         0.048s     ERR     ERR    0.026s  0.011s
 ```
 
-(Sample run from the host this readme was authored on, after a warm
-filesystem cache. Apple M-series, macOS.)
+(Apple M-series, macOS. Chez 10.3.0, Guile 3.0.11, Gambit 4.9.5,
+rustc 1.95 stable. ERR = the comparison Scheme rejected our source —
+typically because it expects a different module-import dialect.)
 
 Rough takeaways at these N values:
 
-- The **VM tier** lands in the 1.5x–10x slower-than-Rust band for
-  CPU-bound work — about what you'd expect from a non-JITed bytecode
-  interpreter against `rustc -O`.
-- The **walker tier** is 3x–35x slower than the VM tier, mostly from
+- The **VM tier holds its own against mature Schemes** on small,
+  CPU-bound programs. On `fib` it actually beats Chez (33 ms vs
+  44 ms) and matches Guile (35 ms) / Gambit (31 ms). On
+  `tak`/`ack`/`nqueens` it's within ~1.5× of all three.
+- The **VM tier is ~2× slower** than Chez/Guile/Gambit on the
+  flonum-heavy benchmarks (`mandelbrot`, `spectral-norm`). All three
+  comparison Schemes JIT or AOT-compile; ours doesn't yet, so this
+  gap is the JIT delta.
+- The **walker tier** is 3×–11× slower than our VM tier, mostly from
   per-call EvalCtx threading and frame allocation that the VM tier
   amortizes.
-- `ack` is the one benchmark where Rust looks slow — process startup
-  dominates that one because the workload itself is small.
+- **Process startup** dominates Rust at this scale. Don't read "VM
+  is 3× slower than Rust" — at the actual workload scale the gap
+  is real but smaller than this table suggests. Use `hyperfine
+  --warmup 3` or scale `N` upward for a fair single-engine
+  comparison.
 
 ## Why these benchmarks
 
