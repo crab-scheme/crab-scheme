@@ -254,6 +254,16 @@ pub enum Inst {
     /// are both `Type::Any`.
     Cdr(Value, Value),
 
+    /// `dst = pair?(v)` — type predicate. Operand is `Type::Any`,
+    /// dst is `Type::Boolean`. Lowers to `vm_pair_p`, which
+    /// consumes the operand box.
+    PairP(Value, Value),
+
+    /// `dst = null?(v)` — type predicate for `'()`. Operand is
+    /// `Type::Any`, dst is `Type::Boolean`. Lowers to `vm_null_p`
+    /// which consumes the operand box.
+    NullP(Value, Value),
+
     /// Type guard: if the value's runtime type doesn't match the
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
     /// always dispatches dynamically).

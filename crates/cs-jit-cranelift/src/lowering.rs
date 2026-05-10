@@ -76,6 +76,13 @@ pub struct Lowerer {
     /// lowering.
     #[allow(dead_code)]
     pair_cdr_func: cranelift_module::FuncId,
+    /// FuncId of `vm_pair_p(v) -> i64`. `Inst::PairP` lowers to a
+    /// Cranelift call against this. Helper consumes the Any-tagged
+    /// operand box.
+    pair_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_null_p(v) -> i64`. `Inst::NullP` lowers to a
+    /// Cranelift call against this.
+    null_p_func: cranelift_module::FuncId,
 }
 
 impl Lowerer {
@@ -115,6 +122,8 @@ impl Lowerer {
         builder.symbol("vm_alloc_pair", cs_vm::vm::vm_alloc_pair as *const u8);
         builder.symbol("vm_pair_car", cs_vm::vm::vm_pair_car as *const u8);
         builder.symbol("vm_pair_cdr", cs_vm::vm::vm_pair_cdr as *const u8);
+        builder.symbol("vm_pair_p", cs_vm::vm::vm_pair_p as *const u8);
+        builder.symbol("vm_null_p", cs_vm::vm::vm_null_p as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -180,6 +189,24 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_pair_cdr: {e}")))?;
 
+        // vm_pair_p / vm_null_p — same shape as the accessors: a
+        // single Any-tagged i64 in, an i64 (0/1) out. Both consume
+        // the input box.
+        let pair_p_func = module
+            .declare_function(
+                "vm_pair_p",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_pair_p: {e}")))?;
+        let null_p_func = module
+            .declare_function(
+                "vm_null_p",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_null_p: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -191,6 +218,8 @@ impl Lowerer {
             alloc_pair_func,
             pair_car_func,
             pair_cdr_func,
+            pair_p_func,
+            null_p_func,
         })
     }
 
@@ -310,6 +339,12 @@ impl Lowerer {
             let pair_cdr_fnref = self
                 .module
                 .declare_func_in_func(self.pair_cdr_func, builder.func);
+            let pair_p_fnref = self
+                .module
+                .declare_func_in_func(self.pair_p_func, builder.func);
+            let null_p_fnref = self
+                .module
+                .declare_func_in_func(self.null_p_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -367,6 +402,8 @@ impl Lowerer {
                         alloc_pair_fnref,
                         pair_car_fnref,
                         pair_cdr_fnref,
+                        pair_p_fnref,
+                        null_p_fnref,
                         inst,
                     )?;
                 }
@@ -519,6 +556,8 @@ fn lower_inst(
     alloc_pair_fnref: cranelift_codegen::ir::FuncRef,
     pair_car_fnref: cranelift_codegen::ir::FuncRef,
     pair_cdr_fnref: cranelift_codegen::ir::FuncRef,
+    pair_p_fnref: cranelift_codegen::ir::FuncRef,
+    null_p_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -661,6 +700,34 @@ fn lower_inst(
             if results.len() != 1 {
                 return Err(JitError::Codegen(format!(
                     "Cdr expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::PairP(dst, src) => {
+            // Lowers to vm_pair_p(any) -> i64. The helper consumes
+            // the box; result is 0/1, decoded as Boolean by the
+            // dispatcher when PairP's dst flows to the function's
+            // return value.
+            let v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(pair_p_fnref, &[v]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "PairP expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::NullP(dst, src) => {
+            let v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(null_p_fnref, &[v]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "NullP expected 1 result, got {}",
                     results.len()
                 )));
             }

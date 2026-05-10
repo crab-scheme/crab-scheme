@@ -795,6 +795,26 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::Cdr(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    ("pair?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        // Lower to vm_pair_p. The helper
+                                        // consumes the operand box, so
+                                        // the operand RIR Value must not
+                                        // be reused in this body — a
+                                        // future iter adds AnyClone to
+                                        // support multi-use patterns.
+                                        insts.push(RirInst::PairP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("null?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::NullP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     ("integer->char", 1) => {
                                         // Same bit pattern as the Fixnum input;
                                         // the return-type post-pass will tag
@@ -1186,7 +1206,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::Lt(dst, _, _)
                 | RirInst::Eq(dst, _, _)
                 | RirInst::FlonumLt(dst, _, _)
-                | RirInst::FlonumEq(dst, _, _) => {
+                | RirInst::FlonumEq(dst, _, _)
+                | RirInst::PairP(dst, _)
+                | RirInst::NullP(dst, _) => {
                     bool_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {

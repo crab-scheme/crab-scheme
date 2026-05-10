@@ -374,6 +374,23 @@ pub unsafe extern "C" fn vm_pair_cdr(pair: i64) -> i64 {
     }
 }
 
+/// `(pair? v)` — type predicate. Consumes the Any-tagged box on
+/// the way out and returns 1 if the inner Value is a Pair, 0
+/// otherwise. Consume-on-use keeps the lifetime model linear:
+/// each Any-tagged i64 must be used exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn vm_pair_p(r: i64) -> i64 {
+    let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
+    matches!(*boxed, Value::Pair(_)) as i64
+}
+
+/// `(null? v)` — type predicate. Consume-on-use, like `vm_pair_p`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_null_p(r: i64) -> i64 {
+    let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
+    matches!(*boxed, Value::Null) as i64
+}
+
 /// Read the per-thread JIT-dispatch count. Test/diagnostics only.
 pub fn jit_call_count() -> u64 {
     VM_JIT_CALL_COUNT.with(|c| c.get())
@@ -419,6 +436,13 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
             }
             (JIT_RT_BOOLEAN, Value::Boolean(b)) => argv[i] = if *b { 1 } else { 0 },
             (JIT_RT_CHARACTER, Value::Character(c)) => argv[i] = *c as u32 as i64,
+            // Any-tagged param: clone the Value into a fresh Box and
+            // pass its raw pointer as the i64. The JIT body owns the
+            // box and is expected to consume it linearly (via car /
+            // cdr / pair? / null? / return). Iter AU only fires this
+            // path when param_hints recorded the arg as a non-
+            // immediate Value (Pair, Vector, ...).
+            (JIT_RT_ANY, v) => argv[i] = value_to_any_i64(v.clone()),
             _ => {
                 // Type-guard miss: the JIT body's signature doesn't
                 // match this call's arg shapes. Bump the per-closure

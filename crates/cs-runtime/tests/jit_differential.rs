@@ -1069,6 +1069,80 @@ fn diff_jit_cons_pair_return() {
 }
 
 #[test]
+fn diff_jit_pair_predicate() {
+    // M6 Phase 4 iter AU: heap-pointer args reach the JIT through
+    // the Any param lane, and pair?/null? predicates lower to
+    // vm_pair_p / vm_null_p (consume-on-use).
+    //
+    // (define (kind v) (if (pair? v) 1 0)) — single linear use of
+    // v. The predicate consumes the argument's owned box, returns
+    // a Boolean, and the if folds to a Fixnum return. We warm with
+    // a Pair so the JIT body's param hint is Any.
+    let defines = &["(define (kind v) (if (pair? v) 1 0))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (kind (cons i i)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, i64)] = &[
+        ("(kind (cons 1 2))", 1),
+        ("(kind (cons 99 100))", 1),
+        ("(kind (cons -1 0))", 1),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Fixnum(j)),
+                Value::Number(cs_core::Number::Fixnum(w)),
+            ) => {
+                assert_eq!(j, w, "tier mismatch on {}", expr);
+                assert_eq!(*j, *expected, "wrong value on {}", expr);
+            }
+            other => panic!("expected fixnums on {}, got {:?}", expr, other),
+        }
+    }
+}
+
+#[test]
+fn diff_jit_null_predicate() {
+    // Companion to diff_jit_pair_predicate exercising null?.
+    let defines = &["(define (is-null v) (if (null? v) 1 0))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    // Warm with '() so param0 is hinted Any (Null is one of the
+    // Any-mapped variants in jit.rs).
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (is-null (quote ())) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let nil_call = "(is-null (quote ()))";
+    let pair_call = "(is-null (cons 1 2))";
+    for (expr, expected) in [(nil_call, 1), (pair_call, 0)] {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Fixnum(j)),
+                Value::Number(cs_core::Number::Fixnum(w)),
+            ) => {
+                assert_eq!(j, w, "tier mismatch on {}", expr);
+                assert_eq!(*j, expected, "wrong value on {}", expr);
+            }
+            other => panic!("expected fixnums on {}, got {:?}", expr, other),
+        }
+    }
+}
+
+#[test]
 fn diff_jit_car_cdr_passthrough() {
     // M6 Phase 4 iter AT: Inst::Car / Inst::Cdr lower to vm_pair_car
     // / vm_pair_cdr. The car/cdr of a freshly-consed pair returns

@@ -96,6 +96,26 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
             Value::Number(Number::Flonum(_)) => RirType::Flonum,
             Value::Boolean(_) => RirType::Boolean,
             Value::Character(_) => RirType::Character,
+            // Heap-pointer Values (Pair, Vector, String, ...) hint
+            // as Type::Any so the translator accepts them and the
+            // dispatcher boxes them via value_to_any_i64. The JIT
+            // body must consume each Any-tagged i64 linearly (via
+            // car/cdr/pair?/null?/return) — multi-use of the same
+            // RirValue isn't yet supported on the Any lane.
+            Value::Pair(_)
+            | Value::Vector(_)
+            | Value::String(_)
+            | Value::ByteVector(_)
+            | Value::Hashtable(_)
+            | Value::Port(_)
+            | Value::Promise(_)
+            | Value::Symbol(_)
+            | Value::Null
+            | Value::Procedure(_) => RirType::Any,
+            // Unspecified / Eof we leave as Fixnum for now — they
+            // can't be passed to any of the Any-consumers we
+            // currently lower, so they'll deopt at the type guard
+            // and tier back down to bytecode.
             _ => RirType::Fixnum,
         })
         .collect();
@@ -105,6 +125,7 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
             RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
             RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,
             RirType::Flonum => cs_vm::vm::JIT_RT_FLONUM,
+            RirType::Any => cs_vm::vm::JIT_RT_ANY,
             _ => cs_vm::vm::JIT_RT_FIXNUM,
         })
         .collect();
