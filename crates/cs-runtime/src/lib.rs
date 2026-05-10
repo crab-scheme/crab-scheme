@@ -1749,18 +1749,22 @@ impl Runtime {
             let msg = match &e.kind {
                 crate::eval::EvalErrorKind::Raised(v) => format_condition(v, &self.syms),
                 crate::eval::EvalErrorKind::Escape(id, v) => format!(
-                    "uncaught escape continuation #{} (value: {})",
+                    "continuation #{} invoked outside its dynamic extent (value: {}) \
+                     — first-class re-invocation is not yet supported (see M8 spec)",
                     id,
                     v.format_with(&self.syms, WriteMode::Write)
                 ),
                 crate::eval::EvalErrorKind::Message(m) => match m.as_str() {
                     "__escape__" => match pending_escape {
                         Some((id, v)) => format!(
-                            "uncaught escape continuation #{} (value: {})",
+                            "continuation #{} invoked outside its dynamic extent (value: {}) \
+                             — first-class re-invocation is not yet supported (see M8 spec)",
                             id,
                             v.format_with(&self.syms, WriteMode::Write)
                         ),
-                        None => "uncaught escape continuation".to_string(),
+                        None => "uncaught escape continuation \
+                                 — first-class continuations are not yet implemented (see M8 spec)"
+                            .to_string(),
                     },
                     "__raised__" => match &pending_raise {
                         Some(cond) => format_condition(cond, &self.syms),
@@ -1873,11 +1877,14 @@ impl Runtime {
                 },
                 "__escape__" => match cs_vm::vm::vm_take_pending_escape() {
                     Some((id, v)) => format!(
-                        "uncaught escape continuation #{} (value: {})",
+                        "continuation #{} invoked outside its dynamic extent (value: {}) \
+                         — first-class re-invocation is not yet supported (see M8 spec)",
                         id,
                         v.format_with(&self.syms, WriteMode::Write)
                     ),
-                    None => "uncaught escape continuation".to_string(),
+                    None => "uncaught escape continuation \
+                             — first-class continuations are not yet implemented (see M8 spec)"
+                        .to_string(),
                 },
                 _ => e.message,
             };

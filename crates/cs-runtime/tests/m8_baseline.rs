@@ -14,6 +14,40 @@ fn run(prog: &str) -> Result<Value, String> {
     rt.eval_str("<m8>", prog).map_err(|d| d.message)
 }
 
+// ---- Diagnostic-shape baseline (M8 iter 2) ----
+
+#[test]
+fn after_extent_invocation_emits_clear_diagnostic() {
+    // Until the M8 driver-loop refactor lands, invoking a saved
+    // continuation outside its dynamic extent must produce a
+    // diagnostic that names the limitation rather than the generic
+    // "uncaught escape" message users were previously seeing.
+    let mut rt = Runtime::new();
+    let prog = "(define saved #f) \
+                (call/cc (lambda (k) (set! saved k) 10)) \
+                (saved 100)";
+    let err = rt.eval_str("<m8>", prog).expect_err("should error");
+    let msg = err.message;
+    assert!(
+        msg.contains("outside its dynamic extent") && msg.contains("M8"),
+        "diagnostic should name the M8 limitation, got: {msg}"
+    );
+}
+
+#[test]
+fn after_extent_invocation_emits_clear_diagnostic_vm() {
+    let mut rt = Runtime::new();
+    let prog = "(define saved #f) \
+                (call/cc (lambda (k) (set! saved k) 10)) \
+                (saved 100)";
+    let err = rt.eval_str_via_vm("<m8>", prog).expect_err("should error");
+    let msg = err.message;
+    assert!(
+        msg.contains("outside its dynamic extent") && msg.contains("M8"),
+        "VM diagnostic should name the M8 limitation, got: {msg}"
+    );
+}
+
 // ---- Already passes (escape-only baseline) ----
 
 #[test]
