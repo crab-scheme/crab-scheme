@@ -1583,3 +1583,91 @@ fn diff_jit_car_cdr_passthrough() {
         }
     }
 }
+
+#[test]
+fn diff_jit_eq_on_any_symbol() {
+    // M6 Phase 4 iter BB: eq? on Any operands routes through
+    // vm_eq_any. Without this, eq?'s fallthrough i64 compare on
+    // two Box pointers is always false even when the boxed Values
+    // are equal symbols.
+    //
+    // Body: `(define (is-foo? v) (if (eq? v (quote foo)) 1 0))`.
+    // v arrives Any-tagged (Symbol from warmup). The Const::Symbol
+    // 'foo is Type::Symbol; the translator boxes it via BoxTyped
+    // so both eq? operands are Any-tagged on entry to vm_eq_any.
+    let defines = &["(define (is-foo? v) (if (eq? v (quote foo)) 1 0))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+         (if (= i 1500) 'done (begin (is-foo? (quote foo)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    cs_vm::vm::reset_jit_call_count();
+    let jit_match = rt
+        .eval_str_via_vm("<diff>", "(is-foo? (quote foo))")
+        .unwrap();
+    let jit_miss = rt
+        .eval_str_via_vm("<diff>", "(is-foo? (quote bar))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(after >= 2, "is-foo? never JITted (count = {})", after);
+
+    let walker_match = walker_eval(defines, "(is-foo? (quote foo))");
+    let walker_miss = walker_eval(defines, "(is-foo? (quote bar))");
+    for (label, jit, walker, expected) in [
+        ("match", &jit_match, &walker_match, 1i64),
+        ("miss", &jit_miss, &walker_miss, 0),
+    ] {
+        match (jit, walker) {
+            (
+                Value::Number(cs_core::Number::Fixnum(j)),
+                Value::Number(cs_core::Number::Fixnum(w)),
+            ) => {
+                assert_eq!(j, w, "tier mismatch on {}", label);
+                assert_eq!(*j, expected, "wrong value on {}", label);
+            }
+            other => panic!("expected fixnums on {}, got {:?}", label, other),
+        }
+    }
+}
+
+#[test]
+fn diff_jit_unbox_flonum_via_car() {
+    // M6 Phase 4 iter BB: arithmetic on Any + Flonum routes the
+    // Any operand through vm_unbox_flonum (not vm_unbox_fixnum,
+    // which would panic on a runtime-Flonum value).
+    //
+    // Body: `(define (head-add v) (+ 1.5 (car v)))`. (car v) is
+    // Any. The Const 1.5 is Flonum. `unbox_any_against` picks
+    // AnyToFlo because the typed operand is Flonum.
+    let defines = &["(define (head-add v) (+ 1.5 (car v)))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+         (if (= i 1500) 'done (begin (head-add (cons 2.0 0)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    cs_vm::vm::reset_jit_call_count();
+    let jit = rt
+        .eval_str_via_vm("<diff>", "(head-add (cons 3.5 0))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(after > 0, "head-add never JITted (count = {})", after);
+
+    let walker = walker_eval(defines, "(head-add (cons 3.5 0))");
+    match (&jit, &walker) {
+        (Value::Number(cs_core::Number::Flonum(j)), Value::Number(cs_core::Number::Flonum(w))) => {
+            assert_eq!(j.to_bits(), w.to_bits(), "tier mismatch");
+            assert!((j - 5.0).abs() < 1e-9, "expected 5.0, got {}", j);
+        }
+        other => panic!("expected flonums, got {:?}", other),
+    }
+}

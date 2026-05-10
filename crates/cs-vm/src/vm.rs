@@ -439,6 +439,66 @@ pub unsafe extern "C" fn vm_unbox_fixnum(r: i64) -> i64 {
     }
 }
 
+/// Consume an Any-tagged box and return its inner Boolean as 0/1.
+/// Panics on non-Boolean. Symmetric with `vm_unbox_fixnum`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_unbox_boolean(r: i64) -> i64 {
+    let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
+    match *boxed {
+        Value::Boolean(b) => b as i64,
+        ref other => panic!("vm_unbox_boolean: not a boolean ({})", other.type_name()),
+    }
+}
+
+/// Consume an Any-tagged box and return its inner Flonum's bit
+/// pattern (matches the i64-ABI encoding for Flonum). Panics on
+/// non-Flonum.
+#[no_mangle]
+pub unsafe extern "C" fn vm_unbox_flonum(r: i64) -> i64 {
+    let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
+    match *boxed {
+        Value::Number(cs_core::Number::Flonum(f)) => f.to_bits() as i64,
+        ref other => panic!("vm_unbox_flonum: not a flonum ({})", other.type_name()),
+    }
+}
+
+/// R6RS `(eq? a b)` on two Any-tagged boxes. Consumes both boxes
+/// (Box::from_raw on each) and returns 1 if eq?, else 0.
+///
+/// eq? semantics: same Symbol id, same Fixnum value, same Char
+/// value, same Boolean value, same Null. For heap-pointer types
+/// (Pair, Vector, ...) returns true iff the underlying Gc handles
+/// point at the same allocation. Otherwise false.
+#[no_mangle]
+pub unsafe extern "C" fn vm_eq_any(a: i64, b: i64) -> i64 {
+    let av: Box<Value> = unsafe { Box::from_raw(a as *mut Value) };
+    let bv: Box<Value> = unsafe { Box::from_raw(b as *mut Value) };
+    let eq = match (&*av, &*bv) {
+        (Value::Null, Value::Null) => true,
+        (Value::Unspecified, Value::Unspecified) => true,
+        (Value::Eof, Value::Eof) => true,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Character(x), Value::Character(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Number(cs_core::Number::Fixnum(x)), Value::Number(cs_core::Number::Fixnum(y))) => {
+            x == y
+        }
+        (Value::Number(cs_core::Number::Flonum(x)), Value::Number(cs_core::Number::Flonum(y))) => {
+            x.to_bits() == y.to_bits()
+        }
+        (Value::Pair(x), Value::Pair(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::Vector(x), Value::Vector(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::String(x), Value::String(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::ByteVector(x), Value::ByteVector(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::Hashtable(x), Value::Hashtable(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::Port(x), Value::Port(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::Promise(x), Value::Promise(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::Procedure(x), Value::Procedure(y)) => std::rc::Rc::ptr_eq(x, y),
+        _ => false,
+    };
+    eq as i64
+}
+
 /// Read the per-thread JIT-dispatch count. Test/diagnostics only.
 pub fn jit_call_count() -> u64 {
     VM_JIT_CALL_COUNT.with(|c| c.get())

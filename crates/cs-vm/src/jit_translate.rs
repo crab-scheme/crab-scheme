@@ -926,6 +926,53 @@ pub fn bytecode_to_rir_with_hints(
                                     // lowers to the same RIR op; the
                                     // type-guard at dispatch ensures both
                                     // args are i64-shaped before we enter.
+                                    // `eq?` / `eqv?` on Any operands routes
+                                    // through vm_eq_any (consume-on-use
+                                    // identity check). Both operands must be
+                                    // Box pointers; if one side is a typed
+                                    // immediate (Fixnum / Boolean / Symbol /
+                                    // ...) we wrap it first via BoxTyped.
+                                    ("eq?", 2) | ("eqv?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            || value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        let lhs_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let rhs_t = value_types
+                                            .get(&args[1])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let lhs = if lhs_t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(lhs_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        let rhs = if rhs_t == Type::Any {
+                                            args[1]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[1],
+                                                type_to_jit_rt_tag(rhs_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::EqAny(dst, lhs, rhs));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     ("eq?", 2)
                                     | ("eqv?", 2)
                                     | ("boolean=?", 2)
@@ -1414,7 +1461,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::FlonumLt(dst, _, _)
                 | RirInst::FlonumEq(dst, _, _)
                 | RirInst::PairP(dst, _)
-                | RirInst::NullP(dst, _) => {
+                | RirInst::NullP(dst, _)
+                | RirInst::EqAny(dst, _, _) => {
                     bool_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {
@@ -1698,6 +1746,47 @@ fn unbox_any_to_fix(
     dst
 }
 
+/// If `v` is `Type::Any`, emit `Inst::AnyToFlo(fresh, v)` and
+/// return the fresh Flonum-typed RirValue (the i64 carries the f64
+/// bit pattern). Otherwise return `v` unchanged.
+fn unbox_any_to_flo(
+    insts: &mut Vec<RirInst>,
+    value_types: &mut HashMap<RirValue, Type>,
+    alloc: &mut impl FnMut() -> RirValue,
+    v: RirValue,
+) -> RirValue {
+    if value_types.get(&v).copied() != Some(Type::Any) {
+        return v;
+    }
+    let dst = alloc();
+    insts.push(RirInst::AnyToFlo(dst, v));
+    value_types.insert(dst, Type::Flonum);
+    dst
+}
+
+/// Choose the unbox target based on the *other* operand's type so
+/// the result agrees with the surrounding op's signature. If the
+/// other side is Flonum, unbox Any → Flo (else vm_unbox_fixnum
+/// would panic on a runtime-Flonum operand). If the other side is
+/// any non-Any type, unbox to Fixnum (today's default — assumes
+/// Fixnum-shaped Any).
+fn unbox_any_against(
+    insts: &mut Vec<RirInst>,
+    value_types: &mut HashMap<RirValue, Type>,
+    alloc: &mut impl FnMut() -> RirValue,
+    v: RirValue,
+    other_ty: Type,
+) -> RirValue {
+    if value_types.get(&v).copied() != Some(Type::Any) {
+        return v;
+    }
+    if other_ty == Type::Flonum {
+        unbox_any_to_flo(insts, value_types, alloc, v)
+    } else {
+        unbox_any_to_fix(insts, value_types, alloc, v)
+    }
+}
+
 fn emit_arith_binop(
     insts: &mut Vec<RirInst>,
     stack: &mut Vec<StackEntry>,
@@ -1706,8 +1795,15 @@ fn emit_arith_binop(
     fixnum_ctor: fn(RirValue, RirValue, RirValue) -> RirInst,
     flonum_ctor: fn(RirValue, RirValue, RirValue) -> RirInst,
 ) -> Result<(), TranslateError> {
-    let rhs = unbox_any_to_fix(insts, value_types, alloc, pop_value(stack)?);
-    let lhs = unbox_any_to_fix(insts, value_types, alloc, pop_value(stack)?);
+    // Peek raw types first so we can pick the right unbox target
+    // when one operand is Any. (Any+Flonum needs AnyToFlo, else
+    // vm_unbox_fixnum would panic on a runtime-Flonum operand.)
+    let rhs_raw = pop_value(stack)?;
+    let lhs_raw = pop_value(stack)?;
+    let lt_raw = value_types.get(&lhs_raw).copied().unwrap_or(Type::Fixnum);
+    let rt_raw = value_types.get(&rhs_raw).copied().unwrap_or(Type::Fixnum);
+    let lhs = unbox_any_against(insts, value_types, alloc, lhs_raw, rt_raw);
+    let rhs = unbox_any_against(insts, value_types, alloc, rhs_raw, lt_raw);
     let dst = alloc();
     let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
     let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
@@ -1750,8 +1846,10 @@ fn emit_typed_lt(
     lhs: RirValue,
     rhs: RirValue,
 ) -> RirValue {
-    let lhs = unbox_any_to_fix(insts, value_types, alloc, lhs);
-    let rhs = unbox_any_to_fix(insts, value_types, alloc, rhs);
+    let lt_raw = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
+    let rt_raw = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
+    let lhs = unbox_any_against(insts, value_types, alloc, lhs, rt_raw);
+    let rhs = unbox_any_against(insts, value_types, alloc, rhs, lt_raw);
     let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
     let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
     let dst = alloc();
@@ -1773,8 +1871,10 @@ fn emit_typed_eq(
     lhs: RirValue,
     rhs: RirValue,
 ) -> RirValue {
-    let lhs = unbox_any_to_fix(insts, value_types, alloc, lhs);
-    let rhs = unbox_any_to_fix(insts, value_types, alloc, rhs);
+    let lt_raw = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
+    let rt_raw = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
+    let lhs = unbox_any_against(insts, value_types, alloc, lhs, rt_raw);
+    let rhs = unbox_any_against(insts, value_types, alloc, rhs, lt_raw);
     let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
     let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
     let dst = alloc();

@@ -99,6 +99,16 @@ pub struct Lowerer {
     /// lowers to a Cranelift call against this. Helper consumes
     /// the Any-tagged box and panics on non-Fixnum runtime values.
     unbox_fixnum_func: cranelift_module::FuncId,
+    /// FuncId of `vm_unbox_boolean(r) -> i64`. `Inst::AnyToBool`
+    /// lowers to this. Consumes the box; returns 0/1.
+    unbox_boolean_func: cranelift_module::FuncId,
+    /// FuncId of `vm_unbox_flonum(r) -> i64`. `Inst::AnyToFlo`
+    /// lowers to this. Consumes the box; returns the f64 bit
+    /// pattern.
+    unbox_flonum_func: cranelift_module::FuncId,
+    /// FuncId of `vm_eq_any(a, b) -> i64`. `Inst::EqAny` lowers
+    /// to this. Consumes both boxes; returns 0/1.
+    eq_any_func: cranelift_module::FuncId,
 }
 
 impl Lowerer {
@@ -144,6 +154,9 @@ impl Lowerer {
         builder.symbol("vm_value_drop", cs_vm::vm::vm_value_drop as *const u8);
         builder.symbol("vm_box_typed", cs_vm::vm::vm_box_typed as *const u8);
         builder.symbol("vm_unbox_fixnum", cs_vm::vm::vm_unbox_fixnum as *const u8);
+        builder.symbol("vm_unbox_boolean", cs_vm::vm::vm_unbox_boolean as *const u8);
+        builder.symbol("vm_unbox_flonum", cs_vm::vm::vm_unbox_flonum as *const u8);
+        builder.symbol("vm_eq_any", cs_vm::vm::vm_eq_any as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -269,6 +282,32 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_unbox_fixnum: {e}")))?;
 
+        // Same shape (i64 -> i64) for boolean and flonum unbox.
+        let unbox_boolean_func = module
+            .declare_function(
+                "vm_unbox_boolean",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_unbox_boolean: {e}")))?;
+        let unbox_flonum_func = module
+            .declare_function(
+                "vm_unbox_flonum",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_unbox_flonum: {e}")))?;
+
+        // vm_eq_any(a, b) -> i64. Same shape as the existing
+        // `box_typed_sig` (i64, i64) -> i64.
+        let eq_any_func = module
+            .declare_function(
+                "vm_eq_any",
+                cranelift_module::Linkage::Import,
+                &box_typed_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_eq_any: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -286,6 +325,9 @@ impl Lowerer {
             value_drop_func,
             box_typed_func,
             unbox_fixnum_func,
+            unbox_boolean_func,
+            unbox_flonum_func,
+            eq_any_func,
         })
     }
 
@@ -423,6 +465,15 @@ impl Lowerer {
             let unbox_fixnum_fnref = self
                 .module
                 .declare_func_in_func(self.unbox_fixnum_func, builder.func);
+            let unbox_boolean_fnref = self
+                .module
+                .declare_func_in_func(self.unbox_boolean_func, builder.func);
+            let unbox_flonum_fnref = self
+                .module
+                .declare_func_in_func(self.unbox_flonum_func, builder.func);
+            let eq_any_fnref = self
+                .module
+                .declare_func_in_func(self.eq_any_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -486,6 +537,9 @@ impl Lowerer {
                         value_drop_fnref,
                         box_typed_fnref,
                         unbox_fixnum_fnref,
+                        unbox_boolean_fnref,
+                        unbox_flonum_fnref,
+                        eq_any_fnref,
                         inst,
                     )?;
                 }
@@ -644,6 +698,9 @@ fn lower_inst(
     value_drop_fnref: cranelift_codegen::ir::FuncRef,
     box_typed_fnref: cranelift_codegen::ir::FuncRef,
     unbox_fixnum_fnref: cranelift_codegen::ir::FuncRef,
+    unbox_boolean_fnref: cranelift_codegen::ir::FuncRef,
+    unbox_flonum_fnref: cranelift_codegen::ir::FuncRef,
+    eq_any_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -859,6 +916,43 @@ fn lower_inst(
             if results.len() != 1 {
                 return Err(JitError::Codegen(format!(
                     "AnyToFix expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::AnyToBool(dst, src) => {
+            let v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(unbox_boolean_fnref, &[v]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "AnyToBool expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::AnyToFlo(dst, src) => {
+            let v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(unbox_flonum_fnref, &[v]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "AnyToFlo expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::EqAny(dst, lhs, rhs) => {
+            let l = lookup(map, *lhs)?;
+            let r = lookup(map, *rhs)?;
+            let inst_ref = b.ins().call(eq_any_fnref, &[l, r]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "EqAny expected 1 result, got {}",
                     results.len()
                 )));
             }

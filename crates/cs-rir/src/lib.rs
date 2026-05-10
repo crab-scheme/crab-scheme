@@ -305,6 +305,23 @@ pub enum Inst {
     /// an operand is `Type::Any` but the op needs raw Fixnum bits.
     AnyToFix(Value, Value),
 
+    /// `dst = unbox_boolean(src)` — consume an Any-tagged box and
+    /// extract its inner Boolean as 0/1 i64. Lowers to
+    /// `vm_unbox_boolean`. dst is `Type::Boolean`.
+    AnyToBool(Value, Value),
+
+    /// `dst = unbox_flonum(src)` — consume an Any-tagged box and
+    /// extract its inner Flonum's bit pattern. Lowers to
+    /// `vm_unbox_flonum`. dst is `Type::Flonum`.
+    AnyToFlo(Value, Value),
+
+    /// `dst = eq?(lhs, rhs)` on two Any-tagged boxes. Consumes
+    /// both operands and produces `Type::Boolean`. Lowers to
+    /// `vm_eq_any` which does the per-variant identity comparison
+    /// (Symbol id, Fixnum value, Gc::ptr_eq for heap-pointer
+    /// types).
+    EqAny(Value, Value, Value),
+
     /// Type guard: if the value's runtime type doesn't match the
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
     /// always dispatches dynamically).
