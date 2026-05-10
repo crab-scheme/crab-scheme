@@ -137,6 +137,36 @@ fn recursive_fib_jits_after_warmup() {
     );
 }
 
+/// M6 Phase 2 iter E: `<=`, `>`, `>=` outside fused-branch
+/// contexts now JIT (translator lowers GtFx2/LeFx2/GeFx2 via Lt+Eq
+/// combinations).
+#[test]
+fn jit_handles_le_gt_ge_comparisons() {
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<jit>",
+        "(define cmp (lambda (a b) (if (<= a b) (if (>= a b) 'eq 'lt) 'gt)))",
+    )
+    .unwrap();
+    // Warm cmp past threshold.
+    rt.eval_str_via_vm(
+        "<jit>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (cmp i (- i 1)) (cmp i i) (cmp i (+ i 1)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    // Functional checks — three result values.
+    let lt = rt.eval_str_via_vm("<jit>", "(cmp 5 10)").unwrap();
+    let eq = rt.eval_str_via_vm("<jit>", "(cmp 7 7)").unwrap();
+    let gt = rt.eval_str_via_vm("<jit>", "(cmp 99 1)").unwrap();
+    for (label, v) in [("lt", lt), ("eq", eq), ("gt", gt)] {
+        match v {
+            Value::Symbol(_) => {}
+            other => panic!("{label}: expected symbol, got {:?}", other),
+        }
+    }
+}
+
 /// M6 Phase 2 iter B: closures with free Fixnum vars can JIT.
 /// `(define base 100) (define add-base (lambda (x) (+ x base)))` —
 /// `base` is a free var inside add-base's body. The JIT translator

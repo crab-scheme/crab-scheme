@@ -224,6 +224,35 @@ pub fn bytecode_to_rir(
                 Inst::MulFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Mul)?,
                 Inst::LtFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Lt)?,
                 Inst::EqFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Eq)?,
+                Inst::GtFx2 => {
+                    // a > b  →  b < a (swap operands).
+                    let (a, b) = pop_two_values(&mut sim_stack)?;
+                    let dst = alloc();
+                    insts.push(RirInst::Lt(dst, b, a));
+                    sim_stack.push(StackEntry::Value(dst));
+                }
+                Inst::LeFx2 => {
+                    // a <= b  →  NOT (b < a)  →  Eq(_, Lt(_, b, a), 0).
+                    let (a, b) = pop_two_values(&mut sim_stack)?;
+                    let lt = alloc();
+                    insts.push(RirInst::Lt(lt, b, a));
+                    let zero = alloc();
+                    insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                    let dst = alloc();
+                    insts.push(RirInst::Eq(dst, lt, zero));
+                    sim_stack.push(StackEntry::Value(dst));
+                }
+                Inst::GeFx2 => {
+                    // a >= b  →  NOT (a < b)  →  Eq(_, Lt(_, a, b), 0).
+                    let (a, b) = pop_two_values(&mut sim_stack)?;
+                    let lt = alloc();
+                    insts.push(RirInst::Lt(lt, a, b));
+                    let zero = alloc();
+                    insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                    let dst = alloc();
+                    insts.push(RirInst::Eq(dst, lt, zero));
+                    sim_stack.push(StackEntry::Value(dst));
+                }
                 Inst::JumpIfFalse(target) => {
                     let cond = pop_value(&mut sim_stack)?;
                     let target_block = lookup_block(&offset_to_block, *target, "JumpIfFalse")?;
