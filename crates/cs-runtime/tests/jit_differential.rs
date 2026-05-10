@@ -533,3 +533,44 @@ fn diff_flonum_comparison() {
         }
     }
 }
+
+#[test]
+fn diff_flonum_branch() {
+    // M6 Phase 2 iter AC: BranchOn{Lt,Le,Gt,Ge,Ne}Fx2 against
+    // Flonum-typed operands lower through FlonumLt / FlonumEq so
+    // the brif terminator gets IEEE ordering rather than i64 cmp on
+    // bit patterns. Verifies via a clamping body that branches
+    // twice on flonum comparisons.
+    let defines = &["(define clamp01 (lambda (n) \
+        (let ((f (real->flonum n))) \
+          (if (< f 0.0) 0.0 (if (> f 1.0) 1.0 f)))))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (clamp01 0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, f64)] = &[
+        ("(clamp01 -5)", 0.0),
+        ("(clamp01 0)", 0.0),
+        ("(clamp01 2)", 1.0),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Flonum(j)),
+                Value::Number(cs_core::Number::Flonum(w)),
+            ) => {
+                assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
+                assert_eq!(*j, *expected, "value mismatch on {}", expr);
+            }
+            other => panic!("{}: expected flonums, got {:?}", expr, other),
+        }
+    }
+}

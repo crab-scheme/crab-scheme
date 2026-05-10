@@ -376,8 +376,7 @@ pub fn bytecode_to_rir(
                 }
                 Inst::BranchOnGeFx2(target) => {
                     let (a, b) = pop_two_values(&mut sim_stack)?;
-                    let cond = alloc();
-                    insts.push(RirInst::Lt(cond, a, b));
+                    let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnGeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGeFx2 fall")?;
                     let height = sim_stack.len();
@@ -400,8 +399,7 @@ pub fn bytecode_to_rir(
                 }
                 Inst::BranchOnGtFx2(target) => {
                     let (a, b) = pop_two_values(&mut sim_stack)?;
-                    let cond = alloc();
-                    insts.push(RirInst::Lt(cond, b, a));
+                    let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, b, a);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnGtFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGtFx2 fall")?;
                     let height = sim_stack.len();
@@ -424,8 +422,7 @@ pub fn bytecode_to_rir(
                 }
                 Inst::BranchOnLeFx2(target) => {
                     let (a, b) = pop_two_values(&mut sim_stack)?;
-                    let cond = alloc();
-                    insts.push(RirInst::Lt(cond, b, a));
+                    let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, b, a);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnLeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLeFx2 fall")?;
                     let height = sim_stack.len();
@@ -448,8 +445,7 @@ pub fn bytecode_to_rir(
                 }
                 Inst::BranchOnLtFx2(target) => {
                     let (a, b) = pop_two_values(&mut sim_stack)?;
-                    let cond = alloc();
-                    insts.push(RirInst::Lt(cond, a, b));
+                    let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnLtFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLtFx2 fall")?;
                     let height = sim_stack.len();
@@ -472,8 +468,7 @@ pub fn bytecode_to_rir(
                 }
                 Inst::BranchOnNeFx2(target) => {
                     let (a, b) = pop_two_values(&mut sim_stack)?;
-                    let cond = alloc();
-                    insts.push(RirInst::Eq(cond, a, b));
+                    let cond = emit_typed_eq(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnNeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnNeFx2 fall")?;
                     let height = sim_stack.len();
@@ -1047,6 +1042,51 @@ fn emit_arith_binop(
     value_types.insert(dst, dst_t);
     stack.push(StackEntry::Value(dst));
     Ok(())
+}
+
+/// Emit a typed less-than instruction (Lt vs FlonumLt) and record
+/// the dst as Boolean. Used by both `emit_cmp_binop` and the
+/// BranchOn*Fx2 terminator translations where we need just the
+/// comparison value for a brif, not a sim-stack push.
+fn emit_typed_lt(
+    insts: &mut Vec<RirInst>,
+    value_types: &mut HashMap<RirValue, Type>,
+    alloc: &mut impl FnMut() -> RirValue,
+    lhs: RirValue,
+    rhs: RirValue,
+) -> RirValue {
+    let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
+    let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
+    let dst = alloc();
+    let inst = if lt == Type::Flonum && rt == Type::Flonum {
+        RirInst::FlonumLt(dst, lhs, rhs)
+    } else {
+        RirInst::Lt(dst, lhs, rhs)
+    };
+    insts.push(inst);
+    value_types.insert(dst, Type::Boolean);
+    dst
+}
+
+/// Counterpart to `emit_typed_lt` for equality.
+fn emit_typed_eq(
+    insts: &mut Vec<RirInst>,
+    value_types: &mut HashMap<RirValue, Type>,
+    alloc: &mut impl FnMut() -> RirValue,
+    lhs: RirValue,
+    rhs: RirValue,
+) -> RirValue {
+    let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
+    let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
+    let dst = alloc();
+    let inst = if lt == Type::Flonum && rt == Type::Flonum {
+        RirInst::FlonumEq(dst, lhs, rhs)
+    } else {
+        RirInst::Eq(dst, lhs, rhs)
+    };
+    insts.push(inst);
+    value_types.insert(dst, Type::Boolean);
+    dst
 }
 
 /// Comparison binop emission. Same shape as `emit_arith_binop` but
