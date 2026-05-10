@@ -149,19 +149,35 @@ impl Lowerer {
         // imports today (no translator path uses them yet); subsequent
         // iters wire `cons` / `car` / `cdr` lowering through these
         // and unlock end-to-end Pair-returning JIT bodies.
-        builder.symbol("vm_alloc_pair", cs_vm::vm::vm_alloc_pair as *const u8);
-        builder.symbol("vm_pair_car", cs_vm::vm::vm_pair_car as *const u8);
-        builder.symbol("vm_pair_cdr", cs_vm::vm::vm_pair_cdr as *const u8);
-        builder.symbol("vm_pair_p", cs_vm::vm::vm_pair_p as *const u8);
-        builder.symbol("vm_null_p", cs_vm::vm::vm_null_p as *const u8);
-        builder.symbol("vm_value_clone", cs_vm::vm::vm_value_clone as *const u8);
-        builder.symbol("vm_value_drop", cs_vm::vm::vm_value_drop as *const u8);
-        builder.symbol("vm_box_typed", cs_vm::vm::vm_box_typed as *const u8);
-        builder.symbol("vm_unbox_fixnum", cs_vm::vm::vm_unbox_fixnum as *const u8);
-        builder.symbol("vm_unbox_boolean", cs_vm::vm::vm_unbox_boolean as *const u8);
-        builder.symbol("vm_unbox_flonum", cs_vm::vm::vm_unbox_flonum as *const u8);
-        builder.symbol("vm_eq_any", cs_vm::vm::vm_eq_any as *const u8);
-        builder.symbol("vm_any_truthy", cs_vm::vm::vm_any_truthy as *const u8);
+        // ADR 0012 D-2 (iter BJ) — every Any-flavored runtime helper
+        // now resolves to the `*_gc` variant. The symbol names stay
+        // unchanged so we don't have to thread renames through every
+        // declare_function / declare_func_in_func site; only the
+        // resolved function address changes. The Box-flavored helpers
+        // (vm_alloc_pair etc.) remain defined in cs-vm but become
+        // unreachable from JIT'd code after this commit.
+        builder.symbol("vm_alloc_pair", cs_vm::vm::vm_alloc_pair_gc as *const u8);
+        builder.symbol("vm_pair_car", cs_vm::vm::vm_pair_car_gc as *const u8);
+        builder.symbol("vm_pair_cdr", cs_vm::vm::vm_pair_cdr_gc as *const u8);
+        builder.symbol("vm_pair_p", cs_vm::vm::vm_pair_p_gc as *const u8);
+        builder.symbol("vm_null_p", cs_vm::vm::vm_null_p_gc as *const u8);
+        builder.symbol("vm_value_clone", cs_vm::vm::vm_value_clone_gc as *const u8);
+        builder.symbol("vm_value_drop", cs_vm::vm::vm_value_drop_gc as *const u8);
+        builder.symbol("vm_box_typed", cs_vm::vm::vm_box_typed_gc as *const u8);
+        builder.symbol(
+            "vm_unbox_fixnum",
+            cs_vm::vm::vm_unbox_fixnum_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_unbox_boolean",
+            cs_vm::vm::vm_unbox_boolean_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_unbox_flonum",
+            cs_vm::vm::vm_unbox_flonum_gc as *const u8,
+        );
+        builder.symbol("vm_eq_any", cs_vm::vm::vm_eq_any_gc as *const u8);
+        builder.symbol("vm_any_truthy", cs_vm::vm::vm_any_truthy_gc as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
