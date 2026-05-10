@@ -732,3 +732,55 @@ fn diff_arg_side_flonum_passthrough() {
     let fix_walker = walker_eval(defines, "(sqr 5)");
     assert_eq!(format!("{:?}", fix), format!("{:?}", fix_walker));
 }
+
+#[test]
+fn diff_flonum_rounding_ops() {
+    // M6 Phase 2 iter AG: floor / ceiling / truncate / round on
+    // Flonum-typed operands lower through Cranelift floor / ceil /
+    // trunc / nearest. Without this, the translator's identity-on-
+    // fixnum Move path was wrong for f64 inputs (it returned the
+    // bit pattern unchanged, which decoded as the original flonum).
+    let defines = &[
+        "(define floor-mul (lambda (x) (floor (* x 1.5))))",
+        "(define ceil-mul  (lambda (x) (ceiling (* x 1.5))))",
+        "(define trunc-mul (lambda (x) (truncate (* x 1.5))))",
+        "(define round-mul (lambda (x) (round (* x 1.5))))",
+    ];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+            (if (= i 1500) 'done \
+                (begin (floor-mul 2.0) (ceil-mul 2.0) (trunc-mul 2.0) (round-mul 2.0) \
+                       (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, f64)] = &[
+        ("(floor-mul 2.7)", 4.0),
+        ("(floor-mul -3.7)", -6.0),
+        ("(ceil-mul 2.1)", 4.0),
+        ("(trunc-mul -2.7)", -4.0),
+        ("(round-mul 2.5)", 4.0),
+        ("(round-mul 3.5)", 5.0),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Flonum(j)),
+                Value::Number(cs_core::Number::Flonum(w)),
+            ) => {
+                assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
+                assert_eq!(*j, *expected, "value mismatch on {}", expr);
+            }
+            other => panic!("{}: expected flonums, got {:?}", expr, other),
+        }
+    }
+}

@@ -129,6 +129,19 @@ pub enum Inst {
     /// `dst = min(lhs, rhs)` (flonum). Lowers to Cranelift `fmin`.
     FlonumMin(Value, Value, Value),
 
+    /// `dst = floor(src)` (flonum). Cranelift `floor`.
+    FlonumFloor(Value, Value),
+
+    /// `dst = ceil(src)` (flonum). Cranelift `ceil`.
+    FlonumCeil(Value, Value),
+
+    /// `dst = trunc(src)` (flonum). Cranelift `trunc`.
+    FlonumTrunc(Value, Value),
+
+    /// `dst = round-to-nearest-even(src)` (flonum). Cranelift `nearest` —
+    /// IEEE-754 banker's rounding, matching R6RS `round`.
+    FlonumRound(Value, Value),
+
     /// `dst = (lhs < rhs)`. cs-vm: `Inst::Lt`.
     Lt(Value, Value, Value),
 

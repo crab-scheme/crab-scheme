@@ -692,6 +692,38 @@ pub fn bytecode_to_rir_with_hints(
                                         let _ = args[0];
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
                                     }
+                                    // Flonum rounding when the arg is
+                                    // statically Flonum-typed. Cranelift
+                                    // floor/ceil/trunc/nearest do the
+                                    // actual rounding on f64 bits.
+                                    ("floor", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumFloor(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("ceiling", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumCeil(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("truncate", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumTrunc(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("round", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumRound(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
                                     // Identity-on-fixnum rounding ops.
                                     // (floor n), (ceiling n), etc. all
                                     // return n unchanged when n is an
@@ -1028,7 +1060,11 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::FlonumSqrt(dst, _)
                 | RirInst::FlonumAbs(dst, _)
                 | RirInst::FlonumMax(dst, _, _)
-                | RirInst::FlonumMin(dst, _, _) => {
+                | RirInst::FlonumMin(dst, _, _)
+                | RirInst::FlonumFloor(dst, _)
+                | RirInst::FlonumCeil(dst, _)
+                | RirInst::FlonumTrunc(dst, _)
+                | RirInst::FlonumRound(dst, _) => {
                     flo_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Flonum(_)) => {

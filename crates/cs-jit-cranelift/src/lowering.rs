@@ -464,6 +464,10 @@ fn lower_inst(
         Inst::FlonumMin(dst, lhs, rhs) => {
             fbinop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().fmin(l, r))?
         }
+        Inst::FlonumFloor(dst, src) => funary(b, map, *dst, *src, |b, x| b.ins().floor(x))?,
+        Inst::FlonumCeil(dst, src) => funary(b, map, *dst, *src, |b, x| b.ins().ceil(x))?,
+        Inst::FlonumTrunc(dst, src) => funary(b, map, *dst, *src, |b, x| b.ins().trunc(x))?,
+        Inst::FlonumRound(dst, src) => funary(b, map, *dst, *src, |b, x| b.ins().nearest(x))?,
         Inst::Param(_, _) => {
             // Param entries are populated from the entry block's
             // appended params before lower_inst runs.
