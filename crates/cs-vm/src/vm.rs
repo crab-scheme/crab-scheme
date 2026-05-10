@@ -151,6 +151,79 @@ thread_local! {
     /// fires. Tests use this to assert threshold-crossing behavior
     /// without installing a real hook.
     static VM_TIER_UP_COUNT: Cell<u64> = const { Cell::new(0) };
+    /// Diagnostic counter: incremented each time a JIT-compiled
+    /// closure dispatches through its native pointer rather than
+    /// the bytecode body. Tests use this to assert the JIT actually
+    /// ran (vs just being installed).
+    static VM_JIT_CALL_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Read the per-thread JIT-dispatch count. Test/diagnostics only.
+pub fn jit_call_count() -> u64 {
+    VM_JIT_CALL_COUNT.with(|c| c.get())
+}
+
+/// Reset the per-thread JIT-dispatch count.
+pub fn reset_jit_call_count() {
+    VM_JIT_CALL_COUNT.with(|c| c.set(0));
+}
+
+/// Increment the JIT-dispatch counter. Called by the closure-call
+/// dispatch each time it routes through native code.
+fn bump_jit_call_count() {
+    VM_JIT_CALL_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+/// Try to dispatch a JIT-compiled closure call. Returns
+/// `Some(result)` if the closure has a JIT pointer installed and
+/// every arg is a Fixnum; otherwise `None` (caller falls back to
+/// bytecode dispatch).
+///
+/// Iter-6 ABI: `extern "C" fn(i64, ..., i64) -> i64`. Args are
+/// unboxed Fixnums; the result is wrapped as `Value::Number(Fixnum)`.
+fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
+    let ptr = closure.jit_ptr();
+    if ptr.is_null() {
+        return None;
+    }
+    if closure.jit_arity() as usize != args.len() {
+        return None;
+    }
+    let mut argv = [0i64; 6];
+    if args.len() > argv.len() {
+        return None;
+    }
+    for (i, a) in args.iter().enumerate() {
+        match a {
+            Value::Number(cs_core::Number::Fixnum(n)) => argv[i] = *n,
+            _ => return None,
+        }
+    }
+    bump_jit_call_count();
+    let r: i64 = match args.len() {
+        0 => {
+            let f: extern "C" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
+            f()
+        }
+        1 => {
+            let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+            f(argv[0])
+        }
+        2 => {
+            let f: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+            f(argv[0], argv[1])
+        }
+        3 => {
+            let f: extern "C" fn(i64, i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+            f(argv[0], argv[1], argv[2])
+        }
+        4 => {
+            let f: extern "C" fn(i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+            f(argv[0], argv[1], argv[2], argv[3])
+        }
+        _ => return None,
+    };
+    Some(Value::Number(cs_core::Number::Fixnum(r)))
 }
 
 /// Install the `eval` hook for the current thread. Returns the previous hook
@@ -301,6 +374,11 @@ impl VmError {
 /// [`install_tier_up_hook`]) fires. The hook is the JIT compiler's
 /// trigger; if it's `None`, the counter still bumps but nothing
 /// happens.
+///
+/// On successful JIT compilation, the hook calls
+/// [`VmClosure::set_jit_ptr`] to install the native function
+/// pointer + arity. The closure-call dispatch checks `jit_ptr`
+/// before falling back to bytecode.
 #[derive(Debug)]
 pub struct VmClosure {
     pub lambda_idx: usize,
@@ -309,6 +387,36 @@ pub struct VmClosure {
     /// Per-closure tier counter. Owned, not shared — each freshly
     /// allocated closure starts at 0. (M6 iter 3.)
     pub tier: cs_jit::Tier,
+    /// Native function pointer once JIT-compiled, else null.
+    /// Lazy: filled by the tier-up hook (M6 iter 6).
+    jit_ptr: Cell<*const u8>,
+    /// Arity at which `jit_ptr` was compiled. Caller checks this
+    /// before transmuting.
+    jit_arity: Cell<u32>,
+}
+
+impl VmClosure {
+    /// Install a native function pointer compiled by the JIT, with
+    /// the matching parameter count. Called by the tier-up hook on
+    /// successful compilation. After this, the closure-call dispatch
+    /// will route through native code when arg types match.
+    pub fn set_jit_ptr(&self, ptr: *const u8, arity: u32) {
+        self.jit_ptr.set(ptr);
+        self.jit_arity.set(arity);
+    }
+
+    /// Currently-installed JIT pointer, if any. `None` until the
+    /// tier-up hook fires + succeeds; persists for the closure's
+    /// lifetime once set.
+    pub fn jit_ptr(&self) -> *const u8 {
+        self.jit_ptr.get()
+    }
+
+    /// Arity the JIT pointer was compiled for. Meaningful only when
+    /// [`jit_ptr`] is non-null.
+    pub fn jit_arity(&self) -> u32 {
+        self.jit_arity.get()
+    }
 }
 
 impl Procedure for VmClosure {
@@ -651,6 +759,26 @@ fn run_dispatch(
                     if let Some(closure) = any.downcast_ref::<VmClosure>() {
                         if closure.tier.bump() {
                             fire_tier_up_hook(closure);
+                        }
+                        // JIT fast path: if a native pointer is
+                        // installed and every arg is a Fixnum, run
+                        // the JIT body. Falls through to bytecode on
+                        // ABI mismatch or non-Fixnum args.
+                        if !closure.jit_ptr().is_null() {
+                            let arg_slice = &stack[args_start..stack_len];
+                            if let Some(result) = try_dispatch_jit(closure, arg_slice) {
+                                stack.truncate(func_idx);
+                                stack.push(result);
+                                if is_tail {
+                                    frames.pop();
+                                    if frames.is_empty() {
+                                        return stack
+                                            .pop()
+                                            .ok_or_else(|| VmError::new("empty stack at exit"));
+                                    }
+                                }
+                                continue;
+                            }
                         }
                         let lam = &closure.bc.lambdas[closure.lambda_idx];
                         if !lambda_arity_ok(lam, n) {
@@ -2024,6 +2152,20 @@ fn run_dispatch(
                             if closure.tier.bump() {
                                 fire_tier_up_hook(closure);
                             }
+                            if !closure.jit_ptr().is_null() {
+                                if let Some(result) = try_dispatch_jit(closure, &args) {
+                                    stack.push(result);
+                                    if is_tail {
+                                        frames.pop();
+                                        if frames.is_empty() {
+                                            return stack.pop().ok_or_else(|| {
+                                                VmError::new("empty stack at tail-jit")
+                                            });
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
                             let lam = &closure.bc.lambdas[closure.lambda_idx];
                             if !lambda_arity_ok(lam, args.len()) {
                                 return Err(VmError::new("arity mismatch"));
@@ -2110,6 +2252,8 @@ fn run_dispatch(
                     env: frame.env.clone(),
                     bc: frame.bc.clone(),
                     tier: cs_jit::Tier::default(),
+                    jit_ptr: Cell::new(std::ptr::null()),
+                    jit_arity: Cell::new(0),
                 };
                 let p: Rc<dyn Procedure> = Rc::new(cl);
                 stack.push(Value::Procedure(p));
@@ -3169,6 +3313,11 @@ pub fn vm_call_sync(
             if let Some(c) = any.downcast_ref::<VmClosure>() {
                 if c.tier.bump() {
                     fire_tier_up_hook(c);
+                }
+                if !c.jit_ptr().is_null() {
+                    if let Some(result) = try_dispatch_jit(c, args) {
+                        return Ok(result);
+                    }
                 }
                 let lam = &c.bc.lambdas[c.lambda_idx];
                 if !lambda_arity_ok(lam, args.len()) {

@@ -4,6 +4,7 @@ pub mod builtins;
 pub mod env;
 pub mod eval;
 pub mod ffi;
+pub mod jit;
 pub mod proc;
 
 use std::cell::{Cell, RefCell};
@@ -51,6 +52,10 @@ pub struct Runtime {
     /// runtime back-pointer (which equals `self`) stays valid even
     /// if Runtime fields are reordered.
     ffi_ctx: Option<Box<crate::ffi::RuntimeFfiContext>>,
+    /// JIT lowerer; populated by [`Runtime::install_jit`]. None
+    /// means the runtime hasn't opted into JIT (closures stay on
+    /// the bytecode VM regardless of tier-up).
+    pub(crate) jit_lowerer: Option<cs_jit_cranelift::Lowerer>,
 }
 
 /// Opaque handle for a [`Pinned`] slot. See [`Runtime::pin`].
@@ -1557,6 +1562,7 @@ impl Runtime {
             next_pin_id: Rc::new(Cell::new(1)),
             loaded_libs: Vec::new(),
             ffi_ctx: None,
+            jit_lowerer: None,
         }
     }
 

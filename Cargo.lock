@@ -449,6 +449,7 @@ dependencies = [
  "cs-gc",
  "cs-ir",
  "cs-jit",
+ "cs-jit-cranelift",
  "cs-lex",
  "cs-parse",
  "cs-vm",

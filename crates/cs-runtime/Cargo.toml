@@ -15,6 +15,8 @@ cs-ir = { workspace = true }
 cs-lex = { workspace = true }
 cs-parse = { workspace = true }
 cs-vm = { workspace = true }
+cs-jit = { workspace = true }
+cs-jit-cranelift = { workspace = true }
 libloading = { workspace = true }
 num-traits = { workspace = true }
 thiserror = { workspace = true }
@@ -22,5 +24,4 @@ thiserror = { workspace = true }
 [dev-dependencies]
 cs-ffi-example = { workspace = true }
 cs-ffi-macros = { workspace = true }
-cs-jit = { workspace = true }
 
