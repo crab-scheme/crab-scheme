@@ -277,12 +277,13 @@ Iters 117+ are filling R7RS gaps one per iter:
   bytevector with [start [end]] range; returns count or eof-object
 - 152 R7RS (load filename [environment]); also fixed write-char and
   write-string to handle FileOutput ports (were StringOutput-only)
-  (this iter)
+- 153 R7RS complex? and real? as aliases for number? (no complex
+  numbers in our subset, so all numbers satisfy both) (this iter)
 
 Current totals:
-- 106 conformance test files (cli)
-- VM tier: 107 tests
-- Aggregate: 2116 individual Scheme tests passing
+- 107 conformance test files (cli)
+- VM tier: 108 tests
+- Aggregate: 2150 individual Scheme tests passing
 
 ## Loop cadence
 

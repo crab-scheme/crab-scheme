@@ -962,3 +962,12 @@ fn vm_conformance_r7rs_read_bytevector_bang() {
     println!("r7rs_read_bytevector_bang: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_numeric_predicates() {
+    let walker = pass_count_walker("r7rs_numeric_predicates.scm");
+    let vm = pass_count_vm("r7rs_numeric_predicates.scm")
+        .expect("vm should run r7rs_numeric_predicates.scm");
+    println!("r7rs_numeric_predicates: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}

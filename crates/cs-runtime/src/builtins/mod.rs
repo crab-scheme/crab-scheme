@@ -143,6 +143,8 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("fixnum->flonum", b_fixnum_to_flonum),
         // type predicates
         ("number?", b_number_p),
+        ("complex?", b_number_p),
+        ("real?", b_number_p),
         ("integer?", b_integer_p),
         ("fixnum?", b_fixnum_p),
         ("flonum?", b_flonum_p),
