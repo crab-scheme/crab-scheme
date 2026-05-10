@@ -593,10 +593,43 @@ pub const JIT_DEOPT_RECOMPILE_THRESHOLD: u32 = 256;
 /// Encodings for [`VmClosure::jit_return_type`] and the per-nibble
 /// slots in `jit_param_types`. Kept as plain `u8` so storage stays
 /// Copy without pulling cs-rir into cs-vm.
+///
+/// Tags 0..3 are the M6 Phase 2 immediate types — fully wired through
+/// the dispatcher and Cranelift lowering. Tags 4..14 are the heap-
+/// pointer types reserved by ADR 0011 D-1 for the next milestone;
+/// they only have constant entries today, no dispatcher decode yet
+/// (try_dispatch_jit rejects any non-immediate slot until those
+/// iters land). Tag 15 = Any per ADR 0011 D-3.
 pub const JIT_RT_FIXNUM: u8 = 0;
 pub const JIT_RT_BOOLEAN: u8 = 1;
 pub const JIT_RT_CHARACTER: u8 = 2;
 pub const JIT_RT_FLONUM: u8 = 3;
+/// Heap-pointer Pair (`Rc<Pair>::into_raw`).
+pub const JIT_RT_PAIR: u8 = 4;
+/// Heap-pointer Vector (`Gc<RefCell<Vec<Value>>>::into_raw`).
+pub const JIT_RT_VECTOR: u8 = 5;
+/// Heap-pointer String.
+pub const JIT_RT_STRING: u8 = 6;
+/// Heap-pointer ByteVector.
+pub const JIT_RT_BYTEVECTOR: u8 = 7;
+/// Heap-pointer Procedure (`Rc<dyn Procedure>::into_raw`).
+pub const JIT_RT_PROCEDURE: u8 = 8;
+/// `Symbol(u32)` zero-extended.
+pub const JIT_RT_SYMBOL: u8 = 9;
+/// Heap-pointer BigInt.
+pub const JIT_RT_BIGINT: u8 = 10;
+/// Heap-pointer Rational.
+pub const JIT_RT_RATIONAL: u8 = 11;
+/// Heap-pointer Hashtable.
+pub const JIT_RT_HASHTABLE: u8 = 12;
+/// Heap-pointer Port.
+pub const JIT_RT_PORT: u8 = 13;
+/// Reserved for one extra immediate-or-pointer type; currently unused.
+pub const JIT_RT_RESERVED: u8 = 14;
+/// Polymorphic slot — i64 carries `Box::into_raw(Box<Value>)`. Per
+/// ADR 0011 D-3, used at megamorphic call sites.
+pub const JIT_RT_ANY: u8 = 15;
+
 /// Default `jit_param_types` value: every nibble = JIT_RT_FIXNUM (0).
 pub const JIT_PARAM_TYPES_ALL_FIXNUM: u32 = 0;
 
