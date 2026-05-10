@@ -863,11 +863,15 @@ pub fn bytecode_to_rir_with_hints(
                                     // to the Flonum* variants when every
                                     // operand is statically Flonum-typed.
                                     ("+", _) | ("-", _) | ("*", _) => {
-                                        let all_flonum = !args.is_empty()
-                                            && args.iter().all(|v| {
-                                                value_types.get(v).copied() == Some(Type::Flonum)
-                                            });
-                                        let result_t = if all_flonum {
+                                        // Mixed-tower contagion: any
+                                        // Flonum operand promotes the
+                                        // whole chain to Flonum (R6RS
+                                        // numeric tower). Promote each
+                                        // Fixnum operand via FixToFlo.
+                                        let any_flonum = args.iter().any(|v| {
+                                            value_types.get(v).copied() == Some(Type::Flonum)
+                                        });
+                                        let result_t = if any_flonum {
                                             Type::Flonum
                                         } else {
                                             Type::Fixnum
@@ -886,8 +890,32 @@ pub fn bytecode_to_rir_with_hints(
                                                 "*" => RirInst::FlonumMul,
                                                 _ => unreachable!(),
                                             };
-                                        let ctor = if all_flonum { fl_ctor } else { fx_ctor };
-                                        if args.is_empty() {
+                                        let ctor = if any_flonum { fl_ctor } else { fx_ctor };
+                                        // Promote any Fixnum operands to
+                                        // Flonum when the chain is
+                                        // any-flonum. Stays Fixnum if all
+                                        // operands are Fixnum.
+                                        let promoted_args: Vec<RirValue> = if any_flonum {
+                                            args.iter()
+                                                .map(|v| {
+                                                    let t = value_types
+                                                        .get(v)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    if t == Type::Flonum {
+                                                        *v
+                                                    } else {
+                                                        let p = alloc();
+                                                        insts.push(RirInst::FixToFlo(p, *v));
+                                                        value_types.insert(p, Type::Flonum);
+                                                        p
+                                                    }
+                                                })
+                                                .collect()
+                                        } else {
+                                            args.clone()
+                                        };
+                                        if promoted_args.is_empty() {
                                             // (+) = 0; (*) = 1; (-) is
                                             // an arity error in walker — bail.
                                             match name {
@@ -906,29 +934,28 @@ pub fn bytecode_to_rir_with_hints(
                                                 }
                                             }
                                             value_types.insert(dst, Type::Fixnum);
-                                        } else if args.len() == 1 {
+                                        } else if promoted_args.len() == 1 {
                                             match name {
                                                 "+" | "*" => {
                                                     // Identity.
-                                                    insts.push(RirInst::Move(dst, args[0]));
-                                                    let t = value_types
-                                                        .get(&args[0])
-                                                        .copied()
-                                                        .unwrap_or(Type::Fixnum);
-                                                    value_types.insert(dst, t);
+                                                    insts
+                                                        .push(RirInst::Move(dst, promoted_args[0]));
+                                                    value_types.insert(dst, result_t);
                                                 }
                                                 "-" => {
                                                     // (- x) = 0 - x. Same
                                                     // operand-type rules.
                                                     let zero = alloc();
-                                                    if all_flonum {
+                                                    if any_flonum {
                                                         insts.push(RirInst::LoadConst(
                                                             zero,
                                                             Const::Flonum(0.0),
                                                         ));
                                                         value_types.insert(zero, Type::Flonum);
                                                         insts.push(RirInst::FlonumSub(
-                                                            dst, zero, args[0],
+                                                            dst,
+                                                            zero,
+                                                            promoted_args[0],
                                                         ));
                                                     } else {
                                                         insts.push(RirInst::LoadConst(
@@ -936,27 +963,30 @@ pub fn bytecode_to_rir_with_hints(
                                                             Const::Fixnum(0),
                                                         ));
                                                         value_types.insert(zero, Type::Fixnum);
-                                                        insts
-                                                            .push(RirInst::Sub(dst, zero, args[0]));
+                                                        insts.push(RirInst::Sub(
+                                                            dst,
+                                                            zero,
+                                                            promoted_args[0],
+                                                        ));
                                                     }
                                                     value_types.insert(dst, result_t);
                                                 }
                                                 _ => unreachable!(),
                                             }
                                         } else {
-                                            // 2+: chain. The compiler folds
-                                            // 2-arg cases to *Fx2, but we
-                                            // accept them here too in case
-                                            // they reach us via a different
-                                            // path.
-                                            let mut acc = args[0];
-                                            for &x in &args[1..args.len() - 1] {
+                                            // 2+: chain.
+                                            let mut acc = promoted_args[0];
+                                            for &x in &promoted_args[1..promoted_args.len() - 1] {
                                                 let next = alloc();
                                                 insts.push(ctor(next, acc, x));
                                                 value_types.insert(next, result_t);
                                                 acc = next;
                                             }
-                                            insts.push(ctor(dst, acc, *args.last().unwrap()));
+                                            insts.push(ctor(
+                                                dst,
+                                                acc,
+                                                *promoted_args.last().unwrap(),
+                                            ));
                                             value_types.insert(dst, result_t);
                                         }
                                     }
@@ -1311,7 +1341,10 @@ fn seed_block_entry(
 
 /// Arithmetic binop emission with flonum/fixnum dispatch. When both
 /// operands are typed Flonum (per `value_types`), emit the flonum
-/// variant; otherwise fall back to the fixnum form. dst's type is
+/// variant. When operand types are mixed (one Flonum, one Fixnum),
+/// promote the Fixnum operand via FixToFlo and emit the Flonum op
+/// — R6RS numeric-tower contagion: `(+ 1 1.0) ⇒ 2.0` not `2`. When
+/// both Fixnum, fall back to the integer form. dst's type is
 /// recorded in `value_types` so downstream ops can chain.
 fn emit_arith_binop(
     insts: &mut Vec<RirInst>,
@@ -1326,13 +1359,30 @@ fn emit_arith_binop(
     let dst = alloc();
     let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
     let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
-    let (inst, dst_t) = if lt == Type::Flonum && rt == Type::Flonum {
-        (flonum_ctor(dst, lhs, rhs), Type::Flonum)
+    let any_flonum = lt == Type::Flonum || rt == Type::Flonum;
+    if any_flonum {
+        let lhs_f = if lt == Type::Flonum {
+            lhs
+        } else {
+            let promoted = alloc();
+            insts.push(RirInst::FixToFlo(promoted, lhs));
+            value_types.insert(promoted, Type::Flonum);
+            promoted
+        };
+        let rhs_f = if rt == Type::Flonum {
+            rhs
+        } else {
+            let promoted = alloc();
+            insts.push(RirInst::FixToFlo(promoted, rhs));
+            value_types.insert(promoted, Type::Flonum);
+            promoted
+        };
+        insts.push(flonum_ctor(dst, lhs_f, rhs_f));
+        value_types.insert(dst, Type::Flonum);
     } else {
-        (fixnum_ctor(dst, lhs, rhs), Type::Fixnum)
-    };
-    insts.push(inst);
-    value_types.insert(dst, dst_t);
+        insts.push(fixnum_ctor(dst, lhs, rhs));
+        value_types.insert(dst, Type::Fixnum);
+    }
     stack.push(StackEntry::Value(dst));
     Ok(())
 }
@@ -1384,7 +1434,9 @@ fn emit_typed_eq(
 
 /// Comparison binop emission. Same shape as `emit_arith_binop` but
 /// dst is always Boolean — the IEEE-754 / signed-integer comparison
-/// produces a 0/1 i64 either way.
+/// produces a 0/1 i64 either way. Mixed-type compares promote the
+/// Fixnum operand via FixToFlo so `(< 1 1.5)` runs through the
+/// Flonum compare path, matching R6RS numeric-tower contagion.
 fn emit_cmp_binop(
     insts: &mut Vec<RirInst>,
     stack: &mut Vec<StackEntry>,
@@ -1398,12 +1450,28 @@ fn emit_cmp_binop(
     let dst = alloc();
     let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
     let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
-    let inst = if lt == Type::Flonum && rt == Type::Flonum {
-        flonum_ctor(dst, lhs, rhs)
+    let any_flonum = lt == Type::Flonum || rt == Type::Flonum;
+    if any_flonum {
+        let lhs_f = if lt == Type::Flonum {
+            lhs
+        } else {
+            let promoted = alloc();
+            insts.push(RirInst::FixToFlo(promoted, lhs));
+            value_types.insert(promoted, Type::Flonum);
+            promoted
+        };
+        let rhs_f = if rt == Type::Flonum {
+            rhs
+        } else {
+            let promoted = alloc();
+            insts.push(RirInst::FixToFlo(promoted, rhs));
+            value_types.insert(promoted, Type::Flonum);
+            promoted
+        };
+        insts.push(flonum_ctor(dst, lhs_f, rhs_f));
     } else {
-        fixnum_ctor(dst, lhs, rhs)
-    };
-    insts.push(inst);
+        insts.push(fixnum_ctor(dst, lhs, rhs));
+    }
     value_types.insert(dst, Type::Boolean);
     stack.push(StackEntry::Value(dst));
     Ok(())

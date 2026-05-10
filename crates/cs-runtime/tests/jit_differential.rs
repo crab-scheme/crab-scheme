@@ -964,12 +964,54 @@ fn diff_jit_tail_call_deep_recursion() {
     let jit = rt.eval_str_via_vm("<diff>", "(sumsq 250000)").unwrap();
     let walker = walker_eval(defines, "(sumsq 250000)");
     match (&jit, &walker) {
-        (
-            Value::Number(cs_core::Number::Flonum(j)),
-            Value::Number(cs_core::Number::Flonum(w)),
-        ) => {
+        (Value::Number(cs_core::Number::Flonum(j)), Value::Number(cs_core::Number::Flonum(w))) => {
             assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on (sumsq 250000)");
         }
         other => panic!("expected flonums, got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_jit_mixed_fixnum_flonum_arithmetic() {
+    // M6 Phase 3 iter AP: emit_arith_binop / emit_cmp_binop / the
+    // variadic + - * chain now promote Fixnum operands to Flonum
+    // when ANY operand is Flonum. R6RS numeric-tower contagion.
+    //
+    // Pre-AP, the body
+    //   (define (sum-up-to n) (let loop ((i 0) (acc 0.0))
+    //     (if (= i n) acc (loop (+ i 1) (+ acc 1.0 i)))))
+    // returned i64::MAX as f64 (~9.2e18) instead of the correct
+    // 2_001_000.0 — the chain fell back to fixnum addition because
+    // `(+ acc 1.0 i)` had mixed types and the all_flonum gate said
+    // "not all flonum, use Add".
+    let defines = &["(define sum-up-to (lambda (n) \
+        (let loop ((i 0) (acc 0.0)) \
+          (if (= i n) acc \
+              (loop (+ i 1) (+ acc 1.0 i))))))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    // Force tier-up of the inner loop closure.
+    rt.eval_str_via_vm("<diff>", "(sum-up-to 2000)").unwrap();
+
+    let cases: &[(&str, f64)] = &[
+        ("(sum-up-to 100)", 5050.0),
+        ("(sum-up-to 1000)", 500500.0),
+        ("(sum-up-to 2000)", 2001000.0),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Flonum(j)),
+                Value::Number(cs_core::Number::Flonum(w)),
+            ) => {
+                assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
+                assert_eq!(*j, *expected, "value mismatch on {}", expr);
+            }
+            other => panic!("{}: expected flonums, got {:?}", expr, other),
+        }
     }
 }
