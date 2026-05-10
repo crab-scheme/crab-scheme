@@ -896,3 +896,50 @@ fn diff_jit_introspection_and_distinct_compiles() {
         stats_str
     );
 }
+
+#[test]
+fn diff_jit_let_loop_flonum_accumulator() {
+    // M6 Phase 3 iter AM: regression for a load-bearing bug — a
+    // `let loop ((i 0) (acc 0.0)) ...` body whose acc accumulates a
+    // flonum sum was JIT'd as if acc were a Fixnum. The `Return acc`
+    // path inferred Fixnum (because acc, a block param, was typed
+    // Fixnum by seed_block_entry's old default), and the dispatcher
+    // decoded the f64 bit pattern as Number(Fixnum(<bits-as-int>)).
+    //
+    // Two fixes:
+    //   1. seed_block_entry propagates predecessor stack types into
+    //      block params, instead of defaulting every param to Fixnum.
+    //   2. infer_return_type seeds flo_values / bool_values /
+    //      char_values from `func.params` and each block's `params`
+    //      so block-param-typed returns resolve correctly.
+    //
+    // Cross-tier-checked because walker handles this trivially.
+    let defines = &["(define sumsq (lambda (n) \
+        (let loop ((i 0) (acc 0.0)) \
+          (if (= i n) acc \
+              (loop (+ i 1) (+ acc (* (real->flonum i) (real->flonum i))))))))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    // Warm with 2000 calls — enough to trigger the loop closure's
+    // tier-up.
+    rt.eval_str_via_vm("<diff>", "(sumsq 2000)").unwrap();
+
+    // Bench at a smaller n to keep the test fast (also avoids the
+    // separate JIT'd-CallSelf-burns-stack issue at very deep
+    // recursion — that's a tail-call-deferred follow-up).
+    let jit = rt.eval_str_via_vm("<diff>", "(sumsq 5000)").unwrap();
+    let walker = walker_eval(defines, "(sumsq 5000)");
+    match (&jit, &walker) {
+        (
+            Value::Number(cs_core::Number::Flonum(j)),
+            Value::Number(cs_core::Number::Flonum(w)),
+        ) => {
+            assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on (sumsq 5000)");
+            // sum of i*i for i in 0..5000 = 41654167500.0
+            assert_eq!(*j, 41654167500.0);
+        }
+        other => panic!("expected flonums, got {:?}", other),
+    }
+}

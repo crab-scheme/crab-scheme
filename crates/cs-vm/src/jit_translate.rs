@@ -382,16 +382,18 @@ pub fn bytecode_to_rir_with_hints(
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         target_block,
-                        stack_height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         fall_block,
-                        stack_height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     // JumpIfFalse jumps when cond is falsy. brif: cond truthy -> first, else second.
                     term = Some(Term::Branch(cond, fall_block, target_block));
@@ -406,16 +408,18 @@ pub fn bytecode_to_rir_with_hints(
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         target_block,
-                        height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         fall_block,
-                        height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     term = Some(Term::Branch(cond, fall_block, target_block));
                     break;
@@ -429,16 +433,18 @@ pub fn bytecode_to_rir_with_hints(
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         target_block,
-                        height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         fall_block,
-                        height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     term = Some(Term::Branch(cond, target_block, fall_block));
                     break;
@@ -452,16 +458,18 @@ pub fn bytecode_to_rir_with_hints(
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         target_block,
-                        height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         fall_block,
-                        height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     term = Some(Term::Branch(cond, fall_block, target_block));
                     break;
@@ -475,16 +483,18 @@ pub fn bytecode_to_rir_with_hints(
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         target_block,
-                        height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         fall_block,
-                        height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     term = Some(Term::Branch(cond, target_block, fall_block));
                     break;
@@ -498,16 +508,18 @@ pub fn bytecode_to_rir_with_hints(
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         target_block,
-                        height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         fall_block,
-                        height,
+                        &sim_stack_values(&sim_stack),
                     )?;
                     term = Some(Term::Branch(cond, fall_block, target_block));
                     break;
@@ -533,9 +545,10 @@ pub fn bytecode_to_rir_with_hints(
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
+                        &mut value_types,
                         &mut alloc,
                         target_block,
-                        stack_vals.len(),
+                        &stack_vals,
                     )?;
                     term = Some(Term::Jump(target_block, stack_vals));
                     break;
@@ -1001,9 +1014,10 @@ pub fn bytecode_to_rir_with_hints(
                 seed_block_entry(
                     &mut block_entry_stack,
                     &mut block_params,
+                    &mut value_types,
                     &mut alloc,
                     next_id,
-                    stack_vals.len(),
+                    &stack_vals,
                 )?;
                 Term::Jump(next_id, stack_vals)
             }
@@ -1034,6 +1048,46 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     let mut bool_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     let mut char_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     let mut flo_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
+    // Seed from the function's per-param types — when the runtime
+    // hook supplied hints (arg-side feedback), parameters get the
+    // observed types. Without this, a body that returns a typed
+    // parameter directly (e.g. `(define (id-flo n) n)` warmed with
+    // a flonum) would fall to Fixnum because the param isn't the
+    // dst of any RirInst.
+    for (val, ty) in &func.params {
+        match ty {
+            Type::Flonum => {
+                flo_values.insert(*val);
+            }
+            Type::Boolean => {
+                bool_values.insert(*val);
+            }
+            Type::Character => {
+                char_values.insert(*val);
+            }
+            _ => {}
+        }
+    }
+    // Same for block params — type-propagated by `seed_block_entry`.
+    // Required for Return values that came through a Branch
+    // terminator (the sim_stack value is reborn as a block param
+    // with its predecessor's type).
+    for block in &func.blocks {
+        for (val, ty) in &block.params {
+            match ty {
+                Type::Flonum => {
+                    flo_values.insert(*val);
+                }
+                Type::Boolean => {
+                    bool_values.insert(*val);
+                }
+                Type::Character => {
+                    char_values.insert(*val);
+                }
+                _ => {}
+            }
+        }
+    }
     for block in &func.blocks {
         for inst in &block.insts {
             match inst {
@@ -1074,13 +1128,29 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
             }
         }
     }
+    // CallSelf dsts inherit the function's own return type — that's
+    // a fixed-point. Tracking which return values came from CallSelf
+    // lets us defer their classification: if every other return is
+    // uniform, the CallSelf path agrees by construction. If the
+    // non-CallSelf returns are mixed (or empty), fall back to Fixnum.
+    let mut callself_dsts: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let RirInst::CallSelf(dst, _) = inst {
+                callself_dsts.insert(*dst);
+            }
+        }
+    }
     let mut seen_fixnum = false;
     let mut seen_bool = false;
     let mut seen_char = false;
     let mut seen_flo = false;
+    let mut seen_callself = false;
     for block in &func.blocks {
         if let Term::Return(v) = &block.terminator {
-            if flo_values.contains(v) {
+            if callself_dsts.contains(v) {
+                seen_callself = true;
+            } else if flo_values.contains(v) {
                 seen_flo = true;
             } else if char_values.contains(v) {
                 seen_char = true;
@@ -1092,10 +1162,13 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
         }
     }
     // Disjoint-tag inference: only resolve to a non-Fixnum tag when
-    // every observed return agrees. Mixed returns fall back to
-    // Fixnum (the conservative default — caller will see wrapped
-    // numbers; the type guard at the dispatch site catches misuse
-    // downstream rather than masking it as a wrong-type Value).
+    // every non-CallSelf return agrees. CallSelf returns inherit
+    // the function's own type, so they don't constrain. Mixed returns
+    // fall back to Fixnum (the conservative default — caller will
+    // see wrapped numbers; the type guard at the dispatch site
+    // catches misuse downstream rather than masking it as a wrong-
+    // type Value).
+    let _ = seen_callself; // tracked but not consumed beyond the inheritance contract
     match (seen_flo, seen_char, seen_bool, seen_fixnum) {
         (true, false, false, false) => Type::Flonum,
         (false, true, false, false) => Type::Character,
@@ -1183,13 +1256,31 @@ fn lookup_block(
 /// Seed a target block's entry stack with `count` fresh RIR Values
 /// (allocated via `alloc`), or — if the target was already seeded
 /// — verify that the count matches.
+/// Extract just the `RirValue` slots from a sim_stack — Branch
+/// terminators emit with the entire current stack as block-passing
+/// args, so we collect their values for `seed_block_entry`. Non-Value
+/// entries (SelfRef / BuiltinRef) shouldn't appear at terminator
+/// positions; if one slips through it stays mapped as a fresh
+/// throwaway value (defaults to Fixnum).
+fn sim_stack_values(sim_stack: &[StackEntry]) -> Vec<RirValue> {
+    sim_stack
+        .iter()
+        .filter_map(|e| match e {
+            StackEntry::Value(v) => Some(*v),
+            _ => None,
+        })
+        .collect()
+}
+
 fn seed_block_entry(
     entry_stack: &mut HashMap<BlockId, Vec<RirValue>>,
     block_params: &mut HashMap<BlockId, Vec<(RirValue, Type)>>,
+    value_types: &mut HashMap<RirValue, Type>,
     alloc: &mut impl FnMut() -> RirValue,
     target: BlockId,
-    count: usize,
+    src_values: &[RirValue],
 ) -> Result<(), TranslateError> {
+    let count = src_values.len();
     if let Some(existing) = entry_stack.get(&target) {
         if existing.len() != count {
             return Err(TranslateError::Invalid(format!(
@@ -1201,8 +1292,18 @@ fn seed_block_entry(
         }
         return Ok(());
     }
+    // Allocate fresh block params + propagate their types from the
+    // predecessor's stack. Without type propagation, every block
+    // param defaulted to Fixnum even when the predecessor pushed a
+    // Flonum — silently turning later flonum arithmetic into i64
+    // ops with garbage results.
     let vals: Vec<RirValue> = (0..count).map(|_| alloc()).collect();
-    let params: Vec<(RirValue, Type)> = vals.iter().map(|v| (*v, Type::Fixnum)).collect();
+    let mut params: Vec<(RirValue, Type)> = Vec::with_capacity(count);
+    for (new_val, src) in vals.iter().zip(src_values.iter()) {
+        let t = value_types.get(src).copied().unwrap_or(Type::Fixnum);
+        params.push((*new_val, t));
+        value_types.insert(*new_val, t);
+    }
     entry_stack.insert(target, vals);
     block_params.insert(target, params);
     Ok(())

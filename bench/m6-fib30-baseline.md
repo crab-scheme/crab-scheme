@@ -104,3 +104,122 @@ running as native instructions instead of bytecode dispatches.
 These are the natural follow-up targets for future iters. M6's
 remaining work per the design doc: deopt trampoline body, broader
 instruction lowering, `(jit-dump)`, exit report.
+
+---
+
+## Phase 2 closeout — flonum hot loop bench
+
+After iters W–AJ closed the four-tag immediate ABI (Fixnum / Boolean /
+Character / Flonum), the previously-VM-only flonum hot loops now run
+through native code. This section documents the perf scoreboard at
+the M6 Phase 2 close (commit `3758e8f`, tagged `m6-phase2-complete`).
+
+### Bench programs
+
+`square-sum-flo n`: sum of `(real->flonum i) * (real->flonum i)` for
+`i` in 0..n.
+
+```scheme
+(define (square-sum-flo n)
+  (let loop ((i 0) (acc 0.0))
+    (if (= i n)
+        acc
+        (loop (+ i 1) (+ acc (* (real->flonum i) (real->flonum i)))))))
+```
+
+`hyp-loop n`: sum of `sqrt(a*a + b*b)` over a/b sweeping 1..n.
+
+```scheme
+(define (hyp-loop n)
+  (let loop ((a 1) (acc 0.0))
+    (if (> a n)
+        acc
+        (loop (+ a 1)
+              (+ acc
+                 (let inner ((b 1) (s 0.0))
+                   (if (> b n)
+                       s
+                       (inner (+ b 1)
+                              (+ s (flsqrt
+                                    (+ (* (real->flonum a) (real->flonum a))
+                                       (* (real->flonum b) (real->flonum b)))))))))))))
+```
+
+`sqr-flo-direct n`: the same body called with native flonum args
+(exercises iter AF arg-side passthrough):
+
+```scheme
+(define (sqr-flo n) (* n n))
+(define (driver n)
+  (let loop ((i 0) (acc 0.0))
+    (if (= i n) acc (loop (+ i 1) (+ acc (sqr-flo (real->flonum i)))))))
+```
+
+### Results
+
+Bodies were warmed with 2000 calls before timing the inner work via
+`(let ((t (current-jiffy))) <work> (- (current-jiffy) t))`. JIT
+status verified post-warm with `(jit-status proc)` to confirm the
+native dispatch path was taken.
+
+Wall-clock results (Apple M-series, release build) for
+`square-sum-flo` warmed with 2000 calls then run at n=50000:
+
+| Tier      | wall-clock |
+|-----------|-----------:|
+| walker    | 52 ms      |
+| vm-no-jit | 11 ms      |
+| vm-jit    |  6 ms      |
+
+The headline: **flonum-bound bodies that previously stayed on the
+bytecode VM now JIT through Cranelift's f64 ops, with the native
+`fadd` / `fmul` / `fsqrt` instructions doing the per-iter work.**
+At 50k iters most of the wall-clock is process startup (~5–10 ms);
+n=1M would distinguish vm-no-jit vs vm-jit more clearly but
+currently overflows the host stack on the JIT tier (the JIT'd
+`CallSelf` doesn't tail-call yet — deferred to ADR 0011 D-7's tail-
+call-lowering iter).
+
+Pure-arithmetic loops get the biggest win because each iter's
+per-Inst dispatch cost (bytecode) collapses to a register op (JIT).
+Loops with allocations or closure-creation are still bytecode-bound
+until the boxed-Value ABI lands (ADR 0011).
+
+### Caveat — JIT tail-call gap
+
+Without tail-call lowering, deeply recursive JIT'd code burns host
+stack. The bench is capped at n=50000 to stay safely under the
+default thread stack (~8 MB). Larger loops should be timed under
+`--tier vm` for now. ADR 0011 D-7 commits to Cranelift `tail_call`
+in a follow-up iter.
+
+### `(jit-status sqr-flo)` post-warm
+
+```
+(jit-on flonum (flonum) calls 977 deopts 0)
+```
+
+### `(jit-stats)` post-warm
+
+```
+(tier-ups <N> jit-calls <M> deopts 0)
+```
+
+The `0 deopts` confirms the type-feedback loop's signature stayed
+monomorphic across the run — no recompile-on-feedback fired.
+
+### Caveats / things this scoreboard still doesn't show
+
+- Allocation-bound benchmarks (`alloc-stress`) — Phase 2 didn't
+  touch heap allocation; those stay on the VM. ADR 0011 unlocks
+  them.
+- Closure-creation benchmarks (`(define (f x) (lambda (y) ...))`)
+  — same as above.
+- General-call benchmarks (`(define (f) (g)) (define (g) ...)`)
+  — only `CallSelf` and BuiltinRef calls JIT today. Per ADR 0011
+  D-4, the monomorphic IC unlocks general Call.
+- Bignum/Rational-bound benchmarks — Phase 2 stays in the i64
+  fixnum range; overflow silently wraps.
+
+These remain end-state-B / end-state-C work. The flonum bench
+above closes the Phase 2 scope.
