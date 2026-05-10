@@ -831,14 +831,28 @@ fn lower_inst(
             let inst_ref = b
                 .ins()
                 .call(alloc_pair_fnref, &[car_v, car_t, cdr_v, cdr_t]);
-            let results = b.inst_results(inst_ref);
-            if results.len() != 1 {
-                return Err(JitError::Codegen(format!(
-                    "Cons expected 1 result, got {}",
-                    results.len()
-                )));
-            }
-            map.insert(*dst, results[0]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Cons expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            // ADR 0012 D-2 — declare this SSA value a stack-map root.
+            // Cranelift's frontend will spill it to a known SP-offset
+            // slot before each call (every `call` is a safepoint) and
+            // reload after. The metadata is harvested at
+            // `define_function` time and stored in a per-closure
+            // `JitStackMaps` (wired in iter BG when the GC scanner
+            // consumes the registry). Today (BF) this is metadata-
+            // only — the helper still allocates Box<Value>; semantics
+            // unchanged. Risk localized to Cranelift's spill
+            // discipline; M6 Phase 4 test suite is the canary.
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
         }
         Inst::Car(dst, src) => {
             // Lowers to vm_pair_car(pair_i64) -> i64. The runtime
