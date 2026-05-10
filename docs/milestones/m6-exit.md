@@ -145,17 +145,29 @@ Workspace at exit: **540 passed, 0 failed** (skipping the pre-existing `memory_b
 
 ## What's deferred (Phase 2 / M6 follow-ups)
 
+### Phase 2 progress (post-`m6-complete` tag)
+
+The following landed *after* the M6 exit was tagged, on the same branch:
+
+| Phase 2 iter | Commit | Item | Status |
+|---|---|---|---|
+| A | `d1c1bf4` | Lower `Inst::Pop`; clearer translator diagnostics. | ✅ |
+| B | `f234651` | Free-var `LoadVar` lowers to `Inst::EnvLookup` + Cranelift call to `vm_env_lookup_fixnum`. Closures with free Fixnum globals JIT correctly. Compiler fold restricted to Procedure-typed globals so user-defined numbers stay live. | ✅ |
+| C | `2358f84` | Free-var `set!` lowers to `Inst::EnvSet` + `vm_env_set_fixnum`. JIT'd `set!` writes back through the env. | ✅ |
+| D | `b33c8c9` | Three-tier differential coverage for env-access programs. | ✅ |
+
+### Still deferred
+
 | Item | Why deferred | Where it lands |
 |---|---|---|
 | Mid-execution deopt trampoline | The current "check before transmute" pattern handles the simple case (mismatched types fall through to bytecode at the call boundary) but the spec calls for full state-saving and recompilation on in-flight deopt. Substantive cranelift integration. | M6 follow-up perf track. |
 | OSR (on-stack replacement) | Spec FR-3 second paragraph. Long-running loops should tier-up mid-call, not just at next function entry. | M6 follow-up. |
-| Gabriel benchmarks (FR-6 second perf gate) | The translator can't yet lower the closures these tests use (env access, set!, allocation). Once env-access lands, the suite can run. | Post-translator-broadening iter. |
+| Gabriel benchmarks (FR-6 second perf gate) | Some tests use closures the translator still rejects (`MakeClosure`, general `Call`, `let`-via-Lambda). | Post-broader-translator iter. |
 | `(jit-dump <proc>)` REPL primitive (FR-7) | Requires a disassembler dep + per-function code-buffer plumbing. | Post-M6 tooling iter. |
-| Broader instruction lowering | Closures (env access via `LoadVar` of free variables), `set!`, `Pop`, `DefineLocal`, `MakeClosure`, `TailCall`, raise/values — all currently `Unsupported` in the translator. The runtime silently falls back, so this is a coverage-not-correctness gap. | Sequential post-M6 iters. |
+| `MakeClosure` / general `Call` / `DefineLocal` | These need closure-value marshaling across the JIT boundary (i64 ABI doesn't fit a Procedure value cleanly). Substantive design work. | Multi-iter project. |
 | Flonum / Boolean specialization | Translator only supports i64-typed args. Mixed-type lambdas stay on the VM. | Post-M6. |
-| 10k-expression differential test | Bound by translator coverage; will land naturally once env access does. | After translator broadening. |
+| Non-Fixnum env-binding deopt | `vm_env_lookup_fixnum` panics if the bound value isn't a Fixnum. Real deopt would unwind and retry on the VM. | Post-deopt-trampoline. |
 | Type-feedback-driven recompilation (FR-4 second clause) | `TypeFeedback` exists in `cs-jit::Tier` but is unused; once OSR + deopt land, feedback can drive specialization. | Post-deopt-trampoline. |
-| Cross-procedure `Call` (`Inst::Call`) lowering | Only `CallSelf` is lowered. General Call needs procedure-value resolution + ABI for non-fixnum args. | Sequential post-M6. |
 
 ---
 
