@@ -1295,6 +1295,72 @@ impl Runtime {
                 }
             }),
         );
+        let rbvb_sym = syms.intern("read-bytevector!");
+        vm_env.define(
+            rbvb_sym,
+            cs_vm::vm::make_vm_builtin("read-bytevector!", |args| {
+                if args.is_empty() || args.len() > 4 {
+                    return Err("read-bytevector!: 1..4 args".into());
+                }
+                let bv = match &args[0] {
+                    Value::ByteVector(b) => b.clone(),
+                    _ => return Err("read-bytevector!: arg 1 must be bytevector".into()),
+                };
+                let port = if args.len() >= 2 {
+                    args[1].clone()
+                } else {
+                    cs_vm::vm::vm_current_input_port_value()
+                        .ok_or_else(|| "read-bytevector!: no current input port".to_string())?
+                };
+                let bv_len = bv.borrow().len();
+                let start = if args.len() >= 3 {
+                    match &args[2] {
+                        Value::Number(n) => match n.to_f64() as i64 {
+                            i if i >= 0 && (i as usize) <= bv_len => i as usize,
+                            _ => return Err("read-bytevector!: start out of range".into()),
+                        },
+                        _ => return Err("read-bytevector!: start must be integer".into()),
+                    }
+                } else {
+                    0
+                };
+                let end = if args.len() == 4 {
+                    match &args[3] {
+                        Value::Number(n) => match n.to_f64() as i64 {
+                            i if i >= 0 && (i as usize) <= bv_len && (i as usize) >= start => {
+                                i as usize
+                            }
+                            _ => return Err("read-bytevector!: end out of range".into()),
+                        },
+                        _ => return Err("read-bytevector!: end must be integer".into()),
+                    }
+                } else {
+                    bv_len
+                };
+                let n_wanted = end - start;
+                match &port {
+                    Value::Port(p) => match &**p {
+                        cs_core::Port::ByteVectorInput(state) => {
+                            let mut s = state.borrow_mut();
+                            if n_wanted == 0 {
+                                return Ok(Value::fixnum(0));
+                            }
+                            if s.pos >= s.bytes.len() {
+                                return Ok(Value::Eof);
+                            }
+                            let avail = s.bytes.len() - s.pos;
+                            let n = n_wanted.min(avail);
+                            let mut buf = bv.borrow_mut();
+                            buf[start..start + n].copy_from_slice(&s.bytes[s.pos..s.pos + n]);
+                            s.pos += n;
+                            Ok(Value::fixnum(n as i64))
+                        }
+                        _ => Err("read-bytevector!: not a binary input port".into()),
+                    },
+                    _ => Err("read-bytevector!: not a port".into()),
+                }
+            }),
+        );
         let wbv_sym = syms.intern("write-bytevector");
         vm_env.define(
             wbv_sym,

@@ -273,12 +273,14 @@ Iters 117+ are filling R7RS gaps one per iter:
   non-integer + non-decimal radix
 - 150 R5RS-legacy null-environment / scheme-report-environment (R7RS
   retains both for compat); arity-checked; reject bad versions
+- 151 R7RS read-bytevector! — destructive in-place read into existing
+  bytevector with [start [end]] range; returns count or eof-object
   (this iter)
 
 Current totals:
-- 104 conformance test files (cli)
-- VM tier: 106 tests
-- Aggregate: 2090 individual Scheme tests passing
+- 105 conformance test files (cli)
+- VM tier: 107 tests
+- Aggregate: 2108 individual Scheme tests passing
 
 ## Loop cadence
 

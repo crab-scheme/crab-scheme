@@ -613,6 +613,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("read-bytevector", b_read_bytevector_ho),
         ("write-u8", b_write_u8_ho),
         ("write-bytevector", b_write_bytevector_ho),
+        ("read-bytevector!", b_read_bytevector_bang),
         ("read-line", b_read_line_implicit),
         ("get-string-all", b_get_string_all),
         // SRFI-1 (higher-order)
@@ -6059,6 +6060,68 @@ fn b_u8_ready_p_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         args[0].clone()
     };
     b_u8_ready_p(&[port])
+}
+
+/// R7RS `(read-bytevector! bv [port [start [end]]])`.
+/// Reads from port into bv[start..end] (mutating in place). Returns the
+/// number of bytes read, or eof-object if no bytes are available and
+/// the requested range is non-empty.
+fn b_read_bytevector_bang(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 4 {
+        return Err(arity_err("read-bytevector!", "1..4", args.len()));
+    }
+    let bv = match &args[0] {
+        Value::ByteVector(b) => b.clone(),
+        v => return Err(type_err("read-bytevector!", "bytevector", v)),
+    };
+    let port = if args.len() >= 2 {
+        args[1].clone()
+    } else {
+        ctx.current_input_port
+            .clone()
+            .ok_or_else(|| "read-bytevector!: no current input port".to_string())?
+    };
+    let bv_len = bv.borrow().len();
+    let start = if args.len() >= 3 {
+        let i = as_int_i64("read-bytevector!", &args[2])?;
+        if i < 0 || (i as usize) > bv_len {
+            return Err(format!("read-bytevector!: start out of range: {}", i));
+        }
+        i as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 4 {
+        let i = as_int_i64("read-bytevector!", &args[3])?;
+        if i < 0 || (i as usize) > bv_len || (i as usize) < start {
+            return Err(format!("read-bytevector!: end out of range: {}", i));
+        }
+        i as usize
+    } else {
+        bv_len
+    };
+    let n_wanted = end - start;
+    match &port {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorInput(state) => {
+                let mut s = state.borrow_mut();
+                if n_wanted == 0 {
+                    return Ok(Value::fixnum(0));
+                }
+                if s.pos >= s.bytes.len() {
+                    return Ok(Value::Eof);
+                }
+                let avail = s.bytes.len() - s.pos;
+                let n = n_wanted.min(avail);
+                let mut buf = bv.borrow_mut();
+                buf[start..start + n].copy_from_slice(&s.bytes[s.pos..s.pos + n]);
+                s.pos += n;
+                Ok(Value::fixnum(n as i64))
+            }
+            _ => Err("read-bytevector!: not a binary input port".into()),
+        },
+        v => Err(type_err("read-bytevector!", "input-port", v)),
+    }
 }
 
 /// R7RS `(read-bytevector k [port])`. k required, port optional.

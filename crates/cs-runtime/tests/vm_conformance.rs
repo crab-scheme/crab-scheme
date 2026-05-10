@@ -953,3 +953,12 @@ fn vm_conformance_r7rs_environments() {
     println!("r7rs_environments: walker={} vm={}", walker, vm);
     assert_eq!(walker, vm);
 }
+
+#[test]
+fn vm_conformance_r7rs_read_bytevector_bang() {
+    let walker = pass_count_walker("r7rs_read_bytevector_bang.scm");
+    let vm = pass_count_vm("r7rs_read_bytevector_bang.scm")
+        .expect("vm should run r7rs_read_bytevector_bang.scm");
+    println!("r7rs_read_bytevector_bang: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
