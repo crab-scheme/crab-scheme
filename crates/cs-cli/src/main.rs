@@ -63,15 +63,16 @@ enum Cmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let via_vm = cli.tier == "vm";
+    let via_vm = cli.tier == "vm" || cli.tier == "vm-jit";
+    let with_jit = cli.tier == "vm-jit";
     let color = color_enabled(&cli.color);
 
     if let Some(expr) = cli.expr {
-        return run_eval(&expr, via_vm, color);
+        return run_eval(&expr, via_vm, with_jit, color);
     }
 
     match cli.cmd {
-        Some(Cmd::Run { file }) => run_file(&file, via_vm, color),
+        Some(Cmd::Run { file }) => run_file(&file, via_vm, with_jit, color),
         Some(Cmd::Repl) | None => run_repl(via_vm, color),
     }
 }
@@ -89,8 +90,14 @@ fn eval_with_tier(
     }
 }
 
-fn run_eval(src: &str, via_vm: bool, color: bool) -> ExitCode {
+fn run_eval(src: &str, via_vm: bool, with_jit: bool, color: bool) -> ExitCode {
     let mut rt = Runtime::new();
+    if with_jit {
+        if let Err(e) = rt.install_jit() {
+            eprintln!("crabscheme: failed to install JIT: {e}");
+            return ExitCode::from(1);
+        }
+    }
     match eval_with_tier(&mut rt, "<command-line>", src, via_vm) {
         Ok(v) => {
             if !matches!(v, Value::Unspecified) {
@@ -106,7 +113,7 @@ fn run_eval(src: &str, via_vm: bool, color: bool) -> ExitCode {
     }
 }
 
-fn run_file(path: &str, via_vm: bool, color: bool) -> ExitCode {
+fn run_file(path: &str, via_vm: bool, with_jit: bool, color: bool) -> ExitCode {
     let src = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -115,6 +122,12 @@ fn run_file(path: &str, via_vm: bool, color: bool) -> ExitCode {
         }
     };
     let mut rt = Runtime::new();
+    if with_jit {
+        if let Err(e) = rt.install_jit() {
+            eprintln!("crabscheme: failed to install JIT: {e}");
+            return ExitCode::from(1);
+        }
+    }
     match eval_with_tier(&mut rt, path, &src, via_vm) {
         Ok(v) => {
             if !matches!(v, Value::Unspecified) {

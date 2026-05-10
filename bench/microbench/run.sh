@@ -42,6 +42,7 @@ BENCHES=(fib tak ack nqueens mandelbrot spectral-norm binary-trees alloc-stress)
 declare -a IMPLS
 IMPLS=("crabscheme-walker:$CS --tier walker run")
 IMPLS+=("crabscheme-vm:$CS --tier vm run")
+IMPLS+=("crabscheme-jit:$CS --tier vm-jit run")
 if command -v racket >/dev/null 2>&1; then IMPLS+=("racket:racket"); fi
 # Chez Scheme ships its REPL binary as `scheme` (or sometimes `chez`).
 # Detection: prefer `chez` if present; otherwise check that `scheme`
