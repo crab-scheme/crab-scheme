@@ -27,7 +27,7 @@ pub struct BlockId(pub u32);
 ///
 /// Tags don't have to be precise — the deopt machinery catches the
 /// case where a value's actual type at runtime contradicts its tag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
     /// A fixnum (i64). Direct register arithmetic possible.
     Fixnum,
@@ -277,6 +277,16 @@ pub enum Inst {
     /// Any-typed params so the dispatch-side allocation doesn't
     /// leak when the body never consumed it.
     AnyDrop(Value),
+
+    /// `dst = box_typed(src, tag)` — box a typed i64 (Fixnum /
+    /// Boolean / Character / Flonum) into an Any-tagged
+    /// `Box<Value>` via the `vm_box_typed` runtime helper. The
+    /// `u8` tag is the JIT_RT_* code identifying how to interpret
+    /// `src`. Inserted by the translator's post-pass when a Jump's
+    /// arg or a function's Return value needs to widen to Any
+    /// because a sibling control-flow path produced an Any-tagged
+    /// value.
+    BoxTyped(Value, Value, u8),
 
     /// Type guard: if the value's runtime type doesn't match the
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter

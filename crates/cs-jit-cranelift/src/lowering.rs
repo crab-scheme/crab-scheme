@@ -91,6 +91,10 @@ pub struct Lowerer {
     /// to a Cranelift call against this. Helper consumes (drops)
     /// the operand box.
     value_drop_func: cranelift_module::FuncId,
+    /// FuncId of `vm_box_typed(i, tag) -> i64`. `Inst::BoxTyped`
+    /// lowers to a Cranelift call against this. Tag passes as i64
+    /// (Cranelift has no u8 ABI param).
+    box_typed_func: cranelift_module::FuncId,
 }
 
 impl Lowerer {
@@ -134,6 +138,7 @@ impl Lowerer {
         builder.symbol("vm_null_p", cs_vm::vm::vm_null_p as *const u8);
         builder.symbol("vm_value_clone", cs_vm::vm::vm_value_clone as *const u8);
         builder.symbol("vm_value_drop", cs_vm::vm::vm_value_drop as *const u8);
+        builder.symbol("vm_box_typed", cs_vm::vm::vm_box_typed as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -237,6 +242,19 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_value_drop: {e}")))?;
 
+        // vm_box_typed(i, tag) — (i64, i64) → i64.
+        let mut box_typed_sig = module.make_signature();
+        box_typed_sig.params.push(AbiParam::new(I64));
+        box_typed_sig.params.push(AbiParam::new(I64));
+        box_typed_sig.returns.push(AbiParam::new(I64));
+        let box_typed_func = module
+            .declare_function(
+                "vm_box_typed",
+                cranelift_module::Linkage::Import,
+                &box_typed_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_box_typed: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -252,6 +270,7 @@ impl Lowerer {
             null_p_func,
             value_clone_func,
             value_drop_func,
+            box_typed_func,
         })
     }
 
@@ -383,6 +402,9 @@ impl Lowerer {
             let value_drop_fnref = self
                 .module
                 .declare_func_in_func(self.value_drop_func, builder.func);
+            let box_typed_fnref = self
+                .module
+                .declare_func_in_func(self.box_typed_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -444,6 +466,7 @@ impl Lowerer {
                         null_p_fnref,
                         value_clone_fnref,
                         value_drop_fnref,
+                        box_typed_fnref,
                         inst,
                     )?;
                 }
@@ -600,6 +623,7 @@ fn lower_inst(
     null_p_fnref: cranelift_codegen::ir::FuncRef,
     value_clone_fnref: cranelift_codegen::ir::FuncRef,
     value_drop_fnref: cranelift_codegen::ir::FuncRef,
+    box_typed_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -790,6 +814,21 @@ fn lower_inst(
         Inst::AnyDrop(src) => {
             let v = lookup(map, *src)?;
             b.ins().call(value_drop_fnref, &[v]);
+        }
+        Inst::BoxTyped(dst, src, tag) => {
+            // Box a typed i64 (Fixnum/Boolean/Character/Flonum)
+            // into an Any-tagged Box<Value>. Tag passes as i64.
+            let v = lookup(map, *src)?;
+            let t = b.ins().iconst(I64, *tag as i64);
+            let inst_ref = b.ins().call(box_typed_fnref, &[v, t]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "BoxTyped expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
         }
         Inst::FlonumAdd(dst, lhs, rhs) => {
             fbinop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().fadd(l, r))?

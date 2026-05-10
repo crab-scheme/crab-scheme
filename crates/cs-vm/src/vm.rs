@@ -410,6 +410,18 @@ pub unsafe extern "C" fn vm_value_drop(r: i64) {
     drop(unsafe { Box::from_raw(r as *mut Value) });
 }
 
+/// Box a typed i64 into an Any-tagged `Box<Value>` and return the
+/// raw pointer as the new i64. `tag` is a JIT_RT_* value (passed as
+/// i64 because Cranelift doesn't have a direct u8 ABI type; the
+/// helper truncates). Used by `Inst::BoxTyped` to widen a
+/// Fixnum/Boolean/Character/Flonum value into the Any lane on
+/// control-flow joins or returns.
+#[no_mangle]
+pub unsafe extern "C" fn vm_box_typed(i: i64, tag: i64) -> i64 {
+    let v = unsafe { i64_to_value(i, tag as u8) };
+    value_to_any_i64(v)
+}
+
 /// Read the per-thread JIT-dispatch count. Test/diagnostics only.
 pub fn jit_call_count() -> u64 {
     VM_JIT_CALL_COUNT.with(|c| c.get())

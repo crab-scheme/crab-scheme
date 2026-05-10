@@ -1069,6 +1069,55 @@ fn diff_jit_cons_pair_return() {
 }
 
 #[test]
+fn diff_jit_mixed_tier_return() {
+    // M6 Phase 4 iter AW: control-flow joins where one predecessor
+    // pushes Any (e.g. `(car v)`) and the other pushes a typed
+    // immediate (e.g. a Fixnum) used to crash because the join
+    // block_param picked one type and the dispatcher decoded the
+    // other branch's i64 with the wrong tag.
+    //
+    // The post-pass `widen_joins_to_any` widens the join's slot to
+    // Any and inserts BoxTyped on the predecessor that was passing
+    // a typed value, so the dispatcher always sees a Box pointer
+    // when the function's inferred return type is Any.
+    let defines = &["(define (head v fb) (if (pair? v) (car v) fb))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+         (if (= i 1500) 'done (begin (head (cons i (+ i 1)) -1) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    // Pair input: returns car (a Fixnum, boxed for Any return).
+    let jit_pair = rt
+        .eval_str_via_vm("<diff>", "(head (cons 7 8) -1)")
+        .unwrap();
+    let walker_pair = walker_eval(defines, "(head (cons 7 8) -1)");
+    match (&jit_pair, &walker_pair) {
+        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+            assert_eq!(j, w);
+            assert_eq!(*j, 7);
+        }
+        other => panic!("expected fixnum 7 from pair branch, got {:?}", other),
+    }
+
+    // Non-pair input: returns the fb argument (raw Fixnum, must be
+    // boxed by the post-pass since the function returns Any).
+    let jit_fb = rt.eval_str_via_vm("<diff>", "(head 0 42)").unwrap();
+    let walker_fb = walker_eval(defines, "(head 0 42)");
+    match (&jit_fb, &walker_fb) {
+        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+            assert_eq!(j, w);
+            assert_eq!(*j, 42);
+        }
+        other => panic!("expected fixnum 42 from fb branch, got {:?}", other),
+    }
+}
+
+#[test]
 fn diff_jit_multi_use_any_param() {
     // M6 Phase 4 iter AV: `v` appears twice in the body — once as
     // the predicate operand (consumes), once inside the true branch

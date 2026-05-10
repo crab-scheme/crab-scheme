@@ -1159,8 +1159,131 @@ pub fn bytecode_to_rir_with_hints(
         });
     }
 
+    // Phase 4 iter AW — control-flow-join widening. When two
+    // predecessors of a block push different-typed values, widen the
+    // join's params to Any and insert BoxTyped on the immediate-typed
+    // predecessors. Iterates to a fixed point so widening can
+    // propagate (e.g., outer ifs whose branches go through inner
+    // joins). Mutates `func` in place + grows `value_types` for the
+    // freshly allocated boxed values.
+    widen_joins_to_any(&mut func, &mut value_types, &mut alloc);
+
     func.return_type = infer_return_type(&func);
+    // Same idea on the return side: when a function's inferred type
+    // is Any, every Return path must produce a Box pointer. Insert
+    // BoxTyped on Returns whose value is still typed.
+    if func.return_type == Type::Any {
+        box_mixed_returns(&mut func, &mut value_types, &mut alloc);
+    }
     Ok(func)
+}
+
+/// Iterate to fixed point: for each block whose predecessors push
+/// disagreeing types into the same slot, widen that block's
+/// `params[i]` to `Type::Any` and insert `BoxTyped` on every
+/// predecessor's Jump that passes a non-Any value. Each widening
+/// can change a downstream block's argument type, so we re-loop
+/// until no changes happen.
+fn widen_joins_to_any(
+    func: &mut cs_rir::Function,
+    value_types: &mut HashMap<RirValue, Type>,
+    alloc: &mut impl FnMut() -> RirValue,
+) {
+    use std::collections::HashSet;
+    loop {
+        // (target_block, slot) -> set of arg types observed.
+        let mut slot_types: HashMap<(BlockId, usize), HashSet<Type>> = HashMap::new();
+        for block in &func.blocks {
+            if let Term::Jump(target, args) = &block.terminator {
+                for (i, arg) in args.iter().enumerate() {
+                    let t = value_types.get(arg).copied().unwrap_or(Type::Fixnum);
+                    slot_types.entry((*target, i)).or_default().insert(t);
+                }
+            }
+        }
+
+        let mut widened = false;
+        for ((target, slot), types) in &slot_types {
+            let needs_widen = types.contains(&Type::Any) && types.len() > 1;
+            if !needs_widen {
+                continue;
+            }
+            let target_idx = match func.blocks.iter().position(|b| b.id == *target) {
+                Some(i) => i,
+                None => continue,
+            };
+            if func.blocks[target_idx].params[*slot].1 != Type::Any {
+                let pv = func.blocks[target_idx].params[*slot].0;
+                func.blocks[target_idx].params[*slot].1 = Type::Any;
+                value_types.insert(pv, Type::Any);
+                widened = true;
+            }
+        }
+        if !widened {
+            break;
+        }
+    }
+
+    // Now insert BoxTyped on every Jump arg whose target slot is Any
+    // but whose source value isn't.
+    for block_idx in 0..func.blocks.len() {
+        let (target_idx, mut new_args) = match &func.blocks[block_idx].terminator {
+            Term::Jump(target, args) => {
+                let target_idx = match func.blocks.iter().position(|b| b.id == *target) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                (target_idx, args.clone())
+            }
+            _ => continue,
+        };
+
+        let mut box_inserts: Vec<RirInst> = Vec::new();
+        for (i, arg) in new_args.iter_mut().enumerate() {
+            let exp_t = func.blocks[target_idx].params[i].1;
+            let arg_t = value_types.get(arg).copied().unwrap_or(Type::Fixnum);
+            if exp_t == Type::Any && arg_t != Type::Any {
+                let tag = type_to_jit_rt_tag(arg_t);
+                let fresh = alloc();
+                box_inserts.push(RirInst::BoxTyped(fresh, *arg, tag));
+                value_types.insert(fresh, Type::Any);
+                *arg = fresh;
+            }
+        }
+        if !box_inserts.is_empty() {
+            func.blocks[block_idx].insts.extend(box_inserts);
+            if let Term::Jump(_, ref mut args) = func.blocks[block_idx].terminator {
+                *args = new_args;
+            }
+        }
+    }
+}
+
+/// For every Return whose value is still typed (not Any), insert a
+/// `BoxTyped` and rewrite the terminator. Called only when the
+/// function's overall return type is Any.
+fn box_mixed_returns(
+    func: &mut cs_rir::Function,
+    value_types: &mut HashMap<RirValue, Type>,
+    alloc: &mut impl FnMut() -> RirValue,
+) {
+    for block_idx in 0..func.blocks.len() {
+        let v = match &func.blocks[block_idx].terminator {
+            Term::Return(v) => *v,
+            _ => continue,
+        };
+        let vt = value_types.get(&v).copied().unwrap_or(Type::Fixnum);
+        if vt == Type::Any {
+            continue;
+        }
+        let tag = type_to_jit_rt_tag(vt);
+        let fresh = alloc();
+        func.blocks[block_idx]
+            .insts
+            .push(RirInst::BoxTyped(fresh, v, tag));
+        value_types.insert(fresh, Type::Any);
+        func.blocks[block_idx].terminator = Term::Return(fresh);
+    }
 }
 
 /// Walk every instruction in `func` and compute a per-Value type table,
@@ -1333,11 +1456,17 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     // catches misuse downstream rather than masking it as a wrong-
     // type Value).
     let _ = seen_callself; // tracked but not consumed beyond the inheritance contract
-    match (seen_any, seen_flo, seen_char, seen_bool, seen_fixnum) {
-        (true, false, false, false, false) => Type::Any,
-        (false, true, false, false, false) => Type::Flonum,
-        (false, false, true, false, false) => Type::Character,
-        (false, false, false, true, false) => Type::Boolean,
+                           // Any wins on mixed: when the body has at least one Any-typed
+                           // return path, the inferred type is Any, and the post-pass
+                           // (`box_mixed_returns`) inserts BoxTyped on the immediate-typed
+                           // return paths so the dispatcher always sees a Box pointer.
+    if seen_any {
+        return Type::Any;
+    }
+    match (seen_flo, seen_char, seen_bool, seen_fixnum) {
+        (true, false, false, false) => Type::Flonum,
+        (false, true, false, false) => Type::Character,
+        (false, false, true, false) => Type::Boolean,
         _ => Type::Fixnum,
     }
 }
