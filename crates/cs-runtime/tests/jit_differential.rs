@@ -443,3 +443,52 @@ fn diff_real_to_flonum_returns_flonum() {
         }
     }
 }
+
+#[test]
+fn diff_flonum_arithmetic() {
+    // M6 Phase 2 iter AA: + - * / on operands typed Flonum should
+    // emit FlonumAdd/Sub/Mul/Div in the RIR — Cranelift fadd / fsub
+    // / fmul / fdiv with bitcast to/from i64. Bodies that lift
+    // Fixnum params via real->flonum and then arithmetic flow
+    // through the new path.
+    let defines = &[
+        "(define sqr-flo (lambda (n) (let ((f (real->flonum n))) (* f f))))",
+        "(define avg2-flo (lambda (a b) \
+            (let ((fa (real->flonum a)) (fb (real->flonum b))) \
+              (* (+ fa fb) 0.5))))",
+    ];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+            (if (= i 1500) 'done \
+                (begin (sqr-flo 7) (avg2-flo 3 5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, f64)] = &[
+        ("(sqr-flo 5)", 25.0),
+        ("(sqr-flo -7)", 49.0),
+        ("(avg2-flo 3 4)", 3.5),
+        ("(avg2-flo 100 50)", 75.0),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Flonum(j)),
+                Value::Number(cs_core::Number::Flonum(w)),
+            ) => {
+                assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
+                assert_eq!(*j, *expected, "value mismatch on {}", expr);
+            }
+            other => panic!("{}: expected flonums, got {:?}", expr, other),
+        }
+    }
+}

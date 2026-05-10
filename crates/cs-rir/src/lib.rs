@@ -87,6 +87,23 @@ pub enum Inst {
     /// `dst = lhs * rhs`. cs-vm: `Inst::Mul`.
     Mul(Value, Value, Value),
 
+    /// `dst = lhs + rhs` interpreted as flonums. Operands and dst are
+    /// i64 carriers of f64 bit patterns; the lowerer bitcasts to f64,
+    /// runs Cranelift's `fadd`, and bitcasts back. Used when the
+    /// translator's per-Value type analysis classifies both operands
+    /// as Flonum.
+    FlonumAdd(Value, Value, Value),
+
+    /// `dst = lhs - rhs` (flonum). See `FlonumAdd`.
+    FlonumSub(Value, Value, Value),
+
+    /// `dst = lhs * rhs` (flonum). See `FlonumAdd`.
+    FlonumMul(Value, Value, Value),
+
+    /// `dst = lhs / rhs` (flonum). See `FlonumAdd`. IEEE-754 division —
+    /// no zero-check; division by zero produces ±inf or NaN per spec.
+    FlonumDiv(Value, Value, Value),
+
     /// `dst = (lhs < rhs)`. cs-vm: `Inst::Lt`.
     Lt(Value, Value, Value),
 

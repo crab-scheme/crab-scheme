@@ -413,6 +413,18 @@ fn lower_inst(
                 .bitcast(I64, cranelift_codegen::ir::MemFlags::new(), f);
             map.insert(*dst, bits);
         }
+        Inst::FlonumAdd(dst, lhs, rhs) => {
+            fbinop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().fadd(l, r))?
+        }
+        Inst::FlonumSub(dst, lhs, rhs) => {
+            fbinop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().fsub(l, r))?
+        }
+        Inst::FlonumMul(dst, lhs, rhs) => {
+            fbinop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().fmul(l, r))?
+        }
+        Inst::FlonumDiv(dst, lhs, rhs) => {
+            fbinop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().fdiv(l, r))?
+        }
         Inst::Param(_, _) => {
             // Param entries are populated from the entry block's
             // appended params before lower_inst runs.
@@ -481,6 +493,32 @@ fn binop(
     let r = lookup(map, rhs)?;
     let v = op(b, l, r);
     map.insert(dst, v);
+    Ok(())
+}
+
+/// Flonum binop: bitcast both i64 carriers to f64, run the op,
+/// bitcast the f64 result back to i64. Cranelift's optimizer folds
+/// the redundant bitcasts when the producers are also f64-typed.
+fn fbinop(
+    b: &mut FunctionBuilder,
+    map: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
+    dst: RirValue,
+    lhs: RirValue,
+    rhs: RirValue,
+    op: impl FnOnce(
+        &mut FunctionBuilder,
+        cranelift_codegen::ir::Value,
+        cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value,
+) -> Result<(), JitError> {
+    let l_i = lookup(map, lhs)?;
+    let r_i = lookup(map, rhs)?;
+    let mf = cranelift_codegen::ir::MemFlags::new();
+    let l_f = b.ins().bitcast(F64, mf, l_i);
+    let r_f = b.ins().bitcast(F64, mf, r_i);
+    let v_f = op(b, l_f, r_f);
+    let v_i = b.ins().bitcast(I64, mf, v_f);
+    map.insert(dst, v_i);
     Ok(())
 }
 

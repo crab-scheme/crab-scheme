@@ -125,6 +125,16 @@ pub fn bytecode_to_rir(
         param_map.insert(*sym, RirValue(i as u32));
     }
 
+    // Per-Value type table populated as the translator emits
+    // instructions. Lets arithmetic emission pick FlonumAdd vs
+    // Add based on operand types, and the return-type post-pass
+    // skip its own re-classification. Params default to Fixnum
+    // (the i64 ABI's only legal arg type at present).
+    let mut value_types: HashMap<RirValue, Type> = HashMap::new();
+    for i in 0..lambda.params.len() {
+        value_types.insert(RirValue(i as u32), Type::Fixnum);
+    }
+
     // Per-block entry stack: the SSA values that should be on the
     // simulated stack when the block starts executing. Set by the
     // predecessor's Jump emission (the predecessor allocates fresh
@@ -187,7 +197,14 @@ pub fn bytecode_to_rir(
                     }
                     let c = value_to_const(v)?;
                     let dst = alloc();
+                    let t = match c {
+                        Const::Flonum(_) => Type::Flonum,
+                        Const::Boolean(_) => Type::Boolean,
+                        Const::Character(_) => Type::Character,
+                        _ => Type::Fixnum,
+                    };
                     insts.push(RirInst::LoadConst(dst, c));
+                    value_types.insert(dst, t);
                     sim_stack.push(StackEntry::Value(dst));
                 }
                 Inst::LoadVar(sym) => {
@@ -234,9 +251,30 @@ pub fn bytecode_to_rir(
                     }
                     insts.push(RirInst::EnvSet(sym.0, val));
                 }
-                Inst::AddFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Add)?,
-                Inst::SubFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Sub)?,
-                Inst::MulFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Mul)?,
+                Inst::AddFx2 => emit_arith_binop(
+                    &mut insts,
+                    &mut sim_stack,
+                    &mut alloc,
+                    &mut value_types,
+                    RirInst::Add,
+                    RirInst::FlonumAdd,
+                )?,
+                Inst::SubFx2 => emit_arith_binop(
+                    &mut insts,
+                    &mut sim_stack,
+                    &mut alloc,
+                    &mut value_types,
+                    RirInst::Sub,
+                    RirInst::FlonumSub,
+                )?,
+                Inst::MulFx2 => emit_arith_binop(
+                    &mut insts,
+                    &mut sim_stack,
+                    &mut alloc,
+                    &mut value_types,
+                    RirInst::Mul,
+                    RirInst::FlonumMul,
+                )?,
                 Inst::LtFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Lt)?,
                 Inst::EqFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Eq)?,
                 Inst::GtFx2 => {
@@ -623,6 +661,7 @@ pub fn bytecode_to_rir(
                                         // Flonum; dispatcher decodes via
                                         // f64::from_bits.
                                         insts.push(RirInst::FixToFlo(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
                                     }
                                     ("char->integer", 1) => {
                                         // Symmetric to integer->char: the i64
@@ -934,11 +973,41 @@ where
     Ok(())
 }
 
+/// Arithmetic binop emission with flonum/fixnum dispatch. When both
+/// operands are typed Flonum (per `value_types`), emit the flonum
+/// variant; otherwise fall back to the fixnum form. dst's type is
+/// recorded in `value_types` so downstream ops can chain.
+fn emit_arith_binop(
+    insts: &mut Vec<RirInst>,
+    stack: &mut Vec<StackEntry>,
+    alloc: &mut impl FnMut() -> RirValue,
+    value_types: &mut HashMap<RirValue, Type>,
+    fixnum_ctor: fn(RirValue, RirValue, RirValue) -> RirInst,
+    flonum_ctor: fn(RirValue, RirValue, RirValue) -> RirInst,
+) -> Result<(), TranslateError> {
+    let rhs = pop_value(stack)?;
+    let lhs = pop_value(stack)?;
+    let dst = alloc();
+    let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
+    let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
+    let (inst, dst_t) = if lt == Type::Flonum && rt == Type::Flonum {
+        (flonum_ctor(dst, lhs, rhs), Type::Flonum)
+    } else {
+        (fixnum_ctor(dst, lhs, rhs), Type::Fixnum)
+    };
+    insts.push(inst);
+    value_types.insert(dst, dst_t);
+    stack.push(StackEntry::Value(dst));
+    Ok(())
+}
+
 fn value_to_const(v: &cs_core::Value) -> Result<Const, TranslateError> {
     use cs_core::Value;
     match v {
         Value::Number(cs_core::Number::Fixnum(n)) => Ok(Const::Fixnum(*n)),
+        Value::Number(cs_core::Number::Flonum(f)) => Ok(Const::Flonum(*f)),
         Value::Boolean(b) => Ok(Const::Boolean(*b)),
+        Value::Character(c) => Ok(Const::Character(*c)),
         Value::Null => Ok(Const::Null),
         Value::Unspecified => Ok(Const::Unspecified),
         other => Err(TranslateError::Unsupported(format!(
