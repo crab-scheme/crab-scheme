@@ -330,6 +330,29 @@ fn value_to_any_i64(v: Value) -> i64 {
     Box::into_raw(Box::new(v)) as i64
 }
 
+/// Encode a `Value` into a Gc-backed raw handle carried as a single
+/// i64 word. Companion to `value_to_any_i64` for the JIT_RT_GC ABI
+/// per ADR 0012 D-2. The Gc handle is unregistered with any specific
+/// `Heap` for now (per cs-gc's `Gc::new`) — a follow-up iter will
+/// route through `Heap::alloc` so the tracing GC sees the
+/// allocation.
+fn value_to_gc_i64(v: Value) -> i64 {
+    cs_gc::Gc::into_raw_jit(cs_gc::Gc::new(v)) as i64
+}
+
+/// Decode a Gc-backed raw handle from an i64. Consumes one strong
+/// count (Rc::from_raw semantics). Use `Gc::raw_incref(ptr)` first
+/// if you want to borrow without consuming.
+///
+/// # Safety
+///
+/// `i` must be a live, owned handle from `value_to_gc_i64` (or
+/// `Gc::into_raw_jit`) for `Value`.
+unsafe fn gc_i64_to_value(i: i64) -> Value {
+    let g: cs_gc::Gc<Value> = unsafe { cs_gc::Gc::from_raw_jit(i as *const ()) };
+    (*g).clone()
+}
+
 /// `(cons car cdr)` — heap-allocate a fresh pair. Operands are i64
 /// carriers tagged per the wider ABI; the helper decodes both into
 /// `Value`s, allocates a `Pair`, and returns an `Any`-tagged i64
@@ -347,6 +370,23 @@ pub unsafe extern "C" fn vm_alloc_pair(car: i64, car_tag: u8, cdr: i64, cdr_tag:
     let car_v = unsafe { i64_to_value(car, car_tag) };
     let cdr_v = unsafe { i64_to_value(cdr, cdr_tag) };
     value_to_any_i64(Value::Pair(cs_core::Pair::new(car_v, cdr_v)))
+}
+
+/// Gc-backed counterpart to `vm_alloc_pair` per ADR 0012 D-2. Same
+/// shape (car, car_tag, cdr, cdr_tag) -> i64, but the returned
+/// handle is a `Gc::into_raw_jit` value (refcount = 1) instead of a
+/// `Box::into_raw`. The body's caller (the JIT, once iter BH
+/// switches its lowering) must consume it via `gc_i64_to_value` or
+/// `Gc::from_raw_jit` exactly once.
+///
+/// For now (iter BG) this helper is exported but unused — iter BH
+/// is the lowering switch. Wired here so the JIT module can declare
+/// it as a symbol when BH lands.
+#[no_mangle]
+pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_tag: u8) -> i64 {
+    let car_v = unsafe { i64_to_value(car, car_tag) };
+    let cdr_v = unsafe { i64_to_value(cdr, cdr_tag) };
+    value_to_gc_i64(Value::Pair(cs_core::Pair::new(car_v, cdr_v)))
 }
 
 /// `(car pair)` — return the pair's car, Any-tagged. Pre-decodes the
@@ -5300,6 +5340,49 @@ mod tests {
         match r {
             Value::Number(Number::Fixnum(120)) => {}
             other => panic!("expected 120, got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod gc_helper_tests {
+    use super::*;
+
+    #[test]
+    fn vm_alloc_pair_gc_roundtrip() {
+        // ADR 0012 D-2 — vm_alloc_pair_gc allocates a Gc-backed
+        // Pair and returns its raw handle. Decoding via
+        // gc_i64_to_value reproduces the Pair without leaking.
+        let car = 7i64;
+        let cdr = 11i64;
+        // SAFETY: both args are live Fixnums under JIT_RT_FIXNUM.
+        let i = unsafe { vm_alloc_pair_gc(car, JIT_RT_FIXNUM, cdr, JIT_RT_FIXNUM) };
+        assert_ne!(i, 0, "vm_alloc_pair_gc returned null handle");
+        // Decode + verify.
+        let v = unsafe { gc_i64_to_value(i) };
+        match v {
+            Value::Pair(p) => match (&*p.car.borrow(), &*p.cdr.borrow()) {
+                (
+                    Value::Number(cs_core::Number::Fixnum(7)),
+                    Value::Number(cs_core::Number::Fixnum(11)),
+                ) => {}
+                other => panic!("pair contents mismatch: {:?}", other),
+            },
+            other => panic!("expected Pair, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn value_to_gc_i64_and_back_preserves_value() {
+        let v = Value::Number(cs_core::Number::Fixnum(42));
+        let i = value_to_gc_i64(v.clone());
+        let back = unsafe { gc_i64_to_value(i) };
+        match (&v, &back) {
+            (
+                Value::Number(cs_core::Number::Fixnum(a)),
+                Value::Number(cs_core::Number::Fixnum(b)),
+            ) => assert_eq!(a, b),
+            _ => panic!("mismatch"),
         }
     }
 }
