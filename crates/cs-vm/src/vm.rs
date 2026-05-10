@@ -607,6 +607,97 @@ pub unsafe extern "C" fn vm_eq_any(a: i64, b: i64) -> i64 {
     eq as i64
 }
 
+// ----------------------------------------------------------------------------
+// Gc-backed counterparts to the Box-flavored helpers above
+// (ADR 0012 D-2 — iter BI adds the remaining six). Pure-additive;
+// JIT lowering still calls the Box variants. Iter BJ flips
+// the FuncRefs.
+// ----------------------------------------------------------------------------
+
+/// Gc-backed counterpart to `vm_box_typed`. Wraps a typed i64
+/// (Fixnum/Boolean/Character/Flonum/Null/Symbol/Unspecified/Eof)
+/// in a fresh `Gc<Value>` and returns its raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_box_typed_gc(i: i64, tag: i64) -> i64 {
+    let v = unsafe { i64_to_value(i, tag as u8) };
+    value_to_gc_i64(v)
+}
+
+/// Gc-backed counterpart to `vm_unbox_fixnum`. Consumes the Gc
+/// handle and extracts its inner Fixnum as raw i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_unbox_fixnum_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Number(cs_core::Number::Fixnum(n)) => n,
+        ref other => panic!("vm_unbox_fixnum_gc: not a fixnum ({})", other.type_name()),
+    }
+}
+
+/// Gc-backed counterpart to `vm_unbox_boolean`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_unbox_boolean_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Boolean(b) => b as i64,
+        ref other => panic!("vm_unbox_boolean_gc: not a boolean ({})", other.type_name()),
+    }
+}
+
+/// Gc-backed counterpart to `vm_unbox_flonum`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_unbox_flonum_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Number(cs_core::Number::Flonum(f)) => f.to_bits() as i64,
+        ref other => panic!("vm_unbox_flonum_gc: not a flonum ({})", other.type_name()),
+    }
+}
+
+/// Gc-backed counterpart to `vm_any_truthy`. Consumes the Gc
+/// handle and returns 1 iff inner is not `Boolean(false)`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_any_truthy_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Boolean(false) => 0,
+        _ => 1,
+    }
+}
+
+/// Gc-backed counterpart to `vm_eq_any`. Same semantics, same
+/// match arms — only the input ABI changes (consume-on-use Gc
+/// handle vs Box).
+#[no_mangle]
+pub unsafe extern "C" fn vm_eq_any_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    let eq = match (&av, &bv) {
+        (Value::Null, Value::Null) => true,
+        (Value::Unspecified, Value::Unspecified) => true,
+        (Value::Eof, Value::Eof) => true,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Character(x), Value::Character(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Number(cs_core::Number::Fixnum(x)), Value::Number(cs_core::Number::Fixnum(y))) => {
+            x == y
+        }
+        (Value::Number(cs_core::Number::Flonum(x)), Value::Number(cs_core::Number::Flonum(y))) => {
+            x.to_bits() == y.to_bits()
+        }
+        (Value::Pair(x), Value::Pair(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::Vector(x), Value::Vector(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::String(x), Value::String(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::ByteVector(x), Value::ByteVector(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::Hashtable(x), Value::Hashtable(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::Port(x), Value::Port(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::Promise(x), Value::Promise(y)) => cs_core::Gc::ptr_eq(x, y),
+        (Value::Procedure(x), Value::Procedure(y)) => std::rc::Rc::ptr_eq(x, y),
+        _ => false,
+    };
+    eq as i64
+}
+
 /// Read the per-thread JIT-dispatch count. Test/diagnostics only.
 pub fn jit_call_count() -> u64 {
     VM_JIT_CALL_COUNT.with(|c| c.get())
@@ -5496,5 +5587,88 @@ mod gc_helper_tests {
             ) => {}
             other => panic!("unexpected clones: {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod gc_helper_tests_extra {
+    use super::*;
+
+    #[test]
+    fn vm_box_typed_gc_roundtrip_fixnum() {
+        let i = unsafe { vm_box_typed_gc(42, JIT_RT_FIXNUM as i64) };
+        let v = unsafe { gc_i64_to_value(i) };
+        match v {
+            Value::Number(cs_core::Number::Fixnum(42)) => {}
+            other => panic!("expected fixnum 42, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn vm_box_typed_gc_roundtrip_null() {
+        let i = unsafe { vm_box_typed_gc(0, JIT_RT_NULL as i64) };
+        let v = unsafe { gc_i64_to_value(i) };
+        assert!(matches!(v, Value::Null));
+    }
+
+    #[test]
+    fn vm_unbox_fixnum_gc_extracts() {
+        let v = Value::Number(cs_core::Number::Fixnum(-17));
+        let i = value_to_gc_i64(v);
+        let n = unsafe { vm_unbox_fixnum_gc(i) };
+        assert_eq!(n, -17);
+    }
+
+    #[test]
+    fn vm_unbox_boolean_gc_extracts() {
+        let i_true = value_to_gc_i64(Value::Boolean(true));
+        let i_false = value_to_gc_i64(Value::Boolean(false));
+        assert_eq!(unsafe { vm_unbox_boolean_gc(i_true) }, 1);
+        assert_eq!(unsafe { vm_unbox_boolean_gc(i_false) }, 0);
+    }
+
+    #[test]
+    fn vm_unbox_flonum_gc_extracts() {
+        let i = value_to_gc_i64(Value::Number(cs_core::Number::Flonum(2.5)));
+        let bits = unsafe { vm_unbox_flonum_gc(i) };
+        let f = f64::from_bits(bits as u64);
+        assert!((f - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn vm_any_truthy_gc_classifies() {
+        // R6RS: only #f is falsy.
+        assert_eq!(
+            unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Boolean(false))) },
+            0
+        );
+        assert_eq!(
+            unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Boolean(true))) },
+            1
+        );
+        assert_eq!(
+            unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(0)))) },
+            1
+        );
+        assert_eq!(unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Null)) }, 1);
+    }
+
+    #[test]
+    fn vm_eq_any_gc_compares() {
+        // Symbol identity.
+        let a = value_to_gc_i64(Value::Symbol(cs_core::Symbol(42)));
+        let b = value_to_gc_i64(Value::Symbol(cs_core::Symbol(42)));
+        assert_eq!(unsafe { vm_eq_any_gc(a, b) }, 1);
+        let c = value_to_gc_i64(Value::Symbol(cs_core::Symbol(99)));
+        let d = value_to_gc_i64(Value::Symbol(cs_core::Symbol(42)));
+        assert_eq!(unsafe { vm_eq_any_gc(c, d) }, 0);
+        // Fixnum value equality.
+        let e = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(5)));
+        let f = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(5)));
+        assert_eq!(unsafe { vm_eq_any_gc(e, f) }, 1);
+        // Distinct heap pairs are NOT eq? (different Gc allocations).
+        let p1 = unsafe { vm_alloc_pair_gc(1, JIT_RT_FIXNUM, 2, JIT_RT_FIXNUM) };
+        let p2 = unsafe { vm_alloc_pair_gc(1, JIT_RT_FIXNUM, 2, JIT_RT_FIXNUM) };
+        assert_eq!(unsafe { vm_eq_any_gc(p1, p2) }, 0);
     }
 }
