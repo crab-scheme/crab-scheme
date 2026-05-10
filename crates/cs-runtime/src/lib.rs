@@ -381,6 +381,38 @@ impl Runtime {
                 Ok(cs_vm::vm::vm_current_error_port_value())
             }),
         );
+        // R6RS §8.2 — standard-{input,output,error}-port. Aliased to
+        // the same backing thread-local as current-* on the VM tier.
+        let sip_sym = syms.intern("standard-input-port");
+        vm_env.define(
+            sip_sym,
+            cs_vm::vm::make_vm_builtin("standard-input-port", |args| {
+                if !args.is_empty() {
+                    return Err("standard-input-port: 0 args".into());
+                }
+                Ok(cs_vm::vm::vm_current_input_port_value().unwrap_or(Value::Unspecified))
+            }),
+        );
+        let sop_sym = syms.intern("standard-output-port");
+        vm_env.define(
+            sop_sym,
+            cs_vm::vm::make_vm_builtin("standard-output-port", |args| {
+                if !args.is_empty() {
+                    return Err("standard-output-port: 0 args".into());
+                }
+                Ok(cs_vm::vm::vm_current_output_port_value().unwrap_or(Value::Unspecified))
+            }),
+        );
+        let sep_sym = syms.intern("standard-error-port");
+        vm_env.define(
+            sep_sym,
+            cs_vm::vm::make_vm_builtin("standard-error-port", |args| {
+                if !args.is_empty() {
+                    return Err("standard-error-port: 0 args".into());
+                }
+                Ok(cs_vm::vm::vm_current_error_port_value())
+            }),
+        );
         // eval: thread-local hook installed at entry to eval_str_via_vm so
         // VmEval can call back into the runtime without a direct cycle.
         let eval_sym = syms.intern("eval");

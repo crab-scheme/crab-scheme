@@ -41,3 +41,54 @@
 (write-string "Hello, " op2)
 (write-string "world!" op2)
 (test-equal "write-string-collected" "Hello, world!" (get-output-string op2))
+
+; ---- R6RS §8.2 — put-char / put-string / put-bytevector --------------
+(test-section "R6RS port writes")
+
+(let ((p (open-string-output-port)))
+  (put-char p #\h)
+  (put-char p #\i)
+  (test-equal "put-char-builds-string" "hi" (get-output-string p)))
+
+(let ((p (open-string-output-port)))
+  (put-string p "hello")
+  (put-string p " world!" 0 6)
+  (test-equal "put-string-with-slice" "hello world" (get-output-string p)))
+
+(let ((p (open-string-output-port)))
+  (put-string p "abcdef" 2 3)
+  (test-equal "put-string-mid-slice" "cde" (get-output-string p)))
+
+(let ((p (open-output-bytevector)))
+  (put-bytevector p (bytevector 1 2 3 4 5))
+  (put-bytevector p (bytevector 10 20 30 40) 1 2)
+  (test-equal "put-bytevector-with-slice"
+              #u8(1 2 3 4 5 20 30)
+              (get-output-bytevector p)))
+
+; ---- R6RS get-bytevector-all / get-string-n -------------------------
+(test-section "R6RS port reads")
+
+(let ((p (open-bytevector-input-port (bytevector 1 2 3 4 5))))
+  (test-equal "gba-takes-some"  #u8(1 2)   (get-bytevector-n p 2))
+  (test-equal "gba-takes-rest"  #u8(3 4 5) (get-bytevector-all p))
+  (test-true  "gba-eof-after"   (eof-object? (get-bytevector-all p))))
+
+(let ((p (open-string-input-port "Hello, world!")))
+  (test-equal "gsn-takes-some"  "Hello" (get-string-n p 5))
+  (test-equal "gsn-takes-rest"  ", world!" (get-string-n p 1000))
+  (test-true  "gsn-eof-after"   (eof-object? (get-string-n p 1))))
+
+(let ((p (open-string-input-port "")))
+  (test-true  "gsn-eof-empty"   (eof-object? (get-string-n p 5))))
+
+; ---- R6RS standard-{input,output,error}-port -----------------------
+(test-section "R6RS standard ports exist")
+
+; The exact return value depends on how the runtime is hooked up
+; (REPL/file/embedded). For now we only verify the procedures exist
+; and don't error.
+(test-true "standard-input-exists"  (procedure? standard-input-port))
+(test-true "standard-output-exists" (procedure? standard-output-port))
+(test-true "standard-error-exists"  (procedure? standard-error-port))
+(test-true "standard-error-is-port" (port? (standard-error-port)))

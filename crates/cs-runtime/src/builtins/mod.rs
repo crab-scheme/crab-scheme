@@ -513,7 +513,12 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("get-u8", b_get_u8),
         ("lookahead-u8", b_lookahead_u8),
         ("put-u8", b_put_u8),
+        ("put-char", b_put_char),
+        ("put-string", b_put_string),
+        ("put-bytevector", b_put_bytevector),
         ("get-bytevector-n", b_get_bytevector_n),
+        ("get-bytevector-all", b_get_bytevector_all),
+        ("get-string-n", b_get_string_n),
         ("binary-port?", b_binary_port_p),
         ("textual-port?", b_textual_port_p),
         ("get-output-string", b_get_output_string),
@@ -677,6 +682,9 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("current-input-port", b_current_input_port),
         ("current-output-port", b_current_output_port),
         ("current-error-port", b_current_error_port),
+        ("standard-input-port", b_standard_input_port),
+        ("standard-output-port", b_standard_output_port),
+        ("standard-error-port", b_standard_error_port),
         ("gensym", b_gensym),
         ("eval", b_eval),
         ("environment", b_environment),
@@ -6294,6 +6302,197 @@ fn b_get_bytevector_n(args: &[Value]) -> Result<Value, String> {
     }
 }
 
+/// R6RS `(get-bytevector-all port)` — read every remaining byte
+/// into a fresh bytevector. EOF if already drained.
+fn b_get_bytevector_all(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("get-bytevector-all", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorInput(state) => {
+                let mut s = state.borrow_mut();
+                if s.pos >= s.bytes.len() {
+                    return Ok(Value::Eof);
+                }
+                let bytes = s.bytes[s.pos..].to_vec();
+                s.pos = s.bytes.len();
+                Ok(Value::ByteVector(cs_core::Gc::new(
+                    std::cell::RefCell::new(bytes),
+                )))
+            }
+            _ => Err("get-bytevector-all: not a binary input port".into()),
+        },
+        v => Err(type_err("get-bytevector-all", "binary-input-port", v)),
+    }
+}
+
+/// R6RS `(get-string-n port count)` — read up to `count` chars from a
+/// textual input port into a fresh string. EOF if already drained.
+fn b_get_string_n(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("get-string-n", "2", args.len()));
+    }
+    let n = as_int_i64("get-string-n", &args[1])?;
+    if n < 0 {
+        return Err("get-string-n: negative count".into());
+    }
+    let n = n as usize;
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::StringInput(state) => {
+                let mut s = state.borrow_mut();
+                if s.pos >= s.chars.len() {
+                    return Ok(Value::Eof);
+                }
+                let avail = s.chars.len() - s.pos;
+                let take = n.min(avail);
+                let collected: String = s.chars[s.pos..s.pos + take].iter().collect();
+                s.pos += take;
+                Ok(Value::string(collected))
+            }
+            _ => Err("get-string-n: not a textual input port".into()),
+        },
+        v => Err(type_err("get-string-n", "textual-input-port", v)),
+    }
+}
+
+/// R6RS `(put-char port char)` — write a character to a textual
+/// output port. Mirrors `write-char` but with the R6RS arg order
+/// (port first).
+fn b_put_char(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("put-char", "2", args.len()));
+    }
+    let c = match &args[1] {
+        Value::Character(c) => *c,
+        v => return Err(type_err("put-char", "character", v)),
+    };
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::StringOutput(buf) => {
+                buf.borrow_mut().push(c);
+                Ok(Value::Unspecified)
+            }
+            Port::FileOutput(state) => {
+                let mut st = state.borrow_mut();
+                if st.closed {
+                    return Err("put-char: port is closed".into());
+                }
+                let mut tmp = [0u8; 4];
+                let s = c.encode_utf8(&mut tmp);
+                st.buf.extend_from_slice(s.as_bytes());
+                Ok(Value::Unspecified)
+            }
+            _ => Err("put-char: not a textual output port".into()),
+        },
+        v => Err(type_err("put-char", "textual-output-port", v)),
+    }
+}
+
+/// R6RS `(put-string port string [start [count]])` — write a slice
+/// of a string to a textual output port.
+fn b_put_string(args: &[Value]) -> Result<Value, String> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(arity_err("put-string", "2..4", args.len()));
+    }
+    let s = match &args[1] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("put-string", "string", v)),
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let start = if args.len() >= 3 {
+        let i = as_int_i64("put-string", &args[2])?;
+        if i < 0 || (i as usize) > len {
+            return Err(format!("put-string: start out of range: {}", i));
+        }
+        i as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 4 {
+        let c = as_int_i64("put-string", &args[3])?;
+        if c < 0 {
+            return Err("put-string: negative count".into());
+        }
+        let e = start + c as usize;
+        if e > len {
+            return Err(format!("put-string: count exceeds string length: {}", c));
+        }
+        e
+    } else {
+        len
+    };
+    let slice: String = chars[start..end].iter().collect();
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::StringOutput(buf) => {
+                buf.borrow_mut().push_str(&slice);
+                Ok(Value::Unspecified)
+            }
+            Port::FileOutput(state) => {
+                let mut st = state.borrow_mut();
+                if st.closed {
+                    return Err("put-string: port is closed".into());
+                }
+                st.buf.extend_from_slice(slice.as_bytes());
+                Ok(Value::Unspecified)
+            }
+            _ => Err("put-string: not a textual output port".into()),
+        },
+        v => Err(type_err("put-string", "textual-output-port", v)),
+    }
+}
+
+/// R6RS `(put-bytevector port bytevector [start [count]])` — write
+/// a slice of a bytevector to a binary output port.
+fn b_put_bytevector(args: &[Value]) -> Result<Value, String> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(arity_err("put-bytevector", "2..4", args.len()));
+    }
+    let bytes = match &args[1] {
+        Value::ByteVector(b) => b.borrow().clone(),
+        v => return Err(type_err("put-bytevector", "bytevector", v)),
+    };
+    let len = bytes.len();
+    let start = if args.len() >= 3 {
+        let i = as_int_i64("put-bytevector", &args[2])?;
+        if i < 0 || (i as usize) > len {
+            return Err(format!("put-bytevector: start out of range: {}", i));
+        }
+        i as usize
+    } else {
+        0
+    };
+    let end = if args.len() == 4 {
+        let c = as_int_i64("put-bytevector", &args[3])?;
+        if c < 0 {
+            return Err("put-bytevector: negative count".into());
+        }
+        let e = start + c as usize;
+        if e > len {
+            return Err(format!(
+                "put-bytevector: count exceeds bytevector length: {}",
+                c
+            ));
+        }
+        e
+    } else {
+        len
+    };
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::ByteVectorOutput(buf) => {
+                buf.borrow_mut().extend_from_slice(&bytes[start..end]);
+                Ok(Value::Unspecified)
+            }
+            _ => Err("put-bytevector: not a binary output port".into()),
+        },
+        v => Err(type_err("put-bytevector", "binary-output-port", v)),
+    }
+}
+
 fn b_binary_port_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("binary-port?", "1", args.len()));
@@ -8172,6 +8371,38 @@ fn b_current_output_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
 fn b_current_error_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("current-error-port", "0", args.len()));
+    }
+    if ctx.current_error_port.is_none() {
+        ctx.current_error_port = Some(Value::Port(Port::string_output()));
+    }
+    Ok(ctx.current_error_port.clone().unwrap())
+}
+
+// R6RS §8.2 — `(standard-input-port)`, `(standard-output-port)`,
+// `(standard-error-port)`. Spec says these are *binary* ports for
+// stdio. We alias them to the same backing port as current-* (which
+// is treated as textual): foundation-level Scheme programs treat
+// them as opaque port handles to thread through I/O ops.
+fn b_standard_input_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("standard-input-port", "0", args.len()));
+    }
+    Ok(ctx.current_input_port.clone().unwrap_or(Value::Unspecified))
+}
+
+fn b_standard_output_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("standard-output-port", "0", args.len()));
+    }
+    Ok(ctx
+        .current_output_port
+        .clone()
+        .unwrap_or(Value::Unspecified))
+}
+
+fn b_standard_error_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("standard-error-port", "0", args.len()));
     }
     if ctx.current_error_port.is_none() {
         ctx.current_error_port = Some(Value::Port(Port::string_output()));
