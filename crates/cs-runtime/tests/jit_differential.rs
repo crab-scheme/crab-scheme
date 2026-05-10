@@ -1015,3 +1015,55 @@ fn diff_jit_mixed_fixnum_flonum_arithmetic() {
         }
     }
 }
+
+#[test]
+fn diff_jit_cons_pair_return() {
+    // M6 Phase 4 iter AS: first end-to-end Pair-returning JIT body.
+    // (define (pair-up a b) (cons a b)) tier-ups, the JIT translator
+    // emits Inst::Cons (with per-operand JIT_RT_* tags), the lowerer
+    // calls vm_alloc_pair, and the dispatcher decodes the Any-tagged
+    // Box::into_raw return back into a proper Value::Pair.
+    let defines = &["(define pair-up (lambda (a b) (cons a b)))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (pair-up 99 100) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, i64, i64)] = &[
+        ("(pair-up 5 7)", 5, 7),
+        ("(pair-up 100 200)", 100, 200),
+        ("(pair-up -1 0)", -1, 0),
+    ];
+    for (expr, ec, ed) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (Value::Pair(jp), Value::Pair(wp)) => {
+                let jc = jp.car.borrow().clone();
+                let jd = jp.cdr.borrow().clone();
+                let wc = wp.car.borrow().clone();
+                let wd = wp.cdr.borrow().clone();
+                match (&jc, &wc, &jd, &wd) {
+                    (
+                        Value::Number(cs_core::Number::Fixnum(a)),
+                        Value::Number(cs_core::Number::Fixnum(b)),
+                        Value::Number(cs_core::Number::Fixnum(c)),
+                        Value::Number(cs_core::Number::Fixnum(d)),
+                    ) => {
+                        assert_eq!(a, b);
+                        assert_eq!(c, d);
+                        assert_eq!(*a, *ec);
+                        assert_eq!(*c, *ed);
+                    }
+                    other => panic!("unexpected pair contents on {}: {:?}", expr, other),
+                }
+            }
+            other => panic!("expected pairs, got {:?}", other),
+        }
+    }
+}

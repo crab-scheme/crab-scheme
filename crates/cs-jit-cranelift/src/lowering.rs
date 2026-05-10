@@ -66,8 +66,7 @@ pub struct Lowerer {
     /// `Inst::EnvSet` lowers to a Cranelift call against this.
     env_set_func: cranelift_module::FuncId,
     /// FuncId of `vm_alloc_pair(car, car_tag, cdr, cdr_tag) -> i64`.
-    /// Reserved for `cons` lowering — no translator path uses it yet.
-    #[allow(dead_code)]
+    /// `Inst::Cons` lowers to a Cranelift call against this.
     alloc_pair_func: cranelift_module::FuncId,
     /// FuncId of `vm_pair_car(pair) -> i64`. Reserved for `car`
     /// lowering.
@@ -302,6 +301,9 @@ impl Lowerer {
             let env_set_fnref = self
                 .module
                 .declare_func_in_func(self.env_set_func, builder.func);
+            let alloc_pair_fnref = self
+                .module
+                .declare_func_in_func(self.alloc_pair_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -356,6 +358,7 @@ impl Lowerer {
                         self_fnref,
                         env_lookup_fnref,
                         env_set_fnref,
+                        alloc_pair_fnref,
                         inst,
                     )?;
                 }
@@ -505,6 +508,7 @@ fn lower_inst(
     self_fnref: cranelift_codegen::ir::FuncRef,
     env_lookup_fnref: cranelift_codegen::ir::FuncRef,
     env_set_fnref: cranelift_codegen::ir::FuncRef,
+    alloc_pair_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -600,6 +604,28 @@ fn lower_inst(
                 .ins()
                 .bitcast(I64, cranelift_codegen::ir::MemFlags::new(), f);
             map.insert(*dst, bits);
+        }
+        Inst::Cons(dst, car, car_tag, cdr, cdr_tag) => {
+            // Lowers to a call against vm_alloc_pair(car, car_tag,
+            // cdr, cdr_tag). Tags are baked at translate time;
+            // operands are whatever values the JIT body computed.
+            // Result is Any-tagged (the i64 carries
+            // Box::into_raw(Box<Value::Pair(_)>)).
+            let car_v = lookup(map, *car)?;
+            let cdr_v = lookup(map, *cdr)?;
+            let car_t = b.ins().iconst(I64, *car_tag as i64);
+            let cdr_t = b.ins().iconst(I64, *cdr_tag as i64);
+            let inst_ref = b
+                .ins()
+                .call(alloc_pair_fnref, &[car_v, car_t, cdr_v, cdr_t]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "Cons expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
         }
         Inst::FlonumAdd(dst, lhs, rhs) => {
             fbinop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().fadd(l, r))?

@@ -753,6 +753,28 @@ pub fn bytecode_to_rir_with_hints(
                                         // (square x) → x * x
                                         insts.push(RirInst::Mul(dst, args[0], args[0]));
                                     }
+                                    ("cons", 2) => {
+                                        // Heap-allocate a Pair via
+                                        // vm_alloc_pair. Tags come from
+                                        // value_types so the helper
+                                        // decodes operands correctly.
+                                        // dst is Type::Any (the i64
+                                        // carries Box::into_raw(Box<Value>)).
+                                        let car_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let cdr_t = value_types
+                                            .get(&args[1])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let car_tag = type_to_jit_rt_tag(car_t);
+                                        let cdr_tag = type_to_jit_rt_tag(cdr_t);
+                                        insts.push(RirInst::Cons(
+                                            dst, args[0], car_tag, args[1], cdr_tag,
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     ("integer->char", 1) => {
                                         // Same bit pattern as the Fixnum input;
                                         // the return-type post-pass will tag
@@ -1073,11 +1095,31 @@ pub fn bytecode_to_rir_with_hints(
 /// Boolean. If multiple Returns disagree we conservatively fall back to
 /// `Type::Fixnum` (which is the i64-passthrough decoding) — the
 /// dispatcher's own type guards will catch a mismatch downstream.
+/// Map an RIR `Type` to the matching `JIT_RT_*` u8 tag in cs-vm.
+/// Mirrors `cs_vm::vm::JIT_RT_FIXNUM` etc. — duplicated here to
+/// avoid a circular import at translate time. Heap-pointer types
+/// not yet wired through Cranelift map to `JIT_RT_ANY`.
+fn type_to_jit_rt_tag(t: Type) -> u8 {
+    match t {
+        Type::Fixnum => 0,
+        Type::Boolean => 1,
+        Type::Character => 2,
+        Type::Flonum => 3,
+        Type::Pair => 4,
+        Type::Vector => 5,
+        Type::String => 6,
+        Type::ByteVector => 7,
+        Type::Procedure => 8,
+        Type::Any => 15,
+    }
+}
+
 fn infer_return_type(func: &cs_rir::Function) -> Type {
     use cs_rir::Const;
     let mut bool_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     let mut char_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     let mut flo_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
+    let mut any_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     // Seed from the function's per-param types — when the runtime
     // hook supplied hints (arg-side feedback), parameters get the
     // observed types. Without this, a body that returns a typed
@@ -1154,6 +1196,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::LoadConst(dst, Const::Flonum(_)) => {
                     flo_values.insert(*dst);
                 }
+                RirInst::Cons(dst, _, _, _, _) => {
+                    any_values.insert(*dst);
+                }
                 _ => {}
             }
         }
@@ -1175,11 +1220,14 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     let mut seen_bool = false;
     let mut seen_char = false;
     let mut seen_flo = false;
+    let mut seen_any = false;
     let mut seen_callself = false;
     for block in &func.blocks {
         if let Term::Return(v) = &block.terminator {
             if callself_dsts.contains(v) {
                 seen_callself = true;
+            } else if any_values.contains(v) {
+                seen_any = true;
             } else if flo_values.contains(v) {
                 seen_flo = true;
             } else if char_values.contains(v) {
@@ -1199,10 +1247,11 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     // catches misuse downstream rather than masking it as a wrong-
     // type Value).
     let _ = seen_callself; // tracked but not consumed beyond the inheritance contract
-    match (seen_flo, seen_char, seen_bool, seen_fixnum) {
-        (true, false, false, false) => Type::Flonum,
-        (false, true, false, false) => Type::Character,
-        (false, false, true, false) => Type::Boolean,
+    match (seen_any, seen_flo, seen_char, seen_bool, seen_fixnum) {
+        (true, false, false, false, false) => Type::Any,
+        (false, true, false, false, false) => Type::Flonum,
+        (false, false, true, false, false) => Type::Character,
+        (false, false, false, true, false) => Type::Boolean,
         _ => Type::Fixnum,
     }
 }

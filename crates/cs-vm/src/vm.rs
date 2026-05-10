@@ -470,7 +470,9 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
 /// Wrap a raw i64 from a JIT'd body into the matching `Value` form
 /// based on the closure's stored return-type tag. Boolean uses 0/1
 /// from Lt/Eq; Character carries the codepoint in the low 32 bits;
-/// Flonum reads the i64 as the bit pattern of an f64.
+/// Flonum reads the i64 as the bit pattern of an f64. Any reads
+/// the i64 as `Box::into_raw(Box<Value>)` and reconstitutes the
+/// owned Value (dropping the Box on the way out).
 fn decode_jit_return(rt: u8, r: i64) -> Value {
     match rt {
         JIT_RT_BOOLEAN => Value::Boolean(r != 0),
@@ -485,6 +487,14 @@ fn decode_jit_return(rt: u8, r: i64) -> Value {
         JIT_RT_FLONUM => {
             let f = f64::from_bits(r as u64);
             Value::Number(cs_core::Number::Flonum(f))
+        }
+        JIT_RT_ANY => {
+            // SAFETY: the JIT body produced this i64 via
+            // `value_to_any_i64` (Box::into_raw). We own the Box now
+            // and reconstitute it, copying out the inner Value before
+            // the Box drops.
+            let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
+            *boxed
         }
         _ => Value::Number(cs_core::Number::Fixnum(r)),
     }

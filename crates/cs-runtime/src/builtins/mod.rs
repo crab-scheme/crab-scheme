@@ -11443,6 +11443,17 @@ fn b_jit_status(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String>
             cs_vm::vm::JIT_RT_BOOLEAN => "boolean",
             cs_vm::vm::JIT_RT_CHARACTER => "character",
             cs_vm::vm::JIT_RT_FLONUM => "flonum",
+            cs_vm::vm::JIT_RT_PAIR => "pair",
+            cs_vm::vm::JIT_RT_VECTOR => "vector",
+            cs_vm::vm::JIT_RT_STRING => "string",
+            cs_vm::vm::JIT_RT_BYTEVECTOR => "bytevector",
+            cs_vm::vm::JIT_RT_PROCEDURE => "procedure",
+            cs_vm::vm::JIT_RT_SYMBOL => "symbol",
+            cs_vm::vm::JIT_RT_BIGINT => "bigint",
+            cs_vm::vm::JIT_RT_RATIONAL => "rational",
+            cs_vm::vm::JIT_RT_HASHTABLE => "hashtable",
+            cs_vm::vm::JIT_RT_PORT => "port",
+            cs_vm::vm::JIT_RT_ANY => "any",
             _ => "fixnum",
         };
         Value::Symbol(syms.intern(name))

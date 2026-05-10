@@ -236,6 +236,14 @@ pub enum Inst {
     /// `exact->inexact`.
     FixToFlo(Value, Value),
 
+    /// `dst = cons(car, cdr)` — heap-allocate a Pair via the
+    /// `vm_alloc_pair` runtime helper. The two `u8` fields are the
+    /// per-operand JIT_RT_* tags, embedded at translate time so the
+    /// lowerer can pass them through to the helper without consulting
+    /// per-Value type tables. dst is tagged as `Type::Any` (the i64
+    /// carries `Box::into_raw(Box<Value::Pair(_)>)`).
+    Cons(Value, Value, u8, Value, u8),
+
     /// Type guard: if the value's runtime type doesn't match the
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
     /// always dispatches dynamically).
