@@ -1069,6 +1069,125 @@ fn diff_jit_cons_pair_return() {
 }
 
 #[test]
+fn diff_jit_recursive_length() {
+    // M6 Phase 4 iter AY: recursive list traversal. `length` takes
+    // an Any param, recurses through cdr, accumulates a Fixnum
+    // count via (+ 1 (length (cdr lst))). Exercises CallSelf with
+    // Any args, AnyToFix on the recursive return value (which is
+    // already Fixnum-typed since the function returns Fixnum), and
+    // the AnyClone/AnyDrop machinery for the multi-use lst param.
+    let defines = &["(define (length lst) \
+           (if (null? lst) 0 (+ 1 (length (cdr lst)))))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    // Warm with a 4-element list, repeated to push past the
+    // tier-up threshold.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+         (if (= i 1500) 'done \
+             (begin (length (cons 1 (cons 2 (cons 3 (cons 4 (quote ())))))) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    // Sanity-check that the body actually dispatched through native
+    // code rather than silently falling back to bytecode (a translator
+    // refusal would still produce correct results — we want to know
+    // the iter actually exercises the JIT path).
+    cs_vm::vm::reset_jit_call_count();
+    let _ = rt
+        .eval_str_via_vm("<diff>", "(length (cons 1 (cons 2 (quote ()))))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after > 0,
+        "length never dispatched through the JIT (count = {})",
+        after
+    );
+
+    let cases: &[(&str, i64)] = &[
+        ("(length (quote ()))", 0),
+        ("(length (cons 1 (quote ())))", 1),
+        (
+            "(length (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 (quote ())))))))",
+            5,
+        ),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Fixnum(j)),
+                Value::Number(cs_core::Number::Fixnum(w)),
+            ) => {
+                assert_eq!(j, w, "tier mismatch on {}", expr);
+                assert_eq!(*j, *expected, "wrong value on {}", expr);
+            }
+            other => panic!("expected fixnums on {}, got {:?}", expr, other),
+        }
+    }
+}
+
+#[test]
+fn diff_jit_recursive_sum_list() {
+    // M6 Phase 4 iter AY: companion to diff_jit_recursive_length
+    // exercising AnyToFix on the (car lst) operand of `+`. The body
+    // is `(if (null? lst) 0 (+ (car lst) (sum-list (cdr lst))))`.
+    // Iter AX's unbox_any_to_fix gates on Any types, so this iter
+    // confirms the integration with CallSelf-with-Any-args does not
+    // disturb the Fixnum-typed return inference.
+    let defines = &["(define (sum-list lst) \
+           (if (null? lst) 0 (+ (car lst) (sum-list (cdr lst)))))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+         (if (= i 1500) 'done \
+             (begin (sum-list (cons 1 (cons 2 (cons 3 (quote ()))))) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    cs_vm::vm::reset_jit_call_count();
+    let _ = rt
+        .eval_str_via_vm("<diff>", "(sum-list (cons 1 (cons 2 (quote ()))))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after > 0,
+        "sum-list never dispatched through the JIT (count = {})",
+        after
+    );
+
+    let cases: &[(&str, i64)] = &[
+        ("(sum-list (quote ()))", 0),
+        ("(sum-list (cons 7 (quote ())))", 7),
+        (
+            "(sum-list (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 (quote ())))))))",
+            15,
+        ),
+        ("(sum-list (cons 100 (cons -50 (cons 25 (quote ())))))", 75),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Fixnum(j)),
+                Value::Number(cs_core::Number::Fixnum(w)),
+            ) => {
+                assert_eq!(j, w, "tier mismatch on {}", expr);
+                assert_eq!(*j, *expected, "wrong value on {}", expr);
+            }
+            other => panic!("expected fixnums on {}, got {:?}", expr, other),
+        }
+    }
+}
+
+#[test]
 fn diff_jit_arith_on_any_operand() {
     // M6 Phase 4 iter AX: arithmetic on Any operands. `(car v)`
     // returns an Any-tagged Box; `(+ (car v) 1)` needs raw Fixnum
