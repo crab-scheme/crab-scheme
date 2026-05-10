@@ -69,7 +69,20 @@ pub fn compile_with_globals_and_primops(
 ) -> Result<Bytecode, CompileError> {
     let mut buf = InstBuf::new();
     let mut lambdas: Vec<CompiledLambda> = Vec::new();
+    // Names that are mutated anywhere in the program — top-level
+    // `define` lowers to `CoreExpr::Set`, as does `set!`. Treat them
+    // as a synthetic scope so the global-fold optimization in
+    // compile_expr's `Ref` arm sees them as locally bound and emits
+    // `Inst::LoadVar` instead of folding the captured-at-snapshot
+    // global value. Without this guard, `(define count 0) (+ count
+    // 1)` mistakenly folds `count` to the builtin procedure of the
+    // same name.
     let mut scope: Vec<HashSet<Symbol>> = Vec::new();
+    let mut assigned: HashSet<Symbol> = HashSet::new();
+    collect_assigned_names(expr, &mut assigned);
+    if !assigned.is_empty() {
+        scope.push(assigned);
+    }
     compile_expr(
         expr,
         &mut buf,
@@ -85,6 +98,48 @@ pub fn compile_with_globals_and_primops(
         spans: Rc::new(spans),
         lambdas: Rc::new(lambdas),
     })
+}
+
+/// Walk `expr` and add every `Set { name, .. }` target to `out`.
+/// Used to suppress the global-fold optimization for any name the
+/// program rebinds (top-level `define` lowers to Set in expand).
+fn collect_assigned_names(expr: &CoreExpr, out: &mut HashSet<Symbol>) {
+    match expr {
+        CoreExpr::Const { .. } | CoreExpr::Ref { .. } => {}
+        CoreExpr::Set { name, value, .. } => {
+            out.insert(*name);
+            collect_assigned_names(value, out);
+        }
+        CoreExpr::Lambda { body, .. } => collect_assigned_names(body, out),
+        CoreExpr::App { func, args, .. } => {
+            collect_assigned_names(func, out);
+            for a in args {
+                collect_assigned_names(a, out);
+            }
+        }
+        CoreExpr::If {
+            cond, then, alt, ..
+        } => {
+            collect_assigned_names(cond, out);
+            collect_assigned_names(then, out);
+            collect_assigned_names(alt, out);
+        }
+        CoreExpr::Begin { exprs, .. } => {
+            for e in exprs {
+                collect_assigned_names(e, out);
+            }
+        }
+        CoreExpr::Letrec { bindings, body, .. } => {
+            // letrec bindings ARE locally bound, not free globals,
+            // so they're already excluded from the fold by the
+            // letrec scope push. We still walk the binding values
+            // and body to find any nested Sets.
+            for (_, v) in bindings {
+                collect_assigned_names(v, out);
+            }
+            collect_assigned_names(body, out);
+        }
+    }
 }
 
 /// Buffered output of compile: parallel insts + spans Vecs that grow

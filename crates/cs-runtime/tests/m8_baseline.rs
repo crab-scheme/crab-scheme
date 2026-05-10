@@ -107,13 +107,11 @@ fn m8_reinvocation_after_extent_walker() {
     }
 }
 
-// VM-tier multi-invocation: blocked on a pre-existing unrelated VM
-// bug with multi-form programs of the shape `(define x 0) (set! x
-// (+ x 1)) ...` — the `+` site sees `x` as a procedure rather than
-// a number. Filed as a separate iter; reinstate this test once the
-// VM compiler's name-resolution issue is fixed.
+/// VM-tier multi-invocation. Each invocation of the saved
+/// continuation re-runs the captured context (which carries
+/// fresh-cloned frames + value stack on every restore, so the
+/// snapshot is reusable).
 #[test]
-#[ignore = "blocked on pre-existing VM multi-form (+ count 1) bug — separate iter"]
 fn m8_multiple_invocations_vm() {
     let mut rt = Runtime::new();
     let r = rt
