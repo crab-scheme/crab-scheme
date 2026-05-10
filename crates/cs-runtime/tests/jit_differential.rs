@@ -784,3 +784,53 @@ fn diff_flonum_rounding_ops() {
         }
     }
 }
+
+#[test]
+fn diff_jit_recompile_on_arg_type_change() {
+    // M6 Phase 2 iter AH: feedback-driven recompile. A closure first
+    // tier-up'd with one arg-type signature (e.g. all Fixnum) gets
+    // a JIT body baked in. Calls with mismatching types previously
+    // fell through to bytecode forever; this iter bumps a per-
+    // closure deopt counter and clears the JIT pointer once it
+    // crosses JIT_DEOPT_RECOMPILE_THRESHOLD, so the next call's
+    // tier-up hook compiles fresh against the new arg shape.
+    let defines = &["(define sqr (lambda (n) (* n n)))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+
+    // Phase 1: warm with FIXNUM args. JIT'd with Fixnum signature.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (sqr i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    let fix_jit = rt.eval_str_via_vm("<diff>", "(sqr 7)").unwrap();
+    let fix_walker = walker_eval(defines, "(sqr 7)");
+    assert_eq!(format!("{:?}", fix_jit), format!("{:?}", fix_walker));
+
+    // Phase 2: hammer with FLONUM args. The first ~256 calls miss
+    // the type-guard and run on bytecode. After the threshold
+    // crosses, jit_ptr clears + tier counter primes for re-JIT.
+    // Subsequent flonum calls trigger the new compile.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (sqr 2.5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    // After recompile, flonum calls should produce a flonum result.
+    let flo_jit = rt.eval_str_via_vm("<diff>", "(sqr 3.5)").unwrap();
+    let flo_walker = walker_eval(defines, "(sqr 3.5)");
+    match (&flo_jit, &flo_walker) {
+        (
+            Value::Number(cs_core::Number::Flonum(j)),
+            Value::Number(cs_core::Number::Flonum(w)),
+        ) => {
+            assert_eq!(j.to_bits(), w.to_bits());
+            assert_eq!(*j, 12.25);
+        }
+        other => panic!("expected flonums, got {:?}", other),
+    }
+}

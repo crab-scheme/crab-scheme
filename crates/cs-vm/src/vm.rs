@@ -312,7 +312,19 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
             }
             (JIT_RT_BOOLEAN, Value::Boolean(b)) => argv[i] = if *b { 1 } else { 0 },
             (JIT_RT_CHARACTER, Value::Character(c)) => argv[i] = *c as u32 as i64,
-            _ => return None,
+            _ => {
+                // Type-guard miss: the JIT body's signature doesn't
+                // match this call's arg shapes. Bump the per-closure
+                // deopt counter; if it crosses the recompile
+                // threshold, drop the JIT pointer so the next
+                // call's tier-up hook recompiles with fresh type
+                // feedback. (Iter AH — feedback-driven recompile.)
+                let n = closure.bump_jit_deopt();
+                if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
+                    closure.clear_jit_for_recompile();
+                }
+                return None;
+            }
         }
     }
     bump_jit_call_count();
@@ -553,7 +565,23 @@ pub struct VmClosure {
     /// against the matching nibble before transmuting to the
     /// `extern "C"` function pointer.
     jit_param_types: Cell<u32>,
+    /// Per-closure type-guard miss counter. Incremented by
+    /// `try_dispatch_jit` whenever an arg fails the stored
+    /// signature. When the count exceeds [`JIT_DEOPT_RECOMPILE_THRESHOLD`]
+    /// the dispatch site fires the tier-up hook again with the
+    /// current args; the hook clears `jit_ptr`, recompiles with
+    /// fresh signature, and the next call retries against the
+    /// new layout. (Item 12 of the JIT roadmap — feedback-driven
+    /// recompile.)
+    jit_deopt_count: Cell<u32>,
 }
+
+/// How many type-guard misses a closure tolerates before the
+/// dispatch site re-fires the tier-up hook for recompilation.
+/// Set conservatively — a single mistyped warming call shouldn't
+/// trigger a wholesale recompile, but a closure that's
+/// consistently called with different types should adapt.
+pub const JIT_DEOPT_RECOMPILE_THRESHOLD: u32 = 256;
 
 /// Encodings for [`VmClosure::jit_return_type`] and the per-nibble
 /// slots in `jit_param_types`. Kept as plain `u8` so storage stays
@@ -603,6 +631,31 @@ impl VmClosure {
 
     pub fn jit_param_types(&self) -> u32 {
         self.jit_param_types.get()
+    }
+
+    /// Bump the deopt counter; returns the new value. Called from
+    /// the dispatch path each time `try_dispatch_jit` rejects on a
+    /// type-guard mismatch.
+    pub fn bump_jit_deopt(&self) -> u32 {
+        let n = self.jit_deopt_count.get().saturating_add(1);
+        self.jit_deopt_count.set(n);
+        n
+    }
+
+    pub fn jit_deopt_count(&self) -> u32 {
+        self.jit_deopt_count.get()
+    }
+
+    /// Clear the JIT pointer + deopt counter so the next call's
+    /// tier-up hook recompiles with fresh type feedback. The
+    /// closure stays alive; only the cached native function
+    /// pointer is dropped. Tier counter is primed to threshold-1
+    /// via `Tier::reset_for_recompile` so the very next call
+    /// re-fires the hook.
+    pub fn clear_jit_for_recompile(&self) {
+        self.jit_ptr.set(std::ptr::null());
+        self.jit_deopt_count.set(0);
+        self.tier.reset_for_recompile();
     }
 
     /// Currently-installed JIT pointer, if any. `None` until the
@@ -2551,6 +2604,7 @@ fn run_dispatch(
                     self_name: Cell::new(None),
                     jit_return_type: Cell::new(JIT_RT_FIXNUM),
                     jit_param_types: Cell::new(JIT_PARAM_TYPES_ALL_FIXNUM),
+                    jit_deopt_count: Cell::new(0),
                 };
                 let p: Rc<dyn Procedure> = Rc::new(cl);
                 stack.push(Value::Procedure(p));

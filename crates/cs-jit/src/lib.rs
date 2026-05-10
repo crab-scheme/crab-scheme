@@ -72,6 +72,17 @@ impl Tier {
         prev + 1 >= MAX_DEOPT_RETRIES
     }
 
+    /// Reset the call counter to 0 and bump the deopt budget. Used
+    /// by feedback-driven recompile: the next call after this will
+    /// re-fire the tier-up hook (which can pick up the new arg-type
+    /// signature). Bumps `deopt_count` as one of the
+    /// `MAX_DEOPT_RETRIES` retry budget so a pathological program
+    /// can't re-trigger forever.
+    pub fn reset_for_recompile(&self) {
+        self.counter.store(self.threshold - 1, Ordering::Relaxed);
+        self.deopt_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Current call count.
     pub fn count(&self) -> u32 {
         self.counter.load(Ordering::Relaxed)
