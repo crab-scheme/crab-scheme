@@ -362,14 +362,55 @@ fn value_to_any_i64(v: Value) -> i64 {
     Box::into_raw(Box::new(v)) as i64
 }
 
+thread_local! {
+    /// Pointer to the active `Heap` for the current thread, used by
+    /// JIT runtime helpers when allocating Gc<Value> handles. Set by
+    /// `cs_runtime::Runtime::with_active` (iter BP) so JIT-allocated
+    /// Pairs etc. participate in tracing GC. Null when no Heap is
+    /// installed — helpers fall back to unregistered `Gc::new`.
+    /// ADR 0012 D-2 (iter BO).
+    static JIT_ACTIVE_HEAP: Cell<*const cs_gc::Heap> = const { Cell::new(std::ptr::null()) };
+}
+
+/// Install a `Heap` pointer for use by JIT runtime helpers on the
+/// current thread. Pair with `clear_jit_active_heap` (or another
+/// `set_jit_active_heap`) to restore. Pointer must remain valid
+/// until cleared.
+///
+/// # Safety
+///
+/// `heap` must outlive the next call to `clear_jit_active_heap` and
+/// must point at a live `Heap`. Typical pattern: stash inside a
+/// guard struct whose Drop calls `clear_jit_active_heap`.
+pub unsafe fn set_jit_active_heap(heap: *const cs_gc::Heap) {
+    JIT_ACTIVE_HEAP.with(|c| c.set(heap));
+}
+
+/// Clear the active Heap pointer.
+pub fn clear_jit_active_heap() {
+    JIT_ACTIVE_HEAP.with(|c| c.set(std::ptr::null()));
+}
+
 /// Encode a `Value` into a Gc-backed raw handle carried as a single
 /// i64 word. Companion to `value_to_any_i64` for the JIT_RT_GC ABI
-/// per ADR 0012 D-2. The Gc handle is unregistered with any specific
-/// `Heap` for now (per cs-gc's `Gc::new`) — a follow-up iter will
-/// route through `Heap::alloc` so the tracing GC sees the
-/// allocation.
+/// per ADR 0012 D-2.
+///
+/// If a `Heap` is installed on this thread via `set_jit_active_heap`,
+/// the allocation routes through `Heap::alloc` so the tracing GC
+/// sees the slot. Otherwise falls back to unregistered `Gc::new`
+/// (refcount-only — cycles can leak but values stay alive).
 fn value_to_gc_i64(v: Value) -> i64 {
-    cs_gc::Gc::into_raw_jit(cs_gc::Gc::new(v)) as i64
+    let g = JIT_ACTIVE_HEAP.with(|c| {
+        let ptr = c.get();
+        if ptr.is_null() {
+            cs_gc::Gc::new(v)
+        } else {
+            // SAFETY: caller of set_jit_active_heap guaranteed the
+            // pointer is live until clear/replace.
+            unsafe { (*ptr).alloc(v) }
+        }
+    });
+    cs_gc::Gc::into_raw_jit(g) as i64
 }
 
 /// Decode a Gc-backed raw handle from an i64. Consumes one strong
@@ -5713,6 +5754,31 @@ mod gc_helper_tests_extra {
             1
         );
         assert_eq!(unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Null)) }, 1);
+    }
+
+    #[test]
+    fn value_to_gc_i64_uses_active_heap_when_set() {
+        // With no Heap installed, the allocation is via Gc::new
+        // (unregistered). The Heap's alloc_count stays at 0.
+        let h = cs_gc::Heap::new();
+        let before = h.alloc_count();
+        let _ = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(1)));
+        assert_eq!(
+            h.alloc_count(),
+            before,
+            "no Heap installed; alloc_count should not move"
+        );
+
+        // Install the Heap; subsequent allocations are tracked.
+        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
+        let _ = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(2)));
+        let _ = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(3)));
+        clear_jit_active_heap();
+        assert_eq!(
+            h.alloc_count(),
+            before + 2,
+            "two allocations through the Heap should bump alloc_count by 2"
+        );
     }
 
     #[test]
