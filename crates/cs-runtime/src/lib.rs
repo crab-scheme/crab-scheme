@@ -446,6 +446,35 @@ impl Runtime {
                 Ok(Value::Unspecified)
             }),
         );
+        // SRFI-1 `split-at` — pure data shuffle returning 2 values.
+        // Walker version uses ctx.pending_values; VM mirrors via the
+        // VM's pending-values thread-local.
+        let split_at_sym = syms.intern("split-at");
+        vm_env.define(
+            split_at_sym,
+            cs_vm::vm::make_vm_builtin("split-at", |args| {
+                if args.len() != 2 {
+                    return Err("split-at: 2 args".into());
+                }
+                let n = builtins::as_int_i64_pub("split-at", &args[1])?;
+                if n < 0 {
+                    return Err("split-at: negative count".into());
+                }
+                let n = n as usize;
+                let items = builtins::collect_proper_list_pub("split-at", &args[0])?;
+                if n > items.len() {
+                    return Err(format!(
+                        "split-at: count {} exceeds list length {}",
+                        n,
+                        items.len()
+                    ));
+                }
+                let head: Vec<Value> = items[..n].to_vec();
+                let tail: Vec<Value> = items[n..].to_vec();
+                cs_vm::vm::vm_set_pending_values(vec![Value::list(head), Value::list(tail)]);
+                Ok(Value::Unspecified)
+            }),
+        );
         // VM-tier shims for assoc / member. The 3-arg form needs to
         // apply a user-supplied comparison procedure, so the impl uses
         // vm_call_sync. The 2-arg form falls back to the same eq /

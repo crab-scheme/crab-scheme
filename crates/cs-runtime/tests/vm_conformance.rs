@@ -420,6 +420,14 @@ fn vm_conformance_r6rs_misc() {
 }
 
 #[test]
+fn vm_conformance_srfi1_more() {
+    let walker = pass_count_walker("srfi1_more.scm");
+    let vm = pass_count_vm("srfi1_more.scm").expect("vm should run srfi1_more.scm");
+    println!("srfi1_more: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
+
+#[test]
 fn vm_conformance_define_condition_type() {
     let walker = pass_count_walker("define_condition_type.scm");
     let vm = pass_count_vm("define_condition_type.scm")

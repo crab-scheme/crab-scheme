@@ -658,6 +658,20 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("first", b_first),
         ("second", b_second),
         ("third", b_third),
+        ("fourth", b_fourth),
+        ("fifth", b_fifth),
+        ("sixth", b_sixth),
+        ("seventh", b_seventh),
+        ("eighth", b_eighth),
+        ("ninth", b_ninth),
+        ("tenth", b_tenth),
+        ("not-pair?", b_not_pair_p),
+        ("null-list?", b_null_list_p),
+        ("proper-list?", b_proper_list_p),
+        ("dotted-list?", b_dotted_list_p),
+        ("circular-list?", b_circular_list_p),
+        ("append-reverse", b_append_reverse),
+        ("reverse!", b_reverse_bang),
         // hashtable conversions
         ("hashtable->alist", b_hashtable_to_alist),
         ("alist->hashtable", b_alist_to_hashtable),
@@ -712,6 +726,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("drop-while", b_drop_while),
         ("span", b_span),
         ("break", b_break),
+        ("split-at", b_split_at),
         ("list-index", b_list_index),
         ("filter-map", b_filter_map),
         ("append-map", b_append_map),
@@ -929,6 +944,10 @@ fn as_num(name: &str, v: &Value) -> Result<Number, String> {
         Value::Number(n) => Ok(n.clone()),
         _ => Err(type_err(name, "number", v)),
     }
+}
+
+pub fn as_int_i64_pub(name: &str, v: &Value) -> Result<i64, String> {
+    as_int_i64(name, v)
 }
 
 fn as_int_i64(name: &str, v: &Value) -> Result<i64, String> {
@@ -2977,6 +2996,10 @@ fn b_for_each(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
     }
     Ok(Value::Unspecified)
+}
+
+pub fn collect_proper_list_pub(name: &str, v: &Value) -> Result<Vec<Value>, String> {
+    collect_proper_list(name, v)
 }
 
 fn collect_proper_list(name: &str, v: &Value) -> Result<Vec<Value>, String> {
@@ -9362,6 +9385,194 @@ fn b_third(args: &[Value]) -> Result<Value, String> {
         .get(2)
         .cloned()
         .ok_or_else(|| "third: list has fewer than 3 elements".into())
+}
+
+/// SRFI-1 nth-element selectors for n=4..10.
+fn list_nth(name: &str, args: &[Value], n: usize) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err(name, "1", args.len()));
+    }
+    let items = collect_proper_list(name, &args[0])?;
+    items
+        .get(n - 1)
+        .cloned()
+        .ok_or_else(|| format!("{}: list has fewer than {} elements", name, n))
+}
+
+fn b_fourth(args: &[Value]) -> Result<Value, String> {
+    list_nth("fourth", args, 4)
+}
+fn b_fifth(args: &[Value]) -> Result<Value, String> {
+    list_nth("fifth", args, 5)
+}
+fn b_sixth(args: &[Value]) -> Result<Value, String> {
+    list_nth("sixth", args, 6)
+}
+fn b_seventh(args: &[Value]) -> Result<Value, String> {
+    list_nth("seventh", args, 7)
+}
+fn b_eighth(args: &[Value]) -> Result<Value, String> {
+    list_nth("eighth", args, 8)
+}
+fn b_ninth(args: &[Value]) -> Result<Value, String> {
+    list_nth("ninth", args, 9)
+}
+fn b_tenth(args: &[Value]) -> Result<Value, String> {
+    list_nth("tenth", args, 10)
+}
+
+/// SRFI-1 type predicates. We intentionally don't construct cyclic
+/// lists from foundation Scheme, so the cycle predicates resolve via
+/// a tortoise-and-hare walk; circular lists built via set-cdr! show
+/// up correctly.
+fn b_not_pair_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("not-pair?", "1", args.len()));
+    }
+    Ok(Value::Boolean(!matches!(&args[0], Value::Pair(_))))
+}
+
+fn b_null_list_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("null-list?", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Boolean(true)),
+        Value::Pair(_) => Ok(Value::Boolean(false)),
+        _ => Err("null-list?: argument is neither a pair nor empty list".into()),
+    }
+}
+
+/// Walk-once detection via tortoise/hare. Returns
+///   None — non-list (improper terminator)
+///   Some(true) — proper finite
+///   Some(false) — circular
+fn list_classify(v: &Value) -> Option<bool> {
+    let mut slow = v.clone();
+    let mut fast = v.clone();
+    loop {
+        match fast {
+            Value::Null => return Some(true),
+            Value::Pair(p) => {
+                let next = p.cdr.borrow().clone();
+                match next {
+                    Value::Null => return Some(true),
+                    Value::Pair(p2) => {
+                        let next2 = p2.cdr.borrow().clone();
+                        // advance slow once.
+                        slow = match slow {
+                            Value::Pair(sp) => sp.cdr.borrow().clone(),
+                            _ => return Some(true),
+                        };
+                        fast = next2;
+                        if values_eq_ptr(&slow, &fast) {
+                            return Some(false);
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn values_eq_ptr(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Pair(p1), Value::Pair(p2)) => cs_core::Gc::ptr_eq(p1, p2),
+        _ => false,
+    }
+}
+
+fn b_proper_list_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("proper-list?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(
+        list_classify(&args[0]),
+        Some(true)
+    )))
+}
+
+fn b_dotted_list_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("dotted-list?", "1", args.len()));
+    }
+    // A non-pair, non-null is dotted (degenerate). A proper finite
+    // list is NOT dotted. A circular list is NOT dotted.
+    let cls = list_classify(&args[0]);
+    let is_dotted = match (&args[0], cls) {
+        (Value::Null, _) => false,
+        (Value::Pair(_), Some(true)) => false,
+        (Value::Pair(_), Some(false)) => false,
+        (Value::Pair(_), None) => true,
+        _ => true,
+    };
+    Ok(Value::Boolean(is_dotted))
+}
+
+fn b_circular_list_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("circular-list?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(
+        list_classify(&args[0]),
+        Some(false)
+    )))
+}
+
+/// SRFI-1 `(append-reverse rev tail)` — same as `(append (reverse rev) tail)`
+/// without building the intermediate. We delegate to that simple form.
+fn b_append_reverse(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("append-reverse", "2", args.len()));
+    }
+    let rev = collect_proper_list("append-reverse", &args[0])?;
+    let mut acc = args[1].clone();
+    for item in rev {
+        acc = Value::Pair(Pair::new(item, acc));
+    }
+    Ok(acc)
+}
+
+/// SRFI-1 `(reverse! list)` — destructive reverse. Foundation: just
+/// dispatch to the immutable `reverse`. Treating the destructive form
+/// as a hint (R7RS recommends pure semantics) is safe — callers that
+/// actually need in-place mutation are vanishingly rare in idiomatic
+/// Scheme and would be surprising in our shared-ref model.
+fn b_reverse_bang(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("reverse!", "1", args.len()));
+    }
+    let items = collect_proper_list("reverse!", &args[0])?;
+    let mut out: Vec<Value> = items;
+    out.reverse();
+    Ok(Value::list(out))
+}
+
+/// SRFI-1 `(split-at list k)` — return two values: the first k items
+/// and the rest. Uses pending_values like other multi-value builtins.
+fn b_split_at(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("split-at", "2", args.len()));
+    }
+    let n = as_int_i64("split-at", &args[1])?;
+    if n < 0 {
+        return Err("split-at: negative count".into());
+    }
+    let n = n as usize;
+    let items = collect_proper_list("split-at", &args[0])?;
+    if n > items.len() {
+        return Err(format!(
+            "split-at: count {} exceeds list length {}",
+            n,
+            items.len()
+        ));
+    }
+    let head: Vec<Value> = items[..n].to_vec();
+    let tail: Vec<Value> = items[n..].to_vec();
+    ctx.pending_values = Some(vec![Value::list(head), Value::list(tail)]);
+    Ok(Value::Unspecified)
 }
 
 // ---- hashtable conversions ----
