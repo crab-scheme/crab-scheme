@@ -561,6 +561,36 @@ pub fn bytecode_to_rir(
                                         insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
                                         insts.push(RirInst::Eq(dst, args[0], zero));
                                     }
+                                    // Always-true predicates: when the
+                                    // arg is a Fixnum (which it always
+                                    // is in our i64 ABI), every numeric
+                                    // type predicate matches. The JIT
+                                    // emits Const(1) and ignores the
+                                    // arg — the upstream load of `args[0]`
+                                    // is preserved by SSA but unused;
+                                    // Cranelift's DCE removes it.
+                                    ("number?", 1)
+                                    | ("integer?", 1)
+                                    | ("rational?", 1)
+                                    | ("real?", 1)
+                                    | ("exact?", 1)
+                                    | ("exact-integer?", 1)
+                                    | ("exact-rational?", 1)
+                                    | ("exact-real?", 1)
+                                    | ("fixnum?", 1) => {
+                                        let _ = args[0]; // load preserved for SSA correctness
+                                        insts.push(RirInst::LoadConst(dst, Const::Fixnum(1)));
+                                    }
+                                    ("inexact?", 1)
+                                    | ("flonum?", 1)
+                                    | ("nan?", 1)
+                                    | ("infinite?", 1) => {
+                                        // Always-false predicates: arg
+                                        // is a Fixnum, which is exact /
+                                        // not a flonum / not NaN / finite.
+                                        let _ = args[0];
+                                        insts.push(RirInst::LoadConst(dst, Const::Fixnum(0)));
+                                    }
                                     _ => {
                                         return Err(TranslateError::Unsupported(format!(
                                             "Call to builtin `{name}` (arity {}) not yet lowered",
