@@ -354,6 +354,80 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("condition-message", b_condition_message),
         ("condition-irritants", b_condition_irritants),
         ("condition-who", b_condition_who),
+        // R6RS §7.2 — &i/o family.
+        ("make-i/o-error", b_make_io_error),
+        ("i/o-error?", b_io_error_p),
+        ("make-i/o-read-error", b_make_io_read_error),
+        ("i/o-read-error?", b_io_read_error_p),
+        ("make-i/o-write-error", b_make_io_write_error),
+        ("i/o-write-error?", b_io_write_error_p),
+        (
+            "make-i/o-invalid-position-error",
+            b_make_io_invalid_position_error,
+        ),
+        ("i/o-invalid-position-error?", b_io_invalid_position_error_p),
+        ("i/o-error-position", b_io_error_position),
+        ("make-i/o-filename-error", b_make_io_filename_error),
+        ("i/o-filename-error?", b_io_filename_error_p),
+        ("i/o-error-filename", b_io_error_filename),
+        (
+            "make-i/o-file-protection-error",
+            b_make_io_file_protection_error,
+        ),
+        ("i/o-file-protection-error?", b_io_file_protection_error_p),
+        (
+            "make-i/o-file-is-read-only-error",
+            b_make_io_file_is_read_only_error,
+        ),
+        (
+            "i/o-file-is-read-only-error?",
+            b_io_file_is_read_only_error_p,
+        ),
+        (
+            "make-i/o-file-already-exists-error",
+            b_make_io_file_already_exists_error,
+        ),
+        (
+            "i/o-file-already-exists-error?",
+            b_io_file_already_exists_error_p,
+        ),
+        (
+            "make-i/o-file-does-not-exist-error",
+            b_make_io_file_does_not_exist_error,
+        ),
+        (
+            "i/o-file-does-not-exist-error?",
+            b_io_file_does_not_exist_error_p,
+        ),
+        ("make-i/o-port-error", b_make_io_port_error),
+        ("i/o-port-error?", b_io_port_error_p),
+        ("i/o-error-port", b_io_error_port),
+        ("make-i/o-decoding-error", b_make_io_decoding_error),
+        ("i/o-decoding-error?", b_io_decoding_error_p),
+        ("make-i/o-encoding-error", b_make_io_encoding_error),
+        ("i/o-encoding-error?", b_io_encoding_error_p),
+        ("i/o-encoding-error-char", b_io_encoding_error_char),
+        // R6RS §7.2 — violation subtypes.
+        ("make-syntax-violation", b_make_syntax_violation),
+        ("syntax-violation?", b_syntax_violation_p),
+        ("syntax-violation-form", b_syntax_violation_form),
+        ("syntax-violation-subform", b_syntax_violation_subform),
+        ("make-undefined-violation", b_make_undefined_violation),
+        ("undefined-violation?", b_undefined_violation_p),
+        ("make-lexical-violation", b_make_lexical_violation),
+        ("lexical-violation?", b_lexical_violation_p),
+        (
+            "make-implementation-restriction-violation",
+            b_make_impl_restriction,
+        ),
+        (
+            "implementation-restriction-violation?",
+            b_impl_restriction_p,
+        ),
+        ("make-no-infinities-violation", b_make_no_infinities),
+        ("no-infinities-violation?", b_no_infinities_p),
+        ("make-no-nans-violation", b_make_no_nans),
+        ("no-nans-violation?", b_no_nans_p),
         // R6RS condition compounding
         ("condition", b_condition),
         ("simple-conditions", b_simple_conditions),
@@ -3665,6 +3739,26 @@ const TAG_CONDITION: &str = "&condition";
 const TAG_FILE_ERROR: &str = "&file-error";
 const TAG_READ_ERROR: &str = "&read-error";
 const TAG_EXIT_REQUESTED: &str = "&exit-requested";
+// R6RS §7.2 — &i/o family.
+const TAG_IO: &str = "&i/o";
+const TAG_IO_READ: &str = "&i/o-read";
+const TAG_IO_WRITE: &str = "&i/o-write";
+const TAG_IO_INVALID_POSITION: &str = "&i/o-invalid-position";
+const TAG_IO_FILENAME: &str = "&i/o-filename";
+const TAG_IO_FILE_PROTECTION: &str = "&i/o-file-protection";
+const TAG_IO_FILE_IS_READ_ONLY: &str = "&i/o-file-is-read-only";
+const TAG_IO_FILE_ALREADY_EXISTS: &str = "&i/o-file-already-exists";
+const TAG_IO_FILE_DOES_NOT_EXIST: &str = "&i/o-file-does-not-exist";
+const TAG_IO_PORT: &str = "&i/o-port";
+const TAG_IO_DECODING: &str = "&i/o-decoding";
+const TAG_IO_ENCODING: &str = "&i/o-encoding";
+// R6RS §7.2 — violation subtypes.
+const TAG_SYNTAX: &str = "&syntax";
+const TAG_UNDEFINED: &str = "&undefined";
+const TAG_LEXICAL: &str = "&lexical";
+const TAG_IMPL_RESTRICTION: &str = "&implementation-restriction";
+const TAG_NO_INFINITIES: &str = "&no-infinities";
+const TAG_NO_NANS: &str = "&no-nans";
 
 thread_local! {
     /// Map from condition tag → its parent tag. Walked by predicates to
@@ -3704,6 +3798,29 @@ pub fn init_condition_registry() {
         m.insert(TAG_FILE_ERROR.into(), TAG_ERROR.into());
         m.insert(TAG_READ_ERROR.into(), TAG_ERROR.into());
         m.insert(TAG_EXIT_REQUESTED.into(), TAG_CONDITION.into());
+        // R6RS §7.2 — &i/o family rooted at &error.
+        m.insert(TAG_IO.into(), TAG_ERROR.into());
+        m.insert(TAG_IO_READ.into(), TAG_IO.into());
+        m.insert(TAG_IO_WRITE.into(), TAG_IO.into());
+        m.insert(TAG_IO_INVALID_POSITION.into(), TAG_IO.into());
+        m.insert(TAG_IO_FILENAME.into(), TAG_IO.into());
+        m.insert(TAG_IO_FILE_PROTECTION.into(), TAG_IO_FILENAME.into());
+        m.insert(
+            TAG_IO_FILE_IS_READ_ONLY.into(),
+            TAG_IO_FILE_PROTECTION.into(),
+        );
+        m.insert(TAG_IO_FILE_ALREADY_EXISTS.into(), TAG_IO_FILENAME.into());
+        m.insert(TAG_IO_FILE_DOES_NOT_EXIST.into(), TAG_IO_FILENAME.into());
+        m.insert(TAG_IO_PORT.into(), TAG_IO.into());
+        m.insert(TAG_IO_DECODING.into(), TAG_IO_PORT.into());
+        m.insert(TAG_IO_ENCODING.into(), TAG_IO_PORT.into());
+        // R6RS §7.2 — violation subtypes rooted at &violation.
+        m.insert(TAG_SYNTAX.into(), TAG_VIOLATION.into());
+        m.insert(TAG_UNDEFINED.into(), TAG_VIOLATION.into());
+        m.insert(TAG_LEXICAL.into(), TAG_VIOLATION.into());
+        m.insert(TAG_IMPL_RESTRICTION.into(), TAG_VIOLATION.into());
+        m.insert(TAG_NO_INFINITIES.into(), TAG_IMPL_RESTRICTION.into());
+        m.insert(TAG_NO_NANS.into(), TAG_IMPL_RESTRICTION.into());
     });
     COND_KNOWN_TAGS.with(|reg| {
         let mut s = reg.borrow_mut();
@@ -3722,6 +3839,24 @@ pub fn init_condition_registry() {
             TAG_FILE_ERROR,
             TAG_READ_ERROR,
             TAG_EXIT_REQUESTED,
+            TAG_IO,
+            TAG_IO_READ,
+            TAG_IO_WRITE,
+            TAG_IO_INVALID_POSITION,
+            TAG_IO_FILENAME,
+            TAG_IO_FILE_PROTECTION,
+            TAG_IO_FILE_IS_READ_ONLY,
+            TAG_IO_FILE_ALREADY_EXISTS,
+            TAG_IO_FILE_DOES_NOT_EXIST,
+            TAG_IO_PORT,
+            TAG_IO_DECODING,
+            TAG_IO_ENCODING,
+            TAG_SYNTAX,
+            TAG_UNDEFINED,
+            TAG_LEXICAL,
+            TAG_IMPL_RESTRICTION,
+            TAG_NO_INFINITIES,
+            TAG_NO_NANS,
         ] {
             s.insert(t.into());
         }
@@ -4021,6 +4156,223 @@ fn b_who_condition_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("who-condition?", "1", args.len()));
     }
     Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_WHO)))
+}
+
+// ---- R6RS §7.2 condition subtype constructors / predicates ----
+
+// Field-less condition makers. R6RS §7.2 specifies these as 0-arg
+// constructors that build a compound containing one simple of the
+// matching tag.
+macro_rules! field_less_cond {
+    ($maker:ident, $pred:ident, $tag:ident, $name:literal) => {
+        fn $maker(args: &[Value]) -> Result<Value, String> {
+            if !args.is_empty() {
+                return Err(arity_err(concat!("make-", $name), "0", args.len()));
+            }
+            Ok(make_compound(vec![make_simple($tag, vec![])]))
+        }
+        fn $pred(args: &[Value]) -> Result<Value, String> {
+            if args.len() != 1 {
+                return Err(arity_err(concat!($name, "?"), "1", args.len()));
+            }
+            Ok(Value::Boolean(cond_has_subtype(&args[0], $tag)))
+        }
+    };
+}
+
+field_less_cond!(b_make_io_error, b_io_error_p, TAG_IO, "i/o-error");
+field_less_cond!(
+    b_make_io_read_error,
+    b_io_read_error_p,
+    TAG_IO_READ,
+    "i/o-read-error"
+);
+field_less_cond!(
+    b_make_io_write_error,
+    b_io_write_error_p,
+    TAG_IO_WRITE,
+    "i/o-write-error"
+);
+field_less_cond!(
+    b_make_io_file_protection_error,
+    b_io_file_protection_error_p,
+    TAG_IO_FILE_PROTECTION,
+    "i/o-file-protection-error"
+);
+field_less_cond!(
+    b_make_io_file_is_read_only_error,
+    b_io_file_is_read_only_error_p,
+    TAG_IO_FILE_IS_READ_ONLY,
+    "i/o-file-is-read-only-error"
+);
+field_less_cond!(
+    b_make_io_file_already_exists_error,
+    b_io_file_already_exists_error_p,
+    TAG_IO_FILE_ALREADY_EXISTS,
+    "i/o-file-already-exists-error"
+);
+field_less_cond!(
+    b_make_io_file_does_not_exist_error,
+    b_io_file_does_not_exist_error_p,
+    TAG_IO_FILE_DOES_NOT_EXIST,
+    "i/o-file-does-not-exist-error"
+);
+field_less_cond!(
+    b_make_io_decoding_error,
+    b_io_decoding_error_p,
+    TAG_IO_DECODING,
+    "i/o-decoding-error"
+);
+field_less_cond!(
+    b_make_undefined_violation,
+    b_undefined_violation_p,
+    TAG_UNDEFINED,
+    "undefined-violation"
+);
+field_less_cond!(
+    b_make_lexical_violation,
+    b_lexical_violation_p,
+    TAG_LEXICAL,
+    "lexical-violation"
+);
+field_less_cond!(
+    b_make_impl_restriction,
+    b_impl_restriction_p,
+    TAG_IMPL_RESTRICTION,
+    "implementation-restriction-violation"
+);
+field_less_cond!(
+    b_make_no_infinities,
+    b_no_infinities_p,
+    TAG_NO_INFINITIES,
+    "no-infinities-violation"
+);
+field_less_cond!(
+    b_make_no_nans,
+    b_no_nans_p,
+    TAG_NO_NANS,
+    "no-nans-violation"
+);
+
+// Single-field condition makers. R6RS §7.2: each takes one value
+// stored in the simple alongside the tag.
+macro_rules! one_field_cond {
+    ($maker:ident, $pred:ident, $accessor:ident, $tag:ident, $maker_name:literal, $pred_name:literal, $accessor_name:literal) => {
+        fn $maker(args: &[Value]) -> Result<Value, String> {
+            if args.len() != 1 {
+                return Err(arity_err($maker_name, "1", args.len()));
+            }
+            Ok(make_compound(vec![make_simple(
+                $tag,
+                vec![args[0].clone()],
+            )]))
+        }
+        fn $pred(args: &[Value]) -> Result<Value, String> {
+            if args.len() != 1 {
+                return Err(arity_err($pred_name, "1", args.len()));
+            }
+            Ok(Value::Boolean(cond_has_subtype(&args[0], $tag)))
+        }
+        fn $accessor(args: &[Value]) -> Result<Value, String> {
+            if args.len() != 1 {
+                return Err(arity_err($accessor_name, "1", args.len()));
+            }
+            let simple = find_simple_with_tag(&args[0], $tag)
+                .ok_or_else(|| format!("{}: not the matching condition type", $accessor_name))?;
+            if let Value::Vector(vc) = simple {
+                let v = vc.borrow();
+                if v.len() >= 2 {
+                    return Ok(v[1].clone());
+                }
+            }
+            Err(format!("{}: malformed", $accessor_name))
+        }
+    };
+}
+
+one_field_cond!(
+    b_make_io_invalid_position_error,
+    b_io_invalid_position_error_p,
+    b_io_error_position,
+    TAG_IO_INVALID_POSITION,
+    "make-i/o-invalid-position-error",
+    "i/o-invalid-position-error?",
+    "i/o-error-position"
+);
+one_field_cond!(
+    b_make_io_filename_error,
+    b_io_filename_error_p,
+    b_io_error_filename,
+    TAG_IO_FILENAME,
+    "make-i/o-filename-error",
+    "i/o-filename-error?",
+    "i/o-error-filename"
+);
+one_field_cond!(
+    b_make_io_port_error,
+    b_io_port_error_p,
+    b_io_error_port,
+    TAG_IO_PORT,
+    "make-i/o-port-error",
+    "i/o-port-error?",
+    "i/o-error-port"
+);
+one_field_cond!(
+    b_make_io_encoding_error,
+    b_io_encoding_error_p,
+    b_io_encoding_error_char,
+    TAG_IO_ENCODING,
+    "make-i/o-encoding-error",
+    "i/o-encoding-error?",
+    "i/o-encoding-error-char"
+);
+
+// &syntax has two fields (form, subform).
+fn b_make_syntax_violation(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("make-syntax-violation", "2", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(
+        TAG_SYNTAX,
+        vec![args[0].clone(), args[1].clone()],
+    )]))
+}
+
+fn b_syntax_violation_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax-violation?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_SYNTAX)))
+}
+
+fn b_syntax_violation_form(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax-violation-form", "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_SYNTAX)
+        .ok_or_else(|| "syntax-violation-form: not a syntax-violation".to_string())?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() >= 2 {
+            return Ok(v[1].clone());
+        }
+    }
+    Err("syntax-violation-form: malformed".to_string())
+}
+
+fn b_syntax_violation_subform(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax-violation-subform", "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_SYNTAX)
+        .ok_or_else(|| "syntax-violation-subform: not a syntax-violation".to_string())?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() >= 3 {
+            return Ok(v[2].clone());
+        }
+    }
+    Err("syntax-violation-subform: malformed".to_string())
 }
 
 // ---- standard accessors ----
