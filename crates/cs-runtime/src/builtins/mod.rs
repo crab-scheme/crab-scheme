@@ -519,6 +519,18 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("delete-file", b_delete_file),
         ("open-input-file", b_open_input_file),
         ("open-output-file", b_open_output_file),
+        // R6RS named aliases for the file-port factories.
+        ("open-file-input-port", b_open_input_file),
+        ("open-file-output-port", b_open_output_file),
+        // R6RS §8.2.6 — port positions and textual peek alias.
+        ("port-position", b_port_position),
+        ("set-port-position!", b_set_port_position),
+        ("port-has-port-position?", b_port_has_port_position_p),
+        (
+            "port-has-set-port-position!?",
+            b_port_has_set_port_position_p,
+        ),
+        ("lookahead-char", b_lookahead_char),
         ("close-port", b_close_port),
         ("port-eof?", b_port_eof_p),
         // ports
@@ -704,6 +716,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("with-input-from-string", b_with_input_from_string),
         ("with-output-to-string", b_with_output_to_string),
         ("call-with-port", b_call_with_port),
+        ("call-with-input-file", b_call_with_input_file),
+        ("call-with-output-file", b_call_with_output_file),
         ("call-with-input-string", b_call_with_input_string),
         ("call-with-output-string", b_call_with_output_string),
         ("with-output-to-file", b_with_output_to_file),
@@ -7590,6 +7604,32 @@ fn b_call_with_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> 
     result
 }
 
+/// R6RS `(call-with-input-file path proc)` — open the file as a
+/// textual input port, pass it to proc, and close it on return.
+/// Mirrors call-with-port's best-effort-close semantics.
+fn b_call_with_input_file(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("call-with-input-file", "2", args.len()));
+    }
+    let port = b_open_input_file(&[args[0].clone()])?;
+    let result = apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| e.message());
+    let _ = b_close_port(&[port]);
+    result
+}
+
+/// R6RS `(call-with-output-file path proc)` — create the file as a
+/// textual output port, pass it to proc, and close it on return so
+/// the buffered writes are flushed to disk.
+fn b_call_with_output_file(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("call-with-output-file", "2", args.len()));
+    }
+    let port = b_open_output_file(&[args[0].clone()])?;
+    let result = apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| e.message());
+    let _ = b_close_port(&[port]);
+    result
+}
+
 /// R7RS `(call-with-input-string str proc)` — convenience wrapper:
 /// open a string input port, hand it to proc, close it on return.
 fn b_call_with_input_string(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
@@ -9597,6 +9637,92 @@ fn b_open_output_file(args: &[Value]) -> Result<Value, String> {
         format!("open-output-file: cannot create {}: {}", path, e)
     })?;
     Ok(Value::Port(Port::file_output(path)))
+}
+
+// ---- R6RS §8.2.6 — port positions ----------------------------------
+
+/// `(port-position port)` — current 0-based offset for input/output
+/// ports. R6RS specifies that this is in *octets* for binary ports
+/// and in *characters* for textual ports; foundation matches that
+/// semantics for our four port types.
+fn b_port_position(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("port-position", "1", args.len()));
+    }
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::StringInput(state) => Ok(Value::fixnum(state.borrow().pos as i64)),
+            Port::ByteVectorInput(state) => Ok(Value::fixnum(state.borrow().pos as i64)),
+            Port::StringOutput(buf) => Ok(Value::fixnum(buf.borrow().chars().count() as i64)),
+            Port::ByteVectorOutput(buf) => Ok(Value::fixnum(buf.borrow().len() as i64)),
+            Port::FileOutput(state) => Ok(Value::fixnum(state.borrow().buf.len() as i64)),
+        },
+        v => Err(type_err("port-position", "port", v)),
+    }
+}
+
+/// `(set-port-position! port pos)` — only meaningful for ports whose
+/// data structure permits a seek. Foundation supports input ports
+/// (random access by adjusting `pos`) and rejects output ports —
+/// rewinding an already-emitted output stream isn't useful.
+fn b_set_port_position(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("set-port-position!", "2", args.len()));
+    }
+    let pos = as_int_i64("set-port-position!", &args[1])?;
+    if pos < 0 {
+        return Err("set-port-position!: negative position".into());
+    }
+    let pos = pos as usize;
+    match &args[0] {
+        Value::Port(p) => match &**p {
+            Port::StringInput(state) => {
+                let mut s = state.borrow_mut();
+                if pos > s.chars.len() {
+                    return Err("set-port-position!: past end of input".into());
+                }
+                s.pos = pos;
+                Ok(Value::Unspecified)
+            }
+            Port::ByteVectorInput(state) => {
+                let mut s = state.borrow_mut();
+                if pos > s.bytes.len() {
+                    return Err("set-port-position!: past end of input".into());
+                }
+                s.pos = pos;
+                Ok(Value::Unspecified)
+            }
+            Port::StringOutput(_) | Port::ByteVectorOutput(_) | Port::FileOutput(_) => {
+                Err("set-port-position!: output ports do not support repositioning".into())
+            }
+        },
+        v => Err(type_err("set-port-position!", "port", v)),
+    }
+}
+
+fn b_port_has_port_position_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("port-has-port-position?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(&args[0], Value::Port(_))))
+}
+
+fn b_port_has_set_port_position_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("port-has-set-port-position!?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(
+        &args[0],
+        Value::Port(p) if matches!(**p, Port::StringInput(_) | Port::ByteVectorInput(_))
+    )))
+}
+
+/// R6RS `(lookahead-char port)` — alias for peek-char.
+fn b_lookahead_char(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("lookahead-char", "1", args.len()));
+    }
+    b_peek_char(args)
 }
 
 fn b_close_port(args: &[Value]) -> Result<Value, String> {

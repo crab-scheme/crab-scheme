@@ -135,3 +135,47 @@
        (txp (transcoded-port binp (native-transcoder))))
   (test-true  "txp-textual"   (textual-port? txp))
   (test-equal "txp-content"   "abc" (get-string-all txp)))
+
+; ---- R6RS §8.2.6 — port positions -----------------------------------
+(test-section "R6RS port positions")
+
+(let ((p (open-string-input-port "Hello")))
+  (test-equal "pos-initial"   0 (port-position p))
+  (read-char p) (read-char p)
+  (test-equal "pos-after-2"   2 (port-position p))
+  (set-port-position! p 4)
+  (test-equal "pos-set"       4 (port-position p))
+  (test-equal "char-after-seek" #\o (read-char p)))
+
+(let ((p (open-string-output-port)))
+  (test-equal "out-pos-initial" 0 (port-position p))
+  (put-string p "abc")
+  (test-equal "out-pos-after"   3 (port-position p)))
+
+(let ((p (open-bytevector-input-port (bytevector 1 2 3 4 5))))
+  (test-equal "bv-pos-initial" 0 (port-position p))
+  (get-bytevector-n p 3)
+  (test-equal "bv-pos-after"   3 (port-position p))
+  (set-port-position! p 1)
+  (test-equal "bv-after-seek"  #u8(2 3 4) (get-bytevector-n p 3)))
+
+(test-true  "input-has-set-pos"
+  (port-has-set-port-position!? (open-string-input-port "x")))
+(test-false "output-no-set-pos"
+  (port-has-set-port-position!? (open-string-output-port)))
+(test-true  "any-port-has-pos"
+  (port-has-port-position? (open-string-output-port)))
+
+; lookahead-char alias
+(let ((p (open-string-input-port "ab")))
+  (test-equal "lookahead-char-1" #\a (lookahead-char p))
+  (test-equal "lookahead-no-advance" #\a (lookahead-char p))
+  (read-char p)
+  (test-equal "lookahead-after-read" #\b (lookahead-char p)))
+
+; out-of-range set-port-position! errors
+(test-true "set-pos-rejects-overflow"
+  (guard (c (#t #t))
+    (let ((p (open-string-input-port "xy")))
+      (set-port-position! p 5)
+      #f)))
