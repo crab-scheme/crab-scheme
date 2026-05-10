@@ -65,6 +65,18 @@ pub struct Lowerer {
     /// FuncId of the imported `vm_env_set_fixnum` helper.
     /// `Inst::EnvSet` lowers to a Cranelift call against this.
     env_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_alloc_pair(car, car_tag, cdr, cdr_tag) -> i64`.
+    /// Reserved for `cons` lowering — no translator path uses it yet.
+    #[allow(dead_code)]
+    alloc_pair_func: cranelift_module::FuncId,
+    /// FuncId of `vm_pair_car(pair) -> i64`. Reserved for `car`
+    /// lowering.
+    #[allow(dead_code)]
+    pair_car_func: cranelift_module::FuncId,
+    /// FuncId of `vm_pair_cdr(pair) -> i64`. Reserved for `cdr`
+    /// lowering.
+    #[allow(dead_code)]
+    pair_cdr_func: cranelift_module::FuncId,
 }
 
 impl Lowerer {
@@ -97,6 +109,13 @@ impl Lowerer {
             "vm_env_set_fixnum",
             cs_vm::vm::vm_env_set_fixnum as *const u8,
         );
+        // ADR 0011 D-5 — heap-pointer ABI helpers. Pure-additive
+        // imports today (no translator path uses them yet); subsequent
+        // iters wire `cons` / `car` / `cdr` lowering through these
+        // and unlock end-to-end Pair-returning JIT bodies.
+        builder.symbol("vm_alloc_pair", cs_vm::vm::vm_alloc_pair as *const u8);
+        builder.symbol("vm_pair_car", cs_vm::vm::vm_pair_car as *const u8);
+        builder.symbol("vm_pair_cdr", cs_vm::vm::vm_pair_cdr as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -123,6 +142,45 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function env_set: {e}")))?;
 
+        // Heap-pointer ABI helpers (ADR 0011 D-5). Imported so the
+        // module knows about them; no JIT body calls them yet.
+        // vm_alloc_pair(car: i64, car_tag: u8, cdr: i64, cdr_tag: u8) -> i64.
+        // The u8 tag args are passed as i64 (Cranelift doesn't have
+        // a direct u8 ABI param; the helper's Rust signature truncates
+        // to u8).
+        let mut alloc_pair_sig = module.make_signature();
+        alloc_pair_sig.params.push(AbiParam::new(I64)); // car
+        alloc_pair_sig.params.push(AbiParam::new(I64)); // car_tag
+        alloc_pair_sig.params.push(AbiParam::new(I64)); // cdr
+        alloc_pair_sig.params.push(AbiParam::new(I64)); // cdr_tag
+        alloc_pair_sig.returns.push(AbiParam::new(I64));
+        let alloc_pair_func = module
+            .declare_function(
+                "vm_alloc_pair",
+                cranelift_module::Linkage::Import,
+                &alloc_pair_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_alloc_pair: {e}")))?;
+
+        // vm_pair_car(pair: i64) -> i64 and vm_pair_cdr same shape.
+        let mut pair_accessor_sig = module.make_signature();
+        pair_accessor_sig.params.push(AbiParam::new(I64));
+        pair_accessor_sig.returns.push(AbiParam::new(I64));
+        let pair_car_func = module
+            .declare_function(
+                "vm_pair_car",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_pair_car: {e}")))?;
+        let pair_cdr_func = module
+            .declare_function(
+                "vm_pair_cdr",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_pair_cdr: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -131,6 +189,9 @@ impl Lowerer {
             next_id: 0,
             env_lookup_func,
             env_set_func,
+            alloc_pair_func,
+            pair_car_func,
+            pair_cdr_func,
         })
     }
 

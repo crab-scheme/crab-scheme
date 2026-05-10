@@ -267,6 +267,113 @@ pub extern "C" fn vm_env_lookup_fixnum(sym: i64) -> i64 {
     }
 }
 
+// ====================================================================
+// JIT heap-pointer ABI helpers (ADR 0011 D-2 / D-3 / D-5).
+//
+// Per ADR 0011, JIT'd bodies that need to construct or access heap-
+// allocated values (Pair, Vector, Procedure, ...) call extern "C"
+// runtime helpers via Cranelift. The helpers internally use cs-core's
+// Value enum; the i64 ABI carriers are tagged per-slot via the
+// `JIT_RT_*` constants in this file.
+//
+// Common encoding:
+//   - Immediate types: Fixnum (i64 directly), Boolean (0/1),
+//     Character (codepoint), Flonum (f64::to_bits).
+//   - Heap-pointer types: tagged-pointer-style with the i64
+//     carrying `Box::into_raw(Box<Value>)` for `JIT_RT_ANY`, or
+//     the relevant `Rc::into_raw` / `Gc::into_raw` cast for the
+//     specific-pointer tags.
+//
+// For now (iter AR) the helpers route everything through `Box<Value>`
+// (the Any tag) — that's the simplest correctness-first path and
+// matches D-3's polymorphic-call-site fallback. Specific-pointer
+// tags get added as their lowering iters land (cons → Pair, vector →
+// Vector, etc.).
+
+/// Decode a `(i64, tag)` pair into a `Value`. Caller-owned: returns
+/// a fresh `Value` that the caller drops on its own schedule.
+///
+/// For heap-pointer tags the i64 is consumed: `JIT_RT_ANY` calls
+/// `Box::from_raw` (taking ownership of the box), which means each
+/// i64 must only be decoded once. For other heap tags the contract
+/// is the same — the caller hands ownership to the helper.
+///
+/// # Safety
+///
+/// Heap-pointer tags require the i64 to be a live, owned pointer of
+/// the matching shape. Decoding mismatched tags / pointers is UB.
+unsafe fn i64_to_value(i: i64, tag: u8) -> Value {
+    match tag {
+        JIT_RT_FIXNUM => Value::Number(cs_core::Number::Fixnum(i)),
+        JIT_RT_BOOLEAN => Value::Boolean(i != 0),
+        JIT_RT_CHARACTER => Value::Character(char::from_u32(i as u32).unwrap_or('\u{FFFD}')),
+        JIT_RT_FLONUM => Value::Number(cs_core::Number::Flonum(f64::from_bits(i as u64))),
+        JIT_RT_ANY => {
+            // SAFETY: caller transferred ownership of the Box<Value>
+            // when it produced the i64 via `value_to_any_i64`.
+            let boxed: Box<Value> = unsafe { Box::from_raw(i as *mut Value) };
+            *boxed
+        }
+        _ => panic!(
+            "i64_to_value: tag {} not yet decodable (deferred to a follow-up iter)",
+            tag
+        ),
+    }
+}
+
+/// Encode a `Value` into a `(i64, tag)` pair carried as a single
+/// i64 word with the tag stored externally — typically as Any-tagged
+/// `Box::into_raw`. Caller is responsible for the matching decode.
+fn value_to_any_i64(v: Value) -> i64 {
+    Box::into_raw(Box::new(v)) as i64
+}
+
+/// `(cons car cdr)` — heap-allocate a fresh pair. Operands are i64
+/// carriers tagged per the wider ABI; the helper decodes both into
+/// `Value`s, allocates a `Pair`, and returns an `Any`-tagged i64
+/// pointing at a `Box<Value::Pair(gc)>`.
+///
+/// `extern "C"` so Cranelift can import it via `JITBuilder::symbol`.
+///
+/// # Safety
+///
+/// Each input i64 must be a live, owned value of its declared tag.
+/// `JIT_RT_ANY` inputs are consumed (Box::from_raw); pass each i64
+/// only once. Caller (the JIT dispatcher) owns the ABI contract.
+#[no_mangle]
+pub unsafe extern "C" fn vm_alloc_pair(car: i64, car_tag: u8, cdr: i64, cdr_tag: u8) -> i64 {
+    let car_v = unsafe { i64_to_value(car, car_tag) };
+    let cdr_v = unsafe { i64_to_value(cdr, cdr_tag) };
+    value_to_any_i64(Value::Pair(cs_core::Pair::new(car_v, cdr_v)))
+}
+
+/// `(car pair)` — return the pair's car, Any-tagged. Pre-decodes the
+/// Any-tagged input box and re-Anys the inner car.
+///
+/// # Safety
+///
+/// Same contract as `vm_alloc_pair` — `pair` must be a live,
+/// owned i64 from `value_to_any_i64`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_pair_car(pair: i64) -> i64 {
+    let v = unsafe { i64_to_value(pair, JIT_RT_ANY) };
+    match v {
+        Value::Pair(p) => value_to_any_i64(p.car.borrow().clone()),
+        other => panic!("vm_pair_car: not a pair ({})", other.type_name()),
+    }
+}
+
+/// `(cdr pair)` — Any-tagged cdr. See `vm_pair_car` for the safety
+/// contract.
+#[no_mangle]
+pub unsafe extern "C" fn vm_pair_cdr(pair: i64) -> i64 {
+    let v = unsafe { i64_to_value(pair, JIT_RT_ANY) };
+    match v {
+        Value::Pair(p) => value_to_any_i64(p.cdr.borrow().clone()),
+        other => panic!("vm_pair_cdr: not a pair ({})", other.type_name()),
+    }
+}
+
 /// Read the per-thread JIT-dispatch count. Test/diagnostics only.
 pub fn jit_call_count() -> u64 {
     VM_JIT_CALL_COUNT.with(|c| c.get())
