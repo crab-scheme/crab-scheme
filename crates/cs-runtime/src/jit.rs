@@ -154,6 +154,8 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
         RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
         RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,
         RirType::Flonum => cs_vm::vm::JIT_RT_FLONUM,
+        RirType::Null => cs_vm::vm::JIT_RT_NULL,
+        RirType::Symbol => cs_vm::vm::JIT_RT_SYMBOL,
         RirType::Any => cs_vm::vm::JIT_RT_ANY,
         _ => cs_vm::vm::JIT_RT_FIXNUM,
     };

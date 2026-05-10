@@ -309,6 +309,7 @@ unsafe fn i64_to_value(i: i64, tag: u8) -> Value {
         JIT_RT_CHARACTER => Value::Character(char::from_u32(i as u32).unwrap_or('\u{FFFD}')),
         JIT_RT_FLONUM => Value::Number(cs_core::Number::Flonum(f64::from_bits(i as u64))),
         JIT_RT_NULL => Value::Null,
+        JIT_RT_SYMBOL => Value::Symbol(cs_core::Symbol(i as u32)),
         JIT_RT_ANY => {
             // SAFETY: caller transferred ownership of the Box<Value>
             // when it produced the i64 via `value_to_any_i64`.
@@ -560,6 +561,7 @@ fn decode_jit_return(rt: u8, r: i64) -> Value {
             Value::Number(cs_core::Number::Flonum(f))
         }
         JIT_RT_NULL => Value::Null,
+        JIT_RT_SYMBOL => Value::Symbol(cs_core::Symbol(r as u32)),
         JIT_RT_ANY => {
             // SAFETY: the JIT body produced this i64 via
             // `value_to_any_i64` (Box::into_raw). We own the Box now

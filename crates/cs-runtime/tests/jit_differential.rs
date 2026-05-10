@@ -1069,6 +1069,99 @@ fn diff_jit_cons_pair_return() {
 }
 
 #[test]
+fn diff_jit_const_symbol_in_body() {
+    // M6 Phase 4 iter BA: Symbol literal `'foo` round-trips
+    // through the JIT lane via the JIT_RT_SYMBOL tag. Pre-BA,
+    // Const::Symbol defaulted to Type::Fixnum, so the i64 (the
+    // symbol id) decoded as a Fixnum.
+    let defines = &["(define (kind v) (if (pair? v) (quote pair) (quote not-pair)))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+         (if (= i 1500) 'done \
+             (begin (kind (cons i i)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    cs_vm::vm::reset_jit_call_count();
+    let jit_pair = rt.eval_str_via_vm("<diff>", "(kind (cons 1 2))").unwrap();
+    let jit_nil = rt.eval_str_via_vm("<diff>", "(kind (quote ()))").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(after >= 2, "kind never JITted (count = {})", after);
+
+    let walker_pair = walker_eval(defines, "(kind (cons 1 2))");
+    let walker_nil = walker_eval(defines, "(kind (quote ()))");
+    match (&jit_pair, &walker_pair) {
+        (Value::Symbol(j), Value::Symbol(w)) => assert_eq!(j, w, "pair-branch symbol mismatch"),
+        other => panic!("expected matching symbols on pair branch, got {:?}", other),
+    }
+    match (&jit_nil, &walker_nil) {
+        (Value::Symbol(j), Value::Symbol(w)) => assert_eq!(j, w, "nil-branch symbol mismatch"),
+        other => panic!("expected matching symbols on nil branch, got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_jit_tail_recursive_length_acc() {
+    // M6 Phase 4 iter BA: accumulator-style list traversal in
+    // tail position. Args are mixed (Any list + Fixnum acc); the
+    // recursive call must not block tail-call optimization.
+    //
+    // The pre-widen CallSelf-type-propagation pass (iter AZ)
+    // ensures the CallSelf dst's type matches sibling Jump args
+    // (both Fixnum here), so widen_joins_to_any leaves the
+    // CallSelf in tail position untouched and detect_tail_call_self
+    // fires.
+    let defines = &["(define (length-acc lst acc) \
+           (if (null? lst) acc (length-acc (cdr lst) (+ acc 1))))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+         (if (= i 1500) 'done \
+             (begin (length-acc (cons 1 (cons 2 (cons 3 (quote ())))) 0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    cs_vm::vm::reset_jit_call_count();
+    let _ = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(length-acc (cons 1 (cons 2 (cons 3 (quote ())))) 0)",
+        )
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after > 0,
+        "length-acc never dispatched through the JIT (count = {})",
+        after
+    );
+
+    // Build a long list to exercise the tail-call path. Walker
+    // also needs TCO to handle this — confirmed by walker_eval
+    // returning the right answer rather than overflowing.
+    let mut build = String::from("(quote ())");
+    for i in 0..200 {
+        build = format!("(cons {} {})", i, build);
+    }
+    let expr = format!("(length-acc {} 0)", build);
+    let jit = rt.eval_str_via_vm("<diff>", &expr).unwrap();
+    let walker = walker_eval(defines, &expr);
+    match (&jit, &walker) {
+        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+            assert_eq!(j, w);
+            assert_eq!(*j, 200);
+        }
+        other => panic!("expected fixnum 200, got {:?}", other),
+    }
+}
+
+#[test]
 fn diff_jit_const_null_in_body() {
     // M6 Phase 4 iter AZ: `(quote ())` inside a JIT body must
     // round-trip as Value::Null, not Value::Number(Fixnum(0)).

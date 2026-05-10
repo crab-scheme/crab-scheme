@@ -237,6 +237,7 @@ pub fn bytecode_to_rir_with_hints(
                         Const::Boolean(_) => Type::Boolean,
                         Const::Character(_) => Type::Character,
                         Const::Null => Type::Null,
+                        Const::Symbol(_) => Type::Symbol,
                         _ => Type::Fixnum,
                     };
                     insts.push(RirInst::LoadConst(dst, c));
@@ -1333,6 +1334,7 @@ fn type_to_jit_rt_tag(t: Type) -> u8 {
         Type::String => 6,
         Type::ByteVector => 7,
         Type::Procedure => 8,
+        Type::Symbol => 9,
         Type::Null => 14,
         Type::Any => 15,
     }
@@ -1344,6 +1346,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     let mut char_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     let mut flo_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     let mut null_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
+    let mut sym_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     let mut any_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     // Seed from the function's per-param types — when the runtime
     // hook supplied hints (arg-side feedback), parameters get the
@@ -1364,6 +1367,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
             }
             Type::Null => {
                 null_values.insert(*val);
+            }
+            Type::Symbol => {
+                sym_values.insert(*val);
             }
             Type::Any => {
                 any_values.insert(*val);
@@ -1389,6 +1395,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 }
                 Type::Null => {
                     null_values.insert(*val);
+                }
+                Type::Symbol => {
+                    sym_values.insert(*val);
                 }
                 Type::Any => {
                     any_values.insert(*val);
@@ -1438,6 +1447,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::LoadConst(dst, Const::Null) => {
                     null_values.insert(*dst);
                 }
+                RirInst::LoadConst(dst, Const::Symbol(_)) => {
+                    sym_values.insert(*dst);
+                }
                 RirInst::Cons(dst, _, _, _, _)
                 | RirInst::Car(dst, _)
                 | RirInst::Cdr(dst, _)
@@ -1466,6 +1478,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     let mut seen_char = false;
     let mut seen_flo = false;
     let mut seen_null = false;
+    let mut seen_sym = false;
     let mut seen_any = false;
     let mut seen_callself = false;
     for block in &func.blocks {
@@ -1482,6 +1495,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 seen_bool = true;
             } else if null_values.contains(v) {
                 seen_null = true;
+            } else if sym_values.contains(v) {
+                seen_sym = true;
             } else {
                 seen_fixnum = true;
             }
@@ -1502,17 +1517,25 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     if seen_any {
         return Type::Any;
     }
-    match (seen_flo, seen_char, seen_bool, seen_null, seen_fixnum) {
-        (true, false, false, false, false) => Type::Flonum,
-        (false, true, false, false, false) => Type::Character,
-        (false, false, true, false, false) => Type::Boolean,
-        (false, false, false, true, false) => Type::Null,
-        (false, false, false, false, false) => Type::Fixnum,
+    match (
+        seen_flo,
+        seen_char,
+        seen_bool,
+        seen_null,
+        seen_sym,
+        seen_fixnum,
+    ) {
+        (true, false, false, false, false, false) => Type::Flonum,
+        (false, true, false, false, false, false) => Type::Character,
+        (false, false, true, false, false, false) => Type::Boolean,
+        (false, false, false, true, false, false) => Type::Null,
+        (false, false, false, false, true, false) => Type::Symbol,
+        (false, false, false, false, false, false) => Type::Fixnum,
         // Single-immediate-type uniform return → that type. Any
         // disagreement → widen to Any so `box_mixed_returns`
         // inserts BoxTyped on the typed Return paths and the
         // dispatcher decodes via JIT_RT_ANY.
-        (false, false, false, false, true) => Type::Fixnum,
+        (false, false, false, false, false, true) => Type::Fixnum,
         _ => Type::Any,
     }
 }
@@ -1819,6 +1842,7 @@ fn value_to_const(v: &cs_core::Value) -> Result<Const, TranslateError> {
         Value::Character(c) => Ok(Const::Character(*c)),
         Value::Null => Ok(Const::Null),
         Value::Unspecified => Ok(Const::Unspecified),
+        Value::Symbol(s) => Ok(Const::Symbol(s.0)),
         other => Err(TranslateError::Unsupported(format!(
             "Const value {:?} not in iter-5 scope",
             other

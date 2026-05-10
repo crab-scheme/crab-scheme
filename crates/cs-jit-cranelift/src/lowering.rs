@@ -660,6 +660,7 @@ fn lower_inst(
                 }
                 Const::Null => b.ins().iconst(I64, 0),
                 Const::Unspecified => b.ins().iconst(I64, 0),
+                Const::Symbol(id) => b.ins().iconst(I64, *id as i64),
                 other => {
                     return Err(JitError::Unsupported(format!(
                         "LoadConst {:?} not in iter-2 scope",

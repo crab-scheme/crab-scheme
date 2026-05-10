@@ -47,6 +47,10 @@ pub enum Type {
     ByteVector,
     /// Heap-pointer to a Procedure (closure or builtin).
     Procedure,
+    /// `Value::Symbol(u32)`. The i64 carries the symbol id
+    /// zero-extended into the low 32 bits; the dispatcher decodes
+    /// via `cs_core::Symbol(i as u32)`.
+    Symbol,
     /// `Value::Null` (the `'()` singleton). Carried as a sentinel
     /// i64 (always 0); the dispatcher decodes by tag rather than
     /// inspecting the i64.
