@@ -153,6 +153,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-ffi-example"
+version = "0.0.1"
+dependencies = [
+ "cs-ffi",
+]
+
+[[package]]
 name = "cs-ffi-macros"
 version = "0.0.1"
 dependencies = [
@@ -224,6 +231,7 @@ dependencies = [
  "cs-diag",
  "cs-expand",
  "cs-ffi",
+ "cs-ffi-example",
  "cs-ffi-macros",
  "cs-gc",
  "cs-ir",

@@ -3,6 +3,7 @@
 pub mod builtins;
 pub mod env;
 pub mod eval;
+pub mod ffi;
 pub mod proc;
 
 use std::cell::{Cell, RefCell};
@@ -1540,7 +1541,10 @@ impl Runtime {
             vm_env,
             heap,
             pinned,
-            next_pin_id: Rc::new(Cell::new(0)),
+            // Start at 1 so handle 0 can be reserved as the FFI
+            // "null" ValueRef. Internal Pinned guards never use 0
+            // either, so the convention is consistent across users.
+            next_pin_id: Rc::new(Cell::new(1)),
         }
     }
 
@@ -1569,6 +1573,33 @@ impl Runtime {
     /// diagnostics; should be 0 in steady state.
     pub fn pin_count(&self) -> usize {
         self.pinned.borrow().len()
+    }
+
+    /// Pin a value without an RAII guard, returning the raw u64
+    /// handle. Caller MUST eventually call [`unpin_raw`] to release;
+    /// otherwise the value remains rooted indefinitely.
+    ///
+    /// Used by the C-ABI backend (`cs-runtime/src/ffi.rs`) to expose
+    /// `ValueRef` handles to dylib plugins that release explicitly
+    /// rather than via Rust Drop semantics. The handle is the
+    /// underlying `PinId.0`; the slab is shared with [`Pinned`].
+    pub fn pin_raw(&self, v: Value) -> u64 {
+        let id = PinId(self.next_pin_id.get());
+        self.next_pin_id.set(id.0 + 1);
+        self.pinned.borrow_mut().insert(id, v);
+        id.0
+    }
+
+    /// Release a raw pin allocated by [`pin_raw`]. Idempotent on
+    /// already-released handles.
+    pub fn unpin_raw(&self, handle: u64) {
+        self.pinned.borrow_mut().remove(&PinId(handle));
+    }
+
+    /// Look up the value behind a raw pin handle. Returns `None`
+    /// if the handle was never minted or was already released.
+    pub fn lookup_raw(&self, handle: u64) -> Option<Value> {
+        self.pinned.borrow().get(&PinId(handle)).cloned()
     }
 
     /// Run a stop-the-world GC pass. Phase 1 walks the registered root

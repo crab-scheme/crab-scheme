@@ -41,6 +41,7 @@ cs-rir = { path = "crates/cs-rir" }
 cs-jit = { path = "crates/cs-jit" }
 cs-jit-cranelift = { path = "crates/cs-jit-cranelift" }
 cs-ffi = { path = "crates/cs-ffi" }
+cs-ffi-example = { path = "crates/cs-ffi-example" }
 cs-ffi-macros = { path = "crates/cs-ffi-macros" }
 
 # External crates

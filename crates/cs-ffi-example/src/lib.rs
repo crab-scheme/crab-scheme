@@ -61,13 +61,16 @@ pub extern "C" fn crabscheme_register(rt: *mut RuntimeFfi) -> i32 {
         return RegisterStatus::VersionMismatch as i32;
     }
 
-    // Register a trivial procedure: (example-add a b) -> a + b.
-    let name = b"example-add";
+    // Register a marker procedure: (example-magic) -> 42. The
+    // marker always returns the same value so iter 6b/6c tests can
+    // verify the wire protocol without value-inspection callbacks
+    // (those land in a follow-up iter when needed).
+    let name = b"example-magic";
     let decl = HostProcDecl {
         name_ptr: name.as_ptr() as *const c_char,
         name_len: name.len(),
-        call: example_add_call,
-        arity: 2,
+        call: example_magic_call,
+        arity: 0,
     };
     // SAFETY: rt is valid for the call duration; decl is valid for
     // the call (the runtime is required to copy out anything it
@@ -77,37 +80,33 @@ pub extern "C" fn crabscheme_register(rt: *mut RuntimeFfi) -> i32 {
     RegisterStatus::Ok as i32
 }
 
-/// Implementation of (example-add a b).
-extern "C" fn example_add_call(
+/// Magic constant returned by (example-magic). Tests in cs-runtime
+/// match against this exact value.
+pub const EXAMPLE_MAGIC_VALUE: i64 = 42;
+
+/// Implementation of (example-magic) -> 42. Always returns the same
+/// fixnum regardless of args.
+extern "C" fn example_magic_call(
     rt: *mut RuntimeFfi,
-    args: *const ValueRef,
+    _args: *const ValueRef,
     argc: usize,
     out: *mut EvalOutput,
 ) {
-    if argc != 2 || rt.is_null() || args.is_null() || out.is_null() {
-        // SAFETY: out is checked non-null above.
-        unsafe {
-            *out = EvalOutput {
-                status: EvalStatus::EvalError,
-                value: ValueRef { handle: 0 },
-                error: ValueRef { handle: 0 },
-            };
+    if rt.is_null() || out.is_null() || argc != 0 {
+        if !out.is_null() {
+            // SAFETY: out is non-null per the check above.
+            unsafe {
+                *out = EvalOutput {
+                    status: EvalStatus::EvalError,
+                    value: ValueRef { handle: 0 },
+                    error: ValueRef { handle: 0 },
+                };
+            }
         }
         return;
     }
-    // For now, the example just produces a fixnum sum-of-handles.
-    // A real plugin would call back through `rt` to inspect args.
-    // Iter 6b will add helpers (`value_ref_as_fixnum` etc.) so this
-    // can do real arithmetic; for iter 6a we just demonstrate the
-    // wire protocol.
-    //
-    // SAFETY: args is non-null and points to argc=2 ValueRef
-    // entries; out is non-null. Both are guaranteed valid for the
-    // call by the caller (the runtime).
-    let (a, b) = unsafe { (*args, *args.add(1)) };
-    let sum = a.handle.wrapping_add(b.handle);
     // SAFETY: rt is non-null per the early return above.
-    let result = unsafe { ((*rt).alloc_fixnum)(rt, sum as i64) };
+    let result = unsafe { ((*rt).alloc_fixnum)(rt, EXAMPLE_MAGIC_VALUE) };
     // SAFETY: out is non-null per the early return above.
     unsafe {
         *out = EvalOutput {
