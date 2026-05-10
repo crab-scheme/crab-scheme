@@ -104,6 +104,17 @@ pub enum Inst {
     /// no zero-check; division by zero produces ±inf or NaN per spec.
     FlonumDiv(Value, Value, Value),
 
+    /// `dst = (lhs < rhs)` interpreted as flonums. Distinct from
+    /// `Lt` because IEEE-754 ordering doesn't match signed-integer
+    /// compare on the bit pattern (negative zero, NaN, etc.).
+    /// Result is 0/1 i64 — Boolean-typed for return-decoding.
+    FlonumLt(Value, Value, Value),
+
+    /// `dst = (lhs == rhs)` interpreted as flonums. Distinct from
+    /// `Eq` because IEEE-754 equality has NaN ≠ NaN semantics that
+    /// integer compare on bits would mishandle.
+    FlonumEq(Value, Value, Value),
+
     /// `dst = (lhs < rhs)`. cs-vm: `Inst::Lt`.
     Lt(Value, Value, Value),
 

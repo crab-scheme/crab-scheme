@@ -425,6 +425,37 @@ fn lower_inst(
         Inst::FlonumDiv(dst, lhs, rhs) => {
             fbinop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().fdiv(l, r))?
         }
+        Inst::FlonumLt(dst, lhs, rhs) => {
+            // IEEE-754 less-than: NaN compares unordered, so we use
+            // `LessThan` (the strict/ordered form). NaN < x is false
+            // on either side, matching R6RS flonum semantics.
+            let l_i = lookup(map, *lhs)?;
+            let r_i = lookup(map, *rhs)?;
+            let mf = cranelift_codegen::ir::MemFlags::new();
+            let l_f = b.ins().bitcast(F64, mf, l_i);
+            let r_f = b.ins().bitcast(F64, mf, r_i);
+            let cmp = b.ins().fcmp(
+                cranelift_codegen::ir::condcodes::FloatCC::LessThan,
+                l_f,
+                r_f,
+            );
+            let widened = b.ins().uextend(I64, cmp);
+            map.insert(*dst, widened);
+        }
+        Inst::FlonumEq(dst, lhs, rhs) => {
+            // IEEE-754 equality: NaN ≠ NaN. `Equal` is the ordered
+            // (no-NaN-match) form.
+            let l_i = lookup(map, *lhs)?;
+            let r_i = lookup(map, *rhs)?;
+            let mf = cranelift_codegen::ir::MemFlags::new();
+            let l_f = b.ins().bitcast(F64, mf, l_i);
+            let r_f = b.ins().bitcast(F64, mf, r_i);
+            let cmp = b
+                .ins()
+                .fcmp(cranelift_codegen::ir::condcodes::FloatCC::Equal, l_f, r_f);
+            let widened = b.ins().uextend(I64, cmp);
+            map.insert(*dst, widened);
+        }
         Inst::Param(_, _) => {
             // Param entries are populated from the entry block's
             // appended params before lower_inst runs.

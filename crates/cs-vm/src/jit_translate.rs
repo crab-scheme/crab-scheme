@@ -275,35 +275,80 @@ pub fn bytecode_to_rir(
                     RirInst::Mul,
                     RirInst::FlonumMul,
                 )?,
-                Inst::LtFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Lt)?,
-                Inst::EqFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Eq)?,
+                Inst::LtFx2 => emit_cmp_binop(
+                    &mut insts,
+                    &mut sim_stack,
+                    &mut alloc,
+                    &mut value_types,
+                    RirInst::Lt,
+                    RirInst::FlonumLt,
+                )?,
+                Inst::EqFx2 => emit_cmp_binop(
+                    &mut insts,
+                    &mut sim_stack,
+                    &mut alloc,
+                    &mut value_types,
+                    RirInst::Eq,
+                    RirInst::FlonumEq,
+                )?,
                 Inst::GtFx2 => {
                     // a > b  →  b < a (swap operands).
                     let (a, b) = pop_two_values(&mut sim_stack)?;
                     let dst = alloc();
-                    insts.push(RirInst::Lt(dst, b, a));
+                    let at = value_types.get(&a).copied().unwrap_or(Type::Fixnum);
+                    let bt = value_types.get(&b).copied().unwrap_or(Type::Fixnum);
+                    let lt_inst = if at == Type::Flonum && bt == Type::Flonum {
+                        RirInst::FlonumLt(dst, b, a)
+                    } else {
+                        RirInst::Lt(dst, b, a)
+                    };
+                    insts.push(lt_inst);
+                    value_types.insert(dst, Type::Boolean);
                     sim_stack.push(StackEntry::Value(dst));
                 }
                 Inst::LeFx2 => {
-                    // a <= b  →  NOT (b < a)  →  Eq(_, Lt(_, b, a), 0).
+                    // a <= b  →  NOT (b < a). The negation is done as
+                    // (Eq lt 0) — both ends of the equality are
+                    // Booleans so it's safe regardless of operand
+                    // tier.
                     let (a, b) = pop_two_values(&mut sim_stack)?;
+                    let at = value_types.get(&a).copied().unwrap_or(Type::Fixnum);
+                    let bt = value_types.get(&b).copied().unwrap_or(Type::Fixnum);
                     let lt = alloc();
-                    insts.push(RirInst::Lt(lt, b, a));
+                    let lt_inst = if at == Type::Flonum && bt == Type::Flonum {
+                        RirInst::FlonumLt(lt, b, a)
+                    } else {
+                        RirInst::Lt(lt, b, a)
+                    };
+                    insts.push(lt_inst);
+                    value_types.insert(lt, Type::Boolean);
                     let zero = alloc();
                     insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                    value_types.insert(zero, Type::Fixnum);
                     let dst = alloc();
                     insts.push(RirInst::Eq(dst, lt, zero));
+                    value_types.insert(dst, Type::Boolean);
                     sim_stack.push(StackEntry::Value(dst));
                 }
                 Inst::GeFx2 => {
-                    // a >= b  →  NOT (a < b)  →  Eq(_, Lt(_, a, b), 0).
+                    // a >= b  →  NOT (a < b).
                     let (a, b) = pop_two_values(&mut sim_stack)?;
+                    let at = value_types.get(&a).copied().unwrap_or(Type::Fixnum);
+                    let bt = value_types.get(&b).copied().unwrap_or(Type::Fixnum);
                     let lt = alloc();
-                    insts.push(RirInst::Lt(lt, a, b));
+                    let lt_inst = if at == Type::Flonum && bt == Type::Flonum {
+                        RirInst::FlonumLt(lt, a, b)
+                    } else {
+                        RirInst::Lt(lt, a, b)
+                    };
+                    insts.push(lt_inst);
+                    value_types.insert(lt, Type::Boolean);
                     let zero = alloc();
                     insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                    value_types.insert(zero, Type::Fixnum);
                     let dst = alloc();
                     insts.push(RirInst::Eq(dst, lt, zero));
+                    value_types.insert(dst, Type::Boolean);
                     sim_stack.push(StackEntry::Value(dst));
                 }
                 Inst::JumpIfFalse(target) => {
@@ -800,7 +845,10 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     for block in &func.blocks {
         for inst in &block.insts {
             match inst {
-                RirInst::Lt(dst, _, _) | RirInst::Eq(dst, _, _) => {
+                RirInst::Lt(dst, _, _)
+                | RirInst::Eq(dst, _, _)
+                | RirInst::FlonumLt(dst, _, _)
+                | RirInst::FlonumEq(dst, _, _) => {
                     bool_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {
@@ -997,6 +1045,33 @@ fn emit_arith_binop(
     };
     insts.push(inst);
     value_types.insert(dst, dst_t);
+    stack.push(StackEntry::Value(dst));
+    Ok(())
+}
+
+/// Comparison binop emission. Same shape as `emit_arith_binop` but
+/// dst is always Boolean — the IEEE-754 / signed-integer comparison
+/// produces a 0/1 i64 either way.
+fn emit_cmp_binop(
+    insts: &mut Vec<RirInst>,
+    stack: &mut Vec<StackEntry>,
+    alloc: &mut impl FnMut() -> RirValue,
+    value_types: &mut HashMap<RirValue, Type>,
+    fixnum_ctor: fn(RirValue, RirValue, RirValue) -> RirInst,
+    flonum_ctor: fn(RirValue, RirValue, RirValue) -> RirInst,
+) -> Result<(), TranslateError> {
+    let rhs = pop_value(stack)?;
+    let lhs = pop_value(stack)?;
+    let dst = alloc();
+    let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
+    let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
+    let inst = if lt == Type::Flonum && rt == Type::Flonum {
+        flonum_ctor(dst, lhs, rhs)
+    } else {
+        fixnum_ctor(dst, lhs, rhs)
+    };
+    insts.push(inst);
+    value_types.insert(dst, Type::Boolean);
     stack.push(StackEntry::Value(dst));
     Ok(())
 }

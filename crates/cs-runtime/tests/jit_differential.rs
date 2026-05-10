@@ -492,3 +492,44 @@ fn diff_flonum_arithmetic() {
         }
     }
 }
+
+#[test]
+fn diff_flonum_comparison() {
+    // M6 Phase 2 iter AB: < / = / > / <= / >= on Flonum-typed
+    // operands lower to FlonumLt / FlonumEq with Cranelift fcmp,
+    // not the i64 icmp. Without this, comparing two i64 carriers
+    // of f64 bit patterns would silently disagree with IEEE-754
+    // ordering.
+    let defines = &["(define gt-flo (lambda (a b) \
+        (let ((fa (real->flonum a)) (fb (real->flonum b))) \
+          (if (< fa fb) -1 (if (= fa fb) 0 1)))))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (gt-flo 3 5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, i64)] = &[
+        ("(gt-flo 3 5)", -1),
+        ("(gt-flo 5 5)", 0),
+        ("(gt-flo 7 2)", 1),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Fixnum(j)),
+                Value::Number(cs_core::Number::Fixnum(w)),
+            ) => {
+                assert_eq!(j, w, "tier-mismatch on {}", expr);
+                assert_eq!(*j, *expected, "value mismatch on {}", expr);
+            }
+            other => panic!("{}: expected fixnums, got {:?}", expr, other),
+        }
+    }
+}
