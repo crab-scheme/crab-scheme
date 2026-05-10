@@ -1208,23 +1208,6 @@ fn seed_block_entry(
     Ok(())
 }
 
-fn emit_binop<F>(
-    insts: &mut Vec<RirInst>,
-    stack: &mut Vec<StackEntry>,
-    alloc: &mut impl FnMut() -> RirValue,
-    ctor: F,
-) -> Result<(), TranslateError>
-where
-    F: FnOnce(RirValue, RirValue, RirValue) -> RirInst,
-{
-    let rhs = pop_value(stack)?;
-    let lhs = pop_value(stack)?;
-    let dst = alloc();
-    insts.push(ctor(dst, lhs, rhs));
-    stack.push(StackEntry::Value(dst));
-    Ok(())
-}
-
 /// Arithmetic binop emission with flonum/fixnum dispatch. When both
 /// operands are typed Flonum (per `value_types`), emit the flonum
 /// variant; otherwise fall back to the fixnum form. dst's type is

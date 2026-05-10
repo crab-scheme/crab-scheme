@@ -24,3 +24,10 @@ cranelift-native = { workspace = true }
 [dev-dependencies]
 cs-diag = { workspace = true }
 cs-vm = { workspace = true }
+
+[features]
+# Expose internal testing helpers (RIR builders, golden fixtures) to
+# downstream test crates. The `cfg(any(test, feature = "test-helpers"))`
+# gate inside lowering.rs makes the `testing` module visible to both
+# our own unit tests and to integration crates that opt in.
+test-helpers = []
