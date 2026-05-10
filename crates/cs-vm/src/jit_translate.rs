@@ -236,6 +236,7 @@ pub fn bytecode_to_rir_with_hints(
                         Const::Flonum(_) => Type::Flonum,
                         Const::Boolean(_) => Type::Boolean,
                         Const::Character(_) => Type::Character,
+                        Const::Null => Type::Null,
                         _ => Type::Fixnum,
                     };
                     insts.push(RirInst::LoadConst(dst, c));
@@ -1159,6 +1160,24 @@ pub fn bytecode_to_rir_with_hints(
         });
     }
 
+    // Pre-widen: infer a preliminary return type, then propagate
+    // it to every CallSelf dst's `value_types` slot. CallSelf
+    // returns are "the function's own type" by definition, but
+    // without explicit propagation the dst defaults to Type::Fixnum
+    // and triggers spurious widening when a sibling Jump arg is
+    // typed differently. The tail-call optimization in the lowerer
+    // requires `CallSelf` to be the LAST inst of its block — once
+    // widening inserts a BoxTyped after CallSelf, that invariant
+    // breaks and sumsq-style let-loop bodies stop tail-recursing.
+    let preliminary = infer_return_type(&func);
+    for block in &mut func.blocks {
+        for inst in &block.insts {
+            if let RirInst::CallSelf(dst, _) = inst {
+                value_types.insert(*dst, preliminary);
+            }
+        }
+    }
+
     // Phase 4 iter AW — control-flow-join widening. When two
     // predecessors of a block push different-typed values, widen the
     // join's params to Any and insert BoxTyped on the immediate-typed
@@ -1204,7 +1223,13 @@ fn widen_joins_to_any(
 
         let mut widened = false;
         for ((target, slot), types) in &slot_types {
-            let needs_widen = types.contains(&Type::Any) && types.len() > 1;
+            // Widen whenever the predecessors disagree on a slot's
+            // type, regardless of whether Any is one of them. Without
+            // this, the join block_param keeps the first predecessor's
+            // type and other predecessors' i64s get reinterpreted at
+            // decode time (e.g. a Null carried as Fixnum would
+            // surface as `0` instead of `'()`).
+            let needs_widen = types.len() > 1;
             if !needs_widen {
                 continue;
             }
@@ -1308,6 +1333,7 @@ fn type_to_jit_rt_tag(t: Type) -> u8 {
         Type::String => 6,
         Type::ByteVector => 7,
         Type::Procedure => 8,
+        Type::Null => 14,
         Type::Any => 15,
     }
 }
@@ -1317,6 +1343,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     let mut bool_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     let mut char_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     let mut flo_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
+    let mut null_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     let mut any_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     // Seed from the function's per-param types — when the runtime
     // hook supplied hints (arg-side feedback), parameters get the
@@ -1334,6 +1361,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
             }
             Type::Character => {
                 char_values.insert(*val);
+            }
+            Type::Null => {
+                null_values.insert(*val);
             }
             Type::Any => {
                 any_values.insert(*val);
@@ -1356,6 +1386,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 }
                 Type::Character => {
                     char_values.insert(*val);
+                }
+                Type::Null => {
+                    null_values.insert(*val);
                 }
                 Type::Any => {
                     any_values.insert(*val);
@@ -1402,6 +1435,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::LoadConst(dst, Const::Flonum(_)) => {
                     flo_values.insert(*dst);
                 }
+                RirInst::LoadConst(dst, Const::Null) => {
+                    null_values.insert(*dst);
+                }
                 RirInst::Cons(dst, _, _, _, _)
                 | RirInst::Car(dst, _)
                 | RirInst::Cdr(dst, _)
@@ -1429,6 +1465,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     let mut seen_bool = false;
     let mut seen_char = false;
     let mut seen_flo = false;
+    let mut seen_null = false;
     let mut seen_any = false;
     let mut seen_callself = false;
     for block in &func.blocks {
@@ -1443,6 +1480,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 seen_char = true;
             } else if bool_values.contains(v) {
                 seen_bool = true;
+            } else if null_values.contains(v) {
+                seen_null = true;
             } else {
                 seen_fixnum = true;
             }
@@ -1463,11 +1502,18 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
     if seen_any {
         return Type::Any;
     }
-    match (seen_flo, seen_char, seen_bool, seen_fixnum) {
-        (true, false, false, false) => Type::Flonum,
-        (false, true, false, false) => Type::Character,
-        (false, false, true, false) => Type::Boolean,
-        _ => Type::Fixnum,
+    match (seen_flo, seen_char, seen_bool, seen_null, seen_fixnum) {
+        (true, false, false, false, false) => Type::Flonum,
+        (false, true, false, false, false) => Type::Character,
+        (false, false, true, false, false) => Type::Boolean,
+        (false, false, false, true, false) => Type::Null,
+        (false, false, false, false, false) => Type::Fixnum,
+        // Single-immediate-type uniform return → that type. Any
+        // disagreement → widen to Any so `box_mixed_returns`
+        // inserts BoxTyped on the typed Return paths and the
+        // dispatcher decodes via JIT_RT_ANY.
+        (false, false, false, false, true) => Type::Fixnum,
+        _ => Type::Any,
     }
 }
 

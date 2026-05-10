@@ -308,6 +308,7 @@ unsafe fn i64_to_value(i: i64, tag: u8) -> Value {
         JIT_RT_BOOLEAN => Value::Boolean(i != 0),
         JIT_RT_CHARACTER => Value::Character(char::from_u32(i as u32).unwrap_or('\u{FFFD}')),
         JIT_RT_FLONUM => Value::Number(cs_core::Number::Flonum(f64::from_bits(i as u64))),
+        JIT_RT_NULL => Value::Null,
         JIT_RT_ANY => {
             // SAFETY: caller transferred ownership of the Box<Value>
             // when it produced the i64 via `value_to_any_i64`.
@@ -558,6 +559,7 @@ fn decode_jit_return(rt: u8, r: i64) -> Value {
             let f = f64::from_bits(r as u64);
             Value::Number(cs_core::Number::Flonum(f))
         }
+        JIT_RT_NULL => Value::Null,
         JIT_RT_ANY => {
             // SAFETY: the JIT body produced this i64 via
             // `value_to_any_i64` (Box::into_raw). We own the Box now
@@ -811,8 +813,10 @@ pub const JIT_RT_RATIONAL: u8 = 11;
 pub const JIT_RT_HASHTABLE: u8 = 12;
 /// Heap-pointer Port.
 pub const JIT_RT_PORT: u8 = 13;
-/// Reserved for one extra immediate-or-pointer type; currently unused.
-pub const JIT_RT_RESERVED: u8 = 14;
+/// `Value::Null` (the `'()` singleton) — immediate-shaped: the i64
+/// payload is ignored on decode (always 0). Lets the JIT carry an
+/// empty-list value through the i64 ABI without any heap allocation.
+pub const JIT_RT_NULL: u8 = 14;
 /// Polymorphic slot — i64 carries `Box::into_raw(Box<Value>)`. Per
 /// ADR 0011 D-3, used at megamorphic call sites.
 pub const JIT_RT_ANY: u8 = 15;

@@ -1069,6 +1069,63 @@ fn diff_jit_cons_pair_return() {
 }
 
 #[test]
+fn diff_jit_const_null_in_body() {
+    // M6 Phase 4 iter AZ: `(quote ())` inside a JIT body must
+    // round-trip as Value::Null, not Value::Number(Fixnum(0)).
+    // Pre-AZ, Const::Null defaulted to Type::Fixnum, so the join
+    // post-pass widened with JIT_RT_FIXNUM tag and the dispatcher
+    // decoded the i64 as Fixnum(0).
+    let defines = &["(define (head-or-empty v) \
+           (if (pair? v) (car v) (quote ())))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+         (if (= i 1500) 'done \
+             (begin (head-or-empty (cons i i)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    cs_vm::vm::reset_jit_call_count();
+    let jit_pair = rt
+        .eval_str_via_vm("<diff>", "(head-or-empty (cons 5 6))")
+        .unwrap();
+    let jit_nil = rt
+        .eval_str_via_vm("<diff>", "(head-or-empty (quote ()))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "head-or-empty did not dispatch via JIT (count = {})",
+        after
+    );
+
+    // Pair input: car = 5.
+    match &jit_pair {
+        Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(*n, 5),
+        other => panic!("expected fixnum 5, got {:?}", other),
+    }
+
+    // Nil input: must be Value::Null, not Fixnum(0).
+    assert!(
+        matches!(jit_nil, Value::Null),
+        "head-or-empty '() should return Null, got {:?}",
+        jit_nil
+    );
+
+    // Walker agreement.
+    let walker_pair = walker_eval(defines, "(head-or-empty (cons 5 6))");
+    let walker_nil = walker_eval(defines, "(head-or-empty (quote ()))");
+    assert!(matches!(
+        walker_pair,
+        Value::Number(cs_core::Number::Fixnum(5))
+    ));
+    assert!(matches!(walker_nil, Value::Null));
+}
+
+#[test]
 fn diff_jit_recursive_length() {
     // M6 Phase 4 iter AY: recursive list traversal. `length` takes
     // an Any param, recurses through cdr, accumulates a Fixnum

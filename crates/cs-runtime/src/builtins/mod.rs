@@ -11453,6 +11453,7 @@ fn b_jit_status(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String>
             cs_vm::vm::JIT_RT_RATIONAL => "rational",
             cs_vm::vm::JIT_RT_HASHTABLE => "hashtable",
             cs_vm::vm::JIT_RT_PORT => "port",
+            cs_vm::vm::JIT_RT_NULL => "null",
             cs_vm::vm::JIT_RT_ANY => "any",
             _ => "fixnum",
         };

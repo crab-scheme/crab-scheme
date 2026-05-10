@@ -47,6 +47,10 @@ pub enum Type {
     ByteVector,
     /// Heap-pointer to a Procedure (closure or builtin).
     Procedure,
+    /// `Value::Null` (the `'()` singleton). Carried as a sentinel
+    /// i64 (always 0); the dispatcher decodes by tag rather than
+    /// inspecting the i64.
+    Null,
     /// Type unknown at compile time — must do runtime dispatch.
     Any,
 }
