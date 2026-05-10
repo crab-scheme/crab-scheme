@@ -205,6 +205,42 @@ fn jit_handles_fixnum_builtin_calls() {
     }
 }
 
+/// M6 Phase 2 iter G: `abs`, `min`, `max` lower to Cranelift
+/// native instructions (iabs / smin / smax).
+#[test]
+fn jit_handles_abs_min_max() {
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<jit>", "(define dist (lambda (a b) (abs (- a b))))")
+        .unwrap();
+    rt.eval_str_via_vm("<jit>", "(define clamp-low (lambda (x lo) (max x lo)))")
+        .unwrap();
+    rt.eval_str_via_vm("<jit>", "(define clamp-hi (lambda (x hi) (min x hi)))")
+        .unwrap();
+
+    let warmup = "(let loop ((i 0)) \
+                    (if (= i 1500) 'done \
+                        (begin (dist i (- 0 i)) (clamp-low i 0) (clamp-hi i 1000) \
+                               (loop (+ i 1)))))";
+    rt.eval_str_via_vm("<jit>", warmup).unwrap();
+
+    let r = rt.eval_str_via_vm("<jit>", "(dist 5 -3)").unwrap();
+    match r {
+        Value::Number(Number::Fixnum(8)) => {}
+        other => panic!("dist 5 -3: expected 8, got {:?}", other),
+    }
+    let r = rt.eval_str_via_vm("<jit>", "(clamp-low -2 0)").unwrap();
+    match r {
+        Value::Number(Number::Fixnum(0)) => {}
+        other => panic!("clamp-low -2 0: expected 0, got {:?}", other),
+    }
+    let r = rt.eval_str_via_vm("<jit>", "(clamp-hi 9999 1000)").unwrap();
+    match r {
+        Value::Number(Number::Fixnum(1000)) => {}
+        other => panic!("clamp-hi 9999 1000: expected 1000, got {:?}", other),
+    }
+}
+
 /// M6 Phase 2 iter B: closures with free Fixnum vars can JIT.
 /// `(define base 100) (define add-base (lambda (x) (+ x base)))` —
 /// `base` is a free var inside add-base's body. The JIT translator

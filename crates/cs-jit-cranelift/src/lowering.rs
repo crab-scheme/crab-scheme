@@ -351,6 +351,17 @@ fn lower_inst(
         Inst::BitXor(dst, lhs, rhs) => {
             binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().bxor(l, r))?
         }
+        Inst::AbsFixnum(dst, src) => {
+            let s = lookup(map, *src)?;
+            let v = b.ins().iabs(s);
+            map.insert(*dst, v);
+        }
+        Inst::MaxFixnum(dst, lhs, rhs) => {
+            binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().smax(l, r))?
+        }
+        Inst::MinFixnum(dst, lhs, rhs) => {
+            binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().smin(l, r))?
+        }
         Inst::Lt(dst, lhs, rhs) => {
             let l = lookup(map, *lhs)?;
             let r = lookup(map, *rhs)?;

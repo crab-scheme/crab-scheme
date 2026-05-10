@@ -497,6 +497,9 @@ pub fn bytecode_to_rir(
                                     RirInst::BitOr(dst, args[0], args[1])
                                 }
                                 ("bitwise-xor", 2) => RirInst::BitXor(dst, args[0], args[1]),
+                                ("abs", 1) => RirInst::AbsFixnum(dst, args[0]),
+                                ("max", 2) => RirInst::MaxFixnum(dst, args[0], args[1]),
+                                ("min", 2) => RirInst::MinFixnum(dst, args[0], args[1]),
                                 _ => {
                                     return Err(TranslateError::Unsupported(format!(
                                         "Call to builtin `{name}` (arity {}) not yet lowered",

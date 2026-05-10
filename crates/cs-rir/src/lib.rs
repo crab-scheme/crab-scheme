@@ -142,6 +142,22 @@ pub enum Inst {
     /// `dst = bxor(lhs, rhs)`. R6RS `bitwise-xor` for two fixnums.
     BitXor(Value, Value, Value),
 
+    /// `dst = abs(src)`. R6RS `abs` for fixnums. Cranelift `iabs`.
+    /// Note: i64::MIN has no positive representation; the bytecode
+    /// VM upgrades to bignum, while the JIT fastpath wraps. The
+    /// Fixnum-only contract means this is fine for typical inputs;
+    /// pathological inputs (i64::MIN) would deopt under a real
+    /// trampoline.
+    AbsFixnum(Value, Value),
+
+    /// `dst = max(lhs, rhs)`. R6RS `max` for two fixnums.
+    /// Cranelift `smax`.
+    MaxFixnum(Value, Value, Value),
+
+    /// `dst = min(lhs, rhs)`. R6RS `min` for two fixnums.
+    /// Cranelift `smin`.
+    MinFixnum(Value, Value, Value),
+
     /// `dst = arg<i>`. cs-vm: implicit (arguments are on the stack
     /// at the procedure entry; this names them as SSA values).
     Param(Value, u32),
