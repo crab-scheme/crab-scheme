@@ -141,9 +141,10 @@ GC binding for precise rooting techniques.
 
 ---
 
-## M5b: Rust FFI
+## M5b: Rust FFI ✅ DONE
 
 **Spec slug:** `ffi`
+**Exit:** [`docs/milestones/m5b-exit.md`](docs/milestones/m5b-exit.md), tag `m5b-complete`.
 
 Rust FFI surface so CrabScheme programs can call Rust libraries and Rust
 applications can embed CrabScheme as a scripting layer. Independent of the
