@@ -534,8 +534,15 @@ impl Lowerer {
                     entry_params.len()
                 )));
             }
-            for ((rir_v, _ty), clif_v) in rir.params.iter().zip(entry_params.iter()) {
+            for ((rir_v, ty), clif_v) in rir.params.iter().zip(entry_params.iter()) {
                 value_map.insert(*rir_v, *clif_v);
+                // ADR 0012 D-2 (iter BK) — Any-typed params arrive as
+                // Gc<Value> raw handles. Mark them for stack-map
+                // tracking so Cranelift spills them around each call
+                // (every call is an implicit safepoint).
+                if *ty == cs_rir::Type::Any {
+                    builder.declare_value_needs_stack_map(*clif_v);
+                }
             }
 
             for rir_block in &rir.blocks {
@@ -543,8 +550,14 @@ impl Lowerer {
                 builder.switch_to_block(cb);
                 if rir_block.id != rir.entry {
                     let bps = builder.block_params(cb).to_vec();
-                    for ((rir_v, _ty), clif_v) in rir_block.params.iter().zip(bps.iter()) {
+                    for ((rir_v, ty), clif_v) in rir_block.params.iter().zip(bps.iter()) {
                         value_map.insert(*rir_v, *clif_v);
+                        // Mark Any-typed join-block params for stack
+                        // maps too — they hold Gc<Value> handles
+                        // flowing in from predecessor Jumps.
+                        if *ty == cs_rir::Type::Any {
+                            builder.declare_value_needs_stack_map(*clif_v);
+                        }
                     }
                 }
 
@@ -871,33 +884,41 @@ fn lower_inst(
             map.insert(*dst, result);
         }
         Inst::Car(dst, src) => {
-            // Lowers to vm_pair_car(pair_i64) -> i64. The runtime
-            // helper unboxes the Any-tagged operand, returns the
-            // car as an Any-tagged i64. Type-guard for the operand
-            // already happened at the call site (or will be
-            // re-checked at the dispatcher boundary).
+            // Lowers to vm_pair_car_gc(pair_i64) -> i64. The runtime
+            // helper consumes the Gc<Value> handle, returns the car
+            // as a fresh Gc<Value> handle. ADR 0012 D-2 (iter BK) —
+            // mark the dst as a stack-map root so Cranelift spills
+            // it around subsequent calls.
             let v = lookup(map, *src)?;
             let inst_ref = b.ins().call(pair_car_fnref, &[v]);
-            let results = b.inst_results(inst_ref);
-            if results.len() != 1 {
-                return Err(JitError::Codegen(format!(
-                    "Car expected 1 result, got {}",
-                    results.len()
-                )));
-            }
-            map.insert(*dst, results[0]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Car expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
         }
         Inst::Cdr(dst, src) => {
             let v = lookup(map, *src)?;
             let inst_ref = b.ins().call(pair_cdr_fnref, &[v]);
-            let results = b.inst_results(inst_ref);
-            if results.len() != 1 {
-                return Err(JitError::Codegen(format!(
-                    "Cdr expected 1 result, got {}",
-                    results.len()
-                )));
-            }
-            map.insert(*dst, results[0]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Cdr expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
         }
         Inst::PairP(dst, src) => {
             // Lowers to vm_pair_p(any) -> i64. The helper consumes
@@ -930,33 +951,41 @@ fn lower_inst(
         Inst::AnyClone(dst, src) => {
             let v = lookup(map, *src)?;
             let inst_ref = b.ins().call(value_clone_fnref, &[v]);
-            let results = b.inst_results(inst_ref);
-            if results.len() != 1 {
-                return Err(JitError::Codegen(format!(
-                    "AnyClone expected 1 result, got {}",
-                    results.len()
-                )));
-            }
-            map.insert(*dst, results[0]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "AnyClone expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
         }
         Inst::AnyDrop(src) => {
             let v = lookup(map, *src)?;
             b.ins().call(value_drop_fnref, &[v]);
         }
         Inst::BoxTyped(dst, src, tag) => {
-            // Box a typed i64 (Fixnum/Boolean/Character/Flonum)
-            // into an Any-tagged Box<Value>. Tag passes as i64.
+            // Box a typed i64 (Fixnum/Boolean/Character/Flonum/...)
+            // into an Any-tagged Gc<Value> handle. Tag passes as i64.
             let v = lookup(map, *src)?;
             let t = b.ins().iconst(I64, *tag as i64);
             let inst_ref = b.ins().call(box_typed_fnref, &[v, t]);
-            let results = b.inst_results(inst_ref);
-            if results.len() != 1 {
-                return Err(JitError::Codegen(format!(
-                    "BoxTyped expected 1 result, got {}",
-                    results.len()
-                )));
-            }
-            map.insert(*dst, results[0]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BoxTyped expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
         }
         Inst::AnyToFix(dst, src) => {
             // Lowers to vm_unbox_fixnum — consumes the box.
