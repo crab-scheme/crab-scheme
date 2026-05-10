@@ -1610,6 +1610,25 @@ fn seed_block_entry(
 /// — R6RS numeric-tower contagion: `(+ 1 1.0) ⇒ 2.0` not `2`. When
 /// both Fixnum, fall back to the integer form. dst's type is
 /// recorded in `value_types` so downstream ops can chain.
+/// If `v` is `Type::Any`, emit `Inst::AnyToFix(fresh, v)` and
+/// return the fresh Fixnum-typed RirValue. Otherwise return `v`
+/// unchanged. The unbox is consume-on-use — `v` must not be
+/// referenced after this call (the underlying box gets dropped).
+fn unbox_any_to_fix(
+    insts: &mut Vec<RirInst>,
+    value_types: &mut HashMap<RirValue, Type>,
+    alloc: &mut impl FnMut() -> RirValue,
+    v: RirValue,
+) -> RirValue {
+    if value_types.get(&v).copied() != Some(Type::Any) {
+        return v;
+    }
+    let dst = alloc();
+    insts.push(RirInst::AnyToFix(dst, v));
+    value_types.insert(dst, Type::Fixnum);
+    dst
+}
+
 fn emit_arith_binop(
     insts: &mut Vec<RirInst>,
     stack: &mut Vec<StackEntry>,
@@ -1618,8 +1637,8 @@ fn emit_arith_binop(
     fixnum_ctor: fn(RirValue, RirValue, RirValue) -> RirInst,
     flonum_ctor: fn(RirValue, RirValue, RirValue) -> RirInst,
 ) -> Result<(), TranslateError> {
-    let rhs = pop_value(stack)?;
-    let lhs = pop_value(stack)?;
+    let rhs = unbox_any_to_fix(insts, value_types, alloc, pop_value(stack)?);
+    let lhs = unbox_any_to_fix(insts, value_types, alloc, pop_value(stack)?);
     let dst = alloc();
     let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
     let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
@@ -1662,6 +1681,8 @@ fn emit_typed_lt(
     lhs: RirValue,
     rhs: RirValue,
 ) -> RirValue {
+    let lhs = unbox_any_to_fix(insts, value_types, alloc, lhs);
+    let rhs = unbox_any_to_fix(insts, value_types, alloc, rhs);
     let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
     let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
     let dst = alloc();
@@ -1683,6 +1704,8 @@ fn emit_typed_eq(
     lhs: RirValue,
     rhs: RirValue,
 ) -> RirValue {
+    let lhs = unbox_any_to_fix(insts, value_types, alloc, lhs);
+    let rhs = unbox_any_to_fix(insts, value_types, alloc, rhs);
     let lt = value_types.get(&lhs).copied().unwrap_or(Type::Fixnum);
     let rt = value_types.get(&rhs).copied().unwrap_or(Type::Fixnum);
     let dst = alloc();

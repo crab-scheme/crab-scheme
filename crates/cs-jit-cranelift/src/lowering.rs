@@ -95,6 +95,10 @@ pub struct Lowerer {
     /// lowers to a Cranelift call against this. Tag passes as i64
     /// (Cranelift has no u8 ABI param).
     box_typed_func: cranelift_module::FuncId,
+    /// FuncId of `vm_unbox_fixnum(r) -> i64`. `Inst::AnyToFix`
+    /// lowers to a Cranelift call against this. Helper consumes
+    /// the Any-tagged box and panics on non-Fixnum runtime values.
+    unbox_fixnum_func: cranelift_module::FuncId,
 }
 
 impl Lowerer {
@@ -139,6 +143,7 @@ impl Lowerer {
         builder.symbol("vm_value_clone", cs_vm::vm::vm_value_clone as *const u8);
         builder.symbol("vm_value_drop", cs_vm::vm::vm_value_drop as *const u8);
         builder.symbol("vm_box_typed", cs_vm::vm::vm_box_typed as *const u8);
+        builder.symbol("vm_unbox_fixnum", cs_vm::vm::vm_unbox_fixnum as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -255,6 +260,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_box_typed: {e}")))?;
 
+        // vm_unbox_fixnum — same shape as the accessors (i64 -> i64).
+        let unbox_fixnum_func = module
+            .declare_function(
+                "vm_unbox_fixnum",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_unbox_fixnum: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -271,6 +285,7 @@ impl Lowerer {
             value_clone_func,
             value_drop_func,
             box_typed_func,
+            unbox_fixnum_func,
         })
     }
 
@@ -405,6 +420,9 @@ impl Lowerer {
             let box_typed_fnref = self
                 .module
                 .declare_func_in_func(self.box_typed_func, builder.func);
+            let unbox_fixnum_fnref = self
+                .module
+                .declare_func_in_func(self.unbox_fixnum_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -467,6 +485,7 @@ impl Lowerer {
                         value_clone_fnref,
                         value_drop_fnref,
                         box_typed_fnref,
+                        unbox_fixnum_fnref,
                         inst,
                     )?;
                 }
@@ -624,6 +643,7 @@ fn lower_inst(
     value_clone_fnref: cranelift_codegen::ir::FuncRef,
     value_drop_fnref: cranelift_codegen::ir::FuncRef,
     box_typed_fnref: cranelift_codegen::ir::FuncRef,
+    unbox_fixnum_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -825,6 +845,19 @@ fn lower_inst(
             if results.len() != 1 {
                 return Err(JitError::Codegen(format!(
                     "BoxTyped expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::AnyToFix(dst, src) => {
+            // Lowers to vm_unbox_fixnum — consumes the box.
+            let v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(unbox_fixnum_fnref, &[v]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "AnyToFix expected 1 result, got {}",
                     results.len()
                 )));
             }

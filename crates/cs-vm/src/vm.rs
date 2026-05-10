@@ -422,6 +422,21 @@ pub unsafe extern "C" fn vm_box_typed(i: i64, tag: i64) -> i64 {
     value_to_any_i64(v)
 }
 
+/// Consume an Any-tagged box and extract its inner Fixnum as a
+/// raw i64. Panics if the boxed Value isn't a Fixnum — the
+/// caller's responsibility to ensure the type-feedback signature
+/// filtered out non-Fixnum-valued bodies upstream. Used by
+/// `Inst::AnyToFix` to feed an Any operand into a Fixnum-only op
+/// like `Add` or `Lt`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_unbox_fixnum(r: i64) -> i64 {
+    let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
+    match *boxed {
+        Value::Number(cs_core::Number::Fixnum(n)) => n,
+        ref other => panic!("vm_unbox_fixnum: not a fixnum ({})", other.type_name()),
+    }
+}
+
 /// Read the per-thread JIT-dispatch count. Test/diagnostics only.
 pub fn jit_call_count() -> u64 {
     VM_JIT_CALL_COUNT.with(|c| c.get())

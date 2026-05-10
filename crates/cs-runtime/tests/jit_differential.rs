@@ -1069,6 +1069,44 @@ fn diff_jit_cons_pair_return() {
 }
 
 #[test]
+fn diff_jit_arith_on_any_operand() {
+    // M6 Phase 4 iter AX: arithmetic on Any operands. `(car v)`
+    // returns an Any-tagged Box; `(+ (car v) 1)` needs raw Fixnum
+    // bits. The translator emits Inst::AnyToFix on Any operands
+    // to consume the box and extract the Fixnum.
+    let defines = &["(define (head-plus-one v) (+ (car v) 1))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+         (if (= i 1500) 'done (begin (head-plus-one (cons i 0)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, i64)] = &[
+        ("(head-plus-one (cons 5 0))", 6),
+        ("(head-plus-one (cons -3 99))", -2),
+        ("(head-plus-one (cons 41 'x))", 42),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Fixnum(j)),
+                Value::Number(cs_core::Number::Fixnum(w)),
+            ) => {
+                assert_eq!(j, w, "tier mismatch on {}", expr);
+                assert_eq!(*j, *expected, "wrong value on {}", expr);
+            }
+            other => panic!("expected fixnums on {}, got {:?}", expr, other),
+        }
+    }
+}
+
+#[test]
 fn diff_jit_mixed_tier_return() {
     // M6 Phase 4 iter AW: control-flow joins where one predecessor
     // pushes Any (e.g. `(car v)`) and the other pushes a typed

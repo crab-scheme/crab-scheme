@@ -288,6 +288,15 @@ pub enum Inst {
     /// value.
     BoxTyped(Value, Value, u8),
 
+    /// `dst = unbox_fixnum(src)` — consume an Any-tagged box and
+    /// extract its inner Fixnum as a raw i64. Lowers to
+    /// `vm_unbox_fixnum` which panics if the runtime value isn't
+    /// a Fixnum (the JIT body's type-feedback signature filtered
+    /// for that case at the dispatch layer; deopt rather than UB).
+    /// Inserted by `emit_arith_binop` / `emit_typed_lt` etc. when
+    /// an operand is `Type::Any` but the op needs raw Fixnum bits.
+    AnyToFix(Value, Value),
+
     /// Type guard: if the value's runtime type doesn't match the
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
     /// always dispatches dynamically).
