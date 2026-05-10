@@ -187,6 +187,9 @@ pub fn bytecode_to_rir(
                         )));
                     }
                 }
+                Inst::Pop => {
+                    pop_value(&mut sim_stack)?;
+                }
                 Inst::AddFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Add)?,
                 Inst::SubFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Sub)?,
                 Inst::MulFx2 => emit_binop(&mut insts, &mut sim_stack, &mut alloc, RirInst::Mul)?,
@@ -403,8 +406,8 @@ pub fn bytecode_to_rir(
                 }
                 other => {
                     return Err(TranslateError::Unsupported(format!(
-                        "opcode {:?} not in iter-5 scope",
-                        other
+                        "opcode {} not yet lowered",
+                        opcode_name(other)
                     )));
                 }
             }
@@ -477,6 +480,38 @@ fn pop_two_values(stack: &mut Vec<StackEntry>) -> Result<(RirValue, RirValue), T
     let b = pop_value(stack)?;
     let a = pop_value(stack)?;
     Ok((a, b))
+}
+
+/// Short opcode name for diagnostics (Debug prints fields too,
+/// which clutters error messages with closure indices etc.).
+fn opcode_name(inst: &Inst) -> &'static str {
+    match inst {
+        Inst::Const(_) => "Const",
+        Inst::LoadVar(_) => "LoadVar",
+        Inst::SetVar(_) => "SetVar",
+        Inst::DefineGlobal(_) => "DefineGlobal",
+        Inst::DefineLocal(_) => "DefineLocal",
+        Inst::Pop => "Pop",
+        Inst::JumpIfFalse(_) => "JumpIfFalse",
+        Inst::Jump(_) => "Jump",
+        Inst::Call(_) => "Call",
+        Inst::TailCall(_) => "TailCall",
+        Inst::MakeClosure(_) => "MakeClosure",
+        Inst::Return => "Return",
+        Inst::AddFx2 => "AddFx2",
+        Inst::SubFx2 => "SubFx2",
+        Inst::MulFx2 => "MulFx2",
+        Inst::LtFx2 => "LtFx2",
+        Inst::LeFx2 => "LeFx2",
+        Inst::GtFx2 => "GtFx2",
+        Inst::GeFx2 => "GeFx2",
+        Inst::EqFx2 => "EqFx2",
+        Inst::BranchOnGeFx2(_) => "BranchOnGeFx2",
+        Inst::BranchOnGtFx2(_) => "BranchOnGtFx2",
+        Inst::BranchOnLeFx2(_) => "BranchOnLeFx2",
+        Inst::BranchOnLtFx2(_) => "BranchOnLtFx2",
+        Inst::BranchOnNeFx2(_) => "BranchOnNeFx2",
+    }
 }
 
 fn lookup_block(
