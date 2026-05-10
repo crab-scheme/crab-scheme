@@ -56,6 +56,16 @@ pub struct Runtime {
     /// means the runtime hasn't opted into JIT (closures stay on
     /// the bytecode VM regardless of tier-up).
     pub(crate) jit_lowerer: Option<cs_jit_cranelift::Lowerer>,
+    /// Override for `(command-line)`. R6RS specifies that
+    /// command-line returns `(<program-path> <arg> ...)` — the
+    /// script path followed by the args passed after it. The
+    /// process's full argv (which includes `crabscheme`, the
+    /// `--tier` flag, and the `run` subcommand) is the wrong
+    /// answer. cs-cli's `run_file` sets this to the right list
+    /// before evaluating the script. When `None`, the builtin
+    /// falls back to `std::env::args()` for backward compat (REPL,
+    /// `-e` evaluation, etc.).
+    pub(crate) command_line: Option<Vec<String>>,
 }
 
 /// Opaque handle for a [`Pinned`] slot. See [`Runtime::pin`].
@@ -1563,7 +1573,18 @@ impl Runtime {
             loaded_libs: Vec::new(),
             ffi_ctx: None,
             jit_lowerer: None,
+            command_line: None,
         }
+    }
+
+    /// Set the `(command-line)` override for this runtime. Call
+    /// this before evaluating user code that may consult the
+    /// command line. R6RS expects `(<program> <arg> ...)` — the
+    /// script path followed by post-script args; the runtime
+    /// embedder is responsible for filtering its own dispatcher
+    /// args (e.g., `crabscheme --tier vm run`) out of the list.
+    pub fn set_command_line(&mut self, args: Vec<String>) {
+        self.command_line = Some(args);
     }
 
     /// Pin a Scheme `Value` so it survives any number of intervening

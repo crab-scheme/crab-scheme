@@ -56,6 +56,9 @@ enum Cmd {
     Run {
         /// Path to the .scm file.
         file: String,
+        /// Args passed to the script — surfaced via R6RS `(command-line)`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Start an interactive REPL.
     Repl,
@@ -72,7 +75,7 @@ fn main() -> ExitCode {
     }
 
     match cli.cmd {
-        Some(Cmd::Run { file }) => run_file(&file, via_vm, with_jit, color),
+        Some(Cmd::Run { file, args }) => run_file(&file, &args, via_vm, with_jit, color),
         Some(Cmd::Repl) | None => run_repl(via_vm, color),
     }
 }
@@ -113,7 +116,13 @@ fn run_eval(src: &str, via_vm: bool, with_jit: bool, color: bool) -> ExitCode {
     }
 }
 
-fn run_file(path: &str, via_vm: bool, with_jit: bool, color: bool) -> ExitCode {
+fn run_file(
+    path: &str,
+    script_args: &[String],
+    via_vm: bool,
+    with_jit: bool,
+    color: bool,
+) -> ExitCode {
     let src = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -128,6 +137,13 @@ fn run_file(path: &str, via_vm: bool, with_jit: bool, color: bool) -> ExitCode {
             return ExitCode::from(1);
         }
     }
+    // R6RS `(command-line)` — script path + args after it. Strip the
+    // crabscheme dispatcher's own argv so user code sees the same
+    // shape as `gsi script.scm a b` would.
+    let mut argv: Vec<String> = Vec::with_capacity(script_args.len() + 1);
+    argv.push(path.to_string());
+    argv.extend(script_args.iter().cloned());
+    rt.set_command_line(argv);
     match eval_with_tier(&mut rt, path, &src, via_vm) {
         Ok(v) => {
             if !matches!(v, Value::Unspecified) {

@@ -9517,12 +9517,27 @@ fn b_get_environment_variables(args: &[Value]) -> Result<Value, String> {
     Ok(Value::list(pairs))
 }
 
-/// `command-line` — returns process argv as a list of strings.
+/// `command-line` — R6RS §6.4. Returns a list whose first element
+/// is the script path and whose subsequent elements are the args
+/// passed after it. When the runtime has `command_line` set (via
+/// `Runtime::set_command_line`, typically from `cs-cli` before
+/// running a script), that list is returned verbatim. Otherwise
+/// (REPL, `-e`, embedded use without explicit set) the full
+/// process argv is returned for backward compatibility.
 fn b_command_line(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("command-line", "0", args.len()));
     }
-    let argv: Vec<Value> = std::env::args().map(Value::string).collect();
+    // SAFETY: command-line is invoked from inside an eval call.
+    // `Runtime::with_active` set the thread-local before eval ran;
+    // we read it here. The borrow lives only for the duration of
+    // building the list.
+    let from_runtime: Option<Vec<String>> =
+        unsafe { crate::Runtime::active() }.and_then(|rt| rt.command_line.as_ref().cloned());
+    let argv: Vec<Value> = match from_runtime {
+        Some(list) => list.into_iter().map(Value::string).collect(),
+        None => std::env::args().map(Value::string).collect(),
+    };
     Ok(Value::list(argv))
 }
 
