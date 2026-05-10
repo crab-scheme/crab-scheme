@@ -10,6 +10,9 @@ members = [
     "crates/cs-runtime",
     "crates/cs-vm",
     "crates/cs-gc",
+    "crates/cs-rir",
+    "crates/cs-jit",
+    "crates/cs-jit-cranelift",
     "crates/cs-cli",
 ]
 
@@ -31,6 +34,9 @@ cs-expand = { path = "crates/cs-expand" }
 cs-runtime = { path = "crates/cs-runtime" }
 cs-vm = { path = "crates/cs-vm" }
 cs-gc = { path = "crates/cs-gc" }
+cs-rir = { path = "crates/cs-rir" }
+cs-jit = { path = "crates/cs-jit" }
+cs-jit-cranelift = { path = "crates/cs-jit-cranelift" }
 
 # External crates
 logos = "0.14"

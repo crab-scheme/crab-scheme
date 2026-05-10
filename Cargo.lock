@@ -158,6 +158,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-jit"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-rir",
+]
+
+[[package]]
+name = "cs-jit-cranelift"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-jit",
+ "cs-rir",
+]
+
+[[package]]
 name = "cs-lex"
 version = "0.0.1"
 dependencies = [
@@ -174,6 +191,13 @@ dependencies = [
  "cs-core",
  "cs-diag",
  "cs-lex",
+]
+
+[[package]]
+name = "cs-rir"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
 ]
 
 [[package]]

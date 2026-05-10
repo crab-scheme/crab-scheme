@@ -1,0 +1,23 @@
+[package]
+name = "cs-jit-cranelift"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+description = "CrabScheme JIT backend lowering cs-rir to Cranelift IR and native code."
+
+[dependencies]
+cs-core = { path = "../cs-core" }
+cs-rir = { path = "../cs-rir" }
+cs-jit = { path = "../cs-jit" }
+
+# Cranelift dependencies — pinned per ADR 0007 D-9. The codegen and JIT
+# crates evolve together; bump in lockstep.
+#
+# Wired up in iter 2 once the lowering lands. Iter 1 ships only the
+# scaffold so we can land the trait + tier-up state machine without
+# blocking on Cranelift's compile time on first use.
+# cranelift-codegen = "0.105"
+# cranelift-frontend = "0.105"
+# cranelift-jit      = "0.105"
+# cranelift-module   = "0.105"

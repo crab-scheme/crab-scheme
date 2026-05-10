@@ -1,0 +1,11 @@
+[package]
+name = "cs-jit"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+description = "CrabScheme JIT abstraction (backend trait, tier-up state machine, deopt machinery)."
+
+[dependencies]
+cs-core = { path = "../cs-core" }
+cs-rir = { path = "../cs-rir" }

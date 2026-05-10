@@ -1,0 +1,242 @@
+//! CrabScheme JIT-backend IR (RIR — Rust IR).
+//!
+//! Lowered from `cs-ir` (the existing `CoreExpr` / bytecode source) and
+//! consumed by every JIT backend (`cs-jit-cranelift`, future
+//! `cs-jit-holy`). Backend-agnostic: SSA-shaped values, basic blocks,
+//! terminator-style control flow, with each opcode documented against
+//! its `cs-vm` bytecode equivalent so the differential test in the M6
+//! spec FR-5 reduces to per-instruction equivalence.
+//!
+//! See `.spec-workflow/specs/jit-cranelift/design.md` for the design
+//! and `docs/adr/0007-jit-design.md` for the architecture decisions.
+
+#![deny(unsafe_code)]
+
+/// SSA value identifier within a function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Value(pub u32);
+
+/// Basic-block identifier within a function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockId(pub u32);
+
+/// Coarse type tag carried alongside each SSA value. The JIT uses
+/// these for type-specialization: a `Fixnum`-tagged value can use
+/// integer ops directly; an `Any`-tagged value must dispatch
+/// dynamically.
+///
+/// Tags don't have to be precise — the deopt machinery catches the
+/// case where a value's actual type at runtime contradicts its tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Type {
+    /// A fixnum (i64). Direct register arithmetic possible.
+    Fixnum,
+    /// A flonum (f64). Direct FP arithmetic possible.
+    Flonum,
+    /// A boolean.
+    Boolean,
+    /// A character (u32 codepoint).
+    Character,
+    /// Heap-pointer to a Pair.
+    Pair,
+    /// Heap-pointer to a Vector.
+    Vector,
+    /// Heap-pointer to a String.
+    String,
+    /// Heap-pointer to a ByteVector.
+    ByteVector,
+    /// Heap-pointer to a Procedure (closure or builtin).
+    Procedure,
+    /// Type unknown at compile time — must do runtime dispatch.
+    Any,
+}
+
+/// Compile-time literal. Materialized as `LoadConst`.
+#[derive(Debug, Clone)]
+pub enum Const {
+    Fixnum(i64),
+    Flonum(f64),
+    Boolean(bool),
+    Character(char),
+    Null,
+    Unspecified,
+    Eof,
+    /// Symbol id from the runtime's symbol table; emitted as an i32.
+    Symbol(u32),
+    /// Static-string-table index. The JIT loads via a `static`-table
+    /// indirection so we don't bake string content into native code.
+    StringRef(u32),
+}
+
+/// One RIR instruction. Each variant cites the equivalent `cs-vm`
+/// bytecode opcode; the differential test asserts they produce
+/// identical results.
+#[derive(Debug, Clone)]
+pub enum Inst {
+    /// `dst = const`. cs-vm: `Inst::Const`.
+    LoadConst(Value, Const),
+
+    /// `dst = lhs + rhs`. cs-vm: `Inst::Add`.
+    /// Type-stable variant: both operands tagged Fixnum or Flonum;
+    /// guard inserted by the lowerer if not.
+    Add(Value, Value, Value),
+
+    /// `dst = lhs - rhs`. cs-vm: `Inst::Sub`.
+    Sub(Value, Value, Value),
+
+    /// `dst = lhs * rhs`. cs-vm: `Inst::Mul`.
+    Mul(Value, Value, Value),
+
+    /// `dst = (lhs < rhs)`. cs-vm: `Inst::Lt`.
+    Lt(Value, Value, Value),
+
+    /// `dst = (lhs == rhs)`. cs-vm: `Inst::Eq`.
+    Eq(Value, Value, Value),
+
+    /// `dst = call(callee, args...)`. cs-vm: `Inst::Call`.
+    /// `callee` is a Value of type Procedure; the JIT specializes on
+    /// the procedure identity if the type-feedback is monomorphic.
+    Call(Value, Value, Vec<Value>),
+
+    /// `dst = arg<i>`. cs-vm: implicit (arguments are on the stack
+    /// at the procedure entry; this names them as SSA values).
+    Param(Value, u32),
+
+    /// `dst = src` (move; lowered away in most backends but useful in
+    /// IR for clarity). cs-vm: no-op equivalent.
+    Move(Value, Value),
+
+    /// Type guard: if the value's runtime type doesn't match the
+    /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
+    /// always dispatches dynamically).
+    DeoptCheck(Value, Type),
+}
+
+/// Block terminator. Every basic block ends in exactly one of these.
+#[derive(Debug, Clone)]
+pub enum Term {
+    /// `return v`. cs-vm: `Inst::Ret`.
+    Return(Value),
+
+    /// Unconditional jump to `target`, passing `args` as block params.
+    Jump(BlockId, Vec<Value>),
+
+    /// Branch on `cond`. If `cond` is truthy go to `then_target`, else
+    /// `else_target`. cs-vm: `Inst::JumpIf` / `JumpIfNot`.
+    Branch(Value, BlockId, BlockId),
+}
+
+/// One basic block: a list of straight-line instructions plus a
+/// terminator. Block parameters are SSA values that incoming jumps
+/// supply (cf. Cranelift's block params).
+#[derive(Debug, Clone)]
+pub struct Block {
+    pub id: BlockId,
+    pub params: Vec<(Value, Type)>,
+    pub insts: Vec<Inst>,
+    pub terminator: Term,
+}
+
+/// One JIT-compilable procedure body.
+#[derive(Debug, Clone)]
+pub struct Function {
+    pub name: String,
+    pub params: Vec<(Value, Type)>,
+    pub entry: BlockId,
+    pub blocks: Vec<Block>,
+}
+
+impl Function {
+    /// Create an empty function with the given name and entry block.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            params: Vec::new(),
+            entry: BlockId(0),
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Number of basic blocks.
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Total instruction count across all blocks. Used as a coarse
+    /// "is this worth JIT-compiling" heuristic by the tier-up code.
+    pub fn inst_count(&self) -> usize {
+        self.blocks.iter().map(|b| b.insts.len()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_function_construction() {
+        let f = Function::new("foo");
+        assert_eq!(f.name, "foo");
+        assert_eq!(f.block_count(), 0);
+        assert_eq!(f.inst_count(), 0);
+    }
+
+    #[test]
+    fn one_block_one_instruction() {
+        let mut f = Function::new("inc");
+        f.params.push((Value(0), Type::Fixnum));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(Value(1), Const::Fixnum(1)),
+                Inst::Add(Value(2), Value(0), Value(1)),
+            ],
+            terminator: Term::Return(Value(2)),
+        });
+        assert_eq!(f.block_count(), 1);
+        assert_eq!(f.inst_count(), 2);
+    }
+
+    #[test]
+    fn const_variants_round_trip_via_clone() {
+        let consts = [
+            Const::Fixnum(42),
+            Const::Flonum(3.14),
+            Const::Boolean(true),
+            Const::Character('a'),
+            Const::Null,
+            Const::Unspecified,
+            Const::Eof,
+            Const::Symbol(7),
+            Const::StringRef(99),
+        ];
+        for c in consts {
+            // Clone path exists.
+            let _c2 = c.clone();
+        }
+    }
+
+    #[test]
+    fn type_tags_distinct() {
+        let tags = [
+            Type::Fixnum,
+            Type::Flonum,
+            Type::Boolean,
+            Type::Character,
+            Type::Pair,
+            Type::Vector,
+            Type::String,
+            Type::ByteVector,
+            Type::Procedure,
+            Type::Any,
+        ];
+        // Distinct under PartialEq.
+        for (i, a) in tags.iter().enumerate() {
+            for (j, b) in tags.iter().enumerate() {
+                assert_eq!(i == j, a == b);
+            }
+        }
+    }
+}
