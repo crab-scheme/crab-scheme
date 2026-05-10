@@ -158,6 +158,71 @@ thread_local! {
     static VM_JIT_CALL_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
+thread_local! {
+    /// Pointer to the current closure's captured `Env`, set by
+    /// `try_dispatch_jit` before calling into JITted code and
+    /// cleared on return. The JIT calls `vm_env_lookup_fixnum`
+    /// (below) which reads from this. Per-thread because the
+    /// runtime is single-threaded.
+    static JIT_CALLER_ENV: Cell<*const Env> = const { Cell::new(std::ptr::null()) };
+}
+
+/// RAII helper: set `JIT_CALLER_ENV` for the duration of a JIT
+/// call, restore on drop.
+struct JitEnvGuard {
+    prev: *const Env,
+}
+
+impl JitEnvGuard {
+    fn install(env: &Rc<Env>) -> Self {
+        let prev = JIT_CALLER_ENV.with(|c| c.get());
+        JIT_CALLER_ENV.with(|c| c.set(Rc::as_ptr(env)));
+        Self { prev }
+    }
+}
+
+impl Drop for JitEnvGuard {
+    fn drop(&mut self) {
+        JIT_CALLER_ENV.with(|c| c.set(self.prev));
+    }
+}
+
+/// Helper called by JIT-compiled code to look up a free variable's
+/// fixnum value in the closure's captured env. The env pointer is
+/// pulled from `JIT_CALLER_ENV` (set by `try_dispatch_jit`).
+///
+/// # Safety
+///
+/// The thread-local must be set to a valid Env pointer for the
+/// duration of any JIT call that lowers `Inst::EnvLookup`. The
+/// caller (the runtime's dispatch site) is responsible for that.
+///
+/// Returns the i64 value of the bound Fixnum. Panics on:
+/// - Unbound symbol.
+/// - Bound value not a Fixnum (TODO: deopt instead).
+///
+/// `extern "C"` so Cranelift can call it via a function pointer.
+#[no_mangle]
+pub extern "C" fn vm_env_lookup_fixnum(sym: i64) -> i64 {
+    let env_ptr = JIT_CALLER_ENV.with(|c| c.get());
+    if env_ptr.is_null() {
+        panic!("vm_env_lookup_fixnum: JIT_CALLER_ENV is null");
+    }
+    // SAFETY: caller (try_dispatch_jit) guarantees env_ptr points
+    // to a live Rc'd Env for the duration of the JIT call.
+    let env = unsafe { &*env_ptr };
+    let sym = Symbol(sym as u32);
+    match env.get(sym) {
+        Some(Value::Number(cs_core::Number::Fixnum(n))) => n,
+        Some(other) => panic!(
+            "vm_env_lookup_fixnum: symbol {:?} bound to non-Fixnum ({})",
+            sym,
+            other.type_name()
+        ),
+        None => panic!("vm_env_lookup_fixnum: unbound symbol {:?}", sym),
+    }
+}
+
 /// Read the per-thread JIT-dispatch count. Test/diagnostics only.
 pub fn jit_call_count() -> u64 {
     VM_JIT_CALL_COUNT.with(|c| c.get())
@@ -200,6 +265,11 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
         }
     }
     bump_jit_call_count();
+    // Install the closure's env in the JIT thread-local so any
+    // Inst::EnvLookup the body emits can read free vars. The
+    // guard restores the previous value (or null) on drop, even
+    // on panic from inside the JIT body.
+    let _env_guard = JitEnvGuard::install(&closure.env);
     let r: i64 = match args.len() {
         0 => {
             let f: extern "C" fn() -> i64 = unsafe { std::mem::transmute(ptr) };

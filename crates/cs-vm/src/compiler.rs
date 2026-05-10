@@ -297,11 +297,21 @@ fn compile_expr(
         }
         CoreExpr::Ref { name, .. } => {
             // Fold to Const if the name is a known immutable global AND not
-            // shadowed in any enclosing scope.
+            // shadowed in any enclosing scope. Restricted to Procedure
+            // values: builtins like `+`, `<`, `car` rarely get redefined
+            // and benefit hugely from the fold. User-bound non-procedure
+            // globals (numbers, strings, etc.) can be redefined / set!'d
+            // across compile units, so we keep them as LoadVar so the
+            // runtime resolves them live. (M6 Phase 2 iter B: this also
+            // preserves correctness for the JIT's env-lookup path —
+            // free-var refs to user globals stay as LoadVar in the
+            // bytecode and translate to Inst::EnvLookup at JIT time.)
             if !is_locally_bound(scope, *name) {
                 if let Some(v) = globals.get(name) {
-                    out.push(Inst::Const(v.clone()), span);
-                    return Ok(());
+                    if matches!(v, Value::Procedure(_)) {
+                        out.push(Inst::Const(v.clone()), span);
+                        return Ok(());
+                    }
                 }
             }
             out.push(Inst::LoadVar(*name), span);

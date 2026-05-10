@@ -181,10 +181,16 @@ pub fn bytecode_to_rir(
                     } else if Some(*sym) == self_name {
                         sim_stack.push(StackEntry::SelfRef);
                     } else {
-                        return Err(TranslateError::Unsupported(format!(
-                            "LoadVar of non-param {:?} (env access not yet supported)",
-                            sym
-                        )));
+                        // Free variable: emit RIR EnvLookup, which
+                        // the lowerer turns into a call to the
+                        // runtime helper `vm_env_lookup_fixnum`.
+                        // The helper reads the closure's env from
+                        // the thread-local set by `try_dispatch_jit`.
+                        // Currently only Fixnum-bound free vars are
+                        // supported; non-Fixnum bindings panic.
+                        let dst = alloc();
+                        insts.push(RirInst::EnvLookup(dst, sym.0));
+                        sim_stack.push(StackEntry::Value(dst));
                     }
                 }
                 Inst::Pop => {
@@ -700,7 +706,10 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_loadvar_rejected() {
+    fn loadvar_of_free_var_emits_envlookup() {
+        // Free-var LoadVar now lowers to Inst::EnvLookup (M6 Phase 2
+        // iter B). Translator accepts; the lowerer emits a Cranelift
+        // call to vm_env_lookup_fixnum.
         let mut syms = SymbolTable::new();
         let foo = syms.intern("foo");
         let body = vec![Inst::LoadVar(foo), Inst::Return];
@@ -712,17 +721,21 @@ mod tests {
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None,
         };
-        match bytecode_to_rir(&lam, "f", None) {
-            Err(TranslateError::Unsupported(msg)) => assert!(msg.contains("non-param")),
-            other => panic!("expected Unsupported, got {:?}", other),
-        }
+        let f = bytecode_to_rir(&lam, "f", None).expect("free-var LoadVar should translate");
+        // Look for the EnvLookup in block 0's insts.
+        let has_envlookup = f.blocks[0]
+            .insts
+            .iter()
+            .any(|i| matches!(i, RirInst::EnvLookup(_, _)));
+        assert!(has_envlookup, "expected EnvLookup, got {:?}", f.blocks[0]);
     }
 
     #[test]
     fn unsupported_general_call_rejected() {
         let mut syms = SymbolTable::new();
         let g = syms.intern("g");
-        // (g 1) — calls non-self.
+        // (g 1) — calls non-self. The LoadVar(g) succeeds (becomes
+        // EnvLookup); the Call non-self is what rejects.
         let body = vec![
             Inst::LoadVar(g),
             Inst::Const(Value::Number(Number::Fixnum(1))),
@@ -739,7 +752,7 @@ mod tests {
         };
         match bytecode_to_rir(&lam, "f", None) {
             Err(TranslateError::Unsupported(msg)) => assert!(
-                msg.contains("LoadVar") || msg.contains("non-param") || msg.contains("non-self"),
+                msg.contains("non-self") || msg.contains("Call"),
                 "msg = {msg}"
             ),
             other => panic!("expected Unsupported, got {:?}", other),

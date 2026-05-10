@@ -58,6 +58,9 @@ pub struct Lowerer {
     ctx: Context,
     func_ctx: FunctionBuilderContext,
     next_id: u64,
+    /// FuncId of the imported `vm_env_lookup_fixnum` helper.
+    /// `Inst::EnvLookup` lowers to a Cranelift call against this.
+    env_lookup_func: cranelift_module::FuncId,
 }
 
 impl Lowerer {
@@ -77,14 +80,37 @@ impl Lowerer {
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .map_err(|e| JitError::Codegen(format!("isa finish: {e}")))?;
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        let module = JITModule::new(builder);
+        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        // Register runtime helpers that JITted code calls. The
+        // address comes from cs-vm's `extern "C"` function; the
+        // linker resolves the symbol across workspace crates via
+        // `#[no_mangle]`.
+        builder.symbol(
+            "vm_env_lookup_fixnum",
+            cs_vm::vm::vm_env_lookup_fixnum as *const u8,
+        );
+        let mut module = JITModule::new(builder);
+
+        // Import vm_env_lookup_fixnum as a Cranelift function so
+        // the lowerer can call it. Signature: extern "C" fn(i64) -> i64.
+        let mut env_lookup_sig = module.make_signature();
+        env_lookup_sig.params.push(AbiParam::new(I64));
+        env_lookup_sig.returns.push(AbiParam::new(I64));
+        let env_lookup_func = module
+            .declare_function(
+                "vm_env_lookup_fixnum",
+                cranelift_module::Linkage::Import,
+                &env_lookup_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function env_lookup: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
             ctx,
             func_ctx: FunctionBuilderContext::new(),
             next_id: 0,
+            env_lookup_func,
         })
     }
 
@@ -132,6 +158,10 @@ impl Lowerer {
 
             // Import a self-FuncRef for CallSelf to dispatch through.
             let self_fnref = self.module.declare_func_in_func(func_id, builder.func);
+            // Import the env-lookup helper into this function.
+            let env_lookup_fnref = self
+                .module
+                .declare_func_in_func(self.env_lookup_func, builder.func);
 
             // Create a Cranelift block for every RIR block, with the
             // matching block params.
@@ -186,7 +216,13 @@ impl Lowerer {
                 }
 
                 for inst in &rir_block.insts {
-                    lower_inst(&mut builder, &mut value_map, self_fnref, inst)?;
+                    lower_inst(
+                        &mut builder,
+                        &mut value_map,
+                        self_fnref,
+                        env_lookup_fnref,
+                        inst,
+                    )?;
                 }
 
                 lower_terminator(&mut builder, &block_map, &value_map, &rir_block.terminator)?;
@@ -255,6 +291,7 @@ fn lower_inst(
     b: &mut FunctionBuilder,
     map: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
     self_fnref: cranelift_codegen::ir::FuncRef,
+    env_lookup_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -320,6 +357,21 @@ fn lower_inst(
             if results.len() != 1 {
                 return Err(JitError::Codegen(format!(
                     "CallSelf expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::EnvLookup(dst, sym) => {
+            // Pass the symbol id as i64; the helper reads
+            // JIT_CALLER_ENV from a thread-local that the runtime
+            // dispatch site set before the JIT call.
+            let sym_v = b.ins().iconst(I64, *sym as i64);
+            let inst_ref = b.ins().call(env_lookup_fnref, &[sym_v]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "EnvLookup expected 1 result, got {}",
                     results.len()
                 )));
             }

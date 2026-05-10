@@ -105,6 +105,16 @@ pub enum Inst {
     /// the general procedure-value lookup that lands later.
     CallSelf(Value, Vec<Value>),
 
+    /// `dst = env_lookup(sym)`. Look up a free variable by symbol id
+    /// in the closure's captured environment. cs-vm: `Inst::LoadVar`
+    /// of a non-parameter non-self symbol. The lowerer emits a
+    /// Cranelift call to a runtime helper that reads from a
+    /// thread-local env pointer set up by the dispatch site.
+    /// Currently the helper assumes the bound value is a Fixnum
+    /// and returns its i64; non-fixnum bindings panic. A future
+    /// iter adds proper deopt for type mismatch.
+    EnvLookup(Value, u32),
+
     /// `dst = arg<i>`. cs-vm: implicit (arguments are on the stack
     /// at the procedure entry; this names them as SSA values).
     Param(Value, u32),

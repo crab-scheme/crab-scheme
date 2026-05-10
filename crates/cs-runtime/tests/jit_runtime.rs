@@ -137,6 +137,46 @@ fn recursive_fib_jits_after_warmup() {
     );
 }
 
+/// M6 Phase 2 iter B: closures with free Fixnum vars can JIT.
+/// `(define base 100) (define add-base (lambda (x) (+ x base)))` —
+/// `base` is a free var inside add-base's body. The JIT translator
+/// emits Inst::EnvLookup, which the lowerer turns into a Cranelift
+/// call to vm_env_lookup_fixnum at runtime.
+#[test]
+fn jit_handles_free_var_env_lookup() {
+    cs_vm::vm::reset_jit_call_count();
+    cs_vm::vm::reset_tier_up_count();
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<jit>", "(define base 100)").unwrap();
+    rt.eval_str_via_vm("<jit>", "(define add-base (lambda (x) (+ x base)))")
+        .unwrap();
+
+    // Warm add-base past the threshold.
+    rt.eval_str_via_vm(
+        "<jit>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (add-base i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    // Functional: (add-base 42) = 142. The JIT body reads base from
+    // the captured env via Inst::EnvLookup.
+    let r = rt.eval_str_via_vm("<jit>", "(add-base 42)").unwrap();
+    match r {
+        Value::Number(Number::Fixnum(142)) => {}
+        other => panic!("expected 142, got {:?}", other),
+    }
+
+    // base mutation reflects in subsequent JIT calls (env is shared
+    // via Rc, the helper reads live state).
+    rt.eval_str_via_vm("<jit>", "(set! base 1000)").unwrap();
+    let r = rt.eval_str_via_vm("<jit>", "(add-base 5)").unwrap();
+    match r {
+        Value::Number(Number::Fixnum(1005)) => {}
+        other => panic!("expected 1005 after set!, got {:?}", other),
+    }
+}
+
 #[test]
 fn unsupported_closure_stays_on_vm_silently() {
     // A closure with non-fixnum / env-access body translates fail

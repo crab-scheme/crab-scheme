@@ -10,6 +10,7 @@ description = "CrabScheme JIT backend lowering cs-rir to Cranelift IR and native
 cs-core = { path = "../cs-core" }
 cs-rir = { path = "../cs-rir" }
 cs-jit = { path = "../cs-jit" }
+cs-vm = { path = "../cs-vm" }
 
 # Cranelift — codegen + frontend + JIT module + module trait. Bump
 # in lockstep per ADR 0007 D-9. Iter 2 picks 0.131 (latest stable
