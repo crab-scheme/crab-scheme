@@ -324,6 +324,7 @@ fn lower_inst(
                 Const::Fixnum(n) => b.ins().iconst(I64, *n),
                 Const::Boolean(true) => b.ins().iconst(I64, 1),
                 Const::Boolean(false) => b.ins().iconst(I64, 0),
+                Const::Character(c) => b.ins().iconst(I64, *c as u32 as i64),
                 Const::Null => b.ins().iconst(I64, 0),
                 Const::Unspecified => b.ins().iconst(I64, 0),
                 other => {
@@ -385,6 +386,12 @@ fn lower_inst(
             map.insert(*dst, widened);
         }
         Inst::Move(dst, src) => {
+            let v = lookup(map, *src)?;
+            map.insert(*dst, v);
+        }
+        Inst::IntCharBitcast(dst, src) => {
+            // Same i64 carrying the codepoint; only the dst's
+            // type tag changes for the return-type post-pass.
             let v = lookup(map, *src)?;
             map.insert(*dst, v);
         }

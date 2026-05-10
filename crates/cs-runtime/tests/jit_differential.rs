@@ -299,7 +299,11 @@ fn diff_predicate_returns_boolean() {
     // even though the source used `positive?`. Now the dispatcher
     // decodes them as proper Booleans.
     assert!(matches!(jit_t, Value::Boolean(true)), "jit_t = {:?}", jit_t);
-    assert!(matches!(jit_f, Value::Boolean(false)), "jit_f = {:?}", jit_f);
+    assert!(
+        matches!(jit_f, Value::Boolean(false)),
+        "jit_f = {:?}",
+        jit_f
+    );
     assert!(
         matches!(jit_zero, Value::Boolean(false)),
         "jit_zero = {:?}",
@@ -313,4 +317,42 @@ fn diff_predicate_returns_boolean() {
     );
     assert_eq!(format!("{:?}", jit_f), format!("{:?}", walker_f));
     assert_eq!(format!("{:?}", jit_zero), format!("{:?}", walker_zero));
+}
+
+#[test]
+fn diff_integer_to_char_returns_character() {
+    // M6 Phase 2 iter X: procedures whose body ends in
+    // `(integer->char ...)` should JIT and decode the i64 codepoint
+    // into a proper Value::Character on return.
+    let defines = &["(define digit (lambda (n) (integer->char (+ 48 n))))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (digit 3) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let jit_zero = rt.eval_str_via_vm("<diff>", "(digit 0)").unwrap();
+    let jit_nine = rt.eval_str_via_vm("<diff>", "(digit 9)").unwrap();
+
+    let walker_zero = walker_eval(defines, "(digit 0)");
+    let walker_nine = walker_eval(defines, "(digit 9)");
+
+    assert!(
+        matches!(jit_zero, Value::Character('0')),
+        "jit_zero = {:?}",
+        jit_zero
+    );
+    assert!(
+        matches!(jit_nine, Value::Character('9')),
+        "jit_nine = {:?}",
+        jit_nine
+    );
+    assert_eq!(format!("{:?}", jit_zero), format!("{:?}", walker_zero));
+    assert_eq!(format!("{:?}", jit_nine), format!("{:?}", walker_nine));
 }

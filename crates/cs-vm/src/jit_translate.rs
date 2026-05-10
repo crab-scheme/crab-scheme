@@ -607,6 +607,14 @@ pub fn bytecode_to_rir(
                                         // (square x) → x * x
                                         insts.push(RirInst::Mul(dst, args[0], args[0]));
                                     }
+                                    ("integer->char", 1) => {
+                                        // Same bit pattern as the Fixnum input;
+                                        // the return-type post-pass will tag
+                                        // dst as Character so the dispatcher
+                                        // decodes the i64 codepoint into a
+                                        // Value::Character on the way out.
+                                        insts.push(RirInst::IntCharBitcast(dst, args[0]));
+                                    }
                                     _ => {
                                         return Err(TranslateError::Unsupported(format!(
                                             "Call to builtin `{name}` (arity {}) not yet lowered",
@@ -692,6 +700,7 @@ pub fn bytecode_to_rir(
 fn infer_return_type(func: &cs_rir::Function) -> Type {
     use cs_rir::Const;
     let mut bool_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
+    let mut char_values: std::collections::HashSet<RirValue> = std::collections::HashSet::new();
     for block in &func.blocks {
         for inst in &block.insts {
             match inst {
@@ -701,25 +710,39 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {
                     bool_values.insert(*dst);
                 }
+                RirInst::IntCharBitcast(dst, _) => {
+                    char_values.insert(*dst);
+                }
+                RirInst::LoadConst(dst, Const::Character(_)) => {
+                    char_values.insert(*dst);
+                }
                 _ => {}
             }
         }
     }
     let mut seen_fixnum = false;
     let mut seen_bool = false;
+    let mut seen_char = false;
     for block in &func.blocks {
         if let Term::Return(v) = &block.terminator {
-            if bool_values.contains(v) {
+            if char_values.contains(v) {
+                seen_char = true;
+            } else if bool_values.contains(v) {
                 seen_bool = true;
             } else {
                 seen_fixnum = true;
             }
         }
     }
-    if seen_bool && !seen_fixnum {
-        Type::Boolean
-    } else {
-        Type::Fixnum
+    // Disjoint-tag inference: only resolve to a non-Fixnum tag when
+    // every observed return agrees. Mixed returns fall back to
+    // Fixnum (the conservative default — caller will see wrapped
+    // numbers; the type guard at the dispatch site catches misuse
+    // downstream rather than masking it as a wrong-type Value).
+    match (seen_char, seen_bool, seen_fixnum) {
+        (true, false, false) => Type::Character,
+        (false, true, false) => Type::Boolean,
+        _ => Type::Fixnum,
     }
 }
 

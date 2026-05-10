@@ -339,11 +339,19 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
 }
 
 /// Wrap a raw i64 from a JIT'd body into the matching `Value` form
-/// based on the closure's stored return-type tag. Boolean is decoded
-/// as `r != 0` so the JIT's existing 0/1 Lt/Eq encoding works.
+/// based on the closure's stored return-type tag. Boolean uses 0/1
+/// from Lt/Eq; Character carries the codepoint in the low 32 bits.
 fn decode_jit_return(rt: u8, r: i64) -> Value {
     match rt {
         JIT_RT_BOOLEAN => Value::Boolean(r != 0),
+        JIT_RT_CHARACTER => {
+            // Truncate to u32; `char::from_u32` rejects surrogates and
+            // out-of-range codepoints. If the JIT body produced an
+            // invalid codepoint we fall back to U+FFFD rather than
+            // panicking — this lines up with `decode_bytes` in the
+            // codec layer.
+            Value::Character(char::from_u32(r as u32).unwrap_or('\u{FFFD}'))
+        }
         _ => Value::Number(cs_core::Number::Fixnum(r)),
     }
 }
@@ -531,6 +539,7 @@ pub struct VmClosure {
 /// so the storage Cell stays Copy without pulling cs-rir into cs-vm.
 pub const JIT_RT_FIXNUM: u8 = 0;
 pub const JIT_RT_BOOLEAN: u8 = 1;
+pub const JIT_RT_CHARACTER: u8 = 2;
 
 impl VmClosure {
     /// Install a native function pointer compiled by the JIT, with

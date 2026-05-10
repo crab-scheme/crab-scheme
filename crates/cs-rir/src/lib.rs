@@ -166,6 +166,13 @@ pub enum Inst {
     /// IR for clarity). cs-vm: no-op equivalent.
     Move(Value, Value),
 
+    /// `dst = src` (same bit pattern), but tags `dst` as a Character
+    /// for return-type inference. Lowered identically to `Move` in
+    /// the i64-only ABI — the i64 carries the codepoint, the
+    /// dispatcher decodes it back into `Value::Character` based on
+    /// the function's inferred return type. Used for `integer->char`.
+    IntCharBitcast(Value, Value),
+
     /// Type guard: if the value's runtime type doesn't match the
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
     /// always dispatches dynamically).
