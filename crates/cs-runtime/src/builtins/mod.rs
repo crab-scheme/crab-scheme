@@ -453,6 +453,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("record-type-sealed?", b_record_type_sealed_p),
         ("record-type-opaque?", b_record_type_opaque_p),
         ("record-type-generative?", b_record_type_generative_p),
+        // R6RS §7.2 — bridge from procedural rtds to compound conditions.
+        ("condition-predicate", b_condition_predicate),
+        ("condition-accessor", b_condition_accessor),
         // copy variants
         ("vector-copy", b_vector_copy),
         ("vector-copy!", b_vector_copy_bang),
@@ -3971,10 +3974,28 @@ fn is_compound_cond(v: &Value) -> bool {
 
 fn is_simple_cond(v: &Value) -> bool {
     if let Some(t) = vec_first_tag(v) {
-        is_known_simple_tag(&t)
-    } else {
-        false
+        return is_known_simple_tag(&t);
     }
+    // R6RS §7 — a record-typed value whose rtd descends from
+    // `&condition` is also a simple condition. We recognize ANY
+    // procedural-records instance as a candidate; the condition?
+    // predicate is descendants-inclusive in the existing string-tagged
+    // hierarchy and treats procedural-records instances as additional
+    // simples carried alongside.
+    is_proc_record_simple(v)
+}
+
+/// True if `v` is a procedural-records instance — a vector whose
+/// first slot is a Symbol registered in PROC_RECORD_RTDS. Enables
+/// procedural rtds to participate in compound conditions.
+fn is_proc_record_simple(v: &Value) -> bool {
+    if let Value::Vector(vc) = v {
+        let v = vc.borrow();
+        if let Some(Value::Symbol(s)) = v.first() {
+            return PROC_RECORD_RTDS.with(|m| m.borrow().contains_key(s));
+        }
+    }
+    false
 }
 
 fn is_any_cond(v: &Value) -> bool {
@@ -11665,6 +11686,98 @@ fn b_record_type_opaque_p(args: &[Value]) -> Result<Value, String> {
         return Err(type_err("record-type-opaque?", "rtd", &args[0]));
     }
     Ok(vec_at(&args[0], 5).unwrap_or(Value::Boolean(false)))
+}
+
+/// `(condition-predicate rtd)` — R6RS §7.2 bridge: returns a
+/// 1-arg predicate that returns #t when its arg is a condition
+/// containing a record of `rtd`'s type (or a descendant) as one
+/// of its simples.
+fn b_condition_predicate(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("condition-predicate", "1", args.len()));
+    }
+    if !is_rtd(&args[0]) {
+        return Err(type_err("condition-predicate", "rtd", &args[0]));
+    }
+    let tag = rtd_tag(&args[0]).ok_or("condition-predicate: rtd has no tag")?;
+    let f: std::sync::Arc<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync> =
+        std::sync::Arc::new(move |args: &[Value]| {
+            if args.len() != 1 {
+                return Err("condition-predicate: 1 arg".into());
+            }
+            let mut found = false;
+            for_each_simple(&args[0], |simple| {
+                if found {
+                    return;
+                }
+                if let Value::Vector(vc) = simple {
+                    let v = vc.borrow();
+                    if let Some(Value::Symbol(s)) = v.first() {
+                        if tag_descends_from(*s, tag) {
+                            found = true;
+                        }
+                    }
+                }
+            });
+            Ok(Value::Boolean(found))
+        });
+    Ok(crate::proc::make_host_builtin("condition-predicate", f))
+}
+
+/// `(condition-accessor rtd proc)` — R6RS §7.2 bridge: returns a
+/// 1-arg accessor that takes a condition, finds its simple of
+/// `rtd`'s type (or a descendant), and applies `proc` to that
+/// simple. Errors if no matching simple is present.
+///
+/// Foundation: `proc` must be a host-builtin (e.g. produced by
+/// `record-accessor`) so we can hold its inner closure across the
+/// Send+Sync boundary. Generic Scheme lambdas would need an active
+/// EvalCtx to apply, which the closure's signature cannot reach.
+fn b_condition_accessor(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("condition-accessor", "2", args.len()));
+    }
+    if !is_rtd(&args[0]) {
+        return Err(type_err("condition-accessor", "rtd", &args[0]));
+    }
+    let tag = rtd_tag(&args[0]).ok_or("condition-accessor: rtd has no tag")?;
+    // Extract the host-builtin's Arc<dyn Fn> directly — that lets us
+    // dispatch with no runtime back-pointer required.
+    let inner = match &args[1] {
+        Value::Procedure(p) => p
+            .as_any()
+            .downcast_ref::<cs_vm::vm::VmHostBuiltin>()
+            .map(|h| h.f.clone()),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        "condition-accessor: proc must be a host-builtin (e.g. from record-accessor)".to_string()
+    })?;
+    let f: std::sync::Arc<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync> =
+        std::sync::Arc::new(move |args: &[Value]| {
+            if args.len() != 1 {
+                return Err("condition-accessor: 1 arg".into());
+            }
+            let mut hit: Option<Value> = None;
+            for_each_simple(&args[0], |simple| {
+                if hit.is_some() {
+                    return;
+                }
+                if let Value::Vector(vc) = simple {
+                    let v = vc.borrow();
+                    if let Some(Value::Symbol(s)) = v.first() {
+                        if tag_descends_from(*s, tag) {
+                            hit = Some(simple.clone());
+                        }
+                    }
+                }
+            });
+            let target = hit.ok_or_else(|| {
+                "condition-accessor: condition does not contain matching simple".to_string()
+            })?;
+            (inner)(&[target])
+        });
+    Ok(crate::proc::make_host_builtin("condition-accessor", f))
 }
 
 fn b_record_type_generative_p(args: &[Value]) -> Result<Value, String> {

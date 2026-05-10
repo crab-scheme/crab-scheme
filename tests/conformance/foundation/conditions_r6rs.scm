@@ -182,3 +182,47 @@
 (define nn (make-no-nans-violation))
 (test-true  "nn-pred"                 (no-nans-violation? nn))
 (test-true  "nn-is-impl"              (implementation-restriction-violation? nn))
+
+; ---- R6RS §7.2 — condition-predicate / condition-accessor bridge -----
+(test-section "R6RS condition-predicate / accessor over procedural rtds")
+
+(define ce-rtd
+  (make-record-type-descriptor '&my-err #f #f #f #f
+    (vector (list 'immutable 'reason) (list 'immutable 'code))))
+(define ce-cd  (make-record-constructor-descriptor ce-rtd #f #f))
+(define ce-mk  (record-constructor ce-cd))
+(define ce?    (condition-predicate ce-rtd))
+(define ce-reason (condition-accessor ce-rtd (record-accessor ce-rtd 0)))
+(define ce-code   (condition-accessor ce-rtd (record-accessor ce-rtd 1)))
+
+(define ce1 (ce-mk "disk full" 42))
+(test-true  "bare-procrec-is-condition" (condition? ce1))
+(test-true  "bare-procrec-pred"         (ce? ce1))
+(test-equal "bare-reason"               "disk full" (ce-reason ce1))
+(test-equal "bare-code"                 42 (ce-code ce1))
+
+;; In a compound — interleaved with stock simples.
+(define c2 (condition (make-message-condition "ouch") ce1 (make-irritants-condition '(1 2))))
+(test-true  "compound-includes-our-rec" (ce? c2))
+(test-equal "compound-msg"              "ouch" (condition-message c2))
+(test-equal "compound-our-reason"       "disk full" (ce-reason c2))
+(test-equal "compound-our-code"         42 (ce-code c2))
+(test-equal "compound-irritants"        '(1 2) (condition-irritants c2))
+
+;; Predicate is descendant-inclusive.
+(define cd-rtd
+  (make-record-type-descriptor '&my-disk-err ce-rtd #f #f #f
+    (vector (list 'immutable 'path))))
+(define cd-mk (record-constructor (make-record-constructor-descriptor cd-rtd #f #f)))
+(define cd?  (condition-predicate cd-rtd))
+(define cd1  (cd-mk "blah" 42 "/tmp"))
+(test-true  "descendant-pred-on-self"   (cd? cd1))
+(test-true  "ancestor-pred-on-desc"     (ce? cd1))    ; descendant included
+(test-false "desc-pred-on-bare-anc"     (cd? ce1))    ; not the other way
+(test-equal "anc-accessor-on-desc"      "blah" (ce-reason cd1))
+
+;; condition-accessor errors when no matching simple is present.
+(test-true "cond-accessor-rejects-mismatch"
+  (guard (c (#t #t))
+    (ce-reason (make-message-condition "no rec here"))
+    #f))
