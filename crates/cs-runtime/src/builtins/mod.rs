@@ -592,6 +592,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("null-environment", b_null_environment),
         ("scheme-report-environment", b_scheme_report_environment),
         ("load", b_load),
+        ("load-shared-library", b_load_shared_library),
         ("div-and-mod", b_div_and_mod),
         ("div0-and-mod0", b_div0_and_mod0),
         ("exact-integer-sqrt", b_exact_integer_sqrt),
@@ -8101,6 +8102,26 @@ fn b_eval(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         .map_err(|e| format!("eval: expand error: {}", e.message()))?;
     drop(expander);
     crate::eval::eval(&core, ctx.top.clone(), ctx).map_err(|e| e.message())
+}
+
+// ---- load-shared-library ----
+
+fn b_load_shared_library(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("load-shared-library", "1", args.len()));
+    }
+    let path = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        v => return Err(type_err("load-shared-library", "string", v)),
+    };
+    // SAFETY: load-shared-library is only callable from inside an
+    // active eval, which set ACTIVE_RUNTIME via with_active. The
+    // active back-pointer is the unique &mut access for the call.
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "load-shared-library: no active runtime".to_string())?;
+    rt.load_shared_library(&path)
+        .map_err(|e| format!("load-shared-library: {}", e))?;
+    Ok(Value::Unspecified)
 }
 
 // ---- error-object accessors ----

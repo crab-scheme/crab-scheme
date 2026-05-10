@@ -52,6 +52,7 @@ num-traits = "0.2"
 unicode-normalization = "0.1"
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
+libloading = "0.8"
 proptest = "1"
 
 [profile.release]

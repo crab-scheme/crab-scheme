@@ -41,6 +41,16 @@ pub struct Runtime {
     /// Next PinId — never reused. u64 is enough for any conceivable
     /// program lifetime (~5×10^14 pins/sec for 1000 years).
     next_pin_id: Rc<Cell<u64>>,
+    /// Shared libraries loaded via [`Runtime::load_shared_library`].
+    /// Held here only so the plugin's text segment stays mapped for
+    /// the runtime's lifetime; we never inspect them after register.
+    loaded_libs: Vec<libloading::Library>,
+    /// Cached C-ABI context. Lazily initialized on first FFI use;
+    /// kept alive for the runtime's lifetime so registered host
+    /// procedures' captured back-pointers stay valid. Boxed so the
+    /// runtime back-pointer (which equals `self`) stays valid even
+    /// if Runtime fields are reordered.
+    ffi_ctx: Option<Box<crate::ffi::RuntimeFfiContext>>,
 }
 
 /// Opaque handle for a [`Pinned`] slot. See [`Runtime::pin`].
@@ -1545,6 +1555,8 @@ impl Runtime {
             // "null" ValueRef. Internal Pinned guards never use 0
             // either, so the convention is consistent across users.
             next_pin_id: Rc::new(Cell::new(1)),
+            loaded_libs: Vec::new(),
+            ffi_ctx: None,
         }
     }
 
@@ -1628,7 +1640,7 @@ impl Runtime {
     /// top-level expression (or `Unspecified` for empty/define-only input).
     pub fn eval_str(&mut self, name: &str, src: &str) -> Result<Value, Diagnostic> {
         let file_id = self.sources.add(name, src);
-        self.eval_str_in_file(file_id, src)
+        self.with_active(|rt| rt.eval_str_in_file(file_id, src))
     }
 
     /// Register a Rust procedure as a top-level Scheme binding. After
@@ -1797,6 +1809,10 @@ impl Runtime {
     /// path is best-effort for pure-arithmetic / pure-list programs.
     pub fn eval_str_via_vm(&mut self, name: &str, src: &str) -> Result<Value, Diagnostic> {
         let file_id = self.sources.add(name, src);
+        self.with_active(|rt| rt.eval_str_via_vm_inner(file_id, src))
+    }
+
+    fn eval_str_via_vm_inner(&mut self, file_id: FileId, src: &str) -> Result<Value, Diagnostic> {
         let data = match read_all(file_id, src, &mut self.syms) {
             Ok(d) => d,
             Err(errs) => {

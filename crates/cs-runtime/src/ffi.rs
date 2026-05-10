@@ -25,6 +25,7 @@
 //! See `.spec-workflow/specs/ffi/{requirements,design}.md` and
 //! `docs/adr/0008-ffi-design.md` D-2.
 
+use std::cell::Cell;
 use std::os::raw::c_char;
 use std::sync::Arc;
 
@@ -36,6 +37,102 @@ use cs_ffi::abi::{
 use cs_ffi::{FfiError, HostProcedure};
 
 use crate::Runtime;
+
+thread_local! {
+    /// Active-runtime back-pointer, set by [`Runtime::with_active`]
+    /// for the duration of an eval call. Read by the
+    /// `(load-shared-library)` builtin to recover `&mut Runtime`
+    /// from inside the eval call chain (where the borrow has been
+    /// downgraded to `&mut EvalCtx`).
+    ///
+    /// Single-threaded model: only one runtime active per thread.
+    /// Nested `with_active` saves and restores via the returned
+    /// guard, so re-entrancy is safe.
+    static ACTIVE_RUNTIME: Cell<*mut Runtime> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+impl Runtime {
+    /// Run `f` with this runtime stashed in the thread-local
+    /// `ACTIVE_RUNTIME` slot. The previous value is saved and
+    /// restored on return so nested calls work correctly.
+    ///
+    /// Used by `Runtime::eval_str` / `eval_str_via_vm` to make
+    /// the active runtime reachable from inside builtins that
+    /// need it (`(load-shared-library)` etc.).
+    pub fn with_active<R>(&mut self, f: impl FnOnce(&mut Runtime) -> R) -> R {
+        let prev = ACTIVE_RUNTIME.with(|c| c.replace(self as *mut Runtime));
+        let result = f(self);
+        ACTIVE_RUNTIME.with(|c| c.set(prev));
+        result
+    }
+
+    /// Borrow the thread's active runtime, if any. Returns `None`
+    /// if no runtime is currently active.
+    ///
+    /// # Safety
+    ///
+    /// The caller MUST ensure that no other live `&mut Runtime`
+    /// exists. The intended use is from inside a builtin call
+    /// where the only `&mut Runtime` was just downgraded via
+    /// `with_active`, so the back-pointer is the unique mutable
+    /// access for the call's duration.
+    pub unsafe fn active<'a>() -> Option<&'a mut Runtime> {
+        let ptr = ACTIVE_RUNTIME.with(|c| c.get());
+        if ptr.is_null() {
+            None
+        } else {
+            Some(&mut *ptr)
+        }
+    }
+
+    /// Open a shared library at `path`, look up its
+    /// `crabscheme_register` symbol, and call it with a freshly-
+    /// built C-ABI context so the plugin can register its host
+    /// procedures.
+    ///
+    /// The library handle is retained on this runtime so the
+    /// plugin's code (function bodies for registered procedures)
+    /// remains mapped for the runtime's lifetime.
+    ///
+    /// # Errors
+    ///
+    /// - `FfiError::HostFailure` on dlopen failure, missing
+    ///   `crabscheme_register` symbol, or non-zero return from
+    ///   the plugin's register entry point.
+    pub fn load_shared_library(&mut self, path: &str) -> Result<(), FfiError> {
+        // SAFETY: dlopen of a user-provided path. Loading native
+        // code is inherently unsafe and the caller is asserting
+        // the path is trusted.
+        let lib = unsafe { libloading::Library::new(path) }.map_err(|e| {
+            FfiError::HostFailure(format!("load_shared_library({path}): dlopen: {e}"))
+        })?;
+
+        // SAFETY: the symbol's signature must match the C-ABI
+        // contract; mismatch is the plugin author's bug.
+        let register: libloading::Symbol<extern "C" fn(*mut RuntimeFfi) -> i32> = unsafe {
+            lib.get(b"crabscheme_register\0").map_err(|e| {
+                FfiError::HostFailure(format!(
+                    "load_shared_library({path}): crabscheme_register symbol: {e}"
+                ))
+            })?
+        };
+
+        // Use the cached context — its *mut Runtime back-pointer
+        // outlives this call, so registered host procedures'
+        // captured rt_ptr stays valid for the runtime's lifetime.
+        let p = self.ffi_context_ptr();
+        let status = register(p);
+
+        if status != 0 {
+            return Err(FfiError::HostFailure(format!(
+                "load_shared_library({path}): plugin register returned {status}"
+            )));
+        }
+
+        self.loaded_libs.push(lib);
+        Ok(())
+    }
+}
 
 /// Boxed wrapper produced by [`Runtime::ffi_context`]. The plugin
 /// sees only the `ffi` field; the runtime's callbacks cast back
@@ -68,13 +165,40 @@ impl RuntimeFfiContext {
 }
 
 impl Runtime {
-    /// Build a [`RuntimeFfiContext`] backed by this runtime.
+    /// Borrow this runtime's lazy [`RuntimeFfiContext`], creating
+    /// it on first use. The Box is kept alive for the runtime's
+    /// lifetime so any plugin-captured `*mut RuntimeFfi` stays
+    /// valid.
     ///
-    /// The returned `Box` must be kept alive for the duration of
-    /// any FFI session that uses its pointer. The runtime back-
-    /// pointer is stored as a raw pointer; `&mut self` is held only
-    /// for the call (the box itself does not borrow, matching
-    /// `Pinned`'s no-borrow design).
+    /// Returns a `*mut RuntimeFfi` pointing into the cached box.
+    /// Equivalent to `self.ffi_ctx.as_mut().unwrap().as_ffi_ptr()`
+    /// after the lazy init.
+    pub fn ffi_context_ptr(&mut self) -> *mut RuntimeFfi {
+        if self.ffi_ctx.is_none() {
+            let runtime_ptr = self as *mut Runtime;
+            let ffi = RuntimeFfi {
+                api_version: CRABSCHEME_FFI_API_VERSION,
+                _reserved: 0,
+                register_proc: ffi_register_proc,
+                eval_str: ffi_eval_str,
+                alloc_pair: ffi_alloc_pair,
+                alloc_fixnum: ffi_alloc_fixnum,
+                alloc_string: ffi_alloc_string,
+                release_value: ffi_release_value,
+                raise: ffi_raise,
+            };
+            self.ffi_ctx = Some(Box::new(RuntimeFfiContext {
+                ffi,
+                runtime: runtime_ptr,
+            }));
+        }
+        self.ffi_ctx.as_mut().unwrap().as_ffi_ptr()
+    }
+
+    /// Test-only helper: build a fresh non-cached `Box<RuntimeFfiContext>`.
+    /// Used by unit tests that exercise the C-ABI directly without
+    /// needing the cached singleton lifetime.
+    #[doc(hidden)]
     pub fn ffi_context(&mut self) -> Box<RuntimeFfiContext> {
         let runtime_ptr = self as *mut Runtime;
         let ffi = RuntimeFfi {
