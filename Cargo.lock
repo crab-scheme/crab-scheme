@@ -146,6 +146,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-ffi"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+]
+
+[[package]]
 name = "cs-gc"
 version = "0.0.1"
 
@@ -207,6 +214,7 @@ dependencies = [
  "cs-core",
  "cs-diag",
  "cs-expand",
+ "cs-ffi",
  "cs-gc",
  "cs-ir",
  "cs-lex",

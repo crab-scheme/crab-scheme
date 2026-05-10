@@ -1,0 +1,10 @@
+[package]
+name = "cs-ffi"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+description = "CrabScheme Rust FFI surface — host-procedure trait, marshaling, error types."
+
+[dependencies]
+cs-core = { path = "../cs-core" }

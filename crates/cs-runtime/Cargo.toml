@@ -9,6 +9,7 @@ license.workspace = true
 cs-core = { workspace = true }
 cs-diag = { workspace = true }
 cs-expand = { workspace = true }
+cs-ffi = { workspace = true }
 cs-gc = { workspace = true }
 cs-ir = { workspace = true }
 cs-lex = { workspace = true }

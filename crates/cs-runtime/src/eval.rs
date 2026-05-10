@@ -196,6 +196,9 @@ pub fn apply_procedure(
                     }
                 };
             }
+            if let Some(h) = any.downcast_ref::<crate::proc::HostBuiltin>() {
+                return (h.f)(args).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY));
+            }
             if let Some(c) = any.downcast_ref::<Closure>() {
                 if !c.params.accepts_arity(args.len()) {
                     return Err(EvalError::new(
@@ -336,6 +339,10 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
                                 BuiltinFn::Higher(f) => f(&arg_vals, ctx),
                                 BuiltinFn::Syms(f) => f(&arg_vals, ctx.syms),
                             };
+                            return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
+                        }
+                        if let Some(h) = any.downcast_ref::<crate::proc::HostBuiltin>() {
+                            let res = (h.f)(&arg_vals);
                             return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
                         }
                         if let Some(c) = any.downcast_ref::<Closure>() {

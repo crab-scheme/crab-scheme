@@ -641,6 +641,27 @@ fn run_dispatch(
                         }
                         continue;
                     }
+                    if let Some(h) = any.downcast_ref::<VmHostBuiltin>() {
+                        let name = h.name;
+                        let raw = (h.f)(&stack[args_start..stack_len]);
+                        let r = match raw {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return Err(builtin_err_to_raised(name, &e, syms, call_span));
+                            }
+                        };
+                        stack.truncate(func_idx);
+                        stack.push(r);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack.pop().ok_or_else(|| {
+                                    VmError::new("empty stack at tail-host-builtin")
+                                });
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(b) = any.downcast_ref::<VmBuiltinSyms>() {
                         let name = b.name;
                         let raw = (b.f)(&stack[args_start..stack_len], syms);
@@ -2482,6 +2503,39 @@ pub fn make_vm_builtin_syms(name: &'static str, f: VmBuiltinSymsFn) -> Value {
     Value::Procedure(p)
 }
 
+/// Boxed-closure VM builtin — for FFI host procedures whose
+/// implementation captures state (an `Arc<dyn HostProcedure>`) and
+/// therefore can't be a plain `fn` pointer. Handled symmetrically
+/// with `VmBuiltin` in the dispatch loop.
+#[allow(clippy::type_complexity)]
+pub struct VmHostBuiltin {
+    pub name: &'static str,
+    pub f: std::sync::Arc<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for VmHostBuiltin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VmHostBuiltin({})", self.name)
+    }
+}
+
+impl Procedure for VmHostBuiltin {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> Option<&str> {
+        Some(self.name)
+    }
+}
+
+pub fn make_vm_host_builtin(
+    name: &'static str,
+    f: std::sync::Arc<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync>,
+) -> Value {
+    let p: Rc<dyn Procedure> = Rc::new(VmHostBuiltin { name, f });
+    Value::Procedure(p)
+}
+
 /// Marker for the `apply` builtin. The VM call dispatch recognizes this
 /// type and spreads the last arg (a list) before calling the inner procedure.
 #[derive(Debug)]
@@ -3013,6 +3067,9 @@ pub fn vm_call_sync(
             }
             if let Some(b) = any.downcast_ref::<VmBuiltinSyms>() {
                 return (b.f)(args, syms).map_err(|e| VmError::new(format!("{}: {}", b.name, e)));
+            }
+            if let Some(h) = any.downcast_ref::<VmHostBuiltin>() {
+                return (h.f)(args).map_err(|e| VmError::new(format!("{}: {}", h.name, e)));
             }
             if let Some(c) = any.downcast_ref::<VmClosure>() {
                 let lam = &c.bc.lambdas[c.lambda_idx];
@@ -3930,6 +3987,7 @@ macro_rules! trace_leaf_proc {
 trace_leaf_proc!(
     VmBuiltin,
     VmBuiltinSyms,
+    VmHostBuiltin,
     VmApply,
     VmMap,
     VmForEach,

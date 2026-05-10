@@ -1504,6 +1504,59 @@ impl Runtime {
         self.eval_str_in_file(file_id, src)
     }
 
+    /// Register a Rust procedure as a top-level Scheme binding. After
+    /// this, Scheme code can call `(<name> args...)` and dispatch to
+    /// the supplied `cs_ffi::HostProcedure`.
+    ///
+    /// The proc is installed on both the walker and VM tiers so it
+    /// works on either evaluation path.
+    ///
+    /// `FfiError` returned by the proc is translated into a Scheme
+    /// condition that `with-exception-handler` can catch:
+    /// - `TypeMismatch` and `HostFailure` -> standard error
+    /// - `ArityError` -> arity error condition
+    /// - `Panic` -> error with the panic message (the boundary
+    ///   already caught the panic via `catch_unwind`).
+    ///
+    /// See `.spec-workflow/specs/ffi/{requirements,design}.md` and
+    /// `docs/adr/0008-ffi-design.md`.
+    pub fn register_host_procedure(&mut self, proc: std::sync::Arc<dyn cs_ffi::HostProcedure>) {
+        let name_owned: String = proc.name().to_string();
+        let name_static: &'static str = Box::leak(name_owned.into_boxed_str());
+
+        // Single shared dispatcher closure both tiers point at via Arc
+        // clones. FfiError translation matches the format the eval
+        // layer's `builtin_err_to_eval` parses ("name: rest") so the
+        // resulting Scheme condition has &who and &message simples
+        // populated.
+        let proc_arc = proc;
+        let dispatcher: std::sync::Arc<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync> =
+            std::sync::Arc::new(move |args: &[Value]| {
+                proc_arc.call(args).map_err(|e| match e {
+                    cs_ffi::FfiError::ArityError {
+                        name,
+                        expected,
+                        got,
+                    } => format!("{}: expected {} args, got {}", name, expected, got),
+                    cs_ffi::FfiError::TypeMismatch { expected, got } => {
+                        format!("{}: expected {}, got {}", name_static, expected, got)
+                    }
+                    cs_ffi::FfiError::Panic(msg) => format!("{}: panic: {}", name_static, msg),
+                    cs_ffi::FfiError::HostFailure(msg) => format!("{}: {}", name_static, msg),
+                })
+            });
+
+        let sym = self.syms.intern(name_static);
+        self.top.define(
+            sym,
+            crate::proc::make_host_builtin(name_static, dispatcher.clone()),
+        );
+        self.vm_env.define(
+            sym,
+            cs_vm::vm::make_vm_host_builtin(name_static, dispatcher),
+        );
+    }
+
     fn eval_str_in_file(&mut self, file_id: FileId, src: &str) -> Result<Value, Diagnostic> {
         let data = match read_all(file_id, src, &mut self.syms) {
             Ok(d) => d,

@@ -115,6 +115,52 @@ pub fn make_builtin_pure(name: &'static str, f: PureBuiltinFn) -> Value {
     Value::Procedure(p)
 }
 
+/// Host-procedure adapter — wraps an `Arc`-stored closure so the
+/// runtime can install user-supplied Rust callbacks via the FFI
+/// without requiring them to be plain `fn` pointers.
+///
+/// Used by `Runtime::register_host_procedure` (M5b iter 2). The
+/// boxed closure is shared across walker and VM tiers via separate
+/// `Arc` clones.
+pub struct HostBuiltin {
+    pub name: &'static str,
+    #[allow(clippy::type_complexity)]
+    pub f: std::sync::Arc<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for HostBuiltin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HostBuiltin({})", self.name)
+    }
+}
+
+impl Procedure for HostBuiltin {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> Option<&str> {
+        Some(self.name)
+    }
+}
+
+impl cs_core::Trace for HostBuiltin {
+    fn trace(&self, _marker: &mut cs_core::Marker) {
+        // The boxed closure may capture Values, but in the FFI use
+        // case the closure holds only an `Arc<dyn HostProcedure>`
+        // (Send+Sync, no Scheme-Value capture). User code that
+        // captures Values across the boundary is required to use
+        // Pinned<'rt> per ADR 0008-D-3.
+    }
+}
+
+pub fn make_host_builtin(
+    name: &'static str,
+    f: std::sync::Arc<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync>,
+) -> Value {
+    let p: Rc<dyn Procedure> = Rc::new(HostBuiltin { name, f });
+    Value::Procedure(p)
+}
+
 pub fn make_builtin_higher(name: &'static str, f: HoBuiltinFn) -> Value {
     let p: Rc<dyn Procedure> = Rc::new(Builtin {
         name,

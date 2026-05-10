@@ -13,6 +13,7 @@ members = [
     "crates/cs-rir",
     "crates/cs-jit",
     "crates/cs-jit-cranelift",
+    "crates/cs-ffi",
     "crates/cs-cli",
 ]
 
@@ -37,6 +38,7 @@ cs-gc = { path = "crates/cs-gc" }
 cs-rir = { path = "crates/cs-rir" }
 cs-jit = { path = "crates/cs-jit" }
 cs-jit-cranelift = { path = "crates/cs-jit-cranelift" }
+cs-ffi = { path = "crates/cs-ffi" }
 
 # External crates
 logos = "0.14"
