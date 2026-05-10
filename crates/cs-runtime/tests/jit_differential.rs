@@ -877,8 +877,18 @@ fn diff_jit_introspection_and_distinct_compiles() {
     let flo_str = rt.format_value(&flo_status, cs_core::WriteMode::Write);
     let fix_str = rt.format_value(&fix_status, cs_core::WriteMode::Write);
     let stats_str = rt.format_value(&stats, cs_core::WriteMode::Write);
-    assert_eq!(flo_str, "(jit-on flonum flonum)");
-    assert_eq!(fix_str, "(jit-on fixnum fixnum)");
+    // Shape: (jit-on <return> (<params...>) calls <N> deopts <M>).
+    // We pin the prefix; counts depend on test harness ordering.
+    assert!(
+        flo_str.starts_with("(jit-on flonum (flonum) calls "),
+        "flo: {}",
+        flo_str
+    );
+    assert!(
+        fix_str.starts_with("(jit-on fixnum (fixnum) calls "),
+        "fix: {}",
+        fix_str
+    );
     assert!(matches!(installed, Value::Boolean(true)));
     assert!(
         stats_str.starts_with('(') && stats_str.ends_with(')'),

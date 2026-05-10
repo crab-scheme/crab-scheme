@@ -328,6 +328,7 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
         }
     }
     bump_jit_call_count();
+    closure.bump_jit_call_count_self();
     // Install the closure's env in the JIT thread-local so any
     // Inst::EnvLookup the body emits can read free vars. The
     // guard restores the previous value (or null) on drop, even
@@ -574,6 +575,12 @@ pub struct VmClosure {
     /// new layout. (Item 12 of the JIT roadmap — feedback-driven
     /// recompile.)
     jit_deopt_count: Cell<u32>,
+    /// Per-closure JIT call counter. Bumped each time
+    /// `try_dispatch_jit` successfully runs the native body.
+    /// Exposed via the `jit-status` builtin so tests/benchmarks
+    /// can pin down which specific closures are tier'd up vs
+    /// just having a JIT pointer that nobody dispatches through.
+    jit_call_count: Cell<u64>,
 }
 
 /// How many type-guard misses a closure tolerates before the
@@ -644,6 +651,15 @@ impl VmClosure {
 
     pub fn jit_deopt_count(&self) -> u32 {
         self.jit_deopt_count.get()
+    }
+
+    pub fn jit_call_count(&self) -> u64 {
+        self.jit_call_count.get()
+    }
+
+    pub(crate) fn bump_jit_call_count_self(&self) {
+        let n = self.jit_call_count.get().saturating_add(1);
+        self.jit_call_count.set(n);
     }
 
     /// Clear the JIT pointer + deopt counter so the next call's
@@ -2605,6 +2621,7 @@ fn run_dispatch(
                     jit_return_type: Cell::new(JIT_RT_FIXNUM),
                     jit_param_types: Cell::new(JIT_PARAM_TYPES_ALL_FIXNUM),
                     jit_deopt_count: Cell::new(0),
+                    jit_call_count: Cell::new(0),
                 };
                 let p: Rc<dyn Procedure> = Rc::new(cl);
                 stack.push(Value::Procedure(p));

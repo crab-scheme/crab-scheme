@@ -11396,7 +11396,7 @@ fn b_command_line(args: &[Value]) -> Result<Value, String> {
 // `(jit-status proc)`        -> if not a closure: 'not-a-closure
 //                               otherwise:
 //                                 'jit-off                -- never tier'd up
-//                                 (jit-on <return-tag> <param-tags>...)
+//                                 (jit-on <return-tag> (<param-tag>...) calls <N> deopts <M>)
 //                                                          where each tag is
 //                                                          'fixnum 'boolean
 //                                                          'character or 'flonum
@@ -11447,15 +11447,22 @@ fn b_jit_status(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String>
         };
         Value::Symbol(syms.intern(name))
     };
-    let mut out = Vec::new();
-    out.push(Value::Symbol(syms.intern("jit-on")));
-    out.push(tag_to_sym(closure.jit_return_type(), syms));
     let arity = closure.jit_arity();
     let packed = closure.jit_param_types();
+    let mut params: Vec<Value> = Vec::with_capacity(arity as usize);
     for i in 0..arity {
         let nibble = ((packed >> (i as u32 * 4)) & 0xF) as u8;
-        out.push(tag_to_sym(nibble, syms));
+        params.push(tag_to_sym(nibble, syms));
     }
+    let out = vec![
+        Value::Symbol(syms.intern("jit-on")),
+        tag_to_sym(closure.jit_return_type(), syms),
+        Value::list(params),
+        Value::Symbol(syms.intern("calls")),
+        Value::fixnum(closure.jit_call_count() as i64),
+        Value::Symbol(syms.intern("deopts")),
+        Value::fixnum(closure.jit_deopt_count() as i64),
+    ];
     Ok(Value::list(out))
 }
 
