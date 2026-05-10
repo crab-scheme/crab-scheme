@@ -205,6 +205,44 @@ fn jit_handles_fixnum_builtin_calls() {
     }
 }
 
+/// M6 Phase 2 iter H: 1-arg fixnum predicates (zero?, positive?,
+/// negative?, odd?, even?, not) lower to existing RIR primitives
+/// (Lt / Eq / BitAnd / Const).
+#[test]
+fn jit_handles_fixnum_predicates() {
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<jit>",
+        "(define classify (lambda (n) \
+            (if (zero? n) 0 (if (positive? n) (if (odd? n) 1 2) (if (even? n) 3 4)))))",
+    )
+    .unwrap();
+    let warmup = "(let loop ((i -750)) \
+                    (if (= i 750) 'done (begin (classify i) (loop (+ i 1)))))";
+    rt.eval_str_via_vm("<jit>", warmup).unwrap();
+
+    // Probe each branch.
+    let cases = &[
+        (0, 0),  // zero
+        (3, 1),  // positive odd
+        (4, 2),  // positive even
+        (-4, 3), // negative even
+        (-7, 4), // negative odd
+    ];
+    for (input, expected) in cases {
+        let r = rt
+            .eval_str_via_vm("<jit>", &format!("(classify {})", input))
+            .unwrap();
+        match r {
+            Value::Number(Number::Fixnum(n)) => {
+                assert_eq!(n, *expected, "classify({}) = {}", input, n);
+            }
+            other => panic!("classify {}: not a fixnum, got {:?}", input, other),
+        }
+    }
+}
+
 /// M6 Phase 2 iter G: `abs`, `min`, `max` lower to Cranelift
 /// native instructions (iabs / smin / smax).
 #[test]

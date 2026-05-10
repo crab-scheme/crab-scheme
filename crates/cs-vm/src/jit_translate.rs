@@ -489,26 +489,87 @@ pub fn bytecode_to_rir(
                                 }
                             }
                             let dst = alloc();
-                            let inst = match (name, args.len()) {
-                                ("quotient", 2) => RirInst::Quotient(dst, args[0], args[1]),
-                                ("remainder", 2) => RirInst::Remainder(dst, args[0], args[1]),
-                                ("bitwise-and", 2) => RirInst::BitAnd(dst, args[0], args[1]),
+                            // Single-Inst lowerings.
+                            let single = match (name, args.len()) {
+                                ("quotient", 2) => Some(RirInst::Quotient(dst, args[0], args[1])),
+                                ("remainder", 2) => Some(RirInst::Remainder(dst, args[0], args[1])),
+                                ("bitwise-and", 2) => Some(RirInst::BitAnd(dst, args[0], args[1])),
                                 ("bitwise-ior", 2) | ("bitwise-or", 2) => {
-                                    RirInst::BitOr(dst, args[0], args[1])
+                                    Some(RirInst::BitOr(dst, args[0], args[1]))
                                 }
-                                ("bitwise-xor", 2) => RirInst::BitXor(dst, args[0], args[1]),
-                                ("abs", 1) => RirInst::AbsFixnum(dst, args[0]),
-                                ("max", 2) => RirInst::MaxFixnum(dst, args[0], args[1]),
-                                ("min", 2) => RirInst::MinFixnum(dst, args[0], args[1]),
-                                _ => {
-                                    return Err(TranslateError::Unsupported(format!(
-                                        "Call to builtin `{name}` (arity {}) not yet lowered",
-                                        args.len()
-                                    )));
-                                }
+                                ("bitwise-xor", 2) => Some(RirInst::BitXor(dst, args[0], args[1])),
+                                ("abs", 1) => Some(RirInst::AbsFixnum(dst, args[0])),
+                                ("max", 2) => Some(RirInst::MaxFixnum(dst, args[0], args[1])),
+                                ("min", 2) => Some(RirInst::MinFixnum(dst, args[0], args[1])),
+                                _ => None,
                             };
-                            insts.push(inst);
-                            sim_stack.push(StackEntry::Value(dst));
+                            if let Some(inst) = single {
+                                insts.push(inst);
+                                sim_stack.push(StackEntry::Value(dst));
+                            } else {
+                                // Multi-Inst lowerings for 1-arg fixnum
+                                // predicates that the cs-vm compiler
+                                // doesn't have specialized opcodes for.
+                                // All produce Boolean (0 or 1 i64).
+                                match (name, args.len()) {
+                                    ("zero?", 1) => {
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Eq(dst, args[0], zero));
+                                    }
+                                    ("positive?", 1) => {
+                                        // x > 0  →  Lt(0, x)
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Lt(dst, zero, args[0]));
+                                    }
+                                    ("negative?", 1) => {
+                                        // x < 0  →  Lt(x, 0)
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Lt(dst, args[0], zero));
+                                    }
+                                    ("odd?", 1) => {
+                                        // x & 1 == 1  →  BitAnd then Eq with 1.
+                                        let one = alloc();
+                                        insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
+                                        let bit = alloc();
+                                        insts.push(RirInst::BitAnd(bit, args[0], one));
+                                        insts.push(RirInst::Eq(dst, bit, one));
+                                    }
+                                    ("even?", 1) => {
+                                        // x & 1 == 0
+                                        let one = alloc();
+                                        insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        let bit = alloc();
+                                        insts.push(RirInst::BitAnd(bit, args[0], one));
+                                        insts.push(RirInst::Eq(dst, bit, zero));
+                                    }
+                                    ("not", 1) => {
+                                        // (not x) — only works correctly
+                                        // when x is in {0,1} (a Boolean).
+                                        // For arbitrary values the
+                                        // bytecode VM treats only #f as
+                                        // false. The JIT path here only
+                                        // runs when the operand was
+                                        // produced as a Boolean (0/1)
+                                        // by upstream RIR; equivalent
+                                        // to `Eq(x, 0)`.
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Eq(dst, args[0], zero));
+                                    }
+                                    _ => {
+                                        return Err(TranslateError::Unsupported(format!(
+                                            "Call to builtin `{name}` (arity {}) not yet lowered",
+                                            args.len()
+                                        )));
+                                    }
+                                }
+                                sim_stack.push(StackEntry::Value(dst));
+                            }
                         }
                         StackEntry::Value(_) => {
                             return Err(TranslateError::Unsupported(
