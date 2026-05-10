@@ -456,6 +456,14 @@ fn lower_inst(
             let widened = b.ins().uextend(I64, cmp);
             map.insert(*dst, widened);
         }
+        Inst::FlonumSqrt(dst, src) => funary(b, map, *dst, *src, |b, x| b.ins().sqrt(x))?,
+        Inst::FlonumAbs(dst, src) => funary(b, map, *dst, *src, |b, x| b.ins().fabs(x))?,
+        Inst::FlonumMax(dst, lhs, rhs) => {
+            fbinop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().fmax(l, r))?
+        }
+        Inst::FlonumMin(dst, lhs, rhs) => {
+            fbinop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().fmin(l, r))?
+        }
         Inst::Param(_, _) => {
             // Param entries are populated from the entry block's
             // appended params before lower_inst runs.
@@ -524,6 +532,24 @@ fn binop(
     let r = lookup(map, rhs)?;
     let v = op(b, l, r);
     map.insert(dst, v);
+    Ok(())
+}
+
+/// Flonum unary op: bitcast i64 carrier to f64, run the op, bitcast
+/// back. Same semantics-on-bits as `fbinop`.
+fn funary(
+    b: &mut FunctionBuilder,
+    map: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
+    dst: RirValue,
+    src: RirValue,
+    op: impl FnOnce(&mut FunctionBuilder, cranelift_codegen::ir::Value) -> cranelift_codegen::ir::Value,
+) -> Result<(), JitError> {
+    let s_i = lookup(map, src)?;
+    let mf = cranelift_codegen::ir::MemFlags::new();
+    let s_f = b.ins().bitcast(F64, mf, s_i);
+    let v_f = op(b, s_f);
+    let v_i = b.ins().bitcast(I64, mf, v_f);
+    map.insert(dst, v_i);
     Ok(())
 }
 

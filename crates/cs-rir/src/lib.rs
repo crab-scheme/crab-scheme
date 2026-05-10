@@ -115,6 +115,20 @@ pub enum Inst {
     /// integer compare on bits would mishandle.
     FlonumEq(Value, Value, Value),
 
+    /// `dst = sqrt(src)` (flonum). Lowers to Cranelift `sqrt`.
+    FlonumSqrt(Value, Value),
+
+    /// `dst = |src|` (flonum). Lowers to Cranelift `fabs`. Strips
+    /// the sign bit; NaN propagates unchanged.
+    FlonumAbs(Value, Value),
+
+    /// `dst = max(lhs, rhs)` (flonum). Lowers to Cranelift `fmax` —
+    /// IEEE-754 maximum (NaN-preserving on both inputs).
+    FlonumMax(Value, Value, Value),
+
+    /// `dst = min(lhs, rhs)` (flonum). Lowers to Cranelift `fmin`.
+    FlonumMin(Value, Value, Value),
+
     /// `dst = (lhs < rhs)`. cs-vm: `Inst::Lt`.
     Lt(Value, Value, Value),
 

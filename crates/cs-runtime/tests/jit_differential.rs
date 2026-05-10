@@ -574,3 +574,54 @@ fn diff_flonum_branch() {
         }
     }
 }
+
+#[test]
+fn diff_flonum_unary_and_minmax() {
+    // M6 Phase 2 iter AD: flsqrt / flabs / flmax / flmin lower to
+    // Cranelift sqrt / fabs / fmax / fmin when operands are
+    // statically Flonum-typed. Body composes them through
+    // multi-flonum arithmetic.
+    let defines = &[
+        "(define hyp-flo (lambda (a b) \
+            (let ((fa (real->flonum a)) (fb (real->flonum b))) \
+              (flsqrt (+ (* fa fa) (* fb fb))))))",
+        "(define clamped-abs (lambda (n lo hi) \
+            (let ((f (real->flonum n)) (flo (real->flonum lo)) (fhi (real->flonum hi))) \
+              (flmin fhi (flmax flo (flabs f))))))",
+    ];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+            (if (= i 1500) 'done \
+                (begin (hyp-flo 3 4) (clamped-abs i 0 100) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, f64)] = &[
+        ("(hyp-flo 3 4)", 5.0),
+        ("(hyp-flo 5 12)", 13.0),
+        ("(clamped-abs 50 0 100)", 50.0),
+        ("(clamped-abs -200 0 100)", 100.0),
+        ("(clamped-abs -10 0 100)", 10.0),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Flonum(j)),
+                Value::Number(cs_core::Number::Flonum(w)),
+            ) => {
+                assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
+                assert_eq!(*j, *expected, "value mismatch on {}", expr);
+            }
+            other => panic!("{}: expected flonums, got {:?}", expr, other),
+        }
+    }
+}

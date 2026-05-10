@@ -703,6 +703,42 @@ pub fn bytecode_to_rir(
                                         insts.push(RirInst::FixToFlo(dst, args[0]));
                                         value_types.insert(dst, Type::Flonum);
                                     }
+                                    // Flonum unary builtins. Only fire when
+                                    // the operand is statically Flonum-
+                                    // typed, otherwise fall through to the
+                                    // unsupported tail (deopt to bytecode).
+                                    ("flsqrt", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumSqrt(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("flabs", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumAbs(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("flmax", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumMax(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("flmin", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumMin(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
                                     ("char->integer", 1) => {
                                         // Symmetric to integer->char: the i64
                                         // *already* carries the codepoint, so
@@ -855,7 +891,15 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::LoadConst(dst, Const::Character(_)) => {
                     char_values.insert(*dst);
                 }
-                RirInst::FixToFlo(dst, _) => {
+                RirInst::FixToFlo(dst, _)
+                | RirInst::FlonumAdd(dst, _, _)
+                | RirInst::FlonumSub(dst, _, _)
+                | RirInst::FlonumMul(dst, _, _)
+                | RirInst::FlonumDiv(dst, _, _)
+                | RirInst::FlonumSqrt(dst, _)
+                | RirInst::FlonumAbs(dst, _)
+                | RirInst::FlonumMax(dst, _, _)
+                | RirInst::FlonumMin(dst, _, _) => {
                     flo_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Flonum(_)) => {
