@@ -123,6 +123,25 @@ pub enum Inst {
     /// just `()` (void) — no SSA result.
     EnvSet(u32, Value),
 
+    /// `dst = sdiv(lhs, rhs)`. R6RS `quotient` for fixnums.
+    /// Cranelift native sdiv (signed integer divide). Divide-by-
+    /// zero traps; the JIT body propagates the trap as a panic
+    /// (matches the bytecode VM's error path).
+    Quotient(Value, Value, Value),
+
+    /// `dst = srem(lhs, rhs)`. R6RS `remainder` for fixnums.
+    Remainder(Value, Value, Value),
+
+    /// `dst = band(lhs, rhs)`. R6RS `bitwise-and` (R6RS) /
+    /// `bitwise-and-bitwise` for two fixnums.
+    BitAnd(Value, Value, Value),
+
+    /// `dst = bor(lhs, rhs)`. R6RS `bitwise-ior` for two fixnums.
+    BitOr(Value, Value, Value),
+
+    /// `dst = bxor(lhs, rhs)`. R6RS `bitwise-xor` for two fixnums.
+    BitXor(Value, Value, Value),
+
     /// `dst = arg<i>`. cs-vm: implicit (arguments are on the stack
     /// at the procedure entry; this names them as SSA values).
     Param(Value, u32),

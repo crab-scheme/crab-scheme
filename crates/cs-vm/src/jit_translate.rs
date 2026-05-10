@@ -170,6 +170,21 @@ pub fn bytecode_to_rir(
             ip += 1;
             match op {
                 Inst::Const(v) => {
+                    // Procedure constants (compiler-folded builtins
+                    // like `quotient`, `bitwise-and`) get pushed as
+                    // BuiltinRef sentinels. The matching Call N
+                    // consumes them and emits a specialized RIR op.
+                    if let cs_core::Value::Procedure(p) = v {
+                        if let Some(name) = p.name() {
+                            // Leak the name into 'static. Builtins
+                            // we lower have stable static names; the
+                            // leak is one-per-distinct-builtin per
+                            // process and bounded.
+                            let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+                            sim_stack.push(StackEntry::BuiltinRef(leaked));
+                            continue;
+                        }
+                    }
                     let c = value_to_const(v)?;
                     let dst = alloc();
                     insts.push(RirInst::LoadConst(dst, c));
@@ -409,6 +424,9 @@ pub fn bytecode_to_rir(
                             StackEntry::SelfRef => Err(TranslateError::Unsupported(
                                 "self-ref in Jump-arg position".into(),
                             )),
+                            StackEntry::BuiltinRef(_) => Err(TranslateError::Unsupported(
+                                "builtin-ref in Jump-arg position".into(),
+                            )),
                         })
                         .collect::<Result<_, _>>()?;
                     seed_block_entry(
@@ -444,9 +462,9 @@ pub fn bytecode_to_rir(
                             for e in args_entries {
                                 match e {
                                     StackEntry::Value(v) => args.push(v),
-                                    StackEntry::SelfRef => {
+                                    StackEntry::SelfRef | StackEntry::BuiltinRef(_) => {
                                         return Err(TranslateError::Unsupported(
-                                            "self ref as arg".into(),
+                                            "non-Value entry as Call arg".into(),
                                         ));
                                     }
                                 }
@@ -455,9 +473,43 @@ pub fn bytecode_to_rir(
                             insts.push(RirInst::CallSelf(dst, args));
                             sim_stack.push(StackEntry::Value(dst));
                         }
+                        StackEntry::BuiltinRef(name) => {
+                            // Specialized lowering for known fixnum-only
+                            // builtins. Unknown names fall through to
+                            // Unsupported.
+                            let mut args: Vec<RirValue> = Vec::with_capacity(*n);
+                            for e in args_entries {
+                                match e {
+                                    StackEntry::Value(v) => args.push(v),
+                                    _ => {
+                                        return Err(TranslateError::Unsupported(
+                                            "non-Value entry as builtin arg".into(),
+                                        ));
+                                    }
+                                }
+                            }
+                            let dst = alloc();
+                            let inst = match (name, args.len()) {
+                                ("quotient", 2) => RirInst::Quotient(dst, args[0], args[1]),
+                                ("remainder", 2) => RirInst::Remainder(dst, args[0], args[1]),
+                                ("bitwise-and", 2) => RirInst::BitAnd(dst, args[0], args[1]),
+                                ("bitwise-ior", 2) | ("bitwise-or", 2) => {
+                                    RirInst::BitOr(dst, args[0], args[1])
+                                }
+                                ("bitwise-xor", 2) => RirInst::BitXor(dst, args[0], args[1]),
+                                _ => {
+                                    return Err(TranslateError::Unsupported(format!(
+                                        "Call to builtin `{name}` (arity {}) not yet lowered",
+                                        args.len()
+                                    )));
+                                }
+                            };
+                            insts.push(inst);
+                            sim_stack.push(StackEntry::Value(dst));
+                        }
                         StackEntry::Value(_) => {
                             return Err(TranslateError::Unsupported(
-                                "Call with non-self callee not yet supported".into(),
+                                "Call with non-builtin non-self callee not yet supported".into(),
                             ));
                         }
                     }
@@ -491,6 +543,9 @@ pub fn bytecode_to_rir(
                         StackEntry::SelfRef => Err(TranslateError::Unsupported(
                             "self-ref in fall-through stack".into(),
                         )),
+                        StackEntry::BuiltinRef(_) => Err(TranslateError::Unsupported(
+                            "builtin-ref in fall-through stack".into(),
+                        )),
                     })
                     .collect::<Result<_, _>>()?;
                 seed_block_entry(
@@ -517,11 +572,18 @@ pub fn bytecode_to_rir(
 }
 
 /// One simulated stack slot. Either an already-bound RIR Value, or
-/// the special `SelfRef` sentinel that `LoadVar(self_name)` pushes;
-/// the sentinel is consumed by the matching `Call N`.
+/// the special `SelfRef` sentinel that `LoadVar(self_name)` pushes,
+/// or a `BuiltinRef` for Const-folded builtin procedures (consumed
+/// by a matching `Call N` to emit a specialized RIR op like
+/// `Quotient` / `Remainder` / `BitAnd` etc.).
 enum StackEntry {
     Value(RirValue),
     SelfRef,
+    /// Captured at Const-of-Procedure time. The static str is the
+    /// procedure's `name()`. Recognized names trigger specialized
+    /// lowering at the matching Call; unrecognized names cause the
+    /// translator to reject the function (Unsupported).
+    BuiltinRef(&'static str),
 }
 
 fn pop_value(stack: &mut Vec<StackEntry>) -> Result<RirValue, TranslateError> {
@@ -530,6 +592,9 @@ fn pop_value(stack: &mut Vec<StackEntry>) -> Result<RirValue, TranslateError> {
         Some(StackEntry::SelfRef) => Err(TranslateError::Unsupported(
             "self-ref appears where a Value is required".into(),
         )),
+        Some(StackEntry::BuiltinRef(name)) => Err(TranslateError::Unsupported(format!(
+            "builtin `{name}` reference appears where a Value is required (passed to non-Call)"
+        ))),
         None => Err(TranslateError::Invalid("stack underflow".into())),
     }
 }

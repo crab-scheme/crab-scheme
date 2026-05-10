@@ -167,6 +167,44 @@ fn jit_handles_le_gt_ge_comparisons() {
     }
 }
 
+/// M6 Phase 2 iter F: fixnum-only builtins (quotient / remainder /
+/// bitwise-{and,ior,xor}) JIT via specialized native instructions
+/// (Cranelift sdiv / srem / band / bor / bxor).
+#[test]
+fn jit_handles_fixnum_builtin_calls() {
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<jit>", "(define div2 (lambda (n) (quotient n 2)))")
+        .unwrap();
+    rt.eval_str_via_vm("<jit>", "(define mask (lambda (n) (bitwise-and n 7)))")
+        .unwrap();
+    rt.eval_str_via_vm("<jit>", "(define mod3 (lambda (n) (remainder n 3)))")
+        .unwrap();
+
+    // Warm each closure past the threshold.
+    let warmup = "(let loop ((i 0)) \
+                    (if (= i 1500) 'done \
+                        (begin (div2 i) (mod3 i) (mask i) (loop (+ i 1)))))";
+    rt.eval_str_via_vm("<jit>", warmup).unwrap();
+
+    let r = rt.eval_str_via_vm("<jit>", "(div2 100)").unwrap();
+    match r {
+        Value::Number(Number::Fixnum(50)) => {}
+        other => panic!("expected 50, got {:?}", other),
+    }
+    let r = rt.eval_str_via_vm("<jit>", "(mod3 100)").unwrap();
+    match r {
+        Value::Number(Number::Fixnum(1)) => {}
+        other => panic!("expected 1 (100 mod 3), got {:?}", other),
+    }
+    let r = rt.eval_str_via_vm("<jit>", "(mask 13)").unwrap();
+    match r {
+        // 13 & 7 = 5
+        Value::Number(Number::Fixnum(5)) => {}
+        other => panic!("expected 5, got {:?}", other),
+    }
+}
+
 /// M6 Phase 2 iter B: closures with free Fixnum vars can JIT.
 /// `(define base 100) (define add-base (lambda (x) (+ x base)))` —
 /// `base` is a free var inside add-base's body. The JIT translator

@@ -338,6 +338,19 @@ fn lower_inst(
         Inst::Add(dst, lhs, rhs) => binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().iadd(l, r))?,
         Inst::Sub(dst, lhs, rhs) => binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().isub(l, r))?,
         Inst::Mul(dst, lhs, rhs) => binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().imul(l, r))?,
+        Inst::Quotient(dst, lhs, rhs) => {
+            binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().sdiv(l, r))?
+        }
+        Inst::Remainder(dst, lhs, rhs) => {
+            binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().srem(l, r))?
+        }
+        Inst::BitAnd(dst, lhs, rhs) => {
+            binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().band(l, r))?
+        }
+        Inst::BitOr(dst, lhs, rhs) => binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().bor(l, r))?,
+        Inst::BitXor(dst, lhs, rhs) => {
+            binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().bxor(l, r))?
+        }
         Inst::Lt(dst, lhs, rhs) => {
             let l = lookup(map, *lhs)?;
             let r = lookup(map, *rhs)?;
