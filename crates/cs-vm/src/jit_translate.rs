@@ -591,6 +591,22 @@ pub fn bytecode_to_rir(
                                         let _ = args[0];
                                         insts.push(RirInst::LoadConst(dst, Const::Fixnum(0)));
                                     }
+                                    // Identity-on-fixnum rounding ops.
+                                    // (floor n), (ceiling n), etc. all
+                                    // return n unchanged when n is an
+                                    // integer (i.e., a Fixnum here).
+                                    ("floor", 1)
+                                    | ("ceiling", 1)
+                                    | ("truncate", 1)
+                                    | ("round", 1)
+                                    | ("exact", 1)
+                                    | ("inexact->exact", 1) => {
+                                        insts.push(RirInst::Move(dst, args[0]));
+                                    }
+                                    ("square", 1) => {
+                                        // (square x) → x * x
+                                        insts.push(RirInst::Mul(dst, args[0], args[0]));
+                                    }
                                     _ => {
                                         return Err(TranslateError::Unsupported(format!(
                                             "Call to builtin `{name}` (arity {}) not yet lowered",
