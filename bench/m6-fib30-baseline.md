@@ -47,6 +47,37 @@ inside the budget; the perf-tuning iter (planned as a separate
 follow-up) can focus on broader JIT coverage and benchmark spread
 rather than fib-specific gains.
 
+## Phase 2 — env access + builtin lowering bench
+
+Added in M6 Phase 2 iters B-I to validate that env-lookup / set! /
+fixnum-builtin lowerings deliver real speedup on programs that
+weren't pure-recursive-fixnum. Workload exercises:
+
+```scheme
+(define n 0)
+(define stride 7)
+(define (step x)
+  (set! n (+ n 1))                  ; EnvSet
+  (if (zero? (remainder x 13))      ; zero? predicate + remainder
+      (quotient x 2)                ; quotient
+      (bitwise-and (+ x stride) 1023))) ; bitwise-and + EnvLookup
+(let loop ((i 0) (acc 0))
+  (if (= i 2000000) ...
+      (loop (+ i 1) (+ acc (step i)))))
+```
+
+| tier         | wall-clock | vs VM |
+|--------------|-----------:|------:|
+| walker       | 0.95 s     | 1.6×  |
+| vm           | 0.59 s     | 1.0×  |
+| vm-jit       | 0.27 s     | **2.2× faster** |
+
+Modest but real — the per-iter helper-call overhead (each
+`vm_env_lookup_fixnum` is a native call) limits speedup vs the
+~150× we get on pure-fixnum fib. Most of the win comes from the
+arithmetic chain (`quotient`, `remainder`, `bitwise-and`, `zero?`)
+running as native instructions instead of bytecode dispatches.
+
 ## Methodology notes
 
 - Each tier runs the full bench file (parse + compile + run) inside
