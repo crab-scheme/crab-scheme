@@ -1034,6 +1034,13 @@ pub struct VmClosure {
     /// can pin down which specific closures are tier'd up vs
     /// just having a JIT pointer that nobody dispatches through.
     jit_call_count: Cell<u64>,
+    /// Stack-map registry harvested from Cranelift after this
+    /// closure's body was compiled. Used by `Heap::collect` to
+    /// walk JIT frames and root Gc<Value> handles spilled to the
+    /// host stack. Rc-shared so closure clones don't duplicate the
+    /// map. None until the tier-up hook installs both the JIT ptr
+    /// and the maps. ADR 0012 D-2 (iter BM).
+    jit_stack_maps: std::cell::RefCell<Option<std::rc::Rc<crate::jit_stackmap::JitStackMaps>>>,
 }
 
 /// How many type-guard misses a closure tolerates before the
@@ -1122,6 +1129,20 @@ impl VmClosure {
 
     pub fn jit_return_type(&self) -> u8 {
         self.jit_return_type.get()
+    }
+
+    /// Install the stack-map registry harvested when this closure
+    /// was JIT-compiled. Stored as `Rc` so the registry can be
+    /// shared if the closure is cloned. ADR 0012 D-2 (iter BM).
+    pub fn set_jit_stack_maps(&self, maps: std::rc::Rc<crate::jit_stackmap::JitStackMaps>) {
+        *self.jit_stack_maps.borrow_mut() = Some(maps);
+    }
+
+    /// Read the stack-map registry, if any. Returns a cloned Rc
+    /// (cheap refcount bump) so callers don't hold a `RefCell`
+    /// borrow across GC operations.
+    pub fn jit_stack_maps(&self) -> Option<std::rc::Rc<crate::jit_stackmap::JitStackMaps>> {
+        self.jit_stack_maps.borrow().clone()
     }
 
     /// Bake per-param type tags from a slice (low nibble = arg 0).
@@ -3122,6 +3143,7 @@ fn run_dispatch(
                     jit_param_types: Cell::new(JIT_PARAM_TYPES_ALL_FIXNUM),
                     jit_deopt_count: Cell::new(0),
                     jit_call_count: Cell::new(0),
+                    jit_stack_maps: std::cell::RefCell::new(None),
                 };
                 let p: Rc<dyn Procedure> = Rc::new(cl);
                 stack.push(Value::Procedure(p));

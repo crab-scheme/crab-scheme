@@ -147,6 +147,17 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     };
     closure.set_jit_ptr(ptr, lam.params.len() as u32);
     closure.set_jit_param_types(&param_tags);
+    // ADR 0012 D-2 (iter BM) — install the harvested stack-map
+    // registry on the closure. Empty record-set is fine (means no
+    // call inside the body kept a Gc handle live across it). The
+    // GC scanner (iter BN) will use these maps to walk JIT frames.
+    if !lowerer.last_inner_stack_maps.is_empty() {
+        let mut maps = cs_vm::jit_stackmap::JitStackMaps::new(lowerer.last_inner_base);
+        for (pc, offsets) in lowerer.last_inner_stack_maps.drain() {
+            maps.insert(pc, offsets);
+        }
+        closure.set_jit_stack_maps(std::rc::Rc::new(maps));
+    }
     // Phase-2 ABI generalization: tell the dispatcher how to decode
     // the i64 return. Defaults to Fixnum; flip to Boolean when the
     // RIR's inferred return type says so.

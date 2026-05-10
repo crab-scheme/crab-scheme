@@ -27,6 +27,7 @@ use std::collections::HashMap;
 ///
 /// One `JitStackMaps` per `VmClosure` once we wire it into the
 /// closure struct in iter BF.
+#[derive(Debug)]
 pub struct JitStackMaps {
     /// PC-offset (return-address minus function-base) -> list of
     /// SP-relative byte offsets that hold raw `Gc` handles.

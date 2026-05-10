@@ -66,6 +66,12 @@ pub struct Lowerer {
     /// `compile_pure_fixnum`'s caller, then overwritten by the next
     /// compile. ADR 0012 D-2 (iter BL).
     pub last_inner_stack_maps: HashMap<u32, Vec<i32>>,
+    /// Base address of the most-recently-compiled inner function
+    /// after `finalize_definitions`. Combined with
+    /// `last_inner_stack_maps` keys (code offsets), this gives the
+    /// absolute PC of each safepoint at runtime. Set by
+    /// `compile_pure_fixnum` (iter BM).
+    pub last_inner_base: *const u8,
     /// FuncId of the imported `vm_env_lookup_fixnum` helper.
     /// `Inst::EnvLookup` lowers to a Cranelift call against this.
     env_lookup_func: cranelift_module::FuncId,
@@ -352,6 +358,7 @@ impl Lowerer {
             func_ctx: FunctionBuilderContext::new(),
             next_id: 0,
             last_inner_stack_maps: HashMap::new(),
+            last_inner_base: std::ptr::null(),
             env_lookup_func,
             env_set_func,
             alloc_pair_func,
@@ -455,6 +462,11 @@ impl Lowerer {
         self.module
             .finalize_definitions()
             .map_err(|e| JitError::Codegen(format!("finalize_definitions: {e}")))?;
+        // ADR 0012 D-2 (iter BM) — capture the inner function's
+        // runtime base address. The caller (tier-up hook) uses this
+        // alongside `last_inner_stack_maps` to construct a
+        // `JitStackMaps` keyed by the inner base for the closure.
+        self.last_inner_base = self.module.get_finalized_function(inner_id);
         Ok(self.module.get_finalized_function(outer_id))
     }
 
