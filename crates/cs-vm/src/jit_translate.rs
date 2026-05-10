@@ -775,6 +775,26 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    ("car", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        // Lower to vm_pair_car. We only
+                                        // accept Any-tagged operands —
+                                        // everything else deopts. (A
+                                        // future iter can add a
+                                        // monomorphic IC for Pair-typed
+                                        // ops.)
+                                        insts.push(RirInst::Car(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("cdr", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::Cdr(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     ("integer->char", 1) => {
                                         // Same bit pattern as the Fixnum input;
                                         // the return-type post-pass will tag
@@ -1196,7 +1216,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::LoadConst(dst, Const::Flonum(_)) => {
                     flo_values.insert(*dst);
                 }
-                RirInst::Cons(dst, _, _, _, _) => {
+                RirInst::Cons(dst, _, _, _, _) | RirInst::Car(dst, _) | RirInst::Cdr(dst, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

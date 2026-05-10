@@ -244,6 +244,16 @@ pub enum Inst {
     /// carries `Box::into_raw(Box<Value::Pair(_)>)`).
     Cons(Value, Value, u8, Value, u8),
 
+    /// `dst = car(pair)` — extract the first slot of an Any-tagged
+    /// pair via the `vm_pair_car` runtime helper. Operand is
+    /// expected to be `Type::Any`; dst is `Type::Any` too.
+    Car(Value, Value),
+
+    /// `dst = cdr(pair)` — extract the second slot of an Any-tagged
+    /// pair via the `vm_pair_cdr` runtime helper. Operand and dst
+    /// are both `Type::Any`.
+    Cdr(Value, Value),
+
     /// Type guard: if the value's runtime type doesn't match the
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
     /// always dispatches dynamically).

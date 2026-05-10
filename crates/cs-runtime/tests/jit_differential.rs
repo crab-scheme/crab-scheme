@@ -1067,3 +1067,47 @@ fn diff_jit_cons_pair_return() {
         }
     }
 }
+
+#[test]
+fn diff_jit_car_cdr_passthrough() {
+    // M6 Phase 4 iter AT: Inst::Car / Inst::Cdr lower to vm_pair_car
+    // / vm_pair_cdr. The car/cdr of a freshly-consed pair returns
+    // through the JIT body's Any-tagged return — when the slots are
+    // Fixnum-Boxed Values, the dispatcher decodes them back to the
+    // expected Value variants on the way out.
+    let defines = &[
+        "(define (pcar a b) (car (cons a b)))",
+        "(define (pcdr a b) (cdr (cons a b)))",
+    ];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (pcar 1 2) (pcdr 3 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let cases: &[(&str, i64)] = &[
+        ("(pcar 11 22)", 11),
+        ("(pcdr 11 22)", 22),
+        ("(pcar -7 99)", -7),
+        ("(pcdr -7 99)", 99),
+    ];
+    for (expr, expected) in cases {
+        let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let walker = walker_eval(defines, expr);
+        match (&jit, &walker) {
+            (
+                Value::Number(cs_core::Number::Fixnum(j)),
+                Value::Number(cs_core::Number::Fixnum(w)),
+            ) => {
+                assert_eq!(j, w, "tier mismatch on {}", expr);
+                assert_eq!(*j, *expected, "wrong value on {}", expr);
+            }
+            other => panic!("expected fixnums on {}, got {:?}", expr, other),
+        }
+    }
+}

@@ -304,6 +304,12 @@ impl Lowerer {
             let alloc_pair_fnref = self
                 .module
                 .declare_func_in_func(self.alloc_pair_func, builder.func);
+            let pair_car_fnref = self
+                .module
+                .declare_func_in_func(self.pair_car_func, builder.func);
+            let pair_cdr_fnref = self
+                .module
+                .declare_func_in_func(self.pair_cdr_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -359,6 +365,8 @@ impl Lowerer {
                         env_lookup_fnref,
                         env_set_fnref,
                         alloc_pair_fnref,
+                        pair_car_fnref,
+                        pair_cdr_fnref,
                         inst,
                     )?;
                 }
@@ -509,6 +517,8 @@ fn lower_inst(
     env_lookup_fnref: cranelift_codegen::ir::FuncRef,
     env_set_fnref: cranelift_codegen::ir::FuncRef,
     alloc_pair_fnref: cranelift_codegen::ir::FuncRef,
+    pair_car_fnref: cranelift_codegen::ir::FuncRef,
+    pair_cdr_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -622,6 +632,35 @@ fn lower_inst(
             if results.len() != 1 {
                 return Err(JitError::Codegen(format!(
                     "Cons expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::Car(dst, src) => {
+            // Lowers to vm_pair_car(pair_i64) -> i64. The runtime
+            // helper unboxes the Any-tagged operand, returns the
+            // car as an Any-tagged i64. Type-guard for the operand
+            // already happened at the call site (or will be
+            // re-checked at the dispatcher boundary).
+            let v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(pair_car_fnref, &[v]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "Car expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::Cdr(dst, src) => {
+            let v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(pair_cdr_fnref, &[v]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "Cdr expected 1 result, got {}",
                     results.len()
                 )));
             }
