@@ -240,6 +240,9 @@ impl Runtime {
         vm_env.define(tab_sym, cs_vm::vm::make_vm_tabulate());
         let rem_sym = syms.intern("remove");
         vm_env.define(rem_sym, cs_vm::vm::make_vm_remove());
+        // R6RS `remp` — same shape as walker-side; reuse VmRemove.
+        let remp_sym = syms.intern("remp");
+        vm_env.define(remp_sym, cs_vm::vm::make_vm_remove());
         let force_sym = syms.intern("force");
         vm_env.define(force_sym, cs_vm::vm::make_vm_force());
         // I/O port-state ops.

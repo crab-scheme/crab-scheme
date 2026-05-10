@@ -131,6 +131,18 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("flround", b_fl_round),
         ("flsqrt", b_fl_sqrt),
         ("flexp", b_fl_exp),
+        ("flexpt", b_fl_expt),
+        // R6RS fixnum bit ops + bounds.
+        ("fxlength", b_fx_length),
+        ("fxbit-count", b_fx_bit_count),
+        ("fxfirst-bit-set", b_fx_first_bit_set),
+        ("fxbit-set?", b_fx_bit_set_p),
+        ("fixnum-width", b_fixnum_width),
+        ("least-fixnum", b_least_fixnum),
+        ("greatest-fixnum", b_greatest_fixnum),
+        // R6RS list ops.
+        ("remv", b_remv),
+        ("list-head", b_list_head),
         ("fllog", b_fl_log),
         ("flsin", b_fl_sin),
         ("flcos", b_fl_cos),
@@ -770,6 +782,7 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         // SRFI-1 (higher-order)
         ("tabulate", b_tabulate),
         ("remove", b_remove),
+        ("remp", b_remp),
         ("string-map", b_string_map),
         ("string-for-each", b_string_for_each),
         ("vector-filter", b_vector_filter),
@@ -1631,6 +1644,87 @@ fn b_fx_arith_shift_right(args: &[Value]) -> Result<Value, String> {
     Ok(Value::fixnum(x >> k))
 }
 
+/// R6RS `(fxlength fx)` — number of bits needed to represent fx in
+/// two's-complement, excluding the sign bit. (fxlength 0) = 0.
+fn b_fx_length(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("fxlength", "1", args.len()));
+    }
+    let x = as_fx("fxlength", &args[0])?;
+    let bits = if x >= 0 {
+        64 - x.leading_zeros()
+    } else {
+        64 - (!x).leading_zeros()
+    };
+    Ok(Value::fixnum(bits as i64))
+}
+
+/// R6RS `(fxbit-count fx)` — popcount for non-negative; for negative,
+/// returns -(popcount-of-bitwise-not + 1) per spec.
+fn b_fx_bit_count(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("fxbit-count", "1", args.len()));
+    }
+    let x = as_fx("fxbit-count", &args[0])?;
+    let r = if x >= 0 {
+        x.count_ones() as i64
+    } else {
+        -((!x).count_ones() as i64 + 1)
+    };
+    Ok(Value::fixnum(r))
+}
+
+/// R6RS `(fxfirst-bit-set fx)` — index of the lowest set bit; -1
+/// if fx is 0.
+fn b_fx_first_bit_set(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("fxfirst-bit-set", "1", args.len()));
+    }
+    let x = as_fx("fxfirst-bit-set", &args[0])?;
+    let r = if x == 0 {
+        -1
+    } else {
+        x.trailing_zeros() as i64
+    };
+    Ok(Value::fixnum(r))
+}
+
+/// R6RS `(fxbit-set? fx idx)` — #t iff bit `idx` of fx is 1.
+fn b_fx_bit_set_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("fxbit-set?", "2", args.len()));
+    }
+    let x = as_fx("fxbit-set?", &args[0])?;
+    let k = as_fx("fxbit-set?", &args[1])?;
+    if !(0..64).contains(&k) {
+        return Err(fx_overflow("fxbit-set?"));
+    }
+    Ok(Value::Boolean((x >> k) & 1 == 1))
+}
+
+/// R6RS `(fixnum-width)` — bit width of the fixnum type. We use i64,
+/// so the range is [-2^63, 2^63-1] — width 64.
+fn b_fixnum_width(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("fixnum-width", "0", args.len()));
+    }
+    Ok(Value::fixnum(64))
+}
+
+fn b_least_fixnum(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("least-fixnum", "0", args.len()));
+    }
+    Ok(Value::fixnum(i64::MIN))
+}
+
+fn b_greatest_fixnum(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("greatest-fixnum", "0", args.len()));
+    }
+    Ok(Value::fixnum(i64::MAX))
+}
+
 // =====================================================================
 // R6RS (rnrs arithmetic flonums) — typed flonum ops.
 // Operands MUST be flonums (no fixnum/big/rational); pure IEEE-754
@@ -1847,6 +1941,17 @@ fn b_fl_cos(args: &[Value]) -> Result<Value, String> {
 }
 fn b_fl_tan(args: &[Value]) -> Result<Value, String> {
     fl_unary("fltan", args, f64::tan)
+}
+
+/// R6RS `(flexpt x y)` — typed flonum exponentiation. Both args must
+/// be flonums; result follows IEEE-754 (NaN/inf propagate).
+fn b_fl_expt(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("flexpt", "2", args.len()));
+    }
+    let x = as_fl("flexpt", &args[0])?;
+    let y = as_fl("flexpt", &args[1])?;
+    Ok(Value::Number(Number::Flonum(x.powf(y))))
 }
 
 fn b_fixnum_to_flonum(args: &[Value]) -> Result<Value, String> {
@@ -9342,6 +9447,63 @@ fn b_remove(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         }
     }
     Ok(Value::list(out))
+}
+
+/// R6RS `(remp pred list)` — same shape as our `remove`, kept under
+/// the R6RS name so srfi/r6rs test fixtures resolve it.
+fn b_remp(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("remp", "2", args.len()));
+    }
+    let pred = args[0].clone();
+    let items = collect_proper_list("remp", &args[1])?;
+    let mut out = Vec::new();
+    for item in items {
+        let r = apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| e.message())?;
+        if !r.is_truthy() {
+            out.push(item);
+        }
+    }
+    Ok(Value::list(out))
+}
+
+/// R6RS `(remv obj list)` — remove items that are `eqv?` to obj.
+fn b_remv(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("remv", "2", args.len()));
+    }
+    let target = &args[0];
+    let items = collect_proper_list("remv", &args[1])?;
+    let out: Vec<Value> = items
+        .into_iter()
+        .filter(|x| !cs_core::eq::eqv(x, target))
+        .collect();
+    Ok(Value::list(out))
+}
+
+/// SRFI-1 / R6RS-ish `(list-head list k)` — return the first k items
+/// of `list` as a proper list. R6RS has it as `list-head`; SRFI-1
+/// names it `take`. We already export `take` as the SRFI-1 name; this
+/// adds the R6RS name as an alias.
+fn b_list_head(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("list-head", "2", args.len()));
+    }
+    let n = as_int_i64("list-head", &args[1])?;
+    if n < 0 {
+        return Err("list-head: negative count".into());
+    }
+    let n = n as usize;
+    let items = collect_proper_list("list-head", &args[0])?;
+    if n > items.len() {
+        return Err(format!(
+            "list-head: count {} exceeds list length {}",
+            n,
+            items.len()
+        ));
+    }
+    let head: Vec<Value> = items.into_iter().take(n).collect();
+    Ok(Value::list(head))
 }
 
 // ---- transcendental functions ----

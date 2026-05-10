@@ -264,6 +264,11 @@ fn conformance_records_procedural() {
 }
 
 #[test]
+fn conformance_r6rs_misc() {
+    run_conformance_file("r6rs_misc.scm");
+}
+
+#[test]
 fn conformance_define_condition_type() {
     run_conformance_file("define_condition_type.scm");
 }
@@ -681,6 +686,7 @@ fn conformance_aggregate_count() {
                 "conditions_r6rs.scm",
                 "records_parent.scm",
                 "records_procedural.scm",
+                "r6rs_misc.scm",
                 "define_condition_type.scm",
                 "error_who.scm",
                 "builtin_errors.scm",

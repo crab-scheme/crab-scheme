@@ -412,6 +412,14 @@ fn vm_conformance_records_procedural() {
 }
 
 #[test]
+fn vm_conformance_r6rs_misc() {
+    let walker = pass_count_walker("r6rs_misc.scm");
+    let vm = pass_count_vm("r6rs_misc.scm").expect("vm should run r6rs_misc.scm");
+    println!("r6rs_misc: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
+
+#[test]
 fn vm_conformance_define_condition_type() {
     let walker = pass_count_walker("define_condition_type.scm");
     let vm = pass_count_vm("define_condition_type.scm")
