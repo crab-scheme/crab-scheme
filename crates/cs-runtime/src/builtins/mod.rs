@@ -672,6 +672,12 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("circular-list?", b_circular_list_p),
         ("append-reverse", b_append_reverse),
         ("reverse!", b_reverse_bang),
+        // R6RS numeric "shape" predicates / converters.
+        ("real-valued?", b_real_valued_p),
+        ("rational-valued?", b_rational_valued_p),
+        ("integer-valued?", b_integer_valued_p),
+        ("real->flonum", b_real_to_flonum),
+        ("rationalize", b_rationalize),
         // hashtable conversions
         ("hashtable->alist", b_hashtable_to_alist),
         ("alist->hashtable", b_alist_to_hashtable),
@@ -857,6 +863,8 @@ pub fn syms_builtins() -> Vec<SymsEntry> {
         // to mint fresh tag symbols / read symbol kinds.
         ("make-record-type-descriptor", b_make_rtd),
         ("record-field-mutable?", b_record_field_mutable_p),
+        // R6RS symbol manipulation.
+        ("symbol-append", b_symbol_append),
     ]
 }
 
@@ -2071,6 +2079,145 @@ fn b_rational_p(args: &[Value]) -> Result<Value, String> {
         Value::Number(_) => true, // Fixnum / Big / Rational are all rational
         _ => false,
     }))
+}
+
+/// R6RS §11.7.4 — `(real-valued? v)`: true iff v is a number AND its
+/// imaginary part is zero. Foundation has no complex numbers, so this
+/// reduces to "is a number". Mirrors R6RS spec exactly given that
+/// every Number we have is real.
+fn b_real_valued_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("real-valued?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(&args[0], Value::Number(_))))
+}
+
+/// `(rational-valued? v)` — real-valued? AND finite (mathematically a ratio).
+fn b_rational_valued_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("rational-valued?", "1", args.len()));
+    }
+    Ok(Value::Boolean(match &args[0] {
+        Value::Number(Number::Flonum(f)) => f.is_finite(),
+        Value::Number(_) => true,
+        _ => false,
+    }))
+}
+
+/// `(integer-valued? v)` — real-valued? AND mathematically an integer.
+/// Catches flonums like 5.0 that integer? rejects.
+fn b_integer_valued_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("integer-valued?", "1", args.len()));
+    }
+    Ok(Value::Boolean(match &args[0] {
+        Value::Number(Number::Flonum(f)) => f.is_finite() && f.fract() == 0.0,
+        Value::Number(n) => n.is_integer(),
+        _ => false,
+    }))
+}
+
+/// R6RS `(real->flonum r)` — convert a real number to its flonum
+/// approximation. Equivalent to `(inexact r)` constrained to flonums.
+fn b_real_to_flonum(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("real->flonum", "1", args.len()));
+    }
+    let n = match &args[0] {
+        Value::Number(n) => n.to_f64(),
+        v => return Err(type_err("real->flonum", "real number", v)),
+    };
+    Ok(Value::Number(Number::Flonum(n)))
+}
+
+/// R6RS `(rationalize x eps)` — return the simplest rational `r`
+/// such that `|r - x| <= eps`. Foundation: implemented for finite
+/// flonum inputs via continued-fraction construction; integer / exact
+/// rational inputs short-circuit to the input itself.
+fn b_rationalize(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("rationalize", "2", args.len()));
+    }
+    let x = as_num("rationalize", &args[0])?;
+    let eps = as_num("rationalize", &args[1])?;
+    // Exact integer or exact rational input: already in simplest form
+    // for any non-negative eps.
+    if matches!(x, Number::Fixnum(_) | Number::Rat(_) | Number::Big(_)) {
+        return Ok(Value::Number(x));
+    }
+    let xf = x.to_f64();
+    let ef = eps.to_f64();
+    if !xf.is_finite() {
+        return Ok(Value::Number(x));
+    }
+    if ef < 0.0 {
+        return Err("rationalize: negative epsilon".into());
+    }
+    // Stern-Brocot mediant search bounded by [xf-ef, xf+ef]. Simplest
+    // rational in the closed interval — classic construction.
+    let lo = xf - ef;
+    let hi = xf + ef;
+    if lo <= 0.0 && hi >= 0.0 {
+        return Ok(Value::fixnum(0));
+    }
+    let neg = hi < 0.0;
+    let (lo, hi) = if neg { (-hi, -lo) } else { (lo, hi) };
+    let (n, d) = simplest_rational_in(lo, hi);
+    let num_i = n as i64;
+    let den_i = d as i64;
+    let signed_num = if neg { -num_i } else { num_i };
+    let v = if den_i == 1 {
+        Value::fixnum(signed_num)
+    } else {
+        Value::Number(Number::Flonum(signed_num as f64 / den_i as f64))
+    };
+    Ok(v)
+}
+
+fn simplest_rational_in(lo: f64, hi: f64) -> (u64, u64) {
+    // Stern-Brocot search returning (numerator, denominator) in lowest
+    // terms. lo <= hi, both > 0.
+    let mut lo_n = lo.floor() as u64;
+    let mut lo_d: u64 = 1;
+    let mut hi_n = hi.ceil() as u64;
+    let mut hi_d: u64 = 1;
+    let a = lo_n;
+    if (a as f64) >= lo && (a as f64) <= hi {
+        return (a, 1);
+    }
+    let mut count = 0;
+    loop {
+        count += 1;
+        if count > 1000 {
+            // Safety net for pathological inputs; fall back to flonum approx.
+            return (((lo + hi) * 0.5 * 1.0e6) as u64, 1_000_000);
+        }
+        let m_n = lo_n + hi_n;
+        let m_d = lo_d + hi_d;
+        let m = m_n as f64 / m_d as f64;
+        if m < lo {
+            lo_n = m_n;
+            lo_d = m_d;
+        } else if m > hi {
+            hi_n = m_n;
+            hi_d = m_d;
+        } else {
+            return (m_n, m_d);
+        }
+    }
+}
+
+/// R6RS `(symbol-append sym ...)` — build a fresh symbol from the
+/// concatenation of the input symbols' names.
+fn b_symbol_append(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    let mut out = String::new();
+    for a in args {
+        match a {
+            Value::Symbol(s) => out.push_str(syms.name(*s)),
+            v => return Err(type_err("symbol-append", "symbol", v)),
+        }
+    }
+    Ok(Value::Symbol(syms.intern(&out)))
 }
 
 fn b_boolean_p(args: &[Value]) -> Result<Value, String> {

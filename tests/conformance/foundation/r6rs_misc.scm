@@ -47,3 +47,28 @@
 (test-equal "flexpt-0.5-4"       0.0625                 (flexpt 0.5 4.0))
 (test-equal "flexpt-1-anything"  1.0                    (flexpt 1.0 1234.5))
 (test-equal "flexpt-anything-0"  1.0                    (flexpt 7.5 0.0))
+
+;; ---- *-valued? predicates ----
+(test-true  "real-valued-int"    (real-valued? 3))
+(test-true  "real-valued-flo"    (real-valued? 3.0))
+(test-false "real-valued-str"    (real-valued? "x"))
+(test-false "rational-valued-inf" (rational-valued? +inf.0))
+(test-true  "rational-valued-3.5" (rational-valued? 3.5))
+(test-true  "integer-valued-int" (integer-valued? 5))
+(test-true  "integer-valued-flo" (integer-valued? 5.0))
+(test-false "integer-valued-half" (integer-valued? 5.5))
+(test-true  "integer-valued-neg-flo" (integer-valued? -3.0))
+
+;; ---- real->flonum ----
+(test-equal "real->flo-int"      3.0  (real->flonum 3))
+(test-equal "real->flo-flo"      3.5  (real->flonum 3.5))
+
+;; ---- rationalize ----
+(test-equal "rationalize-int"    5    (rationalize 5 0.1))
+(test-equal "rationalize-zero"   0    (rationalize 0.0 0.01))
+
+;; ---- symbol-append ----
+(test-equal "symbol-append"      'foo-bar (symbol-append 'foo '- 'bar))
+(test-equal "symbol-append-1"    'a       (symbol-append 'a))
+(test-equal "symbol-append-0"    '||      (symbol-append))
+
