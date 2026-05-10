@@ -2851,12 +2851,42 @@ fn b_number_to_string(args: &[Value]) -> Result<Value, String> {
     } else {
         10
     };
-    match (radix, &n) {
-        (10, _) => Ok(Value::string(format!("{}", n))),
-        (2, Number::Fixnum(v)) => Ok(Value::string(format!("{:b}", v))),
-        (8, Number::Fixnum(v)) => Ok(Value::string(format!("{:o}", v))),
-        (16, Number::Fixnum(v)) => Ok(Value::string(format!("{:x}", v))),
-        _ => Err("number->string: unsupported radix or number type".into()),
+    // Decimal: defer to the existing Display impl.
+    if radix == 10 {
+        return Ok(Value::string(format!("{}", n)));
+    }
+    if !matches!(radix, 2 | 8 | 16) {
+        return Err(format!("number->string: unsupported radix: {}", radix));
+    }
+    // For non-decimal radices, R7RS only requires support on integers.
+    // Render with proper sign handling (Rust's {:b}/{:o}/{:x} on negatives
+    // emits the two's-complement bit pattern, not "-...", which is wrong).
+    fn fmt_int(magnitude: u64, radix: i64) -> String {
+        match radix {
+            2 => format!("{:b}", magnitude),
+            8 => format!("{:o}", magnitude),
+            16 => format!("{:x}", magnitude),
+            _ => unreachable!(),
+        }
+    }
+    match &n {
+        Number::Fixnum(v) => {
+            let mag = v.unsigned_abs();
+            let s = if *v < 0 {
+                format!("-{}", fmt_int(mag, radix))
+            } else {
+                fmt_int(mag, radix)
+            };
+            Ok(Value::string(s))
+        }
+        Number::Big(b) => {
+            // BigInt has its own to_str_radix.
+            Ok(Value::string(b.to_str_radix(radix as u32)))
+        }
+        _ => Err(format!(
+            "number->string: radix {} only supported on integers",
+            radix,
+        )),
     }
 }
 

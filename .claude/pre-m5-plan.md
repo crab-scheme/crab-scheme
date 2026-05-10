@@ -266,12 +266,16 @@ Iters 117+ are filling R7RS gaps one per iter:
   write since we don't generate shared notation yet)
 - 148 R7RS string->number with full prefix support: #x #b #o #d
   radix prefixes, #e #i exactness, +inf.0 / -inf.0 / +nan.0 / -nan.0
-  tokens, rationals (1/2), sign on prefixed forms (this iter)
+  tokens, rationals (1/2), sign on prefixed forms
+- 149 R7RS number->string proper sign handling for non-decimal radix
+  (was emitting two's-complement bit pattern); bigint support via
+  BigInt::to_str_radix; clean error for unsupported radix or
+  non-integer + non-decimal radix (this iter)
 
 Current totals:
-- 102 conformance test files (cli)
-- VM tier: 104 tests
-- Aggregate: 2053 individual Scheme tests passing
+- 103 conformance test files (cli)
+- VM tier: 105 tests
+- Aggregate: 2078 individual Scheme tests passing
 
 ## Loop cadence
 

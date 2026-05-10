@@ -594,6 +594,11 @@ fn conformance_r7rs_string_to_number() {
 }
 
 #[test]
+fn conformance_r7rs_number_to_string() {
+    run_conformance_file("r7rs_number_to_string.scm");
+}
+
+#[test]
 fn conformance_macros() {
     run_conformance_file("macros.scm");
 }
@@ -717,6 +722,7 @@ fn conformance_aggregate_count() {
                 "r7rs_current_error_port.scm",
                 "r7rs_write_aliases.scm",
                 "r7rs_string_to_number.scm",
+                "r7rs_number_to_string.scm",
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
