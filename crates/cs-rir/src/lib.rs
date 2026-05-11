@@ -267,6 +267,11 @@ pub enum Inst {
     /// operands return 0 (no deopt — `eq?`-like behaviour).
     StrEq(Value, Value, Value),
 
+    /// `dst = substring(s, start, end)`. Lowers to `vm_substring_gc`.
+    /// `s` Any (consumed), `start` and `end` Fixnum. `dst` is Any
+    /// (fresh Gc<Value::String>). ADR 0012 D-2 (iter CM).
+    Substring(Value, Value, Value, Value),
+
     /// `dst = length(lst)`. Lowers to `vm_length_gc`. `lst` is Any
     /// (consumed). `dst` is Fixnum (raw spine count). On non-list
     /// the helper requests a deopt; the JIT body returns 0 and the

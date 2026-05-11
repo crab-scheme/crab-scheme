@@ -1005,6 +1005,18 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::Assv(dst, key, args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter CM) — substring.
+                                    // String arg Any, start/end Fixnum. Result
+                                    // is a fresh Gc<Value::String>.
+                                    ("substring", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::Substring(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter CK) — list-tail / list-ref.
                                     // lst Any, index Fixnum. Helpers consume
                                     // the lst handle; index is a raw i64.
@@ -2183,7 +2195,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::Member(dst, _, _)
                 | RirInst::Assoc(dst, _, _)
                 | RirInst::ListTail(dst, _, _)
-                | RirInst::ListRef(dst, _, _) => {
+                | RirInst::ListRef(dst, _, _)
+                | RirInst::Substring(dst, _, _, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

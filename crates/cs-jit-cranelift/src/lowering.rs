@@ -215,6 +215,9 @@ pub struct Lowerer {
     /// FuncId of `vm_list_ref_gc(lst, n) -> i64`. ADR 0012 D-2
     /// (iter CK).
     list_ref_func: cranelift_module::FuncId,
+    /// FuncId of `vm_substring_gc(s, start, end) -> i64`. Returns
+    /// a fresh Gc<Value::String>. ADR 0012 D-2 (iter CM).
+    substring_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -367,6 +370,8 @@ impl Lowerer {
         // ADR 0012 D-2 (iter CK) — list-tail / list-ref.
         builder.symbol("vm_list_tail_gc", cs_vm::vm::vm_list_tail_gc as *const u8);
         builder.symbol("vm_list_ref_gc", cs_vm::vm::vm_list_ref_gc as *const u8);
+        // ADR 0012 D-2 (iter CM) — substring.
+        builder.symbol("vm_substring_gc", cs_vm::vm::vm_substring_gc as *const u8);
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
             "vm_char_alphabetic_p",
@@ -819,6 +824,16 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_list_ref_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter CM) — vm_substring_gc(s, start, end) -> i64.
+        // Three i64 in, one out — same shape as vector_set_sig.
+        let substring_func = module
+            .declare_function(
+                "vm_substring_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_substring_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -932,6 +947,7 @@ impl Lowerer {
             assoc_func,
             list_tail_func,
             list_ref_func,
+            substring_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -1203,6 +1219,10 @@ impl Lowerer {
             let list_ref_fnref = self
                 .module
                 .declare_func_in_func(self.list_ref_func, builder.func);
+            // iter CM — substring.
+            let substring_fnref = self
+                .module
+                .declare_func_in_func(self.substring_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -1333,6 +1353,7 @@ impl Lowerer {
                         assoc_fnref,
                         list_tail_fnref,
                         list_ref_fnref,
+                        substring_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -1549,6 +1570,7 @@ fn lower_inst(
     assoc_fnref: cranelift_codegen::ir::FuncRef,
     list_tail_fnref: cranelift_codegen::ir::FuncRef,
     list_ref_fnref: cranelift_codegen::ir::FuncRef,
+    substring_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -2580,6 +2602,27 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "ListRef expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::Substring(dst, s, start, end) => {
+            // ADR 0012 D-2 (iter CM) — vm_substring_gc consumes the
+            // string handle, returns a fresh Gc<Value::String>. Mark
+            // for stack-map tracking.
+            let s_v = lookup(map, *s)?;
+            let start_v = lookup(map, *start)?;
+            let end_v = lookup(map, *end)?;
+            let inst_ref = b.ins().call(substring_fnref, &[s_v, start_v, end_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Substring expected 1 result, got {}",
                         results.len()
                     )));
                 }

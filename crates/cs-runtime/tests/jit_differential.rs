@@ -2959,3 +2959,44 @@ fn diff_jit_modulo_signs() {
         other => panic!("expected (1, 3, -3, -1, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_substring_slices() {
+    // ADR 0012 D-2 (iter CM) — substring lowers to vm_substring_gc.
+    // Indices are character (not byte) positions. Result is a
+    // fresh Gc<Value::String>.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sub s a b) (substring s a b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (sub (make-string 10 #\\x) 2 7) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // (sub "xxxxxxxxxx" 2 7) → 5-char string "xxxxx", length 5.
+    let len = rt
+        .eval_str_via_vm("<diff>", "(string-length (sub (make-string 10 #\\x) 2 7))")
+        .unwrap();
+    let empty_len = rt
+        .eval_str_via_vm("<diff>", "(string-length (sub (make-string 4 #\\a) 2 2))")
+        .unwrap();
+    let full_len = rt
+        .eval_str_via_vm("<diff>", "(string-length (sub (make-string 5 #\\b) 0 5))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "substring never dispatched through JIT (count={after})"
+    );
+    match (&len, &empty_len, &full_len) {
+        (
+            Value::Number(cs_core::Number::Fixnum(5)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(5)),
+        ) => {}
+        other => panic!("expected (5, 0, 5), got {:?}", other),
+    }
+}

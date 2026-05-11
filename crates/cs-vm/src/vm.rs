@@ -879,6 +879,44 @@ pub unsafe extern "C" fn vm_char_whitespace_p(c: i64) -> i64 {
     char::from_u32(c as u32).map_or(0, |ch| ch.is_whitespace() as i64)
 }
 
+/// `(substring s start end)` — return a fresh `Value::String`
+/// containing characters `[start, end)` of `s`. Indices are
+/// character (not byte) positions so multibyte UTF-8 is handled
+/// correctly. Consumes one strong refcount on `s`. `start` and
+/// `end` are raw Fixnum-shape i64. On invalid bounds (negative
+/// start, `end < start`, or `end > char count`) or non-string `s`,
+/// requests a deopt and returns a Gc handle to `Value::Null` as a
+/// placeholder. ADR 0012 D-2 (iter CM).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_substring_gc(s: i64, start: i64, end: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    if start < 0 || end < start {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Null);
+    }
+    match v {
+        Value::String(sc) => {
+            let storage = sc.borrow();
+            let chars: Vec<char> = storage.chars().collect();
+            if (end as usize) > chars.len() {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+            let sub: String = chars[start as usize..end as usize].iter().collect();
+            drop(storage);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(sub))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
 /// `(list-tail lst n)` — walk `n` cdrs and return whatever's
 /// there. `lst` is consumed; `n` is a raw Fixnum-shape i64.
 /// On negative `n` or an out-of-range index (spine exhausted
