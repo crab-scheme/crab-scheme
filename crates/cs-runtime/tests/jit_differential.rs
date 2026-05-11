@@ -1949,3 +1949,55 @@ fn diff_jit_collect_during_jit_body_keeps_live_pairs() {
     // belt-and-suspenders.
     rt.heap().set_auto_collect(false);
 }
+
+#[test]
+fn diff_jit_general_call_via_slow_path() {
+    // M6 Phase 4 iter BU: general (non-self, non-builtin) Call must
+    // route through `vm_call_general` rather than refusing to JIT.
+    //
+    // `outer` invokes `inner` — a free-variable closure, not `self`
+    // and not a constant-folded builtin. Pre-BU, the translator
+    // returned `Unsupported("Call with non-builtin non-self callee
+    // not yet supported")` and `outer` stayed in the bytecode VM
+    // forever. Post-BU, `outer` JITs and the body's `(inner y)`
+    // lowers to `Inst::CallGeneral`, which calls the runtime helper
+    // `vm_call_general` (the IC miss handler; the IC hot path lands
+    // later, ADR 0012 D-1).
+    let defines = &["(define (inner x) (+ x 1))", "(define (outer y) (inner y))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    // Warm `outer` past the tier-up threshold.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+         (if (= i 1500) 'done \
+             (begin (outer i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    cs_vm::vm::reset_jit_call_count();
+    let result = rt.eval_str_via_vm("<diff>", "(outer 41)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after > 0,
+        "outer never dispatched through the JIT (count = {})",
+        after
+    );
+
+    match &result {
+        Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(*n, 42),
+        other => panic!("expected fixnum 42, got {:?}", other),
+    }
+
+    // Walker agreement.
+    let walker = walker_eval(defines, "(outer 41)");
+    match (&result, &walker) {
+        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+            assert_eq!(j, w);
+        }
+        other => panic!("walker / jit disagree: {:?}", other),
+    }
+}

@@ -252,6 +252,34 @@ impl Drop for JitFrameGuard {
     }
 }
 
+/// RAII helper: set `JIT_ACTIVE_SYMS` for the duration of a JIT
+/// call, restore on drop. Used by `try_dispatch_jit` so that the
+/// `vm_call_general` slow-path helper (ADR 0012 D-1 miss path,
+/// iter BU) can re-enter `vm_call_sync` with the same `SymbolTable`
+/// the outer VM dispatch loop is holding.
+///
+/// The pointer is `*mut SymbolTable` (not `*const`) because
+/// `vm_call_sync` and downstream HO builtins mutate the symbol
+/// table (interning, gensym, etc.). Single-threaded use is the
+/// rule today, so a raw pointer is sufficient — no synchronization.
+struct JitSymsGuard {
+    prev: *mut SymbolTable,
+}
+
+impl JitSymsGuard {
+    fn install(syms: *mut SymbolTable) -> Self {
+        let prev = JIT_ACTIVE_SYMS.with(|c| c.get());
+        JIT_ACTIVE_SYMS.with(|c| c.set(syms));
+        Self { prev }
+    }
+}
+
+impl Drop for JitSymsGuard {
+    fn drop(&mut self) {
+        JIT_ACTIVE_SYMS.with(|c| c.set(self.prev));
+    }
+}
+
 /// Helper called by JIT-compiled code to write a Fixnum back to a
 /// free variable's binding. Walks the env chain via `set_existing`;
 /// if no binding is found, defines at the root. Mirrors the
@@ -330,6 +358,43 @@ pub extern "C" fn vm_env_lookup_fixnum(sym: i64) -> i64 {
     }
 }
 
+/// Helper called by JIT-compiled code to look up a free variable's
+/// value as a fresh Any-tagged `Gc<Value>` handle. Used by
+/// `Inst::EnvLookupAny` (ADR 0012 D-1 iter BU), which the
+/// translator emits when a free var flows to a non-self,
+/// non-builtin `Call` callee position — the value must be a live
+/// `Value::Procedure` (or anything else `vm_call_general` will
+/// reject).
+///
+/// Unlike `vm_env_lookup_fixnum`, this helper accepts any `Value`
+/// shape: the binding is cloned through `value_to_gc_i64`, so the
+/// caller receives one strong refcount on a Gc handle and is
+/// responsible for consuming it exactly once (via
+/// `vm_call_general`, `vm_value_drop_gc`, or the dispatcher's
+/// return decode).
+///
+/// # Safety
+///
+/// Same as `vm_env_lookup_fixnum`: `JIT_CALLER_ENV` must be set by
+/// the runtime dispatch site for the duration of the JIT call.
+///
+/// Panics on unbound symbol. Panics across `extern "C"` abort by
+/// default; matches the existing helper convention.
+#[no_mangle]
+pub unsafe extern "C" fn vm_env_lookup_any(sym: i64) -> i64 {
+    let env_ptr = JIT_CALLER_ENV.with(|c| c.get());
+    if env_ptr.is_null() {
+        panic!("vm_env_lookup_any: JIT_CALLER_ENV is null");
+    }
+    // SAFETY: as in vm_env_lookup_fixnum.
+    let env = unsafe { &*env_ptr };
+    let sym = Symbol(sym as u32);
+    match env.get(sym) {
+        Some(v) => value_to_gc_i64(v),
+        None => panic!("vm_env_lookup_any: unbound symbol {:?}", sym),
+    }
+}
+
 // ====================================================================
 // JIT heap-pointer ABI helpers (ADR 0011 D-2 / D-3 / D-5).
 //
@@ -402,6 +467,14 @@ thread_local! {
     /// installed — helpers fall back to unregistered `Gc::new`.
     /// ADR 0012 D-2 (iter BO).
     static JIT_ACTIVE_HEAP: Cell<*const cs_gc::Heap> = const { Cell::new(std::ptr::null()) };
+    /// Pointer to the active `SymbolTable` for the current thread,
+    /// used by the `vm_call_general` slow-path helper (iter BU) to
+    /// re-enter `vm_call_sync` for non-self closure calls embedded in
+    /// JIT bodies. `try_dispatch_jit` installs the pointer for the
+    /// duration of each native call and restores the previous value
+    /// on return (RAII via `JitSymsGuard`); the pointer is null when
+    /// no JIT call is in flight.
+    static JIT_ACTIVE_SYMS: Cell<*mut SymbolTable> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// Install a `Heap` pointer for use by JIT runtime helpers on the
@@ -953,6 +1026,68 @@ pub unsafe extern "C" fn vm_eq_any_gc(a: i64, b: i64) -> i64 {
     eq as i64
 }
 
+/// Slow-path general Call: take an Any-tagged callee handle plus a
+/// pointer to an arg buffer (each slot an Any-tagged `Gc<Value>` raw
+/// handle) and dispatch through the normal closure-call machinery
+/// (`vm_call_sync`). Returns the result as a fresh `Gc<Value>`
+/// handle.
+///
+/// Used by JIT bodies when `Inst::Call` targets a non-self,
+/// non-builtin callee. Per ADR 0012 D-1 this is the IC miss path:
+/// every call goes through here today; a later iter (IC hot path,
+/// BX+) bakes a per-call-site cache into the JIT body and only
+/// falls through to this helper on cache miss / megamorphic sites.
+///
+/// # Safety
+///
+/// - `callee` must be a live, owned `Gc<Value>` raw handle from
+///   `value_to_gc_i64`; consumed (one strong refcount transferred
+///   in).
+/// - `args_ptr` must point to `n_args` consecutive i64 slots, each
+///   a live, owned Any-tagged `Gc<Value>` handle. Each slot is
+///   consumed.
+/// - `JIT_ACTIVE_SYMS` must be installed (set by `try_dispatch_jit`)
+///   for the duration of this call so the helper can re-enter
+///   `vm_call_sync` with the caller's symbol table.
+///
+/// Panics if the callee isn't a `Value::Procedure`, if `vm_call_sync`
+/// returns an error, or if `JIT_ACTIVE_SYMS` is null. Panics across
+/// `extern "C"` abort by default — matching the existing
+/// `vm_unbox_*_gc` convention. A future iter (deopt integration) may
+/// switch this to `extern "C-unwind"` and route errors through the
+/// JIT-frame catch_unwind path; for iter BU a panic is the
+/// starting point.
+#[no_mangle]
+pub unsafe extern "C" fn vm_call_general(callee: i64, args_ptr: *const i64, n_args: usize) -> i64 {
+    let callee_v = unsafe { gc_i64_to_value(callee) };
+    // Materialize each arg slot into a Value, consuming one strong
+    // refcount per slot. The JIT body produced these via
+    // `value_to_gc_i64` (`Gc::into_raw_jit`) when it emitted the
+    // BoxTyped / clone chain feeding into CallGeneral.
+    let mut args: Vec<Value> = Vec::with_capacity(n_args);
+    for i in 0..n_args {
+        // SAFETY: caller (the JIT body) guarantees args_ptr points
+        // to n_args consecutive i64 slots, each a live Any handle.
+        let slot = unsafe { *args_ptr.add(i) };
+        let v = unsafe { gc_i64_to_value(slot) };
+        args.push(v);
+    }
+    let syms_ptr = JIT_ACTIVE_SYMS.with(|c| c.get());
+    if syms_ptr.is_null() {
+        panic!("vm_call_general: JIT_ACTIVE_SYMS is null (no outer VM dispatch)");
+    }
+    // SAFETY: try_dispatch_jit installed the pointer to its
+    // `syms: &mut SymbolTable` argument; the borrow is alive for
+    // the duration of the JIT call frame this helper is nested
+    // inside, and single-threaded execution means no aliasing
+    // mutable borrow exists.
+    let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
+    match vm_call_sync(&callee_v, &args, syms) {
+        Ok(v) => value_to_gc_i64(v),
+        Err(e) => panic!("vm_call_general: {}", e.message),
+    }
+}
+
 /// Read the per-thread JIT-dispatch count. Test/diagnostics only.
 pub fn jit_call_count() -> u64 {
     VM_JIT_CALL_COUNT.with(|c| c.get())
@@ -976,7 +1111,13 @@ fn bump_jit_call_count() {
 ///
 /// Iter-6 ABI: `extern "C" fn(i64, ..., i64) -> i64`. Args are
 /// unboxed Fixnums; the result is wrapped as `Value::Number(Fixnum)`.
-fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
+///
+/// `syms` is the caller's symbol table; installed in
+/// `JIT_ACTIVE_SYMS` for the duration of the JIT call so the
+/// `vm_call_general` slow-path helper (iter BU) can re-enter
+/// `vm_call_sync` with the same table when the JIT body invokes
+/// a non-self, non-builtin closure.
+fn try_dispatch_jit(closure: &VmClosure, args: &[Value], syms: &mut SymbolTable) -> Option<Value> {
     let ptr = closure.jit_ptr();
     if ptr.is_null() {
         return None;
@@ -1035,6 +1176,10 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value]) -> Option<Value> {
     // native call. Pop happens on Drop (RAII), so panics inside
     // the JIT body don't leave a stale entry.
     let _frame_guard = JitFrameGuard::install(closure.jit_stack_maps());
+    // ADR 0012 D-1 (iter BU) — install the caller's symbol table on
+    // the JIT TLS so `vm_call_general` slow-path calls can re-enter
+    // `vm_call_sync`. Guard restores the previous value on drop.
+    let _syms_guard = JitSymsGuard::install(syms as *mut SymbolTable);
     let r: i64 = match args.len() {
         0 => {
             let f: extern "C" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
@@ -1910,7 +2055,7 @@ fn run_dispatch(
                         // ABI mismatch or non-Fixnum args.
                         if !closure.jit_ptr().is_null() {
                             let arg_slice = &stack[args_start..stack_len];
-                            if let Some(result) = try_dispatch_jit(closure, arg_slice) {
+                            if let Some(result) = try_dispatch_jit(closure, arg_slice, syms) {
                                 stack.truncate(func_idx);
                                 stack.push(result);
                                 if is_tail {
@@ -3333,7 +3478,7 @@ fn run_dispatch(
                                 fire_tier_up_hook(closure, &args);
                             }
                             if !closure.jit_ptr().is_null() {
-                                if let Some(result) = try_dispatch_jit(closure, &args) {
+                                if let Some(result) = try_dispatch_jit(closure, &args, syms) {
                                     stack.push(result);
                                     if is_tail {
                                         frames.pop();
@@ -4549,7 +4694,7 @@ pub fn vm_call_sync(
                     fire_tier_up_hook(c, args);
                 }
                 if !c.jit_ptr().is_null() {
-                    if let Some(result) = try_dispatch_jit(c, args) {
+                    if let Some(result) = try_dispatch_jit(c, args, syms) {
                         return Ok(result);
                     }
                 }

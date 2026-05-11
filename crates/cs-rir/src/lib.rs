@@ -168,6 +168,28 @@ pub enum Inst {
     /// the general procedure-value lookup that lands later.
     CallSelf(Value, Vec<Value>),
 
+    /// `dst = call_general(callee, args...)` — slow-path general
+    /// call into a non-self, non-builtin closure. cs-vm: `Inst::Call`
+    /// with a callee that the translator couldn't resolve to
+    /// `SelfRef` or a `BuiltinRef`.
+    ///
+    /// Both `callee` and every entry of `args` are Any-tagged
+    /// (`Gc<Value>` raw handles); the translator inserts `BoxTyped`
+    /// before emitting if any operand is immediate-shaped. `dst` is
+    /// also Any-tagged: the helper returns a fresh `Gc<Value>`
+    /// handle carrying the result.
+    ///
+    /// Lowers to a Cranelift call against `vm_call_general(callee,
+    /// args_ptr, n_args) -> i64`. The lowerer materializes `args`
+    /// into a stack-allocated `[i64]` buffer (one slot per arg),
+    /// passes the buffer address plus the arity, and threads the
+    /// returned Gc handle through `declare_value_needs_stack_map`.
+    ///
+    /// Per ADR 0012 D-1, this is the IC miss path. The IC hot path
+    /// (load-compare-call into a per-call-site cache) lands later;
+    /// today every CallGeneral takes the slow path unconditionally.
+    CallGeneral(Value, Value, Vec<Value>),
+
     /// `dst = env_lookup(sym)`. Look up a free variable by symbol id
     /// in the closure's captured environment. cs-vm: `Inst::LoadVar`
     /// of a non-parameter non-self symbol. The lowerer emits a
@@ -177,6 +199,16 @@ pub enum Inst {
     /// and returns its i64; non-fixnum bindings panic. A future
     /// iter adds proper deopt for type mismatch.
     EnvLookup(Value, u32),
+
+    /// `dst = env_lookup_any(sym)`. Look up a free variable's full
+    /// Value and box it into an Any-tagged `Gc<Value>` handle.
+    /// cs-vm: `Inst::LoadVar` of a non-parameter non-self symbol
+    /// whose use site requires a polymorphic value (e.g. a closure
+    /// flowing to `CallGeneral` as the callee). Lowers to
+    /// `vm_env_lookup_any(sym) -> i64`. Non-fatal: an unbound symbol
+    /// panics, but any bound `Value` succeeds (the helper clones
+    /// the binding through `value_to_gc_i64`). `dst` is typed Any.
+    EnvLookupAny(Value, u32),
 
     /// `env_set(sym, value)`. Write a Fixnum back to a free
     /// variable's binding. cs-vm: `Inst::SetVar` of a non-local

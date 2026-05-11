@@ -34,7 +34,8 @@ use std::collections::HashMap;
 
 use cranelift_codegen::ir::{
     types::{F64, I64},
-    AbiParam, Function as ClifFunction, InstBuilder, Signature, UserFuncName,
+    AbiParam, Function as ClifFunction, InstBuilder, Signature, StackSlotData, StackSlotKind,
+    UserFuncName,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
@@ -77,6 +78,12 @@ pub struct Lowerer {
     /// FuncId of the imported `vm_env_lookup_fixnum` helper.
     /// `Inst::EnvLookup` lowers to a Cranelift call against this.
     env_lookup_func: cranelift_module::FuncId,
+    /// FuncId of the imported `vm_env_lookup_any` helper.
+    /// `Inst::EnvLookupAny` lowers to a Cranelift call against
+    /// this. Used by iter BU's translator when a free-var load
+    /// flows to a `CallGeneral` callee position — the binding's
+    /// shape is unknown at compile time, so we fetch a Gc handle.
+    env_lookup_any_func: cranelift_module::FuncId,
     /// FuncId of the imported `vm_env_set_fixnum` helper.
     /// `Inst::EnvSet` lowers to a Cranelift call against this.
     env_set_func: cranelift_module::FuncId,
@@ -128,6 +135,13 @@ pub struct Lowerer {
     /// lowers to this. Consumes the box; returns 0 iff inner is
     /// `Boolean(false)`.
     any_truthy_func: cranelift_module::FuncId,
+    /// FuncId of `vm_call_general(callee: i64, args_ptr: *const i64,
+    /// n_args: usize) -> i64`. `Inst::CallGeneral` lowers to a
+    /// Cranelift call against this — the slow-path miss handler for
+    /// non-self, non-builtin closure calls (ADR 0012 D-1, iter BU).
+    /// `usize` is modeled as `i64` in the Cranelift signature; the
+    /// helper truncates internally.
+    call_general_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -166,6 +180,10 @@ impl Lowerer {
             cs_vm::vm::vm_env_lookup_fixnum as *const u8,
         );
         builder.symbol(
+            "vm_env_lookup_any",
+            cs_vm::vm::vm_env_lookup_any as *const u8,
+        );
+        builder.symbol(
             "vm_env_set_fixnum",
             cs_vm::vm::vm_env_set_fixnum as *const u8,
         );
@@ -202,6 +220,10 @@ impl Lowerer {
         );
         builder.symbol("vm_eq_any", cs_vm::vm::vm_eq_any_gc as *const u8);
         builder.symbol("vm_any_truthy", cs_vm::vm::vm_any_truthy_gc as *const u8);
+        // ADR 0012 D-1 (iter BU) — slow-path general Call. Lowered
+        // from `Inst::CallGeneral` whenever the bytecode's call
+        // target is neither `self` nor a known builtin.
+        builder.symbol("vm_call_general", cs_vm::vm::vm_call_general as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -215,6 +237,16 @@ impl Lowerer {
                 &env_lookup_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function env_lookup: {e}")))?;
+
+        // Import vm_env_lookup_any: extern "C" fn(i64) -> i64 (same
+        // shape as vm_env_lookup_fixnum).
+        let env_lookup_any_func = module
+            .declare_function(
+                "vm_env_lookup_any",
+                cranelift_module::Linkage::Import,
+                &env_lookup_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function env_lookup_any: {e}")))?;
 
         // Import vm_env_set_fixnum: extern "C" fn(i64, i64) -> ().
         let mut env_set_sig = module.make_signature();
@@ -362,6 +394,23 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_any_truthy: {e}")))?;
 
+        // vm_call_general(callee: i64, args_ptr: i64, n_args: i64) -> i64.
+        // The Rust signature takes `*const i64` + `usize`; Cranelift
+        // models pointers and `usize` as `i64` on the 64-bit hosts we
+        // support, and the helper's Rust prologue casts back.
+        let mut call_general_sig = module.make_signature();
+        call_general_sig.params.push(AbiParam::new(I64)); // callee Gc handle
+        call_general_sig.params.push(AbiParam::new(I64)); // args buffer pointer
+        call_general_sig.params.push(AbiParam::new(I64)); // n_args
+        call_general_sig.returns.push(AbiParam::new(I64));
+        let call_general_func = module
+            .declare_function(
+                "vm_call_general",
+                cranelift_module::Linkage::Import,
+                &call_general_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_call_general: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -371,6 +420,7 @@ impl Lowerer {
             last_inner_stack_maps: HashMap::new(),
             last_inner_base: std::ptr::null(),
             env_lookup_func,
+            env_lookup_any_func,
             env_set_func,
             alloc_pair_func,
             pair_car_func,
@@ -385,6 +435,7 @@ impl Lowerer {
             unbox_flonum_func,
             eq_any_func,
             any_truthy_func,
+            call_general_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -515,6 +566,9 @@ impl Lowerer {
             let env_lookup_fnref = self
                 .module
                 .declare_func_in_func(self.env_lookup_func, builder.func);
+            let env_lookup_any_fnref = self
+                .module
+                .declare_func_in_func(self.env_lookup_any_func, builder.func);
             let env_set_fnref = self
                 .module
                 .declare_func_in_func(self.env_set_func, builder.func);
@@ -557,6 +611,9 @@ impl Lowerer {
             let any_truthy_fnref = self
                 .module
                 .declare_func_in_func(self.any_truthy_func, builder.func);
+            let call_general_fnref = self
+                .module
+                .declare_func_in_func(self.call_general_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -623,6 +680,7 @@ impl Lowerer {
                         &mut value_map,
                         self_fnref,
                         env_lookup_fnref,
+                        env_lookup_any_fnref,
                         env_set_fnref,
                         alloc_pair_fnref,
                         pair_car_fnref,
@@ -637,6 +695,7 @@ impl Lowerer {
                         unbox_flonum_fnref,
                         eq_any_fnref,
                         any_truthy_fnref,
+                        call_general_fnref,
                         inst,
                     )?;
                 }
@@ -805,6 +864,7 @@ fn lower_inst(
     map: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
     self_fnref: cranelift_codegen::ir::FuncRef,
     env_lookup_fnref: cranelift_codegen::ir::FuncRef,
+    env_lookup_any_fnref: cranelift_codegen::ir::FuncRef,
     env_set_fnref: cranelift_codegen::ir::FuncRef,
     alloc_pair_fnref: cranelift_codegen::ir::FuncRef,
     pair_car_fnref: cranelift_codegen::ir::FuncRef,
@@ -819,6 +879,7 @@ fn lower_inst(
     unbox_flonum_fnref: cranelift_codegen::ir::FuncRef,
     eq_any_fnref: cranelift_codegen::ir::FuncRef,
     any_truthy_fnref: cranelift_codegen::ir::FuncRef,
+    call_general_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -1210,10 +1271,75 @@ fn lower_inst(
             }
             map.insert(*dst, results[0]);
         }
+        Inst::EnvLookupAny(dst, sym) => {
+            // Same shape as EnvLookup but the result is a fresh
+            // Gc<Value> handle (Any-tagged), so it needs to be a
+            // stack-map root across subsequent safepoints.
+            let sym_v = b.ins().iconst(I64, *sym as i64);
+            let inst_ref = b.ins().call(env_lookup_any_fnref, &[sym_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "EnvLookupAny expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
         Inst::EnvSet(sym, value) => {
             let val = lookup(map, *value)?;
             let sym_v = b.ins().iconst(I64, *sym as i64);
             b.ins().call(env_set_fnref, &[sym_v, val]);
+        }
+        Inst::CallGeneral(dst, callee, args) => {
+            // ADR 0012 D-1 (iter BU) — slow-path non-self closure
+            // call. Marshal args into a stack-allocated `[i64]`
+            // buffer, then invoke `vm_call_general(callee, ptr,
+            // n_args)`. The helper consumes one strong refcount
+            // per arg slot (and the callee), and returns a fresh
+            // Gc<Value> handle. The IC hot path (per-call-site
+            // mono cache load-compare-call) lands later (BX+);
+            // every CallGeneral takes the slow path today.
+            let callee_v = lookup(map, *callee)?;
+            let n = args.len();
+            // Args buffer: one i64 slot per arg. Allocate even when
+            // n == 0 (we still need a valid pointer to pass through;
+            // a zero-sized stack slot is awkward in Cranelift, so
+            // reserve at least 8 bytes). Alignment 8 (log2 = 3).
+            let buf_bytes = std::cmp::max(8u32, (n as u32) * 8);
+            let slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                buf_bytes,
+                3,
+            ));
+            for (i, a) in args.iter().enumerate() {
+                let av = lookup(map, *a)?;
+                let _ = b.ins().stack_store(av, slot, (i as i32) * 8);
+            }
+            let buf_addr = b.ins().stack_addr(I64, slot, 0);
+            let n_args_v = b.ins().iconst(I64, n as i64);
+            let inst_ref = b
+                .ins()
+                .call(call_general_fnref, &[callee_v, buf_addr, n_args_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "CallGeneral expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            // dst is Any-tagged (a fresh Gc<Value> handle); register
+            // it as a stack-map root so Cranelift spills it across
+            // any subsequent safepoints in the same block.
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
         }
         Inst::Call(_, _, _) | Inst::DeoptCheck(_, _) => {
             return Err(JitError::Unsupported(format!(

@@ -1159,10 +1159,103 @@ pub fn bytecode_to_rir_with_hints(
                                 sim_stack.push(StackEntry::Value(dst));
                             }
                         }
-                        StackEntry::Value(_) => {
-                            return Err(TranslateError::Unsupported(
-                                "Call with non-builtin non-self callee not yet supported".into(),
-                            ));
+                        StackEntry::Value(callee_v) => {
+                            // ADR 0012 D-1 (iter BU) — slow-path
+                            // general Call. The bytecode invoked a
+                            // procedure that the translator couldn't
+                            // resolve to `self` or a known builtin
+                            // (e.g. a top-level lambda binding pulled
+                            // through `EnvLookup`). Emit
+                            // `Inst::CallGeneral`, which lowers to a
+                            // call against `vm_call_general` (the IC
+                            // miss handler). All operands flow as
+                            // Any-tagged `Gc<Value>` handles; if the
+                            // bytecode produced a typed (Fixnum,
+                            // Boolean, ...) value we box it first
+                            // with `BoxTyped`, mirroring the
+                            // `("eq?", 2)` Any-arg pattern above.
+                            //
+                            // Special case: if `callee_v` was just
+                            // produced by an `EnvLookup` (the
+                            // Fixnum-only free-var helper), promote
+                            // that EnvLookup in-place to an
+                            // `EnvLookupAny` so the helper returns a
+                            // live Gc handle instead of panicking on
+                            // a Procedure-bound symbol. This is the
+                            // common case for `(define inner ...)
+                            // (define (outer y) (inner y))`.
+                            let mut callee_box = callee_v;
+                            let mut promoted = false;
+                            // Scan backwards through `insts` to find
+                            // the EnvLookup that produced
+                            // `callee_v`. We can replace it in-place
+                            // with `EnvLookupAny` because:
+                            //   (1) `Value` ids are SSA-style — the
+                            //       producer is unique;
+                            //   (2) no other RIR instruction takes
+                            //       `callee_v`'s Fixnum interpretation
+                            //       between the EnvLookup and this
+                            //       Call (LoadConst etc. produce
+                            //       fresh Values; the only consumer
+                            //       of `callee_v` is the Call itself
+                            //       — guaranteed by the
+                            //       simulated-stack discipline above).
+                            for inst in insts.iter_mut().rev() {
+                                if let RirInst::EnvLookup(d, sym) = inst {
+                                    if *d == callee_v {
+                                        let new = RirInst::EnvLookupAny(*d, *sym);
+                                        *inst = new;
+                                        value_types.insert(callee_v, Type::Any);
+                                        promoted = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !promoted {
+                                let callee_t =
+                                    value_types.get(&callee_v).copied().unwrap_or(Type::Fixnum);
+                                if callee_t != Type::Any {
+                                    let fresh = alloc();
+                                    insts.push(RirInst::BoxTyped(
+                                        fresh,
+                                        callee_v,
+                                        type_to_jit_rt_tag(callee_t),
+                                    ));
+                                    value_types.insert(fresh, Type::Any);
+                                    callee_box = fresh;
+                                }
+                            }
+                            // Box each arg to Any if it's not
+                            // already.
+                            let mut args: Vec<RirValue> = Vec::with_capacity(*n);
+                            for e in args_entries {
+                                let av = match e {
+                                    StackEntry::Value(v) => v,
+                                    StackEntry::SelfRef | StackEntry::BuiltinRef(_) => {
+                                        return Err(TranslateError::Unsupported(
+                                            "non-Value entry as CallGeneral arg".into(),
+                                        ));
+                                    }
+                                };
+                                let at = value_types.get(&av).copied().unwrap_or(Type::Fixnum);
+                                let abox = if at == Type::Any {
+                                    av
+                                } else {
+                                    let fresh = alloc();
+                                    insts.push(RirInst::BoxTyped(
+                                        fresh,
+                                        av,
+                                        type_to_jit_rt_tag(at),
+                                    ));
+                                    value_types.insert(fresh, Type::Any);
+                                    fresh
+                                };
+                                args.push(abox);
+                            }
+                            let dst = alloc();
+                            insts.push(RirInst::CallGeneral(dst, callee_box, args));
+                            value_types.insert(dst, Type::Any);
+                            sim_stack.push(StackEntry::Value(dst));
                         }
                     }
                 }
@@ -1514,7 +1607,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::Cons(dst, _, _, _, _)
                 | RirInst::Car(dst, _)
                 | RirInst::Cdr(dst, _)
-                | RirInst::AnyClone(dst, _) => {
+                | RirInst::AnyClone(dst, _)
+                | RirInst::CallGeneral(dst, _, _)
+                | RirInst::EnvLookupAny(dst, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}
@@ -2105,11 +2200,16 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_general_call_rejected() {
+    fn general_call_lowers_to_call_general() {
+        // ADR 0012 D-1 iter BU — previously `Unsupported` ("Call
+        // with non-builtin non-self callee"); now lowers to
+        // `Inst::CallGeneral`, which routes through the
+        // `vm_call_general` slow-path helper at runtime.
         let mut syms = SymbolTable::new();
         let g = syms.intern("g");
-        // (g 1) — calls non-self. The LoadVar(g) succeeds (becomes
-        // EnvLookup); the Call non-self is what rejects.
+        // (g 1) — calls non-self. The LoadVar(g) for a free var
+        // is promoted to `EnvLookupAny` inline so the callee
+        // arrives as an Any-tagged Gc handle for vm_call_general.
         let body = vec![
             Inst::LoadVar(g),
             Inst::Const(Value::Number(Number::Fixnum(1))),
@@ -2124,13 +2224,27 @@ mod tests {
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None,
         };
-        match bytecode_to_rir(&lam, "f", None) {
-            Err(TranslateError::Unsupported(msg)) => assert!(
-                msg.contains("non-self") || msg.contains("Call"),
-                "msg = {msg}"
-            ),
-            other => panic!("expected Unsupported, got {:?}", other),
-        }
+        let f = bytecode_to_rir(&lam, "f", None).expect("translate succeeded");
+        let has_general = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, RirInst::CallGeneral(_, _, _)));
+        assert!(
+            has_general,
+            "expected an Inst::CallGeneral in {:?}",
+            f.blocks
+        );
+        let has_lookup_any = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, RirInst::EnvLookupAny(_, _)));
+        assert!(
+            has_lookup_any,
+            "expected an Inst::EnvLookupAny in {:?}",
+            f.blocks
+        );
     }
 
     #[test]
