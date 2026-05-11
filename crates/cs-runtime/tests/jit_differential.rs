@@ -5276,3 +5276,45 @@ fn diff_jit_last_pair_and_last() {
         other => panic!("expected (pair, 30, 30), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_zero_positive_negative_flonum() {
+    // ADR 0012 D-2 (iter EP) — zero?/positive?/negative? type-aware
+    // for Flonum operand via FlonumEq/FlonumLt against 0.0.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (z x) (zero? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (p x) (positive? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (n x) (negative? x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (z 1.0) (p 1.0) (n 1.0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let z0 = rt.eval_str_via_vm("<diff>", "(z 0.0)").unwrap();
+    let z1 = rt.eval_str_via_vm("<diff>", "(z 1.5)").unwrap();
+    let p_t = rt.eval_str_via_vm("<diff>", "(p 1.5)").unwrap();
+    let p_f = rt.eval_str_via_vm("<diff>", "(p -1.5)").unwrap();
+    let p_z = rt.eval_str_via_vm("<diff>", "(p 0.0)").unwrap();
+    let n_t = rt.eval_str_via_vm("<diff>", "(n -1.5)").unwrap();
+    let n_f = rt.eval_str_via_vm("<diff>", "(n 1.5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&z0, &z1, &p_t, &p_f, &p_z, &n_t, &n_f) {
+        (
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (T, F, T, F, F, T, F), got {:?}", other),
+    }
+}

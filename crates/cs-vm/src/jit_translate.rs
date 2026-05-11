@@ -798,24 +798,70 @@ pub fn bytecode_to_rir_with_hints(
                                 // doesn't have specialized opcodes for.
                                 // All produce Boolean (0 or 1 i64).
                                 match (name, args.len()) {
-                                    ("zero?", 1) => {
+                                    // ADR 0012 D-2 (iter EP) — Flonum-typed
+                                    // zero?/positive?/negative? use FlonumEq/
+                                    // FlonumLt against a 0.0 constant.
+                                    ("zero?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                        value_types.insert(zero, Type::Flonum);
+                                        insts.push(RirInst::FlonumEq(dst, args[0], zero));
+                                    }
+                                    ("positive?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                        value_types.insert(zero, Type::Flonum);
+                                        insts.push(RirInst::FlonumLt(dst, zero, args[0]));
+                                    }
+                                    ("negative?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                        value_types.insert(zero, Type::Flonum);
+                                        insts.push(RirInst::FlonumLt(dst, args[0], zero));
+                                    }
+                                    // Fixnum default for zero?/positive?/
+                                    // negative? and odd?/even?. odd?/even?
+                                    // refuse Flonum (no integer parity for
+                                    // f64) → fall through to unsupported.
+                                    ("zero?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
                                         let zero = alloc();
                                         insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
                                         insts.push(RirInst::Eq(dst, args[0], zero));
                                     }
-                                    ("positive?", 1) => {
+                                    ("positive?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
                                         // x > 0  →  Lt(0, x)
                                         let zero = alloc();
                                         insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
                                         insts.push(RirInst::Lt(dst, zero, args[0]));
                                     }
-                                    ("negative?", 1) => {
+                                    ("negative?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
                                         // x < 0  →  Lt(x, 0)
                                         let zero = alloc();
                                         insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
                                         insts.push(RirInst::Lt(dst, args[0], zero));
                                     }
-                                    ("odd?", 1) => {
+                                    ("odd?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
                                         // x & 1 == 1  →  BitAnd then Eq with 1.
                                         let one = alloc();
                                         insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
@@ -823,7 +869,10 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::BitAnd(bit, args[0], one));
                                         insts.push(RirInst::Eq(dst, bit, one));
                                     }
-                                    ("even?", 1) => {
+                                    ("even?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
                                         // x & 1 == 0
                                         let one = alloc();
                                         insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
