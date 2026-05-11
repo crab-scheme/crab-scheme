@@ -2867,3 +2867,53 @@ fn diff_jit_char_case_ops() {
         other => panic!("expected (65, 97, 1, 0, 1, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_list_ref_and_tail() {
+    // ADR 0012 D-2 (iter CK) — list-ref / list-tail walk n cdrs.
+    // list-ref then takes the car; list-tail returns the spine
+    // remainder as-is.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ref lst n) (list-ref lst n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (tail lst n) (list-tail lst n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (ref (list 10 20 30 40) 2) (tail (list 1 2 3) 1) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // list-ref at index 0, 2 of (10 20 30 40) → 10, 30.
+    let ref0 = rt
+        .eval_str_via_vm("<diff>", "(ref (list 10 20 30 40) 0)")
+        .unwrap();
+    let ref2 = rt
+        .eval_str_via_vm("<diff>", "(ref (list 10 20 30 40) 2)")
+        .unwrap();
+    // list-tail at index 2 of (1 2 3 4 5) → (3 4 5); length 3.
+    let tail_len = rt
+        .eval_str_via_vm("<diff>", "(length (tail (list 1 2 3 4 5) 2))")
+        .unwrap();
+    // list-tail at index 0 → identity (length 4).
+    let tail_id = rt
+        .eval_str_via_vm("<diff>", "(length (tail (list 1 2 3 4) 0))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "list-ref/list-tail never dispatched through JIT (count={after})"
+    );
+    match (&ref0, &ref2, &tail_len, &tail_id) {
+        (
+            Value::Number(cs_core::Number::Fixnum(10)),
+            Value::Number(cs_core::Number::Fixnum(30)),
+            Value::Number(cs_core::Number::Fixnum(3)),
+            Value::Number(cs_core::Number::Fixnum(4)),
+        ) => {}
+        other => panic!("expected (10, 30, 3, 4), got {:?}", other),
+    }
+}

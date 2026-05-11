@@ -322,6 +322,15 @@ pub enum Inst {
     /// `vm_assoc_gc`. ADR 0012 D-2 (iter CH).
     Assoc(Value, Value, Value),
 
+    /// `dst = list-tail(lst, n)`. Lowers to `vm_list_tail_gc`. `lst`
+    /// Any (consumed), `n` Fixnum. `dst` is Any. ADR 0012 D-2
+    /// (iter CK).
+    ListTail(Value, Value, Value),
+
+    /// `dst = list-ref(lst, n)`. Lowers to `vm_list_ref_gc`.
+    /// ADR 0012 D-2 (iter CK).
+    ListRef(Value, Value, Value),
+
     /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
     /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
     /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).

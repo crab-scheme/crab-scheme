@@ -1004,6 +1004,23 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::Assv(dst, key, args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter CK) — list-tail / list-ref.
+                                    // lst Any, index Fixnum. Helpers consume
+                                    // the lst handle; index is a raw i64.
+                                    ("list-tail", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::ListTail(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("list-ref", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::ListRef(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter CH) — member / assoc,
                                     // the equal?-flavored variants. Same
                                     // BoxTyped dance on the search key.
@@ -2163,7 +2180,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::Memv(dst, _, _)
                 | RirInst::Assv(dst, _, _)
                 | RirInst::Member(dst, _, _)
-                | RirInst::Assoc(dst, _, _) => {
+                | RirInst::Assoc(dst, _, _)
+                | RirInst::ListTail(dst, _, _)
+                | RirInst::ListRef(dst, _, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

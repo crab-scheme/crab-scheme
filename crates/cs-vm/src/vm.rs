@@ -879,6 +879,80 @@ pub unsafe extern "C" fn vm_char_whitespace_p(c: i64) -> i64 {
     char::from_u32(c as u32).map_or(0, |ch| ch.is_whitespace() as i64)
 }
 
+/// `(list-tail lst n)` — walk `n` cdrs and return whatever's
+/// there. `lst` is consumed; `n` is a raw Fixnum-shape i64.
+/// On negative `n` or an out-of-range index (spine exhausted
+/// before n cdrs), requests a deopt and returns a Gc handle to
+/// Null as a placeholder. ADR 0012 D-2 (iter CK).
+///
+/// # Safety
+///
+/// `lst` must be a live, owned `Gc<Value>` raw handle. `n` is
+/// a raw i64 (not a Gc handle).
+#[no_mangle]
+pub unsafe extern "C" fn vm_list_tail_gc(lst: i64, n: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(lst) };
+    if n < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Null);
+    }
+    let mut cur = v;
+    let mut i: i64 = 0;
+    while i < n {
+        match cur {
+            Value::Pair(p) => {
+                let next = p.cdr.borrow().clone();
+                cur = next;
+                i += 1;
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+    value_to_gc_i64(cur)
+}
+
+/// `(list-ref lst n)` — return the n-th element of `lst`. Walks
+/// `n` cdrs then takes car. On out-of-range or non-pair tail,
+/// requests a deopt and returns a Gc handle to Null. ADR 0012 D-2
+/// (iter CK).
+///
+/// # Safety
+///
+/// Same as `vm_list_tail_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_list_ref_gc(lst: i64, n: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(lst) };
+    if n < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Null);
+    }
+    let mut cur = v;
+    let mut i: i64 = 0;
+    while i < n {
+        match cur {
+            Value::Pair(p) => {
+                let next = p.cdr.borrow().clone();
+                cur = next;
+                i += 1;
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+    match cur {
+        Value::Pair(p) => value_to_gc_i64(p.car.borrow().clone()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
 /// `(member item lst)` — equal?-flavored memq. Uses
 /// `cs_core::eq::equal` (R6RS structural equality with cycle
 /// detection) for the per-element comparison. Returns the
