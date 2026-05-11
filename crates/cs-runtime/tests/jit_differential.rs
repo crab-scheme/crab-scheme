@@ -3852,3 +3852,34 @@ fn diff_jit_string_fill() {
         other => panic!("expected #\\Q, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_variadic_min_max() {
+    // ADR 0012 D-2 (iter DI) — variadic min / max chained over
+    // multiple args (3+). 2-arg form was already handled via the
+    // single-Inst table; this iter extends to longer chains.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (m3 a b c) (min a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (x4 a b c d) (max a b c d))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (m3 1 2 3) (x4 1 2 3 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let mn = rt.eval_str_via_vm("<diff>", "(m3 7 3 9)").unwrap(); // 3
+    let mx = rt.eval_str_via_vm("<diff>", "(x4 7 3 9 5)").unwrap(); // 9
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "variadic min/max never dispatched through JIT (count={after})"
+    );
+    match (&mn, &mx) {
+        (Value::Number(cs_core::Number::Fixnum(3)), Value::Number(cs_core::Number::Fixnum(9))) => {}
+        other => panic!("expected (3, 9), got {:?}", other),
+    }
+}

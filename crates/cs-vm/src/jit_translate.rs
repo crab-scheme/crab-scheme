@@ -2216,6 +2216,74 @@ pub fn bytecode_to_rir_with_hints(
                                             value_types.insert(dst, result_t);
                                         }
                                     }
+                                    // ADR 0012 D-2 (iter DI) — variadic
+                                    // min/max chain. Pattern mirrors +/-/*
+                                    // above: Flonum-contagion promotion +
+                                    // left-fold via MinFixnum/MaxFixnum or
+                                    // FlonumMin/FlonumMax.
+                                    ("min", _) | ("max", _) if args.len() >= 1 => {
+                                        let any_flonum = args.iter().any(|v| {
+                                            value_types.get(v).copied() == Some(Type::Flonum)
+                                        });
+                                        let result_t = if any_flonum {
+                                            Type::Flonum
+                                        } else {
+                                            Type::Fixnum
+                                        };
+                                        let fx_ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
+                                            match name {
+                                                "min" => RirInst::MinFixnum,
+                                                "max" => RirInst::MaxFixnum,
+                                                _ => unreachable!(),
+                                            };
+                                        let fl_ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
+                                            match name {
+                                                "min" => RirInst::FlonumMin,
+                                                "max" => RirInst::FlonumMax,
+                                                _ => unreachable!(),
+                                            };
+                                        let ctor = if any_flonum { fl_ctor } else { fx_ctor };
+                                        let promoted_args: Vec<RirValue> = if any_flonum {
+                                            args.iter()
+                                                .map(|v| {
+                                                    let t = value_types
+                                                        .get(v)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    if t == Type::Flonum {
+                                                        *v
+                                                    } else {
+                                                        let p = alloc();
+                                                        insts.push(RirInst::FixToFlo(p, *v));
+                                                        value_types.insert(p, Type::Flonum);
+                                                        p
+                                                    }
+                                                })
+                                                .collect()
+                                        } else {
+                                            args.clone()
+                                        };
+                                        if promoted_args.len() == 1 {
+                                            // Single arg → return as-is.
+                                            insts.push(RirInst::Move(dst, promoted_args[0]));
+                                            value_types.insert(dst, result_t);
+                                        } else {
+                                            // Left-fold: acc = ctor(acc, next).
+                                            let mut acc = promoted_args[0];
+                                            for v in &promoted_args[1..promoted_args.len() - 1] {
+                                                let next = alloc();
+                                                insts.push(ctor(next, acc, *v));
+                                                value_types.insert(next, result_t);
+                                                acc = next;
+                                            }
+                                            insts.push(ctor(
+                                                dst,
+                                                acc,
+                                                *promoted_args.last().unwrap(),
+                                            ));
+                                            value_types.insert(dst, result_t);
+                                        }
+                                    }
                                     _ => {
                                         return Err(TranslateError::Unsupported(format!(
                                             "Call to builtin `{name}` (arity {}) not yet lowered",
