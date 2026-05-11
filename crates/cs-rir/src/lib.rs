@@ -670,6 +670,22 @@ pub enum Inst {
     /// lhs/rhs differ. ADR 0012 D-2 (iter ED).
     FloorQuotient(Value, Value, Value),
 
+    /// `dst = nan?(x)` for Flonum-typed `x`. Lowered inline as
+    /// Cranelift `fcmp Unordered, x, x` (NaN is the only f64 value
+    /// that is unordered with itself). `dst` is Boolean. ADR 0012
+    /// D-2 (iter EF).
+    FlonumIsNan(Value, Value),
+
+    /// `dst = infinite?(x)` for Flonum-typed `x`. Lowered inline
+    /// as `fabs(x) == f64::INFINITY` via Cranelift fabs + fcmp eq
+    /// against a +∞ constant. `dst` is Boolean. ADR 0012 D-2 (iter EF).
+    FlonumIsInfinite(Value, Value),
+
+    /// `dst = finite?(x)` for Flonum-typed `x`. Lowered inline as
+    /// `fabs(x) < f64::INFINITY` (catches both NaN and ±∞ in one
+    /// ordered comparison). `dst` is Boolean. ADR 0012 D-2 (iter EF).
+    FlonumIsFinite(Value, Value),
+
     /// `dst = srem(lhs, rhs)`. R6RS `remainder` for fixnums.
     Remainder(Value, Value, Value),
 

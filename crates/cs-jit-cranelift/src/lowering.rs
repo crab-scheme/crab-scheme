@@ -3348,6 +3348,49 @@ fn lower_inst(
         }
         Inst::FlonumSqrt(dst, src) => funary(b, map, *dst, *src, |b, x| b.ins().sqrt(x))?,
         Inst::FlonumAbs(dst, src) => funary(b, map, *dst, *src, |b, x| b.ins().fabs(x))?,
+        Inst::FlonumIsNan(dst, src) => {
+            // ADR 0012 D-2 (iter EF) — NaN ↔ unordered with itself.
+            let s_i = lookup(map, *src)?;
+            let mf = cranelift_codegen::ir::MemFlags::new();
+            let s_f = b.ins().bitcast(F64, mf, s_i);
+            let cmp = b.ins().fcmp(
+                cranelift_codegen::ir::condcodes::FloatCC::Unordered,
+                s_f,
+                s_f,
+            );
+            let widened = b.ins().uextend(I64, cmp);
+            map.insert(*dst, widened);
+        }
+        Inst::FlonumIsInfinite(dst, src) => {
+            // ADR 0012 D-2 (iter EF) — abs(x) == +∞.
+            let s_i = lookup(map, *src)?;
+            let mf = cranelift_codegen::ir::MemFlags::new();
+            let s_f = b.ins().bitcast(F64, mf, s_i);
+            let abs = b.ins().fabs(s_f);
+            let inf = b.ins().f64const(f64::INFINITY);
+            let cmp = b
+                .ins()
+                .fcmp(cranelift_codegen::ir::condcodes::FloatCC::Equal, abs, inf);
+            let widened = b.ins().uextend(I64, cmp);
+            map.insert(*dst, widened);
+        }
+        Inst::FlonumIsFinite(dst, src) => {
+            // ADR 0012 D-2 (iter EF) — abs(x) < +∞. Ordered LT
+            // rejects NaN (returns false) and ±∞ (returns false),
+            // covering "finite" in one comparison.
+            let s_i = lookup(map, *src)?;
+            let mf = cranelift_codegen::ir::MemFlags::new();
+            let s_f = b.ins().bitcast(F64, mf, s_i);
+            let abs = b.ins().fabs(s_f);
+            let inf = b.ins().f64const(f64::INFINITY);
+            let cmp = b.ins().fcmp(
+                cranelift_codegen::ir::condcodes::FloatCC::LessThan,
+                abs,
+                inf,
+            );
+            let widened = b.ins().uextend(I64, cmp);
+            map.insert(*dst, widened);
+        }
         Inst::FlonumSin(dst, src) => {
             // ADR 0012 D-2 (iter DF) — Cranelift has no native sin;
             // helper takes/returns i64-encoded f64.

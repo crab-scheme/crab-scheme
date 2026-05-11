@@ -4873,3 +4873,50 @@ fn diff_jit_exact_inexact_type_aware() {
         other => panic!("expected (T, F, F, T), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_nan_infinite_finite_flo() {
+    // ADR 0012 D-2 (iter EF) — nan?/infinite?/finite? for Flonum
+    // via inline fcmp. Fixnum/non-flonum cases use the const
+    // predicates from earlier iters.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (np x) (nan? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ip x) (infinite? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fp x) (finite? x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (np 1.0) (ip 1.0) (fp 1.0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let nan_t = rt.eval_str_via_vm("<diff>", "(np (/ 0.0 0.0))").unwrap();
+    let nan_f = rt.eval_str_via_vm("<diff>", "(np 1.5)").unwrap();
+    let inf_t = rt.eval_str_via_vm("<diff>", "(ip (/ 1.0 0.0))").unwrap();
+    let inf_f = rt.eval_str_via_vm("<diff>", "(ip 1.5)").unwrap();
+    let fin_t = rt.eval_str_via_vm("<diff>", "(fp 1.5)").unwrap();
+    let fin_f1 = rt.eval_str_via_vm("<diff>", "(fp (/ 1.0 0.0))").unwrap();
+    let fin_f2 = rt.eval_str_via_vm("<diff>", "(fp (/ 0.0 0.0))").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 6,
+        "nan?/infinite?/finite? never dispatched through JIT (count={after})"
+    );
+    match (&nan_t, &nan_f, &inf_t, &inf_f, &fin_t, &fin_f1, &fin_f2) {
+        (
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (T, F, T, F, T, F, F), got {:?}", other),
+    }
+}

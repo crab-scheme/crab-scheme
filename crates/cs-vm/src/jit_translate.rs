@@ -833,11 +833,42 @@ pub fn bytecode_to_rir_with_hints(
                                             != Some(Type::Flonum) =>
                                     {
                                         // Fixnum / non-flonum: not NaN, not
-                                        // infinite. Flonum case falls
-                                        // through to unsupported (no
-                                        // FlonumIsNan/Infinite RIR yet).
+                                        // infinite.
                                         let _ = args[0];
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
+                                    }
+                                    // ADR 0012 D-2 (iter EF) — nan?/infinite?/
+                                    // finite? for Flonum via inline fcmp.
+                                    ("nan?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumIsNan(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("infinite?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumIsInfinite(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("finite?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumIsFinite(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    // finite? for Fixnum / non-flonum: always
+                                    // true (per R7RS, exact numbers are
+                                    // finite).
+                                    ("finite?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        let _ = args[0];
+                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
                                     }
                                     // Flonum rounding when the arg is
                                     // statically Flonum-typed. Cranelift
@@ -3439,6 +3470,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::Eq(dst, _, _)
                 | RirInst::FlonumLt(dst, _, _)
                 | RirInst::FlonumEq(dst, _, _)
+                | RirInst::FlonumIsNan(dst, _)
+                | RirInst::FlonumIsInfinite(dst, _)
+                | RirInst::FlonumIsFinite(dst, _)
                 | RirInst::PairP(dst, _)
                 | RirInst::NullP(dst, _)
                 | RirInst::EqAny(dst, _, _)
