@@ -4071,3 +4071,44 @@ fn diff_jit_variadic_list() {
         other => panic!("expected (3, 10, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_variadic_vector() {
+    // ADR 0012 D-2 (iter DO) — variadic `vector` lowers via stack-
+    // buffer + vm_make_vector_buf helper.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (v3 a b c) (vector a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (v0) (vector))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (v3 1 2 3) (v0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let len = rt
+        .eval_str_via_vm("<diff>", "(vector-length (v3 10 20 30))")
+        .unwrap();
+    let elem = rt
+        .eval_str_via_vm("<diff>", "(vector-ref (v3 10 20 30) 1)")
+        .unwrap();
+    let empty_len = rt
+        .eval_str_via_vm("<diff>", "(vector-length (v0))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "variadic vector never dispatched through JIT (count={after})"
+    );
+    match (&len, &elem, &empty_len) {
+        (
+            Value::Number(cs_core::Number::Fixnum(3)),
+            Value::Number(cs_core::Number::Fixnum(20)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (3, 20, 0), got {:?}", other),
+    }
+}

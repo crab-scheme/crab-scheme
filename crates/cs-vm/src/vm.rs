@@ -1529,6 +1529,33 @@ pub unsafe extern "C" fn vm_list_copy_gc(lst: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(vector ...)` — variadic constructor that builds a fresh
+/// `Value::Vector` from a buffer of `n` Gc handles (Any-shape).
+/// Each buffer entry is consumed (one strong refcount each); the
+/// resulting vector takes ownership of the decoded `Value`s.
+/// ADR 0012 D-2 (iter DO).
+///
+/// # Safety
+///
+/// `buf` must point to a valid array of `n` live, owned
+/// `Gc<Value>` raw handles. The caller is responsible for the
+/// buffer's allocation lifetime (the JIT body stack-allocates the
+/// buffer for the duration of this call).
+#[no_mangle]
+pub unsafe extern "C" fn vm_make_vector_buf(buf: *const i64, n: usize) -> i64 {
+    let mut items: Vec<Value> = Vec::with_capacity(n);
+    for i in 0..n {
+        // SAFETY: caller (JIT-emitted code) wrote n valid handles
+        // starting at buf; reads are in-bounds.
+        let raw = unsafe { *buf.add(i) };
+        let v = unsafe { gc_i64_to_value(raw) };
+        items.push(v);
+    }
+    value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+        items,
+    ))))
+}
+
 /// `(make-bytevector n fill)` — allocate a fresh `Value::ByteVector`
 /// of length `n` with every byte set to `fill & 0xFF`. Both args
 /// are raw Fixnum-shape i64 (not Gc handles). Negative `n` clamps
