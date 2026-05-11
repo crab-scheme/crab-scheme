@@ -3781,3 +3781,40 @@ fn diff_jit_flonum_transcendentals() {
         other => panic!("expected (sin 0 ≈ 0, exp 0 ≈ 1), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_flonum_inverse_trig() {
+    // ADR 0012 D-2 (iter DG) — asin / acos / atan lower to runtime
+    // helpers.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (as x) (asin x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ac x) (acos x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (at x) (atan x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (as 0.5) (ac 0.5) (at 1.0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let asin0 = rt.eval_str_via_vm("<diff>", "(as 0.0)").unwrap();
+    let acos1 = rt.eval_str_via_vm("<diff>", "(ac 1.0)").unwrap();
+    let atan0 = rt.eval_str_via_vm("<diff>", "(at 0.0)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "inverse trig never dispatched through JIT (count={after})"
+    );
+    match (&asin0, &acos1, &atan0) {
+        (
+            Value::Number(cs_core::Number::Flonum(a)),
+            Value::Number(cs_core::Number::Flonum(b)),
+            Value::Number(cs_core::Number::Flonum(c)),
+        ) if a.abs() < 1e-12 && b.abs() < 1e-12 && c.abs() < 1e-12 => {}
+        other => panic!("expected (asin 0, acos 1, atan 0 all ≈ 0), got {:?}", other),
+    }
+}

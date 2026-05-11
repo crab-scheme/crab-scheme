@@ -901,6 +901,24 @@ pub unsafe extern "C" fn vm_digit_value(c: i64) -> i64 {
     value_to_gc_i64(v)
 }
 
+/// `(asin x)` — flonum arc-sine. ADR 0012 D-2 (iter DG).
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_asin(x: i64) -> i64 {
+    f64::from_bits(x as u64).asin().to_bits() as i64
+}
+
+/// `(acos x)` — flonum arc-cosine. ADR 0012 D-2 (iter DG).
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_acos(x: i64) -> i64 {
+    f64::from_bits(x as u64).acos().to_bits() as i64
+}
+
+/// `(atan x)` — flonum arc-tangent (1-arg). ADR 0012 D-2 (iter DG).
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_atan(x: i64) -> i64 {
+    f64::from_bits(x as u64).atan().to_bits() as i64
+}
+
 /// `(sin x)` — flonum sine via `f64::sin`. Operand and result are
 /// i64 bit patterns of f64. ADR 0012 D-2 (iter DF).
 ///

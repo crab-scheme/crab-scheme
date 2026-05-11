@@ -293,6 +293,12 @@ pub struct Lowerer {
     flonum_log_func: cranelift_module::FuncId,
     /// FuncId of `vm_flonum_exp(x) -> i64`. ADR 0012 D-2 (iter DF).
     flonum_exp_func: cranelift_module::FuncId,
+    /// FuncId of `vm_flonum_asin(x) -> i64`. ADR 0012 D-2 (iter DG).
+    flonum_asin_func: cranelift_module::FuncId,
+    /// FuncId of `vm_flonum_acos(x) -> i64`. ADR 0012 D-2 (iter DG).
+    flonum_acos_func: cranelift_module::FuncId,
+    /// FuncId of `vm_flonum_atan(x) -> i64`. ADR 0012 D-2 (iter DG).
+    flonum_atan_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -549,6 +555,10 @@ impl Lowerer {
         builder.symbol("vm_flonum_tan", cs_vm::vm::vm_flonum_tan as *const u8);
         builder.symbol("vm_flonum_log", cs_vm::vm::vm_flonum_log as *const u8);
         builder.symbol("vm_flonum_exp", cs_vm::vm::vm_flonum_exp as *const u8);
+        // ADR 0012 D-2 (iter DG) — inverse trig.
+        builder.symbol("vm_flonum_asin", cs_vm::vm::vm_flonum_asin as *const u8);
+        builder.symbol("vm_flonum_acos", cs_vm::vm::vm_flonum_acos as *const u8);
+        builder.symbol("vm_flonum_atan", cs_vm::vm::vm_flonum_atan as *const u8);
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
             "vm_char_alphabetic_p",
@@ -1291,6 +1301,29 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_flonum_exp: {e}")))?;
 
+        // ADR 0012 D-2 (iter DG) — inverse trig.
+        let flonum_asin_func = module
+            .declare_function(
+                "vm_flonum_asin",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_flonum_asin: {e}")))?;
+        let flonum_acos_func = module
+            .declare_function(
+                "vm_flonum_acos",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_flonum_acos: {e}")))?;
+        let flonum_atan_func = module
+            .declare_function(
+                "vm_flonum_atan",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_flonum_atan: {e}")))?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -1519,6 +1552,9 @@ impl Lowerer {
             flonum_tan_func,
             flonum_log_func,
             flonum_exp_func,
+            flonum_asin_func,
+            flonum_acos_func,
+            flonum_atan_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -1903,6 +1939,16 @@ impl Lowerer {
             let flonum_exp_fnref = self
                 .module
                 .declare_func_in_func(self.flonum_exp_func, builder.func);
+            // iter DG — inverse trig.
+            let flonum_asin_fnref = self
+                .module
+                .declare_func_in_func(self.flonum_asin_func, builder.func);
+            let flonum_acos_fnref = self
+                .module
+                .declare_func_in_func(self.flonum_acos_func, builder.func);
+            let flonum_atan_fnref = self
+                .module
+                .declare_func_in_func(self.flonum_atan_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -2095,6 +2141,9 @@ impl Lowerer {
                         flonum_tan_fnref,
                         flonum_log_fnref,
                         flonum_exp_fnref,
+                        flonum_asin_fnref,
+                        flonum_acos_fnref,
+                        flonum_atan_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -2350,6 +2399,9 @@ fn lower_inst(
     flonum_tan_fnref: cranelift_codegen::ir::FuncRef,
     flonum_log_fnref: cranelift_codegen::ir::FuncRef,
     flonum_exp_fnref: cranelift_codegen::ir::FuncRef,
+    flonum_asin_fnref: cranelift_codegen::ir::FuncRef,
+    flonum_acos_fnref: cranelift_codegen::ir::FuncRef,
+    flonum_atan_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -2808,6 +2860,51 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "FlonumExp expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::FlonumAsin(dst, src) => {
+            let s = lookup(map, *src)?;
+            let inst_ref = b.ins().call(flonum_asin_fnref, &[s]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "FlonumAsin expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::FlonumAcos(dst, src) => {
+            let s = lookup(map, *src)?;
+            let inst_ref = b.ins().call(flonum_acos_fnref, &[s]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "FlonumAcos expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::FlonumAtan(dst, src) => {
+            let s = lookup(map, *src)?;
+            let inst_ref = b.ins().call(flonum_atan_fnref, &[s]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "FlonumAtan expected 1 result, got {}",
                         results.len()
                     )));
                 }

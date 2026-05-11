@@ -146,6 +146,16 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter DF).
     FlonumExp(Value, Value),
 
+    /// `dst = asin(src)` (flonum arc-sine). ADR 0012 D-2 (iter DG).
+    FlonumAsin(Value, Value),
+
+    /// `dst = acos(src)` (flonum arc-cosine). ADR 0012 D-2 (iter DG).
+    FlonumAcos(Value, Value),
+
+    /// `dst = atan(src)` (flonum arc-tangent, 1-arg). ADR 0012 D-2
+    /// (iter DG).
+    FlonumAtan(Value, Value),
+
     /// `dst = |src|` (flonum). Lowers to Cranelift `fabs`. Strips
     /// the sign bit; NaN propagates unchanged.
     FlonumAbs(Value, Value),
