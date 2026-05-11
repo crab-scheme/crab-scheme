@@ -5524,3 +5524,46 @@ fn diff_jit_string_contains() {
         other => panic!("expected (6, #f, 0, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_prefix_suffix_p() {
+    // ADR 0012 D-2 (iter EV) — string-prefix? / string-suffix?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (pre p s) (string-prefix? p s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (suf p s) (string-suffix? p s))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (pre \"hello\" \"hello world\") \
+                      (suf \"world\" \"hello world\") \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let pt = rt
+        .eval_str_via_vm("<diff>", "(pre \"foo\" \"foobar\")")
+        .unwrap();
+    let pf = rt
+        .eval_str_via_vm("<diff>", "(pre \"baz\" \"foobar\")")
+        .unwrap();
+    let st = rt
+        .eval_str_via_vm("<diff>", "(suf \"bar\" \"foobar\")")
+        .unwrap();
+    let sf = rt
+        .eval_str_via_vm("<diff>", "(suf \"foo\" \"foobar\")")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&pt, &pf, &st, &sf) {
+        (
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (T, F, T, F), got {:?}", other),
+    }
+}

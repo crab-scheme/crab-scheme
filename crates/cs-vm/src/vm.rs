@@ -3152,6 +3152,45 @@ pub unsafe extern "C" fn vm_make_list_fill_gc(n: i64, fill: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(string-prefix? prefix s)` — true iff `s` starts with `prefix`.
+/// Consumes both Gc handles. Returns Gc<Value::Boolean>.
+/// ADR 0012 D-2 (iter EV).
+///
+/// # Safety
+///
+/// `prefix` and `s` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_prefix_p_gc(prefix: i64, s: i64) -> i64 {
+    let p_v = unsafe { gc_i64_to_value(prefix) };
+    let s_v = unsafe { gc_i64_to_value(s) };
+    match (p_v, s_v) {
+        (Value::String(p), Value::String(s)) => s.borrow().starts_with(&*p.borrow()) as i64,
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+/// `(string-suffix? suffix s)` — true iff `s` ends with `suffix`.
+/// ADR 0012 D-2 (iter EV).
+///
+/// # Safety
+///
+/// `suffix` and `s` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_suffix_p_gc(suffix: i64, s: i64) -> i64 {
+    let p_v = unsafe { gc_i64_to_value(suffix) };
+    let s_v = unsafe { gc_i64_to_value(s) };
+    match (p_v, s_v) {
+        (Value::String(p), Value::String(s)) => s.borrow().ends_with(&*p.borrow()) as i64,
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
 /// `(string-contains haystack needle)` — returns the char index of
 /// the first occurrence of `needle` in `haystack`, or #f if not
 /// found. Consumes both Gc handles. Returns a Gc handle (Fixnum or

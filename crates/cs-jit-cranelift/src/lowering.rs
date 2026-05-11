@@ -414,6 +414,10 @@ pub struct Lowerer {
     string_foldcase_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_contains_gc(h, n) -> i64`. ADR 0012 D-2 (iter EU).
     string_contains_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_prefix_p_gc(pre, s) -> i64`. ADR 0012 D-2 (iter EV).
+    string_prefix_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_suffix_p_gc(suf, s) -> i64`. ADR 0012 D-2 (iter EV).
+    string_suffix_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_list_fill_gc(n, fill) -> i64`. ADR 0012
     /// D-2 (iter EM).
     make_list_fill_func: cranelift_module::FuncId,
@@ -807,6 +811,15 @@ impl Lowerer {
         builder.symbol(
             "vm_string_contains_gc",
             cs_vm::vm::vm_string_contains_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter EV) — string-prefix?/suffix?.
+        builder.symbol(
+            "vm_string_prefix_p_gc",
+            cs_vm::vm::vm_string_prefix_p_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_suffix_p_gc",
+            cs_vm::vm::vm_string_suffix_p_gc as *const u8,
         );
         // ADR 0012 D-2 (iter EM) — make-list 2-arg.
         builder.symbol(
@@ -1952,6 +1965,26 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_string_contains_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter EV) — string-prefix?/suffix?.
+        let string_prefix_p_func = module
+            .declare_function(
+                "vm_string_prefix_p_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_prefix_p_gc: {e}"))
+            })?;
+        let string_suffix_p_func = module
+            .declare_function(
+                "vm_string_suffix_p_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_suffix_p_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter EM) — vm_make_list_fill_gc(n, fill) -> i64.
         // Same shape as vector_ref_sig (two i64 in, one out).
         let make_list_fill_func = module
@@ -2166,6 +2199,8 @@ impl Lowerer {
             string_downcase_func,
             string_foldcase_func,
             string_contains_func,
+            string_prefix_p_func,
+            string_suffix_p_func,
             make_list_fill_func,
             iota_n_func,
             last_pair_func,
@@ -2706,6 +2741,13 @@ impl Lowerer {
             let string_contains_fnref = self
                 .module
                 .declare_func_in_func(self.string_contains_func, builder.func);
+            // iter EV — string-prefix?/suffix?.
+            let string_prefix_p_fnref = self
+                .module
+                .declare_func_in_func(self.string_prefix_p_func, builder.func);
+            let string_suffix_p_fnref = self
+                .module
+                .declare_func_in_func(self.string_suffix_p_func, builder.func);
             // iter EM — make-list 2-arg.
             let make_list_fill_fnref = self
                 .module
@@ -2922,6 +2964,8 @@ impl Lowerer {
                         string_downcase_fnref,
                         string_foldcase_fnref,
                         string_contains_fnref,
+                        string_prefix_p_fnref,
+                        string_suffix_p_fnref,
                         make_list_fill_fnref,
                         iota_n_fnref,
                         last_pair_fnref,
@@ -3216,6 +3260,8 @@ fn lower_inst(
     string_downcase_fnref: cranelift_codegen::ir::FuncRef,
     string_foldcase_fnref: cranelift_codegen::ir::FuncRef,
     string_contains_fnref: cranelift_codegen::ir::FuncRef,
+    string_prefix_p_fnref: cranelift_codegen::ir::FuncRef,
+    string_suffix_p_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
     last_pair_fnref: cranelift_codegen::ir::FuncRef,
@@ -5548,6 +5594,29 @@ fn lower_inst(
                 results[0]
             };
             b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringPrefixP(dst, p, s) | Inst::StringSuffixP(dst, p, s) => {
+            // ADR 0012 D-2 (iter EV) — string-prefix?/suffix?.
+            // Both helpers return Boolean (0/1) directly, no Gc handle.
+            let pv = lookup(map, *p)?;
+            let sv = lookup(map, *s)?;
+            let fnref = match inst {
+                Inst::StringPrefixP(..) => string_prefix_p_fnref,
+                Inst::StringSuffixP(..) => string_suffix_p_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[pv, sv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringPrefix/SuffixP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
             map.insert(*dst, result);
         }
         Inst::StringReverse(dst, src)
