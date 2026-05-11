@@ -2647,6 +2647,71 @@ pub unsafe extern "C" fn vm_string_eq_gc(a: i64, b: i64) -> i64 {
     }
 }
 
+/// `(string<? a b)` — strict less-than by lexicographic byte order.
+/// Consumes one strong refcount on each handle. Returns 0 if either
+/// arg is not a string. ADR 0012 D-2 (iter DW).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_lt_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::String(sa), Value::String(sb)) => (*sa.borrow() < *sb.borrow()) as i64,
+        _ => 0,
+    }
+}
+
+/// `(string>? a b)` — strict greater-than. See `vm_string_lt_gc`.
+/// ADR 0012 D-2 (iter DW).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_gt_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::String(sa), Value::String(sb)) => (*sa.borrow() > *sb.borrow()) as i64,
+        _ => 0,
+    }
+}
+
+/// `(string<=? a b)` — less-or-equal. See `vm_string_lt_gc`.
+/// ADR 0012 D-2 (iter DW).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_le_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::String(sa), Value::String(sb)) => (*sa.borrow() <= *sb.borrow()) as i64,
+        _ => 0,
+    }
+}
+
+/// `(string>=? a b)` — greater-or-equal. See `vm_string_lt_gc`.
+/// ADR 0012 D-2 (iter DW).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_ge_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::String(sa), Value::String(sb)) => (*sa.borrow() >= *sb.borrow()) as i64,
+        _ => 0,
+    }
+}
+
 /// `(car pair)` — return the pair's car, Any-tagged. Pre-decodes the
 /// Any-tagged input box and re-Anys the inner car.
 ///

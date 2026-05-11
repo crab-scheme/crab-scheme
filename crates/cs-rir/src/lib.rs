@@ -297,6 +297,26 @@ pub enum Inst {
     /// operands return 0 (no deopt — `eq?`-like behaviour).
     StrEq(Value, Value, Value),
 
+    /// `dst = string<?(a, b)`. Lowers to `vm_string_lt_gc`. Both
+    /// args Any-shape (consumed); `dst` is Boolean.
+    /// ADR 0012 D-2 (iter DW).
+    StrLt(Value, Value, Value),
+
+    /// `dst = string>?(a, b)`. Lowers to `vm_string_gt_gc`. Both
+    /// args Any-shape (consumed); `dst` is Boolean.
+    /// ADR 0012 D-2 (iter DW).
+    StrGt(Value, Value, Value),
+
+    /// `dst = string<=?(a, b)`. Lowers to `vm_string_le_gc`. Both
+    /// args Any-shape (consumed); `dst` is Boolean.
+    /// ADR 0012 D-2 (iter DW).
+    StrLe(Value, Value, Value),
+
+    /// `dst = string>=?(a, b)`. Lowers to `vm_string_ge_gc`. Both
+    /// args Any-shape (consumed); `dst` is Boolean.
+    /// ADR 0012 D-2 (iter DW).
+    StrGe(Value, Value, Value),
+
     /// `dst = substring(s, start, end)`. Lowers to `vm_substring_gc`.
     /// `s` Any (consumed), `start` and `end` Fixnum. `dst` is Any
     /// (fresh Gc<Value::String>). ADR 0012 D-2 (iter CM).

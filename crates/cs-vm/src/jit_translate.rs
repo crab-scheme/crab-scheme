@@ -1892,6 +1892,60 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StrEq(dst, lhs, rhs));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter DW) — ordered string
+                                    // comparisons. Same BoxTyped-fallback
+                                    // pattern as string=?.
+                                    ("string<?", 2)
+                                    | ("string>?", 2)
+                                    | ("string<=?", 2)
+                                    | ("string>=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            || value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        let lhs_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let rhs_t = value_types
+                                            .get(&args[1])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let lhs = if lhs_t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(lhs_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        let rhs = if rhs_t == Type::Any {
+                                            args[1]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[1],
+                                                type_to_jit_rt_tag(rhs_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        let inst = match name {
+                                            "string<?" => RirInst::StrLt(dst, lhs, rhs),
+                                            "string>?" => RirInst::StrGt(dst, lhs, rhs),
+                                            "string<=?" => RirInst::StrLe(dst, lhs, rhs),
+                                            "string>=?" => RirInst::StrGe(dst, lhs, rhs),
+                                            _ => unreachable!(),
+                                        };
+                                        insts.push(inst);
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     ("integer->char", 1) => {
                                         // Same bit pattern as the Fixnum input;
                                         // the return-type post-pass will tag
@@ -3135,6 +3189,10 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VecP(dst, _)
                 | RirInst::StrP(dst, _)
                 | RirInst::StrEq(dst, _, _)
+                | RirInst::StrLt(dst, _, _)
+                | RirInst::StrGt(dst, _, _)
+                | RirInst::StrLe(dst, _, _)
+                | RirInst::StrGe(dst, _, _)
                 | RirInst::ListP(dst, _)
                 | RirInst::CharAlphabeticP(dst, _)
                 | RirInst::CharNumericP(dst, _)

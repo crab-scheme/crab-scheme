@@ -4435,3 +4435,63 @@ fn diff_jit_cxr_accessors() {
         cdar
     );
 }
+
+#[test]
+fn diff_jit_string_ordered_compares() {
+    // ADR 0012 D-2 (iter DW) — string<?/<=?/>?/>=? lower to
+    // dedicated helpers mirroring string=?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (slt a b) (string<? a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sgt a b) (string>? a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sle a b) (string<=? a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sge a b) (string>=? a b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (slt \"a\" \"b\") (sgt \"b\" \"a\") \
+                      (sle \"a\" \"a\") (sge \"a\" \"a\") \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let lt_t = rt
+        .eval_str_via_vm("<diff>", "(slt \"apple\" \"banana\")")
+        .unwrap();
+    let lt_f = rt
+        .eval_str_via_vm("<diff>", "(slt \"banana\" \"apple\")")
+        .unwrap();
+    let gt_t = rt
+        .eval_str_via_vm("<diff>", "(sgt \"banana\" \"apple\")")
+        .unwrap();
+    let le_eq = rt
+        .eval_str_via_vm("<diff>", "(sle \"abc\" \"abc\")")
+        .unwrap();
+    let ge_eq = rt
+        .eval_str_via_vm("<diff>", "(sge \"abc\" \"abc\")")
+        .unwrap();
+    let le_f = rt
+        .eval_str_via_vm("<diff>", "(sle \"abd\" \"abc\")")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "string ordered compares never dispatched through JIT (count={after})"
+    );
+    match (&lt_t, &lt_f, &gt_t, &le_eq, &ge_eq, &le_f) {
+        (
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (T, F, T, T, T, F), got {:?}", other),
+    }
+}
