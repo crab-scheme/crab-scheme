@@ -1405,6 +1405,29 @@ pub fn bytecode_to_rir_with_hints(
                                     // then Car (leftmost 'a'). Requires the
                                     // arg to be Any-typed; intermediate and
                                     // final values are Any.
+                                    // ADR 0012 D-2 (iter EZ) — also handle
+                                    // SRFI-1 first/second/third/fourth as
+                                    // equivalent cxr names (car, cadr,
+                                    // caddr, cadddr).
+                                    (n, 1)
+                                        if ordinal_to_cxr_dirs(n).is_some()
+                                            && value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        let dirs = ordinal_to_cxr_dirs(n).unwrap();
+                                        let mut cur = args[0];
+                                        let last_i = dirs.len() - 1;
+                                        for (i, &is_cdr) in dirs.iter().rev().enumerate() {
+                                            let next = if i == last_i { dst } else { alloc() };
+                                            if is_cdr {
+                                                insts.push(RirInst::Cdr(next, cur));
+                                            } else {
+                                                insts.push(RirInst::Car(next, cur));
+                                            }
+                                            value_types.insert(next, Type::Any);
+                                            cur = next;
+                                        }
+                                    }
                                     (n, 1)
                                         if cxr_parse(n).is_some()
                                             && value_types.get(&args[0]).copied()
@@ -3750,6 +3773,21 @@ fn box_mixed_returns(
 /// Mirrors `cs_vm::vm::JIT_RT_FIXNUM` etc. — duplicated here to
 /// avoid a circular import at translate time. Heap-pointer types
 /// not yet wired through Cranelift map to `JIT_RT_ANY`.
+/// Map SRFI-1 ordinal accessor names to the equivalent cxr direction
+/// chain. `first` ≡ `car` → `[false]`, `second` ≡ `cadr` →
+/// `[false, true]`, `third` ≡ `caddr` → `[false, true, true]`,
+/// `fourth` ≡ `cadddr` → `[false, true, true, true]`. Returns `None`
+/// for other names. ADR 0012 D-2 (iter EZ).
+fn ordinal_to_cxr_dirs(name: &str) -> Option<Vec<bool>> {
+    match name {
+        "first" => Some(vec![false]),
+        "second" => Some(vec![false, true]),
+        "third" => Some(vec![false, true, true]),
+        "fourth" => Some(vec![false, true, true, true]),
+        _ => None,
+    }
+}
+
 /// Parse a composed pair accessor name like `caar`, `caddr`,
 /// `cddddr`. Returns `Some(directions)` where `false` means Car (the
 /// 'a' letter) and `true` means Cdr (the 'd' letter), reading the

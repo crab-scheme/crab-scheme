@@ -5679,3 +5679,50 @@ fn diff_jit_list_classifiers() {
         other => panic!("expected (T, F, T, T, F, T, F, F), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_ordinal_accessors() {
+    // ADR 0012 D-2 (iter EZ) — SRFI-1 first/second/third/fourth.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f1 x) (first x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f2 x) (second x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f3 x) (third x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f4 x) (fourth x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (f1 '(1 2 3 4 5)) (f2 '(1 2 3 4 5)) \
+                      (f3 '(1 2 3 4 5)) (f4 '(1 2 3 4 5)) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let a = rt
+        .eval_str_via_vm("<diff>", "(f1 '(10 20 30 40 50))")
+        .unwrap();
+    let b = rt
+        .eval_str_via_vm("<diff>", "(f2 '(10 20 30 40 50))")
+        .unwrap();
+    let c = rt
+        .eval_str_via_vm("<diff>", "(f3 '(10 20 30 40 50))")
+        .unwrap();
+    let d = rt
+        .eval_str_via_vm("<diff>", "(f4 '(10 20 30 40 50))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&a, &b, &c, &d) {
+        (
+            Value::Number(cs_core::Number::Fixnum(10)),
+            Value::Number(cs_core::Number::Fixnum(20)),
+            Value::Number(cs_core::Number::Fixnum(30)),
+            Value::Number(cs_core::Number::Fixnum(40)),
+        ) => {}
+        other => panic!("expected (10, 20, 30, 40), got {:?}", other),
+    }
+}
