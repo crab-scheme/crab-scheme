@@ -2649,6 +2649,25 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StringJoin(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter FG) — string-pad/string-pad-right 2-arg.
+                                    ("string-pad", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::StringPad(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("string-pad-right", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::StringPadRight(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter FF) — string-split 2-arg.
                                     // sep may be String (Any) or Character;
                                     // BoxTyped if Character so the helper sees
@@ -4151,6 +4170,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StringContains(dst, _, _)
                 | RirInst::StringJoin(dst, _, _)
                 | RirInst::StringSplit(dst, _, _)
+                | RirInst::StringPad(dst, _, _)
+                | RirInst::StringPadRight(dst, _, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)

@@ -5974,3 +5974,37 @@ fn diff_jit_string_split_2arg() {
         other => panic!("expected (pair, 3, \"foo\", 3), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_pad_2arg() {
+    // ADR 0012 D-2 (iter FG) — (string-pad s width) and
+    // (string-pad-right s width) 2-arg forms (default space).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sp s w) (string-pad s w))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (spr s w) (string-pad-right s w))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sp \"a\" 4) (spr \"a\" 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let lp = rt.eval_str_via_vm("<diff>", "(sp \"42\" 5)").unwrap();
+    let rp = rt.eval_str_via_vm("<diff>", "(spr \"42\" 5)").unwrap();
+    let lt = rt.eval_str_via_vm("<diff>", "(sp \"abcdef\" 3)").unwrap();
+    let rt2 = rt.eval_str_via_vm("<diff>", "(spr \"abcdef\" 3)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&lp, &rp, &lt, &rt2) {
+        (Value::String(a), Value::String(b), Value::String(c), Value::String(d)) => {
+            assert_eq!(&*a.borrow(), "   42");
+            assert_eq!(&*b.borrow(), "42   ");
+            assert_eq!(&*c.borrow(), "def");
+            assert_eq!(&*d.borrow(), "abc");
+        }
+        other => panic!("expected four strings, got {:?}", other),
+    }
+}

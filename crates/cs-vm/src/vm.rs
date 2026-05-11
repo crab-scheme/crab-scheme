@@ -3448,6 +3448,71 @@ pub unsafe extern "C" fn vm_make_list_fill_gc(n: i64, fill: i64) -> i64 {
 ///
 /// `s` and `sep` must be live, owned `Gc<Value>` raw handles.
 #[no_mangle]
+pub unsafe extern "C" fn vm_string_pad_gc(s: i64, width: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    let s_str = match v {
+        Value::String(sg) => sg.borrow().clone(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))));
+        }
+    };
+    if width < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            String::new(),
+        ))));
+    }
+    let total = s_str.chars().count();
+    let width = width as usize;
+    let out: String = if total >= width {
+        let drop = total - width;
+        s_str.chars().skip(drop).collect()
+    } else {
+        let pad: String = std::iter::repeat(' ').take(width - total).collect();
+        format!("{}{}", pad, s_str)
+    };
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+}
+
+/// `(string-pad-right s width)` — SRFI-13 2-arg form.
+/// ADR 0012 D-2 (iter FG).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_pad_right_gc(s: i64, width: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    let s_str = match v {
+        Value::String(sg) => sg.borrow().clone(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))));
+        }
+    };
+    if width < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            String::new(),
+        ))));
+    }
+    let total = s_str.chars().count();
+    let width = width as usize;
+    let out: String = if total >= width {
+        s_str.chars().take(width).collect()
+    } else {
+        let pad: String = std::iter::repeat(' ').take(width - total).collect();
+        format!("{}{}", s_str, pad)
+    };
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn vm_string_split_gc(s: i64, sep: i64) -> i64 {
     let s_v = unsafe { gc_i64_to_value(s) };
     let sep_v = unsafe { gc_i64_to_value(sep) };
