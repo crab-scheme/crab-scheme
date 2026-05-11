@@ -2512,6 +2512,12 @@ fn lower_inst(
         Inst::BitXor(dst, lhs, rhs) => {
             binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().bxor(l, r))?
         }
+        Inst::BitNot(dst, src) => {
+            // ADR 0012 D-2 (iter DK) — Cranelift native bnot.
+            let s = lookup(map, *src)?;
+            let v = b.ins().bnot(s);
+            map.insert(*dst, v);
+        }
         Inst::AbsFixnum(dst, src) => {
             let s = lookup(map, *src)?;
             let v = b.ins().iabs(s);

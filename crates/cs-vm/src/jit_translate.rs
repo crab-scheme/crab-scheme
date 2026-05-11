@@ -679,6 +679,7 @@ pub fn bytecode_to_rir_with_hints(
                                     Some(RirInst::BitOr(dst, args[0], args[1]))
                                 }
                                 ("bitwise-xor", 2) => Some(RirInst::BitXor(dst, args[0], args[1])),
+                                ("bitwise-not", 1) => Some(RirInst::BitNot(dst, args[0])),
                                 ("abs", 1) => Some(RirInst::AbsFixnum(dst, args[0])),
                                 ("max", 2) => Some(RirInst::MaxFixnum(dst, args[0], args[1])),
                                 ("min", 2) => Some(RirInst::MinFixnum(dst, args[0], args[1])),

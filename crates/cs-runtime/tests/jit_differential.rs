@@ -3922,3 +3922,35 @@ fn diff_jit_variadic_bitwise() {
         other => panic!("expected (3, 7, 7), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_bitwise_not() {
+    // ADR 0012 D-2 (iter DK) — bitwise-not (1-arg) via Cranelift
+    // native bnot.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bn x) (bitwise-not x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (bn 0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // ~0 = -1
+    let r0 = rt.eval_str_via_vm("<diff>", "(bn 0)").unwrap();
+    // ~5 = -6 (two's complement: ~x = -x-1)
+    let r5 = rt.eval_str_via_vm("<diff>", "(bn 5)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "bitwise-not never dispatched through JIT (count={after})"
+    );
+    match (&r0, &r5) {
+        (
+            Value::Number(cs_core::Number::Fixnum(-1)),
+            Value::Number(cs_core::Number::Fixnum(-6)),
+        ) => {}
+        other => panic!("expected (-1, -6), got {:?}", other),
+    }
+}

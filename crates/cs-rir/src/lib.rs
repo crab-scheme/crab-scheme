@@ -584,6 +584,10 @@ pub enum Inst {
     /// `dst = bxor(lhs, rhs)`. R6RS `bitwise-xor` for two fixnums.
     BitXor(Value, Value, Value),
 
+    /// `dst = !src`. R6RS `bitwise-not` (1-arg). Cranelift `bnot`.
+    /// ADR 0012 D-2 (iter DK).
+    BitNot(Value, Value),
+
     /// `dst = abs(src)`. R6RS `abs` for fixnums. Cranelift `iabs`.
     /// Note: i64::MIN has no positive representation; the bytecode
     /// VM upgrades to bignum, while the JIT fastpath wraps. The
