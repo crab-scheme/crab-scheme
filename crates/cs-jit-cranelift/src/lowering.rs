@@ -258,6 +258,9 @@ pub struct Lowerer {
     /// FuncId of `vm_string_set_gc(s, k, ch) -> i64`. ADR 0012 D-2
     /// (iter DA).
     str_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_fill_gc(s, ch) -> i64`. ADR 0012 D-2
+    /// (iter DH).
+    str_fill_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_copy_gc(s) -> i64`. ADR 0012 D-2
     /// (iter DB).
     str_copy_func: cranelift_module::FuncId,
@@ -522,6 +525,11 @@ impl Lowerer {
         );
         // ADR 0012 D-2 (iter DA) — string-set!.
         builder.symbol("vm_string_set_gc", cs_vm::vm::vm_string_set_gc as *const u8);
+        // ADR 0012 D-2 (iter DH) — string-fill!.
+        builder.symbol(
+            "vm_string_fill_gc",
+            cs_vm::vm::vm_string_fill_gc as *const u8,
+        );
         // ADR 0012 D-2 (iter DB) — string-copy / vector-copy.
         builder.symbol(
             "vm_string_copy_gc",
@@ -1176,6 +1184,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_string_set_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter DH) — vm_string_fill_gc(s, ch) -> i64.
+        let str_fill_func = module
+            .declare_function(
+                "vm_string_fill_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_fill_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter DB) — vm_string_copy_gc / vm_vector_copy_gc.
         let str_copy_func = module
             .declare_function(
@@ -1536,6 +1553,7 @@ impl Lowerer {
             vec_fill_func,
             bv_fill_func,
             str_set_func,
+            str_fill_func,
             str_copy_func,
             vec_copy_func,
             bv_copy_func,
@@ -1886,6 +1904,10 @@ impl Lowerer {
             let str_set_fnref = self
                 .module
                 .declare_func_in_func(self.str_set_func, builder.func);
+            // iter DH — string-fill!.
+            let str_fill_fnref = self
+                .module
+                .declare_func_in_func(self.str_fill_func, builder.func);
             // iter DB — string-copy / vector-copy.
             let str_copy_fnref = self
                 .module
@@ -2125,6 +2147,7 @@ impl Lowerer {
                         vec_fill_fnref,
                         bv_fill_fnref,
                         str_set_fnref,
+                        str_fill_fnref,
                         str_copy_fnref,
                         vec_copy_fnref,
                         bv_copy_fnref,
@@ -2383,6 +2406,7 @@ fn lower_inst(
     vec_fill_fnref: cranelift_codegen::ir::FuncRef,
     bv_fill_fnref: cranelift_codegen::ir::FuncRef,
     str_set_fnref: cranelift_codegen::ir::FuncRef,
+    str_fill_fnref: cranelift_codegen::ir::FuncRef,
     str_copy_fnref: cranelift_codegen::ir::FuncRef,
     vec_copy_fnref: cranelift_codegen::ir::FuncRef,
     bv_copy_fnref: cranelift_codegen::ir::FuncRef,
@@ -3822,6 +3846,24 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "StrSet expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StrFill(dst, s, ch) => {
+            // ADR 0012 D-2 (iter DH) — vm_string_fill_gc.
+            let s_v = lookup(map, *s)?;
+            let ch_v = lookup(map, *ch)?;
+            let inst_ref = b.ins().call(str_fill_fnref, &[s_v, ch_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StrFill expected 1 result, got {}",
                         results.len()
                     )));
                 }

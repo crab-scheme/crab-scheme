@@ -419,6 +419,11 @@ pub enum Inst {
     /// D-2 (iter DA).
     StrSet(Value, Value, Value, Value),
 
+    /// `dst = string-fill!(s, ch)`. Lowers to `vm_string_fill_gc`.
+    /// `s` Any (consumed), `ch` Character. `dst` is Any (Unspecified).
+    /// ADR 0012 D-2 (iter DH).
+    StrFill(Value, Value, Value),
+
     /// `dst = string-copy(s)`. Lowers to `vm_string_copy_gc`. `s`
     /// Any (consumed). `dst` Any (fresh String). 1-arg form only.
     /// ADR 0012 D-2 (iter DB).

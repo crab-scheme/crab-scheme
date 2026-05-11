@@ -1238,6 +1238,17 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StrSet(dst, args[0], args[1], args[2]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter DH) — string-fill!.
+                                    // s Any, ch Character. 2-arg form only.
+                                    ("string-fill!", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Character) =>
+                                    {
+                                        insts.push(RirInst::StrFill(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter CZ) — vector-fill! /
                                     // bytevector-fill!.
                                     ("vector-fill!", 2)
@@ -2733,6 +2744,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VecFill(dst, _, _)
                 | RirInst::BvFill(dst, _, _)
                 | RirInst::StrSet(dst, _, _, _)
+                | RirInst::StrFill(dst, _, _)
                 | RirInst::StrCopy(dst, _)
                 | RirInst::VecCopy(dst, _)
                 | RirInst::BvCopy(dst, _)

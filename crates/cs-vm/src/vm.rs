@@ -1188,6 +1188,39 @@ pub unsafe extern "C" fn vm_vector_copy_gc(r: i64) -> i64 {
     }
 }
 
+/// `(string-fill! s ch)` — overwrite every character of `s` with
+/// `ch`. 2-arg form only; the variadic (start, end slice) variants
+/// are deferred. Consumes `s`. `ch` is a Fixnum-shape codepoint
+/// (Character ABI carrier). Returns Gc(Unspecified). Non-string
+/// or invalid codepoint requests a deopt. ADR 0012 D-2 (iter DH).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_fill_gc(s: i64, ch: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    let new_ch = match char::from_u32(ch as u32) {
+        Some(c) => c,
+        None => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+    };
+    match v {
+        Value::String(sc) => {
+            let n = sc.borrow().chars().count();
+            let new_storage: String = std::iter::repeat(new_ch).take(n).collect();
+            *sc.borrow_mut() = new_storage;
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(string-set! s k ch)` — replace the k-th character of `s` with
 /// `ch` (UTF-8 aware: indexes are character positions, not byte
 /// offsets). Consumes one strong refcount on `s`. `k` and `ch` are
