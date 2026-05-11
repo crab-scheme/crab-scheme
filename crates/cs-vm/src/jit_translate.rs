@@ -885,6 +885,56 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
                                         insts.push(RirInst::Lt(dst, args[0], zero));
                                     }
+                                    // ADR 0012 D-2 (iter FU) — fx predicate aliases.
+                                    // R6RS fixnum-specific; refuse Flonum, lower
+                                    // to the same primitives as Fixnum positive?
+                                    // / negative? / zero? / even? / odd?.
+                                    ("fxzero?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Eq(dst, args[0], zero));
+                                    }
+                                    ("fxpositive?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Lt(dst, zero, args[0]));
+                                    }
+                                    ("fxnegative?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Lt(dst, args[0], zero));
+                                    }
+                                    ("fxeven?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        let one = alloc();
+                                        insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        let bit = alloc();
+                                        insts.push(RirInst::BitAnd(bit, args[0], one));
+                                        insts.push(RirInst::Eq(dst, bit, zero));
+                                    }
+                                    ("fxodd?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        let one = alloc();
+                                        insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
+                                        let bit = alloc();
+                                        insts.push(RirInst::BitAnd(bit, args[0], one));
+                                        insts.push(RirInst::Eq(dst, bit, one));
+                                    }
                                     ("odd?", 1)
                                         if value_types.get(&args[0]).copied()
                                             != Some(Type::Flonum) =>

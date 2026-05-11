@@ -6628,3 +6628,49 @@ fn diff_jit_bytevector_u64_s64_native() {
         Value::Number(cs_core::Number::Fixnum(-9223372036854775808))
     ));
 }
+
+#[test]
+fn diff_jit_fx_predicates() {
+    // ADR 0012 D-2 (iter FU) — fx predicate aliases.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fz n) (fxzero? n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fp n) (fxpositive? n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fn n) (fxnegative? n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fe n) (fxeven? n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fo n) (fxodd? n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (fz 0) (fp 1) (fn -1) (fe 2) (fo 3) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let z0 = rt.eval_str_via_vm("<diff>", "(fz 0)").unwrap();
+    let z1 = rt.eval_str_via_vm("<diff>", "(fz 5)").unwrap();
+    let p1 = rt.eval_str_via_vm("<diff>", "(fp 7)").unwrap();
+    let p0 = rt.eval_str_via_vm("<diff>", "(fp 0)").unwrap();
+    let n1 = rt.eval_str_via_vm("<diff>", "(fn -3)").unwrap();
+    let n0 = rt.eval_str_via_vm("<diff>", "(fn 5)").unwrap();
+    let e_t = rt.eval_str_via_vm("<diff>", "(fe 4)").unwrap();
+    let e_f = rt.eval_str_via_vm("<diff>", "(fe 5)").unwrap();
+    let o_t = rt.eval_str_via_vm("<diff>", "(fo 5)").unwrap();
+    let o_f = rt.eval_str_via_vm("<diff>", "(fo 4)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&z0, Value::Boolean(true)));
+    assert!(matches!(&z1, Value::Boolean(false)));
+    assert!(matches!(&p1, Value::Boolean(true)));
+    assert!(matches!(&p0, Value::Boolean(false)));
+    assert!(matches!(&n1, Value::Boolean(true)));
+    assert!(matches!(&n0, Value::Boolean(false)));
+    assert!(matches!(&e_t, Value::Boolean(true)));
+    assert!(matches!(&e_f, Value::Boolean(false)));
+    assert!(matches!(&o_t, Value::Boolean(true)));
+    assert!(matches!(&o_f, Value::Boolean(false)));
+}
