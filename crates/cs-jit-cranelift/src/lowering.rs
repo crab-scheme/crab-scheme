@@ -418,6 +418,12 @@ pub struct Lowerer {
     /// FuncId of `vm_vector_copy_bang_gc(dest, at, src) -> i64`.
     /// ADR 0012 D-2 (iter ER).
     vector_copy_bang_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_copy_bang_gc(dest, at, src) -> i64`.
+    /// ADR 0012 D-2 (iter ES).
+    bytevector_copy_bang_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_copy_bang_gc(dest, at, src) -> i64`.
+    /// ADR 0012 D-2 (iter ES).
+    string_copy_bang_func: cranelift_module::FuncId,
     /// FuncId of `vm_symbol_to_string_gc(sym) -> i64`. ADR 0012 D-2
     /// (iter CY).
     symbol_to_string_func: cranelift_module::FuncId,
@@ -790,6 +796,15 @@ impl Lowerer {
         builder.symbol(
             "vm_vector_copy_bang_gc",
             cs_vm::vm::vm_vector_copy_bang_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter ES) — bytevector-copy! / string-copy! 3-arg.
+        builder.symbol(
+            "vm_bytevector_copy_bang_gc",
+            cs_vm::vm::vm_bytevector_copy_bang_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_copy_bang_gc",
+            cs_vm::vm::vm_string_copy_bang_gc as *const u8,
         );
         // ADR 0012 D-2 (iter CX) — string<->list.
         builder.symbol(
@@ -1921,6 +1936,26 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_vector_copy_bang_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter ES) — bytevector-copy! / string-copy! 3-arg.
+        let bytevector_copy_bang_func = module
+            .declare_function(
+                "vm_bytevector_copy_bang_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_copy_bang_gc: {e}"))
+            })?;
+        let string_copy_bang_func = module
+            .declare_function(
+                "vm_string_copy_bang_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_copy_bang_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter CY) — vm_symbol_to_string_gc / vm_string_to_symbol_gc.
         let symbol_to_string_func = module
             .declare_function(
@@ -2068,6 +2103,8 @@ impl Lowerer {
             last_pair_func,
             last_func,
             vector_copy_bang_func,
+            bytevector_copy_bang_func,
+            string_copy_bang_func,
             symbol_to_string_func,
             string_to_symbol_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
@@ -2606,6 +2643,13 @@ impl Lowerer {
             let vector_copy_bang_fnref = self
                 .module
                 .declare_func_in_func(self.vector_copy_bang_func, builder.func);
+            // iter ES — bytevector-copy! / string-copy!.
+            let bytevector_copy_bang_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_copy_bang_func, builder.func);
+            let string_copy_bang_fnref = self
+                .module
+                .declare_func_in_func(self.string_copy_bang_func, builder.func);
             // iter CY — symbol<->string.
             let symbol_to_string_fnref = self
                 .module
@@ -2797,6 +2841,8 @@ impl Lowerer {
                         last_pair_fnref,
                         last_fnref,
                         vector_copy_bang_fnref,
+                        bytevector_copy_bang_fnref,
+                        string_copy_bang_fnref,
                         symbol_to_string_fnref,
                         string_to_symbol_fnref,
                         inst,
@@ -3085,6 +3131,8 @@ fn lower_inst(
     last_pair_fnref: cranelift_codegen::ir::FuncRef,
     last_fnref: cranelift_codegen::ir::FuncRef,
     vector_copy_bang_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_copy_bang_fnref: cranelift_codegen::ir::FuncRef,
+    string_copy_bang_fnref: cranelift_codegen::ir::FuncRef,
     symbol_to_string_fnref: cranelift_codegen::ir::FuncRef,
     string_to_symbol_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
@@ -5468,17 +5516,25 @@ fn lower_inst(
             b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
-        Inst::VecCopyBang(dst, dest_v, at_v, src_v) => {
-            // ADR 0012 D-2 (iter ER) — vm_vector_copy_bang_gc.
+        Inst::VecCopyBang(dst, dest_v, at_v, src_v)
+        | Inst::BvCopyBang(dst, dest_v, at_v, src_v)
+        | Inst::StrCopyBang(dst, dest_v, at_v, src_v) => {
+            // ADR 0012 D-2 (iter ER / ES) — copy! family.
             let d = lookup(map, *dest_v)?;
             let a = lookup(map, *at_v)?;
             let s = lookup(map, *src_v)?;
-            let inst_ref = b.ins().call(vector_copy_bang_fnref, &[d, a, s]);
+            let fnref = match inst {
+                Inst::VecCopyBang(..) => vector_copy_bang_fnref,
+                Inst::BvCopyBang(..) => bytevector_copy_bang_fnref,
+                Inst::StrCopyBang(..) => string_copy_bang_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[d, a, s]);
             let result = {
                 let results = b.inst_results(inst_ref);
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
-                        "VecCopyBang expected 1 result, got {}",
+                        "Vec/Bv/StrCopyBang expected 1 result, got {}",
                         results.len()
                     )));
                 }

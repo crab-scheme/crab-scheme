@@ -724,6 +724,16 @@ pub enum Inst {
     /// (iter ER).
     VecCopyBang(Value, Value, Value, Value),
 
+    /// `dst = bytevector-copy!(dest, at, src)`. 3-arg form. Lowers
+    /// to `vm_bytevector_copy_bang_gc`. Same shape as VecCopyBang.
+    /// ADR 0012 D-2 (iter ES).
+    BvCopyBang(Value, Value, Value, Value),
+
+    /// `dst = string-copy!(dest, at, src)`. 3-arg form. Lowers to
+    /// `vm_string_copy_bang_gc`. Same shape as VecCopyBang.
+    /// ADR 0012 D-2 (iter ES).
+    StrCopyBang(Value, Value, Value, Value),
+
     /// `dst = srem(lhs, rhs)`. R6RS `remainder` for fixnums.
     Remainder(Value, Value, Value),
 

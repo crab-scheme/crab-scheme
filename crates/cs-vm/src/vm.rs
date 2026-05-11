@@ -2912,6 +2912,89 @@ pub unsafe extern "C" fn vm_string_to_number_gc(s: i64) -> i64 {
     }
 }
 
+/// `(bytevector-copy! dest at src)` — 3-arg form. Copies all bytes
+/// of `src` into `dest` starting at index `at`. Consumes both Gc
+/// handles. ADR 0012 D-2 (iter ES).
+///
+/// # Safety
+///
+/// `dest` and `src` must be live, owned `Gc<Value>` raw handles.
+/// `at` is raw i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_copy_bang_gc(dest: i64, at: i64, src: i64) -> i64 {
+    let dest_v = unsafe { gc_i64_to_value(dest) };
+    let src_v = unsafe { gc_i64_to_value(src) };
+    let (dest_g, src_g) = match (dest_v, src_v) {
+        (Value::ByteVector(d), Value::ByteVector(s)) => (d, s),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+    };
+    let src_bytes = src_g.borrow().clone();
+    let n = src_bytes.len();
+    if at < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Unspecified);
+    }
+    let at = at as usize;
+    {
+        let mut d = dest_g.borrow_mut();
+        if at + n > d.len() {
+            drop(d);
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+        d[at..at + n].copy_from_slice(&src_bytes);
+    }
+    value_to_gc_i64(Value::Unspecified)
+}
+
+/// `(string-copy! dest at src)` — 3-arg form. Copies all chars of
+/// `src` into `dest` starting at character index `at`. Consumes
+/// both Gc handles. Strings are stored as `String` (UTF-8) so
+/// "char index" requires walking the string. ADR 0012 D-2 (iter ES).
+///
+/// # Safety
+///
+/// `dest` and `src` must be live, owned `Gc<Value>` raw handles.
+/// `at` is raw i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_copy_bang_gc(dest: i64, at: i64, src: i64) -> i64 {
+    let dest_v = unsafe { gc_i64_to_value(dest) };
+    let src_v = unsafe { gc_i64_to_value(src) };
+    let (dest_g, src_g) = match (dest_v, src_v) {
+        (Value::String(d), Value::String(s)) => (d, s),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+    };
+    let src_str = src_g.borrow().clone();
+    let src_chars: Vec<char> = src_str.chars().collect();
+    let n = src_chars.len();
+    if at < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Unspecified);
+    }
+    let at = at as usize;
+    {
+        let mut d = dest_g.borrow_mut();
+        let dest_chars: Vec<char> = d.chars().collect();
+        if at + n > dest_chars.len() {
+            drop(d);
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+        let mut new_chars = dest_chars;
+        for (i, c) in src_chars.iter().enumerate() {
+            new_chars[at + i] = *c;
+        }
+        *d = new_chars.into_iter().collect();
+    }
+    value_to_gc_i64(Value::Unspecified)
+}
+
 /// `(vector-copy! dest at src)` — 3-arg form. Copies all elements
 /// of `src` into `dest` starting at index `at`. Consumes both Gc
 /// handles. `at` is a raw Fixnum-shape i64. Returns a Gc handle to

@@ -5400,3 +5400,51 @@ fn diff_jit_vector_copy_bang_3arg() {
         other => panic!("expected vector, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_bytevector_string_copy_bang() {
+    // ADR 0012 D-2 (iter ES) — (bytevector-copy! d at s) and
+    // (string-copy! d at s) 3-arg forms.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (bcb dest at src) (bytevector-copy! dest at src) dest)",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (scb dest at src) (string-copy! dest at src) dest)",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (bcb (make-bytevector 4 0) 1 (bytevector 9 9)) \
+                      (scb (make-string 4 #\\.) 1 \"ab\") \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let bv = rt
+        .eval_str_via_vm("<diff>", "(bcb (make-bytevector 5 0) 1 (bytevector 7 8 9))")
+        .unwrap();
+    let s = rt
+        .eval_str_via_vm("<diff>", "(scb (make-string 5 #\\.) 1 \"xyz\")")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &bv {
+        Value::ByteVector(bg) => {
+            let inner = bg.borrow();
+            assert_eq!(&inner[..], &[0, 7, 8, 9, 0]);
+        }
+        other => panic!("expected bytevector, got {:?}", other),
+    }
+    match &s {
+        Value::String(sg) => {
+            assert_eq!(&*sg.borrow(), ".xyz.");
+        }
+        other => panic!("expected string, got {:?}", other),
+    }
+}

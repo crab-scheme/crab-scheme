@@ -2601,7 +2601,8 @@ pub fn bytecode_to_rir_with_hints(
                                         value_types.insert(dst, Type::Any);
                                     }
                                     // ADR 0012 D-2 (iter ER) — vector-copy!
-                                    // 3-arg form.
+                                    // 3-arg form. (ES) — same shape for
+                                    // bytevector-copy! and string-copy!.
                                     ("vector-copy!", 3)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any)
@@ -2611,6 +2612,32 @@ pub fn bytecode_to_rir_with_hints(
                                                 == Some(Type::Any) =>
                                     {
                                         insts.push(RirInst::VecCopyBang(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("bytevector-copy!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum)
+                                            && value_types.get(&args[2]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvCopyBang(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("string-copy!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum)
+                                            && value_types.get(&args[2]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::StrCopyBang(
                                             dst, args[0], args[1], args[2],
                                         ));
                                         value_types.insert(dst, Type::Any);
@@ -3886,6 +3913,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::LastPair(dst, _)
                 | RirInst::Last(dst, _)
                 | RirInst::VecCopyBang(dst, _, _, _)
+                | RirInst::BvCopyBang(dst, _, _, _)
+                | RirInst::StrCopyBang(dst, _, _, _)
                 | RirInst::ListToVector(dst, _)
                 | RirInst::StringToList(dst, _)
                 | RirInst::ListToString(dst, _)
