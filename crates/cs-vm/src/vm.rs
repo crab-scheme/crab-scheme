@@ -3440,6 +3440,50 @@ pub unsafe extern "C" fn vm_make_list_fill_gc(n: i64, fill: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(string-split s sep)` — split `s` on each occurrence of `sep`.
+/// `sep` may be a String or a Character. Returns a fresh list of
+/// String pieces. Both Gc handles consumed. ADR 0012 D-2 (iter FF).
+///
+/// # Safety
+///
+/// `s` and `sep` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_split_gc(s: i64, sep: i64) -> i64 {
+    let s_v = unsafe { gc_i64_to_value(s) };
+    let sep_v = unsafe { gc_i64_to_value(sep) };
+    let s_str = match s_v {
+        Value::String(sg) => sg.borrow().clone(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Null);
+        }
+    };
+    let sep_str = match sep_v {
+        Value::String(s) => s.borrow().clone(),
+        Value::Character(c) => c.to_string(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Null);
+        }
+    };
+    let parts: Vec<Value> = if sep_str.is_empty() {
+        s_str
+            .chars()
+            .map(|c| Value::String(cs_gc::Gc::new(std::cell::RefCell::new(c.to_string()))))
+            .collect()
+    } else {
+        s_str
+            .split(&sep_str)
+            .map(|p| Value::String(cs_gc::Gc::new(std::cell::RefCell::new(p.to_string()))))
+            .collect()
+    };
+    let mut acc = Value::Null;
+    for item in parts.into_iter().rev() {
+        acc = Value::Pair(cs_core::Pair::new(item, acc));
+    }
+    value_to_gc_i64(acc)
+}
+
 /// `(string-join parts sep)` — 2-arg form. `parts` is a proper list
 /// of strings; concatenate with `sep` between each. Both Gc handles
 /// consumed. On non-string in the list or non-string separator,

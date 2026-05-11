@@ -2649,6 +2649,33 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StringJoin(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter FF) — string-split 2-arg.
+                                    // sep may be String (Any) or Character;
+                                    // BoxTyped if Character so the helper sees
+                                    // a Gc<Value> uniformly.
+                                    ("string-split", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        let sep_t = value_types
+                                            .get(&args[1])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let sep = if sep_t == Type::Any {
+                                            args[1]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[1],
+                                                type_to_jit_rt_tag(sep_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::StringSplit(dst, args[0], sep));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     ("string-suffix?", 2)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any)
@@ -4123,6 +4150,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StringFoldcase(dst, _)
                 | RirInst::StringContains(dst, _, _)
                 | RirInst::StringJoin(dst, _, _)
+                | RirInst::StringSplit(dst, _, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)

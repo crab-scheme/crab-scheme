@@ -720,6 +720,9 @@ pub enum Inst {
     /// `dst = string-join(parts, sep)`. ADR 0012 D-2 (iter FE).
     StringJoin(Value, Value, Value),
 
+    /// `dst = string-split(s, sep)`. ADR 0012 D-2 (iter FF).
+    StringSplit(Value, Value, Value),
+
     /// `dst = make-list(n, fill)`. Lowers to `vm_make_list_fill_gc`.
     /// `n` Fixnum-shape (raw i64). `fill` Any-shape (consumed).
     /// `dst` is Any (fresh Gc handle to a Null-terminated list).

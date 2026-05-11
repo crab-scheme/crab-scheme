@@ -5933,3 +5933,44 @@ fn diff_jit_string_join_2arg() {
         other => panic!("expected four strings, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_split_2arg() {
+    // ADR 0012 D-2 (iter FF) — (string-split s sep).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ss s sep) (string-split s sep))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (ss \"a,b\" \",\") (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let parts = rt
+        .eval_str_via_vm("<diff>", "(ss \"foo,bar,baz\" \",\")")
+        .unwrap();
+    let len = rt
+        .eval_str_via_vm("<diff>", "(length (ss \"foo,bar,baz\" \",\"))")
+        .unwrap();
+    let first = rt
+        .eval_str_via_vm("<diff>", "(car (ss \"foo,bar,baz\" \",\"))")
+        .unwrap();
+    let char_sep_len = rt
+        .eval_str_via_vm("<diff>", "(length (ss \"a-b-c\" #\\-))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&parts, &len, &first, &char_sep_len) {
+        (
+            Value::Pair(_),
+            Value::Number(cs_core::Number::Fixnum(3)),
+            Value::String(fs),
+            Value::Number(cs_core::Number::Fixnum(3)),
+        ) => {
+            assert_eq!(&*fs.borrow(), "foo");
+        }
+        other => panic!("expected (pair, 3, \"foo\", 3), got {:?}", other),
+    }
+}

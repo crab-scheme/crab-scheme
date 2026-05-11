@@ -420,6 +420,8 @@ pub struct Lowerer {
     string_suffix_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_join_gc(parts, sep) -> i64`. ADR 0012 D-2 (iter FE).
     string_join_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_split_gc(s, sep) -> i64`. ADR 0012 D-2 (iter FF).
+    string_split_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_list_fill_gc(n, fill) -> i64`. ADR 0012
     /// D-2 (iter EM).
     make_list_fill_func: cranelift_module::FuncId,
@@ -847,6 +849,11 @@ impl Lowerer {
         builder.symbol(
             "vm_string_join_gc",
             cs_vm::vm::vm_string_join_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter FF) — string-split.
+        builder.symbol(
+            "vm_string_split_gc",
+            cs_vm::vm::vm_string_split_gc as *const u8,
         );
         // ADR 0012 D-2 (iter EM) — make-list 2-arg.
         builder.symbol(
@@ -2051,6 +2058,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_string_join_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter FF) — vm_string_split_gc(s, sep) -> i64.
+        let string_split_func = module
+            .declare_function(
+                "vm_string_split_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_split_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter EM) — vm_make_list_fill_gc(n, fill) -> i64.
         // Same shape as vector_ref_sig (two i64 in, one out).
         let make_list_fill_func = module
@@ -2350,6 +2366,7 @@ impl Lowerer {
             string_prefix_p_func,
             string_suffix_p_func,
             string_join_func,
+            string_split_func,
             make_list_fill_func,
             iota_n_func,
             iota_ns_func,
@@ -2911,6 +2928,10 @@ impl Lowerer {
             let string_join_fnref = self
                 .module
                 .declare_func_in_func(self.string_join_func, builder.func);
+            // iter FF — string-split.
+            let string_split_fnref = self
+                .module
+                .declare_func_in_func(self.string_split_func, builder.func);
             // iter EM — make-list 2-arg.
             let make_list_fill_fnref = self
                 .module
@@ -3165,6 +3186,7 @@ impl Lowerer {
                         string_prefix_p_fnref,
                         string_suffix_p_fnref,
                         string_join_fnref,
+                        string_split_fnref,
                         make_list_fill_fnref,
                         iota_n_fnref,
                         iota_ns_fnref,
@@ -3472,6 +3494,7 @@ fn lower_inst(
     string_prefix_p_fnref: cranelift_codegen::ir::FuncRef,
     string_suffix_p_fnref: cranelift_codegen::ir::FuncRef,
     string_join_fnref: cranelift_codegen::ir::FuncRef,
+    string_split_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
     iota_ns_fnref: cranelift_codegen::ir::FuncRef,
@@ -5826,6 +5849,24 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "StringJoin expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringSplit(dst, s, sep) => {
+            // ADR 0012 D-2 (iter FF) — vm_string_split_gc.
+            let sv = lookup(map, *s)?;
+            let pv = lookup(map, *sep)?;
+            let inst_ref = b.ins().call(string_split_fnref, &[sv, pv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringSplit expected 1 result, got {}",
                         results.len()
                     )));
                 }
