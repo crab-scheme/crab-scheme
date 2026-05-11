@@ -3750,3 +3750,34 @@ fn diff_jit_immediate_type_predicates_on_any() {
         other => panic!("expected (1,0,1,0,1,0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_flonum_transcendentals() {
+    // ADR 0012 D-2 (iter DF) — sin / cos / tan / log / exp lowered
+    // to runtime helpers.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s x) (sin x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (e x) (exp x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (s 1.0) (e 1.0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let sin0 = rt.eval_str_via_vm("<diff>", "(s 0.0)").unwrap();
+    let exp0 = rt.eval_str_via_vm("<diff>", "(e 0.0)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "transcendentals never dispatched through JIT (count={after})"
+    );
+    match (&sin0, &exp0) {
+        (Value::Number(cs_core::Number::Flonum(a)), Value::Number(cs_core::Number::Flonum(b)))
+            if a.abs() < 1e-12 && (*b - 1.0).abs() < 1e-12 => {}
+        other => panic!("expected (sin 0 ≈ 0, exp 0 ≈ 1), got {:?}", other),
+    }
+}

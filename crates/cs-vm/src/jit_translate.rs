@@ -1639,6 +1639,43 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::FlonumAbs(dst, args[0]));
                                         value_types.insert(dst, Type::Flonum);
                                     }
+                                    // ADR 0012 D-2 (iter DF) — flonum
+                                    // transcendentals. Gated on Flonum operand.
+                                    ("sin", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumSin(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("cos", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumCos(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("tan", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumTan(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("log", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumLog(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("exp", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumExp(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
                                     ("flmax", 2)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Flonum)
@@ -2621,7 +2658,12 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::FlonumFloor(dst, _)
                 | RirInst::FlonumCeil(dst, _)
                 | RirInst::FlonumTrunc(dst, _)
-                | RirInst::FlonumRound(dst, _) => {
+                | RirInst::FlonumRound(dst, _)
+                | RirInst::FlonumSin(dst, _)
+                | RirInst::FlonumCos(dst, _)
+                | RirInst::FlonumTan(dst, _)
+                | RirInst::FlonumLog(dst, _)
+                | RirInst::FlonumExp(dst, _) => {
                     flo_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Flonum(_)) => {

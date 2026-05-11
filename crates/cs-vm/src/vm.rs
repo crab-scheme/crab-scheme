@@ -901,6 +901,42 @@ pub unsafe extern "C" fn vm_digit_value(c: i64) -> i64 {
     value_to_gc_i64(v)
 }
 
+/// `(sin x)` — flonum sine via `f64::sin`. Operand and result are
+/// i64 bit patterns of f64. ADR 0012 D-2 (iter DF).
+///
+/// # Safety
+///
+/// `x` is a raw i64 bit pattern of an f64; no Gc invariants.
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_sin(x: i64) -> i64 {
+    f64::from_bits(x as u64).sin().to_bits() as i64
+}
+
+/// `(cos x)` — flonum cosine. ADR 0012 D-2 (iter DF).
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_cos(x: i64) -> i64 {
+    f64::from_bits(x as u64).cos().to_bits() as i64
+}
+
+/// `(tan x)` — flonum tangent. ADR 0012 D-2 (iter DF).
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_tan(x: i64) -> i64 {
+    f64::from_bits(x as u64).tan().to_bits() as i64
+}
+
+/// `(log x)` — natural log (matches b_log 1-arg). ADR 0012 D-2
+/// (iter DF).
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_log(x: i64) -> i64 {
+    f64::from_bits(x as u64).ln().to_bits() as i64
+}
+
+/// `(exp x)` — e^x. ADR 0012 D-2 (iter DF).
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_exp(x: i64) -> i64 {
+    f64::from_bits(x as u64).exp().to_bits() as i64
+}
+
 /// `(char-foldcase c)` — case-fold mapping for case-insensitive
 /// comparison. For ASCII this matches `char-downcase` (same as the
 /// bytecode `b_char_foldcase`). ADR 0012 D-2 (iter CS).

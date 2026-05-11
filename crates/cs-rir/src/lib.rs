@@ -126,6 +126,26 @@ pub enum Inst {
     /// `dst = sqrt(src)` (flonum). Lowers to Cranelift `sqrt`.
     FlonumSqrt(Value, Value),
 
+    /// `dst = sin(src)` (flonum). Lowers to `vm_flonum_sin`.
+    /// ADR 0012 D-2 (iter DF).
+    FlonumSin(Value, Value),
+
+    /// `dst = cos(src)` (flonum). Lowers to `vm_flonum_cos`.
+    /// ADR 0012 D-2 (iter DF).
+    FlonumCos(Value, Value),
+
+    /// `dst = tan(src)` (flonum). Lowers to `vm_flonum_tan`.
+    /// ADR 0012 D-2 (iter DF).
+    FlonumTan(Value, Value),
+
+    /// `dst = log(src)` (flonum, natural log). Lowers to
+    /// `vm_flonum_log`. ADR 0012 D-2 (iter DF).
+    FlonumLog(Value, Value),
+
+    /// `dst = exp(src)` (flonum, e^src). Lowers to `vm_flonum_exp`.
+    /// ADR 0012 D-2 (iter DF).
+    FlonumExp(Value, Value),
+
     /// `dst = |src|` (flonum). Lowers to Cranelift `fabs`. Strips
     /// the sign bit; NaN propagates unchanged.
     FlonumAbs(Value, Value),
