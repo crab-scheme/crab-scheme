@@ -663,6 +663,15 @@ pub enum Inst {
     /// `dst = port?(v)`. Lowers to `vm_port_p_gc`. ADR 0012 D-2 (iter DD).
     PortP(Value, Value),
 
+    /// `dst = input-port?(v)`. ADR 0012 D-2 (iter GC).
+    InputPortP(Value, Value),
+    /// `dst = output-port?(v)`. ADR 0012 D-2 (iter GC).
+    OutputPortP(Value, Value),
+    /// `dst = binary-port?(v)`. ADR 0012 D-2 (iter GC).
+    BinaryPortP(Value, Value),
+    /// `dst = textual-port?(v)`. ADR 0012 D-2 (iter GC).
+    TextualPortP(Value, Value),
+
     /// `dst = eof-object?(v)`. Lowers to `vm_eof_p_gc`. ADR 0012 D-2
     /// (iter DD).
     EofP(Value, Value),

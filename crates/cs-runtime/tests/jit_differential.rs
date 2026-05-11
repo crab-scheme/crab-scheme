@@ -7121,3 +7121,67 @@ fn diff_jit_string_titlecase_and_hashes() {
         other => panic!("expected Fixnum, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_port_subtype_predicates_and_list_head() {
+    // ADR 0012 D-2 (iter GC) — port-subtype predicates + list-head.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ip v) (input-port? v))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (op v) (output-port? v))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bp v) (binary-port? v))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (tp v) (textual-port? v))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (lh lst n) (list-head lst n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (ip 42) (op 42) (bp 42) (tp 42) \
+                      (lh (list 1 2 3 4 5) 3) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // Non-port values: all #f
+    let ip_no = rt.eval_str_via_vm("<diff>", "(ip 42)").unwrap();
+    let op_no = rt.eval_str_via_vm("<diff>", "(op 42)").unwrap();
+    let bp_no = rt.eval_str_via_vm("<diff>", "(bp 42)").unwrap();
+    let tp_no = rt.eval_str_via_vm("<diff>", "(tp 42)").unwrap();
+    // A textual output port (open-output-string)
+    let op_t = rt
+        .eval_str_via_vm("<diff>", "(op (open-output-string))")
+        .unwrap();
+    let tp_t = rt
+        .eval_str_via_vm("<diff>", "(tp (open-output-string))")
+        .unwrap();
+    let ip_t_str = rt
+        .eval_str_via_vm("<diff>", "(ip (open-input-string \"hi\"))")
+        .unwrap();
+    // list-head
+    let lh = rt
+        .eval_str_via_vm("<diff>", "(lh (list 10 20 30 40 50) 3)")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&ip_no, Value::Boolean(false)));
+    assert!(matches!(&op_no, Value::Boolean(false)));
+    assert!(matches!(&bp_no, Value::Boolean(false)));
+    assert!(matches!(&tp_no, Value::Boolean(false)));
+    assert!(matches!(&op_t, Value::Boolean(true)));
+    assert!(matches!(&tp_t, Value::Boolean(true)));
+    assert!(matches!(&ip_t_str, Value::Boolean(true)));
+    // list-head of 5-element list, n=3 => (10 20 30)
+    match &lh {
+        Value::Pair(p) => {
+            assert!(matches!(
+                p.car.borrow().clone(),
+                Value::Number(cs_core::Number::Fixnum(10))
+            ));
+        }
+        other => panic!("expected pair, got {:?}", other),
+    }
+}

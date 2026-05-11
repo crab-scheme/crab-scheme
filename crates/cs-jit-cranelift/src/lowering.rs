@@ -367,6 +367,14 @@ pub struct Lowerer {
     string_hash_func: cranelift_module::FuncId,
     /// FuncId of `vm_symbol_hash_gc(s) -> i64`. ADR 0012 D-2 (iter GB).
     symbol_hash_func: cranelift_module::FuncId,
+    /// FuncId of `vm_input_port_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GC).
+    input_port_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_output_port_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GC).
+    output_port_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_binary_port_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GC).
+    binary_port_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_textual_port_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GC).
+    textual_port_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -901,6 +909,23 @@ impl Lowerer {
         builder.symbol(
             "vm_symbol_hash_gc",
             cs_vm::vm::vm_symbol_hash_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter GC) — port-subtype predicates.
+        builder.symbol(
+            "vm_input_port_p_gc",
+            cs_vm::vm::vm_input_port_p_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_output_port_p_gc",
+            cs_vm::vm::vm_output_port_p_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_binary_port_p_gc",
+            cs_vm::vm::vm_binary_port_p_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_textual_port_p_gc",
+            cs_vm::vm::vm_textual_port_p_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
@@ -2199,6 +2224,38 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_symbol_hash_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter GC) — port-subtype predicates.
+        let input_port_p_func = module
+            .declare_function(
+                "vm_input_port_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_input_port_p_gc: {e}")))?;
+        let output_port_p_func = module
+            .declare_function(
+                "vm_output_port_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_output_port_p_gc: {e}")))?;
+        let binary_port_p_func = module
+            .declare_function(
+                "vm_binary_port_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_binary_port_p_gc: {e}")))?;
+        let textual_port_p_func = module
+            .declare_function(
+                "vm_textual_port_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_textual_port_p_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
             .declare_function(
@@ -3152,6 +3209,10 @@ impl Lowerer {
             string_titlecase_func,
             string_hash_func,
             symbol_hash_func,
+            input_port_p_func,
+            output_port_p_func,
+            binary_port_p_func,
+            textual_port_p_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -3717,6 +3778,19 @@ impl Lowerer {
             let symbol_hash_fnref = self
                 .module
                 .declare_func_in_func(self.symbol_hash_func, builder.func);
+            // iter GC — port-subtype predicates.
+            let input_port_p_fnref = self
+                .module
+                .declare_func_in_func(self.input_port_p_func, builder.func);
+            let output_port_p_fnref = self
+                .module
+                .declare_func_in_func(self.output_port_p_func, builder.func);
+            let binary_port_p_fnref = self
+                .module
+                .declare_func_in_func(self.binary_port_p_func, builder.func);
+            let textual_port_p_fnref = self
+                .module
+                .declare_func_in_func(self.textual_port_p_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4185,6 +4259,10 @@ impl Lowerer {
                         string_titlecase_fnref,
                         string_hash_fnref,
                         symbol_hash_fnref,
+                        input_port_p_fnref,
+                        output_port_p_fnref,
+                        binary_port_p_fnref,
+                        textual_port_p_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -4542,6 +4620,10 @@ fn lower_inst(
     string_titlecase_fnref: cranelift_codegen::ir::FuncRef,
     string_hash_fnref: cranelift_codegen::ir::FuncRef,
     symbol_hash_fnref: cranelift_codegen::ir::FuncRef,
+    input_port_p_fnref: cranelift_codegen::ir::FuncRef,
+    output_port_p_fnref: cranelift_codegen::ir::FuncRef,
+    binary_port_p_fnref: cranelift_codegen::ir::FuncRef,
+    textual_port_p_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -6757,14 +6839,27 @@ fn lower_inst(
             };
             map.insert(*dst, result);
         }
-        Inst::PortP(dst, src) => {
+        Inst::PortP(dst, src)
+        | Inst::InputPortP(dst, src)
+        | Inst::OutputPortP(dst, src)
+        | Inst::BinaryPortP(dst, src)
+        | Inst::TextualPortP(dst, src) => {
+            // ADR 0012 D-2 (iter DD/GC) — port + port-subtype predicates.
             let v_v = lookup(map, *src)?;
-            let inst_ref = b.ins().call(port_p_fnref, &[v_v]);
+            let fnref = match inst {
+                Inst::PortP(..) => port_p_fnref,
+                Inst::InputPortP(..) => input_port_p_fnref,
+                Inst::OutputPortP(..) => output_port_p_fnref,
+                Inst::BinaryPortP(..) => binary_port_p_fnref,
+                Inst::TextualPortP(..) => textual_port_p_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[v_v]);
             let result = {
                 let results = b.inst_results(inst_ref);
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
-                        "PortP expected 1 result, got {}",
+                        "PortP/family expected 1 result, got {}",
                         results.len()
                     )));
                 }

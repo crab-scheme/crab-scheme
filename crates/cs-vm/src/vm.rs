@@ -759,6 +759,67 @@ pub unsafe extern "C" fn vm_port_p_gc(r: i64) -> i64 {
     matches!(v, Value::Port(_)) as i64
 }
 
+/// `(input-port? v)` — true iff `v` is a Port that supports input.
+/// Consume-on-use; 0/1 out. Total predicate (non-Port → 0).
+/// ADR 0012 D-2 (iter GC).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_input_port_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Port(p) => p.is_input() as i64,
+        _ => 0,
+    }
+}
+
+/// `(output-port? v)` — true iff `v` is a Port that supports output.
+/// ADR 0012 D-2 (iter GC).
+///
+/// # Safety
+///
+/// Same as `vm_input_port_p_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_output_port_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Port(p) => p.is_output() as i64,
+        _ => 0,
+    }
+}
+
+/// `(binary-port? v)` — true iff `v` is a binary Port. ADR 0012 D-2
+/// (iter GC).
+///
+/// # Safety
+///
+/// Same as `vm_input_port_p_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_binary_port_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Port(p) => p.is_binary() as i64,
+        _ => 0,
+    }
+}
+
+/// `(textual-port? v)` — true iff `v` is a textual Port. ADR 0012 D-2
+/// (iter GC).
+///
+/// # Safety
+///
+/// Same as `vm_input_port_p_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_textual_port_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Port(p) => p.is_textual() as i64,
+        _ => 0,
+    }
+}
+
 /// `(eof-object? v)` — true iff `v` is the eof object. Consume-on-use;
 /// 0/1 out. ADR 0012 D-2 (iter DD).
 ///

@@ -1719,6 +1719,35 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::PortP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter GC) — port-subtype predicates.
+                                    ("input-port?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::InputPortP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("output-port?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::OutputPortP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("binary-port?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BinaryPortP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("textual-port?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::TextualPortP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     ("eof-object?", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
@@ -3691,7 +3720,11 @@ pub fn bytecode_to_rir_with_hints(
                                         value_types.insert(dst, Type::Boolean);
                                     }
                                     // ADR 0012 D-2 (iter EX) — take / drop.
-                                    ("take", 2)
+                                    // ADR 0012 D-2 (iter GC) — list-head alias.
+                                    // Both R6RS list-head and SRFI-1 take fail
+                                    // when n exceeds list length; we deopt to
+                                    // bytecode in either case.
+                                    ("take", 2) | ("list-head", 2)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any)
                                             && value_types.get(&args[1]).copied()
@@ -4883,6 +4916,10 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::BitwiseBitSetP(dst, _, _)
                 | RirInst::FlEvenP(dst, _)
                 | RirInst::FlOddP(dst, _)
+                | RirInst::InputPortP(dst, _)
+                | RirInst::OutputPortP(dst, _)
+                | RirInst::BinaryPortP(dst, _)
+                | RirInst::TextualPortP(dst, _)
                 | RirInst::CharNumericP(dst, _)
                 | RirInst::CharWhitespaceP(dst, _)
                 | RirInst::CharUpperCaseP(dst, _)
