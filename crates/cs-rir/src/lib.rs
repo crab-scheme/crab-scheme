@@ -168,6 +168,10 @@ pub enum Inst {
     /// (iter FN).
     BitwiseLength(Value, Value),
 
+    /// `dst = fxfirst-bit-set(n)`. Trailing zeros, or -1 when n == 0.
+    /// ADR 0012 D-2 (iter FX).
+    FxFirstBitSet(Value, Value),
+
     /// `dst = bitwise-arithmetic-shift-left(n, count)`. (Fixnum,
     /// Fixnum) -> Fixnum. ADR 0012 D-2 (iter FO).
     BitwiseArithShiftLeft(Value, Value, Value),

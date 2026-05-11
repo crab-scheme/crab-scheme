@@ -1062,6 +1062,22 @@ pub unsafe extern "C" fn vm_bitwise_arith_shift_right(n: i64, count: i64) -> i64
     }
 }
 
+/// `(fxfirst-bit-set n)` — R6RS. Index of the lowest set bit, or
+/// -1 when n == 0. Operand is a raw Fixnum-shape i64. ADR 0012 D-2
+/// (iter FX).
+///
+/// # Safety
+///
+/// `n` is a raw Fixnum i64, not a heap pointer.
+#[no_mangle]
+pub unsafe extern "C" fn vm_fx_first_bit_set(n: i64) -> i64 {
+    if n == 0 {
+        -1
+    } else {
+        n.trailing_zeros() as i64
+    }
+}
+
 /// `(bitwise-bit-set? n bit)` — test whether bit `bit` is set in
 /// `n`. Returns raw 0/1 (Boolean shape). Out-of-range `bit`
 /// (negative or ≥ 64) returns 0 — matches the bytecode. ADR 0012

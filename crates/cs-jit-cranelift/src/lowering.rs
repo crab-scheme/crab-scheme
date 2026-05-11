@@ -421,6 +421,9 @@ pub struct Lowerer {
     /// FuncId of `vm_bytevector_s64_native_set_gc`. ADR 0012 D-2
     /// (iter FT).
     bytevector_s64_native_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_fx_first_bit_set(n) -> i64`. ADR 0012 D-2
+    /// (iter FX).
+    fx_first_bit_set_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -967,6 +970,11 @@ impl Lowerer {
         builder.symbol(
             "vm_bytevector_s64_native_set_gc",
             cs_vm::vm::vm_bytevector_s64_native_set_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter FX) — fxfirst-bit-set.
+        builder.symbol(
+            "vm_fx_first_bit_set",
+            cs_vm::vm::vm_fx_first_bit_set as *const u8,
         );
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
@@ -2366,6 +2374,15 @@ impl Lowerer {
                 ))
             })?;
 
+        // ADR 0012 D-2 (iter FX) — fxfirst-bit-set.
+        let fx_first_bit_set_func = module
+            .declare_function(
+                "vm_fx_first_bit_set",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_fx_first_bit_set: {e}")))?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -3074,6 +3091,7 @@ impl Lowerer {
             bytevector_s64_native_ref_func,
             bytevector_u64_native_set_func,
             bytevector_s64_native_set_func,
+            fx_first_bit_set_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -3671,6 +3689,10 @@ impl Lowerer {
             let bytevector_s64_native_set_fnref = self
                 .module
                 .declare_func_in_func(self.bytevector_s64_native_set_func, builder.func);
+            // iter FX — fxfirst-bit-set.
+            let fx_first_bit_set_fnref = self
+                .module
+                .declare_func_in_func(self.fx_first_bit_set_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -4076,6 +4098,7 @@ impl Lowerer {
                         bytevector_s64_native_ref_fnref,
                         bytevector_u64_native_set_fnref,
                         bytevector_s64_native_set_fnref,
+                        fx_first_bit_set_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -4426,6 +4449,7 @@ fn lower_inst(
     bytevector_s64_native_ref_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_u64_native_set_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_s64_native_set_fnref: cranelift_codegen::ir::FuncRef,
+    fx_first_bit_set_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -5103,12 +5127,16 @@ fn lower_inst(
             };
             map.insert(*dst, result);
         }
-        Inst::BitwiseBitCount(dst, src) | Inst::BitwiseLength(dst, src) => {
-            // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
+        Inst::BitwiseBitCount(dst, src)
+        | Inst::BitwiseLength(dst, src)
+        | Inst::FxFirstBitSet(dst, src) => {
+            // ADR 0012 D-2 (iter FN/FX) — bitwise-bit-count/-length and
+            // fxfirst-bit-set: 1-arg Fixnum helpers.
             let sv = lookup(map, *src)?;
             let fnref = match inst {
                 Inst::BitwiseBitCount(..) => bitwise_bit_count_fnref,
                 Inst::BitwiseLength(..) => bitwise_length_fnref,
+                Inst::FxFirstBitSet(..) => fx_first_bit_set_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[sv]);
@@ -5116,7 +5144,7 @@ fn lower_inst(
                 let results = b.inst_results(inst_ref);
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
-                        "BitwiseBitCount/Length expected 1 result, got {}",
+                        "Bitwise{{Bit,}}Count/Length/FxFirstBitSet expected 1 result, got {}",
                         results.len()
                     )));
                 }

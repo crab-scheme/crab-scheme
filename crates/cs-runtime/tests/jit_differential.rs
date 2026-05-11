@@ -6795,3 +6795,47 @@ fn diff_jit_fx_bitwise_aliases() {
     assert!(matches!(&s_t, Value::Boolean(true)));
     assert!(matches!(&s_f, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_fx_shift_and_first_bit() {
+    // ADR 0012 D-2 (iter FX) — fx shift family + fxfirst-bit-set.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sh n c) (fxarithmetic-shift n c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sl n c) (fxarithmetic-shift-left n c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sr n c) (fxarithmetic-shift-right n c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fb n) (fxfirst-bit-set n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sh 1 2) (sl 1 3) (sr 16 2) (fb 8) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let h_pos = rt.eval_str_via_vm("<diff>", "(sh 1 3)").unwrap();
+    let h_neg = rt.eval_str_via_vm("<diff>", "(sh 16 -2)").unwrap();
+    let l = rt.eval_str_via_vm("<diff>", "(sl 1 3)").unwrap();
+    let r = rt.eval_str_via_vm("<diff>", "(sr 16 2)").unwrap();
+    let f8 = rt.eval_str_via_vm("<diff>", "(fb 8)").unwrap();
+    let f1 = rt.eval_str_via_vm("<diff>", "(fb 1)").unwrap();
+    let f0 = rt.eval_str_via_vm("<diff>", "(fb 0)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    // arithmetic-shift: positive count = left, negative = right
+    assert!(matches!(&h_pos, Value::Number(cs_core::Number::Fixnum(8))));
+    assert!(matches!(&h_neg, Value::Number(cs_core::Number::Fixnum(4))));
+    // shift-left 1<<3 = 8
+    assert!(matches!(&l, Value::Number(cs_core::Number::Fixnum(8))));
+    // shift-right 16>>2 = 4
+    assert!(matches!(&r, Value::Number(cs_core::Number::Fixnum(4))));
+    // trailing zeros: 8 = 0b1000 -> 3
+    assert!(matches!(&f8, Value::Number(cs_core::Number::Fixnum(3))));
+    // 1 -> 0
+    assert!(matches!(&f1, Value::Number(cs_core::Number::Fixnum(0))));
+    // 0 -> -1
+    assert!(matches!(&f0, Value::Number(cs_core::Number::Fixnum(-1))));
+}

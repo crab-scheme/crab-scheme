@@ -913,6 +913,34 @@ pub fn bytecode_to_rir_with_hints(
                                 {
                                     Some(RirInst::BitwiseArithShiftRight(dst, args[0], args[1]))
                                 }
+                                // ADR 0012 D-2 (iter FX) — fx shift aliases.
+                                ("fxarithmetic-shift", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::ArithShift(dst, args[0], args[1]))
+                                }
+                                ("fxarithmetic-shift-left", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitwiseArithShiftLeft(dst, args[0], args[1]))
+                                }
+                                ("fxarithmetic-shift-right", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitwiseArithShiftRight(dst, args[0], args[1]))
+                                }
+                                // ADR 0012 D-2 (iter FX) — fxfirst-bit-set.
+                                ("fxfirst-bit-set", 1)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::FxFirstBitSet(dst, args[0]))
+                                }
                                 _ => None,
                             };
                             if let Some(inst) = single {
