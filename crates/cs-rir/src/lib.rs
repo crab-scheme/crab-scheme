@@ -296,6 +296,16 @@ pub enum Inst {
     /// (iter CD).
     Assq(Value, Value, Value),
 
+    /// `dst = set-car!(p, v)`. Lowers to `vm_set_car_gc`. Both
+    /// operands Any (consumed). `dst` is Any — a Gc handle to
+    /// `Value::Unspecified`. Side-effect: mutates `p.car`.
+    /// ADR 0012 D-2 (iter CE).
+    SetCar(Value, Value, Value),
+
+    /// `dst = set-cdr!(p, v)`. Lowers to `vm_set_cdr_gc`. Mirrors
+    /// `SetCar`. ADR 0012 D-2 (iter CE).
+    SetCdr(Value, Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a

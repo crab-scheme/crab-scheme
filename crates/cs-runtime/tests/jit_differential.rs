@@ -2532,3 +2532,52 @@ fn diff_jit_assq_walks_alist() {
         other => panic!("expected (2, #f), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_set_car_cdr_mutate_pair() {
+    // ADR 0012 D-2 (iter CE) — set-car! / set-cdr! lower to
+    // vm_set_car_gc / vm_set_cdr_gc. The mutation is observable
+    // through subsequent car/cdr reads. Test pattern: outer fn
+    // takes a pair + a value, set-car! it, then return (car p)
+    // to prove the slot was updated.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (mutate-car! p v) (set-car! p v) (car p))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (mutate-cdr! p v) (set-cdr! p v) (cdr p))",
+    )
+    .unwrap();
+    // Warmup both JIT bodies.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (mutate-car! (cons 1 2) 99) \
+                    (mutate-cdr! (cons 1 2) 99) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let new_car = rt
+        .eval_str_via_vm("<diff>", "(mutate-car! (cons 1 2) 42)")
+        .unwrap();
+    let new_cdr = rt
+        .eval_str_via_vm("<diff>", "(mutate-cdr! (cons 1 2) 88)")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "mutate-car!/cdr! never dispatched through JIT (count={after})"
+    );
+    match (&new_car, &new_cdr) {
+        (
+            Value::Number(cs_core::Number::Fixnum(42)),
+            Value::Number(cs_core::Number::Fixnum(88)),
+        ) => {}
+        other => panic!("expected (42, 88), got {:?}", other),
+    }
+}

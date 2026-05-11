@@ -784,6 +784,55 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
     }
 }
 
+/// `(set-car! p v)` — mutate the `car` field of pair `p` to `v`.
+/// Returns a fresh Gc handle to `Value::Unspecified` (uniform with
+/// other Gc-returning helpers, e.g. `vm_vector_set_gc`). Consumes
+/// one strong refcount on both `p` and `v`. On non-pair, requests
+/// a deopt and returns Gc(Unspecified) as a placeholder so the
+/// bytecode VM can produce the proper diagnostic. ADR 0012 D-2
+/// (iter CE).
+///
+/// # Safety
+///
+/// Both `p` and `v` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_set_car_gc(p: i64, v: i64) -> i64 {
+    let pair = unsafe { gc_i64_to_value(p) };
+    let new_v = unsafe { gc_i64_to_value(v) };
+    match pair {
+        Value::Pair(pp) => {
+            *pp.car.borrow_mut() = new_v;
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
+/// `(set-cdr! p v)` — mutate the `cdr` field of pair `p` to `v`.
+/// Mirrors `vm_set_car_gc`. ADR 0012 D-2 (iter CE).
+///
+/// # Safety
+///
+/// Both `p` and `v` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_set_cdr_gc(p: i64, v: i64) -> i64 {
+    let pair = unsafe { gc_i64_to_value(p) };
+    let new_v = unsafe { gc_i64_to_value(v) };
+    match pair {
+        Value::Pair(pp) => {
+            *pp.cdr.borrow_mut() = new_v;
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(memq item lst)` — return the first sublist of `lst` whose
 /// `car` is `eq?` to `item`, or `#f` if not found. Consume-on-use
 /// for both args; returns an Any-shape Gc handle (either a
