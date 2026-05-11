@@ -2989,6 +2989,36 @@ fn lower_inst(
             let result = b.ins().select(adjust, adjusted, rem);
             map.insert(*dst, result);
         }
+        Inst::FloorQuotient(dst, lhs, rhs) => {
+            // ADR 0012 D-2 (iter ED) — R7RS floor-quotient: sdiv
+            // truncates toward zero, but floor rounds toward
+            // negative infinity. Adjust by -1 when the remainder is
+            // nonzero and the signs of lhs/rhs differ.
+            let l = lookup(map, *lhs)?;
+            let r = lookup(map, *rhs)?;
+            let q = b.ins().sdiv(l, r);
+            let rem = b.ins().srem(l, r);
+            let zero = b.ins().iconst(I64, 0);
+            let rem_nonzero =
+                b.ins()
+                    .icmp(cranelift_codegen::ir::condcodes::IntCC::NotEqual, rem, zero);
+            let lhs_neg = b.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::SignedLessThan,
+                l,
+                zero,
+            );
+            let rhs_neg = b.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::SignedLessThan,
+                r,
+                zero,
+            );
+            let signs_differ = b.ins().bxor(lhs_neg, rhs_neg);
+            let adjust = b.ins().band(rem_nonzero, signs_differ);
+            let one = b.ins().iconst(I64, 1);
+            let q_minus_one = b.ins().isub(q, one);
+            let result = b.ins().select(adjust, q_minus_one, q);
+            map.insert(*dst, result);
+        }
         Inst::BitAnd(dst, lhs, rhs) => {
             binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().band(l, r))?
         }

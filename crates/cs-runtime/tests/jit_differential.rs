@@ -4776,3 +4776,55 @@ fn diff_jit_number_string_conversion() {
         other => panic!("expected (42, 1.5, #f), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_r7rs_div_ops() {
+    // ADR 0012 D-2 (iter ED) — R7RS division ops:
+    // truncate-quotient (= quotient), truncate-remainder
+    // (= remainder), floor-remainder (= modulo), and the new
+    // floor-quotient.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (tq a b) (truncate-quotient a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (tr a b) (truncate-remainder a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fq a b) (floor-quotient a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fr a b) (floor-remainder a b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (tq 7 2) (tr 7 2) (fq 7 2) (fr 7 2) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // truncate -> toward zero. floor -> toward -inf.
+    // Use mixed signs to differentiate.
+    //   7  2: tq=3 tr=1 fq=3 fr=1
+    //  -7  2: tq=-3 tr=-1 fq=-4 fr=1
+    //   7 -2: tq=-3 tr=1 fq=-4 fr=-1
+    let r1 = rt.eval_str_via_vm("<diff>", "(tq -7 2)").unwrap();
+    let r2 = rt.eval_str_via_vm("<diff>", "(tr -7 2)").unwrap();
+    let r3 = rt.eval_str_via_vm("<diff>", "(fq -7 2)").unwrap();
+    let r4 = rt.eval_str_via_vm("<diff>", "(fr -7 2)").unwrap();
+    let r5 = rt.eval_str_via_vm("<diff>", "(fq 7 -2)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "R7RS div ops never dispatched through JIT (count={after})"
+    );
+    match (&r1, &r2, &r3, &r4, &r5) {
+        (
+            Value::Number(cs_core::Number::Fixnum(-3)),
+            Value::Number(cs_core::Number::Fixnum(-1)),
+            Value::Number(cs_core::Number::Fixnum(-4)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(-4)),
+        ) => {}
+        other => panic!("expected (-3, -1, -4, 1, -4), got {:?}", other),
+    }
+}

@@ -668,9 +668,24 @@ pub fn bytecode_to_rir_with_hints(
                             let dst = alloc();
                             // Single-Inst lowerings.
                             let single = match (name, args.len()) {
-                                ("quotient", 2) => Some(RirInst::Quotient(dst, args[0], args[1])),
-                                ("remainder", 2) => Some(RirInst::Remainder(dst, args[0], args[1])),
-                                ("modulo", 2) => Some(RirInst::Modulo(dst, args[0], args[1])),
+                                // ADR 0012 D-2 (iter ED) — R7RS division
+                                // ops: truncate-quotient/remainder are
+                                // aliases for quotient/remainder; floor-
+                                // remainder is an alias for modulo;
+                                // floor-quotient is a new FloorQuotient
+                                // RIR with sdiv+adjust lowering.
+                                ("quotient", 2) | ("truncate-quotient", 2) => {
+                                    Some(RirInst::Quotient(dst, args[0], args[1]))
+                                }
+                                ("remainder", 2) | ("truncate-remainder", 2) => {
+                                    Some(RirInst::Remainder(dst, args[0], args[1]))
+                                }
+                                ("modulo", 2) | ("floor-remainder", 2) => {
+                                    Some(RirInst::Modulo(dst, args[0], args[1]))
+                                }
+                                ("floor-quotient", 2) => {
+                                    Some(RirInst::FloorQuotient(dst, args[0], args[1]))
+                                }
                                 ("gcd", 2) => Some(RirInst::Gcd(dst, args[0], args[1])),
                                 ("lcm", 2) => Some(RirInst::Lcm(dst, args[0], args[1])),
                                 ("expt", 2) => Some(RirInst::Expt(dst, args[0], args[1])),

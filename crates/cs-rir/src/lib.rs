@@ -664,6 +664,12 @@ pub enum Inst {
     /// (matches the bytecode VM's error path).
     Quotient(Value, Value, Value),
 
+    /// `dst = floor_quotient(lhs, rhs)`. R7RS `floor-quotient` for
+    /// fixnums. Lowered inline as truncating sdiv minus an
+    /// adjustment when the remainder is nonzero and the signs of
+    /// lhs/rhs differ. ADR 0012 D-2 (iter ED).
+    FloorQuotient(Value, Value, Value),
+
     /// `dst = srem(lhs, rhs)`. R6RS `remainder` for fixnums.
     Remainder(Value, Value, Value),
 
