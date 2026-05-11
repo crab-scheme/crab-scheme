@@ -2823,6 +2823,29 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::FlonumIsNan(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter GB) — string-titlecase /
+                                    // string-hash / symbol-hash.
+                                    ("string-titlecase", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::StringTitlecase(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("string-hash", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::StringHash(dst, args[0]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
+                                    ("symbol-hash", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::SymbolHash(dst, args[0]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
                                     // ADR 0012 D-2 (iter EB) — abs/max/min for
                                     // Flonum-typed args. max/min widen any
                                     // Fixnum operand to Flonum via FixToFlo
@@ -5014,6 +5037,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StringDrop(dst, _, _)
                 | RirInst::StringTakeRight(dst, _, _)
                 | RirInst::StringDropRight(dst, _, _)
+                | RirInst::StringTitlecase(dst, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)

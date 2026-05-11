@@ -1026,6 +1026,94 @@ pub unsafe extern "C" fn vm_fl_odd_p(x: i64) -> i64 {
     }
 }
 
+/// `(string-titlecase s)` — SRFI-13. First alphabetic char of each
+/// word is upcased; following chars are lowercased. Non-alphabetic
+/// chars are passed through. ADR 0012 D-2 (iter GB).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_titlecase_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    let s_str = match v {
+        Value::String(sg) => sg.borrow().clone(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))));
+        }
+    };
+    let mut out = String::with_capacity(s_str.len());
+    let mut prev_alphabetic = false;
+    for c in s_str.chars() {
+        if c.is_alphabetic() {
+            if !prev_alphabetic {
+                for u in c.to_uppercase() {
+                    out.push(u);
+                }
+            } else {
+                for u in c.to_lowercase() {
+                    out.push(u);
+                }
+            }
+            prev_alphabetic = true;
+        } else {
+            out.push(c);
+            prev_alphabetic = false;
+        }
+    }
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+}
+
+/// 64-bit FNV-1a, truncated to a positive Fixnum (matches the
+/// bytecode `fnv1a_hash`). ADR 0012 D-2 (iter GB).
+fn fnv1a_hash_jit(bytes: &[u8]) -> i64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h as i64).wrapping_abs()
+}
+
+/// `(string-hash s)` — FNV-1a of UTF-8 bytes, as Fixnum. ADR 0012
+/// D-2 (iter GB).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_hash_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => fnv1a_hash_jit(sg.borrow().as_bytes()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+/// `(symbol-hash sym)` — FNV-1a of the symbol id bytes, as Fixnum.
+/// Operand is a Symbol-shape Gc handle. ADR 0012 D-2 (iter GB).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_symbol_hash_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::Symbol(id) => fnv1a_hash_jit(&id.0.to_le_bytes()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
 /// `(bitwise-bit-count n)` — R6RS-flavored popcount. For n ≥ 0
 /// returns popcount; for n < 0 returns `-1 - popcount(!n)` (matches
 /// the bytecode `b_bitwise_bit_count`). Operand is a raw Fixnum i64

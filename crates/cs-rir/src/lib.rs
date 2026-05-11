@@ -182,6 +182,16 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter FX).
     FxFirstBitSet(Value, Value),
 
+    /// `dst = string-titlecase(s)`. String -> String (Gc handle).
+    /// ADR 0012 D-2 (iter GB).
+    StringTitlecase(Value, Value),
+    /// `dst = string-hash(s)`. String -> Fixnum FNV-1a. ADR 0012 D-2
+    /// (iter GB).
+    StringHash(Value, Value),
+    /// `dst = symbol-hash(s)`. Symbol -> Fixnum FNV-1a. ADR 0012 D-2
+    /// (iter GB).
+    SymbolHash(Value, Value),
+
     /// `dst = bitwise-arithmetic-shift-left(n, count)`. (Fixnum,
     /// Fixnum) -> Fixnum. ADR 0012 D-2 (iter FO).
     BitwiseArithShiftLeft(Value, Value, Value),

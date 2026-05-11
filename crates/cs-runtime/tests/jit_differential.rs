@@ -7067,3 +7067,57 @@ fn diff_jit_flexpt_parity_and_fixnum_to_flonum() {
         other => panic!("expected 42.0, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_titlecase_and_hashes() {
+    // ADR 0012 D-2 (iter GB) — string-titlecase + string-hash + symbol-hash.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (tc s) (string-titlecase s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sh s) (string-hash s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (yh s) (symbol-hash s))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (tc \"hello world\") (sh \"hello\") (yh 'sym) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let tc = rt
+        .eval_str_via_vm("<diff>", "(tc \"hello world from scheme\")")
+        .unwrap();
+    let sh = rt.eval_str_via_vm("<diff>", "(sh \"hello\")").unwrap();
+    let sh_consistent = rt.eval_str_via_vm("<diff>", "(sh \"hello\")").unwrap();
+    let sh_diff = rt.eval_str_via_vm("<diff>", "(sh \"world\")").unwrap();
+    let yh = rt.eval_str_via_vm("<diff>", "(yh 'foo)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &tc {
+        Value::String(s) => assert_eq!(&*s.borrow(), "Hello World From Scheme"),
+        other => panic!("expected string, got {:?}", other),
+    }
+    // string-hash should be non-zero Fixnum
+    let sh_val = match &sh {
+        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        other => panic!("expected Fixnum, got {:?}", other),
+    };
+    let sh_val2 = match &sh_consistent {
+        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        other => panic!("expected Fixnum, got {:?}", other),
+    };
+    let sh_diff_val = match &sh_diff {
+        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        other => panic!("expected Fixnum, got {:?}", other),
+    };
+    assert_eq!(sh_val, sh_val2, "string-hash deterministic");
+    assert_ne!(sh_val, sh_diff_val, "different strings hash differently");
+    assert!(sh_val >= 0, "string-hash positive");
+    match &yh {
+        Value::Number(cs_core::Number::Fixnum(v)) => assert!(*v >= 0),
+        other => panic!("expected Fixnum, got {:?}", other),
+    }
+}

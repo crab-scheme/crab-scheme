@@ -360,6 +360,13 @@ pub struct Lowerer {
     fl_even_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_fl_odd_p(x) -> i64`. ADR 0012 D-2 (iter GA).
     fl_odd_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_titlecase_gc(s) -> i64`. ADR 0012 D-2
+    /// (iter GB).
+    string_titlecase_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_hash_gc(s) -> i64`. ADR 0012 D-2 (iter GB).
+    string_hash_func: cranelift_module::FuncId,
+    /// FuncId of `vm_symbol_hash_gc(s) -> i64`. ADR 0012 D-2 (iter GB).
+    symbol_hash_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -882,6 +889,19 @@ impl Lowerer {
         builder.symbol("vm_flonum_expt", cs_vm::vm::vm_flonum_expt as *const u8);
         builder.symbol("vm_fl_even_p", cs_vm::vm::vm_fl_even_p as *const u8);
         builder.symbol("vm_fl_odd_p", cs_vm::vm::vm_fl_odd_p as *const u8);
+        // ADR 0012 D-2 (iter GB) — string-titlecase / string-hash / symbol-hash.
+        builder.symbol(
+            "vm_string_titlecase_gc",
+            cs_vm::vm::vm_string_titlecase_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_hash_gc",
+            cs_vm::vm::vm_string_hash_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_symbol_hash_gc",
+            cs_vm::vm::vm_symbol_hash_gc as *const u8,
+        );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
             "vm_bitwise_bit_count",
@@ -2154,6 +2174,31 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_fl_odd_p: {e}")))?;
 
+        // ADR 0012 D-2 (iter GB) — string-titlecase / string-hash / symbol-hash.
+        let string_titlecase_func = module
+            .declare_function(
+                "vm_string_titlecase_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_titlecase_gc: {e}"))
+            })?;
+        let string_hash_func = module
+            .declare_function(
+                "vm_string_hash_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_hash_gc: {e}")))?;
+        let symbol_hash_func = module
+            .declare_function(
+                "vm_symbol_hash_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_symbol_hash_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
             .declare_function(
@@ -3104,6 +3149,9 @@ impl Lowerer {
             flonum_expt_func,
             fl_even_p_func,
             fl_odd_p_func,
+            string_titlecase_func,
+            string_hash_func,
+            symbol_hash_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -3659,6 +3707,16 @@ impl Lowerer {
             let fl_odd_p_fnref = self
                 .module
                 .declare_func_in_func(self.fl_odd_p_func, builder.func);
+            // iter GB — string-titlecase / string-hash / symbol-hash.
+            let string_titlecase_fnref = self
+                .module
+                .declare_func_in_func(self.string_titlecase_func, builder.func);
+            let string_hash_fnref = self
+                .module
+                .declare_func_in_func(self.string_hash_func, builder.func);
+            let symbol_hash_fnref = self
+                .module
+                .declare_func_in_func(self.symbol_hash_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4124,6 +4182,9 @@ impl Lowerer {
                         flonum_expt_fnref,
                         fl_even_p_fnref,
                         fl_odd_p_fnref,
+                        string_titlecase_fnref,
+                        string_hash_fnref,
+                        symbol_hash_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -4478,6 +4539,9 @@ fn lower_inst(
     flonum_expt_fnref: cranelift_codegen::ir::FuncRef,
     fl_even_p_fnref: cranelift_codegen::ir::FuncRef,
     fl_odd_p_fnref: cranelift_codegen::ir::FuncRef,
+    string_titlecase_fnref: cranelift_codegen::ir::FuncRef,
+    string_hash_fnref: cranelift_codegen::ir::FuncRef,
+    symbol_hash_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -5172,6 +5236,45 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "BitwiseShift/BitSetP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::StringTitlecase(dst, src) => {
+            // ADR 0012 D-2 (iter GB) — vm_string_titlecase_gc. Returns
+            // a fresh Gc<Value::String>.
+            let sv = lookup(map, *src)?;
+            let inst_ref = b.ins().call(string_titlecase_fnref, &[sv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringTitlecase expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringHash(dst, src) | Inst::SymbolHash(dst, src) => {
+            // ADR 0012 D-2 (iter GB) — Fixnum-returning hashes (no Gc).
+            let sv = lookup(map, *src)?;
+            let fnref = match inst {
+                Inst::StringHash(..) => string_hash_fnref,
+                Inst::SymbolHash(..) => symbol_hash_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[sv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "String/SymbolHash expected 1 result, got {}",
                         results.len()
                     )));
                 }
