@@ -956,8 +956,17 @@ pub fn bytecode_to_rir_with_hints(
                                     | ("inexact->exact", 1) => {
                                         insts.push(RirInst::Move(dst, args[0]));
                                     }
+                                    ("square", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        // ADR 0012 D-2 (iter EK) — Flonum
+                                        // square via FlonumMul.
+                                        insts.push(RirInst::FlonumMul(dst, args[0], args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
                                     ("square", 1) => {
-                                        // (square x) → x * x
+                                        // (square x) → x * x for Fixnum.
                                         insts.push(RirInst::Mul(dst, args[0], args[0]));
                                     }
                                     ("cons", 2) => {

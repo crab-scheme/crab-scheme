@@ -5098,3 +5098,32 @@ fn diff_jit_string_reverse() {
         other => panic!("expected two strings, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_square_flonum() {
+    // ADR 0012 D-2 (iter EK) — square Flonum-aware. Closes latent
+    // integer-mul-on-f64 bug: x * x for Flonum used integer imul.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sq-fix n) (square n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sq-flo x) (square x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sq-fix 3) (sq-flo 2.5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let fix = rt.eval_str_via_vm("<diff>", "(sq-fix 7)").unwrap();
+    let flo = rt.eval_str_via_vm("<diff>", "(sq-flo 2.5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&fix, &flo) {
+        (Value::Number(cs_core::Number::Fixnum(49)), Value::Number(cs_core::Number::Flonum(f))) => {
+            assert!((f - 6.25).abs() < 1e-12, "sq-flo 2.5 = {f}");
+        }
+        other => panic!("expected (49, 6.25), got {:?}", other),
+    }
+}
