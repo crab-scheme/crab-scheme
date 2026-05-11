@@ -1832,6 +1832,21 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::BvS8Ref(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Fixnum);
                                     }
+                                    // ADR 0012 D-2 (iter FQ) — bytevector-u16/s16 native-ref.
+                                    ("bytevector-u16-native-ref", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvU16NativeRef(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
+                                    ("bytevector-s16-native-ref", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvS16NativeRef(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
                                     // ADR 0012 D-2 (iter DB) — string-copy /
                                     // vector-copy (1-arg full copy).
                                     ("string-copy", 1)
@@ -1931,6 +1946,25 @@ pub fn bytecode_to_rir_with_hints(
                                     {
                                         insts
                                             .push(RirInst::BvS8Set(dst, args[0], args[1], args[2]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    // ADR 0012 D-2 (iter FQ) — bytevector-u16/s16 native-set!.
+                                    ("bytevector-u16-native-set!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvU16NativeSet(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("bytevector-s16-native-set!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvS16NativeSet(
+                                            dst, args[0], args[1], args[2],
+                                        ));
                                         value_types.insert(dst, Type::Any);
                                     }
                                     // ADR 0012 D-2 (iter CN) — list-copy.
@@ -4358,6 +4392,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::BvAlloc(dst, _, _)
                 | RirInst::BvU8Set(dst, _, _, _)
                 | RirInst::BvS8Set(dst, _, _, _)
+                | RirInst::BvU16NativeSet(dst, _, _, _)
+                | RirInst::BvS16NativeSet(dst, _, _, _)
                 | RirInst::VecBuild(dst, _)
                 | RirInst::StrBuild(dst, _)
                 | RirInst::BvBuild(dst, _)

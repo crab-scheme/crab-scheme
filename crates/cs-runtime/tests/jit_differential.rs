@@ -6404,3 +6404,63 @@ fn diff_jit_bytevector_s8_ref_set() {
         Value::Number(cs_core::Number::Fixnum(-42))
     ));
 }
+
+#[test]
+fn diff_jit_bytevector_u16_s16_native() {
+    // ADR 0012 D-2 (iter FQ) — bytevector u16/s16 native ref/set!.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (ur bv k) (bytevector-u16-native-ref bv k))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (sr bv k) (bytevector-s16-native-ref bv k))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (us bv k v) \
+           (bytevector-u16-native-set! bv k v) \
+           (bytevector-u16-native-ref bv k))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (ss bv k v) \
+           (bytevector-s16-native-set! bv k v) \
+           (bytevector-s16-native-ref bv k))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (us (make-bytevector 4 0) 0 12345) \
+                      (ss (make-bytevector 4 0) 2 -123) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let uw = rt
+        .eval_str_via_vm("<diff>", "(us (make-bytevector 4 0) 0 60000)")
+        .unwrap();
+    let sw_pos = rt
+        .eval_str_via_vm("<diff>", "(ss (make-bytevector 4 0) 0 30000)")
+        .unwrap();
+    let sw_neg = rt
+        .eval_str_via_vm("<diff>", "(ss (make-bytevector 4 0) 0 -30000)")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&uw, Value::Number(cs_core::Number::Fixnum(60000))));
+    assert!(matches!(
+        &sw_pos,
+        Value::Number(cs_core::Number::Fixnum(30000))
+    ));
+    assert!(matches!(
+        &sw_neg,
+        Value::Number(cs_core::Number::Fixnum(-30000))
+    ));
+}

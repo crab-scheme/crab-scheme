@@ -373,6 +373,18 @@ pub struct Lowerer {
     /// FuncId of `vm_bytevector_s8_set_gc(bv, k, v) -> i64`. Returns
     /// Unspecified Gc handle. ADR 0012 D-2 (iter FP).
     bytevector_s8_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_u16_native_ref_gc`. ADR 0012 D-2
+    /// (iter FQ).
+    bytevector_u16_native_ref_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_s16_native_ref_gc`. ADR 0012 D-2
+    /// (iter FQ).
+    bytevector_s16_native_ref_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_u16_native_set_gc`. ADR 0012 D-2
+    /// (iter FQ).
+    bytevector_u16_native_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_s16_native_set_gc`. ADR 0012 D-2
+    /// (iter FQ).
+    bytevector_s16_native_set_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -851,6 +863,23 @@ impl Lowerer {
         builder.symbol(
             "vm_bytevector_s8_set_gc",
             cs_vm::vm::vm_bytevector_s8_set_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter FQ).
+        builder.symbol(
+            "vm_bytevector_u16_native_ref_gc",
+            cs_vm::vm::vm_bytevector_u16_native_ref_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_bytevector_s16_native_ref_gc",
+            cs_vm::vm::vm_bytevector_s16_native_ref_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_bytevector_u16_native_set_gc",
+            cs_vm::vm::vm_bytevector_u16_native_set_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_bytevector_s16_native_set_gc",
+            cs_vm::vm::vm_bytevector_s16_native_set_gc as *const u8,
         );
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
@@ -2066,6 +2095,52 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_bytevector_s8_set_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter FQ) — bytevector u16/s16 native ref/set!.
+        let bytevector_u16_native_ref_func = module
+            .declare_function(
+                "vm_bytevector_u16_native_ref_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_bytevector_u16_native_ref_gc: {e}"
+                ))
+            })?;
+        let bytevector_s16_native_ref_func = module
+            .declare_function(
+                "vm_bytevector_s16_native_ref_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_bytevector_s16_native_ref_gc: {e}"
+                ))
+            })?;
+        let bytevector_u16_native_set_func = module
+            .declare_function(
+                "vm_bytevector_u16_native_set_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_bytevector_u16_native_set_gc: {e}"
+                ))
+            })?;
+        let bytevector_s16_native_set_func = module
+            .declare_function(
+                "vm_bytevector_s16_native_set_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_bytevector_s16_native_set_gc: {e}"
+                ))
+            })?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -2758,6 +2833,10 @@ impl Lowerer {
             bitwise_bit_set_p_func,
             bytevector_s8_ref_func,
             bytevector_s8_set_func,
+            bytevector_u16_native_ref_func,
+            bytevector_s16_native_ref_func,
+            bytevector_u16_native_set_func,
+            bytevector_s16_native_set_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -3303,6 +3382,19 @@ impl Lowerer {
             let bytevector_s8_set_fnref = self
                 .module
                 .declare_func_in_func(self.bytevector_s8_set_func, builder.func);
+            // iter FQ — bytevector u16/s16 native-ref/-set!.
+            let bytevector_u16_native_ref_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_u16_native_ref_func, builder.func);
+            let bytevector_s16_native_ref_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_s16_native_ref_func, builder.func);
+            let bytevector_u16_native_set_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_u16_native_set_func, builder.func);
+            let bytevector_s16_native_set_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_s16_native_set_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -3692,6 +3784,10 @@ impl Lowerer {
                         bitwise_bit_set_p_fnref,
                         bytevector_s8_ref_fnref,
                         bytevector_s8_set_fnref,
+                        bytevector_u16_native_ref_fnref,
+                        bytevector_s16_native_ref_fnref,
+                        bytevector_u16_native_set_fnref,
+                        bytevector_s16_native_set_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -4026,6 +4122,10 @@ fn lower_inst(
     bitwise_bit_set_p_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_s8_ref_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_s8_set_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_u16_native_ref_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_s16_native_ref_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_u16_native_set_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_s16_native_set_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -5638,6 +5738,52 @@ fn lower_inst(
                 }
                 results[0]
             };
+            map.insert(*dst, result);
+        }
+        Inst::BvU16NativeRef(dst, bv, k) | Inst::BvS16NativeRef(dst, bv, k) => {
+            // ADR 0012 D-2 (iter FQ) — bytevector u16/s16 native-ref.
+            let bv_v = lookup(map, *bv)?;
+            let k_v = lookup(map, *k)?;
+            let fnref = match inst {
+                Inst::BvU16NativeRef(..) => bytevector_u16_native_ref_fnref,
+                Inst::BvS16NativeRef(..) => bytevector_s16_native_ref_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[bv_v, k_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Bv{{U,S}}16NativeRef expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::BvU16NativeSet(dst, bv, k, val) | Inst::BvS16NativeSet(dst, bv, k, val) => {
+            // ADR 0012 D-2 (iter FQ) — bytevector u16/s16 native-set!.
+            let bv_v = lookup(map, *bv)?;
+            let k_v = lookup(map, *k)?;
+            let val_v = lookup(map, *val)?;
+            let fnref = match inst {
+                Inst::BvU16NativeSet(..) => bytevector_u16_native_set_fnref,
+                Inst::BvS16NativeSet(..) => bytevector_s16_native_set_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[bv_v, k_v, val_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Bv{{U,S}}16NativeSet expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
         Inst::BvS8Ref(dst, bv, k) => {
