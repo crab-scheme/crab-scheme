@@ -955,6 +955,55 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::Assq(dst, key, args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter CG) — memv / assv,
+                                    // the eqv?-flavored variants. Same
+                                    // BoxTyped dance on the search key.
+                                    ("memv", 2)
+                                        if value_types.get(&args[1]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        let item_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let item = if item_t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(item_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::Memv(dst, item, args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("assv", 2)
+                                        if value_types.get(&args[1]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        let key_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let key = if key_t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(key_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::Assv(dst, key, args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter CE) — pair mutation.
                                     // Pair arg must be Any; value arg gets
                                     // BoxTyped if it's a typed immediate.
@@ -1985,7 +2034,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::Memq(dst, _, _)
                 | RirInst::Assq(dst, _, _)
                 | RirInst::SetCar(dst, _, _)
-                | RirInst::SetCdr(dst, _, _) => {
+                | RirInst::SetCdr(dst, _, _)
+                | RirInst::Memv(dst, _, _)
+                | RirInst::Assv(dst, _, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

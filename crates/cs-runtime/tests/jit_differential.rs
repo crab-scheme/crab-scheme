@@ -2628,3 +2628,50 @@ fn diff_jit_char_ordered_comparisons() {
         other => panic!("expected (1, 0, 1, 1), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_memv_assv_eqv_search() {
+    // ADR 0012 D-2 (iter CG) — memv / assv are the eqv?-flavored
+    // search ops. cs_core::eq::eqv extends eq? with by-value
+    // comparison for numbers and characters.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mv item lst) (memv item lst))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (av key al) (assv key al))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (mv 2 (list 1 2 3)) (av 2 (list (cons 1 'a) (cons 2 'b))) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let mv_hit = rt
+        .eval_str_via_vm("<diff>", "(car (mv 2 (list 1 2 3)))")
+        .unwrap();
+    let mv_miss = rt
+        .eval_str_via_vm("<diff>", "(mv 99 (list 1 2 3))")
+        .unwrap();
+    let av_hit = rt
+        .eval_str_via_vm("<diff>", "(cdr (av 2 (list (cons 1 'a) (cons 2 'b))))")
+        .unwrap();
+    let av_miss = rt
+        .eval_str_via_vm("<diff>", "(av 99 (list (cons 1 'a) (cons 2 'b)))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "memv/assv never dispatched through JIT (count={after})"
+    );
+    match (&mv_hit, &mv_miss, &av_hit, &av_miss) {
+        (
+            Value::Number(cs_core::Number::Fixnum(2)),
+            Value::Boolean(false),
+            Value::Symbol(_),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (2, #f, Symbol(b), #f), got {:?}", other),
+    }
+}

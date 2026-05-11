@@ -306,6 +306,14 @@ pub enum Inst {
     /// `SetCar`. ADR 0012 D-2 (iter CE).
     SetCdr(Value, Value, Value),
 
+    /// `dst = memv(item, lst)`. eqv?-flavored memq. Lowers to
+    /// `vm_memv_gc`. ADR 0012 D-2 (iter CG).
+    Memv(Value, Value, Value),
+
+    /// `dst = assv(key, alist)`. eqv?-flavored assq. Lowers to
+    /// `vm_assv_gc`. ADR 0012 D-2 (iter CG).
+    Assv(Value, Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a

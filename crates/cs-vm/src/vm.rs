@@ -784,6 +784,65 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
     }
 }
 
+/// `(memv item lst)` — eqv?-flavored memq. Walks the spine
+/// comparing each car against `item` with `cs_core::eq::eqv`,
+/// which extends `eq?` with by-value comparison for numbers and
+/// characters. Returns the matched sublist or `#f`. Consume-on-use
+/// for both args. ADR 0012 D-2 (iter CG).
+///
+/// # Safety
+///
+/// Both `item` and `lst` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_memv_gc(item: i64, lst: i64) -> i64 {
+    let needle = unsafe { gc_i64_to_value(item) };
+    let v = unsafe { gc_i64_to_value(lst) };
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                if cs_core::eq::eqv(&needle, &car) {
+                    return value_to_gc_i64(Value::Pair(p.clone()));
+                }
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            _ => return value_to_gc_i64(Value::Boolean(false)),
+        }
+    }
+}
+
+/// `(assv key alist)` — eqv?-flavored assq. Mirrors `vm_assq_gc`
+/// but uses `cs_core::eq::eqv` for the entry-car comparison.
+/// ADR 0012 D-2 (iter CG).
+///
+/// # Safety
+///
+/// Both `key` and `alist` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_assv_gc(key: i64, alist: i64) -> i64 {
+    let needle = unsafe { gc_i64_to_value(key) };
+    let v = unsafe { gc_i64_to_value(alist) };
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let entry = p.car.borrow().clone();
+                if let Value::Pair(ep) = &entry {
+                    let entry_key = ep.car.borrow().clone();
+                    if cs_core::eq::eqv(&needle, &entry_key) {
+                        return value_to_gc_i64(entry);
+                    }
+                }
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            _ => return value_to_gc_i64(Value::Boolean(false)),
+        }
+    }
+}
+
 /// `(set-car! p v)` — mutate the `car` field of pair `p` to `v`.
 /// Returns a fresh Gc handle to `Value::Unspecified` (uniform with
 /// other Gc-returning helpers, e.g. `vm_vector_set_gc`). Consumes

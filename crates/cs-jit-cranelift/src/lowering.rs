@@ -197,6 +197,12 @@ pub struct Lowerer {
     set_car_func: cranelift_module::FuncId,
     /// FuncId of `vm_set_cdr_gc(p, v) -> i64`. ADR 0012 D-2 (iter CE).
     set_cdr_func: cranelift_module::FuncId,
+    /// FuncId of `vm_memv_gc(item, lst) -> i64`. eqv?-flavored memq.
+    /// ADR 0012 D-2 (iter CG).
+    memv_func: cranelift_module::FuncId,
+    /// FuncId of `vm_assv_gc(key, alist) -> i64`. eqv?-flavored assq.
+    /// ADR 0012 D-2 (iter CG).
+    assv_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -320,6 +326,9 @@ impl Lowerer {
         // ADR 0012 D-2 (iter CE) — pair mutation.
         builder.symbol("vm_set_car_gc", cs_vm::vm::vm_set_car_gc as *const u8);
         builder.symbol("vm_set_cdr_gc", cs_vm::vm::vm_set_cdr_gc as *const u8);
+        // ADR 0012 D-2 (iter CG) — memv / assv (eqv?-flavored search).
+        builder.symbol("vm_memv_gc", cs_vm::vm::vm_memv_gc as *const u8);
+        builder.symbol("vm_assv_gc", cs_vm::vm::vm_assv_gc as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -698,6 +707,23 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_set_cdr_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter CG) — vm_memv_gc / vm_assv_gc.
+        // Same shape as memq/assq.
+        let memv_func = module
+            .declare_function(
+                "vm_memv_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_memv_gc: {e}")))?;
+        let assv_func = module
+            .declare_function(
+                "vm_assv_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_assv_gc: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -742,6 +768,8 @@ impl Lowerer {
             assq_func,
             set_car_func,
             set_cdr_func,
+            memv_func,
+            assv_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -985,6 +1013,13 @@ impl Lowerer {
             let set_cdr_fnref = self
                 .module
                 .declare_func_in_func(self.set_cdr_func, builder.func);
+            // iter CG — memv / assv.
+            let memv_fnref = self
+                .module
+                .declare_func_in_func(self.memv_func, builder.func);
+            let assv_fnref = self
+                .module
+                .declare_func_in_func(self.assv_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -1086,6 +1121,8 @@ impl Lowerer {
                         assq_fnref,
                         set_car_fnref,
                         set_cdr_fnref,
+                        memv_fnref,
+                        assv_fnref,
                         inst,
                     )?;
                 }
@@ -1289,6 +1326,8 @@ fn lower_inst(
     assq_fnref: cranelift_codegen::ir::FuncRef,
     set_car_fnref: cranelift_codegen::ir::FuncRef,
     set_cdr_fnref: cranelift_codegen::ir::FuncRef,
+    memv_fnref: cranelift_codegen::ir::FuncRef,
+    assv_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -2176,6 +2215,42 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "SetCdr expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::Memv(dst, item, lst) => {
+            // ADR 0012 D-2 (iter CG) — vm_memv_gc; mirrors Memq.
+            let item_v = lookup(map, *item)?;
+            let lst_v = lookup(map, *lst)?;
+            let inst_ref = b.ins().call(memv_fnref, &[item_v, lst_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Memv expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::Assv(dst, key, alist) => {
+            // ADR 0012 D-2 (iter CG) — vm_assv_gc; mirrors Assq.
+            let key_v = lookup(map, *key)?;
+            let alist_v = lookup(map, *alist)?;
+            let inst_ref = b.ins().call(assv_fnref, &[key_v, alist_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Assv expected 1 result, got {}",
                         results.len()
                     )));
                 }
