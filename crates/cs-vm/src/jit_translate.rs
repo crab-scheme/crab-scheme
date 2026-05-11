@@ -1113,6 +1113,34 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::Cdr(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter DV) — composed pair
+                                    // accessors (caar/cadr/.../cddddr). Lower
+                                    // to a chain of Car/Cdr RIR insts read
+                                    // right-to-left within the c[ad]+r name.
+                                    // `(caddr x)` ≡ `(car (cdr (cdr x)))`:
+                                    // emit Cdr (rightmost 'd'), then Cdr,
+                                    // then Car (leftmost 'a'). Requires the
+                                    // arg to be Any-typed; intermediate and
+                                    // final values are Any.
+                                    (n, 1)
+                                        if cxr_parse(n).is_some()
+                                            && value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        let dirs = cxr_parse(n).unwrap();
+                                        let mut cur = args[0];
+                                        let last_i = dirs.len() - 1;
+                                        for (i, &is_cdr) in dirs.iter().rev().enumerate() {
+                                            let next = if i == last_i { dst } else { alloc() };
+                                            if is_cdr {
+                                                insts.push(RirInst::Cdr(next, cur));
+                                            } else {
+                                                insts.push(RirInst::Car(next, cur));
+                                            }
+                                            value_types.insert(next, Type::Any);
+                                            cur = next;
+                                        }
+                                    }
                                     ("pair?", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
@@ -2981,6 +3009,36 @@ fn box_mixed_returns(
 /// Mirrors `cs_vm::vm::JIT_RT_FIXNUM` etc. — duplicated here to
 /// avoid a circular import at translate time. Heap-pointer types
 /// not yet wired through Cranelift map to `JIT_RT_ANY`.
+/// Parse a composed pair accessor name like `caar`, `caddr`,
+/// `cddddr`. Returns `Some(directions)` where `false` means Car (the
+/// 'a' letter) and `true` means Cdr (the 'd' letter), reading the
+/// middle of the name left-to-right (outermost operation first).
+/// Returns `None` for names that aren't a valid 2..=4-letter cxr
+/// (also rejects `car`/`cdr` since those have specialized arms).
+/// ADR 0012 D-2 (iter DV).
+fn cxr_parse(name: &str) -> Option<Vec<bool>> {
+    let bytes = name.as_bytes();
+    if bytes.len() < 4 || bytes.len() > 6 {
+        return None;
+    }
+    if bytes[0] != b'c' || *bytes.last().unwrap() != b'r' {
+        return None;
+    }
+    let mid = &bytes[1..bytes.len() - 1];
+    if mid.len() < 2 {
+        return None;
+    }
+    let mut dirs = Vec::with_capacity(mid.len());
+    for &b in mid {
+        match b {
+            b'a' => dirs.push(false),
+            b'd' => dirs.push(true),
+            _ => return None,
+        }
+    }
+    Some(dirs)
+}
+
 fn type_to_jit_rt_tag(t: Type) -> u8 {
     match t {
         Type::Fixnum => 0,

@@ -4361,3 +4361,77 @@ fn diff_jit_variadic_bytevector_append() {
         other => panic!("expected (5, 40, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_cxr_accessors() {
+    // ADR 0012 D-2 (iter DV) — composed pair accessors lower to
+    // chains of Car/Cdr. Covers 2/3/4-letter cxr forms.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f-caar x) (caar x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f-cadr x) (cadr x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f-cdar x) (cdar x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f-cddr x) (cddr x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f-caddr x) (caddr x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f-cadddr x) (cadddr x))")
+        .unwrap();
+    // Warmup: each function called repeatedly so the JIT compiles.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (f-caar '((1 2) 3)) \
+                      (f-cadr '(1 2 3)) \
+                      (f-cdar '((1 2) 3)) \
+                      (f-cddr '(1 2 3 4)) \
+                      (f-caddr '(1 2 3 4)) \
+                      (f-cadddr '(1 2 3 4 5)) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let caar = rt
+        .eval_str_via_vm("<diff>", "(f-caar '((10 20) 30))")
+        .unwrap();
+    let cadr = rt
+        .eval_str_via_vm("<diff>", "(f-cadr '(10 20 30))")
+        .unwrap();
+    let cdar = rt
+        .eval_str_via_vm("<diff>", "(f-cdar '((10 20) 30))")
+        .unwrap();
+    let cddr = rt
+        .eval_str_via_vm("<diff>", "(f-cddr '(10 20 30 40))")
+        .unwrap();
+    let caddr = rt
+        .eval_str_via_vm("<diff>", "(f-caddr '(10 20 30 40))")
+        .unwrap();
+    let cadddr = rt
+        .eval_str_via_vm("<diff>", "(f-cadddr '(10 20 30 40 50))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "cxr accessors never dispatched through JIT (count={after})"
+    );
+    match (&caar, &cadr, &cddr, &caddr, &cadddr) {
+        (
+            Value::Number(cs_core::Number::Fixnum(10)),
+            Value::Number(cs_core::Number::Fixnum(20)),
+            Value::Pair(_),
+            Value::Number(cs_core::Number::Fixnum(30)),
+            Value::Number(cs_core::Number::Fixnum(40)),
+        ) => {}
+        other => panic!("expected (10, 20, pair, 30, 40), got {:?}", other),
+    }
+    // cdar of ((10 20) 30) is (20) — a pair.
+    assert!(
+        matches!(&cdar, Value::Pair(_)),
+        "expected pair for cdar, got {:?}",
+        cdar
+    );
+}
