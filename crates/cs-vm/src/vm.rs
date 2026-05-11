@@ -688,6 +688,62 @@ pub unsafe extern "C" fn vm_null_p_gc(r: i64) -> i64 {
     matches!(v, Value::Null) as i64
 }
 
+/// `(length lst)` — count pairs in the spine. Consume-on-use; returns
+/// the count as a raw Fixnum-shape i64 (NOT a Gc handle). Walks
+/// `Pair.cdr` until reaching `Null` (proper list) or another atom
+/// (improper list / type error); on the non-Null exit, requests a
+/// deopt via `jit_request_deopt(DEOPT_REASON_PAIR_MISS)` so the
+/// bytecode VM can produce the proper diagnostic, and returns 0 as
+/// a placeholder. ADR 0012 D-2 (iter CA).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_length_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    let mut cur = v;
+    let mut count: i64 = 0;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                count += 1;
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            Value::Null => return count,
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return 0;
+            }
+        }
+    }
+}
+
+/// `(list? v)` — true iff `v` is a proper list (a chain of pairs
+/// terminated by `Null`). Consume-on-use; 0/1 out. Improper lists
+/// and atoms return 0 (no deopt — `list?` is a total predicate per
+/// R6RS, mirroring `pair?`). ADR 0012 D-2 (iter CA).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_list_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            Value::Null => return 1,
+            _ => return 0,
+        }
+    }
+}
+
 /// Gc-backed counterpart to `vm_value_clone`. Cheaper than the Box
 /// version: bumps the strong refcount on the existing allocation
 /// and returns the same raw handle, so the caller has two

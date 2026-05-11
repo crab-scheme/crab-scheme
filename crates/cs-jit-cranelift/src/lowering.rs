@@ -176,6 +176,12 @@ pub struct Lowerer {
     /// FuncId of `vm_make_closure(lambda_idx) -> i64`. Returns a
     /// fresh `Gc<Value::Procedure>` raw handle. ADR 0012 D-2 (iter BZ).
     make_closure_func: cranelift_module::FuncId,
+    /// FuncId of `vm_length_gc(lst) -> i64`. Returns raw Fixnum-shape
+    /// spine count. ADR 0012 D-2 (iter CA).
+    length_func: cranelift_module::FuncId,
+    /// FuncId of `vm_list_p_gc(v) -> i64`. Returns 0/1. ADR 0012 D-2
+    /// (iter CA).
+    list_p_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -287,6 +293,9 @@ impl Lowerer {
         builder.symbol("vm_string_eq_gc", cs_vm::vm::vm_string_eq_gc as *const u8);
         // ADR 0012 D-2 (iter BZ) — lambda creation in JIT bodies.
         builder.symbol("vm_make_closure", cs_vm::vm::vm_make_closure as *const u8);
+        // ADR 0012 D-2 (iter CA) — list ops.
+        builder.symbol("vm_length_gc", cs_vm::vm::vm_length_gc as *const u8);
+        builder.symbol("vm_list_p_gc", cs_vm::vm::vm_list_p_gc as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -602,6 +611,23 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_make_closure: {e}")))?;
 
+        // ADR 0012 D-2 (iter CA) — vm_length_gc / vm_list_p_gc.
+        // Both share pair_accessor_sig (one i64 in, one i64 out).
+        let length_func = module
+            .declare_function(
+                "vm_length_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_length_gc: {e}")))?;
+        let list_p_func = module
+            .declare_function(
+                "vm_list_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_list_p_gc: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -639,6 +665,8 @@ impl Lowerer {
             string_p_func,
             string_eq_func,
             make_closure_func,
+            length_func,
+            list_p_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -856,6 +884,13 @@ impl Lowerer {
             let make_closure_fnref = self
                 .module
                 .declare_func_in_func(self.make_closure_func, builder.func);
+            // iter CA — list ops.
+            let length_fnref = self
+                .module
+                .declare_func_in_func(self.length_func, builder.func);
+            let list_p_fnref = self
+                .module
+                .declare_func_in_func(self.list_p_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -950,6 +985,8 @@ impl Lowerer {
                         string_p_fnref,
                         string_eq_fnref,
                         make_closure_fnref,
+                        length_fnref,
+                        list_p_fnref,
                         inst,
                     )?;
                 }
@@ -1146,6 +1183,8 @@ fn lower_inst(
     string_p_fnref: cranelift_codegen::ir::FuncRef,
     string_eq_fnref: cranelift_codegen::ir::FuncRef,
     make_closure_fnref: cranelift_codegen::ir::FuncRef,
+    length_fnref: cranelift_codegen::ir::FuncRef,
+    list_p_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -1907,6 +1946,41 @@ fn lower_inst(
                 results[0]
             };
             b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::Length(dst, lst) => {
+            // ADR 0012 D-2 (iter CA) — vm_length_gc consumes the
+            // operand and returns a raw Fixnum-shape spine count.
+            // No stack-map declaration (result is not a Gc handle).
+            let v_v = lookup(map, *lst)?;
+            let inst_ref = b.ins().call(length_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Length expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::ListP(dst, src) => {
+            // ADR 0012 D-2 (iter CA) — vm_list_p_gc consumes the
+            // operand; returns 0/1 (Boolean).
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(list_p_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "ListP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
             map.insert(*dst, result);
         }
         Inst::Call(_, _, _) | Inst::DeoptCheck(_, _) => {

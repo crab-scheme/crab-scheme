@@ -267,6 +267,18 @@ pub enum Inst {
     /// operands return 0 (no deopt — `eq?`-like behaviour).
     StrEq(Value, Value, Value),
 
+    /// `dst = length(lst)`. Lowers to `vm_length_gc`. `lst` is Any
+    /// (consumed). `dst` is Fixnum (raw spine count). On non-list
+    /// the helper requests a deopt; the JIT body returns 0 and the
+    /// dispatcher re-runs through the bytecode VM. ADR 0012 D-2
+    /// (iter CA).
+    Length(Value, Value),
+
+    /// `dst = list?(v)`. Lowers to `vm_list_p_gc`. `v` Any (consumed).
+    /// `dst` is Boolean (0/1). Total predicate — non-list inputs
+    /// return 0 with no deopt. ADR 0012 D-2 (iter CA).
+    ListP(Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a

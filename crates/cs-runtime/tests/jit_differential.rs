@@ -2336,3 +2336,77 @@ fn diff_jit_make_closure_in_body() {
         other => panic!("expected 13, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_length_walks_spine() {
+    // ADR 0012 D-2 (iter CA) — `(length lst)` lowers to vm_length_gc
+    // which walks the spine and returns a raw Fixnum count.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (len lst) (length lst))")
+        .unwrap();
+    // Warmup loop so `len` tiers up.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (len (list 1 2 3)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let r0 = rt.eval_str_via_vm("<diff>", "(len '())").unwrap();
+    let r1 = rt.eval_str_via_vm("<diff>", "(len (list 42))").unwrap();
+    let r5 = rt
+        .eval_str_via_vm("<diff>", "(len (list 1 2 3 4 5))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "len never dispatched through JIT (count={after})"
+    );
+    match (&r0, &r1, &r5) {
+        (
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(5)),
+        ) => {}
+        other => panic!("expected (0, 1, 5), got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_jit_list_pred() {
+    // ADR 0012 D-2 (iter CA) — `(list? v)` lowers to vm_list_p_gc.
+    // Returns 1 for '() and proper chains, 0 for improper lists and
+    // atoms. Total predicate — no deopt on non-list inputs.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (is-list? v) (if (list? v) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (is-list? (list 1 2)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let r_list = rt
+        .eval_str_via_vm("<diff>", "(is-list? (list 1 2 3))")
+        .unwrap();
+    let r_null = rt.eval_str_via_vm("<diff>", "(is-list? '())").unwrap();
+    let r_improper = rt
+        .eval_str_via_vm("<diff>", "(is-list? (cons 1 2))")
+        .unwrap();
+    let r_atom = rt.eval_str_via_vm("<diff>", "(is-list? 42)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "is-list? never dispatched through JIT (count={after})"
+    );
+    match (&r_list, &r_null, &r_improper, &r_atom) {
+        (
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (1, 1, 0, 0), got {:?}", other),
+    }
+}

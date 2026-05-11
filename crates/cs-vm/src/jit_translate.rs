@@ -878,6 +878,21 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::NullP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter CA) — list ops.
+                                    ("length", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::Length(dst, args[0]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
+                                    ("list?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::ListP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // ADR 0012 D-2 (iter BV) — vector ops.
                                     // make-vector requires the fill to be
                                     // Any. If the user passed a typed
@@ -1763,7 +1778,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::EqAny(dst, _, _)
                 | RirInst::VecP(dst, _)
                 | RirInst::StrP(dst, _)
-                | RirInst::StrEq(dst, _, _) => {
+                | RirInst::StrEq(dst, _, _)
+                | RirInst::ListP(dst, _) => {
                     bool_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {
