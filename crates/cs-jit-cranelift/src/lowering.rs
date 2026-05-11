@@ -203,6 +203,12 @@ pub struct Lowerer {
     /// FuncId of `vm_assv_gc(key, alist) -> i64`. eqv?-flavored assq.
     /// ADR 0012 D-2 (iter CG).
     assv_func: cranelift_module::FuncId,
+    /// FuncId of `vm_member_gc(item, lst) -> i64`. equal?-flavored memq.
+    /// ADR 0012 D-2 (iter CH).
+    member_func: cranelift_module::FuncId,
+    /// FuncId of `vm_assoc_gc(key, alist) -> i64`. equal?-flavored assq.
+    /// ADR 0012 D-2 (iter CH).
+    assoc_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -329,6 +335,9 @@ impl Lowerer {
         // ADR 0012 D-2 (iter CG) — memv / assv (eqv?-flavored search).
         builder.symbol("vm_memv_gc", cs_vm::vm::vm_memv_gc as *const u8);
         builder.symbol("vm_assv_gc", cs_vm::vm::vm_assv_gc as *const u8);
+        // ADR 0012 D-2 (iter CH) — member / assoc (equal?-flavored search).
+        builder.symbol("vm_member_gc", cs_vm::vm::vm_member_gc as *const u8);
+        builder.symbol("vm_assoc_gc", cs_vm::vm::vm_assoc_gc as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -724,6 +733,22 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_assv_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter CH) — vm_member_gc / vm_assoc_gc.
+        let member_func = module
+            .declare_function(
+                "vm_member_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_member_gc: {e}")))?;
+        let assoc_func = module
+            .declare_function(
+                "vm_assoc_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_assoc_gc: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -770,6 +795,8 @@ impl Lowerer {
             set_cdr_func,
             memv_func,
             assv_func,
+            member_func,
+            assoc_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -1020,6 +1047,13 @@ impl Lowerer {
             let assv_fnref = self
                 .module
                 .declare_func_in_func(self.assv_func, builder.func);
+            // iter CH — member / assoc.
+            let member_fnref = self
+                .module
+                .declare_func_in_func(self.member_func, builder.func);
+            let assoc_fnref = self
+                .module
+                .declare_func_in_func(self.assoc_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -1123,6 +1157,8 @@ impl Lowerer {
                         set_cdr_fnref,
                         memv_fnref,
                         assv_fnref,
+                        member_fnref,
+                        assoc_fnref,
                         inst,
                     )?;
                 }
@@ -1328,6 +1364,8 @@ fn lower_inst(
     set_cdr_fnref: cranelift_codegen::ir::FuncRef,
     memv_fnref: cranelift_codegen::ir::FuncRef,
     assv_fnref: cranelift_codegen::ir::FuncRef,
+    member_fnref: cranelift_codegen::ir::FuncRef,
+    assoc_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -2251,6 +2289,42 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "Assv expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::Member(dst, item, lst) => {
+            // ADR 0012 D-2 (iter CH) — vm_member_gc; equal?-flavored.
+            let item_v = lookup(map, *item)?;
+            let lst_v = lookup(map, *lst)?;
+            let inst_ref = b.ins().call(member_fnref, &[item_v, lst_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Member expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::Assoc(dst, key, alist) => {
+            // ADR 0012 D-2 (iter CH) — vm_assoc_gc; equal?-flavored.
+            let key_v = lookup(map, *key)?;
+            let alist_v = lookup(map, *alist)?;
+            let inst_ref = b.ins().call(assoc_fnref, &[key_v, alist_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Assoc expected 1 result, got {}",
                         results.len()
                     )));
                 }

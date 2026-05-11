@@ -314,6 +314,14 @@ pub enum Inst {
     /// `vm_assv_gc`. ADR 0012 D-2 (iter CG).
     Assv(Value, Value, Value),
 
+    /// `dst = member(item, lst)`. equal?-flavored memq. Lowers to
+    /// `vm_member_gc`. ADR 0012 D-2 (iter CH).
+    Member(Value, Value, Value),
+
+    /// `dst = assoc(key, alist)`. equal?-flavored assq. Lowers to
+    /// `vm_assoc_gc`. ADR 0012 D-2 (iter CH).
+    Assoc(Value, Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a

@@ -2675,3 +2675,73 @@ fn diff_jit_memv_assv_eqv_search() {
         other => panic!("expected (2, #f, Symbol(b), #f), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_member_assoc_equal_search() {
+    // ADR 0012 D-2 (iter CH) — member / assoc use cs_core::eq::equal
+    // (structural deep equality). Distinguish from memv/assv by
+    // matching structurally identical but distinct allocations
+    // (e.g. two `(list 1 2)` instances): eqv? returns #f (different
+    // identity), equal? returns #t.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (m item lst) (member item lst))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (a key al) (assoc key al))")
+        .unwrap();
+    // Warmup with a structural-match pattern.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (m (list 1 2) (list (list 1 2) (list 3 4))) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (a (list 1 2) (list (cons (list 1 2) 'x) (cons (list 3 4) 'y))) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // member: structurally equal needle (list 1 2) matches the
+    // first element. Take its car (a list) and length → 2.
+    let m_hit_len = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(length (car (m (list 1 2) (list (list 1 2) (list 3 4)))))",
+        )
+        .unwrap();
+    let m_miss = rt
+        .eval_str_via_vm("<diff>", "(m (list 9 9) (list (list 1 2) (list 3 4)))")
+        .unwrap();
+    // assoc: structurally equal key (list 1 2) matches the first
+    // entry. Take its cdr → 'x.
+    let a_hit = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(cdr (a (list 1 2) (list (cons (list 1 2) 'x) (cons (list 3 4) 'y))))",
+        )
+        .unwrap();
+    let a_miss = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(a (list 9 9) (list (cons (list 1 2) 'x) (cons (list 3 4) 'y)))",
+        )
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "member/assoc never dispatched through JIT (count={after})"
+    );
+    match (&m_hit_len, &m_miss, &a_hit, &a_miss) {
+        (
+            Value::Number(cs_core::Number::Fixnum(2)),
+            Value::Boolean(false),
+            Value::Symbol(_),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (2, #f, Symbol(x), #f), got {:?}", other),
+    }
+}

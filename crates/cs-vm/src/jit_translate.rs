@@ -1004,6 +1004,58 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::Assv(dst, key, args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter CH) — member / assoc,
+                                    // the equal?-flavored variants. Same
+                                    // BoxTyped dance on the search key.
+                                    // Only the 2-arg form; the optional
+                                    // 3-arg (user-supplied equiv proc) is
+                                    // out of scope for this iter.
+                                    ("member", 2)
+                                        if value_types.get(&args[1]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        let item_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let item = if item_t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(item_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::Member(dst, item, args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("assoc", 2)
+                                        if value_types.get(&args[1]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        let key_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let key = if key_t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(key_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::Assoc(dst, key, args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter CE) — pair mutation.
                                     // Pair arg must be Any; value arg gets
                                     // BoxTyped if it's a typed immediate.
@@ -2036,7 +2088,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::SetCar(dst, _, _)
                 | RirInst::SetCdr(dst, _, _)
                 | RirInst::Memv(dst, _, _)
-                | RirInst::Assv(dst, _, _) => {
+                | RirInst::Assv(dst, _, _)
+                | RirInst::Member(dst, _, _)
+                | RirInst::Assoc(dst, _, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

@@ -784,6 +784,64 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
     }
 }
 
+/// `(member item lst)` — equal?-flavored memq. Uses
+/// `cs_core::eq::equal` (R6RS structural equality with cycle
+/// detection) for the per-element comparison. Returns the
+/// matched sublist or `#f`. Consume-on-use for both args.
+/// ADR 0012 D-2 (iter CH).
+///
+/// # Safety
+///
+/// Both `item` and `lst` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_member_gc(item: i64, lst: i64) -> i64 {
+    let needle = unsafe { gc_i64_to_value(item) };
+    let v = unsafe { gc_i64_to_value(lst) };
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                if cs_core::eq::equal(&needle, &car) {
+                    return value_to_gc_i64(Value::Pair(p.clone()));
+                }
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            _ => return value_to_gc_i64(Value::Boolean(false)),
+        }
+    }
+}
+
+/// `(assoc key alist)` — equal?-flavored assq. ADR 0012 D-2
+/// (iter CH).
+///
+/// # Safety
+///
+/// Both `key` and `alist` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_assoc_gc(key: i64, alist: i64) -> i64 {
+    let needle = unsafe { gc_i64_to_value(key) };
+    let v = unsafe { gc_i64_to_value(alist) };
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let entry = p.car.borrow().clone();
+                if let Value::Pair(ep) = &entry {
+                    let entry_key = ep.car.borrow().clone();
+                    if cs_core::eq::equal(&needle, &entry_key) {
+                        return value_to_gc_i64(entry);
+                    }
+                }
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            _ => return value_to_gc_i64(Value::Boolean(false)),
+        }
+    }
+}
+
 /// `(memv item lst)` — eqv?-flavored memq. Walks the spine
 /// comparing each car against `item` with `cs_core::eq::eqv`,
 /// which extends `eq?` with by-value comparison for numbers and
