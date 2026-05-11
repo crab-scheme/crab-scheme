@@ -707,6 +707,16 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter EN).
     IotaN(Value, Value),
 
+    /// `dst = last-pair(lst)`. Lowers to `vm_last_pair_gc`. Arg
+    /// Any-shape (consumed); `dst` is Any (Gc handle to the last
+    /// pair). ADR 0012 D-2 (iter EO).
+    LastPair(Value, Value),
+
+    /// `dst = last(lst)`. Lowers to `vm_last_gc`. Arg Any-shape
+    /// (consumed); `dst` is Any (last element of the proper list).
+    /// ADR 0012 D-2 (iter EO).
+    Last(Value, Value),
+
     /// `dst = srem(lhs, rhs)`. R6RS `remainder` for fixnums.
     Remainder(Value, Value, Value),
 

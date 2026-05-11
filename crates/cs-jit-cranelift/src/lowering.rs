@@ -411,6 +411,10 @@ pub struct Lowerer {
     make_list_fill_func: cranelift_module::FuncId,
     /// FuncId of `vm_iota_n_gc(n) -> i64`. ADR 0012 D-2 (iter EN).
     iota_n_func: cranelift_module::FuncId,
+    /// FuncId of `vm_last_pair_gc(lst) -> i64`. ADR 0012 D-2 (iter EO).
+    last_pair_func: cranelift_module::FuncId,
+    /// FuncId of `vm_last_gc(lst) -> i64`. ADR 0012 D-2 (iter EO).
+    last_func: cranelift_module::FuncId,
     /// FuncId of `vm_symbol_to_string_gc(sym) -> i64`. ADR 0012 D-2
     /// (iter CY).
     symbol_to_string_func: cranelift_module::FuncId,
@@ -776,6 +780,9 @@ impl Lowerer {
         );
         // ADR 0012 D-2 (iter EN) — iota 1-arg.
         builder.symbol("vm_iota_n_gc", cs_vm::vm::vm_iota_n_gc as *const u8);
+        // ADR 0012 D-2 (iter EO) — last-pair / last.
+        builder.symbol("vm_last_pair_gc", cs_vm::vm::vm_last_pair_gc as *const u8);
+        builder.symbol("vm_last_gc", cs_vm::vm::vm_last_gc as *const u8);
         // ADR 0012 D-2 (iter CX) — string<->list.
         builder.symbol(
             "vm_string_to_list_gc",
@@ -1879,6 +1886,22 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_iota_n_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter EO) — vm_last_pair_gc / vm_last_gc.
+        let last_pair_func = module
+            .declare_function(
+                "vm_last_pair_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_last_pair_gc: {e}")))?;
+        let last_func = module
+            .declare_function(
+                "vm_last_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_last_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter CY) — vm_symbol_to_string_gc / vm_string_to_symbol_gc.
         let symbol_to_string_func = module
             .declare_function(
@@ -2023,6 +2046,8 @@ impl Lowerer {
             string_reverse_func,
             make_list_fill_func,
             iota_n_func,
+            last_pair_func,
+            last_func,
             symbol_to_string_func,
             string_to_symbol_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
@@ -2550,6 +2575,13 @@ impl Lowerer {
             let iota_n_fnref = self
                 .module
                 .declare_func_in_func(self.iota_n_func, builder.func);
+            // iter EO — last-pair / last.
+            let last_pair_fnref = self
+                .module
+                .declare_func_in_func(self.last_pair_func, builder.func);
+            let last_fnref = self
+                .module
+                .declare_func_in_func(self.last_func, builder.func);
             // iter CY — symbol<->string.
             let symbol_to_string_fnref = self
                 .module
@@ -2738,6 +2770,8 @@ impl Lowerer {
                         string_reverse_fnref,
                         make_list_fill_fnref,
                         iota_n_fnref,
+                        last_pair_fnref,
+                        last_fnref,
                         symbol_to_string_fnref,
                         string_to_symbol_fnref,
                         inst,
@@ -3023,6 +3057,8 @@ fn lower_inst(
     string_reverse_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
+    last_pair_fnref: cranelift_codegen::ir::FuncRef,
+    last_fnref: cranelift_codegen::ir::FuncRef,
     symbol_to_string_fnref: cranelift_codegen::ir::FuncRef,
     string_to_symbol_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
@@ -5376,6 +5412,28 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "IotaN expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::LastPair(dst, src) | Inst::Last(dst, src) => {
+            // ADR 0012 D-2 (iter EO) — last-pair / last.
+            let v_v = lookup(map, *src)?;
+            let fnref = match inst {
+                Inst::LastPair(..) => last_pair_fnref,
+                Inst::Last(..) => last_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "LastPair/Last expected 1 result, got {}",
                         results.len()
                     )));
                 }

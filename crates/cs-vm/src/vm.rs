@@ -2912,6 +2912,70 @@ pub unsafe extern "C" fn vm_string_to_number_gc(s: i64) -> i64 {
     }
 }
 
+/// `(last-pair lst)` — walk `lst` returning the final pair (i.e.
+/// the pair whose cdr is the list's terminator). Consumes the
+/// input Gc handle. On an empty list or improper structure that
+/// doesn't reach a pair, requests a deopt and returns Null.
+/// ADR 0012 D-2 (iter EO).
+///
+/// # Safety
+///
+/// `lst` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_last_pair_gc(lst: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(lst) };
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let cdr = p.cdr.borrow().clone();
+                if !matches!(cdr, Value::Pair(_)) {
+                    return value_to_gc_i64(Value::Pair(p));
+                }
+                cur = cdr;
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+}
+
+/// `(last lst)` — return the car of the final pair (the last
+/// element of a proper list). Consumes the input Gc handle. On an
+/// empty list, requests a deopt and returns Null. ADR 0012 D-2
+/// (iter EO).
+///
+/// # Safety
+///
+/// `lst` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_last_gc(lst: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(lst) };
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let cdr = p.cdr.borrow().clone();
+                if matches!(cdr, Value::Null) {
+                    return value_to_gc_i64(p.car.borrow().clone());
+                }
+                if !matches!(cdr, Value::Pair(_)) {
+                    // Improper tail — deopt and let the VM raise.
+                    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                    return value_to_gc_i64(Value::Null);
+                }
+                cur = cdr;
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+}
+
 /// `(iota n)` — 1-arg form. Returns `(0 1 ... n-1)` as a fresh
 /// list of Fixnums. `n` is a raw Fixnum-shape i64. Returns Null
 /// for n=0. On negative n, requests a deopt and returns Null.

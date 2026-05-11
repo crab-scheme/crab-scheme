@@ -5238,3 +5238,41 @@ fn diff_jit_iota_1arg() {
         other => panic!("expected (pair, null, 10, 9), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_last_pair_and_last() {
+    // ADR 0012 D-2 (iter EO) — last-pair and last walk to the end
+    // of a proper list.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (lp x) (last-pair x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (la x) (last x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (lp '(1 2 3)) (la '(1 2 3)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let lp = rt.eval_str_via_vm("<diff>", "(lp '(10 20 30))").unwrap();
+    let lp_car = rt
+        .eval_str_via_vm("<diff>", "(car (lp '(10 20 30)))")
+        .unwrap();
+    let la = rt.eval_str_via_vm("<diff>", "(la '(10 20 30))").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "last-pair/last never dispatched through JIT (count={after})"
+    );
+    match (&lp, &lp_car, &la) {
+        (
+            Value::Pair(_),
+            Value::Number(cs_core::Number::Fixnum(30)),
+            Value::Number(cs_core::Number::Fixnum(30)),
+        ) => {}
+        other => panic!("expected (pair, 30, 30), got {:?}", other),
+    }
+}
