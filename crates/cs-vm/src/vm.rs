@@ -168,6 +168,14 @@ thread_local! {
     /// (below) which reads from this. Per-thread because the
     /// runtime is single-threaded.
     static JIT_CALLER_ENV: Cell<*const Env> = const { Cell::new(std::ptr::null()) };
+
+    /// Pointer to the current closure's `Rc<Bytecode>`, set by
+    /// `try_dispatch_jit` for the duration of a JIT call. Read by
+    /// `vm_make_closure` (iter BZ) so a nested-lambda site inside
+    /// a JIT body can build a `VmClosure` whose `bc` matches the
+    /// enclosing bytecode (i.e. the same `Rc<Bytecode>` instance,
+    /// so `lambda_idx` continues to resolve).
+    static JIT_CALLER_BC: Cell<*const Bytecode> = const { Cell::new(std::ptr::null()) };
 }
 
 /// RAII helper: set `JIT_CALLER_ENV` for the duration of a JIT
@@ -187,6 +195,28 @@ impl JitEnvGuard {
 impl Drop for JitEnvGuard {
     fn drop(&mut self) {
         JIT_CALLER_ENV.with(|c| c.set(self.prev));
+    }
+}
+
+/// RAII helper: set `JIT_CALLER_BC` for the duration of a JIT
+/// call, restore on drop. Mirrors `JitEnvGuard`; the bytecode is
+/// the second piece of context `vm_make_closure` (iter BZ) needs
+/// to reconstitute a `VmClosure` for a nested lambda.
+struct JitBcGuard {
+    prev: *const Bytecode,
+}
+
+impl JitBcGuard {
+    fn install(bc: &Rc<Bytecode>) -> Self {
+        let prev = JIT_CALLER_BC.with(|c| c.get());
+        JIT_CALLER_BC.with(|c| c.set(Rc::as_ptr(bc)));
+        Self { prev }
+    }
+}
+
+impl Drop for JitBcGuard {
+    fn drop(&mut self) {
+        JIT_CALLER_BC.with(|c| c.set(self.prev));
     }
 }
 
@@ -1343,6 +1373,67 @@ pub unsafe extern "C" fn vm_closure_id_peek(callee: i64) -> u32 {
     id
 }
 
+/// `vm_make_closure(lambda_idx)` — JIT helper that builds a fresh
+/// `VmClosure` for a nested-lambda site, mirroring the
+/// `Inst::MakeClosure` arm of `run_dispatch`. Reads the enclosing
+/// closure's `env` and `bc` from the JIT thread-locals
+/// (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) set by `try_dispatch_jit`.
+/// Returns a fresh `Gc<Value>` raw handle (refcount = 1) carrying
+/// a `Value::Procedure` whose underlying `VmClosure` matches what
+/// the bytecode-tier `Inst::MakeClosure` would have built.
+///
+/// ADR 0012 D-2 (iter BZ).
+///
+/// # Safety
+///
+/// Both `JIT_CALLER_ENV` and `JIT_CALLER_BC` must be set by the
+/// runtime dispatch site for the duration of the JIT call.
+#[no_mangle]
+pub unsafe extern "C" fn vm_make_closure(lambda_idx: i64) -> i64 {
+    let env_ptr = JIT_CALLER_ENV.with(|c| c.get());
+    let bc_ptr = JIT_CALLER_BC.with(|c| c.get());
+    if env_ptr.is_null() || bc_ptr.is_null() {
+        // Without env+bc context we can't build a faithful closure.
+        // Request deopt; the bytecode VM will re-run the MakeClosure
+        // op with its real frame state. Return 0 placeholder.
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return 0;
+    }
+    // Clone the enclosing closure's env Rc without disturbing its
+    // count (same trick as vm_env_set_fixnum): rebuild an Rc from
+    // the raw pointer, clone (bumps count by 1), and forget the
+    // rebuilt one so the original count is preserved.
+    let env_rc: Rc<Env> = unsafe {
+        let raw_rc = Rc::from_raw(env_ptr);
+        let cloned = raw_rc.clone();
+        std::mem::forget(raw_rc);
+        cloned
+    };
+    let bc_rc: Rc<Bytecode> = unsafe {
+        let raw_rc = Rc::from_raw(bc_ptr);
+        let cloned = raw_rc.clone();
+        std::mem::forget(raw_rc);
+        cloned
+    };
+    let cl = VmClosure {
+        lambda_idx: lambda_idx as usize,
+        env: env_rc,
+        bc: bc_rc,
+        tier: cs_jit::Tier::default(),
+        jit_ptr: Cell::new(std::ptr::null()),
+        jit_arity: Cell::new(0),
+        self_name: Cell::new(None),
+        jit_return_type: Cell::new(JIT_RT_FIXNUM),
+        jit_param_types: Cell::new(JIT_PARAM_TYPES_ALL_FIXNUM),
+        jit_deopt_count: Cell::new(0),
+        jit_call_count: Cell::new(0),
+        jit_stack_maps: std::cell::RefCell::new(None),
+        closure_id: alloc_closure_id(),
+    };
+    let p: Rc<dyn Procedure> = Rc::new(cl);
+    value_to_gc_i64(Value::Procedure(p))
+}
+
 /// Read the per-thread JIT-dispatch count. Test/diagnostics only.
 pub fn jit_call_count() -> u64 {
     VM_JIT_CALL_COUNT.with(|c| c.get())
@@ -1425,6 +1516,11 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value], syms: &mut SymbolTable)
     // guard restores the previous value (or null) on drop, even
     // on panic from inside the JIT body.
     let _env_guard = JitEnvGuard::install(&closure.env);
+    // Install the closure's bytecode in the JIT thread-local so
+    // `vm_make_closure` (iter BZ) can build a `VmClosure` for a
+    // nested-lambda site using the same `Rc<Bytecode>` the
+    // enclosing closure was compiled against.
+    let _bc_guard = JitBcGuard::install(&closure.bc);
     // ADR 0012 D-2 (iter BN) — register this closure's stack-map
     // registry on the per-thread active-frames list so the GC can
     // see its Gc<Value> roots if `collect()` fires during the

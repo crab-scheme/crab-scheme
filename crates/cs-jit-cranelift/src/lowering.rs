@@ -173,6 +173,9 @@ pub struct Lowerer {
     string_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_eq_gc(a, b) -> i64`. Returns 0/1.
     string_eq_func: cranelift_module::FuncId,
+    /// FuncId of `vm_make_closure(lambda_idx) -> i64`. Returns a
+    /// fresh `Gc<Value::Procedure>` raw handle. ADR 0012 D-2 (iter BZ).
+    make_closure_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -282,6 +285,8 @@ impl Lowerer {
         );
         builder.symbol("vm_string_p_gc", cs_vm::vm::vm_string_p_gc as *const u8);
         builder.symbol("vm_string_eq_gc", cs_vm::vm::vm_string_eq_gc as *const u8);
+        // ADR 0012 D-2 (iter BZ) — lambda creation in JIT bodies.
+        builder.symbol("vm_make_closure", cs_vm::vm::vm_make_closure as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -587,6 +592,16 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_string_eq_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter BZ) — vm_make_closure(lambda_idx: i64) -> i64.
+        // Same shape as pair_accessor_sig (one i64 in, one i64 out).
+        let make_closure_func = module
+            .declare_function(
+                "vm_make_closure",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_make_closure: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -623,6 +638,7 @@ impl Lowerer {
             string_length_func,
             string_p_func,
             string_eq_func,
+            make_closure_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -836,6 +852,10 @@ impl Lowerer {
             let string_eq_fnref = self
                 .module
                 .declare_func_in_func(self.string_eq_func, builder.func);
+            // iter BZ — lambda creation.
+            let make_closure_fnref = self
+                .module
+                .declare_func_in_func(self.make_closure_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -929,6 +949,7 @@ impl Lowerer {
                         string_length_fnref,
                         string_p_fnref,
                         string_eq_fnref,
+                        make_closure_fnref,
                         inst,
                     )?;
                 }
@@ -1124,6 +1145,7 @@ fn lower_inst(
     string_length_fnref: cranelift_codegen::ir::FuncRef,
     string_p_fnref: cranelift_codegen::ir::FuncRef,
     string_eq_fnref: cranelift_codegen::ir::FuncRef,
+    make_closure_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -1862,6 +1884,29 @@ fn lower_inst(
                 }
                 results[0]
             };
+            map.insert(*dst, result);
+        }
+        Inst::MakeClosure(dst, lambda_idx) => {
+            // ADR 0012 D-2 (iter BZ) — emit a call to
+            // `vm_make_closure(lambda_idx)`. The helper reads the
+            // enclosing closure's env+bc from JIT TLS, builds a
+            // VmClosure, and returns a fresh Gc<Value::Procedure>
+            // raw handle (refcount = 1). Mark the result as
+            // stack-map-tracked so it spills correctly across
+            // subsequent calls.
+            let idx_v = b.ins().iconst(I64, *lambda_idx as i64);
+            let inst_ref = b.ins().call(make_closure_fnref, &[idx_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "MakeClosure expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
         Inst::Call(_, _, _) | Inst::DeoptCheck(_, _) => {

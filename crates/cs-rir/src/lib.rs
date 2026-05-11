@@ -267,6 +267,15 @@ pub enum Inst {
     /// operands return 0 (no deopt — `eq?`-like behaviour).
     StrEq(Value, Value, Value),
 
+    /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
+    /// The helper reads the enclosing closure's env and bc from the
+    /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a
+    /// nested-lambda site inside a JIT body builds a `VmClosure`
+    /// equivalent to what the bytecode-tier `Inst::MakeClosure`
+    /// would produce. `dst` is Any (fresh Gc<Value::Procedure>).
+    /// ADR 0012 D-2 (iter BZ).
+    MakeClosure(Value, u32),
+
     /// `dst = sdiv(lhs, rhs)`. R6RS `quotient` for fixnums.
     /// Cranelift native sdiv (signed integer divide). Divide-by-
     /// zero traps; the JIT body propagates the trap as a panic

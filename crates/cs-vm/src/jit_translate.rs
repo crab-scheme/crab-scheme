@@ -279,6 +279,19 @@ pub fn bytecode_to_rir_with_hints(
                 Inst::Pop => {
                     pop_value(&mut sim_stack)?;
                 }
+                Inst::MakeClosure(idx) => {
+                    // ADR 0012 D-2 (iter BZ) — emit a runtime call to
+                    // `vm_make_closure(lambda_idx)`. The helper reads
+                    // env+bc from JIT TLS (installed by
+                    // `try_dispatch_jit`) and builds a fresh
+                    // `VmClosure` matching the bytecode-tier
+                    // `Inst::MakeClosure`. The result is an Any-typed
+                    // Gc<Value::Procedure> handle.
+                    let dst = alloc();
+                    insts.push(RirInst::MakeClosure(dst, *idx as u32));
+                    value_types.insert(dst, Type::Any);
+                    sim_stack.push(StackEntry::Value(dst));
+                }
                 Inst::SetVar(sym) => {
                     // SetVar pops one value and stores it into the
                     // binding for `sym`. After SetVar, the cs-vm
@@ -1800,7 +1813,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VecAlloc(dst, _, _)
                 | RirInst::VecRef(dst, _, _)
                 | RirInst::VecSet(dst, _, _, _)
-                | RirInst::StrAlloc(dst, _, _) => {
+                | RirInst::StrAlloc(dst, _, _)
+                | RirInst::MakeClosure(dst, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

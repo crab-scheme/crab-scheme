@@ -2286,3 +2286,53 @@ fn diff_jit_string_pred() {
         other => panic!("expected (1, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_make_closure_in_body() {
+    // ADR 0012 D-2 (iter BZ) — Inst::MakeClosure now lowers to a
+    // `vm_make_closure` runtime call inside JIT bodies. Before BZ,
+    // a body containing `(lambda ...)` would deopt at translate
+    // time (Unsupported opcode); after BZ, the outer function
+    // tiers up and the inner lambda is constructed on the hot path
+    // and returned as an Any-typed Gc handle.
+    //
+    // Scope note (iter BZ MVP): the constructed inner closure's
+    // env is the *outer closure's* captured env (read from
+    // JIT_CALLER_ENV). Free vars resolvable through that chain
+    // (globals, parent lexical scope) work; free vars that name
+    // the outer fn's *parameters* do not, because in the JIT path
+    // params live in registers/i64 lanes, not in Env. A later iter
+    // can extend MakeClosure to box param bindings into a fresh
+    // Env::child first. This test closes over a global so it
+    // stays inside the supported envelope.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define base 10)").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mk) (lambda (x) (+ base x)))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (call-it f a) (f a))")
+        .unwrap();
+    // Warm up `mk` so it JITs (Any-returning fn — tiers up after
+    // the JIT threshold).
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (mk) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // Now construct a fresh closure via the JIT path and call it.
+    // The constructed closure isn't itself JIT-compiled, so the
+    // call routes through bytecode dispatch — which is fine; we
+    // just need the MakeClosure call to succeed and the resulting
+    // closure to look up `base` through its (cloned) env chain.
+    let result = rt.eval_str_via_vm("<diff>", "(call-it (mk) 3)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 1,
+        "mk never dispatched through JIT (count={after})"
+    );
+    match &result {
+        Value::Number(cs_core::Number::Fixnum(13)) => {}
+        other => panic!("expected 13, got {:?}", other),
+    }
+}
