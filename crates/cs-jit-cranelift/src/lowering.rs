@@ -406,6 +406,12 @@ pub struct Lowerer {
     /// FuncId of `vm_string_reverse_gc(s) -> i64`. ADR 0012 D-2
     /// (iter EJ).
     string_reverse_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_upcase_gc(s) -> i64`. ADR 0012 D-2 (iter ET).
+    string_upcase_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_downcase_gc(s) -> i64`. ADR 0012 D-2 (iter ET).
+    string_downcase_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_foldcase_gc(s) -> i64`. ADR 0012 D-2 (iter ET).
+    string_foldcase_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_list_fill_gc(n, fill) -> i64`. ADR 0012
     /// D-2 (iter EM).
     make_list_fill_func: cranelift_module::FuncId,
@@ -781,6 +787,19 @@ impl Lowerer {
         builder.symbol(
             "vm_string_reverse_gc",
             cs_vm::vm::vm_string_reverse_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter ET) — string case conversion.
+        builder.symbol(
+            "vm_string_upcase_gc",
+            cs_vm::vm::vm_string_upcase_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_downcase_gc",
+            cs_vm::vm::vm_string_downcase_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_foldcase_gc",
+            cs_vm::vm::vm_string_foldcase_gc as *const u8,
         );
         // ADR 0012 D-2 (iter EM) — make-list 2-arg.
         builder.symbol(
@@ -1888,6 +1907,33 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_string_reverse_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter ET) — string case conversion.
+        let string_upcase_func = module
+            .declare_function(
+                "vm_string_upcase_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_upcase_gc: {e}")))?;
+        let string_downcase_func = module
+            .declare_function(
+                "vm_string_downcase_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_downcase_gc: {e}"))
+            })?;
+        let string_foldcase_func = module
+            .declare_function(
+                "vm_string_foldcase_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_foldcase_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter EM) — vm_make_list_fill_gc(n, fill) -> i64.
         // Same shape as vector_ref_sig (two i64 in, one out).
         let make_list_fill_func = module
@@ -2098,6 +2144,9 @@ impl Lowerer {
             number_to_string_func,
             string_to_number_func,
             string_reverse_func,
+            string_upcase_func,
+            string_downcase_func,
+            string_foldcase_func,
             make_list_fill_func,
             iota_n_func,
             last_pair_func,
@@ -2624,6 +2673,16 @@ impl Lowerer {
             let string_reverse_fnref = self
                 .module
                 .declare_func_in_func(self.string_reverse_func, builder.func);
+            // iter ET — string case conversion.
+            let string_upcase_fnref = self
+                .module
+                .declare_func_in_func(self.string_upcase_func, builder.func);
+            let string_downcase_fnref = self
+                .module
+                .declare_func_in_func(self.string_downcase_func, builder.func);
+            let string_foldcase_fnref = self
+                .module
+                .declare_func_in_func(self.string_foldcase_func, builder.func);
             // iter EM — make-list 2-arg.
             let make_list_fill_fnref = self
                 .module
@@ -2836,6 +2895,9 @@ impl Lowerer {
                         number_to_string_fnref,
                         string_to_number_fnref,
                         string_reverse_fnref,
+                        string_upcase_fnref,
+                        string_downcase_fnref,
+                        string_foldcase_fnref,
                         make_list_fill_fnref,
                         iota_n_fnref,
                         last_pair_fnref,
@@ -3126,6 +3188,9 @@ fn lower_inst(
     number_to_string_fnref: cranelift_codegen::ir::FuncRef,
     string_to_number_fnref: cranelift_codegen::ir::FuncRef,
     string_reverse_fnref: cranelift_codegen::ir::FuncRef,
+    string_upcase_fnref: cranelift_codegen::ir::FuncRef,
+    string_downcase_fnref: cranelift_codegen::ir::FuncRef,
+    string_foldcase_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
     last_pair_fnref: cranelift_codegen::ir::FuncRef,
@@ -5442,15 +5507,25 @@ fn lower_inst(
             b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
-        Inst::StringReverse(dst, src) => {
-            // ADR 0012 D-2 (iter EJ) — vm_string_reverse_gc.
+        Inst::StringReverse(dst, src)
+        | Inst::StringUpcase(dst, src)
+        | Inst::StringDowncase(dst, src)
+        | Inst::StringFoldcase(dst, src) => {
+            // ADR 0012 D-2 (iter EJ / ET) — string transform family.
             let v_v = lookup(map, *src)?;
-            let inst_ref = b.ins().call(string_reverse_fnref, &[v_v]);
+            let fnref = match inst {
+                Inst::StringReverse(..) => string_reverse_fnref,
+                Inst::StringUpcase(..) => string_upcase_fnref,
+                Inst::StringDowncase(..) => string_downcase_fnref,
+                Inst::StringFoldcase(..) => string_foldcase_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[v_v]);
             let result = {
                 let results = b.inst_results(inst_ref);
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
-                        "StringReverse expected 1 result, got {}",
+                        "String transform expected 1 result, got {}",
                         results.len()
                     )));
                 }

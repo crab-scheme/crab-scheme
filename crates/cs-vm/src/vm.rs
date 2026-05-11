@@ -3152,6 +3152,77 @@ pub unsafe extern "C" fn vm_make_list_fill_gc(n: i64, fill: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(string-upcase s)` — return a fresh uppercased string.
+/// ADR 0012 D-2 (iter ET).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_upcase_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            let up = sg.borrow().to_uppercase();
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(up))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
+/// `(string-downcase s)` — return a fresh lowercased string.
+/// ADR 0012 D-2 (iter ET).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_downcase_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            let down = sg.borrow().to_lowercase();
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(down))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
+/// `(string-foldcase s)` — return a fresh case-folded (lowercase
+/// via Unicode case-folding) string. For our purposes equivalent
+/// to to_lowercase since Rust's standard library uses simple
+/// case-folding. ADR 0012 D-2 (iter ET).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_foldcase_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            let fold: String = sg.borrow().chars().flat_map(|c| c.to_lowercase()).collect();
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(fold))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
 /// `(string-reverse s)` — return a fresh string whose characters
 /// are those of `s` in reverse order. Consumes the input Gc
 /// handle. On non-string input, requests a deopt and returns an

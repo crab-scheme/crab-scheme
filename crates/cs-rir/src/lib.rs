@@ -696,6 +696,15 @@ pub enum Inst {
     /// Gc<Value::String>). ADR 0012 D-2 (iter EJ).
     StringReverse(Value, Value),
 
+    /// `dst = string-upcase(s)`. ADR 0012 D-2 (iter ET).
+    StringUpcase(Value, Value),
+
+    /// `dst = string-downcase(s)`. ADR 0012 D-2 (iter ET).
+    StringDowncase(Value, Value),
+
+    /// `dst = string-foldcase(s)`. ADR 0012 D-2 (iter ET).
+    StringFoldcase(Value, Value),
+
     /// `dst = make-list(n, fill)`. Lowers to `vm_make_list_fill_gc`.
     /// `n` Fixnum-shape (raw i64). `fill` Any-shape (consumed).
     /// `dst` is Any (fresh Gc handle to a Null-terminated list).

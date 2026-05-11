@@ -5448,3 +5448,41 @@ fn diff_jit_bytevector_string_copy_bang() {
         other => panic!("expected string, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_case_conversion() {
+    // ADR 0012 D-2 (iter ET) — string-upcase / string-downcase /
+    // string-foldcase.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (up s) (string-upcase s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (dn s) (string-downcase s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fc s) (string-foldcase s))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (up \"abc\") (dn \"ABC\") (fc \"AbC\") (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let u = rt
+        .eval_str_via_vm("<diff>", "(up \"Hello World\")")
+        .unwrap();
+    let d = rt
+        .eval_str_via_vm("<diff>", "(dn \"Hello WORLD\")")
+        .unwrap();
+    let f = rt.eval_str_via_vm("<diff>", "(fc \"FoldME\")").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&u, &d, &f) {
+        (Value::String(a), Value::String(b), Value::String(c)) => {
+            assert_eq!(&*a.borrow(), "HELLO WORLD");
+            assert_eq!(&*b.borrow(), "hello world");
+            assert_eq!(&*c.borrow(), "foldme");
+        }
+        other => panic!("expected three strings, got {:?}", other),
+    }
+}
