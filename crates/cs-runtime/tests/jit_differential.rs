@@ -5860,3 +5860,39 @@ fn diff_jit_iota_2arg() {
         other => panic!("expected (pair, 100, 103, null), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_iota_3arg() {
+    // ADR 0012 D-2 (iter FD) — (iota count start step) 3-arg.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (io3 c s st) (iota c s st))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (io3 4 0 2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let l = rt.eval_str_via_vm("<diff>", "(io3 5 10 3)").unwrap();
+    let first = rt.eval_str_via_vm("<diff>", "(car (io3 5 10 3))").unwrap();
+    let last = rt
+        .eval_str_via_vm("<diff>", "(list-ref (io3 5 10 3) 4)")
+        .unwrap();
+    // Negative step: (io3 3 100 -10) → (100 90 80)
+    let neg = rt
+        .eval_str_via_vm("<diff>", "(list-ref (io3 3 100 -10) 2)")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&l, &first, &last, &neg) {
+        (
+            Value::Pair(_),
+            Value::Number(cs_core::Number::Fixnum(10)),
+            Value::Number(cs_core::Number::Fixnum(22)),
+            Value::Number(cs_core::Number::Fixnum(80)),
+        ) => {}
+        other => panic!("expected (pair, 10, 22, 80), got {:?}", other),
+    }
+}

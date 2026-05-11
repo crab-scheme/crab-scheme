@@ -425,6 +425,8 @@ pub struct Lowerer {
     iota_n_func: cranelift_module::FuncId,
     /// FuncId of `vm_iota_ns_gc(count, start) -> i64`. ADR 0012 D-2 (iter FC).
     iota_ns_func: cranelift_module::FuncId,
+    /// FuncId of `vm_iota_nss_gc(count, start, step) -> i64`. ADR 0012 D-2 (iter FD).
+    iota_nss_func: cranelift_module::FuncId,
     /// FuncId of `vm_last_pair_gc(lst) -> i64`. ADR 0012 D-2 (iter EO).
     last_pair_func: cranelift_module::FuncId,
     /// FuncId of `vm_last_gc(lst) -> i64`. ADR 0012 D-2 (iter EO).
@@ -848,6 +850,8 @@ impl Lowerer {
         builder.symbol("vm_iota_n_gc", cs_vm::vm::vm_iota_n_gc as *const u8);
         // ADR 0012 D-2 (iter FC) — iota 2-arg.
         builder.symbol("vm_iota_ns_gc", cs_vm::vm::vm_iota_ns_gc as *const u8);
+        // ADR 0012 D-2 (iter FD) — iota 3-arg.
+        builder.symbol("vm_iota_nss_gc", cs_vm::vm::vm_iota_nss_gc as *const u8);
         // ADR 0012 D-2 (iter EO) — last-pair / last.
         builder.symbol("vm_last_pair_gc", cs_vm::vm::vm_last_pair_gc as *const u8);
         builder.symbol("vm_last_gc", cs_vm::vm::vm_last_gc as *const u8);
@@ -2061,6 +2065,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_iota_ns_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter FD) — vm_iota_nss_gc(count, start, step) -> i64.
+        let iota_nss_func = module
+            .declare_function(
+                "vm_iota_nss_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_iota_nss_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter EO) — vm_last_pair_gc / vm_last_gc.
         let last_pair_func = module
             .declare_function(
@@ -2323,6 +2336,7 @@ impl Lowerer {
             make_list_fill_func,
             iota_n_func,
             iota_ns_func,
+            iota_nss_func,
             last_pair_func,
             last_func,
             take_func,
@@ -2888,6 +2902,10 @@ impl Lowerer {
             let iota_ns_fnref = self
                 .module
                 .declare_func_in_func(self.iota_ns_func, builder.func);
+            // iter FD — iota 3-arg.
+            let iota_nss_fnref = self
+                .module
+                .declare_func_in_func(self.iota_nss_func, builder.func);
             // iter EO — last-pair / last.
             let last_pair_fnref = self
                 .module
@@ -3128,6 +3146,7 @@ impl Lowerer {
                         make_list_fill_fnref,
                         iota_n_fnref,
                         iota_ns_fnref,
+                        iota_nss_fnref,
                         last_pair_fnref,
                         last_fnref,
                         take_fnref,
@@ -3433,6 +3452,7 @@ fn lower_inst(
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
     iota_ns_fnref: cranelift_codegen::ir::FuncRef,
+    iota_nss_fnref: cranelift_codegen::ir::FuncRef,
     last_pair_fnref: cranelift_codegen::ir::FuncRef,
     last_fnref: cranelift_codegen::ir::FuncRef,
     take_fnref: cranelift_codegen::ir::FuncRef,
@@ -5868,6 +5888,25 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "IotaNs expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::IotaNss(dst, c_v, s_v, st_v) => {
+            // ADR 0012 D-2 (iter FD) — vm_iota_nss_gc(count, start, step).
+            let c = lookup(map, *c_v)?;
+            let s = lookup(map, *s_v)?;
+            let st = lookup(map, *st_v)?;
+            let inst_ref = b.ins().call(iota_nss_fnref, &[c, s, st]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "IotaNss expected 1 result, got {}",
                         results.len()
                     )));
                 }

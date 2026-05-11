@@ -733,6 +733,10 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter FC).
     IotaNs(Value, Value, Value),
 
+    /// `dst = iota(count, start, step)`. Lowers to `vm_iota_nss_gc`.
+    /// All three args Fixnum-shape. ADR 0012 D-2 (iter FD).
+    IotaNss(Value, Value, Value, Value),
+
     /// `dst = last-pair(lst)`. Lowers to `vm_last_pair_gc`. Arg
     /// Any-shape (consumed); `dst` is Any (Gc handle to the last
     /// pair). ADR 0012 D-2 (iter EO).
