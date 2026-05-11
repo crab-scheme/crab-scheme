@@ -10,8 +10,10 @@
 //! See `.spec-workflow/specs/jit-cranelift/{requirements,design}.md`
 //! and `docs/adr/0007-jit-design.md`.
 
+pub mod ic;
 pub mod lowering;
 
+pub use ic::{IcSlot, IcTable};
 pub use lowering::Lowerer;
 
 use std::collections::HashMap;

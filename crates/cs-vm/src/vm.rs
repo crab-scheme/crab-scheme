@@ -4,6 +4,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use cs_core::{Procedure, Symbol, SymbolTable, Value};
 use cs_diag::Span;
@@ -1126,6 +1127,13 @@ pub struct VmClosure {
     /// map. None until the tier-up hook installs both the JIT ptr
     /// and the maps. ADR 0012 D-2 (iter BM).
     jit_stack_maps: std::cell::RefCell<Option<std::rc::Rc<crate::jit_stackmap::JitStackMaps>>>,
+    /// Stable, process-wide unique identity. Stamped once at
+    /// construction (the `Inst::MakeClosure` site in `run_dispatch`)
+    /// from [`NEXT_CLOSURE_ID`] and never mutated thereafter — the
+    /// IC infrastructure (ADR 0012 D-1, iter BR) relies on this
+    /// invariant when comparing a closure against a cached id.
+    /// Always non-zero; the IC reserves 0 as "miss/uninitialized".
+    closure_id: u32,
 }
 
 /// How many type-guard misses a closure tolerates before the
@@ -1191,6 +1199,26 @@ pub const JIT_RT_GC: u8 = 16;
 
 /// Default `jit_param_types` value: every nibble = JIT_RT_FIXNUM (0).
 pub const JIT_PARAM_TYPES_ALL_FIXNUM: u32 = 0;
+
+/// Process-wide monotonic counter for [`VmClosure::closure_id`]. Each
+/// `MakeClosure` site bumps this and stamps the result into the new
+/// closure, giving every constructed closure a stable, unique 32-bit
+/// identity. The IC (per ADR 0012 D-1, iter BR) uses this as its
+/// cache key — see `cs_jit_cranelift::ic::IcSlot::cached_closure_id`.
+///
+/// Starts at 1 so that 0 stays reserved as the "miss/uninitialized"
+/// sentinel for IC slots. Saturating add would technically wrap
+/// after 2^32 closures, but at the iter-BR scale the pre-saturation
+/// space is effectively inexhaustible; future iters can revisit if
+/// long-running processes start churning past that boundary.
+static NEXT_CLOSURE_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Allocate the next process-wide closure id. The only caller is the
+/// `Inst::MakeClosure` site below; exposed at module scope so tests
+/// can observe monotonicity.
+fn alloc_closure_id() -> u32 {
+    NEXT_CLOSURE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 impl VmClosure {
     /// Install a native function pointer compiled by the JIT, with
@@ -1306,6 +1334,15 @@ impl VmClosure {
     /// to drive `bytecode_to_rir`'s self-recursion detection.
     pub fn self_name(&self) -> Option<Symbol> {
         self.self_name.get()
+    }
+
+    /// Stable, process-wide unique identifier. Stamped at
+    /// construction; never mutates over the closure's lifetime.
+    /// Always non-zero — the inline-cache infrastructure (ADR 0012
+    /// D-1, iter BR) reserves `0` to mean "miss/uninitialized" in
+    /// [`cs_jit_cranelift::ic::IcSlot::cached_closure_id`].
+    pub fn closure_id(&self) -> u32 {
+        self.closure_id
     }
 }
 
@@ -3216,6 +3253,11 @@ fn run_dispatch(
                 }
             }
             Inst::MakeClosure(idx) => {
+                // ADR 0012 D-1 (iter BR): every closure gets a
+                // stable, process-wide unique id stamped here.
+                // The IC uses this as its cache key; assigning at
+                // the (single) construction site keeps the id
+                // immutable for the closure's lifetime.
                 let cl = VmClosure {
                     lambda_idx: *idx,
                     env: frame.env.clone(),
@@ -3229,6 +3271,7 @@ fn run_dispatch(
                     jit_deopt_count: Cell::new(0),
                     jit_call_count: Cell::new(0),
                     jit_stack_maps: std::cell::RefCell::new(None),
+                    closure_id: alloc_closure_id(),
                 };
                 let p: Rc<dyn Procedure> = Rc::new(cl);
                 stack.push(Value::Procedure(p));
@@ -5596,6 +5639,63 @@ mod tests {
             Value::Number(Number::Fixnum(120)) => {}
             other => panic!("expected 120, got {:?}", other),
         }
+    }
+
+    /// ADR 0012 D-1 (iter BR): each `MakeClosure` execution must
+    /// stamp a fresh, non-zero closure id. The IC reserves 0 as
+    /// "miss/uninitialized", so any constructed closure must have
+    /// a positive id, and two consecutively constructed closures
+    /// must differ. Exercises the process-wide `NEXT_CLOSURE_ID`
+    /// counter at the only `VmClosure` literal site (`run_dispatch`
+    /// → `Inst::MakeClosure`).
+    #[test]
+    fn closure_ids_are_monotonic() {
+        let mut syms = SymbolTable::new();
+        let env = make_test_env(&mut syms);
+        let x = syms.intern("x");
+        // Build two distinct lambdas and let `Begin` return the
+        // second — both run through MakeClosure but only the last
+        // ends up on top of the stack. Run twice (resetting env)
+        // to also see two separate closures and compare ids.
+        let lam1 = CoreExpr::Lambda {
+            params: Params::fixed(vec![x]),
+            body: Rc::new(CoreExpr::Ref {
+                name: x,
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        };
+        let lam2 = CoreExpr::Lambda {
+            params: Params::fixed(vec![x]),
+            body: Rc::new(CoreExpr::Ref {
+                name: x,
+                span: Span::DUMMY,
+            }),
+            span: Span::DUMMY,
+        };
+        let bc1 = compile(&lam1).unwrap();
+        let bc2 = compile(&lam2).unwrap();
+        let v1 = run(&bc1, env.clone(), &mut syms).unwrap();
+        let v2 = run(&bc2, env, &mut syms).unwrap();
+        let id1 = match &v1 {
+            Value::Procedure(p) => p
+                .as_any()
+                .downcast_ref::<VmClosure>()
+                .expect("first run returned a VmClosure")
+                .closure_id(),
+            other => panic!("expected procedure, got {:?}", other),
+        };
+        let id2 = match &v2 {
+            Value::Procedure(p) => p
+                .as_any()
+                .downcast_ref::<VmClosure>()
+                .expect("second run returned a VmClosure")
+                .closure_id(),
+            other => panic!("expected procedure, got {:?}", other),
+        };
+        assert_ne!(id1, 0, "closure id must not be 0 (reserved sentinel)");
+        assert_ne!(id2, 0, "closure id must not be 0 (reserved sentinel)");
+        assert_ne!(id1, id2, "two MakeClosure events must yield distinct ids");
     }
 }
 

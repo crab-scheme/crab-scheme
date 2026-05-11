@@ -48,6 +48,8 @@ use cs_jit::JitError;
 use cs_rir::Block;
 use cs_rir::{Const, Function as RirFunction, Inst, Term, Value as RirValue};
 
+use crate::ic::IcTable;
+
 /// Owns a Cranelift `JITModule` and emits one native function per
 /// `compile_pure_fixnum` call.
 ///
@@ -126,6 +128,15 @@ pub struct Lowerer {
     /// lowers to this. Consumes the box; returns 0 iff inner is
     /// `Boolean(false)`.
     any_truthy_func: cranelift_module::FuncId,
+    /// Per-module inline-cache slot storage. Indices into this
+    /// table identify call sites; the slot's address is intended
+    /// to be baked into JIT bodies as a constant pointer (ADR
+    /// 0012 D-1; design in `docs/research/jit_inline_cache.md`).
+    /// iter BR ships the table empty — call-site lowering (iter
+    /// BS+) is what allocates and references entries. Exposed
+    /// via [`Lowerer::ic_table_mut`] so future codegen can
+    /// reserve slots without reaching into private fields.
+    ic_table: IcTable,
 }
 
 impl Lowerer {
@@ -374,7 +385,25 @@ impl Lowerer {
             unbox_flonum_func,
             eq_any_func,
             any_truthy_func,
+            // iter BR: empty IC table. Iter BS+ will reserve a
+            // slot per Inst::Call as lowering walks the RIR.
+            ic_table: IcTable::new(0),
         })
+    }
+
+    /// Mutable handle to the per-module IC table. Used by future
+    /// call-site lowering (iter BS+) to reserve a slot per
+    /// `Inst::Call`; iter BR exposes the accessor without any
+    /// in-tree caller so the shape can settle before codegen
+    /// piles on. See `docs/research/jit_inline_cache.md` §3.1.
+    pub fn ic_table_mut(&mut self) -> &mut IcTable {
+        &mut self.ic_table
+    }
+
+    /// Immutable view of the IC table. Tests and diagnostics
+    /// only — the lowering hot path uses `ic_table_mut`.
+    pub fn ic_table(&self) -> &IcTable {
+        &self.ic_table
     }
 
     fn fresh_id(&mut self) -> u64 {
