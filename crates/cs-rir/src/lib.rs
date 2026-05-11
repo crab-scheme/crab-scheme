@@ -739,6 +739,15 @@ pub enum Inst {
     /// `dst = string-replace-all(s, from, to)`. ADR 0012 D-2 (iter FI).
     StringReplaceAll(Value, Value, Value, Value),
 
+    /// `dst = bytevector->u8-list(bv)`. ADR 0012 D-2 (iter FL).
+    BytevectorToU8List(Value, Value),
+    /// `dst = u8-list->bytevector(lst)`. ADR 0012 D-2 (iter FL).
+    U8ListToBytevector(Value, Value),
+    /// `dst = string->utf8(s)` (1-arg). ADR 0012 D-2 (iter FL).
+    StringToUtf8(Value, Value),
+    /// `dst = utf8->string(bv)` (1-arg). ADR 0012 D-2 (iter FL).
+    Utf8ToString(Value, Value),
+
     /// `dst = string-contains-right(haystack, needle)`. ADR 0012 D-2 (iter FK).
     StringContainsRight(Value, Value, Value),
     /// `dst = string-index(s, c)`. `c` is Character-shape raw codepoint.

@@ -2629,6 +2629,35 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StringContains(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter FL) — bytevector/utf8 conversion.
+                                    ("bytevector->u8-list", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BytevectorToU8List(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("u8-list->bytevector", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::U8ListToBytevector(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("string->utf8", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::StringToUtf8(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("utf8->string", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::Utf8ToString(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter FK) — string-contains-right.
                                     ("string-contains-right", 2)
                                         if value_types.get(&args[0]).copied()
@@ -4306,7 +4335,11 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::ListToVector(dst, _)
                 | RirInst::StringToList(dst, _)
                 | RirInst::ListToString(dst, _)
-                | RirInst::SymbolToString(dst, _) => {
+                | RirInst::SymbolToString(dst, _)
+                | RirInst::BytevectorToU8List(dst, _)
+                | RirInst::U8ListToBytevector(dst, _)
+                | RirInst::StringToUtf8(dst, _)
+                | RirInst::Utf8ToString(dst, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

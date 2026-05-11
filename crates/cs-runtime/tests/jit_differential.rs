@@ -6162,3 +6162,68 @@ fn diff_jit_string_index_family() {
     assert!(matches!(&ir_hit, Value::Number(cs_core::Number::Fixnum(3))));
     assert!(matches!(&ir_miss, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_bytevector_utf8_conversion() {
+    // ADR 0012 D-2 (iter FL) — bytevector/utf8 conversion family.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bv2l bv) (bytevector->u8-list bv))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (l2bv l) (u8-list->bytevector l))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s2u s) (string->utf8 s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (u2s b) (utf8->string b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (bv2l (bytevector 1 2 3)) \
+                      (l2bv (list 1 2 3)) \
+                      (s2u \"hi\") \
+                      (u2s (bytevector 104 105)) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let lst = rt
+        .eval_str_via_vm("<diff>", "(bv2l (bytevector 65 66 67))")
+        .unwrap();
+    let bv = rt
+        .eval_str_via_vm("<diff>", "(l2bv (list 65 66 67))")
+        .unwrap();
+    let utf = rt.eval_str_via_vm("<diff>", "(s2u \"AB\")").unwrap();
+    let str_v = rt
+        .eval_str_via_vm("<diff>", "(u2s (bytevector 72 101 108 108 111))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &lst {
+        Value::Pair(p) => {
+            assert!(matches!(
+                p.car.borrow().clone(),
+                Value::Number(cs_core::Number::Fixnum(65))
+            ));
+        }
+        other => panic!("expected pair, got {:?}", other),
+    }
+    match &bv {
+        Value::ByteVector(b) => {
+            assert_eq!(&*b.borrow(), &vec![65u8, 66, 67]);
+        }
+        other => panic!("expected bytevector, got {:?}", other),
+    }
+    match &utf {
+        Value::ByteVector(b) => {
+            assert_eq!(&*b.borrow(), &vec![65u8, 66]);
+        }
+        other => panic!("expected bytevector, got {:?}", other),
+    }
+    match &str_v {
+        Value::String(s) => {
+            assert_eq!(&*s.borrow(), "Hello");
+        }
+        other => panic!("expected string, got {:?}", other),
+    }
+}

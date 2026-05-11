@@ -453,6 +453,16 @@ pub struct Lowerer {
     /// FuncId of `vm_string_index_right_gc(s, c) -> i64`.
     /// ADR 0012 D-2 (iter FK).
     string_index_right_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_to_u8_list_gc(bv) -> i64`.
+    /// ADR 0012 D-2 (iter FL).
+    bytevector_to_u8_list_func: cranelift_module::FuncId,
+    /// FuncId of `vm_u8_list_to_bytevector_gc(lst) -> i64`.
+    /// ADR 0012 D-2 (iter FL).
+    u8_list_to_bytevector_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_to_utf8_gc(s) -> i64`. ADR 0012 D-2 (iter FL).
+    string_to_utf8_func: cranelift_module::FuncId,
+    /// FuncId of `vm_utf8_to_string_gc(bv) -> i64`. ADR 0012 D-2 (iter FL).
+    utf8_to_string_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_list_fill_gc(n, fill) -> i64`. ADR 0012
     /// D-2 (iter EM).
     make_list_fill_func: cranelift_module::FuncId,
@@ -939,6 +949,23 @@ impl Lowerer {
         builder.symbol(
             "vm_string_index_right_gc",
             cs_vm::vm::vm_string_index_right_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter FL).
+        builder.symbol(
+            "vm_bytevector_to_u8_list_gc",
+            cs_vm::vm::vm_bytevector_to_u8_list_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_u8_list_to_bytevector_gc",
+            cs_vm::vm::vm_u8_list_to_bytevector_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_to_utf8_gc",
+            cs_vm::vm::vm_string_to_utf8_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_utf8_to_string_gc",
+            cs_vm::vm::vm_utf8_to_string_gc as *const u8,
         );
         // ADR 0012 D-2 (iter EM) — make-list 2-arg.
         builder.symbol(
@@ -2269,6 +2296,44 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_string_index_right_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter FL).
+        let bytevector_to_u8_list_func = module
+            .declare_function(
+                "vm_bytevector_to_u8_list_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_to_u8_list_gc: {e}"))
+            })?;
+        let u8_list_to_bytevector_func = module
+            .declare_function(
+                "vm_u8_list_to_bytevector_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_u8_list_to_bytevector_gc: {e}"))
+            })?;
+        let string_to_utf8_func = module
+            .declare_function(
+                "vm_string_to_utf8_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_to_utf8_gc: {e}"))
+            })?;
+        let utf8_to_string_func = module
+            .declare_function(
+                "vm_utf8_to_string_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_utf8_to_string_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter EM) — vm_make_list_fill_gc(n, fill) -> i64.
         // Same shape as vector_ref_sig (two i64 in, one out).
         let make_list_fill_func = module
@@ -2582,6 +2647,10 @@ impl Lowerer {
             string_contains_right_func,
             string_index_func,
             string_index_right_func,
+            bytevector_to_u8_list_func,
+            u8_list_to_bytevector_func,
+            string_to_utf8_func,
+            utf8_to_string_func,
             make_list_fill_func,
             iota_n_func,
             iota_ns_func,
@@ -3191,6 +3260,19 @@ impl Lowerer {
             let string_index_right_fnref = self
                 .module
                 .declare_func_in_func(self.string_index_right_func, builder.func);
+            // iter FL — bytevector/utf8 conversion.
+            let bytevector_to_u8_list_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_to_u8_list_func, builder.func);
+            let u8_list_to_bytevector_fnref = self
+                .module
+                .declare_func_in_func(self.u8_list_to_bytevector_func, builder.func);
+            let string_to_utf8_fnref = self
+                .module
+                .declare_func_in_func(self.string_to_utf8_func, builder.func);
+            let utf8_to_string_fnref = self
+                .module
+                .declare_func_in_func(self.utf8_to_string_func, builder.func);
             // iter EM — make-list 2-arg.
             let make_list_fill_fnref = self
                 .module
@@ -3459,6 +3541,10 @@ impl Lowerer {
                         string_contains_right_fnref,
                         string_index_fnref,
                         string_index_right_fnref,
+                        bytevector_to_u8_list_fnref,
+                        u8_list_to_bytevector_fnref,
+                        string_to_utf8_fnref,
+                        utf8_to_string_fnref,
                         make_list_fill_fnref,
                         iota_n_fnref,
                         iota_ns_fnref,
@@ -3780,6 +3866,10 @@ fn lower_inst(
     string_contains_right_fnref: cranelift_codegen::ir::FuncRef,
     string_index_fnref: cranelift_codegen::ir::FuncRef,
     string_index_right_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_to_u8_list_fnref: cranelift_codegen::ir::FuncRef,
+    u8_list_to_bytevector_fnref: cranelift_codegen::ir::FuncRef,
+    string_to_utf8_fnref: cranelift_codegen::ir::FuncRef,
+    utf8_to_string_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
     iota_ns_fnref: cranelift_codegen::ir::FuncRef,
@@ -6152,6 +6242,33 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "StringSplit expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::BytevectorToU8List(dst, src)
+        | Inst::U8ListToBytevector(dst, src)
+        | Inst::StringToUtf8(dst, src)
+        | Inst::Utf8ToString(dst, src) => {
+            // ADR 0012 D-2 (iter FL) — bytevector/utf8 conversion.
+            let sv = lookup(map, *src)?;
+            let fnref = match inst {
+                Inst::BytevectorToU8List(..) => bytevector_to_u8_list_fnref,
+                Inst::U8ListToBytevector(..) => u8_list_to_bytevector_fnref,
+                Inst::StringToUtf8(..) => string_to_utf8_fnref,
+                Inst::Utf8ToString(..) => utf8_to_string_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[sv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BytevectorToU8List/etc expected 1 result, got {}",
                         results.len()
                     )));
                 }

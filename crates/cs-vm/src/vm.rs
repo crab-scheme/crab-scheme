@@ -1498,6 +1498,131 @@ pub unsafe extern "C" fn vm_list_to_vector_gc(r: i64) -> i64 {
     }
 }
 
+/// `(bytevector->u8-list bv)` — fresh list of Fixnum u8 elements.
+/// ADR 0012 D-2 (iter FL).
+///
+/// # Safety
+///
+/// `bv` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_to_u8_list_gc(bv: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(b) => {
+            let list = Value::list(b.borrow().iter().map(|byte| Value::fixnum(*byte as i64)));
+            value_to_gc_i64(list)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
+/// `(u8-list->bytevector lst)` — fresh bytevector from a list of
+/// Fixnum bytes in [0,255]. Deopt on improper list or out-of-range
+/// element. ADR 0012 D-2 (iter FL).
+///
+/// # Safety
+///
+/// `lst` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_u8_list_to_bytevector_gc(lst: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(lst) };
+    let mut out: Vec<u8> = Vec::new();
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                let n = match car {
+                    Value::Number(cs_core::Number::Fixnum(n)) => n,
+                    _ => {
+                        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                        return value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(
+                            std::cell::RefCell::new(Vec::new()),
+                        )));
+                    }
+                };
+                if !(0..=255).contains(&n) {
+                    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                    return value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(
+                        std::cell::RefCell::new(Vec::new()),
+                    )));
+                }
+                out.push(n as u8);
+                cur = p.cdr.borrow().clone();
+            }
+            Value::Null => {
+                return value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(
+                    std::cell::RefCell::new(out),
+                )));
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(
+                    std::cell::RefCell::new(Vec::new()),
+                )));
+            }
+        }
+    }
+}
+
+/// `(string->utf8 s)` — fresh bytevector containing the UTF-8 bytes
+/// of `s` (1-arg form). ADR 0012 D-2 (iter FL).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_to_utf8_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            let bytes = sg.borrow().as_bytes().to_vec();
+            value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(std::cell::RefCell::new(
+                bytes,
+            ))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(std::cell::RefCell::new(
+                Vec::new(),
+            ))))
+        }
+    }
+}
+
+/// `(utf8->string bv)` — decode UTF-8 from `bv` (1-arg form). Invalid
+/// UTF-8 triggers a deopt (the bytecode form raises a condition that
+/// the JIT can't reproduce without runtime machinery). ADR 0012 D-2
+/// (iter FL).
+///
+/// # Safety
+///
+/// `bv` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_utf8_to_string_gc(bv: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(b) => match String::from_utf8(b.borrow().clone()) {
+            Ok(s) => value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s)))),
+            Err(_) => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                    String::new(),
+                ))))
+            }
+        },
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
 /// `(list-copy lst)` — return a freshly allocated copy of `lst`'s
 /// spine. R6RS semantics: for improper lists, copy the spine but
 /// keep the terminating atom as the final cdr; for atoms, return
