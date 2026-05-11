@@ -4686,3 +4686,46 @@ fn diff_jit_sqrt_flo_and_fix() {
         other => panic!("expected three flonums, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_abs_min_max_flonum() {
+    // ADR 0012 D-2 (iter EB) — abs/max/min route through Flonum
+    // RIR when any operand is Flonum-typed.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f-abs x) (abs x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f-max a b) (max a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f-min a b) (min a b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (f-abs -1.5) (f-max 1.0 2.0) (f-min 3.0 4.0) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let a = rt.eval_str_via_vm("<diff>", "(f-abs -3.5)").unwrap();
+    let mx = rt.eval_str_via_vm("<diff>", "(f-max 2.5 7.5)").unwrap();
+    let mn = rt.eval_str_via_vm("<diff>", "(f-min 2.5 7.5)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "flonum abs/max/min never dispatched through JIT (count={after})"
+    );
+    match (&a, &mx, &mn) {
+        (
+            Value::Number(cs_core::Number::Flonum(av)),
+            Value::Number(cs_core::Number::Flonum(mxv)),
+            Value::Number(cs_core::Number::Flonum(mnv)),
+        ) => {
+            assert!((av - 3.5).abs() < 1e-12, "abs -3.5 = {av}");
+            assert!((mxv - 7.5).abs() < 1e-12, "max 2.5 7.5 = {mxv}");
+            assert!((mnv - 2.5).abs() < 1e-12, "min 2.5 7.5 = {mnv}");
+        }
+        other => panic!("expected three flonums, got {:?}", other),
+    }
+}

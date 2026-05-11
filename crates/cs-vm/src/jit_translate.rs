@@ -683,9 +683,29 @@ pub fn bytecode_to_rir_with_hints(
                                 }
                                 ("bitwise-xor", 2) => Some(RirInst::BitXor(dst, args[0], args[1])),
                                 ("bitwise-not", 1) => Some(RirInst::BitNot(dst, args[0])),
-                                ("abs", 1) => Some(RirInst::AbsFixnum(dst, args[0])),
-                                ("max", 2) => Some(RirInst::MaxFixnum(dst, args[0], args[1])),
-                                ("min", 2) => Some(RirInst::MinFixnum(dst, args[0], args[1])),
+                                // ADR 0012 D-2 (iter EB) — abs/max/min are
+                                // Fixnum-only on this fast path. If any
+                                // operand is Flonum the multi-Inst section
+                                // picks them up with FlonumAbs/Max/Min.
+                                ("abs", 1)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::AbsFixnum(dst, args[0]))
+                                }
+                                ("max", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::MaxFixnum(dst, args[0], args[1]))
+                                }
+                                ("min", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::MinFixnum(dst, args[0], args[1]))
+                                }
                                 _ => None,
                             };
                             if let Some(inst) = single {
@@ -2019,6 +2039,75 @@ pub fn bytecode_to_rir_with_hints(
                                             == Some(Type::Flonum) =>
                                     {
                                         insts.push(RirInst::FlonumAbs(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    // ADR 0012 D-2 (iter EB) — abs/max/min for
+                                    // Flonum-typed args. max/min widen any
+                                    // Fixnum operand to Flonum via FixToFlo
+                                    // (numeric-tower contagion).
+                                    ("abs", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumAbs(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("max", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            || value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        let lhs = if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                        {
+                                            args[0]
+                                        } else {
+                                            let p = alloc();
+                                            insts.push(RirInst::FixToFlo(p, args[0]));
+                                            value_types.insert(p, Type::Flonum);
+                                            p
+                                        };
+                                        let rhs = if value_types.get(&args[1]).copied()
+                                            == Some(Type::Flonum)
+                                        {
+                                            args[1]
+                                        } else {
+                                            let p = alloc();
+                                            insts.push(RirInst::FixToFlo(p, args[1]));
+                                            value_types.insert(p, Type::Flonum);
+                                            p
+                                        };
+                                        insts.push(RirInst::FlonumMax(dst, lhs, rhs));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("min", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            || value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        let lhs = if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                        {
+                                            args[0]
+                                        } else {
+                                            let p = alloc();
+                                            insts.push(RirInst::FixToFlo(p, args[0]));
+                                            value_types.insert(p, Type::Flonum);
+                                            p
+                                        };
+                                        let rhs = if value_types.get(&args[1]).copied()
+                                            == Some(Type::Flonum)
+                                        {
+                                            args[1]
+                                        } else {
+                                            let p = alloc();
+                                            insts.push(RirInst::FixToFlo(p, args[1]));
+                                            value_types.insert(p, Type::Flonum);
+                                            p
+                                        };
+                                        insts.push(RirInst::FlonumMin(dst, lhs, rhs));
                                         value_types.insert(dst, Type::Flonum);
                                     }
                                     // ADR 0012 D-2 (iter DF) — flonum
