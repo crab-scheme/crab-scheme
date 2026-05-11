@@ -142,6 +142,10 @@ pub struct Lowerer {
     /// `usize` is modeled as `i64` in the Cranelift signature; the
     /// helper truncates internally.
     call_general_func: cranelift_module::FuncId,
+    /// FuncId of `vm_closure_id_peek(callee: i64) -> u32`. Used by
+    /// the IC hot path (ADR 0012 D-1, iter BY) to read a callee's
+    /// closure id without consuming the Gc handle.
+    closure_id_peek_func: cranelift_module::FuncId,
     /// FuncId of `vm_alloc_vector_gc(n, fill) -> i64`.
     /// `Inst::VecAlloc` lowers to this (ADR 0012 D-2, iter BV).
     alloc_vector_func: cranelift_module::FuncId,
@@ -236,6 +240,10 @@ impl Lowerer {
         // from `Inst::CallGeneral` whenever the bytecode's call
         // target is neither `self` nor a known builtin.
         builder.symbol("vm_call_general", cs_vm::vm::vm_call_general as *const u8);
+        builder.symbol(
+            "vm_closure_id_peek",
+            cs_vm::vm::vm_closure_id_peek as *const u8,
+        );
         builder.symbol(
             "vm_alloc_vector_gc",
             cs_vm::vm::vm_alloc_vector_gc as *const u8,
@@ -425,6 +433,9 @@ impl Lowerer {
         call_general_sig.params.push(AbiParam::new(I64)); // callee Gc handle
         call_general_sig.params.push(AbiParam::new(I64)); // args buffer pointer
         call_general_sig.params.push(AbiParam::new(I64)); // n_args
+                                                          // ADR 0012 D-1 (iter BY) — IC slot pointer for miss-handler
+                                                          // update. Null when the caller hasn't allocated a slot.
+        call_general_sig.params.push(AbiParam::new(I64));
         call_general_sig.returns.push(AbiParam::new(I64));
         let call_general_func = module
             .declare_function(
@@ -433,6 +444,20 @@ impl Lowerer {
                 &call_general_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_call_general: {e}")))?;
+
+        // vm_closure_id_peek(i64) -> i32 (u32 zero-extends).
+        let mut closure_id_peek_sig = module.make_signature();
+        closure_id_peek_sig.params.push(AbiParam::new(I64));
+        closure_id_peek_sig
+            .returns
+            .push(AbiParam::new(cranelift_codegen::ir::types::I32));
+        let closure_id_peek_func = module
+            .declare_function(
+                "vm_closure_id_peek",
+                cranelift_module::Linkage::Import,
+                &closure_id_peek_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_closure_id_peek: {e}")))?;
 
         // ADR 0012 D-2 (iter BV) — vector op helpers.
         // vm_alloc_vector_gc(n: i64, fill: i64) -> i64
@@ -517,6 +542,7 @@ impl Lowerer {
             eq_any_func,
             any_truthy_func,
             call_general_func,
+            closure_id_peek_func,
             alloc_vector_func,
             vector_ref_func,
             vector_set_func,
@@ -700,6 +726,9 @@ impl Lowerer {
             let call_general_fnref = self
                 .module
                 .declare_func_in_func(self.call_general_func, builder.func);
+            let closure_id_peek_fnref = self
+                .module
+                .declare_func_in_func(self.closure_id_peek_func, builder.func);
             // iter BV — vector ops.
             let alloc_vector_fnref = self
                 .module
@@ -798,6 +827,7 @@ impl Lowerer {
                         eq_any_fnref,
                         any_truthy_fnref,
                         call_general_fnref,
+                        closure_id_peek_fnref,
                         alloc_vector_fnref,
                         vector_ref_fnref,
                         vector_set_fnref,
@@ -987,6 +1017,7 @@ fn lower_inst(
     eq_any_fnref: cranelift_codegen::ir::FuncRef,
     any_truthy_fnref: cranelift_codegen::ir::FuncRef,
     call_general_fnref: cranelift_codegen::ir::FuncRef,
+    closure_id_peek_fnref: cranelift_codegen::ir::FuncRef,
     alloc_vector_fnref: cranelift_codegen::ir::FuncRef,
     vector_ref_fnref: cranelift_codegen::ir::FuncRef,
     vector_set_fnref: cranelift_codegen::ir::FuncRef,
@@ -1408,48 +1439,155 @@ fn lower_inst(
             b.ins().call(env_set_fnref, &[sym_v, val]);
         }
         Inst::CallGeneral(dst, callee, args) => {
-            // ADR 0012 D-1 (iter BU) — slow-path non-self closure
-            // call. Marshal args into a stack-allocated `[i64]`
-            // buffer, then invoke `vm_call_general(callee, ptr,
-            // n_args)`. The helper consumes one strong refcount
-            // per arg slot (and the callee), and returns a fresh
-            // Gc<Value> handle. The IC hot path (per-call-site
-            // mono cache load-compare-call) lands later (BX+);
-            // every CallGeneral takes the slow path today.
+            // ADR 0012 D-1 (iter BY) — IC hot path. For each
+            // CallGeneral site we allocate a fresh IcSlot via
+            // Box::leak (stable process-lifetime address). The
+            // emitted code checks the slot's cached_closure_id
+            // against the callee's live id; on match it dispatches
+            // through cached_jit_ptr via call_indirect; on miss it
+            // falls through to vm_call_general which also updates
+            // the slot.
             let callee_v = lookup(map, *callee)?;
             let n = args.len();
-            // Args buffer: one i64 slot per arg. Allocate even when
-            // n == 0 (we still need a valid pointer to pass through;
-            // a zero-sized stack slot is awkward in Cranelift, so
-            // reserve at least 8 bytes). Alignment 8 (log2 = 3).
+            let arg_vs: Vec<cranelift_codegen::ir::Value> = args
+                .iter()
+                .map(|a| lookup(map, *a))
+                .collect::<Result<_, _>>()?;
+
+            // Args buffer for the miss path (vm_call_general expects
+            // an i64[] + count). At least 8 bytes so stack_addr is
+            // always valid even at n == 0.
             let buf_bytes = std::cmp::max(8u32, (n as u32) * 8);
-            let slot = b.create_sized_stack_slot(StackSlotData::new(
+            let buf_slot = b.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
                 buf_bytes,
                 3,
             ));
-            for (i, a) in args.iter().enumerate() {
-                let av = lookup(map, *a)?;
-                let _ = b.ins().stack_store(av, slot, (i as i32) * 8);
+            for (i, av) in arg_vs.iter().enumerate() {
+                let _ = b.ins().stack_store(*av, buf_slot, (i as i32) * 8);
             }
-            let buf_addr = b.ins().stack_addr(I64, slot, 0);
+            let buf_addr = b.ins().stack_addr(I64, buf_slot, 0);
             let n_args_v = b.ins().iconst(I64, n as i64);
-            let inst_ref = b
-                .ins()
-                .call(call_general_fnref, &[callee_v, buf_addr, n_args_v]);
-            let result = {
-                let results = b.inst_results(inst_ref);
-                if results.len() != 1 {
-                    return Err(JitError::Codegen(format!(
-                        "CallGeneral expected 1 result, got {}",
-                        results.len()
-                    )));
+
+            // Allocate per-site IC slot. Box::leak gives a stable
+            // process-lifetime address; the i64 baked into the JIT
+            // body's constant pool is that address.
+            let ic_slot: &'static crate::ic::IcSlot = Box::leak(Box::new(crate::ic::IcSlot::new()));
+            let slot_ptr_const = ic_slot as *const crate::ic::IcSlot as i64;
+            let slot_addr_v = b.ins().iconst(I64, slot_ptr_const);
+
+            // Peek closure id from callee (doesn't consume).
+            let peek_inst = b.ins().call(closure_id_peek_fnref, &[callee_v]);
+            let peeked_id_i32 = {
+                let rs = b.inst_results(peek_inst);
+                if rs.len() != 1 {
+                    return Err(JitError::Codegen(
+                        "vm_closure_id_peek expected 1 result".into(),
+                    ));
                 }
-                results[0]
+                rs[0]
             };
-            // dst is Any-tagged (a fresh Gc<Value> handle); register
-            // it as a stack-map root so Cranelift spills it across
-            // any subsequent safepoints in the same block.
+            // Load cached_closure_id (u32 at offset 0 of IcSlot —
+            // see #[repr(C)] layout invariant in cs-jit-cranelift/ic.rs).
+            let cached_id_i32 = b.ins().load(
+                cranelift_codegen::ir::types::I32,
+                cranelift_codegen::ir::MemFlags::new(),
+                slot_addr_v,
+                0,
+            );
+            // Hit iff cached != 0 AND peeked == cached.
+            let id_match = b.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                peeked_id_i32,
+                cached_id_i32,
+            );
+            let zero32 = b.ins().iconst(cranelift_codegen::ir::types::I32, 0);
+            let cached_nonzero = b.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::NotEqual,
+                cached_id_i32,
+                zero32,
+            );
+            let take_hit = b.ins().band(id_match, cached_nonzero);
+
+            let hit_block = b.create_block();
+            let miss_block = b.create_block();
+            let join_block = b.create_block();
+            // Join block has one block-param: the i64 result Gc handle.
+            b.append_block_param(join_block, I64);
+
+            b.ins().brif(take_hit, hit_block, &[], miss_block, &[]);
+
+            // ===== Hit block =====
+            b.switch_to_block(hit_block);
+            b.seal_block(hit_block);
+            // Drop the callee handle — the cached jit_ptr's body
+            // doesn't consume callee (it consumes args only); we own
+            // the strong ref. Use vm_value_drop_gc.
+            b.ins().call(value_drop_fnref, &[callee_v]);
+            // Load cached_jit_ptr (offset_of cached_jit_ptr inside
+            // IcSlot, #[repr(C)]). Field order:
+            //   cached_closure_id  AtomicU32  offset 0, 4 bytes
+            //   cached_jit_ptr     AtomicPtr  offset 8 (alignment-padded
+            //                                  on 64-bit; 4 bytes pad
+            //                                  follow cached_closure_id)
+            //   cached_arity       AtomicU32  offset 16
+            //   cached_param_types AtomicU32  offset 20
+            //   miss_count         AtomicU32  offset 24
+            let cached_jit_ptr_v =
+                b.ins()
+                    .load(I64, cranelift_codegen::ir::MemFlags::new(), slot_addr_v, 8);
+            // call_indirect with a signature matching args.len().
+            let mut hit_sig = b.func.import_signature({
+                let mut s = cranelift_codegen::ir::Signature::new(
+                    cranelift_codegen::isa::CallConv::SystemV,
+                );
+                for _ in 0..n {
+                    s.params.push(AbiParam::new(I64));
+                }
+                s.returns.push(AbiParam::new(I64));
+                s
+            });
+            let _ = &mut hit_sig;
+            let hit_inst = b.ins().call_indirect(hit_sig, cached_jit_ptr_v, &arg_vs);
+            let hit_result = {
+                let rs = b.inst_results(hit_inst);
+                if rs.len() != 1 {
+                    return Err(JitError::Codegen(
+                        "IC hit call_indirect expected 1 result".into(),
+                    ));
+                }
+                rs[0]
+            };
+            b.ins().jump(
+                join_block,
+                &[cranelift_codegen::ir::BlockArg::Value(hit_result)],
+            );
+
+            // ===== Miss block =====
+            b.switch_to_block(miss_block);
+            b.seal_block(miss_block);
+            let miss_inst = b.ins().call(
+                call_general_fnref,
+                &[callee_v, buf_addr, n_args_v, slot_addr_v],
+            );
+            let miss_result = {
+                let rs = b.inst_results(miss_inst);
+                if rs.len() != 1 {
+                    return Err(JitError::Codegen(
+                        "vm_call_general expected 1 result".into(),
+                    ));
+                }
+                rs[0]
+            };
+            b.ins().jump(
+                join_block,
+                &[cranelift_codegen::ir::BlockArg::Value(miss_result)],
+            );
+
+            // ===== Join =====
+            b.switch_to_block(join_block);
+            b.seal_block(join_block);
+            let result = b.block_params(join_block)[0];
             b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }

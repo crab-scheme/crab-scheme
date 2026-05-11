@@ -2147,3 +2147,43 @@ fn diff_jit_deopt_on_type_miss() {
     // assertion: no process abort.
     let _ = res;
 }
+
+#[test]
+fn diff_jit_ic_hot_path_dispatches_general_call() {
+    // M6 Phase 4 iter BY — IC hot path for general Call.
+    // After warmup, the per-call-site IcSlot is filled (id +
+    // jit_ptr); subsequent calls take the hit branch and dispatch
+    // directly via call_indirect, skipping vm_call_sync's
+    // SymbolTable lookup. Correctness: result equals walker.
+    let defines = &["(define (inner x) (+ x 1))", "(define (outer y) (inner y))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    for d in defines {
+        rt.eval_str_via_vm("<diff>", d).unwrap();
+    }
+    // Warm both: outer's JIT body has a CallGeneral to inner; the
+    // IC slot fills once inner is itself JIT-compiled.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (outer i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    cs_vm::vm::reset_jit_call_count();
+    let result = rt.eval_str_via_vm("<diff>", "(outer 41)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(after > 0, "outer never JITted (count={})", after);
+
+    match result {
+        Value::Number(cs_core::Number::Fixnum(42)) => {}
+        other => panic!("expected fixnum 42, got {:?}", other),
+    }
+
+    let walker = walker_eval(defines, "(outer 41)");
+    match (&result, &walker) {
+        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+            assert_eq!(j, w, "tier mismatch")
+        }
+        _ => panic!("type mismatch"),
+    }
+}

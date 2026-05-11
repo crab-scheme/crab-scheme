@@ -1123,7 +1123,12 @@ pub unsafe extern "C" fn vm_eq_any_gc(a: i64, b: i64) -> i64 {
 /// JIT-frame catch_unwind path; for iter BU a panic is the
 /// starting point.
 #[no_mangle]
-pub unsafe extern "C" fn vm_call_general(callee: i64, args_ptr: *const i64, n_args: usize) -> i64 {
+pub unsafe extern "C" fn vm_call_general(
+    callee: i64,
+    args_ptr: *const i64,
+    n_args: usize,
+    slot_ptr: *const std::ffi::c_void,
+) -> i64 {
     let callee_v = unsafe { gc_i64_to_value(callee) };
     // Materialize each arg slot into a Value, consuming one strong
     // refcount per slot. The JIT body produced these via
@@ -1147,10 +1152,70 @@ pub unsafe extern "C" fn vm_call_general(callee: i64, args_ptr: *const i64, n_ar
     // inside, and single-threaded execution means no aliasing
     // mutable borrow exists.
     let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
+
+    // ADR 0012 D-1 (iter BY) — IC miss handler. If the callee is a
+    // VmClosure with a JIT pointer installed, snapshot (id, ptr,
+    // arity, param_types) into the per-call-site IcSlot so the next
+    // call from this site can hot-path directly to the native fn
+    // without going through vm_call_sync. Non-null slot_ptr is the
+    // hot path's IC slot; null means the caller didn't allocate one
+    // (legacy or no IC wired here yet).
+    if !slot_ptr.is_null() {
+        if let Value::Procedure(p) = &callee_v {
+            if let Some(vmc) = p.as_any().downcast_ref::<VmClosure>() {
+                let id = vmc.closure_id();
+                let jit_ptr = vmc.jit_ptr();
+                if id != 0 && !jit_ptr.is_null() {
+                    // SAFETY: slot_ptr was Box::leak'd by the lowering
+                    // site for an IcSlot; the address is stable for
+                    // the process lifetime. Single-threaded execution
+                    // means no concurrent writer.
+                    let slot = unsafe { &*(slot_ptr as *const crate::ic_compat::IcSlotShim) };
+                    slot.cached_closure_id
+                        .store(id, std::sync::atomic::Ordering::Relaxed);
+                    slot.cached_jit_ptr
+                        .store(jit_ptr as *mut (), std::sync::atomic::Ordering::Relaxed);
+                    slot.cached_arity
+                        .store(vmc.jit_arity(), std::sync::atomic::Ordering::Relaxed);
+                    slot.cached_param_types
+                        .store(vmc.jit_param_types(), std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     match vm_call_sync(&callee_v, &args, syms) {
         Ok(v) => value_to_gc_i64(v),
         Err(e) => panic!("vm_call_general: {}", e.message),
     }
+}
+
+/// Peek a closure's `closure_id` without consuming the Gc handle.
+/// Returns 0 if `callee` is not a `Value::Procedure(VmClosure)`.
+/// Used by JIT-emitted IC hot path: load the id, compare against
+/// the slot's cached value, branch on match.
+///
+/// # Safety
+///
+/// `callee` must be a live `Gc::into_raw_jit` handle. The strong
+/// count stays at +1 after this call (we use raw_incref +
+/// ManuallyDrop to peek).
+#[no_mangle]
+pub unsafe extern "C" fn vm_closure_id_peek(callee: i64) -> u32 {
+    // Bump count so the reconstituted Gc doesn't decrement when it
+    // drops; the caller still owns its strong ref via the raw i64.
+    unsafe { cs_gc::Gc::<Value>::raw_incref(callee as *const ()) };
+    let g: cs_gc::Gc<Value> = unsafe { cs_gc::Gc::from_raw_jit(callee as *const ()) };
+    let id = match &*g {
+        Value::Procedure(p) => p
+            .as_any()
+            .downcast_ref::<VmClosure>()
+            .map(|c| c.closure_id())
+            .unwrap_or(0),
+        _ => 0,
+    };
+    // g drops here, decrementing the count we bumped — net zero.
+    id
 }
 
 /// Read the per-thread JIT-dispatch count. Test/diagnostics only.
