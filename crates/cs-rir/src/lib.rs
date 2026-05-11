@@ -374,6 +374,13 @@ pub enum Inst {
     /// `dst = srem(lhs, rhs)`. R6RS `remainder` for fixnums.
     Remainder(Value, Value, Value),
 
+    /// `dst = modulo(lhs, rhs)`. R6RS `modulo` for fixnums —
+    /// like `remainder` but the result takes the sign of the
+    /// divisor (Euclidean adjustment). Computed inline in
+    /// Cranelift as `srem` + sign-correction `select`.
+    /// ADR 0012 D-2 (iter CL).
+    Modulo(Value, Value, Value),
+
     /// `dst = band(lhs, rhs)`. R6RS `bitwise-and` (R6RS) /
     /// `bitwise-and-bitwise` for two fixnums.
     BitAnd(Value, Value, Value),

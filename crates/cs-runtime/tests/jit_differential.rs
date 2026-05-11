@@ -2917,3 +2917,45 @@ fn diff_jit_list_ref_and_tail() {
         other => panic!("expected (10, 30, 3, 4), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_modulo_signs() {
+    // ADR 0012 D-2 (iter CL) — R6RS modulo follows the divisor's
+    // sign (Euclidean adjustment), unlike `remainder` which
+    // follows the dividend. Lowered inline via Cranelift srem +
+    // select.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (md a b) (modulo a b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (md 13 4) (md -13 4) (md 13 -4) (md -13 -4) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // All four sign combinations.
+    let pp = rt.eval_str_via_vm("<diff>", "(md 13 4)").unwrap(); // 1
+    let np = rt.eval_str_via_vm("<diff>", "(md -13 4)").unwrap(); // 3
+    let pn = rt.eval_str_via_vm("<diff>", "(md 13 -4)").unwrap(); // -3
+    let nn = rt.eval_str_via_vm("<diff>", "(md -13 -4)").unwrap(); // -1
+                                                                   // Zero remainder edge case: clean division.
+    let exact = rt.eval_str_via_vm("<diff>", "(md 12 4)").unwrap(); // 0
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 5,
+        "modulo never dispatched through JIT (count={after})"
+    );
+    match (&pp, &np, &pn, &nn, &exact) {
+        (
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(3)),
+            Value::Number(cs_core::Number::Fixnum(-3)),
+            Value::Number(cs_core::Number::Fixnum(-1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (1, 3, -3, -1, 0), got {:?}", other),
+    }
+}

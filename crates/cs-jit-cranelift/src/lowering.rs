@@ -1591,6 +1591,34 @@ fn lower_inst(
         Inst::Remainder(dst, lhs, rhs) => {
             binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().srem(l, r))?
         }
+        Inst::Modulo(dst, lhs, rhs) => {
+            // ADR 0012 D-2 (iter CL) — R6RS modulo: result has the
+            // sign of the divisor. Compute as srem, then add the
+            // divisor if remainder is non-zero and has a different
+            // sign than the divisor.
+            let l = lookup(map, *lhs)?;
+            let r = lookup(map, *rhs)?;
+            let rem = b.ins().srem(l, r);
+            let zero = b.ins().iconst(I64, 0);
+            let rem_nonzero =
+                b.ins()
+                    .icmp(cranelift_codegen::ir::condcodes::IntCC::NotEqual, rem, zero);
+            let rem_neg = b.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::SignedLessThan,
+                rem,
+                zero,
+            );
+            let div_neg = b.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::SignedLessThan,
+                r,
+                zero,
+            );
+            let sign_diff = b.ins().bxor(rem_neg, div_neg);
+            let adjust = b.ins().band(rem_nonzero, sign_diff);
+            let adjusted = b.ins().iadd(rem, r);
+            let result = b.ins().select(adjust, adjusted, rem);
+            map.insert(*dst, result);
+        }
         Inst::BitAnd(dst, lhs, rhs) => {
             binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().band(l, r))?
         }
