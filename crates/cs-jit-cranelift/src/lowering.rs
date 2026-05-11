@@ -432,6 +432,9 @@ pub struct Lowerer {
     string_trim_left_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_trim_right_gc(s) -> i64`. ADR 0012 D-2 (iter FH).
     string_trim_right_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_replace_all_gc(s, from, to) -> i64`.
+    /// ADR 0012 D-2 (iter FI).
+    string_replace_all_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_list_fill_gc(n, fill) -> i64`. ADR 0012
     /// D-2 (iter EM).
     make_list_fill_func: cranelift_module::FuncId,
@@ -883,6 +886,11 @@ impl Lowerer {
         builder.symbol(
             "vm_string_trim_right_gc",
             cs_vm::vm::vm_string_trim_right_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter FI) — string-replace-all.
+        builder.symbol(
+            "vm_string_replace_all_gc",
+            cs_vm::vm::vm_string_replace_all_gc as *const u8,
         );
         // ADR 0012 D-2 (iter EM) — make-list 2-arg.
         builder.symbol(
@@ -2141,6 +2149,17 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_string_trim_right_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter FI) — string-replace-all.
+        let string_replace_all_func = module
+            .declare_function(
+                "vm_string_replace_all_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_replace_all_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter EM) — vm_make_list_fill_gc(n, fill) -> i64.
         // Same shape as vector_ref_sig (two i64 in, one out).
         let make_list_fill_func = module
@@ -2446,6 +2465,7 @@ impl Lowerer {
             string_trim_func,
             string_trim_left_func,
             string_trim_right_func,
+            string_replace_all_func,
             make_list_fill_func,
             iota_n_func,
             iota_ns_func,
@@ -3028,6 +3048,10 @@ impl Lowerer {
             let string_trim_right_fnref = self
                 .module
                 .declare_func_in_func(self.string_trim_right_func, builder.func);
+            // iter FI — string-replace-all.
+            let string_replace_all_fnref = self
+                .module
+                .declare_func_in_func(self.string_replace_all_func, builder.func);
             // iter EM — make-list 2-arg.
             let make_list_fill_fnref = self
                 .module
@@ -3288,6 +3312,7 @@ impl Lowerer {
                         string_trim_fnref,
                         string_trim_left_fnref,
                         string_trim_right_fnref,
+                        string_replace_all_fnref,
                         make_list_fill_fnref,
                         iota_n_fnref,
                         iota_ns_fnref,
@@ -3601,6 +3626,7 @@ fn lower_inst(
     string_trim_fnref: cranelift_codegen::ir::FuncRef,
     string_trim_left_fnref: cranelift_codegen::ir::FuncRef,
     string_trim_right_fnref: cranelift_codegen::ir::FuncRef,
+    string_replace_all_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
     iota_ns_fnref: cranelift_codegen::ir::FuncRef,
@@ -5973,6 +5999,25 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "StringSplit expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringReplaceAll(dst, s, from, to) => {
+            // ADR 0012 D-2 (iter FI) — vm_string_replace_all_gc.
+            let sv = lookup(map, *s)?;
+            let fv = lookup(map, *from)?;
+            let tv = lookup(map, *to)?;
+            let inst_ref = b.ins().call(string_replace_all_fnref, &[sv, fv, tv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringReplaceAll expected 1 result, got {}",
                         results.len()
                     )));
                 }

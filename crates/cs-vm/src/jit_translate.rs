@@ -2649,6 +2649,20 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StringJoin(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter FI) — string-replace-all.
+                                    ("string-replace-all", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Any)
+                                            && value_types.get(&args[2]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::StringReplaceAll(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter FH) — string trim family.
                                     ("string-trim", 1)
                                         if value_types.get(&args[0]).copied()
@@ -4197,6 +4211,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StringTrim(dst, _)
                 | RirInst::StringTrimLeft(dst, _)
                 | RirInst::StringTrimRight(dst, _)
+                | RirInst::StringReplaceAll(dst, _, _, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)

@@ -6042,3 +6042,39 @@ fn diff_jit_string_trim_family() {
         other => panic!("expected three strings, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_replace_all() {
+    // ADR 0012 D-2 (iter FI) — string-replace-all s from to.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (rep s f t) (string-replace-all s f t))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (rep \"foo bar foo\" \"foo\" \"baz\") \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let a = rt
+        .eval_str_via_vm("<diff>", "(rep \"foo bar foo baz\" \"foo\" \"qux\")")
+        .unwrap();
+    let b = rt
+        .eval_str_via_vm("<diff>", "(rep \"aaaa\" \"aa\" \"b\")")
+        .unwrap();
+    let c = rt
+        .eval_str_via_vm("<diff>", "(rep \"hello world\" \"xyz\" \"abc\")")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&a, &b, &c) {
+        (Value::String(x), Value::String(y), Value::String(z)) => {
+            assert_eq!(&*x.borrow(), "qux bar qux baz");
+            assert_eq!(&*y.borrow(), "bb");
+            assert_eq!(&*z.borrow(), "hello world");
+        }
+        other => panic!("expected three strings, got {:?}", other),
+    }
+}
