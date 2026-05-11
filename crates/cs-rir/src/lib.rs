@@ -439,6 +439,13 @@ pub enum Inst {
     /// Gc<Value::Vector>). ADR 0012 D-2 (iter DT).
     VecAppend(Value, Vec<Value>),
 
+    /// `dst = bytevector-append(bytevectors...)`. Variadic
+    /// bytevector concatenation; lowers to `vm_bytevector_append_buf`
+    /// via a stack-allocated buffer of `Gc<Value::ByteVector>`
+    /// handles. Each arg must be a ByteVector; helper deopts
+    /// otherwise. `dst` is Any. ADR 0012 D-2 (iter DU).
+    BvAppend(Value, Vec<Value>),
+
     /// `dst = bytevector-u8-set!(bv, k, val)`. Lowers to
     /// `vm_bytevector_u8_set_gc`. `bv` Any (consumed), `k` and
     /// `val` Fixnum. `dst` is Any (Gc handle to Unspecified).

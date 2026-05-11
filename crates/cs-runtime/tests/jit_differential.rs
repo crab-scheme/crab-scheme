@@ -4313,3 +4313,51 @@ fn diff_jit_variadic_vector_append() {
         other => panic!("expected (5, 4, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_variadic_bytevector_append() {
+    // ADR 0012 D-2 (iter DU) — variadic `bytevector-append` lowers
+    // via stack-buffer + vm_bytevector_append_buf helper.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ba3 a b c) (bytevector-append a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ba0) (bytevector-append))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (ba3 (bytevector 1 2) (bytevector 3) (bytevector 4 5)) \
+                    (ba0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let len = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(bytevector-length (ba3 (bytevector 10 20) (bytevector 30) (bytevector 40 50)))",
+        )
+        .unwrap();
+    let byte = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(bytevector-u8-ref (ba3 (bytevector 10 20) (bytevector 30) (bytevector 40 50)) 3)",
+        )
+        .unwrap();
+    let empty_len = rt
+        .eval_str_via_vm("<diff>", "(bytevector-length (ba0))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "variadic bytevector-append never dispatched through JIT (count={after})"
+    );
+    match (&len, &byte, &empty_len) {
+        (
+            Value::Number(cs_core::Number::Fixnum(5)),
+            Value::Number(cs_core::Number::Fixnum(40)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (5, 40, 0), got {:?}", other),
+    }
+}

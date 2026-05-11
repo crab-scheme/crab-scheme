@@ -1750,6 +1750,41 @@ pub unsafe extern "C" fn vm_vector_append_buf(buf: *const i64, n: usize) -> i64 
     ))))
 }
 
+/// `(bytevector-append bv ...)` — variadic bytevector concatenation.
+/// `buf` points to `n` raw `Gc<Value::ByteVector>` handles. Each
+/// input handle is consumed. Returns a fresh `Gc<Value::ByteVector>`
+/// handle containing the concatenated bytes. On any non-bytevector
+/// argument, requests a deopt and returns an empty bytevector handle.
+/// ADR 0012 D-2 (iter DU).
+///
+/// # Safety
+///
+/// `buf` must point to a valid array of `n` live, owned `Gc<Value>`
+/// raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_append_buf(buf: *const i64, n: usize) -> i64 {
+    let mut bytes: Vec<u8> = Vec::new();
+    for i in 0..n {
+        let raw = unsafe { *buf.add(i) };
+        let v = unsafe { gc_i64_to_value(raw) };
+        match v {
+            Value::ByteVector(bvc) => {
+                let inner = bvc.borrow();
+                bytes.extend_from_slice(&inner);
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(
+                    std::cell::RefCell::new(Vec::new()),
+                )));
+            }
+        }
+    }
+    value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(std::cell::RefCell::new(
+        bytes,
+    ))))
+}
+
 /// `(make-bytevector n fill)` — allocate a fresh `Value::ByteVector`
 /// of length `n` with every byte set to `fill & 0xFF`. Both args
 /// are raw Fixnum-shape i64 (not Gc handles). Negative `n` clamps
