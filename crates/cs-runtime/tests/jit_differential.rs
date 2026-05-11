@@ -6926,3 +6926,99 @@ fn diff_jit_fl_arith_compare_predicates() {
     assert!(matches!(&p_t, Value::Boolean(true)));
     assert!(matches!(&n_t, Value::Boolean(true)));
 }
+
+#[test]
+fn diff_jit_fl_trig_round_predicates() {
+    // ADR 0012 D-2 (iter FZ) — fl trig/round/predicate aliases.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sn x) (flsin x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (cs x) (flcos x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ex x) (flexp x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (lg x) (fllog x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fl x) (flfloor x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (cl x) (flceiling x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (tr x) (fltruncate x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (rd x) (flround x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fn x) (flfinite? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ifn x) (flinfinite? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (in x) (flinteger? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (nn x) (flnan? x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sn 0.0) (cs 0.0) (ex 0.0) (lg 1.0) \
+                      (fl 1.5) (cl 1.5) (tr 1.5) (rd 1.5) \
+                      (fn 1.0) (ifn 1.0) (in 1.0) (nn 1.0) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let sin0 = rt.eval_str_via_vm("<diff>", "(sn 0.0)").unwrap();
+    let cos0 = rt.eval_str_via_vm("<diff>", "(cs 0.0)").unwrap();
+    let exp0 = rt.eval_str_via_vm("<diff>", "(ex 0.0)").unwrap();
+    let log1 = rt.eval_str_via_vm("<diff>", "(lg 1.0)").unwrap();
+    let f15 = rt.eval_str_via_vm("<diff>", "(fl 1.7)").unwrap();
+    let c15 = rt.eval_str_via_vm("<diff>", "(cl 1.2)").unwrap();
+    let t_neg = rt.eval_str_via_vm("<diff>", "(tr -1.7)").unwrap();
+    let r_half = rt.eval_str_via_vm("<diff>", "(rd 2.5)").unwrap();
+    let fin_t = rt.eval_str_via_vm("<diff>", "(fn 1.0)").unwrap();
+    let inf_t = rt.eval_str_via_vm("<diff>", "(ifn (/ 1.0 0.0))").unwrap();
+    let int_t = rt.eval_str_via_vm("<diff>", "(in 3.0)").unwrap();
+    let int_f = rt.eval_str_via_vm("<diff>", "(in 3.14)").unwrap();
+    let nan_t = rt.eval_str_via_vm("<diff>", "(nn (/ 0.0 0.0))").unwrap();
+    let nan_f = rt.eval_str_via_vm("<diff>", "(nn 1.0)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &sin0 {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!(f.abs() < 1e-9),
+        other => panic!("expected 0.0, got {:?}", other),
+    }
+    match &cos0 {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 1.0).abs() < 1e-9),
+        other => panic!("expected 1.0, got {:?}", other),
+    }
+    match &exp0 {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 1.0).abs() < 1e-9),
+        other => panic!("expected 1.0, got {:?}", other),
+    }
+    match &log1 {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!(f.abs() < 1e-9),
+        other => panic!("expected 0.0, got {:?}", other),
+    }
+    match &f15 {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 1.0).abs() < 1e-9),
+        other => panic!("expected 1.0, got {:?}", other),
+    }
+    match &c15 {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 2.0).abs() < 1e-9),
+        other => panic!("expected 2.0, got {:?}", other),
+    }
+    match &t_neg {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - -1.0).abs() < 1e-9),
+        other => panic!("expected -1.0, got {:?}", other),
+    }
+    // banker's rounding: 2.5 -> 2
+    match &r_half {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 2.0).abs() < 1e-9),
+        other => panic!("expected 2.0, got {:?}", other),
+    }
+    assert!(matches!(&fin_t, Value::Boolean(true)));
+    assert!(matches!(&inf_t, Value::Boolean(true)));
+    assert!(matches!(&int_t, Value::Boolean(true)));
+    assert!(matches!(&int_f, Value::Boolean(false)));
+    assert!(matches!(&nan_t, Value::Boolean(true)));
+    assert!(matches!(&nan_f, Value::Boolean(false)));
+}

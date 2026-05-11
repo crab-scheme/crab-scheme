@@ -2728,6 +2728,99 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::FlonumAbs(dst, args[0]));
                                         value_types.insert(dst, Type::Flonum);
                                     }
+                                    // ADR 0012 D-2 (iter FZ) — fl trig/exp/log/
+                                    // round/predicate aliases (Flonum-only).
+                                    ("flsin", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumSin(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("flcos", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumCos(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("fltan", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumTan(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("flexp", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumExp(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("fllog", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumLog(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("flfloor", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumFloor(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("flceiling", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumCeil(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("fltruncate", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumTrunc(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("flround", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumRound(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("flfinite?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumIsFinite(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("flinfinite?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumIsInfinite(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("flinteger?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumIsInteger(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("flnan?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumIsNan(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // ADR 0012 D-2 (iter EB) — abs/max/min for
                                     // Flonum-typed args. max/min widen any
                                     // Fixnum operand to Flonum via FixToFlo
