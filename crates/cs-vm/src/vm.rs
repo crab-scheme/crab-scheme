@@ -784,6 +784,37 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
     }
 }
 
+/// `(char-foldcase c)` — case-fold mapping for case-insensitive
+/// comparison. For ASCII this matches `char-downcase` (same as the
+/// bytecode `b_char_foldcase`). ADR 0012 D-2 (iter CS).
+///
+/// # Safety
+///
+/// Same as `vm_char_alphabetic_p`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_char_foldcase(c: i64) -> i64 {
+    match char::from_u32(c as u32) {
+        Some(ch) => ch.to_lowercase().next().unwrap_or(ch) as u32 as i64,
+        None => c,
+    }
+}
+
+/// `(char-titlecase c)` — title-case mapping. R7RS allows the
+/// implementation to approximate with uppercase for languages
+/// without a separate title-case form; matches `b_char_titlecase`.
+/// ADR 0012 D-2 (iter CS).
+///
+/// # Safety
+///
+/// Same as `vm_char_alphabetic_p`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_char_titlecase(c: i64) -> i64 {
+    match char::from_u32(c as u32) {
+        Some(ch) => ch.to_uppercase().next().unwrap_or(ch) as u32 as i64,
+        None => c,
+    }
+}
+
 /// `(char-upcase c)` — return the uppercase mapping of `c` as a
 /// Character codepoint. Mirrors the bytecode `b_char_upcase` which
 /// uses `c.to_uppercase().next()` (R6RS simple-case mapping). Invalid

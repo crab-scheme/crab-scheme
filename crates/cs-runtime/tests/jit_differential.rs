@@ -3218,3 +3218,41 @@ fn diff_jit_bytevector_write_ops() {
         other => panic!("expected (8, 171, 171, 42), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_char_foldcase_and_titlecase() {
+    // ADR 0012 D-2 (iter CS) — char-foldcase / char-titlecase.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (fc n) (char->integer (char-foldcase (integer->char n))))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (tc n) (char->integer (char-titlecase (integer->char n))))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (fc 65) (tc 97) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let fc_a = rt.eval_str_via_vm("<diff>", "(fc 65)").unwrap();
+    let tc_a = rt.eval_str_via_vm("<diff>", "(tc 97)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "char-foldcase/titlecase never dispatched through JIT (count={after})"
+    );
+    match (&fc_a, &tc_a) {
+        (
+            Value::Number(cs_core::Number::Fixnum(97)),
+            Value::Number(cs_core::Number::Fixnum(65)),
+        ) => {}
+        other => panic!("expected (97, 65), got {:?}", other),
+    }
+}

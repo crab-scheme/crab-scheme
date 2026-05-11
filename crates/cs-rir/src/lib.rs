@@ -398,6 +398,14 @@ pub enum Inst {
     /// `dst = char-lower-case?(c)`. ADR 0012 D-2 (iter CJ).
     CharLowerCaseP(Value, Value),
 
+    /// `dst = char-foldcase(c)`. Lowers to `vm_char_foldcase`.
+    /// Character result. ADR 0012 D-2 (iter CS).
+    CharFoldcase(Value, Value),
+
+    /// `dst = char-titlecase(c)`. Lowers to `vm_char_titlecase`.
+    /// Character result. ADR 0012 D-2 (iter CS).
+    CharTitlecase(Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a

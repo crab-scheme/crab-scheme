@@ -265,6 +265,12 @@ pub struct Lowerer {
     /// FuncId of `vm_char_lower_case_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CJ).
     char_lower_case_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_char_foldcase(c) -> i64`. Returns Character.
+    /// ADR 0012 D-2 (iter CS).
+    char_foldcase_func: cranelift_module::FuncId,
+    /// FuncId of `vm_char_titlecase(c) -> i64`. Returns Character.
+    /// ADR 0012 D-2 (iter CS).
+    char_titlecase_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -451,6 +457,12 @@ impl Lowerer {
         builder.symbol(
             "vm_char_lower_case_p",
             cs_vm::vm::vm_char_lower_case_p as *const u8,
+        );
+        // ADR 0012 D-2 (iter CS) — char-foldcase / char-titlecase.
+        builder.symbol("vm_char_foldcase", cs_vm::vm::vm_char_foldcase as *const u8);
+        builder.symbol(
+            "vm_char_titlecase",
+            cs_vm::vm::vm_char_titlecase as *const u8,
         );
         let mut module = JITModule::new(builder);
 
@@ -1036,6 +1048,22 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_char_lower_case_p: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter CS) — char-foldcase / char-titlecase.
+        let char_foldcase_func = module
+            .declare_function(
+                "vm_char_foldcase",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_char_foldcase: {e}")))?;
+        let char_titlecase_func = module
+            .declare_function(
+                "vm_char_titlecase",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_char_titlecase: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -1103,6 +1131,8 @@ impl Lowerer {
             char_downcase_func,
             char_upper_case_p_func,
             char_lower_case_p_func,
+            char_foldcase_func,
+            char_titlecase_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -1426,6 +1456,13 @@ impl Lowerer {
             let char_lower_case_p_fnref = self
                 .module
                 .declare_func_in_func(self.char_lower_case_p_func, builder.func);
+            // iter CS — char-foldcase / char-titlecase.
+            let char_foldcase_fnref = self
+                .module
+                .declare_func_in_func(self.char_foldcase_func, builder.func);
+            let char_titlecase_fnref = self
+                .module
+                .declare_func_in_func(self.char_titlecase_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -1550,6 +1587,8 @@ impl Lowerer {
                         char_downcase_fnref,
                         char_upper_case_p_fnref,
                         char_lower_case_p_fnref,
+                        char_foldcase_fnref,
+                        char_titlecase_fnref,
                         inst,
                     )?;
                 }
@@ -1776,6 +1815,8 @@ fn lower_inst(
     char_downcase_fnref: cranelift_codegen::ir::FuncRef,
     char_upper_case_p_fnref: cranelift_codegen::ir::FuncRef,
     char_lower_case_p_fnref: cranelift_codegen::ir::FuncRef,
+    char_foldcase_fnref: cranelift_codegen::ir::FuncRef,
+    char_titlecase_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -3101,6 +3142,38 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "CharLowerCaseP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::CharFoldcase(dst, src) => {
+            // ADR 0012 D-2 (iter CS) — vm_char_foldcase.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(char_foldcase_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "CharFoldcase expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::CharTitlecase(dst, src) => {
+            // ADR 0012 D-2 (iter CS) — vm_char_titlecase.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(char_titlecase_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "CharTitlecase expected 1 result, got {}",
                         results.len()
                     )));
                 }

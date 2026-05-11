@@ -1515,6 +1515,23 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::CharLowerCaseP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter CS) — char-foldcase /
+                                    // char-titlecase. Same Character-gated
+                                    // shape as char-upcase / char-downcase.
+                                    ("char-foldcase", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character) =>
+                                    {
+                                        insts.push(RirInst::CharFoldcase(dst, args[0]));
+                                        value_types.insert(dst, Type::Character);
+                                    }
+                                    ("char-titlecase", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character) =>
+                                    {
+                                        insts.push(RirInst::CharTitlecase(dst, args[0]));
+                                        value_types.insert(dst, Type::Character);
+                                    }
                                     // R6RS tagged-equality on small immediates.
                                     // For Fixnum/Boolean/Character all three
                                     // live in the same i64 register, so an
@@ -2218,9 +2235,13 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                     // the dispatcher decodes via JIT_RT_CHARACTER.
                     char_values.insert(*dst);
                 }
-                RirInst::CharUpcase(dst, _) | RirInst::CharDowncase(dst, _) => {
-                    // char-upcase / char-downcase return a Character
-                    // codepoint; dispatcher decodes via JIT_RT_CHARACTER.
+                RirInst::CharUpcase(dst, _)
+                | RirInst::CharDowncase(dst, _)
+                | RirInst::CharFoldcase(dst, _)
+                | RirInst::CharTitlecase(dst, _) => {
+                    // char-upcase / char-downcase / char-foldcase /
+                    // char-titlecase return a Character codepoint;
+                    // dispatcher decodes via JIT_RT_CHARACTER.
                     char_values.insert(*dst);
                 }
                 RirInst::FixToFlo(dst, _)
