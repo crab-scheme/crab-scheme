@@ -264,6 +264,9 @@ pub struct Lowerer {
     /// FuncId of `vm_vector_copy_gc(v) -> i64`. ADR 0012 D-2
     /// (iter DB).
     vec_copy_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_copy_gc(bv) -> i64`. ADR 0012 D-2
+    /// (iter DC).
+    bv_copy_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -495,6 +498,11 @@ impl Lowerer {
         builder.symbol(
             "vm_vector_copy_gc",
             cs_vm::vm::vm_vector_copy_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter DC) — bytevector-copy.
+        builder.symbol(
+            "vm_bytevector_copy_gc",
+            cs_vm::vm::vm_bytevector_copy_gc as *const u8,
         );
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
@@ -1129,6 +1137,17 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_vector_copy_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter DC) — vm_bytevector_copy_gc(bv) -> i64.
+        let bv_copy_func = module
+            .declare_function(
+                "vm_bytevector_copy_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_copy_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -1343,6 +1362,7 @@ impl Lowerer {
             str_set_func,
             str_copy_func,
             vec_copy_func,
+            bv_copy_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -1681,6 +1701,10 @@ impl Lowerer {
             let vec_copy_fnref = self
                 .module
                 .declare_func_in_func(self.vec_copy_func, builder.func);
+            // iter DC — bytevector-copy.
+            let bv_copy_fnref = self
+                .module
+                .declare_func_in_func(self.bv_copy_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -1859,6 +1883,7 @@ impl Lowerer {
                         str_set_fnref,
                         str_copy_fnref,
                         vec_copy_fnref,
+                        bv_copy_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -2100,6 +2125,7 @@ fn lower_inst(
     str_set_fnref: cranelift_codegen::ir::FuncRef,
     str_copy_fnref: cranelift_codegen::ir::FuncRef,
     vec_copy_fnref: cranelift_codegen::ir::FuncRef,
+    bv_copy_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -3432,6 +3458,23 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "VecCopy expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::BvCopy(dst, src) => {
+            // ADR 0012 D-2 (iter DC) — vm_bytevector_copy_gc.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(bv_copy_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvCopy expected 1 result, got {}",
                         results.len()
                     )));
                 }

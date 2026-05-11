@@ -1076,6 +1076,14 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::VecCopy(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter DC) — bytevector-copy.
+                                    ("bytevector-copy", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvCopy(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter DA) — string-set!.
                                     // s Any, k Fixnum, ch Character.
                                     ("string-set!", 3)
@@ -2511,6 +2519,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StrSet(dst, _, _, _)
                 | RirInst::StrCopy(dst, _)
                 | RirInst::VecCopy(dst, _)
+                | RirInst::BvCopy(dst, _)
                 | RirInst::DigitValue(dst, _)
                 | RirInst::VectorToList(dst, _)
                 | RirInst::ListToVector(dst, _)

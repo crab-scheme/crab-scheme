@@ -970,6 +970,30 @@ pub unsafe extern "C" fn vm_substring_gc(s: i64, start: i64, end: i64) -> i64 {
     }
 }
 
+/// `(bytevector-copy bv)` — return a freshly allocated copy of `bv`.
+/// 1-arg form only. Consumes `bv`. Non-bytevector deopts.
+/// ADR 0012 D-2 (iter DC).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_copy_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let copy = bvc.borrow().clone();
+            value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(std::cell::RefCell::new(
+                copy,
+            ))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
 /// `(string-copy s)` — return a freshly allocated copy of `s`.
 /// 1-arg form only; variadic (start, end slice) variants are
 /// deferred. Consumes `s`. Non-string deopts. ADR 0012 D-2

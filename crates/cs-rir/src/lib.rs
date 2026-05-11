@@ -399,6 +399,11 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter DB).
     VecCopy(Value, Value),
 
+    /// `dst = bytevector-copy(bv)`. Lowers to `vm_bytevector_copy_gc`.
+    /// `bv` Any (consumed). `dst` Any (fresh ByteVector). 1-arg form.
+    /// ADR 0012 D-2 (iter DC).
+    BvCopy(Value, Value),
+
     /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
     /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
     /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).

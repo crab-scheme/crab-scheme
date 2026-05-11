@@ -3632,3 +3632,38 @@ fn diff_jit_string_vector_copy() {
         other => panic!("expected (7, 5), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_bytevector_copy() {
+    // ADR 0012 D-2 (iter DC) — 1-arg bytevector-copy.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bc bv) (bytevector-copy bv))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (bc (make-bytevector 4 0)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let len = rt
+        .eval_str_via_vm("<diff>", "(bytevector-length (bc (make-bytevector 9 7)))")
+        .unwrap();
+    let byte = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(bytevector-u8-ref (bc (make-bytevector 4 42)) 2)",
+        )
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "bytevector-copy never dispatched through JIT (count={after})"
+    );
+    match (&len, &byte) {
+        (Value::Number(cs_core::Number::Fixnum(9)), Value::Number(cs_core::Number::Fixnum(42))) => {
+        }
+        other => panic!("expected (9, 42), got {:?}", other),
+    }
+}
