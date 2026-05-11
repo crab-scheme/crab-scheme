@@ -275,6 +275,9 @@ pub struct Lowerer {
     /// FuncId of `vm_char_titlecase(c) -> i64`. Returns Character.
     /// ADR 0012 D-2 (iter CS).
     char_titlecase_func: cranelift_module::FuncId,
+    /// FuncId of `vm_digit_value(c) -> i64`. Returns Any Gc handle
+    /// (Fixnum or Boolean). ADR 0012 D-2 (iter CV).
+    digit_value_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -470,6 +473,8 @@ impl Lowerer {
             "vm_char_titlecase",
             cs_vm::vm::vm_char_titlecase as *const u8,
         );
+        // ADR 0012 D-2 (iter CV) — digit-value.
+        builder.symbol("vm_digit_value", cs_vm::vm::vm_digit_value as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -1079,6 +1084,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_char_titlecase: {e}")))?;
 
+        // ADR 0012 D-2 (iter CV) — vm_digit_value(c) -> i64.
+        let digit_value_func = module
+            .declare_function(
+                "vm_digit_value",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_digit_value: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -1149,6 +1163,7 @@ impl Lowerer {
             char_lower_case_p_func,
             char_foldcase_func,
             char_titlecase_func,
+            digit_value_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -1483,6 +1498,10 @@ impl Lowerer {
             let char_titlecase_fnref = self
                 .module
                 .declare_func_in_func(self.char_titlecase_func, builder.func);
+            // iter CV — digit-value.
+            let digit_value_fnref = self
+                .module
+                .declare_func_in_func(self.digit_value_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -1610,6 +1629,7 @@ impl Lowerer {
                         char_lower_case_p_fnref,
                         char_foldcase_fnref,
                         char_titlecase_fnref,
+                        digit_value_fnref,
                         inst,
                     )?;
                 }
@@ -1839,6 +1859,7 @@ fn lower_inst(
     char_lower_case_p_fnref: cranelift_codegen::ir::FuncRef,
     char_foldcase_fnref: cranelift_codegen::ir::FuncRef,
     char_titlecase_fnref: cranelift_codegen::ir::FuncRef,
+    digit_value_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -3219,6 +3240,25 @@ fn lower_inst(
                 }
                 results[0]
             };
+            map.insert(*dst, result);
+        }
+        Inst::DigitValue(dst, src) => {
+            // ADR 0012 D-2 (iter CV) — vm_digit_value returns an
+            // Any-shape Gc handle (Fixnum or Boolean). Mark for
+            // stack-map tracking.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(digit_value_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "DigitValue expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
         Inst::Call(_, _, _) | Inst::DeoptCheck(_, _) => {

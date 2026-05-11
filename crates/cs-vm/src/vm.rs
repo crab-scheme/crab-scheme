@@ -784,6 +784,28 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
     }
 }
 
+/// `(digit-value c)` — return the numeric digit value (0-9) of `c`
+/// as a Fixnum, or `#f` if `c` is not a decimal digit. Mixed return
+/// (Fixnum or Boolean) so the result is always an Any-shape Gc handle.
+/// Operand is a Character codepoint (Fixnum-shape i64). Invalid
+/// codepoints (out of u32 range to a char) return `#f`.
+/// ADR 0012 D-2 (iter CV).
+///
+/// # Safety
+///
+/// `c` is a Character codepoint, not a heap pointer.
+#[no_mangle]
+pub unsafe extern "C" fn vm_digit_value(c: i64) -> i64 {
+    let v = match char::from_u32(c as u32) {
+        Some(ch) => match ch.to_digit(10) {
+            Some(d) => Value::Number(cs_core::Number::Fixnum(d as i64)),
+            None => Value::Boolean(false),
+        },
+        None => Value::Boolean(false),
+    };
+    value_to_gc_i64(v)
+}
+
 /// `(char-foldcase c)` — case-fold mapping for case-insensitive
 /// comparison. For ASCII this matches `char-downcase` (same as the
 /// bytecode `b_char_foldcase`). ADR 0012 D-2 (iter CS).

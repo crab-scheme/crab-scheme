@@ -3341,3 +3341,40 @@ fn diff_jit_char_ci_comparisons() {
         other => panic!("expected (1, 0, 1, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_digit_value_mixed_return() {
+    // ADR 0012 D-2 (iter CV) — digit-value returns Fixnum 0-9 for
+    // digit chars and #f for non-digits. Mixed return → Any-shape
+    // Gc result.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (dv n) (digit-value (integer->char n)))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (dv 53) (dv 65) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // 53 = '5', digit-value = 5.
+    let d5 = rt.eval_str_via_vm("<diff>", "(dv 53)").unwrap();
+    // 48 = '0', digit-value = 0.
+    let d0 = rt.eval_str_via_vm("<diff>", "(dv 48)").unwrap();
+    // 65 = 'A', not a digit → #f.
+    let dA = rt.eval_str_via_vm("<diff>", "(dv 65)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "digit-value never dispatched through JIT (count={after})"
+    );
+    match (&d5, &d0, &dA) {
+        (
+            Value::Number(cs_core::Number::Fixnum(5)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (5, 0, #f), got {:?}", other),
+    }
+}

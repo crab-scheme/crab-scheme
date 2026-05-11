@@ -1533,6 +1533,15 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::CharTitlecase(dst, args[0]));
                                         value_types.insert(dst, Type::Character);
                                     }
+                                    // ADR 0012 D-2 (iter CV) — digit-value.
+                                    // Mixed return (Fixnum or #f) so dst is Any.
+                                    ("digit-value", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character) =>
+                                    {
+                                        insts.push(RirInst::DigitValue(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // R6RS tagged-equality on small immediates.
                                     // For Fixnum/Boolean/Character all three
                                     // live in the same i64 register, so an
@@ -2387,7 +2396,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::ListCopy(dst, _)
                 | RirInst::ListSet(dst, _, _, _)
                 | RirInst::BvAlloc(dst, _, _)
-                | RirInst::BvU8Set(dst, _, _, _) => {
+                | RirInst::BvU8Set(dst, _, _, _)
+                | RirInst::DigitValue(dst, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}
