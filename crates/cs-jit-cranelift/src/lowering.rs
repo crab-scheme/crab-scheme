@@ -209,6 +209,15 @@ pub struct Lowerer {
     /// FuncId of `vm_assoc_gc(key, alist) -> i64`. equal?-flavored assq.
     /// ADR 0012 D-2 (iter CH).
     assoc_func: cranelift_module::FuncId,
+    /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
+    /// ADR 0012 D-2 (iter CI).
+    char_alphabetic_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_char_numeric_p(c) -> i64`. Returns 0/1.
+    /// ADR 0012 D-2 (iter CI).
+    char_numeric_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_char_whitespace_p(c) -> i64`. Returns 0/1.
+    /// ADR 0012 D-2 (iter CI).
+    char_whitespace_p_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -338,6 +347,19 @@ impl Lowerer {
         // ADR 0012 D-2 (iter CH) — member / assoc (equal?-flavored search).
         builder.symbol("vm_member_gc", cs_vm::vm::vm_member_gc as *const u8);
         builder.symbol("vm_assoc_gc", cs_vm::vm::vm_assoc_gc as *const u8);
+        // ADR 0012 D-2 (iter CI) — char Unicode predicates.
+        builder.symbol(
+            "vm_char_alphabetic_p",
+            cs_vm::vm::vm_char_alphabetic_p as *const u8,
+        );
+        builder.symbol(
+            "vm_char_numeric_p",
+            cs_vm::vm::vm_char_numeric_p as *const u8,
+        );
+        builder.symbol(
+            "vm_char_whitespace_p",
+            cs_vm::vm::vm_char_whitespace_p as *const u8,
+        );
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -749,6 +771,34 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_assoc_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
+        // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
+        let char_alphabetic_p_func = module
+            .declare_function(
+                "vm_char_alphabetic_p",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_char_alphabetic_p: {e}"))
+            })?;
+        let char_numeric_p_func = module
+            .declare_function(
+                "vm_char_numeric_p",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_char_numeric_p: {e}")))?;
+        let char_whitespace_p_func = module
+            .declare_function(
+                "vm_char_whitespace_p",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_char_whitespace_p: {e}"))
+            })?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -797,6 +847,9 @@ impl Lowerer {
             assv_func,
             member_func,
             assoc_func,
+            char_alphabetic_p_func,
+            char_numeric_p_func,
+            char_whitespace_p_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -1054,6 +1107,16 @@ impl Lowerer {
             let assoc_fnref = self
                 .module
                 .declare_func_in_func(self.assoc_func, builder.func);
+            // iter CI — char predicates.
+            let char_alphabetic_p_fnref = self
+                .module
+                .declare_func_in_func(self.char_alphabetic_p_func, builder.func);
+            let char_numeric_p_fnref = self
+                .module
+                .declare_func_in_func(self.char_numeric_p_func, builder.func);
+            let char_whitespace_p_fnref = self
+                .module
+                .declare_func_in_func(self.char_whitespace_p_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -1159,6 +1222,9 @@ impl Lowerer {
                         assv_fnref,
                         member_fnref,
                         assoc_fnref,
+                        char_alphabetic_p_fnref,
+                        char_numeric_p_fnref,
+                        char_whitespace_p_fnref,
                         inst,
                     )?;
                 }
@@ -1366,6 +1432,9 @@ fn lower_inst(
     assv_fnref: cranelift_codegen::ir::FuncRef,
     member_fnref: cranelift_codegen::ir::FuncRef,
     assoc_fnref: cranelift_codegen::ir::FuncRef,
+    char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
+    char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
+    char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -2331,6 +2400,56 @@ fn lower_inst(
                 results[0]
             };
             b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::CharAlphabeticP(dst, src) => {
+            // ADR 0012 D-2 (iter CI) — vm_char_alphabetic_p.
+            // Operand is a Character codepoint (NOT a Gc handle);
+            // result is Boolean (0/1). No stack-map declaration.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(char_alphabetic_p_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "CharAlphabeticP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::CharNumericP(dst, src) => {
+            // ADR 0012 D-2 (iter CI) — vm_char_numeric_p.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(char_numeric_p_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "CharNumericP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::CharWhitespaceP(dst, src) => {
+            // ADR 0012 D-2 (iter CI) — vm_char_whitespace_p.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(char_whitespace_p_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "CharWhitespaceP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
             map.insert(*dst, result);
         }
         Inst::Call(_, _, _) | Inst::DeoptCheck(_, _) => {

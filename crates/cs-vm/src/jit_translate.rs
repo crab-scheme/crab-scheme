@@ -1291,6 +1291,11 @@ pub fn bytecode_to_rir_with_hints(
                                         // decodes the i64 codepoint into a
                                         // Value::Character on the way out.
                                         insts.push(RirInst::IntCharBitcast(dst, args[0]));
+                                        // Track Character in the inline
+                                        // value_types map so downstream
+                                        // arms (char-alphabetic? etc.) that
+                                        // gate on Type::Character can fire.
+                                        value_types.insert(dst, Type::Character);
                                     }
                                     ("real->flonum", 1) | ("exact->inexact", 1) => {
                                         // Convert the i64 Fixnum into f64
@@ -1349,6 +1354,34 @@ pub fn bytecode_to_rir_with_hints(
                                         // prior integer->char in the same
                                         // body (Fixnum→Char→Fixnum chain).
                                         insts.push(RirInst::Move(dst, args[0]));
+                                    }
+                                    // ADR 0012 D-2 (iter CI) — char Unicode
+                                    // predicates. Gated on Character-typed
+                                    // operand. Operand stays in its Fixnum-
+                                    // shape codepoint lane; helper dispatches
+                                    // via `char::from_u32(...).map_or(0, ...)`
+                                    // so invalid codepoints simply return 0
+                                    // (no deopt).
+                                    ("char-alphabetic?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character) =>
+                                    {
+                                        insts.push(RirInst::CharAlphabeticP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("char-numeric?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character) =>
+                                    {
+                                        insts.push(RirInst::CharNumericP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("char-whitespace?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character) =>
+                                    {
+                                        insts.push(RirInst::CharWhitespaceP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
                                     }
                                     // R6RS tagged-equality on small immediates.
                                     // For Fixnum/Boolean/Character all three
@@ -2030,7 +2063,10 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VecP(dst, _)
                 | RirInst::StrP(dst, _)
                 | RirInst::StrEq(dst, _, _)
-                | RirInst::ListP(dst, _) => {
+                | RirInst::ListP(dst, _)
+                | RirInst::CharAlphabeticP(dst, _)
+                | RirInst::CharNumericP(dst, _)
+                | RirInst::CharWhitespaceP(dst, _) => {
                     bool_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {

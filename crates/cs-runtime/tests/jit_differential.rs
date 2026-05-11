@@ -2745,3 +2745,60 @@ fn diff_jit_member_assoc_equal_search() {
         other => panic!("expected (2, #f, Symbol(x), #f), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_char_unicode_predicates() {
+    // ADR 0012 D-2 (iter CI) — char-alphabetic? / char-numeric? /
+    // char-whitespace? lower to vm_char_*_p helpers using Rust's
+    // Unicode classification. Body uses `integer->char` to feed
+    // each predicate a Character-typed operand so the dispatch
+    // arm fires (it gates on Type::Character).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (alpha? n) (if (char-alphabetic? (integer->char n)) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (numer? n) (if (char-numeric? (integer->char n)) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (white? n) (if (char-whitespace? (integer->char n)) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+            (if (= i 1500) 'done \
+                (begin (alpha? 97) (numer? 97) (white? 97) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // 65 = 'A' (alphabetic), 53 = '5' (numeric), 32 = ' ' (whitespace).
+    let alpha_a = rt.eval_str_via_vm("<diff>", "(alpha? 65)").unwrap();
+    let alpha_5 = rt.eval_str_via_vm("<diff>", "(alpha? 53)").unwrap();
+    let numer_5 = rt.eval_str_via_vm("<diff>", "(numer? 53)").unwrap();
+    let numer_a = rt.eval_str_via_vm("<diff>", "(numer? 65)").unwrap();
+    let white_sp = rt.eval_str_via_vm("<diff>", "(white? 32)").unwrap();
+    let white_a = rt.eval_str_via_vm("<diff>", "(white? 65)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 6,
+        "char predicates never dispatched through JIT (count={after})"
+    );
+    match (&alpha_a, &alpha_5, &numer_5, &numer_a, &white_sp, &white_a) {
+        (
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (1,0,1,0,1,0), got {:?}", other),
+    }
+}

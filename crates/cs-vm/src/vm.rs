@@ -784,6 +784,46 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
     }
 }
 
+/// `(char-alphabetic? c)` — true iff `c` is in a Unicode
+/// alphabetic class. Operand is a Fixnum-shape codepoint i64
+/// (Character ABI carrier — NOT a Gc handle). Invalid codepoints
+/// return 0. ADR 0012 D-2 (iter CI).
+///
+/// # Safety
+///
+/// `c` is a Character codepoint, not a heap pointer. No ABI
+/// invariants beyond the i64 being a valid u32 codepoint (a
+/// Character lane that came from `integer->char` / `string-ref` /
+/// a literal). Out-of-range values are treated as non-character
+/// (return 0) rather than panicking.
+#[no_mangle]
+pub unsafe extern "C" fn vm_char_alphabetic_p(c: i64) -> i64 {
+    char::from_u32(c as u32).map_or(0, |ch| ch.is_alphabetic() as i64)
+}
+
+/// `(char-numeric? c)` — true iff `c` is in a Unicode numeric
+/// class. Mirrors `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).
+///
+/// # Safety
+///
+/// Same as `vm_char_alphabetic_p`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_char_numeric_p(c: i64) -> i64 {
+    char::from_u32(c as u32).map_or(0, |ch| ch.is_numeric() as i64)
+}
+
+/// `(char-whitespace? c)` — true iff `c` is in a Unicode
+/// whitespace class. Mirrors `vm_char_alphabetic_p`.
+/// ADR 0012 D-2 (iter CI).
+///
+/// # Safety
+///
+/// Same as `vm_char_alphabetic_p`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_char_whitespace_p(c: i64) -> i64 {
+    char::from_u32(c as u32).map_or(0, |ch| ch.is_whitespace() as i64)
+}
+
 /// `(member item lst)` — equal?-flavored memq. Uses
 /// `cs_core::eq::equal` (R6RS structural equality with cycle
 /// detection) for the per-element comparison. Returns the

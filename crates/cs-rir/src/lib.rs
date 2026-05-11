@@ -322,6 +322,17 @@ pub enum Inst {
     /// `vm_assoc_gc`. ADR 0012 D-2 (iter CH).
     Assoc(Value, Value, Value),
 
+    /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
+    /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
+    /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).
+    CharAlphabeticP(Value, Value),
+
+    /// `dst = char-numeric?(c)`. ADR 0012 D-2 (iter CI).
+    CharNumericP(Value, Value),
+
+    /// `dst = char-whitespace?(c)`. ADR 0012 D-2 (iter CI).
+    CharWhitespaceP(Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a
