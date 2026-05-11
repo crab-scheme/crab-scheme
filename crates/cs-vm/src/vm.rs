@@ -981,6 +981,51 @@ pub unsafe extern "C" fn vm_flonum_atan2(y: i64, x: i64) -> i64 {
         .to_bits() as i64
 }
 
+/// `(flexpt x y)` — f64::powf. Both args are Flonum bit patterns;
+/// returns Flonum bit pattern. ADR 0012 D-2 (iter GA).
+///
+/// # Safety
+///
+/// Same as `vm_flonum_sin`; both args are raw i64-encoded f64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_expt(x: i64, y: i64) -> i64 {
+    f64::from_bits(x as u64)
+        .powf(f64::from_bits(y as u64))
+        .to_bits() as i64
+}
+
+/// `(fleven? x)` — R6RS Flonum integer parity test. Returns raw 0/1
+/// (Boolean shape). Non-finite or non-integer flonum returns 0.
+/// ADR 0012 D-2 (iter GA).
+///
+/// # Safety
+///
+/// `x` is a Flonum bit pattern.
+#[no_mangle]
+pub unsafe extern "C" fn vm_fl_even_p(x: i64) -> i64 {
+    let f = f64::from_bits(x as u64);
+    if f.is_finite() && f.fract() == 0.0 && (f as i64).rem_euclid(2) == 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// `(flodd? x)` — symmetric to `vm_fl_even_p`. ADR 0012 D-2 (iter GA).
+///
+/// # Safety
+///
+/// Same as `vm_fl_even_p`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_fl_odd_p(x: i64) -> i64 {
+    let f = f64::from_bits(x as u64);
+    if f.is_finite() && f.fract() == 0.0 && (f as i64).rem_euclid(2) != 0 {
+        1
+    } else {
+        0
+    }
+}
+
 /// `(bitwise-bit-count n)` — R6RS-flavored popcount. For n ≥ 0
 /// returns popcount; for n < 0 returns `-1 - popcount(!n)` (matches
 /// the bytecode `b_bitwise_bit_count`). Operand is a raw Fixnum i64

@@ -7022,3 +7022,48 @@ fn diff_jit_fl_trig_round_predicates() {
     assert!(matches!(&nan_t, Value::Boolean(true)));
     assert!(matches!(&nan_f, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_flexpt_parity_and_fixnum_to_flonum() {
+    // ADR 0012 D-2 (iter GA) — flexpt + fleven?/flodd? + fixnum->flonum.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ex x y) (flexpt x y))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (e x) (fleven? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (o x) (flodd? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f n) (fixnum->flonum n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (ex 2.0 10.0) (e 4.0) (o 5.0) (f 42) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let p = rt.eval_str_via_vm("<diff>", "(ex 2.0 8.0)").unwrap();
+    let e_t = rt.eval_str_via_vm("<diff>", "(e 4.0)").unwrap();
+    let e_f = rt.eval_str_via_vm("<diff>", "(e 3.0)").unwrap();
+    let e_frac = rt.eval_str_via_vm("<diff>", "(e 2.5)").unwrap();
+    let o_t = rt.eval_str_via_vm("<diff>", "(o 5.0)").unwrap();
+    let o_f = rt.eval_str_via_vm("<diff>", "(o 4.0)").unwrap();
+    let f42 = rt.eval_str_via_vm("<diff>", "(f 42)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    // 2^8 = 256
+    match &p {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 256.0).abs() < 1e-9),
+        other => panic!("expected 256.0, got {:?}", other),
+    }
+    assert!(matches!(&e_t, Value::Boolean(true)));
+    assert!(matches!(&e_f, Value::Boolean(false)));
+    assert!(matches!(&e_frac, Value::Boolean(false)));
+    assert!(matches!(&o_t, Value::Boolean(true)));
+    assert!(matches!(&o_f, Value::Boolean(false)));
+    match &f42 {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 42.0).abs() < 1e-9),
+        other => panic!("expected 42.0, got {:?}", other),
+    }
+}

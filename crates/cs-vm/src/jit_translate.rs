@@ -2678,7 +2678,9 @@ pub fn bytecode_to_rir_with_hints(
                                         // gate on Type::Character can fire.
                                         value_types.insert(dst, Type::Character);
                                     }
-                                    ("real->flonum", 1) | ("exact->inexact", 1) => {
+                                    ("real->flonum", 1)
+                                    | ("exact->inexact", 1)
+                                    | ("fixnum->flonum", 1) => {
                                         // Convert the i64 Fixnum into f64
                                         // bits via Cranelift's
                                         // fcvt_from_sint+bitcast. The
@@ -2967,6 +2969,30 @@ pub fn bytecode_to_rir_with_hints(
                                     {
                                         insts.push(RirInst::FlonumAtan2(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Flonum);
+                                    }
+                                    // ADR 0012 D-2 (iter GA) — flexpt + fleven?/flodd?.
+                                    ("flexpt", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumExpt(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("fleven?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlEvenP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("flodd?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlOddP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
                                     }
                                     ("flmax", 2)
                                         if value_types.get(&args[0]).copied()
@@ -4832,6 +4858,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::ListP(dst, _)
                 | RirInst::CharAlphabeticP(dst, _)
                 | RirInst::BitwiseBitSetP(dst, _, _)
+                | RirInst::FlEvenP(dst, _)
+                | RirInst::FlOddP(dst, _)
                 | RirInst::CharNumericP(dst, _)
                 | RirInst::CharWhitespaceP(dst, _)
                 | RirInst::CharUpperCaseP(dst, _)
@@ -4893,6 +4921,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::FlonumAtan(dst, _)
                 | RirInst::FlonumLog2(dst, _, _)
                 | RirInst::FlonumAtan2(dst, _, _)
+                | RirInst::FlonumExpt(dst, _, _)
                 | RirInst::BvIeeeSingleNativeRef(dst, _, _)
                 | RirInst::BvIeeeDoubleNativeRef(dst, _, _) => {
                     flo_values.insert(*dst);

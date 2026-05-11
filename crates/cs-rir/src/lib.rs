@@ -160,6 +160,16 @@ pub enum Inst {
     FlonumLog2(Value, Value, Value),
     /// `dst = atan2(y, x)` (2-arg arctangent). ADR 0012 D-2 (iter FM).
     FlonumAtan2(Value, Value, Value),
+    /// `dst = flexpt(x, y)` (2-arg power, f64::powf). ADR 0012 D-2
+    /// (iter GA).
+    FlonumExpt(Value, Value, Value),
+
+    /// `dst = fleven?(x)` (Flonum -> Boolean, raw 0/1). ADR 0012 D-2
+    /// (iter GA).
+    FlEvenP(Value, Value),
+    /// `dst = flodd?(x)` (Flonum -> Boolean, raw 0/1). ADR 0012 D-2
+    /// (iter GA).
+    FlOddP(Value, Value),
 
     /// `dst = bitwise-bit-count(n)`. Fixnum -> Fixnum. ADR 0012 D-2
     /// (iter FN).

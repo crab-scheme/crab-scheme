@@ -354,6 +354,12 @@ pub struct Lowerer {
     flonum_log2_func: cranelift_module::FuncId,
     /// FuncId of `vm_flonum_atan2(y, x) -> i64`. ADR 0012 D-2 (iter FM).
     flonum_atan2_func: cranelift_module::FuncId,
+    /// FuncId of `vm_flonum_expt(x, y) -> i64`. ADR 0012 D-2 (iter GA).
+    flonum_expt_func: cranelift_module::FuncId,
+    /// FuncId of `vm_fl_even_p(x) -> i64`. ADR 0012 D-2 (iter GA).
+    fl_even_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_fl_odd_p(x) -> i64`. ADR 0012 D-2 (iter GA).
+    fl_odd_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -872,6 +878,10 @@ impl Lowerer {
         // ADR 0012 D-2 (iter FM) — log/atan 2-arg.
         builder.symbol("vm_flonum_log2", cs_vm::vm::vm_flonum_log2 as *const u8);
         builder.symbol("vm_flonum_atan2", cs_vm::vm::vm_flonum_atan2 as *const u8);
+        // ADR 0012 D-2 (iter GA) — flexpt, fleven?, flodd?.
+        builder.symbol("vm_flonum_expt", cs_vm::vm::vm_flonum_expt as *const u8);
+        builder.symbol("vm_fl_even_p", cs_vm::vm::vm_fl_even_p as *const u8);
+        builder.symbol("vm_fl_odd_p", cs_vm::vm::vm_fl_odd_p as *const u8);
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
             "vm_bitwise_bit_count",
@@ -2121,6 +2131,29 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_flonum_atan2: {e}")))?;
 
+        // ADR 0012 D-2 (iter GA) — flexpt, fleven?, flodd?.
+        let flonum_expt_func = module
+            .declare_function(
+                "vm_flonum_expt",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_flonum_expt: {e}")))?;
+        let fl_even_p_func = module
+            .declare_function(
+                "vm_fl_even_p",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_fl_even_p: {e}")))?;
+        let fl_odd_p_func = module
+            .declare_function(
+                "vm_fl_odd_p",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_fl_odd_p: {e}")))?;
+
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
             .declare_function(
@@ -3068,6 +3101,9 @@ impl Lowerer {
             flonum_atan_func,
             flonum_log2_func,
             flonum_atan2_func,
+            flonum_expt_func,
+            fl_even_p_func,
+            fl_odd_p_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -3613,6 +3649,16 @@ impl Lowerer {
             let flonum_atan2_fnref = self
                 .module
                 .declare_func_in_func(self.flonum_atan2_func, builder.func);
+            // iter GA — flexpt, fleven?, flodd?.
+            let flonum_expt_fnref = self
+                .module
+                .declare_func_in_func(self.flonum_expt_func, builder.func);
+            let fl_even_p_fnref = self
+                .module
+                .declare_func_in_func(self.fl_even_p_func, builder.func);
+            let fl_odd_p_fnref = self
+                .module
+                .declare_func_in_func(self.fl_odd_p_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4075,6 +4121,9 @@ impl Lowerer {
                         flonum_atan_fnref,
                         flonum_log2_fnref,
                         flonum_atan2_fnref,
+                        flonum_expt_fnref,
+                        fl_even_p_fnref,
+                        fl_odd_p_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -4426,6 +4475,9 @@ fn lower_inst(
     flonum_atan_fnref: cranelift_codegen::ir::FuncRef,
     flonum_log2_fnref: cranelift_codegen::ir::FuncRef,
     flonum_atan2_fnref: cranelift_codegen::ir::FuncRef,
+    flonum_expt_fnref: cranelift_codegen::ir::FuncRef,
+    fl_even_p_fnref: cranelift_codegen::ir::FuncRef,
+    fl_odd_p_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -5129,14 +5181,18 @@ fn lower_inst(
         }
         Inst::BitwiseBitCount(dst, src)
         | Inst::BitwiseLength(dst, src)
-        | Inst::FxFirstBitSet(dst, src) => {
-            // ADR 0012 D-2 (iter FN/FX) — bitwise-bit-count/-length and
-            // fxfirst-bit-set: 1-arg Fixnum helpers.
+        | Inst::FxFirstBitSet(dst, src)
+        | Inst::FlEvenP(dst, src)
+        | Inst::FlOddP(dst, src) => {
+            // ADR 0012 D-2 (iter FN/FX/GA) — 1-arg numeric helpers
+            // (bit-count/-length, trailing-zeros, fl parity).
             let sv = lookup(map, *src)?;
             let fnref = match inst {
                 Inst::BitwiseBitCount(..) => bitwise_bit_count_fnref,
                 Inst::BitwiseLength(..) => bitwise_length_fnref,
                 Inst::FxFirstBitSet(..) => fx_first_bit_set_fnref,
+                Inst::FlEvenP(..) => fl_even_p_fnref,
+                Inst::FlOddP(..) => fl_odd_p_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[sv]);
@@ -5144,7 +5200,7 @@ fn lower_inst(
                 let results = b.inst_results(inst_ref);
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
-                        "Bitwise{{Bit,}}Count/Length/FxFirstBitSet expected 1 result, got {}",
+                        "Bitwise/FxFirstBitSet/Fl{{Even,Odd}}P expected 1 result, got {}",
                         results.len()
                     )));
                 }
@@ -5152,13 +5208,16 @@ fn lower_inst(
             };
             map.insert(*dst, result);
         }
-        Inst::FlonumLog2(dst, n, base) | Inst::FlonumAtan2(dst, n, base) => {
-            // ADR 0012 D-2 (iter FM) — log/atan 2-arg.
+        Inst::FlonumLog2(dst, n, base)
+        | Inst::FlonumAtan2(dst, n, base)
+        | Inst::FlonumExpt(dst, n, base) => {
+            // ADR 0012 D-2 (iter FM/GA) — log/atan/expt 2-arg.
             let nv = lookup(map, *n)?;
             let bv = lookup(map, *base)?;
             let fnref = match inst {
                 Inst::FlonumLog2(..) => flonum_log2_fnref,
                 Inst::FlonumAtan2(..) => flonum_atan2_fnref,
+                Inst::FlonumExpt(..) => flonum_expt_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[nv, bv]);
