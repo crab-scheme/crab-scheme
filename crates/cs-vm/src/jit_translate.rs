@@ -789,21 +789,53 @@ pub fn bytecode_to_rir_with_hints(
                                     // arg — the upstream load of `args[0]`
                                     // is preserved by SSA but unused;
                                     // Cranelift's DCE removes it.
+                                    // Always-true predicates: arg is a Fixnum
+                                    // (or default-typed), which is a number
+                                    // and integer / rational / real /
+                                    // exact-integer / exact-rational /
+                                    // exact-real. exact? is split out below
+                                    // since it depends on Flonum-vs-Fixnum.
                                     ("number?", 1)
                                     | ("integer?", 1)
                                     | ("rational?", 1)
                                     | ("real?", 1)
-                                    | ("exact?", 1)
                                     | ("exact-integer?", 1)
                                     | ("exact-rational?", 1)
                                     | ("exact-real?", 1) => {
                                         let _ = args[0]; // load preserved for SSA correctness
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
                                     }
-                                    ("inexact?", 1) | ("nan?", 1) | ("infinite?", 1) => {
-                                        // Always-false predicates: arg
-                                        // is a Fixnum, which is exact /
-                                        // not a flonum / not NaN / finite.
+                                    // ADR 0012 D-2 (iter EE) — exact?/inexact?
+                                    // are Fixnum-vs-Flonum sensitive. Other
+                                    // types (Character, Boolean, etc.) treat
+                                    // exact? as #t (Fixnum default) — non-
+                                    // numeric args are caller errors.
+                                    ("exact?", 1) => {
+                                        let t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let _ = args[0];
+                                        let v = !matches!(t, Type::Flonum);
+                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(v)));
+                                    }
+                                    ("inexact?", 1) => {
+                                        let t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let _ = args[0];
+                                        let v = matches!(t, Type::Flonum);
+                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(v)));
+                                    }
+                                    ("nan?", 1) | ("infinite?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        // Fixnum / non-flonum: not NaN, not
+                                        // infinite. Flonum case falls
+                                        // through to unsupported (no
+                                        // FlonumIsNan/Infinite RIR yet).
                                         let _ = args[0];
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
                                     }

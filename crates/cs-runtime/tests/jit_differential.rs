@@ -4828,3 +4828,48 @@ fn diff_jit_r7rs_div_ops() {
         other => panic!("expected (-3, -1, -4, 1, -4), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_exact_inexact_type_aware() {
+    // ADR 0012 D-2 (iter EE) — exact?/inexact? type-aware. Closes
+    // a latent gap where the JIT previously emitted const-true /
+    // const-false regardless of operand type. Now Flonum-typed
+    // args correctly return exact? = #f, inexact? = #t.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ex-fix n) (exact? n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ex-flo x) (exact? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (in-fix n) (inexact? n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (in-flo x) (inexact? x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (ex-fix 1) (ex-flo 1.0) (in-fix 1) (in-flo 1.0) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let ef = rt.eval_str_via_vm("<diff>", "(ex-fix 42)").unwrap();
+    let el = rt.eval_str_via_vm("<diff>", "(ex-flo 3.14)").unwrap();
+    let inf = rt.eval_str_via_vm("<diff>", "(in-fix 42)").unwrap();
+    let il = rt.eval_str_via_vm("<diff>", "(in-flo 3.14)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "exact?/inexact? never dispatched through JIT (count={after})"
+    );
+    match (&ef, &el, &inf, &il) {
+        (
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(false),
+            Value::Boolean(true),
+        ) => {}
+        other => panic!("expected (T, F, F, T), got {:?}", other),
+    }
+}
