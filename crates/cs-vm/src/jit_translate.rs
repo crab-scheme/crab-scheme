@@ -882,19 +882,38 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::BitAnd(bit, args[0], one));
                                         insts.push(RirInst::Eq(dst, bit, zero));
                                     }
-                                    ("not", 1) => {
-                                        // (not x) — only works correctly
-                                        // when x is in {0,1} (a Boolean).
-                                        // For arbitrary values the
-                                        // bytecode VM treats only #f as
-                                        // false. The JIT path here only
-                                        // runs when the operand was
-                                        // produced as a Boolean (0/1)
-                                        // by upstream RIR; equivalent
-                                        // to `Eq(x, 0)`.
+                                    // ADR 0012 D-2 (iter EQ) — type-aware (not x).
+                                    // Boolean operand: Eq(x, 0) flips the
+                                    // 0/1 carrier (existing fast path).
+                                    ("not", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Boolean) =>
+                                    {
                                         let zero = alloc();
                                         insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
                                         insts.push(RirInst::Eq(dst, args[0], zero));
+                                    }
+                                    // Any operand: route through AnyTruthy
+                                    // (returns 0 iff inner is #f) and Eq
+                                    // with 0 to invert.
+                                    ("not", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        let truthy = alloc();
+                                        insts.push(RirInst::AnyTruthy(truthy, args[0]));
+                                        value_types.insert(truthy, Type::Boolean);
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Eq(dst, truthy, zero));
+                                    }
+                                    // Other primitive types (Fixnum,
+                                    // Character, Flonum, Symbol, Null): the
+                                    // value is never #f, so (not x) is
+                                    // always #f. Load preserved for SSA.
+                                    ("not", 1) => {
+                                        let _ = args[0];
+                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
                                     }
                                     // Always-true predicates: when the
                                     // arg is a Fixnum (which it always

@@ -5318,3 +5318,44 @@ fn diff_jit_zero_positive_negative_flonum() {
         other => panic!("expected (T, F, T, F, F, T, F), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_not_type_aware() {
+    // ADR 0012 D-2 (iter EQ) — type-aware (not x). Boolean path
+    // is the existing Eq(x, 0). Any path goes through AnyTruthy.
+    // Other primitive types are always truthy → not is always #f.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (n-any x) (not x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (n-bool x) (not (if x #t #f)))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (n-any #t) (n-any 1) (n-bool #f) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // Any operand:
+    let a_f = rt.eval_str_via_vm("<diff>", "(n-any #f)").unwrap();
+    let a_t = rt.eval_str_via_vm("<diff>", "(n-any #t)").unwrap();
+    let a_num = rt.eval_str_via_vm("<diff>", "(n-any 0)").unwrap();
+    let a_nil = rt.eval_str_via_vm("<diff>", "(n-any '())").unwrap();
+    // Boolean operand (via (if x #t #f) normalization):
+    let b_f = rt.eval_str_via_vm("<diff>", "(n-bool #f)").unwrap();
+    let b_t = rt.eval_str_via_vm("<diff>", "(n-bool #t)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&a_f, &a_t, &a_num, &a_nil, &b_f, &b_t) {
+        (
+            Value::Boolean(true),  // (not #f) = #t
+            Value::Boolean(false), // (not #t) = #f
+            Value::Boolean(false), // (not 0) = #f (only #f is falsy)
+            Value::Boolean(false), // (not '()) = #f
+            Value::Boolean(true),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (T, F, F, F, T, F), got {:?}", other),
+    }
+}
