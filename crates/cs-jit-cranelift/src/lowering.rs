@@ -142,6 +142,18 @@ pub struct Lowerer {
     /// `usize` is modeled as `i64` in the Cranelift signature; the
     /// helper truncates internally.
     call_general_func: cranelift_module::FuncId,
+    /// FuncId of `vm_alloc_vector_gc(n, fill) -> i64`.
+    /// `Inst::VecAlloc` lowers to this (ADR 0012 D-2, iter BV).
+    alloc_vector_func: cranelift_module::FuncId,
+    /// FuncId of `vm_vector_ref_gc(vec, idx) -> i64`.
+    vector_ref_func: cranelift_module::FuncId,
+    /// FuncId of `vm_vector_set_gc(vec, idx, x) -> i64`.
+    vector_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_vector_length_gc(vec) -> i64`. Returns raw
+    /// Fixnum-shape i64 (NOT a Gc handle).
+    vector_length_func: cranelift_module::FuncId,
+    /// FuncId of `vm_vector_p_gc(v) -> i64`. Returns 0/1.
+    vector_p_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -224,6 +236,17 @@ impl Lowerer {
         // from `Inst::CallGeneral` whenever the bytecode's call
         // target is neither `self` nor a known builtin.
         builder.symbol("vm_call_general", cs_vm::vm::vm_call_general as *const u8);
+        builder.symbol(
+            "vm_alloc_vector_gc",
+            cs_vm::vm::vm_alloc_vector_gc as *const u8,
+        );
+        builder.symbol("vm_vector_ref_gc", cs_vm::vm::vm_vector_ref_gc as *const u8);
+        builder.symbol("vm_vector_set_gc", cs_vm::vm::vm_vector_set_gc as *const u8);
+        builder.symbol(
+            "vm_vector_length_gc",
+            cs_vm::vm::vm_vector_length_gc as *const u8,
+        );
+        builder.symbol("vm_vector_p_gc", cs_vm::vm::vm_vector_p_gc as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -411,6 +434,64 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_call_general: {e}")))?;
 
+        // ADR 0012 D-2 (iter BV) — vector op helpers.
+        // vm_alloc_vector_gc(n: i64, fill: i64) -> i64
+        let mut alloc_vector_sig = module.make_signature();
+        alloc_vector_sig.params.push(AbiParam::new(I64));
+        alloc_vector_sig.params.push(AbiParam::new(I64));
+        alloc_vector_sig.returns.push(AbiParam::new(I64));
+        let alloc_vector_func = module
+            .declare_function(
+                "vm_alloc_vector_gc",
+                cranelift_module::Linkage::Import,
+                &alloc_vector_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_alloc_vector_gc: {e}")))?;
+
+        // vm_vector_ref_gc(vec: i64, idx: i64) -> i64
+        let mut vector_ref_sig = module.make_signature();
+        vector_ref_sig.params.push(AbiParam::new(I64));
+        vector_ref_sig.params.push(AbiParam::new(I64));
+        vector_ref_sig.returns.push(AbiParam::new(I64));
+        let vector_ref_func = module
+            .declare_function(
+                "vm_vector_ref_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_vector_ref_gc: {e}")))?;
+
+        // vm_vector_set_gc(vec: i64, idx: i64, x: i64) -> i64
+        let mut vector_set_sig = module.make_signature();
+        vector_set_sig.params.push(AbiParam::new(I64));
+        vector_set_sig.params.push(AbiParam::new(I64));
+        vector_set_sig.params.push(AbiParam::new(I64));
+        vector_set_sig.returns.push(AbiParam::new(I64));
+        let vector_set_func = module
+            .declare_function(
+                "vm_vector_set_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_vector_set_gc: {e}")))?;
+
+        // vm_vector_length_gc(vec: i64) -> i64
+        // vm_vector_p_gc(v: i64) -> i64 — same shape.
+        let vector_length_func = module
+            .declare_function(
+                "vm_vector_length_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_vector_length_gc: {e}")))?;
+        let vector_p_func = module
+            .declare_function(
+                "vm_vector_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_vector_p_gc: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -436,6 +517,11 @@ impl Lowerer {
             eq_any_func,
             any_truthy_func,
             call_general_func,
+            alloc_vector_func,
+            vector_ref_func,
+            vector_set_func,
+            vector_length_func,
+            vector_p_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -614,6 +700,22 @@ impl Lowerer {
             let call_general_fnref = self
                 .module
                 .declare_func_in_func(self.call_general_func, builder.func);
+            // iter BV — vector ops.
+            let alloc_vector_fnref = self
+                .module
+                .declare_func_in_func(self.alloc_vector_func, builder.func);
+            let vector_ref_fnref = self
+                .module
+                .declare_func_in_func(self.vector_ref_func, builder.func);
+            let vector_set_fnref = self
+                .module
+                .declare_func_in_func(self.vector_set_func, builder.func);
+            let vector_length_fnref = self
+                .module
+                .declare_func_in_func(self.vector_length_func, builder.func);
+            let vector_p_fnref = self
+                .module
+                .declare_func_in_func(self.vector_p_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -696,6 +798,11 @@ impl Lowerer {
                         eq_any_fnref,
                         any_truthy_fnref,
                         call_general_fnref,
+                        alloc_vector_fnref,
+                        vector_ref_fnref,
+                        vector_set_fnref,
+                        vector_length_fnref,
+                        vector_p_fnref,
                         inst,
                     )?;
                 }
@@ -880,6 +987,11 @@ fn lower_inst(
     eq_any_fnref: cranelift_codegen::ir::FuncRef,
     any_truthy_fnref: cranelift_codegen::ir::FuncRef,
     call_general_fnref: cranelift_codegen::ir::FuncRef,
+    alloc_vector_fnref: cranelift_codegen::ir::FuncRef,
+    vector_ref_fnref: cranelift_codegen::ir::FuncRef,
+    vector_set_fnref: cranelift_codegen::ir::FuncRef,
+    vector_length_fnref: cranelift_codegen::ir::FuncRef,
+    vector_p_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -1339,6 +1451,91 @@ fn lower_inst(
             // it as a stack-map root so Cranelift spills it across
             // any subsequent safepoints in the same block.
             b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::VecAlloc(dst, n_op, fill) => {
+            // ADR 0012 D-2 (iter BV) — vm_alloc_vector_gc(n, fill).
+            let n_v = lookup(map, *n_op)?;
+            let f_v = lookup(map, *fill)?;
+            let inst_ref = b.ins().call(alloc_vector_fnref, &[n_v, f_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "VecAlloc expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::VecRef(dst, vec, idx) => {
+            let v_v = lookup(map, *vec)?;
+            let i_v = lookup(map, *idx)?;
+            let inst_ref = b.ins().call(vector_ref_fnref, &[v_v, i_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "VecRef expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::VecSet(dst, vec, idx, x) => {
+            let v_v = lookup(map, *vec)?;
+            let i_v = lookup(map, *idx)?;
+            let x_v = lookup(map, *x)?;
+            let inst_ref = b.ins().call(vector_set_fnref, &[v_v, i_v, x_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "VecSet expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::VecLength(dst, vec) => {
+            // Returns raw Fixnum-shape i64; no stack-map declaration.
+            let v_v = lookup(map, *vec)?;
+            let inst_ref = b.ins().call(vector_length_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "VecLength expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::VecP(dst, src) => {
+            // Consume-on-use predicate; returns 0/1 (Boolean).
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(vector_p_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "VecP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
             map.insert(*dst, result);
         }
         Inst::Call(_, _, _) | Inst::DeoptCheck(_, _) => {

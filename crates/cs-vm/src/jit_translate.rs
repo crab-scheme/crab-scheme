@@ -865,6 +865,87 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::NullP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter BV) — vector ops.
+                                    // make-vector requires the fill to be
+                                    // Any. If the user passed a typed
+                                    // immediate (e.g. Fixnum), box it via
+                                    // BoxTyped first.
+                                    ("make-vector", 2) => {
+                                        let len_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let fill_t = value_types
+                                            .get(&args[1])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        if len_t != Type::Fixnum {
+                                            return Err(TranslateError::Unsupported(
+                                                "make-vector: length must be Fixnum-typed at JIT translate"
+                                                    .into(),
+                                            ));
+                                        }
+                                        let fill = if fill_t == Type::Any {
+                                            args[1]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[1],
+                                                type_to_jit_rt_tag(fill_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::VecAlloc(dst, args[0], fill));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("vector-ref", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::VecRef(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("vector-set!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        // Box the value-to-store if it's
+                                        // a typed immediate.
+                                        let v_t = value_types
+                                            .get(&args[2])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let val = if v_t == Type::Any {
+                                            args[2]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[2],
+                                                type_to_jit_rt_tag(v_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::VecSet(dst, args[0], args[1], val));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("vector-length", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::VecLength(dst, args[0]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
+                                    ("vector?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::VecP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     ("integer->char", 1) => {
                                         // Same bit pattern as the Fixnum input;
                                         // the return-type post-pass will tag
@@ -1568,7 +1649,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::FlonumEq(dst, _, _)
                 | RirInst::PairP(dst, _)
                 | RirInst::NullP(dst, _)
-                | RirInst::EqAny(dst, _, _) => {
+                | RirInst::EqAny(dst, _, _)
+                | RirInst::VecP(dst, _) => {
                     bool_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {
@@ -1609,7 +1691,10 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::Cdr(dst, _)
                 | RirInst::AnyClone(dst, _)
                 | RirInst::CallGeneral(dst, _, _)
-                | RirInst::EnvLookupAny(dst, _) => {
+                | RirInst::EnvLookupAny(dst, _)
+                | RirInst::VecAlloc(dst, _, _)
+                | RirInst::VecRef(dst, _, _)
+                | RirInst::VecSet(dst, _, _, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

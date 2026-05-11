@@ -2001,3 +2001,98 @@ fn diff_jit_general_call_via_slow_path() {
         other => panic!("walker / jit disagree: {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_vector_ref_from_make_vector() {
+    // M6 Phase 4 iter BV: vector-ref against a freshly-allocated
+    // vector. The body's `make-vector` lowers to vm_alloc_vector_gc;
+    // `vector-ref` lowers to vm_vector_ref_gc; the indexed element
+    // (initialized to 42 via the fill arg) comes back as Fixnum.
+    let defines = &["(define (vec-first n) (vector-ref (make-vector n 42) 0))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (vec-first 3) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let jit = rt.eval_str_via_vm("<diff>", "(vec-first 5)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after > 0,
+        "vec-first never dispatched through JIT (count={})",
+        after
+    );
+    let walker = walker_eval(defines, "(vec-first 5)");
+    match (&jit, &walker) {
+        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+            assert_eq!(j, w);
+            assert_eq!(*j, 42);
+        }
+        other => panic!("expected fixnum 42, got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_jit_vector_length() {
+    // vector-length lowers to vm_vector_length_gc (returns raw
+    // Fixnum-shape i64, no Gc wrapping).
+    let defines = &["(define (vlen n) (vector-length (make-vector n 0)))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (vlen 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let jit = rt.eval_str_via_vm("<diff>", "(vlen 7)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after > 0,
+        "vlen never dispatched through JIT (count={})",
+        after
+    );
+    let walker = walker_eval(defines, "(vlen 7)");
+    match (&jit, &walker) {
+        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+            assert_eq!(j, w);
+            assert_eq!(*j, 7);
+        }
+        other => panic!("expected fixnum 7, got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_jit_vector_pred() {
+    // vector? lowers to vm_vector_p_gc (returns 0/1).
+    let defines = &["(define (is-vec? v) (if (vector? v) 1 0))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (is-vec? (make-vector i 0)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let jit_vec = rt
+        .eval_str_via_vm("<diff>", "(is-vec? (make-vector 3 0))")
+        .unwrap();
+    let jit_pair = rt
+        .eval_str_via_vm("<diff>", "(is-vec? (cons 1 2))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "is-vec? never dispatched through JIT (count={})",
+        after
+    );
+    match (&jit_vec, &jit_pair) {
+        (Value::Number(cs_core::Number::Fixnum(1)), Value::Number(cs_core::Number::Fixnum(0))) => {}
+        other => panic!("expected (1, 0), got {:?}", other),
+    }
+}

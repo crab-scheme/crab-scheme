@@ -218,6 +218,29 @@ pub enum Inst {
     /// just `()` (void) — no SSA result.
     EnvSet(u32, Value),
 
+    /// `dst = make-vector(n, fill)`. Lowers to `vm_alloc_vector_gc`.
+    /// `n` is Fixnum-shape; `fill` is Any (Gc handle, consumed).
+    /// `dst` is Any (fresh Gc handle to a Vector slot).
+    /// ADR 0012 D-2 (iter BV).
+    VecAlloc(Value, Value, Value),
+
+    /// `dst = vector-ref(vec, idx)`. Lowers to `vm_vector_ref_gc`.
+    /// `vec` Any (consumed), `idx` Fixnum, `dst` Any.
+    VecRef(Value, Value, Value),
+
+    /// `dst = vector-set!(vec, idx, x)`. Lowers to `vm_vector_set_gc`.
+    /// `vec` Any (consumed), `idx` Fixnum, `x` Any (consumed). `dst`
+    /// is Any — the helper returns a Gc-wrapped Unspecified.
+    VecSet(Value, Value, Value, Value),
+
+    /// `dst = vector-length(vec)`. Lowers to `vm_vector_length_gc`.
+    /// `vec` Any (consumed). `dst` is Fixnum (raw length, not boxed).
+    VecLength(Value, Value),
+
+    /// `dst = vector?(v)`. Lowers to `vm_vector_p_gc`. `v` Any
+    /// (consumed). `dst` is Boolean (0/1).
+    VecP(Value, Value),
+
     /// `dst = sdiv(lhs, rhs)`. R6RS `quotient` for fixnums.
     /// Cranelift native sdiv (signed integer divide). Divide-by-
     /// zero traps; the JIT body propagates the trap as a panic
