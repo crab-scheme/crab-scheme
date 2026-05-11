@@ -3101,6 +3101,108 @@ pub unsafe extern "C" fn vm_last_gc(lst: i64) -> i64 {
     }
 }
 
+/// Helper: classify a list via tortoise/hare. Returns:
+///   Some(true)  — proper finite list
+///   Some(false) — circular list
+///   None        — improper (dotted) terminator
+/// ADR 0012 D-2 (iter EY). Mirrors cs_runtime::builtins::list_classify.
+#[inline]
+fn jit_list_classify(v: &Value) -> Option<bool> {
+    let mut slow = v.clone();
+    let mut fast = v.clone();
+    loop {
+        match fast {
+            Value::Null => return Some(true),
+            Value::Pair(p) => {
+                let next = p.cdr.borrow().clone();
+                match next {
+                    Value::Null => return Some(true),
+                    Value::Pair(p2) => {
+                        let next2 = p2.cdr.borrow().clone();
+                        slow = match slow {
+                            Value::Pair(sp) => sp.cdr.borrow().clone(),
+                            _ => return Some(true),
+                        };
+                        fast = next2;
+                        if let (Value::Pair(a), Value::Pair(b)) = (&slow, &fast) {
+                            if cs_core::Gc::ptr_eq(a, b) {
+                                return Some(false);
+                            }
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// `(null-list? v)` — SRFI-1. Returns 1 iff v is Null, 0 if Pair,
+/// deopts otherwise. ADR 0012 D-2 (iter EY).
+///
+/// # Safety
+///
+/// `v` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_null_list_p_gc(v: i64) -> i64 {
+    let val = unsafe { gc_i64_to_value(v) };
+    match val {
+        Value::Null => 1,
+        Value::Pair(_) => 0,
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+/// `(proper-list? v)` — SRFI-1. True for Null and for any pair
+/// chain ending in Null. ADR 0012 D-2 (iter EY).
+///
+/// # Safety
+///
+/// `v` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_proper_list_p_gc(v: i64) -> i64 {
+    let val = unsafe { gc_i64_to_value(v) };
+    matches!(jit_list_classify(&val), Some(true)) as i64
+}
+
+/// `(dotted-list? v)` — SRFI-1. True iff `v` is a pair chain ending
+/// in a non-pair non-null, OR is itself a non-pair non-null
+/// (degenerate "list" of length 0 with a single improper element).
+/// ADR 0012 D-2 (iter EY).
+///
+/// # Safety
+///
+/// `v` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_dotted_list_p_gc(v: i64) -> i64 {
+    let val = unsafe { gc_i64_to_value(v) };
+    let cls = jit_list_classify(&val);
+    let r = match (&val, cls) {
+        (Value::Null, _) => false,
+        (Value::Pair(_), Some(true)) => false,
+        (Value::Pair(_), Some(false)) => false,
+        (Value::Pair(_), None) => true,
+        (_, _) => true,
+    };
+    r as i64
+}
+
+/// `(circular-list? v)` — SRFI-1. True iff `v` is a cyclic pair
+/// chain (tortoise/hare meet). ADR 0012 D-2 (iter EY).
+///
+/// # Safety
+///
+/// `v` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_circular_list_p_gc(v: i64) -> i64 {
+    let val = unsafe { gc_i64_to_value(v) };
+    matches!(jit_list_classify(&val), Some(false)) as i64
+}
+
 /// `(take lst n)` — SRFI-1. Return the first `n` elements of
 /// `lst` as a fresh list. `n` is a raw Fixnum-shape i64. Consumes
 /// the input Gc handle. On short list or negative `n`, requests a

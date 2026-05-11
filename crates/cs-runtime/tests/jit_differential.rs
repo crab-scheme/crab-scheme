@@ -5632,3 +5632,50 @@ fn diff_jit_take_drop() {
         other => panic!("expected (pair, 3, pair, 4), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_list_classifiers() {
+    // ADR 0012 D-2 (iter EY) — null-list?/proper-list?/dotted-list?/
+    // circular-list?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (nl x) (null-list? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (pl x) (proper-list? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (dl x) (dotted-list? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (cl x) (circular-list? x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (nl '()) (pl '(1 2 3)) (dl '(1 . 2)) (cl '()) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let n_t = rt.eval_str_via_vm("<diff>", "(nl '())").unwrap();
+    let n_f = rt.eval_str_via_vm("<diff>", "(nl '(1 2))").unwrap();
+    let p_t = rt.eval_str_via_vm("<diff>", "(pl '(1 2 3))").unwrap();
+    let p_n = rt.eval_str_via_vm("<diff>", "(pl '())").unwrap();
+    let p_f = rt.eval_str_via_vm("<diff>", "(pl '(1 . 2))").unwrap();
+    let d_t = rt.eval_str_via_vm("<diff>", "(dl '(1 . 2))").unwrap();
+    let d_f = rt.eval_str_via_vm("<diff>", "(dl '(1 2 3))").unwrap();
+    let c_f = rt.eval_str_via_vm("<diff>", "(cl '(1 2 3))").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&n_t, &n_f, &p_t, &p_n, &p_f, &d_t, &d_f, &c_f) {
+        (
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (T, F, T, T, F, T, F, F), got {:?}", other),
+    }
+}

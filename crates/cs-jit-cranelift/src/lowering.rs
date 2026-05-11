@@ -431,6 +431,14 @@ pub struct Lowerer {
     take_func: cranelift_module::FuncId,
     /// FuncId of `vm_drop_gc(lst, n) -> i64`. ADR 0012 D-2 (iter EX).
     drop_func: cranelift_module::FuncId,
+    /// FuncId of `vm_null_list_p_gc(v) -> i64`. ADR 0012 D-2 (iter EY).
+    null_list_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_proper_list_p_gc(v) -> i64`. ADR 0012 D-2 (iter EY).
+    proper_list_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_dotted_list_p_gc(v) -> i64`. ADR 0012 D-2 (iter EY).
+    dotted_list_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_circular_list_p_gc(v) -> i64`. ADR 0012 D-2 (iter EY).
+    circular_list_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_vector_copy_bang_gc(dest, at, src) -> i64`.
     /// ADR 0012 D-2 (iter ER).
     vector_copy_bang_func: cranelift_module::FuncId,
@@ -838,6 +846,23 @@ impl Lowerer {
         // ADR 0012 D-2 (iter EX) — take / drop.
         builder.symbol("vm_take_gc", cs_vm::vm::vm_take_gc as *const u8);
         builder.symbol("vm_drop_gc", cs_vm::vm::vm_drop_gc as *const u8);
+        // ADR 0012 D-2 (iter EY) — SRFI-1 list classifiers.
+        builder.symbol(
+            "vm_null_list_p_gc",
+            cs_vm::vm::vm_null_list_p_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_proper_list_p_gc",
+            cs_vm::vm::vm_proper_list_p_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_dotted_list_p_gc",
+            cs_vm::vm::vm_dotted_list_p_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_circular_list_p_gc",
+            cs_vm::vm::vm_circular_list_p_gc as *const u8,
+        );
         // ADR 0012 D-2 (iter ER) — vector-copy! 3-arg.
         builder.symbol(
             "vm_vector_copy_bang_gc",
@@ -2045,6 +2070,38 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_drop_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter EY) — SRFI-1 list classifiers.
+        let null_list_p_func = module
+            .declare_function(
+                "vm_null_list_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_null_list_p_gc: {e}")))?;
+        let proper_list_p_func = module
+            .declare_function(
+                "vm_proper_list_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_proper_list_p_gc: {e}")))?;
+        let dotted_list_p_func = module
+            .declare_function(
+                "vm_dotted_list_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_dotted_list_p_gc: {e}")))?;
+        let circular_list_p_func = module
+            .declare_function(
+                "vm_circular_list_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_circular_list_p_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter ER) — vm_vector_copy_bang_gc(dest, at, src).
         let vector_copy_bang_func = module
             .declare_function(
@@ -2230,6 +2287,10 @@ impl Lowerer {
             last_func,
             take_func,
             drop_func,
+            null_list_p_func,
+            proper_list_p_func,
+            dotted_list_p_func,
+            circular_list_p_func,
             vector_copy_bang_func,
             bytevector_copy_bang_func,
             string_copy_bang_func,
@@ -2795,6 +2856,19 @@ impl Lowerer {
             let drop_fnref = self
                 .module
                 .declare_func_in_func(self.drop_func, builder.func);
+            // iter EY — SRFI-1 list classifiers.
+            let null_list_p_fnref = self
+                .module
+                .declare_func_in_func(self.null_list_p_func, builder.func);
+            let proper_list_p_fnref = self
+                .module
+                .declare_func_in_func(self.proper_list_p_func, builder.func);
+            let dotted_list_p_fnref = self
+                .module
+                .declare_func_in_func(self.dotted_list_p_func, builder.func);
+            let circular_list_p_fnref = self
+                .module
+                .declare_func_in_func(self.circular_list_p_func, builder.func);
             // iter ER — vector-copy!.
             let vector_copy_bang_fnref = self
                 .module
@@ -3004,6 +3078,10 @@ impl Lowerer {
                         last_fnref,
                         take_fnref,
                         drop_fnref,
+                        null_list_p_fnref,
+                        proper_list_p_fnref,
+                        dotted_list_p_fnref,
+                        circular_list_p_fnref,
                         vector_copy_bang_fnref,
                         bytevector_copy_bang_fnref,
                         string_copy_bang_fnref,
@@ -3302,6 +3380,10 @@ fn lower_inst(
     last_fnref: cranelift_codegen::ir::FuncRef,
     take_fnref: cranelift_codegen::ir::FuncRef,
     drop_fnref: cranelift_codegen::ir::FuncRef,
+    null_list_p_fnref: cranelift_codegen::ir::FuncRef,
+    proper_list_p_fnref: cranelift_codegen::ir::FuncRef,
+    dotted_list_p_fnref: cranelift_codegen::ir::FuncRef,
+    circular_list_p_fnref: cranelift_codegen::ir::FuncRef,
     vector_copy_bang_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_copy_bang_fnref: cranelift_codegen::ir::FuncRef,
     string_copy_bang_fnref: cranelift_codegen::ir::FuncRef,
@@ -5737,6 +5819,33 @@ fn lower_inst(
                 results[0]
             };
             b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::NullListP(dst, src)
+        | Inst::ProperListP(dst, src)
+        | Inst::DottedListP(dst, src)
+        | Inst::CircularListP(dst, src) => {
+            // ADR 0012 D-2 (iter EY) — SRFI-1 list classifiers.
+            // All four return raw 0/1 (Boolean carrier).
+            let v_v = lookup(map, *src)?;
+            let fnref = match inst {
+                Inst::NullListP(..) => null_list_p_fnref,
+                Inst::ProperListP(..) => proper_list_p_fnref,
+                Inst::DottedListP(..) => dotted_list_p_fnref,
+                Inst::CircularListP(..) => circular_list_p_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "ListClassifier expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
             map.insert(*dst, result);
         }
         Inst::Take(dst, lst, n_v) | Inst::Drop(dst, lst, n_v) => {

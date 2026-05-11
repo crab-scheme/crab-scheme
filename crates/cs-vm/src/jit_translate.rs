@@ -2707,6 +2707,35 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::LastPair(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter EY) — SRFI-1 list classifiers.
+                                    ("null-list?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::NullListP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("proper-list?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::ProperListP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("dotted-list?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::DottedListP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("circular-list?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::CircularListP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // ADR 0012 D-2 (iter EX) — take / drop.
                                     ("take", 2)
                                         if value_types.get(&args[0]).copied()
@@ -3863,6 +3892,10 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StrCiGe(dst, _, _)
                 | RirInst::StringPrefixP(dst, _, _)
                 | RirInst::StringSuffixP(dst, _, _)
+                | RirInst::NullListP(dst, _)
+                | RirInst::ProperListP(dst, _)
+                | RirInst::DottedListP(dst, _)
+                | RirInst::CircularListP(dst, _)
                 | RirInst::ListP(dst, _)
                 | RirInst::CharAlphabeticP(dst, _)
                 | RirInst::CharNumericP(dst, _)

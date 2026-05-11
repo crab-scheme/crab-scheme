@@ -748,6 +748,15 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter EX).
     Drop(Value, Value, Value),
 
+    /// `dst = null-list?(v)`. ADR 0012 D-2 (iter EY).
+    NullListP(Value, Value),
+    /// `dst = proper-list?(v)`. ADR 0012 D-2 (iter EY).
+    ProperListP(Value, Value),
+    /// `dst = dotted-list?(v)`. ADR 0012 D-2 (iter EY).
+    DottedListP(Value, Value),
+    /// `dst = circular-list?(v)`. ADR 0012 D-2 (iter EY).
+    CircularListP(Value, Value),
+
     /// `dst = vector-copy!(dest, at, src)`. 3-arg form. Lowers to
     /// `vm_vector_copy_bang_gc`. `dest` and `src` Any-shape
     /// (consumed). `at` Fixnum-shape. `dst` is Any (Gc handle to
