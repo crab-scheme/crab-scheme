@@ -1824,6 +1824,21 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::HashtableMutableP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter GH) — hashtable-keys/values.
+                                    ("hashtable-keys", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::HashtableKeys(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("hashtable-values", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::HashtableValues(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     ("eof-object?", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
@@ -5154,6 +5169,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StringTakeRight(dst, _, _)
                 | RirInst::StringDropRight(dst, _, _)
                 | RirInst::StringTitlecase(dst, _)
+                | RirInst::HashtableKeys(dst, _)
+                | RirInst::HashtableValues(dst, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)

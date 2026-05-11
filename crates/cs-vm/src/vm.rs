@@ -881,6 +881,52 @@ pub unsafe extern "C" fn vm_hashtable_mutable_p_gc(r: i64) -> i64 {
     }
 }
 
+/// `(hashtable-keys ht)` — fresh Vector of the hashtable's keys.
+/// ADR 0012 D-2 (iter GH).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_keys_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Hashtable(h) => {
+            let keys: Vec<Value> = h.items.borrow().iter().map(|(k, _)| k.clone()).collect();
+            value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(keys))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+                Vec::new(),
+            ))))
+        }
+    }
+}
+
+/// `(hashtable-values ht)` — fresh Vector of the hashtable's values.
+/// ADR 0012 D-2 (iter GH).
+///
+/// # Safety
+///
+/// Same as `vm_hashtable_keys_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_values_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Hashtable(h) => {
+            let vals: Vec<Value> = h.items.borrow().iter().map(|(_, v)| v.clone()).collect();
+            value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(vals))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+                Vec::new(),
+            ))))
+        }
+    }
+}
+
 /// `(div x y)` — R6RS Euclidean division. Result rounds toward -∞
 /// such that `mod` is always non-negative. Deopts on y == 0 (bytecode
 /// raises a condition we don't model here). Both args raw Fixnum-shape.

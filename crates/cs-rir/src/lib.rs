@@ -679,6 +679,10 @@ pub enum Inst {
     HashtableSize(Value, Value),
     /// `dst = hashtable-mutable?(ht)`. ADR 0012 D-2 (iter GG).
     HashtableMutableP(Value, Value),
+    /// `dst = hashtable-keys(ht)`. ADR 0012 D-2 (iter GH).
+    HashtableKeys(Value, Value),
+    /// `dst = hashtable-values(ht)`. ADR 0012 D-2 (iter GH).
+    HashtableValues(Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

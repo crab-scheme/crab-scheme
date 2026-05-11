@@ -7345,3 +7345,56 @@ fn diff_jit_hashtable_size_and_mutable() {
     assert!(matches!(&pop, Value::Number(cs_core::Number::Fixnum(3))));
     assert!(matches!(&mutable, Value::Boolean(true)));
 }
+
+#[test]
+fn diff_jit_hashtable_keys_values() {
+    // ADR 0012 D-2 (iter GH) — hashtable-keys + hashtable-values.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (kk ht) (hashtable-keys ht))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (vv ht) (hashtable-values ht))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm-ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! warm-ht 'a 1)")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (kk warm-ht) (vv warm-ht) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'x 10)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'y 20)")
+        .unwrap();
+    let keys = rt.eval_str_via_vm("<diff>", "(kk ht)").unwrap();
+    let vals = rt.eval_str_via_vm("<diff>", "(vv ht)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &keys {
+        Value::Vector(v) => assert_eq!(v.borrow().len(), 2),
+        other => panic!("expected vector, got {:?}", other),
+    }
+    match &vals {
+        Value::Vector(v) => {
+            assert_eq!(v.borrow().len(), 2);
+            let nums: Vec<i64> = v
+                .borrow()
+                .iter()
+                .filter_map(|x| match x {
+                    Value::Number(cs_core::Number::Fixnum(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(nums.len(), 2);
+            assert!(nums.contains(&10));
+            assert!(nums.contains(&20));
+        }
+        other => panic!("expected vector, got {:?}", other),
+    }
+}
