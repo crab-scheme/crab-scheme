@@ -1588,6 +1588,39 @@ pub unsafe extern "C" fn vm_make_string_buf(buf: *const i64, n: usize) -> i64 {
     value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
 }
 
+/// `(bytevector b ...)` — variadic bytevector constructor. `buf`
+/// points to `n` raw `Gc<Value>` handles (BoxTyped'd from Fixnum
+/// primitives). Each value must be a Fixnum, masked to the low 8
+/// bits. Each input handle is consumed. On any non-fixnum
+/// argument, requests a deopt and returns an empty bytevector
+/// handle. ADR 0012 D-2 (iter DQ).
+///
+/// # Safety
+///
+/// `buf` must point to a valid array of `n` live, owned `Gc<Value>`
+/// raw handles. Caller manages buffer lifetime (stack-allocated for
+/// the call duration).
+#[no_mangle]
+pub unsafe extern "C" fn vm_make_bytevector_buf(buf: *const i64, n: usize) -> i64 {
+    let mut bytes: Vec<u8> = Vec::with_capacity(n);
+    for i in 0..n {
+        let raw = unsafe { *buf.add(i) };
+        let v = unsafe { gc_i64_to_value(raw) };
+        match v {
+            Value::Number(cs_core::Number::Fixnum(x)) => bytes.push((x & 0xFF) as u8),
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(
+                    std::cell::RefCell::new(Vec::new()),
+                )));
+            }
+        }
+    }
+    value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(std::cell::RefCell::new(
+        bytes,
+    ))))
+}
+
 /// `(make-bytevector n fill)` — allocate a fresh `Value::ByteVector`
 /// of length `n` with every byte set to `fill & 0xFF`. Both args
 /// are raw Fixnum-shape i64 (not Gc handles). Negative `n` clamps

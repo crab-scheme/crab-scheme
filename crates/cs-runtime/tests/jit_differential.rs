@@ -4153,3 +4153,44 @@ fn diff_jit_variadic_string() {
         other => panic!("expected (3, #\\y, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_variadic_bytevector() {
+    // ADR 0012 D-2 (iter DQ) — variadic `bytevector` lowers via
+    // stack-buffer + vm_make_bytevector_buf helper.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bv3 a b c) (bytevector a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bv0) (bytevector))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (bv3 1 2 3) (bv0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let len = rt
+        .eval_str_via_vm("<diff>", "(bytevector-length (bv3 10 20 30))")
+        .unwrap();
+    let byte = rt
+        .eval_str_via_vm("<diff>", "(bytevector-u8-ref (bv3 10 20 30) 1)")
+        .unwrap();
+    let empty_len = rt
+        .eval_str_via_vm("<diff>", "(bytevector-length (bv0))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "variadic bytevector never dispatched through JIT (count={after})"
+    );
+    match (&len, &byte, &empty_len) {
+        (
+            Value::Number(cs_core::Number::Fixnum(3)),
+            Value::Number(cs_core::Number::Fixnum(20)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (3, 20, 0), got {:?}", other),
+    }
+}

@@ -411,6 +411,13 @@ pub enum Inst {
     /// `dst` is Any (fresh Gc<Value::String>). ADR 0012 D-2 (iter DP).
     StrBuild(Value, Vec<Value>),
 
+    /// `dst = bytevector(bytes...)`. Variadic bytevector constructor;
+    /// lowers to `vm_make_bytevector_buf` via a stack-allocated buffer
+    /// of Any-tagged Gc handles. Each arg must be a Fixnum; the
+    /// translator boxes Fixnum primitives via BoxTyped first. `dst`
+    /// is Any (fresh Gc<Value::ByteVector>). ADR 0012 D-2 (iter DQ).
+    BvBuild(Value, Vec<Value>),
+
     /// `dst = bytevector-u8-set!(bv, k, val)`. Lowers to
     /// `vm_bytevector_u8_set_gc`. `bv` Any (consumed), `k` and
     /// `val` Fixnum. `dst` is Any (Gc handle to Unspecified).
