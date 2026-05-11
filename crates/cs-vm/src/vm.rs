@@ -1662,6 +1662,60 @@ pub unsafe extern "C" fn vm_string_append_buf(buf: *const i64, n: usize) -> i64 
     value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
 }
 
+/// `(append list1 ... obj)` — variadic list concatenation. `buf`
+/// points to `n` raw `Gc<Value>` handles. All but the last arg must
+/// be proper lists; the last arg is used as-is (R7RS semantics).
+/// Each input handle is consumed. Returns a fresh
+/// `Gc<Value>` handle. On any non-proper-list among the first n-1
+/// args, requests a deopt and returns a Null handle.
+/// ADR 0012 D-2 (iter DS).
+///
+/// # Safety
+///
+/// `buf` must point to a valid array of `n` live, owned `Gc<Value>`
+/// raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_append_buf(buf: *const i64, n: usize) -> i64 {
+    if n == 0 {
+        return value_to_gc_i64(Value::Null);
+    }
+    // Collect each arg via consume-on-use semantics.
+    let mut owned: Vec<Value> = Vec::with_capacity(n);
+    for i in 0..n {
+        let raw = unsafe { *buf.add(i) };
+        owned.push(unsafe { gc_i64_to_value(raw) });
+    }
+    if n == 1 {
+        return value_to_gc_i64(owned.into_iter().next().unwrap());
+    }
+    // Walk all but the last collecting elements; deopt on improper list.
+    let last = owned.pop().unwrap();
+    let mut items: Vec<Value> = Vec::new();
+    for a in owned {
+        let mut cur = a;
+        loop {
+            match cur {
+                Value::Null => break,
+                Value::Pair(p) => {
+                    let car = p.car.borrow().clone();
+                    let cdr = p.cdr.borrow().clone();
+                    items.push(car);
+                    cur = cdr;
+                }
+                _ => {
+                    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                    return value_to_gc_i64(Value::Null);
+                }
+            }
+        }
+    }
+    let mut acc = last;
+    while let Some(item) = items.pop() {
+        acc = Value::Pair(cs_core::Pair::new(item, acc));
+    }
+    value_to_gc_i64(acc)
+}
+
 /// `(make-bytevector n fill)` — allocate a fresh `Value::ByteVector`
 /// of length `n` with every byte set to `fill & 0xFF`. Both args
 /// are raw Fixnum-shape i64 (not Gc handles). Negative `n` clamps

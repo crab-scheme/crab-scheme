@@ -4229,3 +4229,46 @@ fn diff_jit_variadic_string_append() {
         other => panic!("expected two strings, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_variadic_append() {
+    // ADR 0012 D-2 (iter DS) — variadic `append` lowers via stack-
+    // buffer + vm_append_buf helper. R7RS: last arg used as-is.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ap3 a b c) (append a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ap0) (append))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (ap3 '(1 2) '(3) '(4 5)) (ap0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let lst = rt
+        .eval_str_via_vm("<diff>", "(ap3 '(1 2) '(3) '(4 5))")
+        .unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(ap0)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "variadic append never dispatched through JIT (count={after})"
+    );
+    let len = rt
+        .eval_str_via_vm("<diff>", "(length (ap3 '(1 2) '(3) '(4 5)))")
+        .unwrap();
+    let last = rt
+        .eval_str_via_vm("<diff>", "(list-ref (ap3 '(1 2) '(3) '(4 5)) 4)")
+        .unwrap();
+    match (&lst, &empty, &len, &last) {
+        (
+            Value::Pair(_),
+            Value::Null,
+            Value::Number(cs_core::Number::Fixnum(5)),
+            Value::Number(cs_core::Number::Fixnum(5)),
+        ) => {}
+        other => panic!("expected (pair, null, 5, 5), got {:?}", other),
+    }
+}

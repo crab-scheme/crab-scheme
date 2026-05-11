@@ -961,6 +961,36 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StrAppend(dst, boxed));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter DS) — variadic
+                                    // append. Lists / Null are Any-shape;
+                                    // last arg can be any value. Box any
+                                    // primitives just in case (typically a
+                                    // no-op here).
+                                    ("append", _) => {
+                                        let boxed: Vec<RirValue> = args
+                                            .iter()
+                                            .map(|v| {
+                                                let t = value_types
+                                                    .get(v)
+                                                    .copied()
+                                                    .unwrap_or(Type::Fixnum);
+                                                if t == Type::Any {
+                                                    *v
+                                                } else {
+                                                    let fresh = alloc();
+                                                    insts.push(RirInst::BoxTyped(
+                                                        fresh,
+                                                        *v,
+                                                        type_to_jit_rt_tag(t),
+                                                    ));
+                                                    value_types.insert(fresh, Type::Any);
+                                                    fresh
+                                                }
+                                            })
+                                            .collect();
+                                        insts.push(RirInst::ListAppend(dst, boxed));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter DN) — variadic list.
                                     // `(list a b c)` lowers to a right-to-left
                                     // chain of cons: cons(a, cons(b, cons(c, '()))).
@@ -3097,6 +3127,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StrBuild(dst, _)
                 | RirInst::BvBuild(dst, _)
                 | RirInst::StrAppend(dst, _)
+                | RirInst::ListAppend(dst, _)
                 | RirInst::VecFill(dst, _, _)
                 | RirInst::BvFill(dst, _, _)
                 | RirInst::StrSet(dst, _, _, _)
