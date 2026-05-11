@@ -6008,3 +6008,37 @@ fn diff_jit_string_pad_2arg() {
         other => panic!("expected four strings, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_trim_family() {
+    // ADR 0012 D-2 (iter FH) — string-trim/-left/-right.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (tb s) (string-trim s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (tl s) (string-trim-left s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (tr s) (string-trim-right s))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (tb \"  abc  \") (tl \"  abc\") (tr \"abc  \") \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let b_v = rt.eval_str_via_vm("<diff>", "(tb \"  hello  \")").unwrap();
+    let l = rt.eval_str_via_vm("<diff>", "(tl \"   left\")").unwrap();
+    let r = rt.eval_str_via_vm("<diff>", "(tr \"right   \")").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&b_v, &l, &r) {
+        (Value::String(a), Value::String(b), Value::String(c)) => {
+            assert_eq!(&*a.borrow(), "hello");
+            assert_eq!(&*b.borrow(), "left");
+            assert_eq!(&*c.borrow(), "right");
+        }
+        other => panic!("expected three strings, got {:?}", other),
+    }
+}

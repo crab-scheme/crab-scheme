@@ -3447,6 +3447,75 @@ pub unsafe extern "C" fn vm_make_list_fill_gc(n: i64, fill: i64) -> i64 {
 /// # Safety
 ///
 /// `s` and `sep` must be live, owned `Gc<Value>` raw handles.
+
+/// `(string-trim s)` — SRFI-13. ADR 0012 D-2 (iter FH).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_trim_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            let out: String = sg.borrow().trim().to_string();
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
+/// `(string-trim-left s)` — trim whitespace from left.
+/// ADR 0012 D-2 (iter FH).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_trim_left_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            let out: String = sg.borrow().trim_start().to_string();
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
+/// `(string-trim-right s)` — trim whitespace from right.
+/// ADR 0012 D-2 (iter FH).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_trim_right_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            let out: String = sg.borrow().trim_end().to_string();
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn vm_string_pad_gc(s: i64, width: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(s) };

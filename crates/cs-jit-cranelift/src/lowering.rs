@@ -426,6 +426,12 @@ pub struct Lowerer {
     string_pad_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_pad_right_gc(s, w) -> i64`. ADR 0012 D-2 (iter FG).
     string_pad_right_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_trim_gc(s) -> i64`. ADR 0012 D-2 (iter FH).
+    string_trim_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_trim_left_gc(s) -> i64`. ADR 0012 D-2 (iter FH).
+    string_trim_left_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_trim_right_gc(s) -> i64`. ADR 0012 D-2 (iter FH).
+    string_trim_right_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_list_fill_gc(n, fill) -> i64`. ADR 0012
     /// D-2 (iter EM).
     make_list_fill_func: cranelift_module::FuncId,
@@ -864,6 +870,19 @@ impl Lowerer {
         builder.symbol(
             "vm_string_pad_right_gc",
             cs_vm::vm::vm_string_pad_right_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter FH) — string trim family.
+        builder.symbol(
+            "vm_string_trim_gc",
+            cs_vm::vm::vm_string_trim_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_trim_left_gc",
+            cs_vm::vm::vm_string_trim_left_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_trim_right_gc",
+            cs_vm::vm::vm_string_trim_right_gc as *const u8,
         );
         // ADR 0012 D-2 (iter EM) — make-list 2-arg.
         builder.symbol(
@@ -2095,6 +2114,33 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_string_pad_right_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter FH) — string trim family.
+        let string_trim_func = module
+            .declare_function(
+                "vm_string_trim_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_trim_gc: {e}")))?;
+        let string_trim_left_func = module
+            .declare_function(
+                "vm_string_trim_left_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_trim_left_gc: {e}"))
+            })?;
+        let string_trim_right_func = module
+            .declare_function(
+                "vm_string_trim_right_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_trim_right_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter EM) — vm_make_list_fill_gc(n, fill) -> i64.
         // Same shape as vector_ref_sig (two i64 in, one out).
         let make_list_fill_func = module
@@ -2397,6 +2443,9 @@ impl Lowerer {
             string_split_func,
             string_pad_func,
             string_pad_right_func,
+            string_trim_func,
+            string_trim_left_func,
+            string_trim_right_func,
             make_list_fill_func,
             iota_n_func,
             iota_ns_func,
@@ -2969,6 +3018,16 @@ impl Lowerer {
             let string_pad_right_fnref = self
                 .module
                 .declare_func_in_func(self.string_pad_right_func, builder.func);
+            // iter FH — string trim family.
+            let string_trim_fnref = self
+                .module
+                .declare_func_in_func(self.string_trim_func, builder.func);
+            let string_trim_left_fnref = self
+                .module
+                .declare_func_in_func(self.string_trim_left_func, builder.func);
+            let string_trim_right_fnref = self
+                .module
+                .declare_func_in_func(self.string_trim_right_func, builder.func);
             // iter EM — make-list 2-arg.
             let make_list_fill_fnref = self
                 .module
@@ -3226,6 +3285,9 @@ impl Lowerer {
                         string_split_fnref,
                         string_pad_fnref,
                         string_pad_right_fnref,
+                        string_trim_fnref,
+                        string_trim_left_fnref,
+                        string_trim_right_fnref,
                         make_list_fill_fnref,
                         iota_n_fnref,
                         iota_ns_fnref,
@@ -3536,6 +3598,9 @@ fn lower_inst(
     string_split_fnref: cranelift_codegen::ir::FuncRef,
     string_pad_fnref: cranelift_codegen::ir::FuncRef,
     string_pad_right_fnref: cranelift_codegen::ir::FuncRef,
+    string_trim_fnref: cranelift_codegen::ir::FuncRef,
+    string_trim_left_fnref: cranelift_codegen::ir::FuncRef,
+    string_trim_right_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
     iota_ns_fnref: cranelift_codegen::ir::FuncRef,
@@ -5908,6 +5973,31 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "StringSplit expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringTrim(dst, src)
+        | Inst::StringTrimLeft(dst, src)
+        | Inst::StringTrimRight(dst, src) => {
+            // ADR 0012 D-2 (iter FH) — string trim family.
+            let v_v = lookup(map, *src)?;
+            let fnref = match inst {
+                Inst::StringTrim(..) => string_trim_fnref,
+                Inst::StringTrimLeft(..) => string_trim_left_fnref,
+                Inst::StringTrimRight(..) => string_trim_right_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringTrim* expected 1 result, got {}",
                         results.len()
                     )));
                 }
