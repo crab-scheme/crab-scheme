@@ -750,6 +750,12 @@ pub enum Inst {
 
     /// `dst = null-list?(v)`. ADR 0012 D-2 (iter EY).
     NullListP(Value, Value),
+
+    /// `dst = concatenate(lists)`. ADR 0012 D-2 (iter FB).
+    Concatenate(Value, Value),
+
+    /// `dst = not-pair?(v)`. ADR 0012 D-2 (iter FB).
+    NotPairP(Value, Value),
     /// `dst = proper-list?(v)`. ADR 0012 D-2 (iter EY).
     ProperListP(Value, Value),
     /// `dst = dotted-list?(v)`. ADR 0012 D-2 (iter EY).

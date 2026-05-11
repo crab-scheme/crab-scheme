@@ -5787,3 +5787,43 @@ fn diff_jit_more_ordinal_accessors() {
         other => panic!("expected (50..100), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_concatenate_and_not_pair_p() {
+    // ADR 0012 D-2 (iter FB) — concatenate / not-pair?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (cc lol) (concatenate lol))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (np x) (not-pair? x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (cc '((1 2) (3) (4 5))) (np 1) (np '(1 2)) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let c = rt
+        .eval_str_via_vm("<diff>", "(cc '((1 2) (3) (4 5)))")
+        .unwrap();
+    let c_len = rt
+        .eval_str_via_vm("<diff>", "(length (cc '((1 2) (3) (4 5))))")
+        .unwrap();
+    let np_t = rt.eval_str_via_vm("<diff>", "(np 42)").unwrap();
+    let np_f = rt.eval_str_via_vm("<diff>", "(np '(1 2))").unwrap();
+    let np_null = rt.eval_str_via_vm("<diff>", "(np '())").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&c, &c_len, &np_t, &np_f, &np_null) {
+        (
+            Value::Pair(_),
+            Value::Number(cs_core::Number::Fixnum(5)),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+        ) => {}
+        other => panic!("expected (pair, 5, T, F, T), got {:?}", other),
+    }
+}

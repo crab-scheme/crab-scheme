@@ -3101,6 +3101,66 @@ pub unsafe extern "C" fn vm_last_gc(lst: i64) -> i64 {
     }
 }
 
+/// `(concatenate lists)` — SRFI-1. `lists` is a proper list of
+/// proper lists; concatenate their elements into one fresh list.
+/// Consumes the input Gc handle. Deopts on any non-list outer or
+/// inner. ADR 0012 D-2 (iter FB).
+///
+/// # Safety
+///
+/// `lists` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_concatenate_gc(lists: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(lists) };
+    let mut items: Vec<Value> = Vec::new();
+    let mut outer = v;
+    loop {
+        match outer {
+            Value::Null => break,
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                let cdr = p.cdr.borrow().clone();
+                let mut inner = car;
+                loop {
+                    match inner {
+                        Value::Null => break,
+                        Value::Pair(ip) => {
+                            items.push(ip.car.borrow().clone());
+                            inner = ip.cdr.borrow().clone();
+                        }
+                        _ => {
+                            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                            return value_to_gc_i64(Value::Null);
+                        }
+                    }
+                }
+                outer = cdr;
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+    let mut acc = Value::Null;
+    while let Some(item) = items.pop() {
+        acc = Value::Pair(cs_core::Pair::new(item, acc));
+    }
+    value_to_gc_i64(acc)
+}
+
+/// `(not-pair? v)` — SRFI-1. `(not (pair? v))`. Consumes the Gc
+/// handle and returns raw 0/1. ADR 0012 D-2 (iter FB).
+///
+/// # Safety
+///
+/// `v` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_not_pair_p_gc(v: i64) -> i64 {
+    let val = unsafe { gc_i64_to_value(v) };
+    matches!(val, Value::Pair(_)) as i64 ^ 1
+}
+
 /// Helper: classify a list via tortoise/hare. Returns:
 ///   Some(true)  — proper finite list
 ///   Some(false) — circular list

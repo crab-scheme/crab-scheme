@@ -2730,6 +2730,21 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::LastPair(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter FB) — concatenate / not-pair?.
+                                    ("concatenate", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::Concatenate(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("not-pair?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::NotPairP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // ADR 0012 D-2 (iter EY) — SRFI-1 list classifiers.
                                     ("null-list?", 1)
                                         if value_types.get(&args[0]).copied()
@@ -3946,6 +3961,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::ProperListP(dst, _)
                 | RirInst::DottedListP(dst, _)
                 | RirInst::CircularListP(dst, _)
+                | RirInst::NotPairP(dst, _)
                 | RirInst::ListP(dst, _)
                 | RirInst::CharAlphabeticP(dst, _)
                 | RirInst::CharNumericP(dst, _)
@@ -4079,6 +4095,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::Last(dst, _)
                 | RirInst::Take(dst, _, _)
                 | RirInst::Drop(dst, _, _)
+                | RirInst::Concatenate(dst, _)
                 | RirInst::VecCopyBang(dst, _, _, _)
                 | RirInst::BvCopyBang(dst, _, _, _)
                 | RirInst::StrCopyBang(dst, _, _, _)
