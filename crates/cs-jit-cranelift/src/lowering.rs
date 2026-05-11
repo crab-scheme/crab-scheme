@@ -182,6 +182,9 @@ pub struct Lowerer {
     /// FuncId of `vm_list_p_gc(v) -> i64`. Returns 0/1. ADR 0012 D-2
     /// (iter CA).
     list_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_reverse_gc(lst) -> i64`. Returns a fresh Gc
+    /// handle to a reversed list. ADR 0012 D-2 (iter CB).
+    reverse_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -296,6 +299,8 @@ impl Lowerer {
         // ADR 0012 D-2 (iter CA) — list ops.
         builder.symbol("vm_length_gc", cs_vm::vm::vm_length_gc as *const u8);
         builder.symbol("vm_list_p_gc", cs_vm::vm::vm_list_p_gc as *const u8);
+        // ADR 0012 D-2 (iter CB) — reverse.
+        builder.symbol("vm_reverse_gc", cs_vm::vm::vm_reverse_gc as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -628,6 +633,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_list_p_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter CB) — vm_reverse_gc(lst: i64) -> i64.
+        let reverse_func = module
+            .declare_function(
+                "vm_reverse_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_reverse_gc: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -667,6 +681,7 @@ impl Lowerer {
             make_closure_func,
             length_func,
             list_p_func,
+            reverse_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -891,6 +906,10 @@ impl Lowerer {
             let list_p_fnref = self
                 .module
                 .declare_func_in_func(self.list_p_func, builder.func);
+            // iter CB — reverse.
+            let reverse_fnref = self
+                .module
+                .declare_func_in_func(self.reverse_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -987,6 +1006,7 @@ impl Lowerer {
                         make_closure_fnref,
                         length_fnref,
                         list_p_fnref,
+                        reverse_fnref,
                         inst,
                     )?;
                 }
@@ -1185,6 +1205,7 @@ fn lower_inst(
     make_closure_fnref: cranelift_codegen::ir::FuncRef,
     length_fnref: cranelift_codegen::ir::FuncRef,
     list_p_fnref: cranelift_codegen::ir::FuncRef,
+    reverse_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -1981,6 +2002,26 @@ fn lower_inst(
                 }
                 results[0]
             };
+            map.insert(*dst, result);
+        }
+        Inst::Reverse(dst, lst) => {
+            // ADR 0012 D-2 (iter CB) — vm_reverse_gc consumes the
+            // operand and returns a fresh Gc<Value> handle. Mark
+            // the result for stack-map tracking so subsequent calls
+            // can safely interleave.
+            let v_v = lookup(map, *lst)?;
+            let inst_ref = b.ins().call(reverse_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Reverse expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
         Inst::Call(_, _, _) | Inst::DeoptCheck(_, _) => {

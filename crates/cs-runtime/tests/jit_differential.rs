@@ -2410,3 +2410,45 @@ fn diff_jit_list_pred() {
         other => panic!("expected (1, 1, 0, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_reverse_allocates_new_spine() {
+    // ADR 0012 D-2 (iter CB) — `(reverse lst)` lowers to
+    // vm_reverse_gc which walks the spine and builds a fresh
+    // reversed list. Returns an Any-shape Gc handle; result is
+    // structurally a proper list.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (rev lst) (reverse lst))")
+        .unwrap();
+    // Warmup so `rev` tiers up.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (rev (list 1 2 3)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let r_empty = rt.eval_str_via_vm("<diff>", "(rev '())").unwrap();
+    // (length (reverse lst)) == (length lst).
+    let len = rt
+        .eval_str_via_vm("<diff>", "(length (rev (list 10 20 30 40)))")
+        .unwrap();
+    // (car (reverse '(1 2 3))) == 3, (cadr ...) == 2, etc.
+    let first = rt
+        .eval_str_via_vm("<diff>", "(car (rev (list 1 2 3)))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "rev never dispatched through JIT (count={after})"
+    );
+    assert!(
+        matches!(&r_empty, Value::Null),
+        "expected Null, got {:?}",
+        r_empty
+    );
+    match (&len, &first) {
+        (Value::Number(cs_core::Number::Fixnum(4)), Value::Number(cs_core::Number::Fixnum(3))) => {}
+        other => panic!("expected (4, 3), got {:?}", other),
+    }
+}

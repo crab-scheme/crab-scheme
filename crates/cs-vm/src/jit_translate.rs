@@ -893,6 +893,14 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::ListP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter CB) — reverse.
+                                    ("reverse", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::Reverse(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter BV) — vector ops.
                                     // make-vector requires the fill to be
                                     // Any. If the user passed a typed
@@ -1830,7 +1838,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VecRef(dst, _, _)
                 | RirInst::VecSet(dst, _, _, _)
                 | RirInst::StrAlloc(dst, _, _)
-                | RirInst::MakeClosure(dst, _) => {
+                | RirInst::MakeClosure(dst, _)
+                | RirInst::Reverse(dst, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

@@ -279,6 +279,12 @@ pub enum Inst {
     /// return 0 with no deopt. ADR 0012 D-2 (iter CA).
     ListP(Value, Value),
 
+    /// `dst = reverse(lst)`. Lowers to `vm_reverse_gc`. `lst` Any
+    /// (consumed). `dst` is Any (fresh Gc handle to a reversed
+    /// list). On improper / non-list, helper requests deopt and
+    /// returns a Gc handle to Null. ADR 0012 D-2 (iter CB).
+    Reverse(Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a

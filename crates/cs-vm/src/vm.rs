@@ -744,6 +744,39 @@ pub unsafe extern "C" fn vm_list_p_gc(r: i64) -> i64 {
     }
 }
 
+/// `(reverse lst)` — return a freshly allocated reversed list.
+/// Consume-on-use; returns an Any-shape Gc handle. Walks the spine
+/// of the input, accumulating `(cons car acc)` pairs; the final
+/// `acc` is the reversed result. On improper list / non-list,
+/// requests a deopt and returns a Gc handle to `Null` as a
+/// placeholder (the caller's bytecode re-run produces the real
+/// diagnostic). ADR 0012 D-2 (iter CB).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_reverse_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    let mut cur = v;
+    let mut acc = Value::Null;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                acc = Value::Pair(cs_core::Pair::new(car, acc));
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            Value::Null => return value_to_gc_i64(acc),
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+}
+
 /// Gc-backed counterpart to `vm_value_clone`. Cheaper than the Box
 /// version: bumps the strong refcount on the existing allocation
 /// and returns the same raw handle, so the caller has two
