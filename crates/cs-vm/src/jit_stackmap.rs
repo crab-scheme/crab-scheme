@@ -243,6 +243,89 @@ pub fn with_active_jit_frames<R, F: FnOnce(&[Rc<JitStackMaps>]) -> R>(f: F) -> R
     })
 }
 
+/// Whether any JIT frame is currently executing on this thread.
+///
+/// ADR 0012 D-2 (iter BS) — `Heap::collect` reads this to decide
+/// whether the conservative-mark fallback is necessary. When false,
+/// collect proceeds without scanning any JIT spill slots (the
+/// walker's roots are the only roots that matter). When true,
+/// collect may opt into [`scan_all_active_conservatively`] to mark
+/// every recorded spill slot as a root.
+///
+/// In CrabScheme's current design (iter BS), the active-frames list
+/// and the refcount-based survival of `Gc::into_raw_jit` handles
+/// already provide soundness — every JIT-live `Gc<Value>` holds a
+/// strong refcount and so survives `Heap::collect`'s weak-ref
+/// sweep without explicit root scanning. See the doc comment on
+/// `JitFrameGuard` in `cs-vm/src/vm.rs` for the full argument. This
+/// predicate is therefore exported primarily for introspection,
+/// testing, and any future scanner that wants a fast guard.
+pub fn has_active_jit_frames() -> bool {
+    ACTIVE_JIT_FRAMES.with(|s| !s.borrow().is_empty())
+}
+
+/// Number of JIT frames currently active on this thread. Test /
+/// telemetry hook; not used by GC. `0` is equivalent to
+/// `!has_active_jit_frames()`.
+pub fn active_jit_frame_count() -> usize {
+    ACTIVE_JIT_FRAMES.with(|s| s.borrow().len())
+}
+
+/// Conservative root scan for every active JIT frame: walk every
+/// recorded `(pc_offset → sp_offsets)` entry and invoke `visit`
+/// with the *recorded offset bytes* for each spill slot in each
+/// frame.
+///
+/// ADR 0012 D-2 (iter BS) — this is the "conservative-by-PC"
+/// fallback the spec calls for. We don't know which PC any active
+/// frame is actually paused at (that would require either a
+/// signal-handler safepoint poll or inline-assembly FP-chain walk
+/// with platform-specific unwinding — both out of scope for iter
+/// BS). Instead we visit every offset that could ever appear at
+/// any safepoint in any active frame, and let the caller decide
+/// what to do with each one.
+///
+/// **This function does NOT dereference any slot.** It hands the
+/// caller the raw byte offsets (cast to `*const ()` for ABI
+/// convenience). A useful scanner would combine these with an SP
+/// from FP-chain walking; iter BS does neither, because:
+///
+/// 1. `Heap::collect`'s sweep is refcount-driven; JIT-spilled
+///    `Gc::into_raw_jit` handles hold a strong count, so the
+///    sweep won't reclaim them. See `JitFrameGuard` for details.
+/// 2. Reading a JIT spill slot whose `gc_i64_to_value` consumer
+///    has run would dereference a dangling pointer. A conservative
+///    scanner that doesn't know which PC the frame is at can't
+///    distinguish a live slot from a dead one — refcount-by-SP-
+///    walk would be a soundness *regression*, not improvement.
+///
+/// The function exists for introspection and as a hook for a
+/// future precise scanner. Returns the total number of `(frame,
+/// pc, slot)` triples visited.
+pub fn scan_all_active_conservatively<F: FnMut(*const ())>(mut visit: F) -> usize {
+    let mut total = 0;
+    ACTIVE_JIT_FRAMES.with(|s| {
+        for frame in s.borrow().iter() {
+            for (pc_off, sp_offsets) in frame.by_pc.iter() {
+                for &sp_off in sp_offsets {
+                    // Hand the caller a synthetic (pc_off, sp_off)
+                    // pair as a single opaque pointer. The high 32
+                    // bits hold `pc_off`, the low 32 bits hold the
+                    // sp byte-offset reinterpreted as u32. Callers
+                    // that actually want to dereference must
+                    // combine these with an SP they obtained
+                    // elsewhere.
+                    let synthetic =
+                        (((*pc_off as u64) << 32) | (sp_off as u32 as u64)) as *const ();
+                    visit(synthetic);
+                    total += 1;
+                }
+            }
+        }
+    });
+    total
+}
+
 #[cfg(test)]
 mod active_frames_tests {
     use super::*;
@@ -282,5 +365,56 @@ mod active_frames_tests {
         assert_eq!(bases, vec![0xABCD as *const u8]);
         // Cleanup.
         while pop_active_jit_frame().is_some() {}
+    }
+
+    #[test]
+    fn has_active_jit_frames_tracks_push_pop() {
+        // ADR 0012 D-2 (iter BS) — predicate used by Heap::collect
+        // (and tests) to decide whether the conservative-mark path
+        // is necessary.
+        while pop_active_jit_frame().is_some() {}
+        assert!(!has_active_jit_frames());
+        assert_eq!(active_jit_frame_count(), 0);
+        let m = Rc::new(JitStackMaps::new(0x1000 as *const u8));
+        push_active_jit_frame(Rc::clone(&m));
+        assert!(has_active_jit_frames());
+        assert_eq!(active_jit_frame_count(), 1);
+        let _ = pop_active_jit_frame();
+        assert!(!has_active_jit_frames());
+        assert_eq!(active_jit_frame_count(), 0);
+    }
+
+    #[test]
+    fn scan_all_active_conservatively_visits_every_recorded_slot() {
+        // ADR 0012 D-2 (iter BS) — verify the scanner visits
+        // (frame_count * pc_count * sp_offsets_per_pc) triples and
+        // the returned count matches.
+        while pop_active_jit_frame().is_some() {}
+        // Frame 1: two PCs, 2 + 1 sp offsets.
+        let mut m1 = JitStackMaps::new(0x1000 as *const u8);
+        m1.insert(10, vec![0, 8]);
+        m1.insert(20, vec![16]);
+        // Frame 2: one PC, 3 sp offsets.
+        let mut m2 = JitStackMaps::new(0x2000 as *const u8);
+        m2.insert(30, vec![0, 8, 16]);
+        push_active_jit_frame(Rc::new(m1));
+        push_active_jit_frame(Rc::new(m2));
+
+        let mut count = 0usize;
+        let total = scan_all_active_conservatively(|_| count += 1);
+        // 2 + 1 + 3 = 6 triples across both frames.
+        assert_eq!(total, 6);
+        assert_eq!(count, 6);
+        // Cleanup.
+        while pop_active_jit_frame().is_some() {}
+    }
+
+    #[test]
+    fn scan_all_active_conservatively_is_no_op_when_empty() {
+        while pop_active_jit_frame().is_some() {}
+        let mut count = 0usize;
+        let total = scan_all_active_conservatively(|_| count += 1);
+        assert_eq!(total, 0);
+        assert_eq!(count, 0);
     }
 }

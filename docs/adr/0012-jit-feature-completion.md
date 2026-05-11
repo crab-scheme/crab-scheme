@@ -1,12 +1,12 @@
 # ADR 0012 — JIT Feature Completion: IC + GC Integration
 
-> Status: **D-2 (GC integration) Partially Landed** as of M6 Phase 4 iter BQ.
+> Status: **D-2 (GC integration) Landed** as of M6 Phase 4 iter BS.
 > D-1 (Inline cache) — Proposed for M6 Phase 5.
 > Companion research:
 > - `docs/research/jit_inline_cache.md`
 > - `docs/research/jit_gc_integration.md`
 
-## Implementation status (M6 Phase 4 iters BD-BQ)
+## Implementation status (M6 Phase 4 iters BD-BS)
 
 | Iter | Deliverable                                                  | Status   |
 | ---- | ------------------------------------------------------------ | -------- |
@@ -24,6 +24,7 @@
 | BO   | Route JIT allocations through `Heap::alloc` via TLS pointer   | ✓ shipped |
 | BP   | `Runtime::with_active` installs Heap in JIT TLS              | ✓ shipped |
 | BQ   | Verify GC-after-JIT survival + reclamation tests              | ✓ shipped |
+| BS   | Close GC-during-JIT gap (refcount-only soundness)            | ✓ shipped |
 
 **GC integration scope shipped**: JIT-allocated `Gc<Value>`s register
 with the Runtime's Heap. The tracing GC sees them as weak-ref slots
@@ -31,16 +32,41 @@ and can trace through Value::Trace from walker-tier roots. A manual
 `collect()` after a JIT body returns correctly preserves
 walker-reachable values and reclaims unreachable ones.
 
-**Known limitation deferred**: `Heap::collect()` doesn't yet consume
-the active-JIT-frames list to mark roots IN spilled JIT stack slots.
-If `collect()` fires while a JIT body is mid-execution (e.g. from
-auto-collect inside `vm_alloc_pair_gc → Heap::alloc`), Gc handles
-that are only on the JIT body's stack would be incorrectly reclaimed.
-Mitigation: auto-collect is off by default; programs that explicitly
-enable it should pause it for the JIT's duration. The Cranelift
-stack-map metadata (iters BF/BK) and the active-frames list (BN) are
-both in place — a future iter adds FP-chain walking or runtime probe
-to close this last gap.
+**GC-during-JIT soundness (closed in iter BS)**: `Heap::collect()`
+firing *while a JIT body is mid-execution* (e.g. from auto-collect
+inside `vm_alloc_pair_gc → Heap::alloc`) is sound under the Phase-1
+`cs-gc` design without explicit JIT-stack-map root scanning. The
+argument is refcount-driven: every `Gc::into_raw_jit` handle sitting
+in a JIT spill slot contributes a strong count of 1 to the underlying
+`Rc<Slot<T>>`. Phase-1 `Heap::collect`'s sweep retains a slot iff its
+`Weak::strong_count() > 0`, so it cannot reclaim any allocation that
+is referenced by a live JIT stack slot. Linear-consumption helpers
+(`vm_pair_car_gc`, `vm_value_drop_gc`, etc.) decrement the count when
+the JIT body transfers ownership *out* of the spill slot, at which
+point the slot is dead from the body's perspective; the body never
+reads it again, so the sweep's reclamation is correct.
+
+The iter BS stress test
+(`diff_jit_collect_during_jit_body_keeps_live_pairs` in
+`crates/cs-runtime/tests/jit_differential.rs`) exercises this under
+maximum pressure: `Heap::set_auto_collect(true)` plus
+`Heap::set_threshold(1)` makes every JIT-body allocation trigger a
+full collect cycle, and the body's two-Cons sum still computes
+correctly. Public APIs `has_active_jit_frames`,
+`active_jit_frame_count`, and `scan_all_active_conservatively` are
+exported from `cs-vm::jit_stackmap` for introspection and as hooks
+for a future precise scanner.
+
+**Why precise root scanning was deferred (and not needed for Phase
+1)**: a conservative-by-PC scanner that reads every recorded spill
+slot without knowing which PC the frame is actually paused at would
+read dangling pointers in the consume-on-use ABI cases (the slot's
+strong count has already dropped to 0). Precise scanning requires
+either inline-assembly FP-chain walking or signal-handler safepoint
+polling — both platform-specific and out of scope while the refcount
+invariant supplies soundness. When Phase 2 (arena / compacting GC)
+lands, allocations need to be *moved*, which requires precise root
+locations: a future iter adds the FP-chain walker then.
 
 ## Context
 

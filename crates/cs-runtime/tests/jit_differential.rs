@@ -1843,3 +1843,109 @@ fn diff_jit_truthiness_on_any() {
     // the matching walker symbol; that implicitly confirms the
     // branches are distinct.)
 }
+
+#[test]
+fn diff_jit_collect_during_jit_body_keeps_live_pairs() {
+    // M6 Phase 4 iter BS — close ADR 0012 D-2's "Known limitation
+    // deferred" paragraph. If `Heap::collect()` fires *while a JIT
+    // body is mid-execution* (e.g. from auto-collect inside
+    // `vm_alloc_pair_gc → Heap::alloc`), Gc handles held only on
+    // the JIT body's spill slots MUST NOT be incorrectly reclaimed.
+    //
+    // The argument for soundness here is refcount-driven: every
+    // `Gc::into_raw_jit` value sitting in a JIT spill slot
+    // contributes a strong count of 1 to its allocation's Rc, so
+    // the Phase-1 `Heap::collect` sweep — which only reclaims
+    // slots whose `weak.strong_count() == 0` — cannot touch them.
+    // This test exercises that invariant under maximum auto-
+    // collect pressure: threshold=1 means EVERY allocation inside
+    // the JIT body triggers a collect cycle.
+    //
+    // The body is `(define (pcar2 a b c d) (+ (car (cons a b))
+    // (car (cons c d))))`: two Pair allocations, the first's car
+    // must survive the second alloc's auto-collect or the sum
+    // would be wrong (or the body would panic on a dangling i64).
+    let defines = &["(define (pcar2 a b c d) (+ (car (cons a b)) (car (cons c d))))"];
+
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    // Warm up so pcar2 JITs. During warmup, auto-collect is OFF
+    // (the default) so we don't blow up the warmup loop's own
+    // allocations.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (pcar2 1 2 3 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    // Confirm the body has been JIT'd.
+    cs_vm::vm::reset_jit_call_count();
+    let _ = rt.eval_str_via_vm("<diff>", "(pcar2 10 20 30 40)").unwrap();
+    let warm = cs_vm::vm::jit_call_count();
+    assert!(warm >= 1, "pcar2 never JITted (count = {})", warm);
+
+    // Crank up auto-collect to maximum pressure: every `Heap::alloc`
+    // call triggers a `collect()` cycle. The collect_count() we
+    // see before/after each pcar2 call should grow by at least 2
+    // (one per Cons inside the body); if it doesn't, the JIT body
+    // either bypassed the heap or auto-collect wasn't taking
+    // effect — both invalidate the test.
+    rt.heap().set_auto_collect(true);
+    rt.heap().set_threshold(1);
+
+    let cases: &[(&str, i64)] = &[
+        ("(pcar2 1 2 3 4)", 4),      // 1 + 3
+        ("(pcar2 11 22 33 44)", 44), // 11 + 33
+        ("(pcar2 -5 0 7 0)", 2),     // -5 + 7
+        ("(pcar2 100 0 200 0)", 300),
+    ];
+    for (expr, expected) in cases {
+        let before = rt.heap().collect_count();
+        let v = rt.eval_str_via_vm("<diff>", expr).unwrap();
+        let after = rt.heap().collect_count();
+        match v {
+            Value::Number(cs_core::Number::Fixnum(n)) => {
+                assert_eq!(n, *expected, "wrong sum on {}", expr);
+            }
+            other => panic!("expected fixnum on {}, got {:?}", expr, other),
+        }
+        // We expect at least two collects per pcar2 call (one for
+        // each Cons). Loose lower bound — the outer eval may
+        // allocate other auxiliary Gc handles too.
+        let grew = after.saturating_sub(before);
+        assert!(
+            grew >= 2,
+            "expected at least 2 auto-collects during {} (before={}, after={}); \
+             auto-collect under threshold=1 was either skipped or the body bypassed the heap",
+            expr,
+            before,
+            after,
+        );
+    }
+
+    // Sanity: with auto-collect still on, run a tighter loop and
+    // verify nothing panics (the inner JIT body fires many
+    // mid-execution collects).
+    let stress = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(let loop ((i 0) (s 0)) \
+             (if (= i 100) s (loop (+ i 1) (+ s (pcar2 i i (+ i 1) (+ i 1))))))",
+        )
+        .unwrap();
+    // sum over i in 0..100 of (i + (i + 1)) = sum 2i + 1 for i in 0..100
+    //                       = 2 * (0+1+...+99) + 100 = 2*4950 + 100 = 10000
+    match stress {
+        Value::Number(cs_core::Number::Fixnum(n)) => {
+            assert_eq!(n, 10000, "stress loop produced wrong sum");
+        }
+        other => panic!("expected fixnum from stress loop, got {:?}", other),
+    }
+
+    // Reset auto-collect so we don't poison subsequent tests
+    // sharing the binary's static state (cargo test reuses the
+    // process). Each test makes its own Runtime, so this is
+    // belt-and-suspenders.
+    rt.heap().set_auto_collect(false);
+}

@@ -194,6 +194,37 @@ impl Drop for JitEnvGuard {
 /// active-JIT-frames list on construction and pops on drop. Used by
 /// `try_dispatch_jit` to maintain the list across the native call
 /// (including panic-unwind paths). ADR 0012 D-2 (iter BN).
+///
+/// # Why this is sufficient for GC-during-JIT (iter BS)
+///
+/// `Heap::collect`'s Phase-1 sweep retains a slot iff
+/// `weak.strong_count() > 0`. JIT spill slots hold raw handles
+/// produced by `Gc::into_raw_jit`, which is `Rc::into_raw`: the
+/// strong count is unchanged across the i64-ABI boundary, so every
+/// JIT-live `Gc<Value>` on the host stack contributes a strong
+/// count of at least 1 to its slot. Consequently `collect()` cannot
+/// reclaim a JIT-live allocation regardless of whether the active-
+/// frames list is consulted as a root set.
+///
+/// The remaining concern — slots reachable *only* through a JIT
+/// stack-map root — therefore does not arise for the refcount-
+/// based weak-ref sweep. The active-frames list (this struct's
+/// push/pop) remains useful for introspection
+/// (`has_active_jit_frames`, telemetry) and as a hook for a future
+/// precise scanner if Phase-2 GC introduces compaction (which would
+/// need to *move* slots and thus need precise root locations).
+///
+/// Linear-consumption helpers like `vm_pair_car_gc` *consume* one
+/// handle and *produce* another: the consumed slot's strong count
+/// drops to 0 once the helper returns, but the JIT body never
+/// re-reads that slot — it transferred the i64 into the helper as
+/// an argument. So while the stack-map metadata might still list
+/// the slot at the next safepoint, the slot is dead from the GC's
+/// point of view; a conservative scanner that blindly read every
+/// recorded offset would read a dangling pointer. This is exactly
+/// why iter BS opts NOT to scan: the refcount-only invariant is
+/// strictly safer than conservative scanning under the consume-on-
+/// use ABI.
 struct JitFrameGuard {
     pushed: bool,
 }
