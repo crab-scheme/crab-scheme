@@ -411,6 +411,16 @@ pub enum Inst {
     /// for non-digits). ADR 0012 D-2 (iter CV).
     DigitValue(Value, Value),
 
+    /// `dst = vector->list(v)`. Lowers to `vm_vector_to_list_gc`.
+    /// `v` Any (consumed). `dst` is Any (fresh list). ADR 0012 D-2
+    /// (iter CW).
+    VectorToList(Value, Value),
+
+    /// `dst = list->vector(lst)`. Lowers to `vm_list_to_vector_gc`.
+    /// `lst` Any (consumed). `dst` is Any (fresh vector). ADR 0012
+    /// D-2 (iter CW).
+    ListToVector(Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a

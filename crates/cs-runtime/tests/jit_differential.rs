@@ -3378,3 +3378,44 @@ fn diff_jit_digit_value_mixed_return() {
         other => panic!("expected (5, 0, #f), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_vector_list_conversions() {
+    // ADR 0012 D-2 (iter CW) — vector->list / list->vector (1-arg).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (v->l v) (vector->list v))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (l->v lst) (list->vector lst))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (v->l (make-vector 4 0)) (l->v (list 1 2 3)) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let v_len = rt
+        .eval_str_via_vm("<diff>", "(length (v->l (make-vector 5 0)))")
+        .unwrap();
+    let l_len = rt
+        .eval_str_via_vm("<diff>", "(vector-length (l->v (list 10 20 30 40)))")
+        .unwrap();
+    let first = rt
+        .eval_str_via_vm("<diff>", "(car (v->l (l->v (list 42 100 200))))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "vector<->list never dispatched through JIT (count={after})"
+    );
+    match (&v_len, &l_len, &first) {
+        (
+            Value::Number(cs_core::Number::Fixnum(5)),
+            Value::Number(cs_core::Number::Fixnum(4)),
+            Value::Number(cs_core::Number::Fixnum(42)),
+        ) => {}
+        other => panic!("expected (5, 4, 42), got {:?}", other),
+    }
+}

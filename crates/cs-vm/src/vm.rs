@@ -970,6 +970,62 @@ pub unsafe extern "C" fn vm_substring_gc(s: i64, start: i64, end: i64) -> i64 {
     }
 }
 
+/// `(vector->list v)` — walk vector slots and build a freshly
+/// allocated list. Consumes one strong refcount on `v`. Result is
+/// a Gc handle. On non-vector input, requests a deopt and returns
+/// Gc(Null). ADR 0012 D-2 (iter CW).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_to_list_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Vector(vc) => {
+            let items: Vec<Value> = vc.borrow().clone();
+            value_to_gc_i64(Value::list(items))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
+/// `(list->vector lst)` — walk the spine and collect cars into a
+/// fresh `Value::Vector`. Consumes `lst`. Improper-list terminus
+/// (non-pair, non-null) requests a deopt; non-list returns
+/// Gc(Null) placeholder. ADR 0012 D-2 (iter CW).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_list_to_vector_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    let mut items: Vec<Value> = Vec::new();
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                items.push(p.car.borrow().clone());
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            Value::Null => {
+                return value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+                    items,
+                ))));
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+}
+
 /// `(list-copy lst)` — return a freshly allocated copy of `lst`'s
 /// spine. R6RS semantics: for improper lists, copy the spine but
 /// keep the terminating atom as the final cdr; for atoms, return
