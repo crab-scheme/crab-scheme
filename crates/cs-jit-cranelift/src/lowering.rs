@@ -394,6 +394,12 @@ pub struct Lowerer {
     /// FuncId of `vm_vector_to_string_gc(v) -> i64`. ADR 0012 D-2
     /// (iter DY).
     vector_to_string_func: cranelift_module::FuncId,
+    /// FuncId of `vm_number_to_string_gc(n) -> i64`. ADR 0012 D-2
+    /// (iter EC).
+    number_to_string_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_to_number_gc(s) -> i64`. ADR 0012 D-2
+    /// (iter EC).
+    string_to_number_func: cranelift_module::FuncId,
     /// FuncId of `vm_symbol_to_string_gc(sym) -> i64`. ADR 0012 D-2
     /// (iter CY).
     symbol_to_string_func: cranelift_module::FuncId,
@@ -732,6 +738,15 @@ impl Lowerer {
         builder.symbol(
             "vm_vector_to_string_gc",
             cs_vm::vm::vm_vector_to_string_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter EC) — number<->string.
+        builder.symbol(
+            "vm_number_to_string_gc",
+            cs_vm::vm::vm_number_to_string_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_to_number_gc",
+            cs_vm::vm::vm_string_to_number_gc as *const u8,
         );
         // ADR 0012 D-2 (iter CX) — string<->list.
         builder.symbol(
@@ -1773,6 +1788,26 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_vector_to_string_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter EC) — vm_number_to_string_gc / vm_string_to_number_gc.
+        let number_to_string_func = module
+            .declare_function(
+                "vm_number_to_string_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_number_to_string_gc: {e}"))
+            })?;
+        let string_to_number_func = module
+            .declare_function(
+                "vm_string_to_number_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_to_number_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter CY) — vm_symbol_to_string_gc / vm_string_to_symbol_gc.
         let symbol_to_string_func = module
             .declare_function(
@@ -1911,6 +1946,8 @@ impl Lowerer {
             list_to_string_func,
             string_to_vector_func,
             vector_to_string_func,
+            number_to_string_func,
+            string_to_number_func,
             symbol_to_string_func,
             string_to_symbol_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
@@ -2415,6 +2452,13 @@ impl Lowerer {
             let vector_to_string_fnref = self
                 .module
                 .declare_func_in_func(self.vector_to_string_func, builder.func);
+            // iter EC — number<->string.
+            let number_to_string_fnref = self
+                .module
+                .declare_func_in_func(self.number_to_string_func, builder.func);
+            let string_to_number_fnref = self
+                .module
+                .declare_func_in_func(self.string_to_number_func, builder.func);
             // iter CY — symbol<->string.
             let symbol_to_string_fnref = self
                 .module
@@ -2597,6 +2641,8 @@ impl Lowerer {
                         list_to_string_fnref,
                         string_to_vector_fnref,
                         vector_to_string_fnref,
+                        number_to_string_fnref,
+                        string_to_number_fnref,
                         symbol_to_string_fnref,
                         string_to_symbol_fnref,
                         inst,
@@ -2876,6 +2922,8 @@ fn lower_inst(
     list_to_string_fnref: cranelift_codegen::ir::FuncRef,
     string_to_vector_fnref: cranelift_codegen::ir::FuncRef,
     vector_to_string_fnref: cranelift_codegen::ir::FuncRef,
+    number_to_string_fnref: cranelift_codegen::ir::FuncRef,
+    string_to_number_fnref: cranelift_codegen::ir::FuncRef,
     symbol_to_string_fnref: cranelift_codegen::ir::FuncRef,
     string_to_symbol_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
@@ -5053,6 +5101,40 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "VectorToString expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::NumberToString(dst, src) => {
+            // ADR 0012 D-2 (iter EC) — vm_number_to_string_gc.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(number_to_string_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "NumberToString expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringToNumber(dst, src) => {
+            // ADR 0012 D-2 (iter EC) — vm_string_to_number_gc.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(string_to_number_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringToNumber expected 1 result, got {}",
                         results.len()
                     )));
                 }

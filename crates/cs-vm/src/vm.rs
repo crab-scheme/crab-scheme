@@ -2838,6 +2838,80 @@ pub unsafe extern "C" fn vm_string_to_vector_gc(s: i64) -> i64 {
     }
 }
 
+/// `(number->string n)` — 1-arg form, decimal radix. Returns a
+/// fresh `Gc<Value::String>` rendering `n` via the runtime's
+/// `Display` impl on `Number`. Consumes the input Gc handle. On
+/// non-number input, requests a deopt and returns an empty-string
+/// handle. ADR 0012 D-2 (iter EC).
+///
+/// # Safety
+///
+/// `n` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_number_to_string_gc(n: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(n) };
+    match v {
+        Value::Number(num) => {
+            let s = format!("{}", num);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
+/// `(string->number s)` — 1-arg form, decimal radix. Tries Fixnum
+/// parse first, then Flonum. For strings containing R7RS prefixes
+/// (`#x`, `#i`, etc.) or special tokens (`+inf.0`, `+nan.0`),
+/// requests a deopt and returns `Gc<Boolean(false)>` so the VM
+/// path picks up the full lexical handling. Returns
+/// `Gc<Value::Boolean(false)>` for unparseable strings. Consumes
+/// the input handle. ADR 0012 D-2 (iter EC).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_to_number_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            let raw = sg.borrow().clone();
+            // Deopt on R7RS prefixes / special tokens — the VM has
+            // full lexical handling.
+            if raw.starts_with('#')
+                || raw == "+inf.0"
+                || raw == "-inf.0"
+                || raw == "+nan.0"
+                || raw == "-nan.0"
+            {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Boolean(false));
+            }
+            // Try int first (no decimal/exponent), then float.
+            let parsed = if raw.contains('.') || raw.contains('e') || raw.contains('E') {
+                raw.parse::<f64>().ok().map(cs_core::Number::Flonum)
+            } else if let Ok(n) = raw.parse::<i64>() {
+                Some(cs_core::Number::Fixnum(n))
+            } else {
+                raw.parse::<f64>().ok().map(cs_core::Number::Flonum)
+            };
+            match parsed {
+                Some(n) => value_to_gc_i64(Value::Number(n)),
+                None => value_to_gc_i64(Value::Boolean(false)),
+            }
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Boolean(false))
+        }
+    }
+}
+
 /// `(equal? a b)` — structural deep equality (R7RS). Defers to
 /// `cs_core::eq::equal` which handles cycles. Consumes both Gc
 /// handles. Returns 0 or 1. ADR 0012 D-2 (iter DZ).

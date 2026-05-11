@@ -4729,3 +4729,50 @@ fn diff_jit_abs_min_max_flonum() {
         other => panic!("expected three flonums, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_number_string_conversion() {
+    // ADR 0012 D-2 (iter EC) — 1-arg number->string / string->number.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (n2s x) (number->string x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s2n s) (string->number s))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (n2s 42) (n2s 3.14) (s2n \"7\") (s2n \"abc\") \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let s_int = rt.eval_str_via_vm("<diff>", "(n2s 1234)").unwrap();
+    let s_flo = rt.eval_str_via_vm("<diff>", "(n2s 2.5)").unwrap();
+    let n_int = rt.eval_str_via_vm("<diff>", "(s2n \"42\")").unwrap();
+    let n_flo = rt.eval_str_via_vm("<diff>", "(s2n \"1.5\")").unwrap();
+    let n_bad = rt.eval_str_via_vm("<diff>", "(s2n \"hello\")").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "number<->string never dispatched through JIT (count={after})"
+    );
+    match (&s_int, &s_flo) {
+        (Value::String(a), Value::String(b)) => {
+            assert_eq!(&*a.borrow(), "1234");
+            assert!(b.borrow().starts_with("2.5"), "n2s 2.5 = {:?}", b.borrow());
+        }
+        other => panic!("expected (string, string), got {:?}", other),
+    }
+    match (&n_int, &n_flo, &n_bad) {
+        (
+            Value::Number(cs_core::Number::Fixnum(42)),
+            Value::Number(cs_core::Number::Flonum(f)),
+            Value::Boolean(false),
+        ) => {
+            assert!((f - 1.5).abs() < 1e-12);
+        }
+        other => panic!("expected (42, 1.5, #f), got {:?}", other),
+    }
+}

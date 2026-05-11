@@ -350,6 +350,17 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter DZ).
     EqualAny(Value, Value, Value),
 
+    /// `dst = number->string(n)` 1-arg form. Lowers to
+    /// `vm_number_to_string_gc`. Arg Any-shape (consumed); `dst`
+    /// is Any (fresh Gc<Value::String>). ADR 0012 D-2 (iter EC).
+    NumberToString(Value, Value),
+
+    /// `dst = string->number(s)` 1-arg form. Lowers to
+    /// `vm_string_to_number_gc`. Arg Any-shape (consumed); `dst`
+    /// is Any (Gc<Value::Number> or Gc<Value::Boolean(false)>).
+    /// ADR 0012 D-2 (iter EC).
+    StringToNumber(Value, Value),
+
     /// `dst = substring(s, start, end)`. Lowers to `vm_substring_gc`.
     /// `s` Any (consumed), `start` and `end` Fixnum. `dst` is Any
     /// (fresh Gc<Value::String>). ADR 0012 D-2 (iter CM).
