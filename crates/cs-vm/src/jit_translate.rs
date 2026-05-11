@@ -787,6 +787,18 @@ pub fn bytecode_to_rir_with_hints(
                                 {
                                     Some(RirInst::MinFixnum(dst, args[0], args[1]))
                                 }
+                                // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
+                                // Both Fixnum -> Fixnum. Gated to non-Flonum.
+                                ("bitwise-bit-count", 1)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitwiseBitCount(dst, args[0]))
+                                }
+                                ("bitwise-length", 1)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitwiseLength(dst, args[0]))
+                                }
                                 _ => None,
                             };
                             if let Some(inst) = single {

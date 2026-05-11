@@ -981,6 +981,41 @@ pub unsafe extern "C" fn vm_flonum_atan2(y: i64, x: i64) -> i64 {
         .to_bits() as i64
 }
 
+/// `(bitwise-bit-count n)` — R6RS-flavored popcount. For n ≥ 0
+/// returns popcount; for n < 0 returns `-1 - popcount(!n)` (matches
+/// the bytecode `b_bitwise_bit_count`). Operand is a raw Fixnum i64
+/// (NOT a Gc handle). Return is the same shape. ADR 0012 D-2
+/// (iter FN).
+///
+/// # Safety
+///
+/// `n` is a Fixnum codepoint-shape raw i64, not a heap pointer.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bitwise_bit_count(n: i64) -> i64 {
+    if n >= 0 {
+        n.count_ones() as i64
+    } else {
+        -1 - ((!n).count_ones() as i64)
+    }
+}
+
+/// `(bitwise-length n)` — number of bits required to represent
+/// `n`'s magnitude (matches the bytecode `b_bitwise_length`). For
+/// n < 0, computes from `!n` (R6RS). ADR 0012 D-2 (iter FN).
+///
+/// # Safety
+///
+/// Same as `vm_bitwise_bit_count`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bitwise_length(n: i64) -> i64 {
+    let abs = if n < 0 { !n } else { n };
+    if abs == 0 {
+        0
+    } else {
+        64 - abs.leading_zeros() as i64
+    }
+}
+
 /// `(char-foldcase c)` — case-fold mapping for case-insensitive
 /// comparison. For ASCII this matches `char-downcase` (same as the
 /// bytecode `b_char_foldcase`). ADR 0012 D-2 (iter CS).

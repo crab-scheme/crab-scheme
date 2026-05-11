@@ -6273,3 +6273,39 @@ fn diff_jit_log2_atan2() {
         other => panic!("expected 0.0, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_bitwise_bit_count_length() {
+    // ADR 0012 D-2 (iter FN) — bitwise-bit-count / bitwise-length.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bc n) (bitwise-bit-count n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bl n) (bitwise-length n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (bc 7) (bl 16) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // popcount: 7 = 0b111 -> 3
+    let c7 = rt.eval_str_via_vm("<diff>", "(bc 7)").unwrap();
+    // 255 = 0b11111111 -> 8
+    let c255 = rt.eval_str_via_vm("<diff>", "(bc 255)").unwrap();
+    // 0 -> 0
+    let c0 = rt.eval_str_via_vm("<diff>", "(bc 0)").unwrap();
+    // bitwise-length: 16 -> 5 (0b10000)
+    let l16 = rt.eval_str_via_vm("<diff>", "(bl 16)").unwrap();
+    let l1 = rt.eval_str_via_vm("<diff>", "(bl 1)").unwrap();
+    let l0 = rt.eval_str_via_vm("<diff>", "(bl 0)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&c7, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&c255, Value::Number(cs_core::Number::Fixnum(8))));
+    assert!(matches!(&c0, Value::Number(cs_core::Number::Fixnum(0))));
+    assert!(matches!(&l16, Value::Number(cs_core::Number::Fixnum(5))));
+    assert!(matches!(&l1, Value::Number(cs_core::Number::Fixnum(1))));
+    assert!(matches!(&l0, Value::Number(cs_core::Number::Fixnum(0))));
+}

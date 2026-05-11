@@ -161,6 +161,13 @@ pub enum Inst {
     /// `dst = atan2(y, x)` (2-arg arctangent). ADR 0012 D-2 (iter FM).
     FlonumAtan2(Value, Value, Value),
 
+    /// `dst = bitwise-bit-count(n)`. Fixnum -> Fixnum. ADR 0012 D-2
+    /// (iter FN).
+    BitwiseBitCount(Value, Value),
+    /// `dst = bitwise-length(n)`. Fixnum -> Fixnum. ADR 0012 D-2
+    /// (iter FN).
+    BitwiseLength(Value, Value),
+
     /// `dst = |src|` (flonum). Lowers to Cranelift `fabs`. Strips
     /// the sign bit; NaN propagates unchanged.
     FlonumAbs(Value, Value),

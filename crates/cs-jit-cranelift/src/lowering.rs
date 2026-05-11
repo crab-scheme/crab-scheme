@@ -354,6 +354,10 @@ pub struct Lowerer {
     flonum_log2_func: cranelift_module::FuncId,
     /// FuncId of `vm_flonum_atan2(y, x) -> i64`. ADR 0012 D-2 (iter FM).
     flonum_atan2_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
+    bitwise_bit_count_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
+    bitwise_length_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -802,6 +806,15 @@ impl Lowerer {
         // ADR 0012 D-2 (iter FM) — log/atan 2-arg.
         builder.symbol("vm_flonum_log2", cs_vm::vm::vm_flonum_log2 as *const u8);
         builder.symbol("vm_flonum_atan2", cs_vm::vm::vm_flonum_atan2 as *const u8);
+        // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
+        builder.symbol(
+            "vm_bitwise_bit_count",
+            cs_vm::vm::vm_bitwise_bit_count as *const u8,
+        );
+        builder.symbol(
+            "vm_bitwise_length",
+            cs_vm::vm::vm_bitwise_length as *const u8,
+        );
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
             "vm_char_alphabetic_p",
@@ -1947,6 +1960,24 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_flonum_atan2: {e}")))?;
 
+        // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
+        let bitwise_bit_count_func = module
+            .declare_function(
+                "vm_bitwise_bit_count",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bitwise_bit_count: {e}"))
+            })?;
+        let bitwise_length_func = module
+            .declare_function(
+                "vm_bitwise_length",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_bitwise_length: {e}")))?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -2632,6 +2663,8 @@ impl Lowerer {
             flonum_atan_func,
             flonum_log2_func,
             flonum_atan2_func,
+            bitwise_bit_count_func,
+            bitwise_length_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -3153,6 +3186,13 @@ impl Lowerer {
             let flonum_atan2_fnref = self
                 .module
                 .declare_func_in_func(self.flonum_atan2_func, builder.func);
+            // iter FN — bitwise-bit-count / -length.
+            let bitwise_bit_count_fnref = self
+                .module
+                .declare_func_in_func(self.bitwise_bit_count_func, builder.func);
+            let bitwise_length_fnref = self
+                .module
+                .declare_func_in_func(self.bitwise_length_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -3535,6 +3575,8 @@ impl Lowerer {
                         flonum_atan_fnref,
                         flonum_log2_fnref,
                         flonum_atan2_fnref,
+                        bitwise_bit_count_fnref,
+                        bitwise_length_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -3862,6 +3904,8 @@ fn lower_inst(
     flonum_atan_fnref: cranelift_codegen::ir::FuncRef,
     flonum_log2_fnref: cranelift_codegen::ir::FuncRef,
     flonum_atan2_fnref: cranelift_codegen::ir::FuncRef,
+    bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
+    bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -4507,6 +4551,27 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "FlonumAcos expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::BitwiseBitCount(dst, src) | Inst::BitwiseLength(dst, src) => {
+            // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
+            let sv = lookup(map, *src)?;
+            let fnref = match inst {
+                Inst::BitwiseBitCount(..) => bitwise_bit_count_fnref,
+                Inst::BitwiseLength(..) => bitwise_length_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[sv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BitwiseBitCount/Length expected 1 result, got {}",
                         results.len()
                     )));
                 }
