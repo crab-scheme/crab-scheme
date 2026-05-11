@@ -445,6 +445,14 @@ pub struct Lowerer {
     /// FuncId of `vm_string_drop_right_gc(s, n) -> i64`.
     /// ADR 0012 D-2 (iter FJ).
     string_drop_right_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_contains_right_gc(h, n) -> i64`.
+    /// ADR 0012 D-2 (iter FK).
+    string_contains_right_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_index_gc(s, c) -> i64`. ADR 0012 D-2 (iter FK).
+    string_index_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_index_right_gc(s, c) -> i64`.
+    /// ADR 0012 D-2 (iter FK).
+    string_index_right_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_list_fill_gc(n, fill) -> i64`. ADR 0012
     /// D-2 (iter EM).
     make_list_fill_func: cranelift_module::FuncId,
@@ -918,6 +926,19 @@ impl Lowerer {
         builder.symbol(
             "vm_string_drop_right_gc",
             cs_vm::vm::vm_string_drop_right_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter FK).
+        builder.symbol(
+            "vm_string_contains_right_gc",
+            cs_vm::vm::vm_string_contains_right_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_index_gc",
+            cs_vm::vm::vm_string_index_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_index_right_gc",
+            cs_vm::vm::vm_string_index_right_gc as *const u8,
         );
         // ADR 0012 D-2 (iter EM) — make-list 2-arg.
         builder.symbol(
@@ -2221,6 +2242,33 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_string_drop_right_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter FK).
+        let string_contains_right_func = module
+            .declare_function(
+                "vm_string_contains_right_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_contains_right_gc: {e}"))
+            })?;
+        let string_index_func = module
+            .declare_function(
+                "vm_string_index_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_index_gc: {e}")))?;
+        let string_index_right_func = module
+            .declare_function(
+                "vm_string_index_right_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_index_right_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter EM) — vm_make_list_fill_gc(n, fill) -> i64.
         // Same shape as vector_ref_sig (two i64 in, one out).
         let make_list_fill_func = module
@@ -2531,6 +2579,9 @@ impl Lowerer {
             string_drop_func,
             string_take_right_func,
             string_drop_right_func,
+            string_contains_right_func,
+            string_index_func,
+            string_index_right_func,
             make_list_fill_func,
             iota_n_func,
             iota_ns_func,
@@ -3130,6 +3181,16 @@ impl Lowerer {
             let string_drop_right_fnref = self
                 .module
                 .declare_func_in_func(self.string_drop_right_func, builder.func);
+            // iter FK — string-contains-right / string-index / -index-right.
+            let string_contains_right_fnref = self
+                .module
+                .declare_func_in_func(self.string_contains_right_func, builder.func);
+            let string_index_fnref = self
+                .module
+                .declare_func_in_func(self.string_index_func, builder.func);
+            let string_index_right_fnref = self
+                .module
+                .declare_func_in_func(self.string_index_right_func, builder.func);
             // iter EM — make-list 2-arg.
             let make_list_fill_fnref = self
                 .module
@@ -3395,6 +3456,9 @@ impl Lowerer {
                         string_drop_fnref,
                         string_take_right_fnref,
                         string_drop_right_fnref,
+                        string_contains_right_fnref,
+                        string_index_fnref,
+                        string_index_right_fnref,
                         make_list_fill_fnref,
                         iota_n_fnref,
                         iota_ns_fnref,
@@ -3713,6 +3777,9 @@ fn lower_inst(
     string_drop_fnref: cranelift_codegen::ir::FuncRef,
     string_take_right_fnref: cranelift_codegen::ir::FuncRef,
     string_drop_right_fnref: cranelift_codegen::ir::FuncRef,
+    string_contains_right_fnref: cranelift_codegen::ir::FuncRef,
+    string_index_fnref: cranelift_codegen::ir::FuncRef,
+    string_index_right_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
     iota_ns_fnref: cranelift_codegen::ir::FuncRef,
@@ -6085,6 +6152,32 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "StringSplit expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringContainsRight(dst, h, n)
+        | Inst::StringIndex(dst, h, n)
+        | Inst::StringIndexRight(dst, h, n) => {
+            // ADR 0012 D-2 (iter FK) — string-contains-right / string-index / -index-right.
+            let hv = lookup(map, *h)?;
+            let nv = lookup(map, *n)?;
+            let fnref = match inst {
+                Inst::StringContainsRight(..) => string_contains_right_fnref,
+                Inst::StringIndex(..) => string_index_fnref,
+                Inst::StringIndexRight(..) => string_index_right_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[hv, nv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringIndex/ContainsRight expected 1 result, got {}",
                         results.len()
                     )));
                 }

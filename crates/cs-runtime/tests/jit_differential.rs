@@ -6117,3 +6117,48 @@ fn diff_jit_string_take_drop_family() {
         other => panic!("expected four strings, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_index_family() {
+    // ADR 0012 D-2 (iter FK) — string-contains-right / string-index / -index-right.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (scr h n) (string-contains-right h n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (si s c) (string-index s c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sir s c) (string-index-right s c))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (scr \"foo bar foo\" \"foo\") \
+                      (si \"hello\" #\\l) \
+                      (sir \"hello\" #\\l) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let cr_hit = rt
+        .eval_str_via_vm("<diff>", "(scr \"foo bar foo baz\" \"foo\")")
+        .unwrap();
+    let cr_miss = rt
+        .eval_str_via_vm("<diff>", "(scr \"hello world\" \"xyz\")")
+        .unwrap();
+    let i_hit = rt.eval_str_via_vm("<diff>", "(si \"hello\" #\\l)").unwrap();
+    let i_miss = rt.eval_str_via_vm("<diff>", "(si \"hello\" #\\z)").unwrap();
+    let ir_hit = rt
+        .eval_str_via_vm("<diff>", "(sir \"hello\" #\\l)")
+        .unwrap();
+    let ir_miss = rt
+        .eval_str_via_vm("<diff>", "(sir \"hello\" #\\z)")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&cr_hit, Value::Number(cs_core::Number::Fixnum(8))));
+    assert!(matches!(&cr_miss, Value::Boolean(false)));
+    assert!(matches!(&i_hit, Value::Number(cs_core::Number::Fixnum(2))));
+    assert!(matches!(&i_miss, Value::Boolean(false)));
+    assert!(matches!(&ir_hit, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&ir_miss, Value::Boolean(false)));
+}

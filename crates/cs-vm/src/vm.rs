@@ -3889,6 +3889,93 @@ pub unsafe extern "C" fn vm_string_contains_gc(haystack: i64, needle: i64) -> i6
     }
 }
 
+/// `(string-contains-right haystack needle)` — last char-index of
+/// `needle` within `haystack`, or `#f`. ADR 0012 D-2 (iter FK).
+///
+/// # Safety
+///
+/// Both args must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_contains_right_gc(haystack: i64, needle: i64) -> i64 {
+    let h_v = unsafe { gc_i64_to_value(haystack) };
+    let n_v = unsafe { gc_i64_to_value(needle) };
+    let (h, n) = match (h_v, n_v) {
+        (Value::String(h), Value::String(n)) => (h.borrow().clone(), n.borrow().clone()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Boolean(false));
+        }
+    };
+    match h.rfind(&n) {
+        Some(byte_idx) => {
+            let char_idx = h[..byte_idx].chars().count() as i64;
+            value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(char_idx)))
+        }
+        None => value_to_gc_i64(Value::Boolean(false)),
+    }
+}
+
+/// `(string-index s c)` — leftmost char index of Character `c` in `s`,
+/// or `#f`. `c` is a Character-shape raw codepoint i64 (not a Gc
+/// handle). ADR 0012 D-2 (iter FK).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle; `c` is a raw
+/// codepoint (matches the char-upcase ABI).
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_index_gc(s: i64, c: i64) -> i64 {
+    let s_v = unsafe { gc_i64_to_value(s) };
+    let s_str = match s_v {
+        Value::String(sg) => sg.borrow().clone(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Boolean(false));
+        }
+    };
+    let target = match char::from_u32(c as u32) {
+        Some(ch) => ch,
+        None => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Boolean(false));
+        }
+    };
+    match s_str.chars().position(|ch| ch == target) {
+        Some(i) => value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(i as i64))),
+        None => value_to_gc_i64(Value::Boolean(false)),
+    }
+}
+
+/// `(string-index-right s c)` — rightmost char index of Character `c`
+/// in `s`, or `#f`. ADR 0012 D-2 (iter FK).
+///
+/// # Safety
+///
+/// Same as `vm_string_index_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_index_right_gc(s: i64, c: i64) -> i64 {
+    let s_v = unsafe { gc_i64_to_value(s) };
+    let s_str = match s_v {
+        Value::String(sg) => sg.borrow().clone(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Boolean(false));
+        }
+    };
+    let target = match char::from_u32(c as u32) {
+        Some(ch) => ch,
+        None => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Boolean(false));
+        }
+    };
+    let chars: Vec<char> = s_str.chars().collect();
+    match chars.iter().rposition(|ch| *ch == target) {
+        Some(i) => value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(i as i64))),
+        None => value_to_gc_i64(Value::Boolean(false)),
+    }
+}
+
 /// `(string-upcase s)` — return a fresh uppercased string.
 /// ADR 0012 D-2 (iter ET).
 ///

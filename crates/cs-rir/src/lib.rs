@@ -739,6 +739,14 @@ pub enum Inst {
     /// `dst = string-replace-all(s, from, to)`. ADR 0012 D-2 (iter FI).
     StringReplaceAll(Value, Value, Value, Value),
 
+    /// `dst = string-contains-right(haystack, needle)`. ADR 0012 D-2 (iter FK).
+    StringContainsRight(Value, Value, Value),
+    /// `dst = string-index(s, c)`. `c` is Character-shape raw codepoint.
+    /// ADR 0012 D-2 (iter FK).
+    StringIndex(Value, Value, Value),
+    /// `dst = string-index-right(s, c)`. ADR 0012 D-2 (iter FK).
+    StringIndexRight(Value, Value, Value),
+
     /// `dst = string-take(s, n)`. ADR 0012 D-2 (iter FJ).
     StringTake(Value, Value, Value),
     /// `dst = string-drop(s, n)`. ADR 0012 D-2 (iter FJ).
