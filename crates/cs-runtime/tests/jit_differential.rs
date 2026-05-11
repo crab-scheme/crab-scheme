@@ -4272,3 +4272,44 @@ fn diff_jit_variadic_append() {
         other => panic!("expected (pair, null, 5, 5), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_variadic_vector_append() {
+    // ADR 0012 D-2 (iter DT) — variadic `vector-append` lowers via
+    // stack-buffer + vm_vector_append_buf helper.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (va3 a b c) (vector-append a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (va0) (vector-append))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (va3 #(1 2) #(3) #(4 5)) (va0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let len = rt
+        .eval_str_via_vm("<diff>", "(vector-length (va3 #(1 2) #(3) #(4 5)))")
+        .unwrap();
+    let elem = rt
+        .eval_str_via_vm("<diff>", "(vector-ref (va3 #(1 2) #(3) #(4 5)) 3)")
+        .unwrap();
+    let empty_len = rt
+        .eval_str_via_vm("<diff>", "(vector-length (va0))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "variadic vector-append never dispatched through JIT (count={after})"
+    );
+    match (&len, &elem, &empty_len) {
+        (
+            Value::Number(cs_core::Number::Fixnum(5)),
+            Value::Number(cs_core::Number::Fixnum(4)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (5, 4, 0), got {:?}", other),
+    }
+}

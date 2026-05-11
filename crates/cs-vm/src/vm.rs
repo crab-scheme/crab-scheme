@@ -1716,6 +1716,40 @@ pub unsafe extern "C" fn vm_append_buf(buf: *const i64, n: usize) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(vector-append v ...)` — variadic vector concatenation. `buf`
+/// points to `n` raw `Gc<Value::Vector>` handles. Each input handle
+/// is consumed. Returns a fresh `Gc<Value::Vector>` handle containing
+/// the concatenated elements. On any non-vector argument, requests a
+/// deopt and returns an empty-vector handle. ADR 0012 D-2 (iter DT).
+///
+/// # Safety
+///
+/// `buf` must point to a valid array of `n` live, owned `Gc<Value>`
+/// raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_append_buf(buf: *const i64, n: usize) -> i64 {
+    let mut items: Vec<Value> = Vec::new();
+    for i in 0..n {
+        let raw = unsafe { *buf.add(i) };
+        let v = unsafe { gc_i64_to_value(raw) };
+        match v {
+            Value::Vector(vec) => {
+                let inner = vec.borrow();
+                items.extend(inner.iter().cloned());
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+                    Vec::new(),
+                ))));
+            }
+        }
+    }
+    value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+        items,
+    ))))
+}
+
 /// `(make-bytevector n fill)` — allocate a fresh `Value::ByteVector`
 /// of length `n` with every byte set to `fill & 0xFF`. Both args
 /// are raw Fixnum-shape i64 (not Gc handles). Negative `n` clamps
