@@ -555,6 +555,149 @@ pub unsafe extern "C" fn vm_value_drop_gc(r: i64) {
     drop(unsafe { cs_gc::Gc::<Value>::from_raw_jit(r as *const ()) });
 }
 
+/// `(make-vector n fill)` — allocate a fresh vector of length `n`
+/// whose slots are all cloned copies of `fill`. ADR 0012 D-2
+/// Gc-backed counterpart to a future `vm_alloc_vector` (no Box
+/// version exists yet — vector lowering is gated on iter BU).
+///
+/// Shape parallels `vm_alloc_pair_gc`: returns a `Gc<Value>` raw
+/// handle (refcount = 1) carrying `Value::Vector(...)`. The vector's
+/// inner storage is a `Gc<RefCell<Vec<Value>>>` allocated via
+/// `cs_gc::Gc::new` (unregistered with the active Heap), matching
+/// how `cs_core::Pair::new` works inside `vm_alloc_pair_gc`. The
+/// outer `Gc<Value>` box routes through the active Heap when one is
+/// installed (via `value_to_gc_i64`).
+///
+/// # Safety
+///
+/// `fill` must be a live, owned `Gc<Value>` raw handle from
+/// `value_to_gc_i64` (or `0` is NOT a valid sentinel — pass an
+/// explicit `Value::Unspecified` handle if you want default
+/// initialization). Exactly one strong refcount on `fill` is
+/// consumed; the inner `Value` is cloned into each of the `n`
+/// slots, so for non-trivial fills (e.g. `Value::Pair`) every slot
+/// shares the same `Gc` allocation.
+#[no_mangle]
+pub unsafe extern "C" fn vm_alloc_vector_gc(n: i64, fill: i64) -> i64 {
+    let fill_v = unsafe { gc_i64_to_value(fill) };
+    let len = if n < 0 { 0usize } else { n as usize };
+    let storage: Vec<Value> = vec![fill_v; len];
+    value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+        storage,
+    ))))
+}
+
+/// Inner (non-FFI) implementation of `vm_vector_ref_gc`. Same
+/// contract — consumes one strong refcount on `vec`, panics on
+/// type mismatch or out-of-bounds. Split out so unit tests can
+/// observe the panic via `catch_unwind` without crossing the
+/// `extern "C"` abort barrier (panics through `extern "C"` are
+/// undefined / abort by default on this target).
+///
+/// # Safety
+///
+/// Same as `vm_vector_ref_gc`.
+unsafe fn vm_vector_ref_gc_inner(vec: i64, idx: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(vec) };
+    match v {
+        Value::Vector(vc) => {
+            let storage = vc.borrow();
+            if idx < 0 || (idx as usize) >= storage.len() {
+                panic!(
+                    "vm_vector_ref_gc: index {} out of bounds for vector of length {}",
+                    idx,
+                    storage.len()
+                );
+            }
+            value_to_gc_i64(storage[idx as usize].clone())
+        }
+        other => panic!("vm_vector_ref_gc: not a vector ({})", other.type_name()),
+    }
+}
+
+/// `(vector-ref v i)` — return the element at index `idx` of `vec`,
+/// Gc-tagged. Consumes one strong refcount on the `vec` handle.
+///
+/// # Safety
+///
+/// `vec` must be a live, owned `Gc<Value>` raw handle for a
+/// `Value::Vector`. Panics if the underlying `Value` is not a
+/// vector, or if `idx` is out of bounds. Panics across the
+/// `extern "C"` boundary abort by default — a future iter that
+/// integrates with the JIT-frame unwind handler may switch this
+/// helper to `extern "C-unwind"` once the runtime's catch_unwind
+/// site is wired.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_ref_gc(vec: i64, idx: i64) -> i64 {
+    unsafe { vm_vector_ref_gc_inner(vec, idx) }
+}
+
+/// `(vector-set! v i x)` — store `x` into slot `idx` of `vec`.
+/// Consumes one strong refcount on both `vec` and `x` handles.
+/// Returns a fresh Gc handle carrying `Value::Unspecified` so the
+/// ABI shape is uniform with other Gc-returning helpers (the
+/// future lowerer can `vm_value_drop_gc` it or thread it through
+/// the dst register; iter BU picks the convention).
+///
+/// # Safety
+///
+/// Both `vec` and `x` must be live, owned `Gc<Value>` raw handles.
+/// Panics on type mismatch or out-of-bounds index; in either case
+/// the consumed refcounts are released before the panic so no leak
+/// occurs even when the unwind crosses the FFI boundary.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_set_gc(vec: i64, idx: i64, x: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(vec) };
+    let x_v = unsafe { gc_i64_to_value(x) };
+    match v {
+        Value::Vector(vc) => {
+            let mut storage = vc.borrow_mut();
+            if idx < 0 || (idx as usize) >= storage.len() {
+                panic!(
+                    "vm_vector_set_gc: index {} out of bounds for vector of length {}",
+                    idx,
+                    storage.len()
+                );
+            }
+            storage[idx as usize] = x_v;
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        other => panic!("vm_vector_set_gc: not a vector ({})", other.type_name()),
+    }
+}
+
+/// `(vector-length v)` — return the length of `vec` as a raw i64.
+/// Consumes one strong refcount on the `vec` handle. The return is
+/// NOT a Gc handle — it has Fixnum shape, matching the
+/// `JIT_RT_FIXNUM` ABI carrier so the future lowerer can store it
+/// directly without an extra unbox.
+///
+/// # Safety
+///
+/// `vec` must be a live, owned `Gc<Value>` raw handle for a
+/// `Value::Vector`. Panics on type mismatch.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_length_gc(vec: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(vec) };
+    match v {
+        Value::Vector(vc) => vc.borrow().len() as i64,
+        other => panic!("vm_vector_length_gc: not a vector ({})", other.type_name()),
+    }
+}
+
+/// `(vector? v)` — type predicate. Consume-on-use; 0/1 out. Same
+/// shape as `vm_pair_p_gc` / `vm_null_p_gc`.
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Vector(_)) as i64
+}
+
 /// `(car pair)` — return the pair's car, Any-tagged. Pre-decodes the
 /// Any-tagged input box and re-Anys the inner car.
 ///
@@ -5828,6 +5971,95 @@ mod gc_helper_tests {
             ) => {}
             other => panic!("unexpected clones: {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod vector_helper_tests {
+    use super::*;
+
+    #[test]
+    fn vm_alloc_vector_gc_creates_correctly_sized_vector() {
+        // ADR 0012 D-2 iter BT — alloc a length-5 vector filled with
+        // Unspecified and verify shape via gc_i64_to_value.
+        let fill = value_to_gc_i64(Value::Unspecified);
+        let i = unsafe { vm_alloc_vector_gc(5, fill) };
+        assert_ne!(i, 0, "vm_alloc_vector_gc returned null handle");
+        let v = unsafe { gc_i64_to_value(i) };
+        match v {
+            Value::Vector(vc) => {
+                let storage = vc.borrow();
+                assert_eq!(storage.len(), 5, "vector length mismatch");
+                for (idx, slot) in storage.iter().enumerate() {
+                    assert!(
+                        matches!(slot, Value::Unspecified),
+                        "slot {} expected Unspecified, got {:?}",
+                        idx,
+                        slot
+                    );
+                }
+            }
+            other => panic!("expected Vector, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn vm_vector_ref_set_roundtrip() {
+        // alloc length-3 vector filled with Unspecified, set [2] = 99,
+        // ref [2] -> Fixnum(99).
+        let fill = value_to_gc_i64(Value::Unspecified);
+        let vec_i = unsafe { vm_alloc_vector_gc(3, fill) };
+        // Bump count: set! consumes one, ref consumes another.
+        let vec_i2 = unsafe { vm_value_clone_gc(vec_i) };
+        let x = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(99)));
+        let unit = unsafe { vm_vector_set_gc(vec_i, 2, x) };
+        // Drop the Unspecified return so we don't leak the strong count.
+        unsafe { vm_value_drop_gc(unit) };
+        let got = unsafe { vm_vector_ref_gc(vec_i2, 2) };
+        let v = unsafe { gc_i64_to_value(got) };
+        match v {
+            Value::Number(cs_core::Number::Fixnum(99)) => {}
+            other => panic!("expected Fixnum(99), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn vm_vector_length_gc_returns_length() {
+        let fill = value_to_gc_i64(Value::Unspecified);
+        let vec_i = unsafe { vm_alloc_vector_gc(7, fill) };
+        let len = unsafe { vm_vector_length_gc(vec_i) };
+        assert_eq!(len, 7);
+    }
+
+    #[test]
+    fn vm_vector_p_gc_classifies() {
+        // Vector -> 1.
+        let fill = value_to_gc_i64(Value::Unspecified);
+        let i_vec = unsafe { vm_alloc_vector_gc(2, fill) };
+        assert_eq!(unsafe { vm_vector_p_gc(i_vec) }, 1);
+        // Pair -> 0.
+        let i_pair = unsafe { vm_alloc_pair_gc(1, JIT_RT_FIXNUM, 2, JIT_RT_FIXNUM) };
+        assert_eq!(unsafe { vm_vector_p_gc(i_pair) }, 0);
+        // Null -> 0.
+        let i_null = value_to_gc_i64(Value::Null);
+        assert_eq!(unsafe { vm_vector_p_gc(i_null) }, 0);
+    }
+
+    #[test]
+    fn vm_vector_ref_out_of_bounds_panics() {
+        // Allocate length-3 vector, ref [999] should panic. We
+        // exercise the non-FFI inner so `catch_unwind` works —
+        // panics through `extern "C"` abort by default on this
+        // target, so the public `vm_vector_ref_gc` symbol can't be
+        // tested directly. The inner shares the bounds-check logic
+        // verbatim (the FFI wrapper is a one-line forward).
+        let fill = value_to_gc_i64(Value::Unspecified);
+        let vec_i = unsafe { vm_alloc_vector_gc(3, fill) };
+        let result = std::panic::catch_unwind(|| unsafe { vm_vector_ref_gc_inner(vec_i, 999) });
+        assert!(
+            result.is_err(),
+            "vm_vector_ref_gc_inner with idx 999 in length-3 vector should panic"
+        );
     }
 }
 
