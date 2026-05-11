@@ -1311,6 +1311,45 @@ pub fn bytecode_to_rir_with_hints(
                                     | ("symbol=?", 2) => {
                                         insts.push(RirInst::Eq(dst, args[0], args[1]));
                                     }
+                                    // ADR 0012 D-2 (iter CF) — char
+                                    // ordered comparisons. Character carries
+                                    // a codepoint in Fixnum-shape i64 lanes,
+                                    // so RirInst::Lt compares them
+                                    // numerically — matching R6RS char<?
+                                    // (Unicode codepoint order).
+                                    ("char<?", 2) => {
+                                        insts.push(RirInst::Lt(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("char>?", 2) => {
+                                        // a > b → b < a (swap).
+                                        insts.push(RirInst::Lt(dst, args[1], args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("char<=?", 2) => {
+                                        // a <= b → NOT (b < a). Mirrors
+                                        // LeFx2's pattern: Lt(b, a) then
+                                        // Eq(lt, 0).
+                                        let lt = alloc();
+                                        insts.push(RirInst::Lt(lt, args[1], args[0]));
+                                        value_types.insert(lt, Type::Boolean);
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        value_types.insert(zero, Type::Fixnum);
+                                        insts.push(RirInst::Eq(dst, lt, zero));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("char>=?", 2) => {
+                                        // a >= b → NOT (a < b).
+                                        let lt = alloc();
+                                        insts.push(RirInst::Lt(lt, args[0], args[1]));
+                                        value_types.insert(lt, Type::Boolean);
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        value_types.insert(zero, Type::Fixnum);
+                                        insts.push(RirInst::Eq(dst, lt, zero));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // Always-false predicates: JIT bodies
                                     // are only entered when every arg is
                                     // a Fixnum (the type guard's

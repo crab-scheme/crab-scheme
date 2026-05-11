@@ -2581,3 +2581,50 @@ fn diff_jit_set_car_cdr_mutate_pair() {
         other => panic!("expected (42, 88), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_char_ordered_comparisons() {
+    // ADR 0012 D-2 (iter CF) — char<? / char>? / char<=? /
+    // char>=? now lower to RirInst::Lt with appropriate operand
+    // swaps and negation. Character carries codepoint in Fixnum-
+    // shape i64 lanes so numeric comparison matches Unicode order.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (lt? a b) (if (char<? a b) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (gt? a b) (if (char>? a b) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (le? a b) (if (char<=? a b) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ge? a b) (if (char>=? a b) 1 0))")
+        .unwrap();
+    // Warmup all four with #\a #\b.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+            (if (= i 1500) 'done \
+                (begin (lt? #\\a #\\b) (gt? #\\a #\\b) \
+                       (le? #\\a #\\b) (ge? #\\a #\\b) \
+                       (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let lt_yes = rt.eval_str_via_vm("<diff>", "(lt? #\\a #\\z)").unwrap();
+    let gt_no = rt.eval_str_via_vm("<diff>", "(gt? #\\a #\\z)").unwrap();
+    let le_eq = rt.eval_str_via_vm("<diff>", "(le? #\\m #\\m)").unwrap();
+    let ge_eq = rt.eval_str_via_vm("<diff>", "(ge? #\\m #\\m)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "char comparisons never dispatched through JIT (count={after})"
+    );
+    match (&lt_yes, &gt_no, &le_eq, &ge_eq) {
+        (
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+        ) => {}
+        other => panic!("expected (1, 0, 1, 1), got {:?}", other),
+    }
+}

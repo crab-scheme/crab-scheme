@@ -239,6 +239,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // characters
         ("char=?", b_char_eq),
         ("char<?", b_char_lt),
+        ("char>?", b_char_gt),
+        ("char<=?", b_char_le),
+        ("char>=?", b_char_ge),
         ("char->integer", b_char_to_integer),
         ("integer->char", b_integer_to_char),
         ("char-upcase", b_char_upcase),
@@ -2915,6 +2918,69 @@ fn b_char_lt(args: &[Value]) -> Result<Value, String> {
             v => return Err(type_err("char<?", "character", v)),
         };
         if !(prev < cur) {
+            return Ok(Value::Boolean(false));
+        }
+        prev = cur;
+    }
+    Ok(Value::Boolean(true))
+}
+
+fn b_char_gt(args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Ok(Value::Boolean(true));
+    }
+    let mut prev = match &args[0] {
+        Value::Character(c) => *c,
+        v => return Err(type_err("char>?", "character", v)),
+    };
+    for a in &args[1..] {
+        let cur = match a {
+            Value::Character(c) => *c,
+            v => return Err(type_err("char>?", "character", v)),
+        };
+        if !(prev > cur) {
+            return Ok(Value::Boolean(false));
+        }
+        prev = cur;
+    }
+    Ok(Value::Boolean(true))
+}
+
+fn b_char_le(args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Ok(Value::Boolean(true));
+    }
+    let mut prev = match &args[0] {
+        Value::Character(c) => *c,
+        v => return Err(type_err("char<=?", "character", v)),
+    };
+    for a in &args[1..] {
+        let cur = match a {
+            Value::Character(c) => *c,
+            v => return Err(type_err("char<=?", "character", v)),
+        };
+        if !(prev <= cur) {
+            return Ok(Value::Boolean(false));
+        }
+        prev = cur;
+    }
+    Ok(Value::Boolean(true))
+}
+
+fn b_char_ge(args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Ok(Value::Boolean(true));
+    }
+    let mut prev = match &args[0] {
+        Value::Character(c) => *c,
+        v => return Err(type_err("char>=?", "character", v)),
+    };
+    for a in &args[1..] {
+        let cur = match a {
+            Value::Character(c) => *c,
+            v => return Err(type_err("char>=?", "character", v)),
+        };
+        if !(prev >= cur) {
             return Ok(Value::Boolean(false));
         }
         prev = cur;
