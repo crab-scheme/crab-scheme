@@ -7221,3 +7221,45 @@ fn diff_jit_complex_real_valued_promise() {
     assert!(matches!(&pm_no, Value::Boolean(false)));
     assert!(matches!(&pm_yes, Value::Boolean(true)));
 }
+
+#[test]
+fn diff_jit_div_mod_euclid() {
+    // ADR 0012 D-2 (iter GE) — R6RS div/mod (Euclidean).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (d x y) (div x y))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (m x y) (mod x y))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fd x y) (fxdiv x y))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fm x y) (fxmod x y))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (d 10 3) (m 10 3) (fd 7 2) (fm 7 2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // R6RS Euclidean: div(-7, 2) = -4 (not -3); mod always non-negative
+    let dpos = rt.eval_str_via_vm("<diff>", "(d 10 3)").unwrap();
+    let dneg = rt.eval_str_via_vm("<diff>", "(d -7 2)").unwrap();
+    let mpos = rt.eval_str_via_vm("<diff>", "(m 10 3)").unwrap();
+    let mneg = rt.eval_str_via_vm("<diff>", "(m -7 2)").unwrap();
+    let fd = rt.eval_str_via_vm("<diff>", "(fd 17 5)").unwrap();
+    let fm = rt.eval_str_via_vm("<diff>", "(fm 17 5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    // 10 div 3 = 3 (rounds toward -inf)
+    assert!(matches!(&dpos, Value::Number(cs_core::Number::Fixnum(3))));
+    // -7 div 2 = -4 (rounds toward -inf: -3.5 → -4)
+    assert!(matches!(&dneg, Value::Number(cs_core::Number::Fixnum(-4))));
+    // 10 mod 3 = 1
+    assert!(matches!(&mpos, Value::Number(cs_core::Number::Fixnum(1))));
+    // -7 mod 2 = 1 (non-negative remainder)
+    assert!(matches!(&mneg, Value::Number(cs_core::Number::Fixnum(1))));
+    // 17 fxdiv 5 = 3, fxmod = 2
+    assert!(matches!(&fd, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&fm, Value::Number(cs_core::Number::Fixnum(2))));
+}

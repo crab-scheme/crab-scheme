@@ -941,6 +941,36 @@ pub fn bytecode_to_rir_with_hints(
                                 {
                                     Some(RirInst::FxFirstBitSet(dst, args[0]))
                                 }
+                                // ADR 0012 D-2 (iter GE) — R6RS div / mod.
+                                // Both 2-arg Fixnum-only; refuse Flonum.
+                                ("div", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::DivEuclid(dst, args[0], args[1]))
+                                }
+                                ("mod", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::ModEuclid(dst, args[0], args[1]))
+                                }
+                                ("fxdiv", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::DivEuclid(dst, args[0], args[1]))
+                                }
+                                ("fxmod", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::ModEuclid(dst, args[0], args[1]))
+                                }
                                 _ => None,
                             };
                             if let Some(inst) = single {

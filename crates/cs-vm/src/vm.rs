@@ -832,6 +832,38 @@ pub unsafe extern "C" fn vm_promise_p_gc(r: i64) -> i64 {
     matches!(v, Value::Promise(_)) as i64
 }
 
+/// `(div x y)` — R6RS Euclidean division. Result rounds toward -∞
+/// such that `mod` is always non-negative. Deopts on y == 0 (bytecode
+/// raises a condition we don't model here). Both args raw Fixnum-shape.
+/// ADR 0012 D-2 (iter GE).
+///
+/// # Safety
+///
+/// `x` and `y` are raw i64 Fixnums.
+#[no_mangle]
+pub unsafe extern "C" fn vm_div_euclid(x: i64, y: i64) -> i64 {
+    if y == 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return 0;
+    }
+    x.div_euclid(y)
+}
+
+/// `(mod x y)` — R6RS Euclidean modulo. Always non-negative for non-
+/// zero `y`. Deopts on y == 0. ADR 0012 D-2 (iter GE).
+///
+/// # Safety
+///
+/// Same as `vm_div_euclid`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_mod_euclid(x: i64, y: i64) -> i64 {
+    if y == 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return 0;
+    }
+    x.rem_euclid(y)
+}
+
 /// `(eof-object? v)` — true iff `v` is the eof object. Consume-on-use;
 /// 0/1 out. ADR 0012 D-2 (iter DD).
 ///

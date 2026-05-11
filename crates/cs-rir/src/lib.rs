@@ -673,6 +673,10 @@ pub enum Inst {
     TextualPortP(Value, Value),
     /// `dst = promise?(v)`. ADR 0012 D-2 (iter GD).
     PromiseP(Value, Value),
+    /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
+    DivEuclid(Value, Value, Value),
+    /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).
+    ModEuclid(Value, Value, Value),
 
     /// `dst = eof-object?(v)`. Lowers to `vm_eof_p_gc`. ADR 0012 D-2
     /// (iter DD).

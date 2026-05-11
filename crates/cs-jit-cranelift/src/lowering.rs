@@ -377,6 +377,10 @@ pub struct Lowerer {
     textual_port_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_promise_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GD).
     promise_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_div_euclid(x, y) -> i64`. ADR 0012 D-2 (iter GE).
+    div_euclid_func: cranelift_module::FuncId,
+    /// FuncId of `vm_mod_euclid(x, y) -> i64`. ADR 0012 D-2 (iter GE).
+    mod_euclid_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -931,6 +935,9 @@ impl Lowerer {
         );
         // ADR 0012 D-2 (iter GD) — promise?.
         builder.symbol("vm_promise_p_gc", cs_vm::vm::vm_promise_p_gc as *const u8);
+        // ADR 0012 D-2 (iter GE) — R6RS div / mod.
+        builder.symbol("vm_div_euclid", cs_vm::vm::vm_div_euclid as *const u8);
+        builder.symbol("vm_mod_euclid", cs_vm::vm::vm_mod_euclid as *const u8);
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
             "vm_bitwise_bit_count",
@@ -2269,6 +2276,22 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_promise_p_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter GE) — R6RS div / mod.
+        let div_euclid_func = module
+            .declare_function(
+                "vm_div_euclid",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_div_euclid: {e}")))?;
+        let mod_euclid_func = module
+            .declare_function(
+                "vm_mod_euclid",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_mod_euclid: {e}")))?;
+
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
             .declare_function(
@@ -3227,6 +3250,8 @@ impl Lowerer {
             binary_port_p_func,
             textual_port_p_func,
             promise_p_func,
+            div_euclid_func,
+            mod_euclid_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -3809,6 +3834,13 @@ impl Lowerer {
             let promise_p_fnref = self
                 .module
                 .declare_func_in_func(self.promise_p_func, builder.func);
+            // iter GE — div/mod (Euclidean).
+            let div_euclid_fnref = self
+                .module
+                .declare_func_in_func(self.div_euclid_func, builder.func);
+            let mod_euclid_fnref = self
+                .module
+                .declare_func_in_func(self.mod_euclid_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4282,6 +4314,8 @@ impl Lowerer {
                         binary_port_p_fnref,
                         textual_port_p_fnref,
                         promise_p_fnref,
+                        div_euclid_fnref,
+                        mod_euclid_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -4644,6 +4678,8 @@ fn lower_inst(
     binary_port_p_fnref: cranelift_codegen::ir::FuncRef,
     textual_port_p_fnref: cranelift_codegen::ir::FuncRef,
     promise_p_fnref: cranelift_codegen::ir::FuncRef,
+    div_euclid_fnref: cranelift_codegen::ir::FuncRef,
+    mod_euclid_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -5313,6 +5349,28 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "FlonumAcos expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::DivEuclid(dst, x, y) | Inst::ModEuclid(dst, x, y) => {
+            // ADR 0012 D-2 (iter GE) — R6RS div / mod.
+            let xv = lookup(map, *x)?;
+            let yv = lookup(map, *y)?;
+            let fnref = match inst {
+                Inst::DivEuclid(..) => div_euclid_fnref,
+                Inst::ModEuclid(..) => mod_euclid_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[xv, yv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "DivEuclid/ModEuclid expected 1 result, got {}",
                         results.len()
                     )));
                 }
