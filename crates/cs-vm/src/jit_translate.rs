@@ -1607,7 +1607,12 @@ pub fn bytecode_to_rir_with_hints(
                                         value_types.insert(dst, Type::Boolean);
                                     }
                                     // ADR 0012 D-2 (iter CB) — reverse.
-                                    ("reverse", 1)
+                                    // ADR 0012 D-2 (iter EW) — reverse! is
+                                    // an alias for reverse (the cs-runtime
+                                    // builtin doesn't actually mutate; it
+                                    // builds a fresh reversed list, same as
+                                    // R7RS reverse).
+                                    ("reverse", 1) | ("reverse!", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
                                     {

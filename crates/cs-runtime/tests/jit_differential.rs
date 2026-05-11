@@ -5567,3 +5567,29 @@ fn diff_jit_string_prefix_suffix_p() {
         other => panic!("expected (T, F, T, F), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_reverse_bang() {
+    // ADR 0012 D-2 (iter EW) — reverse! aliased to reverse.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (rb x) (reverse! x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (rb '(1 2 3)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let r = rt.eval_str_via_vm("<diff>", "(rb '(10 20 30 40))").unwrap();
+    let first = rt
+        .eval_str_via_vm("<diff>", "(car (rb '(10 20 30 40)))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&r, &first) {
+        (Value::Pair(_), Value::Number(cs_core::Number::Fixnum(40))) => {}
+        other => panic!("expected (pair, 40), got {:?}", other),
+    }
+}
