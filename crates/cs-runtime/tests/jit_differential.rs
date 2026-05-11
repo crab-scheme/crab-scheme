@@ -6356,3 +6356,51 @@ fn diff_jit_bitwise_shift_and_bit_set_p() {
     assert!(matches!(&b2, Value::Boolean(true)));
     assert!(matches!(&bo, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_bytevector_s8_ref_set() {
+    // ADR 0012 D-2 (iter FP) — bytevector-s8-ref/-set!.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sr bv k) (bytevector-s8-ref bv k))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (ss bv k v) (bytevector-s8-set! bv k v) (bytevector-s8-ref bv k))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sr (bytevector 1 255 128) 0) \
+                      (ss (make-bytevector 4 0) 1 -5) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // 0x80 (=128 as u8) read as s8 = -128
+    let neg = rt
+        .eval_str_via_vm("<diff>", "(sr (bytevector 128) 0)")
+        .unwrap();
+    // 0x7F = 127 (positive max s8)
+    let pos = rt
+        .eval_str_via_vm("<diff>", "(sr (bytevector 127) 0)")
+        .unwrap();
+    // 0xFF (=255 as u8) read as s8 = -1
+    let neg1 = rt
+        .eval_str_via_vm("<diff>", "(sr (bytevector 255) 0)")
+        .unwrap();
+    // Set to -42 and read back
+    let setget = rt
+        .eval_str_via_vm("<diff>", "(ss (make-bytevector 4 0) 2 -42)")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&neg, Value::Number(cs_core::Number::Fixnum(-128))));
+    assert!(matches!(&pos, Value::Number(cs_core::Number::Fixnum(127))));
+    assert!(matches!(&neg1, Value::Number(cs_core::Number::Fixnum(-1))));
+    assert!(matches!(
+        &setget,
+        Value::Number(cs_core::Number::Fixnum(-42))
+    ));
+}

@@ -2144,6 +2144,66 @@ pub unsafe extern "C" fn vm_bytevector_u8_ref_gc(bv: i64, k: i64) -> i64 {
     }
 }
 
+/// `(bytevector-s8-ref bv k)` — read byte at `k` as signed i8 and
+/// sign-extend to Fixnum. Deopts on type miss or out-of-range.
+/// ADR 0012 D-2 (iter FP).
+///
+/// # Safety
+///
+/// Same as `vm_bytevector_u8_ref_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_s8_ref_gc(bv: i64, k: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let storage = bvc.borrow();
+            if k < 0 || (k as usize) >= storage.len() {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return 0;
+            }
+            storage[k as usize] as i8 as i64
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+/// `(bytevector-s8-set! bv k v)` — write s8 value at `k`. `v` must
+/// be in [-128, 127]; otherwise deopts. Returns Unspecified Gc
+/// handle. ADR 0012 D-2 (iter FP).
+///
+/// # Safety
+///
+/// `bv` must be a live, owned `Gc<Value>` raw handle. `k` and `val`
+/// are raw i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_s8_set_gc(bv: i64, k: i64, val: i64) -> i64 {
+    if !(-128..=127).contains(&val) {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Unspecified);
+    }
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let mut storage = bvc.borrow_mut();
+            if k < 0 || (k as usize) >= storage.len() {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            storage[k as usize] = (val as i8) as u8;
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(arithmetic-shift n count)` — left-shift if count >= 0,
 /// arithmetic right-shift if count < 0. Matches
 /// `b_bitwise_arith_shift`: shifts past 64 saturate to 0 / -1.

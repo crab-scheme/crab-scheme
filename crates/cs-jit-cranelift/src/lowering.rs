@@ -367,6 +367,12 @@ pub struct Lowerer {
     /// FuncId of `vm_bitwise_bit_set_p(n, bit) -> i64` (raw 0/1).
     /// ADR 0012 D-2 (iter FO).
     bitwise_bit_set_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_s8_ref_gc(bv, k) -> i64`. Sign-extended
+    /// byte read. ADR 0012 D-2 (iter FP).
+    bytevector_s8_ref_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_s8_set_gc(bv, k, v) -> i64`. Returns
+    /// Unspecified Gc handle. ADR 0012 D-2 (iter FP).
+    bytevector_s8_set_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -836,6 +842,15 @@ impl Lowerer {
         builder.symbol(
             "vm_bitwise_bit_set_p",
             cs_vm::vm::vm_bitwise_bit_set_p as *const u8,
+        );
+        // ADR 0012 D-2 (iter FP) — bytevector-s8-ref/-set!.
+        builder.symbol(
+            "vm_bytevector_s8_ref_gc",
+            cs_vm::vm::vm_bytevector_s8_ref_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_bytevector_s8_set_gc",
+            cs_vm::vm::vm_bytevector_s8_set_gc as *const u8,
         );
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
@@ -2031,6 +2046,26 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_bitwise_bit_set_p: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter FP) — bytevector-s8-ref/-set!.
+        let bytevector_s8_ref_func = module
+            .declare_function(
+                "vm_bytevector_s8_ref_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_s8_ref_gc: {e}"))
+            })?;
+        let bytevector_s8_set_func = module
+            .declare_function(
+                "vm_bytevector_s8_set_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_s8_set_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -2721,6 +2756,8 @@ impl Lowerer {
             bitwise_arith_shift_left_func,
             bitwise_arith_shift_right_func,
             bitwise_bit_set_p_func,
+            bytevector_s8_ref_func,
+            bytevector_s8_set_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -3259,6 +3296,13 @@ impl Lowerer {
             let bitwise_bit_set_p_fnref = self
                 .module
                 .declare_func_in_func(self.bitwise_bit_set_p_func, builder.func);
+            // iter FP — bytevector-s8-ref/-set!.
+            let bytevector_s8_ref_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_s8_ref_func, builder.func);
+            let bytevector_s8_set_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_s8_set_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -3646,6 +3690,8 @@ impl Lowerer {
                         bitwise_arith_shift_left_fnref,
                         bitwise_arith_shift_right_fnref,
                         bitwise_bit_set_p_fnref,
+                        bytevector_s8_ref_fnref,
+                        bytevector_s8_set_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -3978,6 +4024,8 @@ fn lower_inst(
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_right_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_set_p_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_s8_ref_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_s8_set_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -5590,6 +5638,44 @@ fn lower_inst(
                 }
                 results[0]
             };
+            map.insert(*dst, result);
+        }
+        Inst::BvS8Ref(dst, bv, k) => {
+            // ADR 0012 D-2 (iter FP) — vm_bytevector_s8_ref_gc. Fixnum
+            // (sign-extended).
+            let bv_v = lookup(map, *bv)?;
+            let k_v = lookup(map, *k)?;
+            let inst_ref = b.ins().call(bytevector_s8_ref_fnref, &[bv_v, k_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvS8Ref expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::BvS8Set(dst, bv, k, val) => {
+            // ADR 0012 D-2 (iter FP) — vm_bytevector_s8_set_gc.
+            // Returns Gc(Unspecified).
+            let bv_v = lookup(map, *bv)?;
+            let k_v = lookup(map, *k)?;
+            let val_v = lookup(map, *val)?;
+            let inst_ref = b.ins().call(bytevector_s8_set_fnref, &[bv_v, k_v, val_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvS8Set expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
         Inst::BvAlloc(dst, n, fill) => {

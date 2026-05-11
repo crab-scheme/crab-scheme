@@ -1824,6 +1824,14 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::BvU8Ref(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Fixnum);
                                     }
+                                    // ADR 0012 D-2 (iter FP) — bytevector-s8-ref.
+                                    ("bytevector-s8-ref", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvS8Ref(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
                                     // ADR 0012 D-2 (iter DB) — string-copy /
                                     // vector-copy (1-arg full copy).
                                     ("string-copy", 1)
@@ -1914,6 +1922,15 @@ pub fn bytecode_to_rir_with_hints(
                                     {
                                         insts
                                             .push(RirInst::BvU8Set(dst, args[0], args[1], args[2]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    // ADR 0012 D-2 (iter FP) — bytevector-s8-set!.
+                                    ("bytevector-s8-set!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts
+                                            .push(RirInst::BvS8Set(dst, args[0], args[1], args[2]));
                                         value_types.insert(dst, Type::Any);
                                     }
                                     // ADR 0012 D-2 (iter CN) — list-copy.
@@ -4340,6 +4357,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::ListSet(dst, _, _, _)
                 | RirInst::BvAlloc(dst, _, _)
                 | RirInst::BvU8Set(dst, _, _, _)
+                | RirInst::BvS8Set(dst, _, _, _)
                 | RirInst::VecBuild(dst, _)
                 | RirInst::StrBuild(dst, _)
                 | RirInst::BvBuild(dst, _)
