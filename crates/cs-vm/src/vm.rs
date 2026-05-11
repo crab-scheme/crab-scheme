@@ -3440,6 +3440,59 @@ pub unsafe extern "C" fn vm_make_list_fill_gc(n: i64, fill: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(string-join parts sep)` — 2-arg form. `parts` is a proper list
+/// of strings; concatenate with `sep` between each. Both Gc handles
+/// consumed. On non-string in the list or non-string separator,
+/// requests a deopt and returns empty string. ADR 0012 D-2 (iter FE).
+///
+/// # Safety
+///
+/// `parts` and `sep` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_join_gc(parts: i64, sep: i64) -> i64 {
+    let p_v = unsafe { gc_i64_to_value(parts) };
+    let s_v = unsafe { gc_i64_to_value(sep) };
+    let sep_s = match s_v {
+        Value::String(s) => s.borrow().clone(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))));
+        }
+    };
+    let mut strs: Vec<String> = Vec::new();
+    let mut cur = p_v;
+    loop {
+        match cur {
+            Value::Null => break,
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                let cdr = p.cdr.borrow().clone();
+                match car {
+                    Value::String(s) => strs.push(s.borrow().clone()),
+                    _ => {
+                        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                        return value_to_gc_i64(Value::String(cs_gc::Gc::new(
+                            std::cell::RefCell::new(String::new()),
+                        )));
+                    }
+                }
+                cur = cdr;
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                    String::new(),
+                ))));
+            }
+        }
+    }
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        strs.join(&sep_s),
+    ))))
+}
+
 /// `(string-prefix? prefix s)` — true iff `s` starts with `prefix`.
 /// Consumes both Gc handles. Returns Gc<Value::Boolean>.
 /// ADR 0012 D-2 (iter EV).

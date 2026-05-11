@@ -5896,3 +5896,40 @@ fn diff_jit_iota_3arg() {
         other => panic!("expected (pair, 10, 22, 80), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_join_2arg() {
+    // ADR 0012 D-2 (iter FE) — (string-join parts sep).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sj parts sep) (string-join parts sep))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sj '(\"a\" \"b\") \"-\") (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let r = rt
+        .eval_str_via_vm("<diff>", "(sj '(\"foo\" \"bar\" \"baz\") \", \")")
+        .unwrap();
+    let single = rt
+        .eval_str_via_vm("<diff>", "(sj '(\"only\") \"--\")")
+        .unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(sj '() \"-\")").unwrap();
+    let no_sep = rt
+        .eval_str_via_vm("<diff>", "(sj '(\"a\" \"b\" \"c\") \"\")")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&r, &single, &empty, &no_sep) {
+        (Value::String(a), Value::String(b), Value::String(c), Value::String(d)) => {
+            assert_eq!(&*a.borrow(), "foo, bar, baz");
+            assert_eq!(&*b.borrow(), "only");
+            assert_eq!(&*c.borrow(), "");
+            assert_eq!(&*d.borrow(), "abc");
+        }
+        other => panic!("expected four strings, got {:?}", other),
+    }
+}
