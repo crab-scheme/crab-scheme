@@ -2187,3 +2187,102 @@ fn diff_jit_ic_hot_path_dispatches_general_call() {
         _ => panic!("type mismatch"),
     }
 }
+
+#[test]
+fn diff_jit_string_length_via_make_string() {
+    // M6 Phase 4 iter BX: string-length against a freshly-allocated
+    // string. The body's `make-string` lowers to vm_alloc_string_gc;
+    // `string-length` lowers to vm_string_length_gc; the length
+    // (char count, not byte count) comes back as Fixnum.
+    let defines = &["(define (slen n) (string-length (make-string n #\\a)))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (slen 3) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let jit = rt.eval_str_via_vm("<diff>", "(slen 5)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after > 0,
+        "slen never dispatched through JIT (count={})",
+        after
+    );
+    let walker = walker_eval(defines, "(slen 5)");
+    match (&jit, &walker) {
+        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+            assert_eq!(j, w);
+            assert_eq!(*j, 5);
+        }
+        other => panic!("expected fixnum 5, got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_jit_string_ref() {
+    // string-ref returns a JIT_RT_CHARACTER-typed result. The body's
+    // `make-string` constructs a freshly-allocated string filled
+    // with the supplied character; `string-ref s 0` returns the
+    // first char as a Value::Character via the dispatcher's
+    // codepoint decode.
+    let defines = &["(define (sfirst c) (string-ref (make-string 3 c) 0))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (sfirst #\\a) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let jit = rt.eval_str_via_vm("<diff>", "(sfirst #\\h)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after > 0,
+        "sfirst never dispatched through JIT (count={})",
+        after
+    );
+    let walker = walker_eval(defines, "(sfirst #\\h)");
+    match (&jit, &walker) {
+        (Value::Character(j), Value::Character(w)) => {
+            assert_eq!(j, w);
+            assert_eq!(*j, 'h');
+        }
+        other => panic!("expected character 'h', got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_jit_string_pred() {
+    // string? lowers to vm_string_p_gc (returns 0/1). Returns 1 for
+    // a freshly-allocated string, 0 for a pair.
+    let defines = &["(define (is-str? v) (if (string? v) 1 0))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (is-str? (make-string 2 #\\x)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let jit_str = rt
+        .eval_str_via_vm("<diff>", "(is-str? (make-string 3 #\\y))")
+        .unwrap();
+    let jit_pair = rt
+        .eval_str_via_vm("<diff>", "(is-str? (cons 1 2))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "is-str? never dispatched through JIT (count={})",
+        after
+    );
+    match (&jit_str, &jit_pair) {
+        (Value::Number(cs_core::Number::Fixnum(1)), Value::Number(cs_core::Number::Fixnum(0))) => {}
+        other => panic!("expected (1, 0), got {:?}", other),
+    }
+}

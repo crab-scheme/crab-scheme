@@ -241,6 +241,32 @@ pub enum Inst {
     /// (consumed). `dst` is Boolean (0/1).
     VecP(Value, Value),
 
+    /// `dst = make-string(n, fill)`. Lowers to `vm_alloc_string_gc`.
+    /// `n` is Fixnum-shape; `fill` is Character (Fixnum-shape
+    /// codepoint i64 — NOT a Gc handle). `dst` is Any (fresh Gc
+    /// handle to a `Value::String`). ADR 0012 D-2 (iter BX).
+    StrAlloc(Value, Value, Value),
+
+    /// `dst = string-ref(s, idx)`. Lowers to `vm_string_ref_gc`.
+    /// `s` Any (consumed), `idx` Fixnum. `dst` is Character (raw
+    /// Fixnum-shape codepoint — the dispatcher decodes it back into
+    /// `Value::Character` via JIT_RT_CHARACTER).
+    StrRef(Value, Value, Value),
+
+    /// `dst = string-length(s)`. Lowers to `vm_string_length_gc`.
+    /// `s` Any (consumed). `dst` is Fixnum (raw char count, not
+    /// boxed). Mirrors `VecLength`.
+    StrLength(Value, Value),
+
+    /// `dst = string?(v)`. Lowers to `vm_string_p_gc`. `v` Any
+    /// (consumed). `dst` is Boolean (0/1).
+    StrP(Value, Value),
+
+    /// `dst = string=?(a, b)`. Lowers to `vm_string_eq_gc`. Both
+    /// operands Any (consumed). `dst` is Boolean (0/1). Non-string
+    /// operands return 0 (no deopt — `eq?`-like behaviour).
+    StrEq(Value, Value, Value),
+
     /// `dst = sdiv(lhs, rhs)`. R6RS `quotient` for fixnums.
     /// Cranelift native sdiv (signed integer divide). Divide-by-
     /// zero traps; the JIT body propagates the trap as a panic

@@ -946,6 +946,104 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::VecP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter BX) — string ops.
+                                    // make-string requires the fill argument
+                                    // to be Character-typed (the helper
+                                    // expects a codepoint i64 in
+                                    // JIT_RT_CHARACTER carrier shape).
+                                    ("make-string", 2) => {
+                                        let len_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let fill_t = value_types
+                                            .get(&args[1])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        if len_t != Type::Fixnum {
+                                            return Err(TranslateError::Unsupported(
+                                                "make-string: length must be Fixnum-typed at JIT translate"
+                                                    .into(),
+                                            ));
+                                        }
+                                        if fill_t != Type::Character {
+                                            return Err(TranslateError::Unsupported(
+                                                "make-string: fill must be Character-typed at JIT translate"
+                                                    .into(),
+                                            ));
+                                        }
+                                        insts.push(RirInst::StrAlloc(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("string-ref", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        // s Any (consumed), idx Fixnum.
+                                        // dst is Character — the dispatcher
+                                        // decodes the i64 codepoint via
+                                        // JIT_RT_CHARACTER.
+                                        insts.push(RirInst::StrRef(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Character);
+                                    }
+                                    ("string-length", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::StrLength(dst, args[0]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
+                                    ("string?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::StrP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    // string=? mirrors the eq? Any-arg
+                                    // pattern: if either side is non-Any,
+                                    // box it via BoxTyped first.
+                                    ("string=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            || value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        let lhs_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let rhs_t = value_types
+                                            .get(&args[1])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let lhs = if lhs_t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(lhs_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        let rhs = if rhs_t == Type::Any {
+                                            args[1]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[1],
+                                                type_to_jit_rt_tag(rhs_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::StrEq(dst, lhs, rhs));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     ("integer->char", 1) => {
                                         // Same bit pattern as the Fixnum input;
                                         // the return-type post-pass will tag
@@ -1650,7 +1748,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::PairP(dst, _)
                 | RirInst::NullP(dst, _)
                 | RirInst::EqAny(dst, _, _)
-                | RirInst::VecP(dst, _) => {
+                | RirInst::VecP(dst, _)
+                | RirInst::StrP(dst, _)
+                | RirInst::StrEq(dst, _, _) => {
                     bool_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {
@@ -1660,6 +1760,11 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                     char_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Character(_)) => {
+                    char_values.insert(*dst);
+                }
+                RirInst::StrRef(dst, _, _) => {
+                    // string-ref returns a Fixnum-shape codepoint;
+                    // the dispatcher decodes via JIT_RT_CHARACTER.
                     char_values.insert(*dst);
                 }
                 RirInst::FixToFlo(dst, _)
@@ -1694,7 +1799,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::EnvLookupAny(dst, _)
                 | RirInst::VecAlloc(dst, _, _)
                 | RirInst::VecRef(dst, _, _)
-                | RirInst::VecSet(dst, _, _, _) => {
+                | RirInst::VecSet(dst, _, _, _)
+                | RirInst::StrAlloc(dst, _, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

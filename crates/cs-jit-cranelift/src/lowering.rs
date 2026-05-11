@@ -158,6 +158,21 @@ pub struct Lowerer {
     vector_length_func: cranelift_module::FuncId,
     /// FuncId of `vm_vector_p_gc(v) -> i64`. Returns 0/1.
     vector_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_alloc_string_gc(n, fill) -> i64`. `Inst::StrAlloc`
+    /// lowers to this (ADR 0012 D-2, iter BX). `fill` is a
+    /// Fixnum-shape codepoint i64 (Character ABI), not a Gc handle.
+    alloc_string_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_ref_gc(s, idx) -> i64`. Returns a
+    /// Fixnum-shape codepoint i64 (Character ABI carrier), NOT a
+    /// Gc handle — so no stack-map declaration.
+    string_ref_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_length_gc(s) -> i64`. Returns raw
+    /// Fixnum-shape i64 (char count, not byte count).
+    string_length_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_p_gc(v) -> i64`. Returns 0/1.
+    string_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_eq_gc(a, b) -> i64`. Returns 0/1.
+    string_eq_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -255,6 +270,18 @@ impl Lowerer {
             cs_vm::vm::vm_vector_length_gc as *const u8,
         );
         builder.symbol("vm_vector_p_gc", cs_vm::vm::vm_vector_p_gc as *const u8);
+        // ADR 0012 D-2 (iter BX) — string op helpers.
+        builder.symbol(
+            "vm_alloc_string_gc",
+            cs_vm::vm::vm_alloc_string_gc as *const u8,
+        );
+        builder.symbol("vm_string_ref_gc", cs_vm::vm::vm_string_ref_gc as *const u8);
+        builder.symbol(
+            "vm_string_length_gc",
+            cs_vm::vm::vm_string_length_gc as *const u8,
+        );
+        builder.symbol("vm_string_p_gc", cs_vm::vm::vm_string_p_gc as *const u8);
+        builder.symbol("vm_string_eq_gc", cs_vm::vm::vm_string_eq_gc as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -517,6 +544,49 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_vector_p_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter BX) — string op helpers. Signatures:
+        // vm_alloc_string_gc(n: i64, fill: i64) -> i64 — reuses
+        //   the vector_ref_sig shape (two i64 in, one i64 out).
+        // vm_string_ref_gc(s: i64, idx: i64) -> i64 — same shape.
+        // vm_string_eq_gc(a: i64, b: i64) -> i64 — same shape.
+        // vm_string_length_gc(s: i64) -> i64 — pair_accessor_sig.
+        // vm_string_p_gc(v: i64) -> i64 — pair_accessor_sig.
+        let alloc_string_func = module
+            .declare_function(
+                "vm_alloc_string_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_alloc_string_gc: {e}")))?;
+        let string_ref_func = module
+            .declare_function(
+                "vm_string_ref_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_ref_gc: {e}")))?;
+        let string_length_func = module
+            .declare_function(
+                "vm_string_length_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_length_gc: {e}")))?;
+        let string_p_func = module
+            .declare_function(
+                "vm_string_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_p_gc: {e}")))?;
+        let string_eq_func = module
+            .declare_function(
+                "vm_string_eq_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_eq_gc: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -548,6 +618,11 @@ impl Lowerer {
             vector_set_func,
             vector_length_func,
             vector_p_func,
+            alloc_string_func,
+            string_ref_func,
+            string_length_func,
+            string_p_func,
+            string_eq_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -745,6 +820,22 @@ impl Lowerer {
             let vector_p_fnref = self
                 .module
                 .declare_func_in_func(self.vector_p_func, builder.func);
+            // iter BX — string ops.
+            let alloc_string_fnref = self
+                .module
+                .declare_func_in_func(self.alloc_string_func, builder.func);
+            let string_ref_fnref = self
+                .module
+                .declare_func_in_func(self.string_ref_func, builder.func);
+            let string_length_fnref = self
+                .module
+                .declare_func_in_func(self.string_length_func, builder.func);
+            let string_p_fnref = self
+                .module
+                .declare_func_in_func(self.string_p_func, builder.func);
+            let string_eq_fnref = self
+                .module
+                .declare_func_in_func(self.string_eq_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -833,6 +924,11 @@ impl Lowerer {
                         vector_set_fnref,
                         vector_length_fnref,
                         vector_p_fnref,
+                        alloc_string_fnref,
+                        string_ref_fnref,
+                        string_length_fnref,
+                        string_p_fnref,
+                        string_eq_fnref,
                         inst,
                     )?;
                 }
@@ -1023,6 +1119,11 @@ fn lower_inst(
     vector_set_fnref: cranelift_codegen::ir::FuncRef,
     vector_length_fnref: cranelift_codegen::ir::FuncRef,
     vector_p_fnref: cranelift_codegen::ir::FuncRef,
+    alloc_string_fnref: cranelift_codegen::ir::FuncRef,
+    string_ref_fnref: cranelift_codegen::ir::FuncRef,
+    string_length_fnref: cranelift_codegen::ir::FuncRef,
+    string_p_fnref: cranelift_codegen::ir::FuncRef,
+    string_eq_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -1669,6 +1770,93 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "VecP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::StrAlloc(dst, n_op, fill) => {
+            // ADR 0012 D-2 (iter BX) — vm_alloc_string_gc(n, fill).
+            // `fill` is a Fixnum-shape codepoint (NOT a Gc handle);
+            // the result is a fresh Gc<Value::String> handle.
+            let n_v = lookup(map, *n_op)?;
+            let f_v = lookup(map, *fill)?;
+            let inst_ref = b.ins().call(alloc_string_fnref, &[n_v, f_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StrAlloc expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StrRef(dst, s, idx) => {
+            // Returns a Fixnum-shape codepoint i64 (Character ABI
+            // carrier); NOT a Gc handle — no stack-map declaration.
+            let s_v = lookup(map, *s)?;
+            let i_v = lookup(map, *idx)?;
+            let inst_ref = b.ins().call(string_ref_fnref, &[s_v, i_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StrRef expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::StrLength(dst, s) => {
+            // Returns raw Fixnum-shape i64; no stack-map declaration.
+            let s_v = lookup(map, *s)?;
+            let inst_ref = b.ins().call(string_length_fnref, &[s_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StrLength expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::StrP(dst, src) => {
+            // Consume-on-use predicate; returns 0/1 (Boolean).
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(string_p_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StrP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::StrEq(dst, a, b_op) => {
+            // Consume both; returns 0/1 (Boolean).
+            let a_v = lookup(map, *a)?;
+            let b_v = lookup(map, *b_op)?;
+            let inst_ref = b.ins().call(string_eq_fnref, &[a_v, b_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StrEq expected 1 result, got {}",
                         results.len()
                     )));
                 }

@@ -818,6 +818,131 @@ pub unsafe extern "C" fn vm_vector_p_gc(r: i64) -> i64 {
     matches!(v, Value::Vector(_)) as i64
 }
 
+/// `(make-string n fill)` — allocate a fresh `Value::String` of length
+/// `n` filled with the character whose Unicode codepoint is `fill`.
+/// ADR 0012 D-2 (iter BX) — string analogue of `vm_alloc_vector_gc`.
+///
+/// The `fill` argument is a Fixnum-shape codepoint i64 (because the
+/// JIT_RT_CHARACTER ABI carries the codepoint in the low 32 bits of
+/// the i64 lane — see `decode_jit_return`). Invalid codepoints fall
+/// back to U+FFFD (REPLACEMENT CHARACTER), matching the rest of the
+/// Character decode path.
+///
+/// # Safety
+///
+/// `n` is a raw i64 (vector-like length). `fill` is a Fixnum-shape
+/// codepoint i64 — NOT a Gc handle. No Gc refcount is consumed on
+/// `fill`. Returns a fresh `Gc<Value>` raw handle (refcount = 1).
+#[no_mangle]
+pub unsafe extern "C" fn vm_alloc_string_gc(n: i64, fill: i64) -> i64 {
+    let len = if n < 0 { 0usize } else { n as usize };
+    let ch = char::from_u32(fill as u32).unwrap_or('\u{FFFD}');
+    let s: String = std::iter::repeat(ch).take(len).collect();
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+}
+
+/// Inner (non-FFI) implementation of `vm_string_ref_gc`. Same
+/// contract. Split out so unit tests can observe the deopt/return
+/// path without crossing the `extern "C"` boundary.
+///
+/// # Safety
+///
+/// Same as `vm_string_ref_gc`.
+unsafe fn vm_string_ref_gc_inner(s: i64, idx: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sc) => {
+            let storage = sc.borrow();
+            if idx < 0 {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return 0xFFFD;
+            }
+            match storage.chars().nth(idx as usize) {
+                Some(c) => c as u32 as i64,
+                None => {
+                    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                    0xFFFD
+                }
+            }
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0xFFFD
+        }
+    }
+}
+
+/// `(string-ref s i)` — return the i-th character of `s` as a
+/// Fixnum-shape codepoint i64 (Character ABI carrier). Consumes one
+/// strong refcount on the `s` handle.
+///
+/// On type miss or out-of-bounds index, requests a deopt via
+/// `jit_request_deopt(DEOPT_REASON_PAIR_MISS)` (reuses the pair-miss
+/// reason; future iters may add a dedicated string-miss reason) and
+/// returns the U+FFFD replacement codepoint. Mirrors the
+/// deopt-instead-of-panic discipline established by iter BW.
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_ref_gc(s: i64, idx: i64) -> i64 {
+    unsafe { vm_string_ref_gc_inner(s, idx) }
+}
+
+/// `(string-length s)` — return the length of `s` (char count, not
+/// byte count) as a raw i64. Consumes one strong refcount on the
+/// `s` handle. Return is Fixnum-shape (NOT a Gc handle), matching
+/// `vm_vector_length_gc`'s ABI.
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle. On type miss,
+/// requests a deopt and returns 0 (mirrors the BW
+/// deopt-instead-of-panic discipline).
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_length_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sc) => sc.borrow().chars().count() as i64,
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+/// `(string? v)` — type predicate. Consume-on-use; 0/1 out. Same
+/// shape as `vm_vector_p_gc`.
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::String(_)) as i64
+}
+
+/// `(string=? a b)` — string equality. Consumes one strong refcount
+/// on each handle. Returns 1 if both `a` and `b` are
+/// `Value::String` with byte-equal contents, 0 otherwise (including
+/// the case where either is not a string — `eq?`-like behaviour
+/// without a deopt request).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_eq_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::String(sa), Value::String(sb)) => (*sa.borrow() == *sb.borrow()) as i64,
+        _ => 0,
+    }
+}
+
 /// `(car pair)` — return the pair's car, Any-tagged. Pre-decodes the
 /// Any-tagged input box and re-Anys the inner car.
 ///
@@ -6351,6 +6476,93 @@ mod vector_helper_tests {
             result.is_err(),
             "vm_vector_ref_gc_inner with idx 999 in length-3 vector should panic"
         );
+    }
+}
+
+#[cfg(test)]
+mod string_helper_tests {
+    use super::*;
+
+    #[test]
+    fn vm_alloc_string_gc_creates_correctly_sized_string() {
+        // ADR 0012 D-2 iter BX — alloc a length-4 string filled with
+        // `a` (codepoint 0x61) and verify shape via gc_i64_to_value.
+        let i = unsafe { vm_alloc_string_gc(4, 'a' as u32 as i64) };
+        assert_ne!(i, 0, "vm_alloc_string_gc returned null handle");
+        let v = unsafe { gc_i64_to_value(i) };
+        match v {
+            Value::String(sc) => {
+                let storage = sc.borrow();
+                assert_eq!(storage.chars().count(), 4, "string char count mismatch");
+                for c in storage.chars() {
+                    assert_eq!(c, 'a', "fill char mismatch");
+                }
+            }
+            other => panic!("expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn vm_string_length_gc_returns_char_count() {
+        // chars().count() is what string-length returns — NOT len()
+        // (bytes). Use a string with a multi-byte character to make
+        // sure we don't accidentally count bytes.
+        let s = Value::String(cs_gc::Gc::new(std::cell::RefCell::new("héllo".into())));
+        let i = value_to_gc_i64(s);
+        let len = unsafe { vm_string_length_gc(i) };
+        assert_eq!(len, 5, "expected 5 chars, got {}", len);
+    }
+
+    #[test]
+    fn vm_string_ref_gc_returns_codepoint() {
+        // string-ref returns the codepoint as a Fixnum-shape i64.
+        // The dispatcher decodes it back into Value::Character based
+        // on the closure's JIT_RT_CHARACTER return type.
+        let s = Value::String(cs_gc::Gc::new(std::cell::RefCell::new("hello".into())));
+        let i = value_to_gc_i64(s);
+        let cp = unsafe { vm_string_ref_gc(i, 1) };
+        assert_eq!(cp, 'e' as u32 as i64, "expected 'e' (0x65), got {:#x}", cp);
+    }
+
+    #[test]
+    fn vm_string_p_gc_classifies() {
+        // String -> 1.
+        let i_s = unsafe { vm_alloc_string_gc(2, 'x' as u32 as i64) };
+        assert_eq!(unsafe { vm_string_p_gc(i_s) }, 1);
+        // Pair -> 0.
+        let i_pair = unsafe { vm_alloc_pair_gc(1, JIT_RT_FIXNUM, 2, JIT_RT_FIXNUM) };
+        assert_eq!(unsafe { vm_string_p_gc(i_pair) }, 0);
+        // Vector -> 0.
+        let fill = value_to_gc_i64(Value::Unspecified);
+        let i_vec = unsafe { vm_alloc_vector_gc(1, fill) };
+        assert_eq!(unsafe { vm_string_p_gc(i_vec) }, 0);
+    }
+
+    #[test]
+    fn vm_string_eq_gc_compares_contents() {
+        // Two distinct allocations with equal contents -> 1.
+        let a = value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            "hi".into(),
+        ))));
+        let b = value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            "hi".into(),
+        ))));
+        assert_eq!(unsafe { vm_string_eq_gc(a, b) }, 1);
+        // Unequal contents -> 0.
+        let c = value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            "hi".into(),
+        ))));
+        let d = value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            "bye".into(),
+        ))));
+        assert_eq!(unsafe { vm_string_eq_gc(c, d) }, 0);
+        // Non-string LHS -> 0 (no deopt sentinel; eq?-like).
+        let fill = value_to_gc_i64(Value::Unspecified);
+        let v = unsafe { vm_alloc_vector_gc(0, fill) };
+        let s = value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            "".into(),
+        ))));
+        assert_eq!(unsafe { vm_string_eq_gc(v, s) }, 0);
     }
 }
 
