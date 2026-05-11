@@ -5201,3 +5201,40 @@ fn diff_jit_make_list_2arg() {
         other => panic!("expected (pair, null, 5, symbol), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_iota_1arg() {
+    // ADR 0012 D-2 (iter EN) — (iota n) returns (0 1 ... n-1).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (io n) (iota n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (io 5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let lst = rt.eval_str_via_vm("<diff>", "(io 4)").unwrap();
+    let zero = rt.eval_str_via_vm("<diff>", "(io 0)").unwrap();
+    let len = rt.eval_str_via_vm("<diff>", "(length (io 10))").unwrap();
+    let last = rt
+        .eval_str_via_vm("<diff>", "(list-ref (io 10) 9)")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "iota never dispatched through JIT (count={after})"
+    );
+    match (&lst, &zero, &len, &last) {
+        (
+            Value::Pair(_),
+            Value::Null,
+            Value::Number(cs_core::Number::Fixnum(10)),
+            Value::Number(cs_core::Number::Fixnum(9)),
+        ) => {}
+        other => panic!("expected (pair, null, 10, 9), got {:?}", other),
+    }
+}

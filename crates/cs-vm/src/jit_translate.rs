@@ -2523,6 +2523,15 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StringReverse(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter EN) — (iota n) 1-arg.
+                                    // n must be Fixnum-shape (not Flonum).
+                                    ("iota", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::IotaN(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter EM) — (make-list n fill).
                                     // Length must be Fixnum-typed; fill is
                                     // boxed if a typed primitive.
@@ -3775,6 +3784,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StringToNumber(dst, _)
                 | RirInst::StringReverse(dst, _)
                 | RirInst::MakeList(dst, _, _)
+                | RirInst::IotaN(dst, _)
                 | RirInst::ListToVector(dst, _)
                 | RirInst::StringToList(dst, _)
                 | RirInst::ListToString(dst, _)

@@ -702,6 +702,11 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter EM).
     MakeList(Value, Value, Value),
 
+    /// `dst = iota(n)`. Lowers to `vm_iota_n_gc`. `n` Fixnum-shape.
+    /// `dst` is Any (fresh Gc handle to `(0 1 ... n-1)`).
+    /// ADR 0012 D-2 (iter EN).
+    IotaN(Value, Value),
+
     /// `dst = srem(lhs, rhs)`. R6RS `remainder` for fixnums.
     Remainder(Value, Value, Value),
 

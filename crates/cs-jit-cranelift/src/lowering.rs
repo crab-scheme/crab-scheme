@@ -409,6 +409,8 @@ pub struct Lowerer {
     /// FuncId of `vm_make_list_fill_gc(n, fill) -> i64`. ADR 0012
     /// D-2 (iter EM).
     make_list_fill_func: cranelift_module::FuncId,
+    /// FuncId of `vm_iota_n_gc(n) -> i64`. ADR 0012 D-2 (iter EN).
+    iota_n_func: cranelift_module::FuncId,
     /// FuncId of `vm_symbol_to_string_gc(sym) -> i64`. ADR 0012 D-2
     /// (iter CY).
     symbol_to_string_func: cranelift_module::FuncId,
@@ -772,6 +774,8 @@ impl Lowerer {
             "vm_make_list_fill_gc",
             cs_vm::vm::vm_make_list_fill_gc as *const u8,
         );
+        // ADR 0012 D-2 (iter EN) — iota 1-arg.
+        builder.symbol("vm_iota_n_gc", cs_vm::vm::vm_iota_n_gc as *const u8);
         // ADR 0012 D-2 (iter CX) — string<->list.
         builder.symbol(
             "vm_string_to_list_gc",
@@ -1866,6 +1870,15 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_make_list_fill_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter EN) — vm_iota_n_gc(n) -> i64.
+        let iota_n_func = module
+            .declare_function(
+                "vm_iota_n_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_iota_n_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter CY) — vm_symbol_to_string_gc / vm_string_to_symbol_gc.
         let symbol_to_string_func = module
             .declare_function(
@@ -2009,6 +2022,7 @@ impl Lowerer {
             string_to_number_func,
             string_reverse_func,
             make_list_fill_func,
+            iota_n_func,
             symbol_to_string_func,
             string_to_symbol_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
@@ -2532,6 +2546,10 @@ impl Lowerer {
             let make_list_fill_fnref = self
                 .module
                 .declare_func_in_func(self.make_list_fill_func, builder.func);
+            // iter EN — iota 1-arg.
+            let iota_n_fnref = self
+                .module
+                .declare_func_in_func(self.iota_n_func, builder.func);
             // iter CY — symbol<->string.
             let symbol_to_string_fnref = self
                 .module
@@ -2719,6 +2737,7 @@ impl Lowerer {
                         string_to_number_fnref,
                         string_reverse_fnref,
                         make_list_fill_fnref,
+                        iota_n_fnref,
                         symbol_to_string_fnref,
                         string_to_symbol_fnref,
                         inst,
@@ -3003,6 +3022,7 @@ fn lower_inst(
     string_to_number_fnref: cranelift_codegen::ir::FuncRef,
     string_reverse_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
+    iota_n_fnref: cranelift_codegen::ir::FuncRef,
     symbol_to_string_fnref: cranelift_codegen::ir::FuncRef,
     string_to_symbol_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
@@ -5339,6 +5359,23 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "MakeList expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::IotaN(dst, n_v) => {
+            // ADR 0012 D-2 (iter EN) — vm_iota_n_gc(n).
+            let n = lookup(map, *n_v)?;
+            let inst_ref = b.ins().call(iota_n_fnref, &[n]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "IotaN expected 1 result, got {}",
                         results.len()
                     )));
                 }
