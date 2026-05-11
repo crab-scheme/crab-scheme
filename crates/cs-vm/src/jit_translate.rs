@@ -1164,7 +1164,13 @@ pub fn bytecode_to_rir_with_hints(
                                     // predicates return #f for Flonum operand
                                     // (ADR 0012 D-2 iter EI). integer? /
                                     // rational? were split via iter EH.
-                                    ("number?", 1) | ("real?", 1) => {
+                                    // ADR 0012 D-2 (iter GD) — complex? and
+                                    // real-valued? are aliases of number? in the
+                                    // CrabScheme tower (no complex numbers).
+                                    ("number?", 1)
+                                    | ("real?", 1)
+                                    | ("complex?", 1)
+                                    | ("real-valued?", 1) => {
                                         let _ = args[0]; // load preserved for SSA correctness
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
                                     }
@@ -1746,6 +1752,14 @@ pub fn bytecode_to_rir_with_hints(
                                             == Some(Type::Any) =>
                                     {
                                         insts.push(RirInst::TextualPortP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    // ADR 0012 D-2 (iter GD) — promise?.
+                                    ("promise?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::PromiseP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
                                     ("eof-object?", 1)
@@ -4920,6 +4934,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::OutputPortP(dst, _)
                 | RirInst::BinaryPortP(dst, _)
                 | RirInst::TextualPortP(dst, _)
+                | RirInst::PromiseP(dst, _)
                 | RirInst::CharNumericP(dst, _)
                 | RirInst::CharWhitespaceP(dst, _)
                 | RirInst::CharUpperCaseP(dst, _)

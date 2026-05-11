@@ -820,6 +820,18 @@ pub unsafe extern "C" fn vm_textual_port_p_gc(r: i64) -> i64 {
     }
 }
 
+/// `(promise? v)` — true iff `v` is a Promise. Consume-on-use; 0/1
+/// out. Total predicate. ADR 0012 D-2 (iter GD).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_promise_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Promise(_)) as i64
+}
+
 /// `(eof-object? v)` — true iff `v` is the eof object. Consume-on-use;
 /// 0/1 out. ADR 0012 D-2 (iter DD).
 ///

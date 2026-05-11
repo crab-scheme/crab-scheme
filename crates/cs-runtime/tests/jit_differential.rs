@@ -7185,3 +7185,39 @@ fn diff_jit_port_subtype_predicates_and_list_head() {
         other => panic!("expected pair, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_complex_real_valued_promise() {
+    // ADR 0012 D-2 (iter GD) — complex?/real-valued?/promise?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (cx v) (complex? v))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (rv v) (real-valued? v))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (pm v) (promise? v))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (cx 5) (rv 5.5) (pm 42) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let cx_fix = rt.eval_str_via_vm("<diff>", "(cx 42)").unwrap();
+    let cx_flo = rt.eval_str_via_vm("<diff>", "(cx 3.14)").unwrap();
+    let rv_fix = rt.eval_str_via_vm("<diff>", "(rv 42)").unwrap();
+    let rv_flo = rt.eval_str_via_vm("<diff>", "(rv 3.14)").unwrap();
+    let pm_no = rt.eval_str_via_vm("<diff>", "(pm 42)").unwrap();
+    let pm_yes = rt
+        .eval_str_via_vm("<diff>", "(pm (make-promise 5))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&cx_fix, Value::Boolean(true)));
+    assert!(matches!(&cx_flo, Value::Boolean(true)));
+    assert!(matches!(&rv_fix, Value::Boolean(true)));
+    assert!(matches!(&rv_flo, Value::Boolean(true)));
+    assert!(matches!(&pm_no, Value::Boolean(false)));
+    assert!(matches!(&pm_yes, Value::Boolean(true)));
+}

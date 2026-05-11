@@ -671,6 +671,8 @@ pub enum Inst {
     BinaryPortP(Value, Value),
     /// `dst = textual-port?(v)`. ADR 0012 D-2 (iter GC).
     TextualPortP(Value, Value),
+    /// `dst = promise?(v)`. ADR 0012 D-2 (iter GD).
+    PromiseP(Value, Value),
 
     /// `dst = eof-object?(v)`. Lowers to `vm_eof_p_gc`. ADR 0012 D-2
     /// (iter DD).

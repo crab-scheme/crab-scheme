@@ -375,6 +375,8 @@ pub struct Lowerer {
     binary_port_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_textual_port_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GC).
     textual_port_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_promise_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GD).
+    promise_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -927,6 +929,8 @@ impl Lowerer {
             "vm_textual_port_p_gc",
             cs_vm::vm::vm_textual_port_p_gc as *const u8,
         );
+        // ADR 0012 D-2 (iter GD) — promise?.
+        builder.symbol("vm_promise_p_gc", cs_vm::vm::vm_promise_p_gc as *const u8);
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
             "vm_bitwise_bit_count",
@@ -2256,6 +2260,15 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_textual_port_p_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter GD) — promise?.
+        let promise_p_func = module
+            .declare_function(
+                "vm_promise_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_promise_p_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
             .declare_function(
@@ -3213,6 +3226,7 @@ impl Lowerer {
             output_port_p_func,
             binary_port_p_func,
             textual_port_p_func,
+            promise_p_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -3791,6 +3805,10 @@ impl Lowerer {
             let textual_port_p_fnref = self
                 .module
                 .declare_func_in_func(self.textual_port_p_func, builder.func);
+            // iter GD — promise?.
+            let promise_p_fnref = self
+                .module
+                .declare_func_in_func(self.promise_p_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4263,6 +4281,7 @@ impl Lowerer {
                         output_port_p_fnref,
                         binary_port_p_fnref,
                         textual_port_p_fnref,
+                        promise_p_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -4624,6 +4643,7 @@ fn lower_inst(
     output_port_p_fnref: cranelift_codegen::ir::FuncRef,
     binary_port_p_fnref: cranelift_codegen::ir::FuncRef,
     textual_port_p_fnref: cranelift_codegen::ir::FuncRef,
+    promise_p_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -6843,8 +6863,9 @@ fn lower_inst(
         | Inst::InputPortP(dst, src)
         | Inst::OutputPortP(dst, src)
         | Inst::BinaryPortP(dst, src)
-        | Inst::TextualPortP(dst, src) => {
-            // ADR 0012 D-2 (iter DD/GC) — port + port-subtype predicates.
+        | Inst::TextualPortP(dst, src)
+        | Inst::PromiseP(dst, src) => {
+            // ADR 0012 D-2 (iter DD/GC/GD) — port family + promise?.
             let v_v = lookup(map, *src)?;
             let fnref = match inst {
                 Inst::PortP(..) => port_p_fnref,
@@ -6852,6 +6873,7 @@ fn lower_inst(
                 Inst::OutputPortP(..) => output_port_p_fnref,
                 Inst::BinaryPortP(..) => binary_port_p_fnref,
                 Inst::TextualPortP(..) => textual_port_p_fnref,
+                Inst::PromiseP(..) => promise_p_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[v_v]);
