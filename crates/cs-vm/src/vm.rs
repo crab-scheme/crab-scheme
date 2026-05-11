@@ -3362,6 +3362,30 @@ pub unsafe extern "C" fn vm_iota_n_gc(n: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(iota count start)` — 2-arg form. Returns
+/// `(start start+1 ... start+count-1)` as a fresh list of Fixnums.
+/// Both args are raw Fixnum-shape i64. On negative count, requests
+/// a deopt and returns Null. ADR 0012 D-2 (iter FC).
+///
+/// # Safety
+///
+/// Both args are raw i64; no Gc handle invariants.
+#[no_mangle]
+pub unsafe extern "C" fn vm_iota_ns_gc(count: i64, start: i64) -> i64 {
+    if count < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Null);
+    }
+    let mut acc = Value::Null;
+    let mut i = count - 1;
+    while i >= 0 {
+        let val = start.wrapping_add(i);
+        acc = Value::Pair(cs_core::Pair::new(Value::fixnum(val), acc));
+        i -= 1;
+    }
+    value_to_gc_i64(acc)
+}
+
 /// `(make-list n fill)` — return a fresh list containing `n` copies
 /// of `fill`. `n` is a raw Fixnum-shape i64. `fill` is consumed as
 /// a `Gc<Value>` handle and cloned into each element. Returns a

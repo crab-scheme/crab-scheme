@@ -2680,6 +2680,16 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::IotaN(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter FC) — (iota count start).
+                                    ("iota", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::IotaNs(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter ER) — vector-copy!
                                     // 3-arg form. (ES) — same shape for
                                     // bytevector-copy! and string-copy!.
@@ -4091,6 +4101,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StringContains(dst, _, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
+                | RirInst::IotaNs(dst, _, _)
                 | RirInst::LastPair(dst, _)
                 | RirInst::Last(dst, _)
                 | RirInst::Take(dst, _, _)

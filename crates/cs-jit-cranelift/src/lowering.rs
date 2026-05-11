@@ -423,6 +423,8 @@ pub struct Lowerer {
     make_list_fill_func: cranelift_module::FuncId,
     /// FuncId of `vm_iota_n_gc(n) -> i64`. ADR 0012 D-2 (iter EN).
     iota_n_func: cranelift_module::FuncId,
+    /// FuncId of `vm_iota_ns_gc(count, start) -> i64`. ADR 0012 D-2 (iter FC).
+    iota_ns_func: cranelift_module::FuncId,
     /// FuncId of `vm_last_pair_gc(lst) -> i64`. ADR 0012 D-2 (iter EO).
     last_pair_func: cranelift_module::FuncId,
     /// FuncId of `vm_last_gc(lst) -> i64`. ADR 0012 D-2 (iter EO).
@@ -844,6 +846,8 @@ impl Lowerer {
         );
         // ADR 0012 D-2 (iter EN) — iota 1-arg.
         builder.symbol("vm_iota_n_gc", cs_vm::vm::vm_iota_n_gc as *const u8);
+        // ADR 0012 D-2 (iter FC) — iota 2-arg.
+        builder.symbol("vm_iota_ns_gc", cs_vm::vm::vm_iota_ns_gc as *const u8);
         // ADR 0012 D-2 (iter EO) — last-pair / last.
         builder.symbol("vm_last_pair_gc", cs_vm::vm::vm_last_pair_gc as *const u8);
         builder.symbol("vm_last_gc", cs_vm::vm::vm_last_gc as *const u8);
@@ -2048,6 +2052,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_iota_n_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter FC) — vm_iota_ns_gc(count, start) -> i64.
+        let iota_ns_func = module
+            .declare_function(
+                "vm_iota_ns_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_iota_ns_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter EO) — vm_last_pair_gc / vm_last_gc.
         let last_pair_func = module
             .declare_function(
@@ -2309,6 +2322,7 @@ impl Lowerer {
             string_suffix_p_func,
             make_list_fill_func,
             iota_n_func,
+            iota_ns_func,
             last_pair_func,
             last_func,
             take_func,
@@ -2870,6 +2884,10 @@ impl Lowerer {
             let iota_n_fnref = self
                 .module
                 .declare_func_in_func(self.iota_n_func, builder.func);
+            // iter FC — iota 2-arg.
+            let iota_ns_fnref = self
+                .module
+                .declare_func_in_func(self.iota_ns_func, builder.func);
             // iter EO — last-pair / last.
             let last_pair_fnref = self
                 .module
@@ -3109,6 +3127,7 @@ impl Lowerer {
                         string_suffix_p_fnref,
                         make_list_fill_fnref,
                         iota_n_fnref,
+                        iota_ns_fnref,
                         last_pair_fnref,
                         last_fnref,
                         take_fnref,
@@ -3413,6 +3432,7 @@ fn lower_inst(
     string_suffix_p_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
+    iota_ns_fnref: cranelift_codegen::ir::FuncRef,
     last_pair_fnref: cranelift_codegen::ir::FuncRef,
     last_fnref: cranelift_codegen::ir::FuncRef,
     take_fnref: cranelift_codegen::ir::FuncRef,
@@ -5830,6 +5850,24 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "IotaN expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::IotaNs(dst, c_v, s_v) => {
+            // ADR 0012 D-2 (iter FC) — vm_iota_ns_gc(count, start).
+            let c = lookup(map, *c_v)?;
+            let s = lookup(map, *s_v)?;
+            let inst_ref = b.ins().call(iota_ns_fnref, &[c, s]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "IotaNs expected 1 result, got {}",
                         results.len()
                     )));
                 }
