@@ -334,6 +334,16 @@ pub enum Inst {
     /// `dst = string-ci>=?(a, b)`. ADR 0012 D-2 (iter DX).
     StrCiGe(Value, Value, Value),
 
+    /// `dst = string->vector(s)` 1-arg form. Lowers to
+    /// `vm_string_to_vector_gc`. Arg Any-shape (consumed); `dst`
+    /// is Any (fresh Gc<Value::Vector>). ADR 0012 D-2 (iter DY).
+    StringToVector(Value, Value),
+
+    /// `dst = vector->string(v)` 1-arg form. Lowers to
+    /// `vm_vector_to_string_gc`. Arg Any-shape (consumed); `dst`
+    /// is Any (fresh Gc<Value::String>). ADR 0012 D-2 (iter DY).
+    VectorToString(Value, Value),
+
     /// `dst = substring(s, start, end)`. Lowers to `vm_substring_gc`.
     /// `s` Any (consumed), `start` and `end` Fixnum. `dst` is Any
     /// (fresh Gc<Value::String>). ADR 0012 D-2 (iter CM).

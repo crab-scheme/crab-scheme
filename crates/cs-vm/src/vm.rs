@@ -2811,6 +2811,71 @@ pub unsafe extern "C" fn vm_string_ci_ge_gc(a: i64, b: i64) -> i64 {
     }
 }
 
+/// `(string->vector s)` — 1-arg form. Returns a fresh
+/// `Value::Vector` whose elements are the characters of `s`. Consumes
+/// the input Gc handle. On non-string input, requests a deopt and
+/// returns an empty-vector handle. ADR 0012 D-2 (iter DY).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_to_vector_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            let chars: Vec<Value> = sg.borrow().chars().map(Value::Character).collect();
+            value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+                chars,
+            ))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+                Vec::new(),
+            ))))
+        }
+    }
+}
+
+/// `(vector->string v)` — 1-arg form. Returns a fresh
+/// `Value::String` built from the characters in `v`. Consumes the
+/// input Gc handle. On non-vector input or any non-character
+/// element, requests a deopt and returns an empty-string handle.
+/// ADR 0012 D-2 (iter DY).
+///
+/// # Safety
+///
+/// `v` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_to_string_gc(v: i64) -> i64 {
+    let val = unsafe { gc_i64_to_value(v) };
+    match val {
+        Value::Vector(vg) => {
+            let items = vg.borrow().clone();
+            let mut s = String::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::Character(c) => s.push(c),
+                    _ => {
+                        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                        return value_to_gc_i64(Value::String(cs_gc::Gc::new(
+                            std::cell::RefCell::new(String::new()),
+                        )));
+                    }
+                }
+            }
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
 /// `(car pair)` — return the pair's car, Any-tagged. Pre-decodes the
 /// Any-tagged input box and re-Anys the inner car.
 ///

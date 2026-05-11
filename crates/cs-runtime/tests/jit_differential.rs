@@ -4556,3 +4556,44 @@ fn diff_jit_string_ci_compares() {
         other => panic!("expected (T, F, T, T, T, T), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_vector_conversion() {
+    // ADR 0012 D-2 (iter DY) — 1-arg (string->vector s) and
+    // (vector->string v) lower via dedicated helpers.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s2v s) (string->vector s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (v2s v) (vector->string v))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (s2v \"abc\") \
+                      (v2s #(#\\a #\\b #\\c)) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let vec_from_str = rt.eval_str_via_vm("<diff>", "(s2v \"hello\")").unwrap();
+    let str_from_vec = rt
+        .eval_str_via_vm("<diff>", "(v2s #(#\\f #\\o #\\o))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "string<->vector conversions never dispatched through JIT (count={after})"
+    );
+    match (&vec_from_str, &str_from_vec) {
+        (Value::Vector(vg), Value::String(sg)) => {
+            let v = vg.borrow();
+            assert_eq!(v.len(), 5);
+            assert!(matches!(&v[0], Value::Character('h')));
+            assert!(matches!(&v[4], Value::Character('o')));
+            assert_eq!(&*sg.borrow(), "foo");
+        }
+        other => panic!("expected (vector, string), got {:?}", other),
+    }
+}

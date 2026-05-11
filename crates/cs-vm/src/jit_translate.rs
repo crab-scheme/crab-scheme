@@ -2209,6 +2209,22 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::ListToString(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter DY) — string<->vector
+                                    // 1-arg forms.
+                                    ("string->vector", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::StringToVector(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("vector->string", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::VectorToString(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter CV) — digit-value.
                                     // Mixed return (Fixnum or #f) so dst is Any.
                                     ("digit-value", 1)
@@ -3328,6 +3344,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::BvCopy(dst, _)
                 | RirInst::DigitValue(dst, _)
                 | RirInst::VectorToList(dst, _)
+                | RirInst::StringToVector(dst, _)
+                | RirInst::VectorToString(dst, _)
                 | RirInst::ListToVector(dst, _)
                 | RirInst::StringToList(dst, _)
                 | RirInst::ListToString(dst, _)
