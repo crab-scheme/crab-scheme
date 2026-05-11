@@ -688,6 +688,54 @@ pub unsafe extern "C" fn vm_null_p_gc(r: i64) -> i64 {
     matches!(v, Value::Null) as i64
 }
 
+/// `(procedure? v)` — true iff `v` is a procedure (closure or
+/// builtin). Consume-on-use; 0/1 out. ADR 0012 D-2 (iter DD).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_procedure_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Procedure(_)) as i64
+}
+
+/// `(port? v)` — true iff `v` is a port. Consume-on-use; 0/1 out.
+/// ADR 0012 D-2 (iter DD).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_port_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Port(_)) as i64
+}
+
+/// `(eof-object? v)` — true iff `v` is the eof object. Consume-on-use;
+/// 0/1 out. ADR 0012 D-2 (iter DD).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_eof_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Eof) as i64
+}
+
+/// `(symbol? v)` — true iff `v` is a symbol. Consume-on-use; 0/1 out.
+/// ADR 0012 D-2 (iter DD).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_symbol_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Symbol(_)) as i64
+}
+
 /// `(length lst)` — count pairs in the spine. Consume-on-use; returns
 /// the count as a raw Fixnum-shape i64 (NOT a Gc handle). Walks
 /// `Pair.cdr` until reaching `Null` (proper list) or another atom

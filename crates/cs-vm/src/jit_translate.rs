@@ -882,6 +882,39 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::NullP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter DD) — type predicates
+                                    // on Any operand. The bottom-of-table
+                                    // "always-false" arms still catch Fixnum-
+                                    // tier operands; these gated arms only
+                                    // fire for Any.
+                                    ("procedure?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::ProcedureP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("port?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::PortP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("eof-object?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::EofP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("symbol?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::SymbolP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // ADR 0012 D-2 (iter CA) — list ops.
                                     ("length", 1)
                                         if value_types.get(&args[0]).copied()
@@ -2434,7 +2467,11 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::CharWhitespaceP(dst, _)
                 | RirInst::CharUpperCaseP(dst, _)
                 | RirInst::CharLowerCaseP(dst, _)
-                | RirInst::BvP(dst, _) => {
+                | RirInst::BvP(dst, _)
+                | RirInst::ProcedureP(dst, _)
+                | RirInst::PortP(dst, _)
+                | RirInst::EofP(dst, _)
+                | RirInst::SymbolP(dst, _) => {
                     bool_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {

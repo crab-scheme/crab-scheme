@@ -3667,3 +3667,41 @@ fn diff_jit_bytevector_copy() {
         other => panic!("expected (9, 42), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_any_type_predicates() {
+    // ADR 0012 D-2 (iter DD) — procedure? / symbol? on Any operands.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (proc? v) (if (procedure? v) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sym? v) (if (symbol? v) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (proc? car) (sym? 'foo) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let p_yes = rt.eval_str_via_vm("<diff>", "(proc? car)").unwrap();
+    let p_no = rt.eval_str_via_vm("<diff>", "(proc? (list 1 2))").unwrap();
+    let s_yes = rt.eval_str_via_vm("<diff>", "(sym? 'foo)").unwrap();
+    let s_no = rt
+        .eval_str_via_vm("<diff>", "(sym? (make-string 3 #\\a))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "type predicates never dispatched through JIT (count={after})"
+    );
+    match (&p_yes, &p_no, &s_yes, &s_no) {
+        (
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (1, 0, 1, 0), got {:?}", other),
+    }
+}

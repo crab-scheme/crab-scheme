@@ -404,6 +404,21 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter DC).
     BvCopy(Value, Value),
 
+    /// `dst = procedure?(v)`. Lowers to `vm_procedure_p_gc`.
+    /// ADR 0012 D-2 (iter DD).
+    ProcedureP(Value, Value),
+
+    /// `dst = port?(v)`. Lowers to `vm_port_p_gc`. ADR 0012 D-2 (iter DD).
+    PortP(Value, Value),
+
+    /// `dst = eof-object?(v)`. Lowers to `vm_eof_p_gc`. ADR 0012 D-2
+    /// (iter DD).
+    EofP(Value, Value),
+
+    /// `dst = symbol?(v)`. Lowers to `vm_symbol_p_gc`. ADR 0012 D-2
+    /// (iter DD).
+    SymbolP(Value, Value),
+
     /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
     /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
     /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).
