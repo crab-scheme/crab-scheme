@@ -2440,6 +2440,14 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::ListToString(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter EJ) — string-reverse.
+                                    ("string-reverse", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::StringReverse(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter DY) — string<->vector
                                     // 1-arg forms.
                                     ("string->vector", 1)
@@ -3664,6 +3672,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VectorToString(dst, _)
                 | RirInst::NumberToString(dst, _)
                 | RirInst::StringToNumber(dst, _)
+                | RirInst::StringReverse(dst, _)
                 | RirInst::ListToVector(dst, _)
                 | RirInst::StringToList(dst, _)
                 | RirInst::ListToString(dst, _)

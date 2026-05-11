@@ -5066,3 +5066,35 @@ fn diff_jit_exact_integer_rational_flonum() {
         other => panic!("expected (T, F, T, F), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_reverse() {
+    // ADR 0012 D-2 (iter EJ) — (string-reverse s) returns a fresh
+    // string with the characters of `s` in reverse order.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sr s) (string-reverse s))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sr \"abc\") (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let hello = rt.eval_str_via_vm("<diff>", "(sr \"hello\")").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(sr \"\")").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "string-reverse never dispatched through JIT (count={after})"
+    );
+    match (&hello, &empty) {
+        (Value::String(h), Value::String(e)) => {
+            assert_eq!(&*h.borrow(), "olleh");
+            assert_eq!(&*e.borrow(), "");
+        }
+        other => panic!("expected two strings, got {:?}", other),
+    }
+}

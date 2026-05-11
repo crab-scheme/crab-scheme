@@ -2912,6 +2912,33 @@ pub unsafe extern "C" fn vm_string_to_number_gc(s: i64) -> i64 {
     }
 }
 
+/// `(string-reverse s)` — return a fresh string whose characters
+/// are those of `s` in reverse order. Consumes the input Gc
+/// handle. On non-string input, requests a deopt and returns an
+/// empty-string handle. ADR 0012 D-2 (iter EJ).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_reverse_gc(s: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            let reversed: String = sg.borrow().chars().rev().collect();
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                reversed,
+            ))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
 /// `(integer? x)` — Flonum-typed fast path. Takes the raw i64 bit
 /// pattern of an f64 (Flonum-shape carrier, not a Gc handle).
 /// Returns 1 iff `x` is finite and has zero fractional part.

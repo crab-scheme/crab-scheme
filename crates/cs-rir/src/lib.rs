@@ -691,6 +691,11 @@ pub enum Inst {
     /// x.fract() == 0.0`. `dst` is Boolean. ADR 0012 D-2 (iter EH).
     FlonumIsInteger(Value, Value),
 
+    /// `dst = string-reverse(s)`. Lowers to `vm_string_reverse_gc`.
+    /// Arg Any-shape (consumed); `dst` is Any (fresh
+    /// Gc<Value::String>). ADR 0012 D-2 (iter EJ).
+    StringReverse(Value, Value),
+
     /// `dst = srem(lhs, rhs)`. R6RS `remainder` for fixnums.
     Remainder(Value, Value, Value),
 
