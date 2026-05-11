@@ -842,6 +842,52 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter DN) — variadic list.
+                                    // `(list a b c)` lowers to a right-to-left
+                                    // chain of cons: cons(a, cons(b, cons(c, '()))).
+                                    // The empty list case yields the Null literal.
+                                    // Emit the final Cons directly into dst so
+                                    // the post-pass's any_values classification
+                                    // covers it (Move doesn't propagate types).
+                                    ("list", _) => {
+                                        if args.is_empty() {
+                                            insts.push(RirInst::LoadConst(dst, Const::Null));
+                                            value_types.insert(dst, Type::Null);
+                                        } else {
+                                            // Build innermost tail: '()
+                                            let mut acc = alloc();
+                                            insts.push(RirInst::LoadConst(acc, Const::Null));
+                                            value_types.insert(acc, Type::Null);
+                                            let mut acc_tag = type_to_jit_rt_tag(Type::Null);
+                                            // Walk args right-to-left, except
+                                            // the last (leftmost) which goes
+                                            // directly into dst.
+                                            for &arg in args[1..].iter().rev() {
+                                                let arg_t = value_types
+                                                    .get(&arg)
+                                                    .copied()
+                                                    .unwrap_or(Type::Fixnum);
+                                                let arg_tag = type_to_jit_rt_tag(arg_t);
+                                                let next = alloc();
+                                                insts.push(RirInst::Cons(
+                                                    next, arg, arg_tag, acc, acc_tag,
+                                                ));
+                                                value_types.insert(next, Type::Any);
+                                                acc = next;
+                                                acc_tag = type_to_jit_rt_tag(Type::Any);
+                                            }
+                                            // First arg goes into dst.
+                                            let first_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let first_tag = type_to_jit_rt_tag(first_t);
+                                            insts.push(RirInst::Cons(
+                                                dst, args[0], first_tag, acc, acc_tag,
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                    }
                                     ("car", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>

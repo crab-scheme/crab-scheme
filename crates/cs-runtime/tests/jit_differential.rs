@@ -4031,3 +4031,43 @@ fn diff_jit_variadic_compares() {
         other => panic!("expected (1,0,1,0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_variadic_list() {
+    // ADR 0012 D-2 (iter DN) — variadic `list` lowers as right-to-
+    // left Cons chain via the existing Cons RIR. No new helper.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (l3 a b c) (list a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (l0) (list))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (l3 1 2 3) (l0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // (list 10 20 30) has length 3.
+    let len = rt
+        .eval_str_via_vm("<diff>", "(length (l3 10 20 30))")
+        .unwrap();
+    // First element of (list 10 20 30) is 10.
+    let first = rt.eval_str_via_vm("<diff>", "(car (l3 10 20 30))").unwrap();
+    // (list) is empty.
+    let empty_len = rt.eval_str_via_vm("<diff>", "(length (l0))").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "variadic list never dispatched through JIT (count={after})"
+    );
+    match (&len, &first, &empty_len) {
+        (
+            Value::Number(cs_core::Number::Fixnum(3)),
+            Value::Number(cs_core::Number::Fixnum(10)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (3, 10, 0), got {:?}", other),
+    }
+}
