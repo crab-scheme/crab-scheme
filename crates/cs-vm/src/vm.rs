@@ -1639,6 +1639,36 @@ pub unsafe extern "C" fn vm_bytevector_u8_ref_gc(bv: i64, k: i64) -> i64 {
     }
 }
 
+/// `(arithmetic-shift n count)` — left-shift if count >= 0,
+/// arithmetic right-shift if count < 0. Matches
+/// `b_bitwise_arith_shift`: shifts past 64 saturate to 0 / -1.
+/// Both args are raw Fixnum-shape i64. ADR 0012 D-2 (iter DL).
+///
+/// # Safety
+///
+/// Both args are raw i64s; no Gc invariants.
+#[no_mangle]
+pub unsafe extern "C" fn vm_arith_shift_fx(n: i64, count: i64) -> i64 {
+    if count >= 0 {
+        if count >= 64 {
+            0
+        } else {
+            n.wrapping_shl(count as u32)
+        }
+    } else {
+        let abs = (-count) as u32;
+        if abs >= 64 {
+            if n < 0 {
+                -1
+            } else {
+                0
+            }
+        } else {
+            n.wrapping_shr(abs)
+        }
+    }
+}
+
 /// `(expt base exp)` — Fixnum exponentiation via repeated squaring.
 /// On Fixnum overflow or a negative exponent (R6RS allows expt
 /// with neg exp to return a rational, which the JIT can't

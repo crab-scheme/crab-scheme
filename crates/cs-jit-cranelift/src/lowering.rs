@@ -234,6 +234,9 @@ pub struct Lowerer {
     /// result Fixnum (deopts on overflow / neg exp).
     /// ADR 0012 D-2 (iter CT).
     expt_func: cranelift_module::FuncId,
+    /// FuncId of `vm_arith_shift_fx(n, count) -> i64`.
+    /// ADR 0012 D-2 (iter DL).
+    arith_shift_func: cranelift_module::FuncId,
     /// FuncId of `vm_bytevector_p_gc(v) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CQ).
     bv_p_func: cranelift_module::FuncId,
@@ -492,6 +495,11 @@ impl Lowerer {
         builder.symbol("vm_lcm_fx", cs_vm::vm::vm_lcm_fx as *const u8);
         // ADR 0012 D-2 (iter CT) — expt.
         builder.symbol("vm_expt_fx", cs_vm::vm::vm_expt_fx as *const u8);
+        // ADR 0012 D-2 (iter DL) — arithmetic-shift.
+        builder.symbol(
+            "vm_arith_shift_fx",
+            cs_vm::vm::vm_arith_shift_fx as *const u8,
+        );
         // ADR 0012 D-2 (iter CQ) — bytevector read ops.
         builder.symbol(
             "vm_bytevector_p_gc",
@@ -1109,6 +1117,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_expt_fx: {e}")))?;
 
+        // ADR 0012 D-2 (iter DL) — vm_arith_shift_fx(n, count) -> i64.
+        let arith_shift_func = module
+            .declare_function(
+                "vm_arith_shift_fx",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_arith_shift_fx: {e}")))?;
+
         // ADR 0012 D-2 (iter CQ) — bytevector read ops.
         let bv_p_func = module
             .declare_function(
@@ -1545,6 +1562,7 @@ impl Lowerer {
             gcd_func,
             lcm_func,
             expt_func,
+            arith_shift_func,
             bv_p_func,
             bv_length_func,
             bv_u8_ref_func,
@@ -1876,6 +1894,10 @@ impl Lowerer {
             let expt_fnref = self
                 .module
                 .declare_func_in_func(self.expt_func, builder.func);
+            // iter DL — arithmetic-shift.
+            let arith_shift_fnref = self
+                .module
+                .declare_func_in_func(self.arith_shift_func, builder.func);
             // iter CQ — bytevector read ops.
             let bv_p_fnref = self
                 .module
@@ -2139,6 +2161,7 @@ impl Lowerer {
                         gcd_fnref,
                         lcm_fnref,
                         expt_fnref,
+                        arith_shift_fnref,
                         bv_p_fnref,
                         bv_length_fnref,
                         bv_u8_ref_fnref,
@@ -2398,6 +2421,7 @@ fn lower_inst(
     gcd_fnref: cranelift_codegen::ir::FuncRef,
     lcm_fnref: cranelift_codegen::ir::FuncRef,
     expt_fnref: cranelift_codegen::ir::FuncRef,
+    arith_shift_fnref: cranelift_codegen::ir::FuncRef,
     bv_p_fnref: cranelift_codegen::ir::FuncRef,
     bv_length_fnref: cranelift_codegen::ir::FuncRef,
     bv_u8_ref_fnref: cranelift_codegen::ir::FuncRef,
@@ -3710,6 +3734,23 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "Expt expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::ArithShift(dst, n, count) => {
+            // ADR 0012 D-2 (iter DL) — vm_arith_shift_fx.
+            let n_v = lookup(map, *n)?;
+            let count_v = lookup(map, *count)?;
+            let inst_ref = b.ins().call(arith_shift_fnref, &[n_v, count_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "ArithShift expected 1 result, got {}",
                         results.len()
                     )));
                 }

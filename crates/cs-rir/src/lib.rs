@@ -574,6 +574,11 @@ pub enum Inst {
     /// exponent, helper deopts. ADR 0012 D-2 (iter CT).
     Expt(Value, Value, Value),
 
+    /// `dst = arithmetic-shift(n, count)`. Positive count → left
+    /// shift; negative → arithmetic right shift. Lowers to
+    /// `vm_arith_shift_fx`. ADR 0012 D-2 (iter DL).
+    ArithShift(Value, Value, Value),
+
     /// `dst = band(lhs, rhs)`. R6RS `bitwise-and` (R6RS) /
     /// `bitwise-and-bitwise` for two fixnums.
     BitAnd(Value, Value, Value),

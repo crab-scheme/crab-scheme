@@ -3954,3 +3954,39 @@ fn diff_jit_bitwise_not() {
         other => panic!("expected (-1, -6), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_arithmetic_shift() {
+    // ADR 0012 D-2 (iter DL) — arithmetic-shift (positive count =
+    // left shift, negative = arithmetic right shift).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ash n c) (arithmetic-shift n c))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (ash 1 4) (ash 16 -2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // 1 << 4 = 16
+    let r_l = rt.eval_str_via_vm("<diff>", "(ash 1 4)").unwrap();
+    // 16 >> 2 = 4
+    let r_r = rt.eval_str_via_vm("<diff>", "(ash 16 -2)").unwrap();
+    // Arithmetic right shift preserves sign: -16 >> 2 = -4
+    let r_neg = rt.eval_str_via_vm("<diff>", "(ash -16 -2)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "arithmetic-shift never dispatched through JIT (count={after})"
+    );
+    match (&r_l, &r_r, &r_neg) {
+        (
+            Value::Number(cs_core::Number::Fixnum(16)),
+            Value::Number(cs_core::Number::Fixnum(4)),
+            Value::Number(cs_core::Number::Fixnum(-4)),
+        ) => {}
+        other => panic!("expected (16, 4, -4), got {:?}", other),
+    }
+}
