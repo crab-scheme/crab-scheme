@@ -6565,3 +6565,66 @@ fn diff_jit_bytevector_ieee_native() {
         other => panic!("expected flonum, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_bytevector_u64_s64_native() {
+    // ADR 0012 D-2 (iter FT) — bytevector u64/s64 native ref/set!.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (us bv k v) \
+           (bytevector-u64-native-set! bv k v) \
+           (bytevector-u64-native-ref bv k))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (ss bv k v) \
+           (bytevector-s64-native-set! bv k v) \
+           (bytevector-s64-native-ref bv k))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (us (make-bytevector 16 0) 0 12345) \
+                      (ss (make-bytevector 16 0) 8 -99999999) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let u = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(us (make-bytevector 16 0) 0 9223372036854775807)",
+        )
+        .unwrap();
+    let sp = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(ss (make-bytevector 16 0) 0 9223372036854775807)",
+        )
+        .unwrap();
+    let sn = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(ss (make-bytevector 16 0) 0 -9223372036854775808)",
+        )
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    // i64::MAX
+    assert!(matches!(
+        &u,
+        Value::Number(cs_core::Number::Fixnum(9223372036854775807))
+    ));
+    assert!(matches!(
+        &sp,
+        Value::Number(cs_core::Number::Fixnum(9223372036854775807))
+    ));
+    assert!(matches!(
+        &sn,
+        Value::Number(cs_core::Number::Fixnum(-9223372036854775808))
+    ));
+}

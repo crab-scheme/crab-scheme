@@ -2533,6 +2533,133 @@ pub unsafe extern "C" fn vm_bytevector_ieee_double_native_set_gc(bv: i64, k: i64
     }
 }
 
+/// Native-endian 8-byte unsigned integer read. Deopts when the
+/// decoded u64 exceeds `i64::MAX` (needs BigInt allocation we don't
+/// model in the JIT). ADR 0012 D-2 (iter FT).
+///
+/// # Safety
+///
+/// `bv` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_u64_native_ref_gc(bv: i64, k: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let storage = bvc.borrow();
+            if k < 0 || (k as usize).saturating_add(8) > storage.len() {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return 0;
+            }
+            let idx = k as usize;
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&storage[idx..idx + 8]);
+            let v = u64::from_ne_bytes(buf);
+            if v > i64::MAX as u64 {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return 0;
+            }
+            v as i64
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+/// Native-endian 8-byte signed integer read. Always fits in Fixnum.
+/// ADR 0012 D-2 (iter FT).
+///
+/// # Safety
+///
+/// Same as `vm_bytevector_u64_native_ref_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_s64_native_ref_gc(bv: i64, k: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let storage = bvc.borrow();
+            if k < 0 || (k as usize).saturating_add(8) > storage.len() {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return 0;
+            }
+            let idx = k as usize;
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&storage[idx..idx + 8]);
+            i64::from_ne_bytes(buf)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+/// Native-endian 8-byte unsigned integer write. `val` must be in
+/// [0, i64::MAX]; deopts otherwise (we can't pass values above
+/// i64::MAX from a Fixnum SSA register). Returns Gc(Unspecified).
+/// ADR 0012 D-2 (iter FT).
+///
+/// # Safety
+///
+/// Same as the integer setter helpers; `val` is a raw Fixnum-shape i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_u64_native_set_gc(bv: i64, k: i64, val: i64) -> i64 {
+    if val < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Unspecified);
+    }
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let mut storage = bvc.borrow_mut();
+            if k < 0 || (k as usize).saturating_add(8) > storage.len() {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            let bytes = (val as u64).to_ne_bytes();
+            let idx = k as usize;
+            storage[idx..idx + 8].copy_from_slice(&bytes);
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
+/// Native-endian 8-byte signed integer write. ADR 0012 D-2 (iter FT).
+///
+/// # Safety
+///
+/// Same as `vm_bytevector_u64_native_set_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_s64_native_set_gc(bv: i64, k: i64, val: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let mut storage = bvc.borrow_mut();
+            if k < 0 || (k as usize).saturating_add(8) > storage.len() {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            let bytes = val.to_ne_bytes();
+            let idx = k as usize;
+            storage[idx..idx + 8].copy_from_slice(&bytes);
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(bytevector-s8-set! bv k v)` — write s8 value at `k`. `v` must
 /// be in [-128, 127]; otherwise deopts. Returns Unspecified Gc
 /// handle. ADR 0012 D-2 (iter FP).

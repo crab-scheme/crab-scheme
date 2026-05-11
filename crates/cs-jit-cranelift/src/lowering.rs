@@ -409,6 +409,18 @@ pub struct Lowerer {
     /// FuncId of `vm_bytevector_ieee_double_native_set_gc`.
     /// ADR 0012 D-2 (iter FS).
     bytevector_ieee_double_native_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_u64_native_ref_gc`. ADR 0012 D-2
+    /// (iter FT).
+    bytevector_u64_native_ref_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_s64_native_ref_gc`. ADR 0012 D-2
+    /// (iter FT).
+    bytevector_s64_native_ref_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_u64_native_set_gc`. ADR 0012 D-2
+    /// (iter FT).
+    bytevector_u64_native_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_s64_native_set_gc`. ADR 0012 D-2
+    /// (iter FT).
+    bytevector_s64_native_set_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -938,6 +950,23 @@ impl Lowerer {
         builder.symbol(
             "vm_bytevector_ieee_double_native_set_gc",
             cs_vm::vm::vm_bytevector_ieee_double_native_set_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter FT) — bytevector u64/s64 native ref/set!.
+        builder.symbol(
+            "vm_bytevector_u64_native_ref_gc",
+            cs_vm::vm::vm_bytevector_u64_native_ref_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_bytevector_s64_native_ref_gc",
+            cs_vm::vm::vm_bytevector_s64_native_ref_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_bytevector_u64_native_set_gc",
+            cs_vm::vm::vm_bytevector_u64_native_set_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_bytevector_s64_native_set_gc",
+            cs_vm::vm::vm_bytevector_s64_native_set_gc as *const u8,
         );
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
@@ -2291,6 +2320,52 @@ impl Lowerer {
                 ))
             })?;
 
+        // ADR 0012 D-2 (iter FT) — bytevector u64/s64 native ref/set!.
+        let bytevector_u64_native_ref_func = module
+            .declare_function(
+                "vm_bytevector_u64_native_ref_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_bytevector_u64_native_ref_gc: {e}"
+                ))
+            })?;
+        let bytevector_s64_native_ref_func = module
+            .declare_function(
+                "vm_bytevector_s64_native_ref_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_bytevector_s64_native_ref_gc: {e}"
+                ))
+            })?;
+        let bytevector_u64_native_set_func = module
+            .declare_function(
+                "vm_bytevector_u64_native_set_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_bytevector_u64_native_set_gc: {e}"
+                ))
+            })?;
+        let bytevector_s64_native_set_func = module
+            .declare_function(
+                "vm_bytevector_s64_native_set_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_bytevector_s64_native_set_gc: {e}"
+                ))
+            })?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -2995,6 +3070,10 @@ impl Lowerer {
             bytevector_ieee_double_native_ref_func,
             bytevector_ieee_single_native_set_func,
             bytevector_ieee_double_native_set_func,
+            bytevector_u64_native_ref_func,
+            bytevector_s64_native_ref_func,
+            bytevector_u64_native_set_func,
+            bytevector_s64_native_set_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -3579,6 +3658,19 @@ impl Lowerer {
             let bytevector_ieee_double_native_set_fnref = self
                 .module
                 .declare_func_in_func(self.bytevector_ieee_double_native_set_func, builder.func);
+            // iter FT — bytevector u64/s64 native-ref/-set!.
+            let bytevector_u64_native_ref_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_u64_native_ref_func, builder.func);
+            let bytevector_s64_native_ref_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_s64_native_ref_func, builder.func);
+            let bytevector_u64_native_set_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_u64_native_set_func, builder.func);
+            let bytevector_s64_native_set_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_s64_native_set_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -3980,6 +4072,10 @@ impl Lowerer {
                         bytevector_ieee_double_native_ref_fnref,
                         bytevector_ieee_single_native_set_fnref,
                         bytevector_ieee_double_native_set_fnref,
+                        bytevector_u64_native_ref_fnref,
+                        bytevector_s64_native_ref_fnref,
+                        bytevector_u64_native_set_fnref,
+                        bytevector_s64_native_set_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -4326,6 +4422,10 @@ fn lower_inst(
     bytevector_ieee_double_native_ref_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_ieee_single_native_set_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_ieee_double_native_set_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_u64_native_ref_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_s64_native_ref_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_u64_native_set_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_s64_native_set_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -5945,8 +6045,10 @@ fn lower_inst(
         | Inst::BvU32NativeRef(dst, bv, k)
         | Inst::BvS32NativeRef(dst, bv, k)
         | Inst::BvIeeeSingleNativeRef(dst, bv, k)
-        | Inst::BvIeeeDoubleNativeRef(dst, bv, k) => {
-            // ADR 0012 D-2 (iter FQ/FR/FS) — bytevector typed native-ref.
+        | Inst::BvIeeeDoubleNativeRef(dst, bv, k)
+        | Inst::BvU64NativeRef(dst, bv, k)
+        | Inst::BvS64NativeRef(dst, bv, k) => {
+            // ADR 0012 D-2 (iter FQ/FR/FS/FT) — bytevector typed native-ref.
             let bv_v = lookup(map, *bv)?;
             let k_v = lookup(map, *k)?;
             let fnref = match inst {
@@ -5956,6 +6058,8 @@ fn lower_inst(
                 Inst::BvS32NativeRef(..) => bytevector_s32_native_ref_fnref,
                 Inst::BvIeeeSingleNativeRef(..) => bytevector_ieee_single_native_ref_fnref,
                 Inst::BvIeeeDoubleNativeRef(..) => bytevector_ieee_double_native_ref_fnref,
+                Inst::BvU64NativeRef(..) => bytevector_u64_native_ref_fnref,
+                Inst::BvS64NativeRef(..) => bytevector_s64_native_ref_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[bv_v, k_v]);
@@ -5976,8 +6080,10 @@ fn lower_inst(
         | Inst::BvU32NativeSet(dst, bv, k, val)
         | Inst::BvS32NativeSet(dst, bv, k, val)
         | Inst::BvIeeeSingleNativeSet(dst, bv, k, val)
-        | Inst::BvIeeeDoubleNativeSet(dst, bv, k, val) => {
-            // ADR 0012 D-2 (iter FQ/FR/FS) — bytevector typed native-set!.
+        | Inst::BvIeeeDoubleNativeSet(dst, bv, k, val)
+        | Inst::BvU64NativeSet(dst, bv, k, val)
+        | Inst::BvS64NativeSet(dst, bv, k, val) => {
+            // ADR 0012 D-2 (iter FQ/FR/FS/FT) — bytevector typed native-set!.
             let bv_v = lookup(map, *bv)?;
             let k_v = lookup(map, *k)?;
             let val_v = lookup(map, *val)?;
@@ -5988,6 +6094,8 @@ fn lower_inst(
                 Inst::BvS32NativeSet(..) => bytevector_s32_native_set_fnref,
                 Inst::BvIeeeSingleNativeSet(..) => bytevector_ieee_single_native_set_fnref,
                 Inst::BvIeeeDoubleNativeSet(..) => bytevector_ieee_double_native_set_fnref,
+                Inst::BvU64NativeSet(..) => bytevector_u64_native_set_fnref,
+                Inst::BvS64NativeSet(..) => bytevector_s64_native_set_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[bv_v, k_v, val_v]);
