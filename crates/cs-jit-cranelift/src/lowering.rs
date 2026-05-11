@@ -249,6 +249,12 @@ pub struct Lowerer {
     /// FuncId of `vm_bytevector_u8_set_gc(bv, k, val) -> i64`. Returns
     /// Gc(Unspecified). ADR 0012 D-2 (iter CR).
     bv_u8_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_vector_fill_gc(vec, fill) -> i64`. ADR 0012 D-2
+    /// (iter CZ).
+    vec_fill_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_fill_gc(bv, fill) -> i64`. ADR 0012
+    /// D-2 (iter CZ).
+    bv_fill_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -460,6 +466,15 @@ impl Lowerer {
         builder.symbol(
             "vm_bytevector_u8_set_gc",
             cs_vm::vm::vm_bytevector_u8_set_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter CZ) — bulk fill ops.
+        builder.symbol(
+            "vm_vector_fill_gc",
+            cs_vm::vm::vm_vector_fill_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_bytevector_fill_gc",
+            cs_vm::vm::vm_bytevector_fill_gc as *const u8,
         );
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
@@ -1050,6 +1065,25 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_bytevector_u8_set_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter CZ) — vm_vector_fill_gc / vm_bytevector_fill_gc.
+        // Two i64 in, one out — vector_ref_sig shape.
+        let vec_fill_func = module
+            .declare_function(
+                "vm_vector_fill_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_vector_fill_gc: {e}")))?;
+        let bv_fill_func = module
+            .declare_function(
+                "vm_bytevector_fill_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_fill_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -1259,6 +1293,8 @@ impl Lowerer {
             bv_u8_ref_func,
             bv_alloc_func,
             bv_u8_set_func,
+            vec_fill_func,
+            bv_fill_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -1579,6 +1615,13 @@ impl Lowerer {
             let bv_u8_set_fnref = self
                 .module
                 .declare_func_in_func(self.bv_u8_set_func, builder.func);
+            // iter CZ — bulk fill ops.
+            let vec_fill_fnref = self
+                .module
+                .declare_func_in_func(self.vec_fill_func, builder.func);
+            let bv_fill_fnref = self
+                .module
+                .declare_func_in_func(self.bv_fill_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -1752,6 +1795,8 @@ impl Lowerer {
                         bv_u8_ref_fnref,
                         bv_alloc_fnref,
                         bv_u8_set_fnref,
+                        vec_fill_fnref,
+                        bv_fill_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -1988,6 +2033,8 @@ fn lower_inst(
     bv_u8_ref_fnref: cranelift_codegen::ir::FuncRef,
     bv_alloc_fnref: cranelift_codegen::ir::FuncRef,
     bv_u8_set_fnref: cranelift_codegen::ir::FuncRef,
+    vec_fill_fnref: cranelift_codegen::ir::FuncRef,
+    bv_fill_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -3231,6 +3278,42 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "BvU8Set expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::VecFill(dst, vec, fill) => {
+            // ADR 0012 D-2 (iter CZ) — vm_vector_fill_gc.
+            let vec_v = lookup(map, *vec)?;
+            let fill_v = lookup(map, *fill)?;
+            let inst_ref = b.ins().call(vec_fill_fnref, &[vec_v, fill_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "VecFill expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::BvFill(dst, bv, fill) => {
+            // ADR 0012 D-2 (iter CZ) — vm_bytevector_fill_gc.
+            let bv_v = lookup(map, *bv)?;
+            let fill_v = lookup(map, *fill)?;
+            let inst_ref = b.ins().call(bv_fill_fnref, &[bv_v, fill_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvFill expected 1 result, got {}",
                         results.len()
                     )));
                 }

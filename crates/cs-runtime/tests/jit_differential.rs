@@ -3509,3 +3509,50 @@ fn diff_jit_symbol_string_conversions() {
         other => panic!("expected (5, #\\Z), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_vector_bytevector_fill() {
+    // ADR 0012 D-2 (iter CZ) — vector-fill! / bytevector-fill!.
+    // Bulk-overwrite every slot; mutation is observable via
+    // subsequent ref ops.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (vfill v fill) (vector-fill! v fill) (vector-ref v 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (bvfill bv fill) \
+             (bytevector-fill! bv fill) (bytevector-u8-ref bv 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (vfill (make-vector 4 0) 42) \
+                    (bvfill (make-bytevector 4 0) 99) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let v_res = rt
+        .eval_str_via_vm("<diff>", "(vfill (make-vector 5 0) 77)")
+        .unwrap();
+    let bv_res = rt
+        .eval_str_via_vm("<diff>", "(bvfill (make-bytevector 5 0) 200)")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "fill ops never dispatched through JIT (count={after})"
+    );
+    match (&v_res, &bv_res) {
+        (
+            Value::Number(cs_core::Number::Fixnum(77)),
+            Value::Number(cs_core::Number::Fixnum(200)),
+        ) => {}
+        other => panic!("expected (77, 200), got {:?}", other),
+    }
+}

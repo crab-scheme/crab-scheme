@@ -373,6 +373,16 @@ pub enum Inst {
     /// Side effect: mutates `bv[k]`. ADR 0012 D-2 (iter CR).
     BvU8Set(Value, Value, Value, Value),
 
+    /// `dst = vector-fill!(vec, fill)`. Lowers to `vm_vector_fill_gc`.
+    /// Both args Any (consumed). `dst` Any (Unspecified). ADR 0012
+    /// D-2 (iter CZ).
+    VecFill(Value, Value, Value),
+
+    /// `dst = bytevector-fill!(bv, fill)`. Lowers to
+    /// `vm_bytevector_fill_gc`. `bv` Any (consumed), `fill` Fixnum.
+    /// `dst` Any (Unspecified). ADR 0012 D-2 (iter CZ).
+    BvFill(Value, Value, Value),
+
     /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
     /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
     /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).

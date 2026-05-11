@@ -970,6 +970,62 @@ pub unsafe extern "C" fn vm_substring_gc(s: i64, start: i64, end: i64) -> i64 {
     }
 }
 
+/// `(vector-fill! vec fill)` — overwrite every slot of `vec` with
+/// a clone of `fill`. Consumes one strong refcount on both `vec`
+/// and `fill`. Returns Gc(Unspecified). On non-vector input,
+/// requests a deopt. ADR 0012 D-2 (iter CZ).
+///
+/// # Safety
+///
+/// Both `vec` and `fill` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_fill_gc(vec: i64, fill: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(vec) };
+    let f = unsafe { gc_i64_to_value(fill) };
+    match v {
+        Value::Vector(vc) => {
+            let mut storage = vc.borrow_mut();
+            for slot in storage.iter_mut() {
+                *slot = f.clone();
+            }
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
+/// `(bytevector-fill! bv fill)` — overwrite every byte of `bv` with
+/// `fill & 0xFF`. `bv` is consumed (Gc handle); `fill` is a raw
+/// Fixnum-shape i64. Returns Gc(Unspecified). Non-bytevector deopts.
+/// ADR 0012 D-2 (iter CZ).
+///
+/// # Safety
+///
+/// `bv` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_fill_gc(bv: i64, fill: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    let byte = (fill & 0xFF) as u8;
+    match v {
+        Value::ByteVector(bvc) => {
+            let mut storage = bvc.borrow_mut();
+            for slot in storage.iter_mut() {
+                *slot = byte;
+            }
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(symbol->string sym)` — return a fresh `Value::String` carrying
 /// the symbol's name. Operand is a Symbol-shape i64 (sym id in low
 /// 32 bits, NOT a Gc handle). Looks up via `JIT_ACTIVE_SYMS`.

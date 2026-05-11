@@ -1060,6 +1060,39 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::BvU8Ref(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Fixnum);
                                     }
+                                    // ADR 0012 D-2 (iter CZ) — vector-fill! /
+                                    // bytevector-fill!.
+                                    ("vector-fill!", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        // fill arg: BoxTyped if not Any.
+                                        let f_t = value_types
+                                            .get(&args[1])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let fill = if f_t == Type::Any {
+                                            args[1]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[1],
+                                                type_to_jit_rt_tag(f_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::VecFill(dst, args[0], fill));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("bytevector-fill!", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvFill(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter CR) — bytevector write ops.
                                     ("make-bytevector", 2) => {
                                         insts.push(RirInst::BvAlloc(dst, args[0], args[1]));
@@ -2446,6 +2479,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::ListSet(dst, _, _, _)
                 | RirInst::BvAlloc(dst, _, _)
                 | RirInst::BvU8Set(dst, _, _, _)
+                | RirInst::VecFill(dst, _, _)
+                | RirInst::BvFill(dst, _, _)
                 | RirInst::DigitValue(dst, _)
                 | RirInst::VectorToList(dst, _)
                 | RirInst::ListToVector(dst, _)
