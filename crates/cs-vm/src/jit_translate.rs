@@ -764,6 +764,47 @@ pub fn bytecode_to_rir_with_hints(
                                 {
                                     Some(RirInst::BitNot(dst, args[0]))
                                 }
+                                // ADR 0012 D-2 (iter FW) — fx bitwise aliases.
+                                // R6RS fixnum-only; refuse Flonum and lower to
+                                // the same primitives as bitwise-{and,or,xor,not}.
+                                ("fxand", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitAnd(dst, args[0], args[1]))
+                                }
+                                ("fxior", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitOr(dst, args[0], args[1]))
+                                }
+                                ("fxxor", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitXor(dst, args[0], args[1]))
+                                }
+                                ("fxnot", 1)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitNot(dst, args[0]))
+                                }
+                                // ADR 0012 D-2 (iter FW) — fx bit-inspection
+                                // aliases (route to vm_bitwise_* helpers).
+                                ("fxbit-count", 1)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitwiseBitCount(dst, args[0]))
+                                }
+                                ("fxlength", 1)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitwiseLength(dst, args[0]))
+                                }
                                 // ADR 0012 D-2 (iter EB) — abs/max/min are
                                 // Fixnum-only on this fast path. If any
                                 // operand is Flonum the multi-Inst section
@@ -2846,6 +2887,16 @@ pub fn bytecode_to_rir_with_hints(
                                     // ADR 0012 D-2 (iter FO) — bitwise-bit-set?.
                                     // (Fixnum, Fixnum) -> Boolean.
                                     ("bitwise-bit-set?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::BitwiseBitSetP(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    // ADR 0012 D-2 (iter FW) — fxbit-set? alias.
+                                    ("fxbit-set?", 2)
                                         if value_types.get(&args[0]).copied()
                                             != Some(Type::Flonum)
                                             && value_types.get(&args[1]).copied()

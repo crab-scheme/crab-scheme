@@ -6742,3 +6742,56 @@ fn diff_jit_fx_arith_and_compare() {
     assert!(matches!(&ge_gt, Value::Boolean(true)));
     assert!(matches!(&ge_lt, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_fx_bitwise_aliases() {
+    // ADR 0012 D-2 (iter FW) — fx bitwise + bit-inspection aliases.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (a b c) (fxand b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (o b c) (fxior b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (x b c) (fxxor b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (n b) (fxnot b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (c b) (fxbit-count b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (l b) (fxlength b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s b k) (fxbit-set? b k))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (a 7 5) (o 8 1) (x 5 3) (n 0) (c 7) (l 16) (s 5 2) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let a = rt.eval_str_via_vm("<diff>", "(a 12 10)").unwrap();
+    let o = rt.eval_str_via_vm("<diff>", "(o 12 3)").unwrap();
+    let x = rt.eval_str_via_vm("<diff>", "(x 12 5)").unwrap();
+    let n = rt.eval_str_via_vm("<diff>", "(n 0)").unwrap();
+    let c = rt.eval_str_via_vm("<diff>", "(c 255)").unwrap();
+    let l = rt.eval_str_via_vm("<diff>", "(l 16)").unwrap();
+    let s_t = rt.eval_str_via_vm("<diff>", "(s 5 2)").unwrap();
+    let s_f = rt.eval_str_via_vm("<diff>", "(s 5 1)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    // 12 & 10 = 8
+    assert!(matches!(&a, Value::Number(cs_core::Number::Fixnum(8))));
+    // 12 | 3 = 15
+    assert!(matches!(&o, Value::Number(cs_core::Number::Fixnum(15))));
+    // 12 ^ 5 = 9
+    assert!(matches!(&x, Value::Number(cs_core::Number::Fixnum(9))));
+    // !0 = -1
+    assert!(matches!(&n, Value::Number(cs_core::Number::Fixnum(-1))));
+    // popcount(255) = 8
+    assert!(matches!(&c, Value::Number(cs_core::Number::Fixnum(8))));
+    // length(16) = 5
+    assert!(matches!(&l, Value::Number(cs_core::Number::Fixnum(5))));
+    assert!(matches!(&s_t, Value::Boolean(true)));
+    assert!(matches!(&s_f, Value::Boolean(false)));
+}
