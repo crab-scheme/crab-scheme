@@ -2523,6 +2523,32 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StringReverse(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter EM) — (make-list n fill).
+                                    // Length must be Fixnum-typed; fill is
+                                    // boxed if a typed primitive.
+                                    ("make-list", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        let fill_t = value_types
+                                            .get(&args[1])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let fill = if fill_t == Type::Any {
+                                            args[1]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[1],
+                                                type_to_jit_rt_tag(fill_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::MakeList(dst, args[0], fill));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter DY) — string<->vector
                                     // 1-arg forms.
                                     ("string->vector", 1)
@@ -3748,6 +3774,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::NumberToString(dst, _)
                 | RirInst::StringToNumber(dst, _)
                 | RirInst::StringReverse(dst, _)
+                | RirInst::MakeList(dst, _, _)
                 | RirInst::ListToVector(dst, _)
                 | RirInst::StringToList(dst, _)
                 | RirInst::ListToString(dst, _)

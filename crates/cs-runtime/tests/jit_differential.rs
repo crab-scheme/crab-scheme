@@ -5163,3 +5163,41 @@ fn diff_jit_integer_ops_flonum_guard() {
         err
     );
 }
+
+#[test]
+fn diff_jit_make_list_2arg() {
+    // ADR 0012 D-2 (iter EM) — (make-list n fill) builds a fresh
+    // list of n copies of fill.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mkl n f) (make-list n f))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (mkl 3 'x) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let three_zero = rt.eval_str_via_vm("<diff>", "(mkl 3 0)").unwrap();
+    let zero_x = rt.eval_str_via_vm("<diff>", "(mkl 0 'x)").unwrap();
+    let len = rt.eval_str_via_vm("<diff>", "(length (mkl 5 'a))").unwrap();
+    let elem = rt
+        .eval_str_via_vm("<diff>", "(list-ref (mkl 5 'a) 2)")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "make-list never dispatched through JIT (count={after})"
+    );
+    match (&three_zero, &zero_x, &len, &elem) {
+        (
+            Value::Pair(_),
+            Value::Null,
+            Value::Number(cs_core::Number::Fixnum(5)),
+            Value::Symbol(_),
+        ) => {}
+        other => panic!("expected (pair, null, 5, symbol), got {:?}", other),
+    }
+}

@@ -2912,6 +2912,34 @@ pub unsafe extern "C" fn vm_string_to_number_gc(s: i64) -> i64 {
     }
 }
 
+/// `(make-list n fill)` — return a fresh list containing `n` copies
+/// of `fill`. `n` is a raw Fixnum-shape i64. `fill` is consumed as
+/// a `Gc<Value>` handle and cloned into each element. Returns a
+/// Gc handle to a Null-terminated list. On negative `n`, requests
+/// a deopt and returns Null. ADR 0012 D-2 (iter EM).
+///
+/// # Safety
+///
+/// `fill` must be a live, owned `Gc<Value>` raw handle. `n` is
+/// raw i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_make_list_fill_gc(n: i64, fill: i64) -> i64 {
+    if n < 0 {
+        // Decode `fill` to drop the strong refcount before requesting
+        // deopt; otherwise we'd leak the input handle.
+        let _drop = unsafe { gc_i64_to_value(fill) };
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Null);
+    }
+    let fill_v = unsafe { gc_i64_to_value(fill) };
+    let len = n as usize;
+    let mut acc = Value::Null;
+    for _ in 0..len {
+        acc = Value::Pair(cs_core::Pair::new(fill_v.clone(), acc));
+    }
+    value_to_gc_i64(acc)
+}
+
 /// `(string-reverse s)` — return a fresh string whose characters
 /// are those of `s` in reverse order. Consumes the input Gc
 /// handle. On non-string input, requests a deopt and returns an
