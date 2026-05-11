@@ -3079,3 +3079,42 @@ fn diff_jit_list_set_mutates_indexed_pair() {
         other => panic!("expected (42, 99), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_gcd_lcm_pair() {
+    // ADR 0012 D-2 (iter CP) — gcd / lcm on fixnum pairs via
+    // Euclidean algorithm. Both operands and result are Fixnum.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (g a b) (gcd a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (l a b) (lcm a b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (g 12 8) (l 12 8) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let g_12_8 = rt.eval_str_via_vm("<diff>", "(g 12 8)").unwrap(); // 4
+    let g_neg = rt.eval_str_via_vm("<diff>", "(g -12 8)").unwrap(); // 4 (abs)
+    let g_zero = rt.eval_str_via_vm("<diff>", "(g 0 7)").unwrap(); // 7 (b_gcd folds 0)
+    let l_12_8 = rt.eval_str_via_vm("<diff>", "(l 12 8)").unwrap(); // 24
+    let l_zero = rt.eval_str_via_vm("<diff>", "(l 0 7)").unwrap(); // 0
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 5,
+        "gcd/lcm never dispatched through JIT (count={after})"
+    );
+    match (&g_12_8, &g_neg, &g_zero, &l_12_8, &l_zero) {
+        (
+            Value::Number(cs_core::Number::Fixnum(4)),
+            Value::Number(cs_core::Number::Fixnum(4)),
+            Value::Number(cs_core::Number::Fixnum(7)),
+            Value::Number(cs_core::Number::Fixnum(24)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (4, 4, 7, 24, 0), got {:?}", other),
+    }
+}

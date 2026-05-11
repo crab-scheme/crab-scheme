@@ -398,6 +398,14 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter CL).
     Modulo(Value, Value, Value),
 
+    /// `dst = gcd(a, b)`. Lowers to `vm_gcd_fx`. Both operands
+    /// Fixnum; result Fixnum. ADR 0012 D-2 (iter CP).
+    Gcd(Value, Value, Value),
+
+    /// `dst = lcm(a, b)`. Lowers to `vm_lcm_fx`. Both operands
+    /// Fixnum; result Fixnum. ADR 0012 D-2 (iter CP).
+    Lcm(Value, Value, Value),
+
     /// `dst = band(lhs, rhs)`. R6RS `bitwise-and` (R6RS) /
     /// `bitwise-and-bitwise` for two fixnums.
     BitAnd(Value, Value, Value),

@@ -948,6 +948,49 @@ pub unsafe extern "C" fn vm_list_copy_gc(lst: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(gcd a b)` — Euclidean GCD on the absolute values of `a` and
+/// `b`. Both operands are raw Fixnum-shape i64; the result is a
+/// raw Fixnum i64. No deopt (gcd is total on fixnums). Matches
+/// `b_gcd`'s 2-arg behaviour. ADR 0012 D-2 (iter CP).
+///
+/// # Safety
+///
+/// Both `a` and `b` are raw Fixnums — no Gc handle invariants.
+#[no_mangle]
+pub unsafe extern "C" fn vm_gcd_fx(a: i64, b: i64) -> i64 {
+    let (mut x, mut y) = (a.abs(), b.abs());
+    while y != 0 {
+        let t = y;
+        y = x % y;
+        x = t;
+    }
+    x
+}
+
+/// `(lcm a b)` — least common multiple. Computed as
+/// `(abs(a) / gcd(a,b)) * abs(b)`. Returns 0 if either operand is
+/// 0 (matches `b_lcm`). Uses `saturating_mul` to match the
+/// bytecode runtime's overflow handling. ADR 0012 D-2 (iter CP).
+///
+/// # Safety
+///
+/// Both `a` and `b` are raw Fixnums.
+#[no_mangle]
+pub unsafe extern "C" fn vm_lcm_fx(a: i64, b: i64) -> i64 {
+    let (ax, bx) = (a.abs(), b.abs());
+    if ax == 0 || bx == 0 {
+        return 0;
+    }
+    let (mut x, mut y) = (ax, bx);
+    while y != 0 {
+        let t = y;
+        y = x % y;
+        x = t;
+    }
+    // x is gcd(ax, bx).
+    (ax / x).saturating_mul(bx)
+}
+
 /// `(list-set! lst n val)` — walk `n` cdrs, then mutate the
 /// resulting pair's car to `val`. Consumes one strong refcount
 /// on both `lst` and `val`. Returns a Gc handle to

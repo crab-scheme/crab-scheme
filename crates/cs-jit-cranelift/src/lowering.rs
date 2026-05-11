@@ -224,6 +224,12 @@ pub struct Lowerer {
     /// FuncId of `vm_list_set_gc(lst, n, val) -> i64`. Returns
     /// Gc(Unspecified). ADR 0012 D-2 (iter CO).
     list_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_gcd_fx(a, b) -> i64`. Both operands Fixnum,
+    /// result Fixnum. ADR 0012 D-2 (iter CP).
+    gcd_func: cranelift_module::FuncId,
+    /// FuncId of `vm_lcm_fx(a, b) -> i64`. Both operands Fixnum,
+    /// result Fixnum. ADR 0012 D-2 (iter CP).
+    lcm_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -382,6 +388,9 @@ impl Lowerer {
         builder.symbol("vm_list_copy_gc", cs_vm::vm::vm_list_copy_gc as *const u8);
         // ADR 0012 D-2 (iter CO) — list-set!.
         builder.symbol("vm_list_set_gc", cs_vm::vm::vm_list_set_gc as *const u8);
+        // ADR 0012 D-2 (iter CP) — gcd / lcm.
+        builder.symbol("vm_gcd_fx", cs_vm::vm::vm_gcd_fx as *const u8);
+        builder.symbol("vm_lcm_fx", cs_vm::vm::vm_lcm_fx as *const u8);
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
             "vm_char_alphabetic_p",
@@ -863,6 +872,23 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_list_set_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter CP) — vm_gcd_fx / vm_lcm_fx. Two i64 in,
+        // one out — same shape as vector_ref_sig.
+        let gcd_func = module
+            .declare_function(
+                "vm_gcd_fx",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_gcd_fx: {e}")))?;
+        let lcm_func = module
+            .declare_function(
+                "vm_lcm_fx",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_lcm_fx: {e}")))?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -979,6 +1005,8 @@ impl Lowerer {
             substring_func,
             list_copy_func,
             list_set_func,
+            gcd_func,
+            lcm_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -1262,6 +1290,13 @@ impl Lowerer {
             let list_set_fnref = self
                 .module
                 .declare_func_in_func(self.list_set_func, builder.func);
+            // iter CP — gcd / lcm.
+            let gcd_fnref = self
+                .module
+                .declare_func_in_func(self.gcd_func, builder.func);
+            let lcm_fnref = self
+                .module
+                .declare_func_in_func(self.lcm_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -1395,6 +1430,8 @@ impl Lowerer {
                         substring_fnref,
                         list_copy_fnref,
                         list_set_fnref,
+                        gcd_fnref,
+                        lcm_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -1614,6 +1651,8 @@ fn lower_inst(
     substring_fnref: cranelift_codegen::ir::FuncRef,
     list_copy_fnref: cranelift_codegen::ir::FuncRef,
     list_set_fnref: cranelift_codegen::ir::FuncRef,
+    gcd_fnref: cranelift_codegen::ir::FuncRef,
+    lcm_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -2713,6 +2752,41 @@ fn lower_inst(
                 results[0]
             };
             b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::Gcd(dst, a, b_op) => {
+            // ADR 0012 D-2 (iter CP) — vm_gcd_fx. Raw Fixnum
+            // operands and result; no stack-map declaration.
+            let a_v = lookup(map, *a)?;
+            let b_v = lookup(map, *b_op)?;
+            let inst_ref = b.ins().call(gcd_fnref, &[a_v, b_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Gcd expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::Lcm(dst, a, b_op) => {
+            // ADR 0012 D-2 (iter CP) — vm_lcm_fx; mirrors Gcd.
+            let a_v = lookup(map, *a)?;
+            let b_v = lookup(map, *b_op)?;
+            let inst_ref = b.ins().call(lcm_fnref, &[a_v, b_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Lcm expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
             map.insert(*dst, result);
         }
         Inst::CharAlphabeticP(dst, src) => {
