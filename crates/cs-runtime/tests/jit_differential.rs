@@ -6517,3 +6517,51 @@ fn diff_jit_bytevector_u32_s32_native() {
         Value::Number(cs_core::Number::Fixnum(-2000000000))
     ));
 }
+
+#[test]
+fn diff_jit_bytevector_ieee_native() {
+    // ADR 0012 D-2 (iter FS) — bytevector IEEE single/double native ref/set!.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (sw bv k v) \
+           (bytevector-ieee-single-native-set! bv k v) \
+           (bytevector-ieee-single-native-ref bv k))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (dw bv k v) \
+           (bytevector-ieee-double-native-set! bv k v) \
+           (bytevector-ieee-double-native-ref bv k))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sw (make-bytevector 16 0) 0 1.5) \
+                      (dw (make-bytevector 16 0) 8 3.14) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let s = rt
+        .eval_str_via_vm("<diff>", "(sw (make-bytevector 16 0) 0 2.5)")
+        .unwrap();
+    let d = rt
+        .eval_str_via_vm("<diff>", "(dw (make-bytevector 16 0) 0 3.14159265)")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    // f32 roundtrip exact for 2.5 (representable)
+    match &s {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 2.5).abs() < 1e-9),
+        other => panic!("expected flonum, got {:?}", other),
+    }
+    // f64 roundtrip exact
+    match &d {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 3.14159265).abs() < 1e-12),
+        other => panic!("expected flonum, got {:?}", other),
+    }
+}

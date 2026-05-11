@@ -2402,6 +2402,137 @@ pub unsafe extern "C" fn vm_bytevector_s32_native_set_gc(bv: i64, k: i64, val: i
     }
 }
 
+/// IEEE-754 native-endian 4-byte float (f32) read from ByteVector.
+/// Returns Flonum bit-pattern i64. R6RS widens to f64. ADR 0012 D-2
+/// (iter FS).
+///
+/// # Safety
+///
+/// `bv` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_ieee_single_native_ref_gc(bv: i64, k: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let storage = bvc.borrow();
+            if k < 0 || (k as usize).saturating_add(4) > storage.len() {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return 0f64.to_bits() as i64;
+            }
+            let idx = k as usize;
+            let buf = [
+                storage[idx],
+                storage[idx + 1],
+                storage[idx + 2],
+                storage[idx + 3],
+            ];
+            let f = f32::from_ne_bytes(buf) as f64;
+            f.to_bits() as i64
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0f64.to_bits() as i64
+        }
+    }
+}
+
+/// IEEE-754 native-endian 8-byte float (f64) read. Returns Flonum
+/// bit-pattern i64. ADR 0012 D-2 (iter FS).
+///
+/// # Safety
+///
+/// Same as `vm_bytevector_ieee_single_native_ref_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_ieee_double_native_ref_gc(bv: i64, k: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let storage = bvc.borrow();
+            if k < 0 || (k as usize).saturating_add(8) > storage.len() {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return 0f64.to_bits() as i64;
+            }
+            let idx = k as usize;
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&storage[idx..idx + 8]);
+            let f = f64::from_ne_bytes(buf);
+            f.to_bits() as i64
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0f64.to_bits() as i64
+        }
+    }
+}
+
+/// IEEE-754 native-endian 4-byte float (f32) write. `val` is a
+/// Flonum bit-pattern i64 (f64); narrowed to f32 before write.
+/// Returns Gc(Unspecified). ADR 0012 D-2 (iter FS).
+///
+/// # Safety
+///
+/// Same as `vm_bytevector_u32_native_set_gc`; `val` is a Flonum-
+/// shaped raw i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_ieee_single_native_set_gc(bv: i64, k: i64, val: i64) -> i64 {
+    let f = f64::from_bits(val as u64) as f32;
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let mut storage = bvc.borrow_mut();
+            if k < 0 || (k as usize).saturating_add(4) > storage.len() {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            let bytes = f.to_ne_bytes();
+            let idx = k as usize;
+            storage[idx] = bytes[0];
+            storage[idx + 1] = bytes[1];
+            storage[idx + 2] = bytes[2];
+            storage[idx + 3] = bytes[3];
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
+/// IEEE-754 native-endian 8-byte float (f64) write. `val` is a
+/// Flonum bit-pattern i64. Returns Gc(Unspecified). ADR 0012 D-2
+/// (iter FS).
+///
+/// # Safety
+///
+/// Same as `vm_bytevector_ieee_single_native_set_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_ieee_double_native_set_gc(bv: i64, k: i64, val: i64) -> i64 {
+    let f = f64::from_bits(val as u64);
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let mut storage = bvc.borrow_mut();
+            if k < 0 || (k as usize).saturating_add(8) > storage.len() {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            let bytes = f.to_ne_bytes();
+            let idx = k as usize;
+            storage[idx..idx + 8].copy_from_slice(&bytes);
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(bytevector-s8-set! bv k v)` — write s8 value at `k`. `v` must
 /// be in [-128, 127]; otherwise deopts. Returns Unspecified Gc
 /// handle. ADR 0012 D-2 (iter FP).

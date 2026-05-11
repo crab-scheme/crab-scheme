@@ -1862,6 +1862,25 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::BvS32NativeRef(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Fixnum);
                                     }
+                                    // ADR 0012 D-2 (iter FS) — IEEE float native-ref.
+                                    ("bytevector-ieee-single-native-ref", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvIeeeSingleNativeRef(
+                                            dst, args[0], args[1],
+                                        ));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("bytevector-ieee-double-native-ref", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvIeeeDoubleNativeRef(
+                                            dst, args[0], args[1],
+                                        ));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
                                     // ADR 0012 D-2 (iter DB) — string-copy /
                                     // vector-copy (1-arg full copy).
                                     ("string-copy", 1)
@@ -1997,6 +2016,31 @@ pub fn bytecode_to_rir_with_hints(
                                             == Some(Type::Any) =>
                                     {
                                         insts.push(RirInst::BvS32NativeSet(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    // ADR 0012 D-2 (iter FS) — IEEE float native-set!.
+                                    // Gated on Flonum value so the operand is
+                                    // already an f64 bit pattern at the call site.
+                                    ("bytevector-ieee-single-native-set!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[2]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::BvIeeeSingleNativeSet(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("bytevector-ieee-double-native-set!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[2]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::BvIeeeDoubleNativeSet(
                                             dst, args[0], args[1], args[2],
                                         ));
                                         value_types.insert(dst, Type::Any);
@@ -4383,7 +4427,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::FlonumAcos(dst, _)
                 | RirInst::FlonumAtan(dst, _)
                 | RirInst::FlonumLog2(dst, _, _)
-                | RirInst::FlonumAtan2(dst, _, _) => {
+                | RirInst::FlonumAtan2(dst, _, _)
+                | RirInst::BvIeeeSingleNativeRef(dst, _, _)
+                | RirInst::BvIeeeDoubleNativeRef(dst, _, _) => {
                     flo_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Flonum(_)) => {
@@ -4430,6 +4476,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::BvS16NativeSet(dst, _, _, _)
                 | RirInst::BvU32NativeSet(dst, _, _, _)
                 | RirInst::BvS32NativeSet(dst, _, _, _)
+                | RirInst::BvIeeeSingleNativeSet(dst, _, _, _)
+                | RirInst::BvIeeeDoubleNativeSet(dst, _, _, _)
                 | RirInst::VecBuild(dst, _)
                 | RirInst::StrBuild(dst, _)
                 | RirInst::BvBuild(dst, _)
