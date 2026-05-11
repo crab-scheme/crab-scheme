@@ -970,6 +970,51 @@ pub unsafe extern "C" fn vm_substring_gc(s: i64, start: i64, end: i64) -> i64 {
     }
 }
 
+/// `(string-copy s)` — return a freshly allocated copy of `s`.
+/// 1-arg form only; variadic (start, end slice) variants are
+/// deferred. Consumes `s`. Non-string deopts. ADR 0012 D-2
+/// (iter DB).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_copy_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::String(sc) => {
+            let copy = sc.borrow().clone();
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(copy))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
+/// `(vector-copy v)` — return a freshly allocated vector with the
+/// same slots as `v`. 1-arg form only. Consumes `v`. Non-vector
+/// deopts. ADR 0012 D-2 (iter DB).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_copy_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Vector(vc) => {
+            let copy = vc.borrow().clone();
+            value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(copy))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
 /// `(string-set! s k ch)` — replace the k-th character of `s` with
 /// `ch` (UTF-8 aware: indexes are character positions, not byte
 /// offsets). Consumes one strong refcount on `s`. `k` and `ch` are

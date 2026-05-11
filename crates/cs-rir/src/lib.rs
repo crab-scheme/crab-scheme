@@ -389,6 +389,16 @@ pub enum Inst {
     /// D-2 (iter DA).
     StrSet(Value, Value, Value, Value),
 
+    /// `dst = string-copy(s)`. Lowers to `vm_string_copy_gc`. `s`
+    /// Any (consumed). `dst` Any (fresh String). 1-arg form only.
+    /// ADR 0012 D-2 (iter DB).
+    StrCopy(Value, Value),
+
+    /// `dst = vector-copy(v)`. Lowers to `vm_vector_copy_gc`. `v`
+    /// Any (consumed). `dst` Any (fresh Vector). 1-arg form only.
+    /// ADR 0012 D-2 (iter DB).
+    VecCopy(Value, Value),
+
     /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
     /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
     /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).

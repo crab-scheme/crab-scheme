@@ -3597,3 +3597,38 @@ fn diff_jit_string_set_mutates_char() {
         other => panic!("expected (#\\Z, #\\!), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_vector_copy() {
+    // ADR 0012 D-2 (iter DB) — 1-arg string-copy / vector-copy.
+    // Verifies via length preservation that the copy succeeded.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sc s) (string-copy s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (vc v) (vector-copy v))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (sc (make-string 4 #\\x)) (vc (make-vector 3 0)) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let s_len = rt
+        .eval_str_via_vm("<diff>", "(string-length (sc (make-string 7 #\\y)))")
+        .unwrap();
+    let v_len = rt
+        .eval_str_via_vm("<diff>", "(vector-length (vc (make-vector 5 99)))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "string-copy/vector-copy never dispatched through JIT (count={after})"
+    );
+    match (&s_len, &v_len) {
+        (Value::Number(cs_core::Number::Fixnum(7)), Value::Number(cs_core::Number::Fixnum(5))) => {}
+        other => panic!("expected (7, 5), got {:?}", other),
+    }
+}

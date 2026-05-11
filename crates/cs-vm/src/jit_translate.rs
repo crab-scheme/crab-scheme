@@ -1060,6 +1060,22 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::BvU8Ref(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Fixnum);
                                     }
+                                    // ADR 0012 D-2 (iter DB) — string-copy /
+                                    // vector-copy (1-arg full copy).
+                                    ("string-copy", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::StrCopy(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("vector-copy", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::VecCopy(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter DA) — string-set!.
                                     // s Any, k Fixnum, ch Character.
                                     ("string-set!", 3)
@@ -2493,6 +2509,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VecFill(dst, _, _)
                 | RirInst::BvFill(dst, _, _)
                 | RirInst::StrSet(dst, _, _, _)
+                | RirInst::StrCopy(dst, _)
+                | RirInst::VecCopy(dst, _)
                 | RirInst::DigitValue(dst, _)
                 | RirInst::VectorToList(dst, _)
                 | RirInst::ListToVector(dst, _)
