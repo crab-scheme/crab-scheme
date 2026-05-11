@@ -3419,3 +3419,52 @@ fn diff_jit_vector_list_conversions() {
         other => panic!("expected (5, 4, 42), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_list_conversions() {
+    // ADR 0012 D-2 (iter CX) — string->list / list->string. Parallel
+    // to CW but operates on chars / strings.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s->l s) (string->list s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (l->s lst) (list->string lst))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (s->l (make-string 4 #\\x)) \
+                    (l->s (list #\\a #\\b)) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // string->list: a 5-char string → length-5 list.
+    let s_len = rt
+        .eval_str_via_vm("<diff>", "(length (s->l (make-string 5 #\\y)))")
+        .unwrap();
+    // list->string: 3-char list → 3-char string.
+    let l_len = rt
+        .eval_str_via_vm("<diff>", "(string-length (l->s (list #\\a #\\b #\\c)))")
+        .unwrap();
+    // Round-trip preserves the first char.
+    let first = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(char->integer (car (s->l (l->s (list #\\Z #\\X)))))",
+        )
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "string<->list never dispatched through JIT (count={after})"
+    );
+    match (&s_len, &l_len, &first) {
+        (
+            Value::Number(cs_core::Number::Fixnum(5)),
+            Value::Number(cs_core::Number::Fixnum(3)),
+            Value::Number(cs_core::Number::Fixnum(90)),
+        ) => {}
+        other => panic!("expected (5, 3, 90), got {:?}", other),
+    }
+}

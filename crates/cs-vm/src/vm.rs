@@ -970,6 +970,67 @@ pub unsafe extern "C" fn vm_substring_gc(s: i64, start: i64, end: i64) -> i64 {
     }
 }
 
+/// `(string->list s)` — walk chars of `s` and build a freshly
+/// allocated list of `Value::Character`. Consumes one strong
+/// refcount on `s`. On non-string input, requests a deopt and
+/// returns Gc(Null). ADR 0012 D-2 (iter CX).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_to_list_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::String(sc) => {
+            let chars: Vec<char> = sc.borrow().chars().collect();
+            value_to_gc_i64(Value::list(chars.into_iter().map(Value::Character)))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
+/// `(list->string lst)` — walk a list of `Value::Character`, push
+/// each char into a fresh `String`, return Gc handle. Consumes
+/// `lst`. Non-character elements / improper-list terminus / non-list
+/// input request a deopt and return Gc(Null). ADR 0012 D-2 (iter CX).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_list_to_string_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    let mut s = String::new();
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Null => {
+                return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))));
+            }
+            Value::Pair(p) => {
+                let head = p.car.borrow().clone();
+                match head {
+                    Value::Character(c) => s.push(c),
+                    _ => {
+                        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                        return value_to_gc_i64(Value::Null);
+                    }
+                }
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+}
+
 /// `(vector->list v)` — walk vector slots and build a freshly
 /// allocated list. Consumes one strong refcount on `v`. Result is
 /// a Gc handle. On non-vector input, requests a deopt and returns

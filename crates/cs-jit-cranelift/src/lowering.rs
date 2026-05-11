@@ -284,6 +284,12 @@ pub struct Lowerer {
     /// FuncId of `vm_list_to_vector_gc(lst) -> i64`. Returns fresh
     /// vector Gc handle. ADR 0012 D-2 (iter CW).
     list_to_vector_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_to_list_gc(s) -> i64`. ADR 0012 D-2
+    /// (iter CX).
+    string_to_list_func: cranelift_module::FuncId,
+    /// FuncId of `vm_list_to_string_gc(lst) -> i64`. ADR 0012 D-2
+    /// (iter CX).
+    list_to_string_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -489,6 +495,15 @@ impl Lowerer {
         builder.symbol(
             "vm_list_to_vector_gc",
             cs_vm::vm::vm_list_to_vector_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter CX) — string<->list.
+        builder.symbol(
+            "vm_string_to_list_gc",
+            cs_vm::vm::vm_string_to_list_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_list_to_string_gc",
+            cs_vm::vm::vm_list_to_string_gc as *const u8,
         );
         let mut module = JITModule::new(builder);
 
@@ -1128,6 +1143,26 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_list_to_vector_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter CX) — vm_string_to_list_gc / vm_list_to_string_gc.
+        let string_to_list_func = module
+            .declare_function(
+                "vm_string_to_list_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_to_list_gc: {e}"))
+            })?;
+        let list_to_string_func = module
+            .declare_function(
+                "vm_list_to_string_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_list_to_string_gc: {e}"))
+            })?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -1201,6 +1236,8 @@ impl Lowerer {
             digit_value_func,
             vector_to_list_func,
             list_to_vector_func,
+            string_to_list_func,
+            list_to_string_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -1546,6 +1583,13 @@ impl Lowerer {
             let list_to_vector_fnref = self
                 .module
                 .declare_func_in_func(self.list_to_vector_func, builder.func);
+            // iter CX — string<->list.
+            let string_to_list_fnref = self
+                .module
+                .declare_func_in_func(self.string_to_list_func, builder.func);
+            let list_to_string_fnref = self
+                .module
+                .declare_func_in_func(self.list_to_string_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -1676,6 +1720,8 @@ impl Lowerer {
                         digit_value_fnref,
                         vector_to_list_fnref,
                         list_to_vector_fnref,
+                        string_to_list_fnref,
+                        list_to_string_fnref,
                         inst,
                     )?;
                 }
@@ -1908,6 +1954,8 @@ fn lower_inst(
     digit_value_fnref: cranelift_codegen::ir::FuncRef,
     vector_to_list_fnref: cranelift_codegen::ir::FuncRef,
     list_to_vector_fnref: cranelift_codegen::ir::FuncRef,
+    string_to_list_fnref: cranelift_codegen::ir::FuncRef,
+    list_to_string_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -3335,6 +3383,40 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "ListToVector expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringToList(dst, src) => {
+            // ADR 0012 D-2 (iter CX) — vm_string_to_list_gc.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(string_to_list_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringToList expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::ListToString(dst, src) => {
+            // ADR 0012 D-2 (iter CX) — vm_list_to_string_gc.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(list_to_string_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "ListToString expected 1 result, got {}",
                         results.len()
                     )));
                 }

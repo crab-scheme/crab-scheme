@@ -421,6 +421,16 @@ pub enum Inst {
     /// D-2 (iter CW).
     ListToVector(Value, Value),
 
+    /// `dst = string->list(s)`. Lowers to `vm_string_to_list_gc`.
+    /// `s` Any (consumed). `dst` is Any (fresh list of Characters).
+    /// ADR 0012 D-2 (iter CX).
+    StringToList(Value, Value),
+
+    /// `dst = list->string(lst)`. Lowers to `vm_list_to_string_gc`.
+    /// `lst` Any (consumed). `dst` is Any (fresh String). ADR 0012
+    /// D-2 (iter CX).
+    ListToString(Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a
