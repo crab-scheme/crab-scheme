@@ -1895,10 +1895,17 @@ pub fn bytecode_to_rir_with_hints(
                                     // ADR 0012 D-2 (iter DW) — ordered string
                                     // comparisons. Same BoxTyped-fallback
                                     // pattern as string=?.
+                                    // ADR 0012 D-2 (iter DX) — string-ci
+                                    // family with same dispatch shape.
                                     ("string<?", 2)
                                     | ("string>?", 2)
                                     | ("string<=?", 2)
                                     | ("string>=?", 2)
+                                    | ("string-ci=?", 2)
+                                    | ("string-ci<?", 2)
+                                    | ("string-ci>?", 2)
+                                    | ("string-ci<=?", 2)
+                                    | ("string-ci>=?", 2)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any)
                                             || value_types.get(&args[1]).copied()
@@ -1941,6 +1948,11 @@ pub fn bytecode_to_rir_with_hints(
                                             "string>?" => RirInst::StrGt(dst, lhs, rhs),
                                             "string<=?" => RirInst::StrLe(dst, lhs, rhs),
                                             "string>=?" => RirInst::StrGe(dst, lhs, rhs),
+                                            "string-ci=?" => RirInst::StrCiEq(dst, lhs, rhs),
+                                            "string-ci<?" => RirInst::StrCiLt(dst, lhs, rhs),
+                                            "string-ci>?" => RirInst::StrCiGt(dst, lhs, rhs),
+                                            "string-ci<=?" => RirInst::StrCiLe(dst, lhs, rhs),
+                                            "string-ci>=?" => RirInst::StrCiGe(dst, lhs, rhs),
                                             _ => unreachable!(),
                                         };
                                         insts.push(inst);
@@ -3193,6 +3205,11 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StrGt(dst, _, _)
                 | RirInst::StrLe(dst, _, _)
                 | RirInst::StrGe(dst, _, _)
+                | RirInst::StrCiEq(dst, _, _)
+                | RirInst::StrCiLt(dst, _, _)
+                | RirInst::StrCiGt(dst, _, _)
+                | RirInst::StrCiLe(dst, _, _)
+                | RirInst::StrCiGe(dst, _, _)
                 | RirInst::ListP(dst, _)
                 | RirInst::CharAlphabeticP(dst, _)
                 | RirInst::CharNumericP(dst, _)

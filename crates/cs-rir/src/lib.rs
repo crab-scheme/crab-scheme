@@ -317,6 +317,23 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter DW).
     StrGe(Value, Value, Value),
 
+    /// `dst = string-ci=?(a, b)`. Case-insensitive equality (Unicode-
+    /// aware lowercase, then byte compare). Lowers to
+    /// `vm_string_ci_eq_gc`. ADR 0012 D-2 (iter DX).
+    StrCiEq(Value, Value, Value),
+
+    /// `dst = string-ci<?(a, b)`. ADR 0012 D-2 (iter DX).
+    StrCiLt(Value, Value, Value),
+
+    /// `dst = string-ci>?(a, b)`. ADR 0012 D-2 (iter DX).
+    StrCiGt(Value, Value, Value),
+
+    /// `dst = string-ci<=?(a, b)`. ADR 0012 D-2 (iter DX).
+    StrCiLe(Value, Value, Value),
+
+    /// `dst = string-ci>=?(a, b)`. ADR 0012 D-2 (iter DX).
+    StrCiGe(Value, Value, Value),
+
     /// `dst = substring(s, start, end)`. Lowers to `vm_substring_gc`.
     /// `s` Any (consumed), `start` and `end` Fixnum. `dst` is Any
     /// (fresh Gc<Value::String>). ADR 0012 D-2 (iter CM).

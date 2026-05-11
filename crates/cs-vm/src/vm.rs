@@ -2712,6 +2712,105 @@ pub unsafe extern "C" fn vm_string_ge_gc(a: i64, b: i64) -> i64 {
     }
 }
 
+/// Helper: Unicode-aware case-folded (lowercase) form of `s`. Mirrors
+/// `cs_runtime::builtins::ci_string`. Used by the `vm_string_ci_*_gc`
+/// helpers below. ADR 0012 D-2 (iter DX).
+#[inline]
+fn ci_string(s: &str) -> String {
+    s.chars().flat_map(|c| c.to_lowercase()).collect()
+}
+
+/// `(string-ci=? a b)` — case-insensitive equality. Lowercases both
+/// strings (Unicode-aware) and compares byte-wise. Consumes both
+/// handles; non-string args yield 0. ADR 0012 D-2 (iter DX).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_ci_eq_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::String(sa), Value::String(sb)) => {
+            (ci_string(&sa.borrow()) == ci_string(&sb.borrow())) as i64
+        }
+        _ => 0,
+    }
+}
+
+/// `(string-ci<? a b)` — case-insensitive strict less-than.
+/// ADR 0012 D-2 (iter DX).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_ci_lt_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::String(sa), Value::String(sb)) => {
+            (ci_string(&sa.borrow()) < ci_string(&sb.borrow())) as i64
+        }
+        _ => 0,
+    }
+}
+
+/// `(string-ci>? a b)` — case-insensitive strict greater-than.
+/// ADR 0012 D-2 (iter DX).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_ci_gt_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::String(sa), Value::String(sb)) => {
+            (ci_string(&sa.borrow()) > ci_string(&sb.borrow())) as i64
+        }
+        _ => 0,
+    }
+}
+
+/// `(string-ci<=? a b)` — case-insensitive less-or-equal.
+/// ADR 0012 D-2 (iter DX).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_ci_le_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::String(sa), Value::String(sb)) => {
+            (ci_string(&sa.borrow()) <= ci_string(&sb.borrow())) as i64
+        }
+        _ => 0,
+    }
+}
+
+/// `(string-ci>=? a b)` — case-insensitive greater-or-equal.
+/// ADR 0012 D-2 (iter DX).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_ci_ge_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::String(sa), Value::String(sb)) => {
+            (ci_string(&sa.borrow()) >= ci_string(&sb.borrow())) as i64
+        }
+        _ => 0,
+    }
+}
+
 /// `(car pair)` — return the pair's car, Any-tagged. Pre-decodes the
 /// Any-tagged input box and re-Anys the inner car.
 ///

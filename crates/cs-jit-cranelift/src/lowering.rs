@@ -181,6 +181,16 @@ pub struct Lowerer {
     string_le_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_ge_gc(a, b) -> i64`. ADR 0012 D-2 (iter DW).
     string_ge_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_ci_eq_gc(a, b) -> i64`. ADR 0012 D-2 (iter DX).
+    string_ci_eq_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_ci_lt_gc(a, b) -> i64`. ADR 0012 D-2 (iter DX).
+    string_ci_lt_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_ci_gt_gc(a, b) -> i64`. ADR 0012 D-2 (iter DX).
+    string_ci_gt_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_ci_le_gc(a, b) -> i64`. ADR 0012 D-2 (iter DX).
+    string_ci_le_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_ci_ge_gc(a, b) -> i64`. ADR 0012 D-2 (iter DX).
+    string_ci_ge_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_closure(lambda_idx) -> i64`. Returns a
     /// fresh `Gc<Value::Procedure>` raw handle. ADR 0012 D-2 (iter BZ).
     make_closure_func: cranelift_module::FuncId,
@@ -495,6 +505,27 @@ impl Lowerer {
         builder.symbol("vm_string_gt_gc", cs_vm::vm::vm_string_gt_gc as *const u8);
         builder.symbol("vm_string_le_gc", cs_vm::vm::vm_string_le_gc as *const u8);
         builder.symbol("vm_string_ge_gc", cs_vm::vm::vm_string_ge_gc as *const u8);
+        // ADR 0012 D-2 (iter DX) — string-ci comparisons.
+        builder.symbol(
+            "vm_string_ci_eq_gc",
+            cs_vm::vm::vm_string_ci_eq_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_ci_lt_gc",
+            cs_vm::vm::vm_string_ci_lt_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_ci_gt_gc",
+            cs_vm::vm::vm_string_ci_gt_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_ci_le_gc",
+            cs_vm::vm::vm_string_ci_le_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_ci_ge_gc",
+            cs_vm::vm::vm_string_ci_ge_gc as *const u8,
+        );
         // ADR 0012 D-2 (iter BZ) — lambda creation in JIT bodies.
         builder.symbol("vm_make_closure", cs_vm::vm::vm_make_closure as *const u8);
         // ADR 0012 D-2 (iter CA) — list ops.
@@ -1034,6 +1065,43 @@ impl Lowerer {
                 &vector_ref_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_string_ge_gc: {e}")))?;
+
+        // ADR 0012 D-2 (iter DX) — string-ci comparisons.
+        let string_ci_eq_func = module
+            .declare_function(
+                "vm_string_ci_eq_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_ci_eq_gc: {e}")))?;
+        let string_ci_lt_func = module
+            .declare_function(
+                "vm_string_ci_lt_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_ci_lt_gc: {e}")))?;
+        let string_ci_gt_func = module
+            .declare_function(
+                "vm_string_ci_gt_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_ci_gt_gc: {e}")))?;
+        let string_ci_le_func = module
+            .declare_function(
+                "vm_string_ci_le_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_ci_le_gc: {e}")))?;
+        let string_ci_ge_func = module
+            .declare_function(
+                "vm_string_ci_ge_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_ci_ge_gc: {e}")))?;
 
         // ADR 0012 D-2 (iter BZ) — vm_make_closure(lambda_idx: i64) -> i64.
         // Same shape as pair_accessor_sig (one i64 in, one i64 out).
@@ -1716,6 +1784,11 @@ impl Lowerer {
             string_gt_func,
             string_le_func,
             string_ge_func,
+            string_ci_eq_func,
+            string_ci_lt_func,
+            string_ci_gt_func,
+            string_ci_le_func,
+            string_ci_ge_func,
             make_closure_func,
             length_func,
             list_p_func,
@@ -2014,6 +2087,22 @@ impl Lowerer {
             let string_ge_fnref = self
                 .module
                 .declare_func_in_func(self.string_ge_func, builder.func);
+            // iter DX — string-ci comparisons.
+            let string_ci_eq_fnref = self
+                .module
+                .declare_func_in_func(self.string_ci_eq_func, builder.func);
+            let string_ci_lt_fnref = self
+                .module
+                .declare_func_in_func(self.string_ci_lt_func, builder.func);
+            let string_ci_gt_fnref = self
+                .module
+                .declare_func_in_func(self.string_ci_gt_func, builder.func);
+            let string_ci_le_fnref = self
+                .module
+                .declare_func_in_func(self.string_ci_le_func, builder.func);
+            let string_ci_ge_fnref = self
+                .module
+                .declare_func_in_func(self.string_ci_ge_func, builder.func);
             // iter BZ — lambda creation.
             let make_closure_fnref = self
                 .module
@@ -2367,6 +2456,11 @@ impl Lowerer {
                         string_gt_fnref,
                         string_le_fnref,
                         string_ge_fnref,
+                        string_ci_eq_fnref,
+                        string_ci_lt_fnref,
+                        string_ci_gt_fnref,
+                        string_ci_le_fnref,
+                        string_ci_ge_fnref,
                         make_closure_fnref,
                         length_fnref,
                         list_p_fnref,
@@ -2638,6 +2732,11 @@ fn lower_inst(
     string_gt_fnref: cranelift_codegen::ir::FuncRef,
     string_le_fnref: cranelift_codegen::ir::FuncRef,
     string_ge_fnref: cranelift_codegen::ir::FuncRef,
+    string_ci_eq_fnref: cranelift_codegen::ir::FuncRef,
+    string_ci_lt_fnref: cranelift_codegen::ir::FuncRef,
+    string_ci_gt_fnref: cranelift_codegen::ir::FuncRef,
+    string_ci_le_fnref: cranelift_codegen::ir::FuncRef,
+    string_ci_ge_fnref: cranelift_codegen::ir::FuncRef,
     make_closure_fnref: cranelift_codegen::ir::FuncRef,
     length_fnref: cranelift_codegen::ir::FuncRef,
     list_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -3607,10 +3706,16 @@ fn lower_inst(
             map.insert(*dst, result);
         }
         // ADR 0012 D-2 (iter DW) — ordered string comparisons.
+        // ADR 0012 D-2 (iter DX) — string-ci comparisons.
         Inst::StrLt(dst, a, b_op)
         | Inst::StrGt(dst, a, b_op)
         | Inst::StrLe(dst, a, b_op)
-        | Inst::StrGe(dst, a, b_op) => {
+        | Inst::StrGe(dst, a, b_op)
+        | Inst::StrCiEq(dst, a, b_op)
+        | Inst::StrCiLt(dst, a, b_op)
+        | Inst::StrCiGt(dst, a, b_op)
+        | Inst::StrCiLe(dst, a, b_op)
+        | Inst::StrCiGe(dst, a, b_op) => {
             let a_v = lookup(map, *a)?;
             let b_v = lookup(map, *b_op)?;
             let fnref = match inst {
@@ -3618,6 +3723,11 @@ fn lower_inst(
                 Inst::StrGt(..) => string_gt_fnref,
                 Inst::StrLe(..) => string_le_fnref,
                 Inst::StrGe(..) => string_ge_fnref,
+                Inst::StrCiEq(..) => string_ci_eq_fnref,
+                Inst::StrCiLt(..) => string_ci_lt_fnref,
+                Inst::StrCiGt(..) => string_ci_gt_fnref,
+                Inst::StrCiLe(..) => string_ci_le_fnref,
+                Inst::StrCiGe(..) => string_ci_ge_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[a_v, b_v]);
