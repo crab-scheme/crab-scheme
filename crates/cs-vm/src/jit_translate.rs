@@ -2893,6 +2893,128 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::FlonumMin(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Flonum);
                                     }
+                                    // ADR 0012 D-2 (iter FY) — fl arithmetic +
+                                    // compare + predicate aliases.
+                                    ("fl+", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumAdd(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("fl-", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumSub(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("fl*", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumMul(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("fl/", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumDiv(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("fl=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumEq(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("fl<?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumLt(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("fl>?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumLt(dst, args[1], args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("fl<=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        // a <= b ≡ not(b < a)
+                                        let lt = alloc();
+                                        insts.push(RirInst::FlonumLt(lt, args[1], args[0]));
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Eq(dst, lt, zero));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("fl>=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        let lt = alloc();
+                                        insts.push(RirInst::FlonumLt(lt, args[0], args[1]));
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Eq(dst, lt, zero));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("flzero?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                        value_types.insert(zero, Type::Flonum);
+                                        insts.push(RirInst::FlonumEq(dst, args[0], zero));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("flpositive?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                        value_types.insert(zero, Type::Flonum);
+                                        insts.push(RirInst::FlonumLt(dst, zero, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("flnegative?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                        value_types.insert(zero, Type::Flonum);
+                                        insts.push(RirInst::FlonumLt(dst, args[0], zero));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     ("char->integer", 1) => {
                                         // Symmetric to integer->char: the i64
                                         // *already* carries the codepoint, so

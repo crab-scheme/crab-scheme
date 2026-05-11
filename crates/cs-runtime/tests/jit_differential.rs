@@ -6839,3 +6839,90 @@ fn diff_jit_fx_shift_and_first_bit() {
     // 0 -> -1
     assert!(matches!(&f0, Value::Number(cs_core::Number::Fixnum(-1))));
 }
+
+#[test]
+fn diff_jit_fl_arith_compare_predicates() {
+    // ADR 0012 D-2 (iter FY) — fl arithmetic + compare + predicates.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (a b c) (fl+ b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s b c) (fl- b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (m b c) (fl* b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (d b c) (fl/ b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (e b c) (fl=? b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (l b c) (fl<? b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (g b c) (fl>? b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (le b c) (fl<=? b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ge b c) (fl>=? b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (z x) (flzero? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (p x) (flpositive? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (n x) (flnegative? x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (a 1.0 2.0) (s 5.0 3.0) (m 3.0 4.0) (d 12.0 4.0) \
+                      (e 1.0 1.0) (l 1.0 2.0) (g 3.0 1.0) (le 4.0 4.0) (ge 4.0 4.0) \
+                      (z 0.0) (p 1.0) (n -1.0) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let add = rt.eval_str_via_vm("<diff>", "(a 1.5 2.5)").unwrap();
+    let sub = rt.eval_str_via_vm("<diff>", "(s 5.5 2.0)").unwrap();
+    let mul = rt.eval_str_via_vm("<diff>", "(m 2.5 4.0)").unwrap();
+    let div = rt.eval_str_via_vm("<diff>", "(d 10.0 4.0)").unwrap();
+    let eq_t = rt.eval_str_via_vm("<diff>", "(e 3.14 3.14)").unwrap();
+    let eq_f = rt.eval_str_via_vm("<diff>", "(e 1.0 2.0)").unwrap();
+    let lt = rt.eval_str_via_vm("<diff>", "(l 1.0 2.0)").unwrap();
+    let gt = rt.eval_str_via_vm("<diff>", "(g 3.0 1.0)").unwrap();
+    let le_eq = rt.eval_str_via_vm("<diff>", "(le 4.0 4.0)").unwrap();
+    let le_gt = rt.eval_str_via_vm("<diff>", "(le 5.0 4.0)").unwrap();
+    let ge_eq = rt.eval_str_via_vm("<diff>", "(ge 4.0 4.0)").unwrap();
+    let ge_lt = rt.eval_str_via_vm("<diff>", "(ge 3.0 4.0)").unwrap();
+    let z_t = rt.eval_str_via_vm("<diff>", "(z 0.0)").unwrap();
+    let z_f = rt.eval_str_via_vm("<diff>", "(z 0.1)").unwrap();
+    let p_t = rt.eval_str_via_vm("<diff>", "(p 0.5)").unwrap();
+    let n_t = rt.eval_str_via_vm("<diff>", "(n -0.5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &add {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 4.0).abs() < 1e-9),
+        other => panic!("expected 4.0, got {:?}", other),
+    }
+    match &sub {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 3.5).abs() < 1e-9),
+        other => panic!("expected 3.5, got {:?}", other),
+    }
+    match &mul {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 10.0).abs() < 1e-9),
+        other => panic!("expected 10.0, got {:?}", other),
+    }
+    match &div {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 2.5).abs() < 1e-9),
+        other => panic!("expected 2.5, got {:?}", other),
+    }
+    assert!(matches!(&eq_t, Value::Boolean(true)));
+    assert!(matches!(&eq_f, Value::Boolean(false)));
+    assert!(matches!(&lt, Value::Boolean(true)));
+    assert!(matches!(&gt, Value::Boolean(true)));
+    assert!(matches!(&le_eq, Value::Boolean(true)));
+    assert!(matches!(&le_gt, Value::Boolean(false)));
+    assert!(matches!(&ge_eq, Value::Boolean(true)));
+    assert!(matches!(&ge_lt, Value::Boolean(false)));
+    assert!(matches!(&z_t, Value::Boolean(true)));
+    assert!(matches!(&z_f, Value::Boolean(false)));
+    assert!(matches!(&p_t, Value::Boolean(true)));
+    assert!(matches!(&n_t, Value::Boolean(true)));
+}
