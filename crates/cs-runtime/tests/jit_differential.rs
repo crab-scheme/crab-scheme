@@ -2492,3 +2492,43 @@ fn diff_jit_memq_matches_by_eq() {
         other => panic!("expected (Symbol(b), #f, 2), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_assq_walks_alist() {
+    // ADR 0012 D-2 (iter CD) — `(assq key alist)` lowers to
+    // vm_assq_gc. Walks the alist spine, eq?-compares each entry's
+    // car against key, returns the matched `(k . v)` pair or #f.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (lookup k al) (assq k al))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (sample) (list (cons 'a 1) (cons 'b 2) (cons 'c 3)))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (lookup 'b (sample)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // Hit: lookup 'b → returns (b . 2); cdr is 2.
+    let val = rt
+        .eval_str_via_vm("<diff>", "(cdr (lookup 'b (sample)))")
+        .unwrap();
+    // Miss: lookup 'z → returns #f.
+    let miss = rt
+        .eval_str_via_vm("<diff>", "(lookup 'z (sample))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "lookup never dispatched through JIT (count={after})"
+    );
+    match (&val, &miss) {
+        (Value::Number(cs_core::Number::Fixnum(2)), Value::Boolean(false)) => {}
+        other => panic!("expected (2, #f), got {:?}", other),
+    }
+}

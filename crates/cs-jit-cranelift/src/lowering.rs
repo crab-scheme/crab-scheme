@@ -188,6 +188,10 @@ pub struct Lowerer {
     /// FuncId of `vm_memq_gc(item, lst) -> i64`. Returns a Gc
     /// handle (matched sublist or `#f`). ADR 0012 D-2 (iter CC).
     memq_func: cranelift_module::FuncId,
+    /// FuncId of `vm_assq_gc(key, alist) -> i64`. Returns a Gc
+    /// handle (matched `(k . v)` pair or `#f`). ADR 0012 D-2
+    /// (iter CD).
+    assq_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -306,6 +310,8 @@ impl Lowerer {
         builder.symbol("vm_reverse_gc", cs_vm::vm::vm_reverse_gc as *const u8);
         // ADR 0012 D-2 (iter CC) — memq.
         builder.symbol("vm_memq_gc", cs_vm::vm::vm_memq_gc as *const u8);
+        // ADR 0012 D-2 (iter CD) — assq.
+        builder.symbol("vm_assq_gc", cs_vm::vm::vm_assq_gc as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -657,6 +663,16 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_memq_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter CD) — vm_assq_gc(key, alist) -> i64.
+        // Same shape as vm_memq_gc.
+        let assq_func = module
+            .declare_function(
+                "vm_assq_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_assq_gc: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -698,6 +714,7 @@ impl Lowerer {
             list_p_func,
             reverse_func,
             memq_func,
+            assq_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -930,6 +947,10 @@ impl Lowerer {
             let memq_fnref = self
                 .module
                 .declare_func_in_func(self.memq_func, builder.func);
+            // iter CD — assq.
+            let assq_fnref = self
+                .module
+                .declare_func_in_func(self.assq_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -1028,6 +1049,7 @@ impl Lowerer {
                         list_p_fnref,
                         reverse_fnref,
                         memq_fnref,
+                        assq_fnref,
                         inst,
                     )?;
                 }
@@ -1228,6 +1250,7 @@ fn lower_inst(
     list_p_fnref: cranelift_codegen::ir::FuncRef,
     reverse_fnref: cranelift_codegen::ir::FuncRef,
     memq_fnref: cranelift_codegen::ir::FuncRef,
+    assq_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -2058,6 +2081,26 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "Memq expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::Assq(dst, key, alist) => {
+            // ADR 0012 D-2 (iter CD) — vm_assq_gc consumes both
+            // operands and returns a Gc handle (matched `(k . v)`
+            // pair or boolean #f). Mark for stack-map tracking.
+            let key_v = lookup(map, *key)?;
+            let alist_v = lookup(map, *alist)?;
+            let inst_ref = b.ins().call(assq_fnref, &[key_v, alist_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Assq expected 1 result, got {}",
                         results.len()
                     )));
                 }

@@ -744,6 +744,46 @@ pub unsafe extern "C" fn vm_list_p_gc(r: i64) -> i64 {
     }
 }
 
+/// `(assq key alist)` — return the first entry of `alist` whose
+/// `car` is `eq?` to `key`, or `#f` if not found. `alist` is a
+/// chain of pairs `((k1 . v1) (k2 . v2) ...)`; the helper walks
+/// the spine, derefs each entry's car for comparison, and returns
+/// the matching pair (`(k . v)`) on hit. Consume-on-use for both
+/// args; returns an Any-shape Gc handle (either a `Value::Pair`
+/// of the matched entry or `Value::Boolean(false)`). Improper
+/// shapes (non-pair entry, atom-terminated spine) return `#f`.
+/// ADR 0012 D-2 (iter CD).
+///
+/// # Safety
+///
+/// Both `key` and `alist` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
+    let needle = unsafe { gc_i64_to_value(key) };
+    let v = unsafe { gc_i64_to_value(alist) };
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let entry = p.car.borrow().clone();
+                if let Value::Pair(ep) = &entry {
+                    let entry_key = ep.car.borrow().clone();
+                    if cs_core::eq::eq(&needle, &entry_key) {
+                        return value_to_gc_i64(entry);
+                    }
+                }
+                // Malformed entry (non-pair) is silently skipped —
+                // typical Scheme convention for assq on improper
+                // shapes. The bytecode VM signals R6RS errors when
+                // strictness matters.
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            _ => return value_to_gc_i64(Value::Boolean(false)),
+        }
+    }
+}
+
 /// `(memq item lst)` — return the first sublist of `lst` whose
 /// `car` is `eq?` to `item`, or `#f` if not found. Consume-on-use
 /// for both args; returns an Any-shape Gc handle (either a

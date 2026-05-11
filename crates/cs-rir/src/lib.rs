@@ -290,6 +290,12 @@ pub enum Inst {
     /// sublist or `Value::Boolean(false)`. ADR 0012 D-2 (iter CC).
     Memq(Value, Value, Value),
 
+    /// `dst = assq(key, alist)`. Lowers to `vm_assq_gc`. Both
+    /// operands Any (consumed). `dst` is Any — either the matched
+    /// `(k . v)` pair or `Value::Boolean(false)`. ADR 0012 D-2
+    /// (iter CD).
+    Assq(Value, Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a
