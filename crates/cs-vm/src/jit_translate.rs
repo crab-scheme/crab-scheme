@@ -1634,6 +1634,98 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::Eq(dst, lt, zero));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter CU) — char-ci
+                                    // comparison family: case-insensitive
+                                    // by foldcasing both operands first,
+                                    // then reusing the base op.
+                                    ("char-ci=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Character) =>
+                                    {
+                                        let fa = alloc();
+                                        let fb = alloc();
+                                        insts.push(RirInst::CharFoldcase(fa, args[0]));
+                                        value_types.insert(fa, Type::Character);
+                                        insts.push(RirInst::CharFoldcase(fb, args[1]));
+                                        value_types.insert(fb, Type::Character);
+                                        insts.push(RirInst::Eq(dst, fa, fb));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("char-ci<?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Character) =>
+                                    {
+                                        let fa = alloc();
+                                        let fb = alloc();
+                                        insts.push(RirInst::CharFoldcase(fa, args[0]));
+                                        value_types.insert(fa, Type::Character);
+                                        insts.push(RirInst::CharFoldcase(fb, args[1]));
+                                        value_types.insert(fb, Type::Character);
+                                        insts.push(RirInst::Lt(dst, fa, fb));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("char-ci>?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Character) =>
+                                    {
+                                        let fa = alloc();
+                                        let fb = alloc();
+                                        insts.push(RirInst::CharFoldcase(fa, args[0]));
+                                        value_types.insert(fa, Type::Character);
+                                        insts.push(RirInst::CharFoldcase(fb, args[1]));
+                                        value_types.insert(fb, Type::Character);
+                                        // a > b → b < a.
+                                        insts.push(RirInst::Lt(dst, fb, fa));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("char-ci<=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Character) =>
+                                    {
+                                        let fa = alloc();
+                                        let fb = alloc();
+                                        insts.push(RirInst::CharFoldcase(fa, args[0]));
+                                        value_types.insert(fa, Type::Character);
+                                        insts.push(RirInst::CharFoldcase(fb, args[1]));
+                                        value_types.insert(fb, Type::Character);
+                                        let lt = alloc();
+                                        insts.push(RirInst::Lt(lt, fb, fa));
+                                        value_types.insert(lt, Type::Boolean);
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        value_types.insert(zero, Type::Fixnum);
+                                        insts.push(RirInst::Eq(dst, lt, zero));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("char-ci>=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Character) =>
+                                    {
+                                        let fa = alloc();
+                                        let fb = alloc();
+                                        insts.push(RirInst::CharFoldcase(fa, args[0]));
+                                        value_types.insert(fa, Type::Character);
+                                        insts.push(RirInst::CharFoldcase(fb, args[1]));
+                                        value_types.insert(fb, Type::Character);
+                                        let lt = alloc();
+                                        insts.push(RirInst::Lt(lt, fa, fb));
+                                        value_types.insert(lt, Type::Boolean);
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        value_types.insert(zero, Type::Fixnum);
+                                        insts.push(RirInst::Eq(dst, lt, zero));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // Always-false predicates: JIT bodies
                                     // are only entered when every arg is
                                     // a Fixnum (the type guard's

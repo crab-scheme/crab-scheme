@@ -3290,3 +3290,54 @@ fn diff_jit_expt_fixnum() {
         other => panic!("expected (1024, 243, 1, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_char_ci_comparisons() {
+    // ADR 0012 D-2 (iter CU) — char-ci=? / char-ci<? / char-ci>? /
+    // char-ci<=? / char-ci>=? lower as CharFoldcase on both operands
+    // followed by the base comparison. No new helpers — purely
+    // dispatch-side rewriting.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (cieq a b) \
+             (if (char-ci=? (integer->char a) (integer->char b)) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (cilt a b) \
+             (if (char-ci<? (integer->char a) (integer->char b)) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (cieq 65 97) (cilt 65 66) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // 'A' ci=? 'a' → 1 (foldcase folds both to 'a').
+    let eq_aA = rt.eval_str_via_vm("<diff>", "(cieq 65 97)").unwrap();
+    // 'A' ci=? 'B' → 0.
+    let eq_AB = rt.eval_str_via_vm("<diff>", "(cieq 65 66)").unwrap();
+    // 'A' ci<? 'b' → 1 ('a' < 'b' after foldcase).
+    let lt_Ab = rt.eval_str_via_vm("<diff>", "(cilt 65 98)").unwrap();
+    // 'B' ci<? 'a' → 0 (both fold; 'b' is not < 'a').
+    let lt_Ba = rt.eval_str_via_vm("<diff>", "(cilt 66 97)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "char-ci ops never dispatched through JIT (count={after})"
+    );
+    match (&eq_aA, &eq_AB, &lt_Ab, &lt_Ba) {
+        (
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (1, 0, 1, 0), got {:?}", other),
+    }
+}
