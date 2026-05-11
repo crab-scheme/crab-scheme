@@ -738,6 +738,16 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter EO).
     Last(Value, Value),
 
+    /// `dst = take(lst, n)`. Lowers to `vm_take_gc`. `lst` Any-shape
+    /// (consumed); `n` Fixnum-shape; `dst` is Any (fresh prefix
+    /// list). ADR 0012 D-2 (iter EX).
+    Take(Value, Value, Value),
+
+    /// `dst = drop(lst, n)`. Lowers to `vm_drop_gc`. `lst` Any-shape
+    /// (consumed); `n` Fixnum-shape; `dst` is Any (the tail).
+    /// ADR 0012 D-2 (iter EX).
+    Drop(Value, Value, Value),
+
     /// `dst = vector-copy!(dest, at, src)`. 3-arg form. Lowers to
     /// `vm_vector_copy_bang_gc`. `dest` and `src` Any-shape
     /// (consumed). `at` Fixnum-shape. `dst` is Any (Gc handle to

@@ -5593,3 +5593,42 @@ fn diff_jit_reverse_bang() {
         other => panic!("expected (pair, 40), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_take_drop() {
+    // ADR 0012 D-2 (iter EX) — take / drop SRFI-1.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (tk lst n) (take lst n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (dr lst n) (drop lst n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (tk '(1 2 3 4 5) 2) \
+                      (dr '(1 2 3 4 5) 2) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let t = rt.eval_str_via_vm("<diff>", "(tk '(1 2 3 4 5) 3)").unwrap();
+    let t_len = rt
+        .eval_str_via_vm("<diff>", "(length (tk '(1 2 3 4 5) 3))")
+        .unwrap();
+    let d = rt.eval_str_via_vm("<diff>", "(dr '(1 2 3 4 5) 3)").unwrap();
+    let d_car = rt
+        .eval_str_via_vm("<diff>", "(car (dr '(1 2 3 4 5) 3))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&t, &t_len, &d, &d_car) {
+        (
+            Value::Pair(_),
+            Value::Number(cs_core::Number::Fixnum(3)),
+            Value::Pair(_),
+            Value::Number(cs_core::Number::Fixnum(4)),
+        ) => {}
+        other => panic!("expected (pair, 3, pair, 4), got {:?}", other),
+    }
+}

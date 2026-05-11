@@ -427,6 +427,10 @@ pub struct Lowerer {
     last_pair_func: cranelift_module::FuncId,
     /// FuncId of `vm_last_gc(lst) -> i64`. ADR 0012 D-2 (iter EO).
     last_func: cranelift_module::FuncId,
+    /// FuncId of `vm_take_gc(lst, n) -> i64`. ADR 0012 D-2 (iter EX).
+    take_func: cranelift_module::FuncId,
+    /// FuncId of `vm_drop_gc(lst, n) -> i64`. ADR 0012 D-2 (iter EX).
+    drop_func: cranelift_module::FuncId,
     /// FuncId of `vm_vector_copy_bang_gc(dest, at, src) -> i64`.
     /// ADR 0012 D-2 (iter ER).
     vector_copy_bang_func: cranelift_module::FuncId,
@@ -831,6 +835,9 @@ impl Lowerer {
         // ADR 0012 D-2 (iter EO) — last-pair / last.
         builder.symbol("vm_last_pair_gc", cs_vm::vm::vm_last_pair_gc as *const u8);
         builder.symbol("vm_last_gc", cs_vm::vm::vm_last_gc as *const u8);
+        // ADR 0012 D-2 (iter EX) — take / drop.
+        builder.symbol("vm_take_gc", cs_vm::vm::vm_take_gc as *const u8);
+        builder.symbol("vm_drop_gc", cs_vm::vm::vm_drop_gc as *const u8);
         // ADR 0012 D-2 (iter ER) — vector-copy! 3-arg.
         builder.symbol(
             "vm_vector_copy_bang_gc",
@@ -2022,6 +2029,22 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_last_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter EX) — vm_take_gc / vm_drop_gc.
+        let take_func = module
+            .declare_function(
+                "vm_take_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_take_gc: {e}")))?;
+        let drop_func = module
+            .declare_function(
+                "vm_drop_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_drop_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter ER) — vm_vector_copy_bang_gc(dest, at, src).
         let vector_copy_bang_func = module
             .declare_function(
@@ -2205,6 +2228,8 @@ impl Lowerer {
             iota_n_func,
             last_pair_func,
             last_func,
+            take_func,
+            drop_func,
             vector_copy_bang_func,
             bytevector_copy_bang_func,
             string_copy_bang_func,
@@ -2763,6 +2788,13 @@ impl Lowerer {
             let last_fnref = self
                 .module
                 .declare_func_in_func(self.last_func, builder.func);
+            // iter EX — take / drop.
+            let take_fnref = self
+                .module
+                .declare_func_in_func(self.take_func, builder.func);
+            let drop_fnref = self
+                .module
+                .declare_func_in_func(self.drop_func, builder.func);
             // iter ER — vector-copy!.
             let vector_copy_bang_fnref = self
                 .module
@@ -2970,6 +3002,8 @@ impl Lowerer {
                         iota_n_fnref,
                         last_pair_fnref,
                         last_fnref,
+                        take_fnref,
+                        drop_fnref,
                         vector_copy_bang_fnref,
                         bytevector_copy_bang_fnref,
                         string_copy_bang_fnref,
@@ -3266,6 +3300,8 @@ fn lower_inst(
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
     last_pair_fnref: cranelift_codegen::ir::FuncRef,
     last_fnref: cranelift_codegen::ir::FuncRef,
+    take_fnref: cranelift_codegen::ir::FuncRef,
+    drop_fnref: cranelift_codegen::ir::FuncRef,
     vector_copy_bang_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_copy_bang_fnref: cranelift_codegen::ir::FuncRef,
     string_copy_bang_fnref: cranelift_codegen::ir::FuncRef,
@@ -5695,6 +5731,29 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "LastPair/Last expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::Take(dst, lst, n_v) | Inst::Drop(dst, lst, n_v) => {
+            // ADR 0012 D-2 (iter EX) — take / drop.
+            let lv = lookup(map, *lst)?;
+            let nv = lookup(map, *n_v)?;
+            let fnref = match inst {
+                Inst::Take(..) => take_fnref,
+                Inst::Drop(..) => drop_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[lv, nv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Take/Drop expected 1 result, got {}",
                         results.len()
                     )));
                 }

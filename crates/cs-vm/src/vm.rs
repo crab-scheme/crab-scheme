@@ -3101,6 +3101,82 @@ pub unsafe extern "C" fn vm_last_gc(lst: i64) -> i64 {
     }
 }
 
+/// `(take lst n)` — SRFI-1. Return the first `n` elements of
+/// `lst` as a fresh list. `n` is a raw Fixnum-shape i64. Consumes
+/// the input Gc handle. On short list or negative `n`, requests a
+/// deopt and returns Null. ADR 0012 D-2 (iter EX).
+///
+/// # Safety
+///
+/// `lst` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_take_gc(lst: i64, n: i64) -> i64 {
+    if n < 0 {
+        let _drop = unsafe { gc_i64_to_value(lst) };
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Null);
+    }
+    let v = unsafe { gc_i64_to_value(lst) };
+    let mut taken: Vec<Value> = Vec::with_capacity(n as usize);
+    let mut cur = v;
+    let mut i: i64 = 0;
+    while i < n {
+        match cur {
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                let cdr = p.cdr.borrow().clone();
+                taken.push(car);
+                cur = cdr;
+                i += 1;
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+    let mut acc = Value::Null;
+    while let Some(item) = taken.pop() {
+        acc = Value::Pair(cs_core::Pair::new(item, acc));
+    }
+    value_to_gc_i64(acc)
+}
+
+/// `(drop lst n)` — SRFI-1. Return the tail of `lst` after the
+/// first `n` elements. Consumes the input handle. Returns the tail
+/// (which may be Null, a Pair, or any other value if the list is
+/// improper). On short list or negative `n`, deopts. ADR 0012 D-2
+/// (iter EX).
+///
+/// # Safety
+///
+/// `lst` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_drop_gc(lst: i64, n: i64) -> i64 {
+    if n < 0 {
+        let _drop = unsafe { gc_i64_to_value(lst) };
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Null);
+    }
+    let v = unsafe { gc_i64_to_value(lst) };
+    let mut cur = v;
+    let mut i: i64 = 0;
+    while i < n {
+        match cur {
+            Value::Pair(p) => {
+                let cdr = p.cdr.borrow().clone();
+                cur = cdr;
+                i += 1;
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+    value_to_gc_i64(cur)
+}
+
 /// `(iota n)` — 1-arg form. Returns `(0 1 ... n-1)` as a fresh
 /// list of Fixnums. `n` is a raw Fixnum-shape i64. Returns Null
 /// for n=0. On negative n, requests a deopt and returns Null.
