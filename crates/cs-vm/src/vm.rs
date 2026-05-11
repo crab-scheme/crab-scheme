@@ -1621,6 +1621,47 @@ pub unsafe extern "C" fn vm_make_bytevector_buf(buf: *const i64, n: usize) -> i6
     ))))
 }
 
+/// `(string-append s ...)` — variadic concatenation. `buf` points to
+/// `n` raw `Gc<Value::String>` handles. Each input handle is
+/// consumed. Returns a fresh `Gc<Value::String>` handle holding the
+/// concatenation. On any non-string argument, requests a deopt and
+/// returns an empty-string handle. ADR 0012 D-2 (iter DR).
+///
+/// # Safety
+///
+/// `buf` must point to a valid array of `n` live, owned `Gc<Value>`
+/// raw handles. Caller manages buffer lifetime.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_append_buf(buf: *const i64, n: usize) -> i64 {
+    // First pass: capacity estimate via cloned strings to avoid
+    // holding multiple borrows. Strings are RefCell-wrapped, so we
+    // collect references and copy.
+    let mut owned: Vec<String> = Vec::with_capacity(n);
+    let mut total: usize = 0;
+    for i in 0..n {
+        let raw = unsafe { *buf.add(i) };
+        let v = unsafe { gc_i64_to_value(raw) };
+        match v {
+            Value::String(s) => {
+                let s_ref = s.borrow();
+                total += s_ref.len();
+                owned.push(s_ref.clone());
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                    String::new(),
+                ))));
+            }
+        }
+    }
+    let mut out = String::with_capacity(total);
+    for s in owned {
+        out.push_str(&s);
+    }
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+}
+
 /// `(make-bytevector n fill)` — allocate a fresh `Value::ByteVector`
 /// of length `n` with every byte set to `fill & 0xFF`. Both args
 /// are raw Fixnum-shape i64 (not Gc handles). Negative `n` clamps

@@ -418,6 +418,13 @@ pub enum Inst {
     /// is Any (fresh Gc<Value::ByteVector>). ADR 0012 D-2 (iter DQ).
     BvBuild(Value, Vec<Value>),
 
+    /// `dst = string-append(strings...)`. Variadic string
+    /// concatenation; lowers to `vm_string_append_buf` via a stack-
+    /// allocated buffer of `Gc<Value::String>` handles. Each arg must
+    /// be Any-shape (strings are always boxed). `dst` is Any (fresh
+    /// Gc<Value::String>). ADR 0012 D-2 (iter DR).
+    StrAppend(Value, Vec<Value>),
+
     /// `dst = bytevector-u8-set!(bv, k, val)`. Lowers to
     /// `vm_bytevector_u8_set_gc`. `bv` Any (consumed), `k` and
     /// `val` Fixnum. `dst` is Any (Gc handle to Unspecified).

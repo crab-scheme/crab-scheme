@@ -4194,3 +4194,38 @@ fn diff_jit_variadic_bytevector() {
         other => panic!("expected (3, 20, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_variadic_string_append() {
+    // ADR 0012 D-2 (iter DR) — variadic `string-append` lowers via
+    // stack-buffer + vm_string_append_buf helper.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sa3 a b c) (string-append a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sa0) (string-append))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (sa3 \"ab\" \"cd\" \"ef\") (sa0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let s = rt
+        .eval_str_via_vm("<diff>", "(sa3 \"hi-\" \"there-\" \"world\")")
+        .unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(sa0)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "variadic string-append never dispatched through JIT (count={after})"
+    );
+    match (&s, &empty) {
+        (Value::String(sg), Value::String(eg)) => {
+            assert_eq!(&*sg.borrow(), "hi-there-world");
+            assert_eq!(&*eg.borrow(), "");
+        }
+        other => panic!("expected two strings, got {:?}", other),
+    }
+}

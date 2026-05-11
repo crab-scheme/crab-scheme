@@ -273,6 +273,9 @@ pub struct Lowerer {
     /// FuncId of `vm_make_bytevector_buf(buf, n) -> i64`. Variadic
     /// bytevector constructor. ADR 0012 D-2 (iter DQ).
     make_bytevector_buf_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_append_buf(buf, n) -> i64`. Variadic
+    /// string concatenation. ADR 0012 D-2 (iter DR).
+    string_append_buf_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_copy_gc(s) -> i64`. ADR 0012 D-2
     /// (iter DB).
     str_copy_func: cranelift_module::FuncId,
@@ -561,6 +564,11 @@ impl Lowerer {
         builder.symbol(
             "vm_make_bytevector_buf",
             cs_vm::vm::vm_make_bytevector_buf as *const u8,
+        );
+        // ADR 0012 D-2 (iter DR) — variadic string-append.
+        builder.symbol(
+            "vm_string_append_buf",
+            cs_vm::vm::vm_string_append_buf as *const u8,
         );
         // ADR 0012 D-2 (iter DB) — string-copy / vector-copy.
         builder.symbol(
@@ -1266,6 +1274,17 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_make_bytevector_buf: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter DR) — vm_string_append_buf(buf, n) -> i64.
+        let string_append_buf_func = module
+            .declare_function(
+                "vm_string_append_buf",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_append_buf: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter DB) — vm_string_copy_gc / vm_vector_copy_gc.
         let str_copy_func = module
             .declare_function(
@@ -1631,6 +1650,7 @@ impl Lowerer {
             make_vector_buf_func,
             make_string_buf_func,
             make_bytevector_buf_func,
+            string_append_buf_func,
             str_copy_func,
             vec_copy_func,
             bv_copy_func,
@@ -2001,6 +2021,10 @@ impl Lowerer {
             let make_bytevector_buf_fnref = self
                 .module
                 .declare_func_in_func(self.make_bytevector_buf_func, builder.func);
+            // iter DR — variadic string-append.
+            let string_append_buf_fnref = self
+                .module
+                .declare_func_in_func(self.string_append_buf_func, builder.func);
             // iter DB — string-copy / vector-copy.
             let str_copy_fnref = self
                 .module
@@ -2245,6 +2269,7 @@ impl Lowerer {
                         make_vector_buf_fnref,
                         make_string_buf_fnref,
                         make_bytevector_buf_fnref,
+                        string_append_buf_fnref,
                         str_copy_fnref,
                         vec_copy_fnref,
                         bv_copy_fnref,
@@ -2508,6 +2533,7 @@ fn lower_inst(
     make_vector_buf_fnref: cranelift_codegen::ir::FuncRef,
     make_string_buf_fnref: cranelift_codegen::ir::FuncRef,
     make_bytevector_buf_fnref: cranelift_codegen::ir::FuncRef,
+    string_append_buf_fnref: cranelift_codegen::ir::FuncRef,
     str_copy_fnref: cranelift_codegen::ir::FuncRef,
     vec_copy_fnref: cranelift_codegen::ir::FuncRef,
     bv_copy_fnref: cranelift_codegen::ir::FuncRef,
@@ -4091,6 +4117,40 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "BvBuild expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StrAppend(dst, args) => {
+            // ADR 0012 D-2 (iter DR) — variadic string-append via
+            // stack-allocated buffer + vm_string_append_buf helper.
+            // Same buffer-fill shape; helper deopts on non-string.
+            let n = args.len();
+            let arg_vs: Vec<cranelift_codegen::ir::Value> = args
+                .iter()
+                .map(|a| lookup(map, *a))
+                .collect::<Result<_, _>>()?;
+            let buf_bytes = std::cmp::max(8u32, (n as u32) * 8);
+            let buf_slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                buf_bytes,
+                3,
+            ));
+            for (i, av) in arg_vs.iter().enumerate() {
+                let _ = b.ins().stack_store(*av, buf_slot, (i as i32) * 8);
+            }
+            let buf_addr = b.ins().stack_addr(I64, buf_slot, 0);
+            let n_v = b.ins().iconst(I64, n as i64);
+            let inst_ref = b.ins().call(string_append_buf_fnref, &[buf_addr, n_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StrAppend expected 1 result, got {}",
                         results.len()
                     )));
                 }
