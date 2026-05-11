@@ -2220,6 +2220,80 @@ pub fn bytecode_to_rir_with_hints(
                                             value_types.insert(dst, result_t);
                                         }
                                     }
+                                    // ADR 0012 D-2 (iter DM) — variadic
+                                    // comparisons (3+ args). R6RS pairwise:
+                                    // (< a b c) means a<b AND b<c. Chains
+                                    // pairwise Lt/Eq with BitAnd on the
+                                    // Boolean (0/1) results. Fixnum-only
+                                    // for now; mixed-tower deferred.
+                                    ("<", n) | (">", n) | ("<=", n) | (">=", n) | ("=", n)
+                                        if n >= 3 =>
+                                    {
+                                        let emit_cmp =
+                                            |insts: &mut Vec<RirInst>,
+                                             value_types: &mut HashMap<RirValue, Type>,
+                                             alloc: &mut dyn FnMut() -> RirValue,
+                                             a: RirValue,
+                                             b: RirValue|
+                                             -> RirValue {
+                                                let d = alloc();
+                                                value_types.insert(d, Type::Boolean);
+                                                match name {
+                                                    "<" => insts.push(RirInst::Lt(d, a, b)),
+                                                    ">" => insts.push(RirInst::Lt(d, b, a)),
+                                                    "<=" => {
+                                                        let lt = alloc();
+                                                        insts.push(RirInst::Lt(lt, b, a));
+                                                        value_types.insert(lt, Type::Boolean);
+                                                        let zero = alloc();
+                                                        insts.push(RirInst::LoadConst(
+                                                            zero,
+                                                            Const::Fixnum(0),
+                                                        ));
+                                                        value_types.insert(zero, Type::Fixnum);
+                                                        insts.push(RirInst::Eq(d, lt, zero));
+                                                    }
+                                                    ">=" => {
+                                                        let lt = alloc();
+                                                        insts.push(RirInst::Lt(lt, a, b));
+                                                        value_types.insert(lt, Type::Boolean);
+                                                        let zero = alloc();
+                                                        insts.push(RirInst::LoadConst(
+                                                            zero,
+                                                            Const::Fixnum(0),
+                                                        ));
+                                                        value_types.insert(zero, Type::Fixnum);
+                                                        insts.push(RirInst::Eq(d, lt, zero));
+                                                    }
+                                                    "=" => insts.push(RirInst::Eq(d, a, b)),
+                                                    _ => unreachable!(),
+                                                }
+                                                d
+                                            };
+                                        let first = emit_cmp(
+                                            &mut insts,
+                                            &mut value_types,
+                                            &mut alloc,
+                                            args[0],
+                                            args[1],
+                                        );
+                                        let mut acc = first;
+                                        for i in 1..args.len() - 1 {
+                                            let cmp = emit_cmp(
+                                                &mut insts,
+                                                &mut value_types,
+                                                &mut alloc,
+                                                args[i],
+                                                args[i + 1],
+                                            );
+                                            let new_acc = alloc();
+                                            insts.push(RirInst::BitAnd(new_acc, acc, cmp));
+                                            value_types.insert(new_acc, Type::Boolean);
+                                            acc = new_acc;
+                                        }
+                                        insts.push(RirInst::Move(dst, acc));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // ADR 0012 D-2 (iter DJ) — variadic
                                     // bitwise ops. Fixnum-only (no Flonum
                                     // promotion). Identity element for

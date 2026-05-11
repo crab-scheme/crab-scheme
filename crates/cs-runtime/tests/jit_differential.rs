@@ -3990,3 +3990,44 @@ fn diff_jit_arithmetic_shift() {
         other => panic!("expected (16, 4, -4), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_variadic_compares() {
+    // ADR 0012 D-2 (iter DM) — variadic <, >, <=, >=, = (3+ args).
+    // R6RS pairwise: (< a b c) means a<b AND b<c.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (lt3 a b c) (if (< a b c) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (eq3 a b c) (if (= a b c) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (lt3 1 2 3) (eq3 5 5 5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // 1 < 2 < 3 → true
+    let lt_ok = rt.eval_str_via_vm("<diff>", "(lt3 1 2 3)").unwrap();
+    // 1 < 2 < 2 → false (second pair fails)
+    let lt_no = rt.eval_str_via_vm("<diff>", "(lt3 1 2 2)").unwrap();
+    // 5 = 5 = 5 → true
+    let eq_ok = rt.eval_str_via_vm("<diff>", "(eq3 5 5 5)").unwrap();
+    // 5 = 5 = 6 → false
+    let eq_no = rt.eval_str_via_vm("<diff>", "(eq3 5 5 6)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "variadic compares never dispatched through JIT (count={after})"
+    );
+    match (&lt_ok, &lt_no, &eq_ok, &eq_no) {
+        (
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (1,0,1,0), got {:?}", other),
+    }
+}
