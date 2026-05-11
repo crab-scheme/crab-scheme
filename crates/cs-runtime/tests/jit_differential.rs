@@ -5726,3 +5726,64 @@ fn diff_jit_ordinal_accessors() {
         other => panic!("expected (10, 20, 30, 40), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_more_ordinal_accessors() {
+    // ADR 0012 D-2 (iter FA) — SRFI-1 fifth/sixth/seventh/eighth/
+    // ninth/tenth.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f5 x) (fifth x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f6 x) (sixth x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f7 x) (seventh x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f8 x) (eighth x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f9 x) (ninth x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (f10 x) (tenth x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (f5 '(1 2 3 4 5 6 7 8 9 10)) \
+                      (f10 '(1 2 3 4 5 6 7 8 9 10)) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let lst = "'(10 20 30 40 50 60 70 80 90 100)";
+    let r5 = rt
+        .eval_str_via_vm("<diff>", &format!("(f5 {})", lst))
+        .unwrap();
+    let r6 = rt
+        .eval_str_via_vm("<diff>", &format!("(f6 {})", lst))
+        .unwrap();
+    let r7 = rt
+        .eval_str_via_vm("<diff>", &format!("(f7 {})", lst))
+        .unwrap();
+    let r8 = rt
+        .eval_str_via_vm("<diff>", &format!("(f8 {})", lst))
+        .unwrap();
+    let r9 = rt
+        .eval_str_via_vm("<diff>", &format!("(f9 {})", lst))
+        .unwrap();
+    let r10 = rt
+        .eval_str_via_vm("<diff>", &format!("(f10 {})", lst))
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&r5, &r6, &r7, &r8, &r9, &r10) {
+        (
+            Value::Number(cs_core::Number::Fixnum(50)),
+            Value::Number(cs_core::Number::Fixnum(60)),
+            Value::Number(cs_core::Number::Fixnum(70)),
+            Value::Number(cs_core::Number::Fixnum(80)),
+            Value::Number(cs_core::Number::Fixnum(90)),
+            Value::Number(cs_core::Number::Fixnum(100)),
+        ) => {}
+        other => panic!("expected (50..100), got {:?}", other),
+    }
+}

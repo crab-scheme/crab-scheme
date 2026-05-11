@@ -3773,19 +3773,31 @@ fn box_mixed_returns(
 /// Mirrors `cs_vm::vm::JIT_RT_FIXNUM` etc. — duplicated here to
 /// avoid a circular import at translate time. Heap-pointer types
 /// not yet wired through Cranelift map to `JIT_RT_ANY`.
-/// Map SRFI-1 ordinal accessor names to the equivalent cxr direction
-/// chain. `first` ≡ `car` → `[false]`, `second` ≡ `cadr` →
-/// `[false, true]`, `third` ≡ `caddr` → `[false, true, true]`,
-/// `fourth` ≡ `cadddr` → `[false, true, true, true]`. Returns `None`
-/// for other names. ADR 0012 D-2 (iter EZ).
+/// Map SRFI-1 ordinal accessor names (first..tenth) to the
+/// equivalent Car/Cdr direction chain: car of N-1 cdrs.
+/// `false` = Car, `true` = Cdr. The dispatch arm applies them
+/// right-to-left, so the chain is `[Car, Cdr, Cdr, ..., Cdr]`
+/// for `nth` = N-1 Cdrs then a Car. ADR 0012 D-2 (iter EZ + FA).
 fn ordinal_to_cxr_dirs(name: &str) -> Option<Vec<bool>> {
-    match name {
-        "first" => Some(vec![false]),
-        "second" => Some(vec![false, true]),
-        "third" => Some(vec![false, true, true]),
-        "fourth" => Some(vec![false, true, true, true]),
-        _ => None,
+    let n = match name {
+        "first" => 1usize,
+        "second" => 2,
+        "third" => 3,
+        "fourth" => 4,
+        "fifth" => 5,
+        "sixth" => 6,
+        "seventh" => 7,
+        "eighth" => 8,
+        "ninth" => 9,
+        "tenth" => 10,
+        _ => return None,
+    };
+    let mut dirs = Vec::with_capacity(n);
+    dirs.push(false);
+    for _ in 1..n {
+        dirs.push(true);
     }
+    Some(dirs)
 }
 
 /// Parse a composed pair accessor name like `caar`, `caddr`,
