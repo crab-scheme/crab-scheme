@@ -784,6 +784,61 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
     }
 }
 
+/// `(char-upcase c)` — return the uppercase mapping of `c` as a
+/// Character codepoint. Mirrors the bytecode `b_char_upcase` which
+/// uses `c.to_uppercase().next()` (R6RS simple-case mapping). Invalid
+/// codepoints return themselves (idempotent). Operand is a
+/// Fixnum-shape codepoint i64 (NOT a Gc handle); return is the
+/// same shape. ADR 0012 D-2 (iter CJ).
+///
+/// # Safety
+///
+/// Same as the iter-CI char predicate helpers: `c` is a Character
+/// codepoint, not a heap pointer.
+#[no_mangle]
+pub unsafe extern "C" fn vm_char_upcase(c: i64) -> i64 {
+    match char::from_u32(c as u32) {
+        Some(ch) => ch.to_uppercase().next().unwrap_or(ch) as u32 as i64,
+        None => c,
+    }
+}
+
+/// `(char-downcase c)` — return the lowercase mapping of `c`.
+/// Mirrors `vm_char_upcase`. ADR 0012 D-2 (iter CJ).
+///
+/// # Safety
+///
+/// Same as `vm_char_upcase`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_char_downcase(c: i64) -> i64 {
+    match char::from_u32(c as u32) {
+        Some(ch) => ch.to_lowercase().next().unwrap_or(ch) as u32 as i64,
+        None => c,
+    }
+}
+
+/// `(char-upper-case? c)` — true iff `c` is in a Unicode uppercase
+/// class. Returns 0/1. ADR 0012 D-2 (iter CJ).
+///
+/// # Safety
+///
+/// Same as `vm_char_alphabetic_p`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_char_upper_case_p(c: i64) -> i64 {
+    char::from_u32(c as u32).map_or(0, |ch| ch.is_uppercase() as i64)
+}
+
+/// `(char-lower-case? c)` — true iff `c` is in a Unicode lowercase
+/// class. ADR 0012 D-2 (iter CJ).
+///
+/// # Safety
+///
+/// Same as `vm_char_alphabetic_p`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_char_lower_case_p(c: i64) -> i64 {
+    char::from_u32(c as u32).map_or(0, |ch| ch.is_lowercase() as i64)
+}
+
 /// `(char-alphabetic? c)` — true iff `c` is in a Unicode
 /// alphabetic class. Operand is a Fixnum-shape codepoint i64
 /// (Character ABI carrier — NOT a Gc handle). Invalid codepoints

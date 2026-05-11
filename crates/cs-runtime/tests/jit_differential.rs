@@ -2802,3 +2802,68 @@ fn diff_jit_char_unicode_predicates() {
         other => panic!("expected (1,0,1,0,1,0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_char_case_ops() {
+    // ADR 0012 D-2 (iter CJ) — char-upcase / char-downcase return
+    // a Character (codepoint via char::to_uppercase().next() /
+    // to_lowercase().next()). char-upper-case? / char-lower-case?
+    // are Boolean predicates. All four operate on Character-typed
+    // operands.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (up n) (char->integer (char-upcase (integer->char n))))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (dn n) (char->integer (char-downcase (integer->char n))))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (uc? n) (if (char-upper-case? (integer->char n)) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (lc? n) (if (char-lower-case? (integer->char n)) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+            (if (= i 1500) 'done \
+                (begin (up 97) (dn 65) (uc? 65) (lc? 97) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // 97 = 'a', upcase → 65 = 'A'.
+    let up_a = rt.eval_str_via_vm("<diff>", "(up 97)").unwrap();
+    // 65 = 'A', downcase → 97 = 'a'.
+    let dn_a = rt.eval_str_via_vm("<diff>", "(dn 65)").unwrap();
+    // 'A' is upper-case.
+    let uc_a = rt.eval_str_via_vm("<diff>", "(uc? 65)").unwrap();
+    let uc_lower = rt.eval_str_via_vm("<diff>", "(uc? 97)").unwrap();
+    // 'a' is lower-case.
+    let lc_a = rt.eval_str_via_vm("<diff>", "(lc? 97)").unwrap();
+    let lc_upper = rt.eval_str_via_vm("<diff>", "(lc? 65)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 6,
+        "char case ops never dispatched through JIT (count={after})"
+    );
+    match (&up_a, &dn_a, &uc_a, &uc_lower, &lc_a, &lc_upper) {
+        (
+            Value::Number(cs_core::Number::Fixnum(65)),
+            Value::Number(cs_core::Number::Fixnum(97)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (65, 97, 1, 0, 1, 0), got {:?}", other),
+    }
+}

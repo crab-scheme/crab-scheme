@@ -333,6 +333,20 @@ pub enum Inst {
     /// `dst = char-whitespace?(c)`. ADR 0012 D-2 (iter CI).
     CharWhitespaceP(Value, Value),
 
+    /// `dst = char-upcase(c)`. Lowers to `vm_char_upcase`. `dst` is
+    /// Character. ADR 0012 D-2 (iter CJ).
+    CharUpcase(Value, Value),
+
+    /// `dst = char-downcase(c)`. ADR 0012 D-2 (iter CJ).
+    CharDowncase(Value, Value),
+
+    /// `dst = char-upper-case?(c)`. Returns Boolean. ADR 0012 D-2
+    /// (iter CJ).
+    CharUpperCaseP(Value, Value),
+
+    /// `dst = char-lower-case?(c)`. ADR 0012 D-2 (iter CJ).
+    CharLowerCaseP(Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a

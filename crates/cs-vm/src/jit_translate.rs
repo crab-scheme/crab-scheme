@@ -1383,6 +1383,36 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::CharWhitespaceP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter CJ) — char case ops.
+                                    // Same Character-gated dispatch as CI.
+                                    ("char-upcase", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character) =>
+                                    {
+                                        insts.push(RirInst::CharUpcase(dst, args[0]));
+                                        value_types.insert(dst, Type::Character);
+                                    }
+                                    ("char-downcase", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character) =>
+                                    {
+                                        insts.push(RirInst::CharDowncase(dst, args[0]));
+                                        value_types.insert(dst, Type::Character);
+                                    }
+                                    ("char-upper-case?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character) =>
+                                    {
+                                        insts.push(RirInst::CharUpperCaseP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("char-lower-case?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Character) =>
+                                    {
+                                        insts.push(RirInst::CharLowerCaseP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // R6RS tagged-equality on small immediates.
                                     // For Fixnum/Boolean/Character all three
                                     // live in the same i64 register, so an
@@ -2066,7 +2096,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::ListP(dst, _)
                 | RirInst::CharAlphabeticP(dst, _)
                 | RirInst::CharNumericP(dst, _)
-                | RirInst::CharWhitespaceP(dst, _) => {
+                | RirInst::CharWhitespaceP(dst, _)
+                | RirInst::CharUpperCaseP(dst, _)
+                | RirInst::CharLowerCaseP(dst, _) => {
                     bool_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {
@@ -2081,6 +2113,11 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::StrRef(dst, _, _) => {
                     // string-ref returns a Fixnum-shape codepoint;
                     // the dispatcher decodes via JIT_RT_CHARACTER.
+                    char_values.insert(*dst);
+                }
+                RirInst::CharUpcase(dst, _) | RirInst::CharDowncase(dst, _) => {
+                    // char-upcase / char-downcase return a Character
+                    // codepoint; dispatcher decodes via JIT_RT_CHARACTER.
                     char_values.insert(*dst);
                 }
                 RirInst::FixToFlo(dst, _)
