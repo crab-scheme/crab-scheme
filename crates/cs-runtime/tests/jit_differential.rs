@@ -3256,3 +3256,37 @@ fn diff_jit_char_foldcase_and_titlecase() {
         other => panic!("expected (97, 65), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_expt_fixnum() {
+    // ADR 0012 D-2 (iter CT) — expt via repeated squaring.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (pw base e) (expt base e))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (pw 2 10) (pw 3 5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let p_2_10 = rt.eval_str_via_vm("<diff>", "(pw 2 10)").unwrap();
+    let p_3_5 = rt.eval_str_via_vm("<diff>", "(pw 3 5)").unwrap();
+    let p_5_0 = rt.eval_str_via_vm("<diff>", "(pw 5 0)").unwrap();
+    let p_0_3 = rt.eval_str_via_vm("<diff>", "(pw 0 3)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "expt never dispatched through JIT (count={after})"
+    );
+    match (&p_2_10, &p_3_5, &p_5_0, &p_0_3) {
+        (
+            Value::Number(cs_core::Number::Fixnum(1024)),
+            Value::Number(cs_core::Number::Fixnum(243)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (1024, 243, 1, 0), got {:?}", other),
+    }
+}

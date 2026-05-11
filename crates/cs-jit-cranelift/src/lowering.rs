@@ -230,6 +230,10 @@ pub struct Lowerer {
     /// FuncId of `vm_lcm_fx(a, b) -> i64`. Both operands Fixnum,
     /// result Fixnum. ADR 0012 D-2 (iter CP).
     lcm_func: cranelift_module::FuncId,
+    /// FuncId of `vm_expt_fx(base, exp) -> i64`. Both Fixnum,
+    /// result Fixnum (deopts on overflow / neg exp).
+    /// ADR 0012 D-2 (iter CT).
+    expt_func: cranelift_module::FuncId,
     /// FuncId of `vm_bytevector_p_gc(v) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CQ).
     bv_p_func: cranelift_module::FuncId,
@@ -412,6 +416,8 @@ impl Lowerer {
         // ADR 0012 D-2 (iter CP) — gcd / lcm.
         builder.symbol("vm_gcd_fx", cs_vm::vm::vm_gcd_fx as *const u8);
         builder.symbol("vm_lcm_fx", cs_vm::vm::vm_lcm_fx as *const u8);
+        // ADR 0012 D-2 (iter CT) — expt.
+        builder.symbol("vm_expt_fx", cs_vm::vm::vm_expt_fx as *const u8);
         // ADR 0012 D-2 (iter CQ) — bytevector read ops.
         builder.symbol(
             "vm_bytevector_p_gc",
@@ -938,6 +944,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_lcm_fx: {e}")))?;
 
+        // ADR 0012 D-2 (iter CT) — vm_expt_fx(base, exp) -> i64.
+        let expt_func = module
+            .declare_function(
+                "vm_expt_fx",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_expt_fx: {e}")))?;
+
         // ADR 0012 D-2 (iter CQ) — bytevector read ops.
         let bv_p_func = module
             .declare_function(
@@ -1119,6 +1134,7 @@ impl Lowerer {
             list_set_func,
             gcd_func,
             lcm_func,
+            expt_func,
             bv_p_func,
             bv_length_func,
             bv_u8_ref_func,
@@ -1416,6 +1432,10 @@ impl Lowerer {
             let lcm_fnref = self
                 .module
                 .declare_func_in_func(self.lcm_func, builder.func);
+            // iter CT — expt.
+            let expt_fnref = self
+                .module
+                .declare_func_in_func(self.expt_func, builder.func);
             // iter CQ — bytevector read ops.
             let bv_p_fnref = self
                 .module
@@ -1575,6 +1595,7 @@ impl Lowerer {
                         list_set_fnref,
                         gcd_fnref,
                         lcm_fnref,
+                        expt_fnref,
                         bv_p_fnref,
                         bv_length_fnref,
                         bv_u8_ref_fnref,
@@ -1803,6 +1824,7 @@ fn lower_inst(
     list_set_fnref: cranelift_codegen::ir::FuncRef,
     gcd_fnref: cranelift_codegen::ir::FuncRef,
     lcm_fnref: cranelift_codegen::ir::FuncRef,
+    expt_fnref: cranelift_codegen::ir::FuncRef,
     bv_p_fnref: cranelift_codegen::ir::FuncRef,
     bv_length_fnref: cranelift_codegen::ir::FuncRef,
     bv_u8_ref_fnref: cranelift_codegen::ir::FuncRef,
@@ -2939,6 +2961,24 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "Lcm expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::Expt(dst, base, exp) => {
+            // ADR 0012 D-2 (iter CT) — vm_expt_fx. Fixnum operands
+            // and result; helper deopts on overflow / neg exp.
+            let base_v = lookup(map, *base)?;
+            let exp_v = lookup(map, *exp)?;
+            let inst_ref = b.ins().call(expt_fnref, &[base_v, exp_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Expt expected 1 result, got {}",
                         results.len()
                     )));
                 }

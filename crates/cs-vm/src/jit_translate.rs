@@ -673,6 +673,7 @@ pub fn bytecode_to_rir_with_hints(
                                 ("modulo", 2) => Some(RirInst::Modulo(dst, args[0], args[1])),
                                 ("gcd", 2) => Some(RirInst::Gcd(dst, args[0], args[1])),
                                 ("lcm", 2) => Some(RirInst::Lcm(dst, args[0], args[1])),
+                                ("expt", 2) => Some(RirInst::Expt(dst, args[0], args[1])),
                                 ("bitwise-and", 2) => Some(RirInst::BitAnd(dst, args[0], args[1])),
                                 ("bitwise-ior", 2) | ("bitwise-or", 2) => {
                                     Some(RirInst::BitOr(dst, args[0], args[1]))

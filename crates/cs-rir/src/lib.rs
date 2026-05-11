@@ -439,6 +439,11 @@ pub enum Inst {
     /// Fixnum; result Fixnum. ADR 0012 D-2 (iter CP).
     Lcm(Value, Value, Value),
 
+    /// `dst = expt(base, exp)`. Lowers to `vm_expt_fx`. Both
+    /// operands Fixnum; result Fixnum. On overflow or negative
+    /// exponent, helper deopts. ADR 0012 D-2 (iter CT).
+    Expt(Value, Value, Value),
+
     /// `dst = band(lhs, rhs)`. R6RS `bitwise-and` (R6RS) /
     /// `bitwise-and-bitwise` for two fixnums.
     BitAnd(Value, Value, Value),

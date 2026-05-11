@@ -1089,6 +1089,49 @@ pub unsafe extern "C" fn vm_bytevector_u8_ref_gc(bv: i64, k: i64) -> i64 {
     }
 }
 
+/// `(expt base exp)` — Fixnum exponentiation via repeated squaring.
+/// On Fixnum overflow or a negative exponent (R6RS allows expt
+/// with neg exp to return a rational, which the JIT can't
+/// represent), requests a deopt and returns 0 — the bytecode VM
+/// then re-runs the call and handles bignum / rational via its
+/// generic `b_expt`. ADR 0012 D-2 (iter CT).
+///
+/// # Safety
+///
+/// Both args are raw Fixnum-shape i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_expt_fx(base: i64, exp: i64) -> i64 {
+    if exp < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return 0;
+    }
+    let mut acc: i64 = 1;
+    let mut b = base;
+    let mut k = exp;
+    while k > 0 {
+        if k & 1 == 1 {
+            match acc.checked_mul(b) {
+                Some(v) => acc = v,
+                None => {
+                    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                    return 0;
+                }
+            }
+        }
+        k >>= 1;
+        if k > 0 {
+            match b.checked_mul(b) {
+                Some(v) => b = v,
+                None => {
+                    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                    return 0;
+                }
+            }
+        }
+    }
+    acc
+}
+
 /// `(gcd a b)` — Euclidean GCD on the absolute values of `a` and
 /// `b`. Both operands are raw Fixnum-shape i64; the result is a
 /// raw Fixnum i64. No deopt (gcd is total on fixnums). Matches
