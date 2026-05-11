@@ -1847,6 +1847,21 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::BvS16NativeRef(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Fixnum);
                                     }
+                                    // ADR 0012 D-2 (iter FR) — bytevector-u32/s32 native-ref.
+                                    ("bytevector-u32-native-ref", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvU32NativeRef(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
+                                    ("bytevector-s32-native-ref", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvS32NativeRef(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
                                     // ADR 0012 D-2 (iter DB) — string-copy /
                                     // vector-copy (1-arg full copy).
                                     ("string-copy", 1)
@@ -1963,6 +1978,25 @@ pub fn bytecode_to_rir_with_hints(
                                             == Some(Type::Any) =>
                                     {
                                         insts.push(RirInst::BvS16NativeSet(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    // ADR 0012 D-2 (iter FR) — bytevector-u32/s32 native-set!.
+                                    ("bytevector-u32-native-set!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvU32NativeSet(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("bytevector-s32-native-set!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvS32NativeSet(
                                             dst, args[0], args[1], args[2],
                                         ));
                                         value_types.insert(dst, Type::Any);
@@ -4394,6 +4428,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::BvS8Set(dst, _, _, _)
                 | RirInst::BvU16NativeSet(dst, _, _, _)
                 | RirInst::BvS16NativeSet(dst, _, _, _)
+                | RirInst::BvU32NativeSet(dst, _, _, _)
+                | RirInst::BvS32NativeSet(dst, _, _, _)
                 | RirInst::VecBuild(dst, _)
                 | RirInst::StrBuild(dst, _)
                 | RirInst::BvBuild(dst, _)

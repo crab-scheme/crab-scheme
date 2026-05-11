@@ -2281,6 +2281,127 @@ pub unsafe extern "C" fn vm_bytevector_s16_native_set_gc(bv: i64, k: i64, val: i
     }
 }
 
+/// Native-endian 4-byte ByteVector reads/writes — `u32` and `s32`
+/// `native-ref` / `native-set!`. ADR 0012 D-2 (iter FR).
+///
+/// # Safety
+///
+/// `bv` must be a live, owned `Gc<Value>` raw handle. `k` and any
+/// `val` are raw Fixnum-shape i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_u32_native_ref_gc(bv: i64, k: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let storage = bvc.borrow();
+            if k < 0 || (k as usize).saturating_add(4) > storage.len() {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return 0;
+            }
+            let idx = k as usize;
+            let buf = [
+                storage[idx],
+                storage[idx + 1],
+                storage[idx + 2],
+                storage[idx + 3],
+            ];
+            u32::from_ne_bytes(buf) as i64
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_s32_native_ref_gc(bv: i64, k: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let storage = bvc.borrow();
+            if k < 0 || (k as usize).saturating_add(4) > storage.len() {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return 0;
+            }
+            let idx = k as usize;
+            let buf = [
+                storage[idx],
+                storage[idx + 1],
+                storage[idx + 2],
+                storage[idx + 3],
+            ];
+            i32::from_ne_bytes(buf) as i64
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_u32_native_set_gc(bv: i64, k: i64, val: i64) -> i64 {
+    if !(0..=u32::MAX as i64).contains(&val) {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Unspecified);
+    }
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let mut storage = bvc.borrow_mut();
+            if k < 0 || (k as usize).saturating_add(4) > storage.len() {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            let bytes = (val as u32).to_ne_bytes();
+            let idx = k as usize;
+            storage[idx] = bytes[0];
+            storage[idx + 1] = bytes[1];
+            storage[idx + 2] = bytes[2];
+            storage[idx + 3] = bytes[3];
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_s32_native_set_gc(bv: i64, k: i64, val: i64) -> i64 {
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&val) {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Unspecified);
+    }
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let mut storage = bvc.borrow_mut();
+            if k < 0 || (k as usize).saturating_add(4) > storage.len() {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            let bytes = (val as i32).to_ne_bytes();
+            let idx = k as usize;
+            storage[idx] = bytes[0];
+            storage[idx + 1] = bytes[1];
+            storage[idx + 2] = bytes[2];
+            storage[idx + 3] = bytes[3];
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(bytevector-s8-set! bv k v)` — write s8 value at `k`. `v` must
 /// be in [-128, 127]; otherwise deopts. Returns Unspecified Gc
 /// handle. ADR 0012 D-2 (iter FP).

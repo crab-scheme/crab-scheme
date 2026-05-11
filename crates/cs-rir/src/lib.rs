@@ -488,6 +488,12 @@ pub enum Inst {
     /// `vm_bytevector_s16_native_ref_gc(bv, k) -> Fixnum`.
     /// ADR 0012 D-2 (iter FQ).
     BvS16NativeRef(Value, Value, Value),
+    /// `vm_bytevector_u32_native_ref_gc(bv, k) -> Fixnum`.
+    /// ADR 0012 D-2 (iter FR).
+    BvU32NativeRef(Value, Value, Value),
+    /// `vm_bytevector_s32_native_ref_gc(bv, k) -> Fixnum`.
+    /// ADR 0012 D-2 (iter FR).
+    BvS32NativeRef(Value, Value, Value),
 
     /// `dst = make-bytevector(n, fill)`. Lowers to
     /// `vm_alloc_bytevector_gc`. Both args Fixnum. `dst` is Any
@@ -559,6 +565,12 @@ pub enum Inst {
     /// `vm_bytevector_s16_native_set_gc(bv, k, v)`. ADR 0012 D-2
     /// (iter FQ).
     BvS16NativeSet(Value, Value, Value, Value),
+    /// `vm_bytevector_u32_native_set_gc(bv, k, v)`. ADR 0012 D-2
+    /// (iter FR).
+    BvU32NativeSet(Value, Value, Value, Value),
+    /// `vm_bytevector_s32_native_set_gc(bv, k, v)`. ADR 0012 D-2
+    /// (iter FR).
+    BvS32NativeSet(Value, Value, Value, Value),
 
     /// `dst = vector-fill!(vec, fill)`. Lowers to `vm_vector_fill_gc`.
     /// Both args Any (consumed). `dst` Any (Unspecified). ADR 0012
