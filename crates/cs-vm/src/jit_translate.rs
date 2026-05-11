@@ -757,15 +757,11 @@ pub fn bytecode_to_rir_with_hints(
                                     | ("exact?", 1)
                                     | ("exact-integer?", 1)
                                     | ("exact-rational?", 1)
-                                    | ("exact-real?", 1)
-                                    | ("fixnum?", 1) => {
+                                    | ("exact-real?", 1) => {
                                         let _ = args[0]; // load preserved for SSA correctness
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
                                     }
-                                    ("inexact?", 1)
-                                    | ("flonum?", 1)
-                                    | ("nan?", 1)
-                                    | ("infinite?", 1) => {
+                                    ("inexact?", 1) | ("nan?", 1) | ("infinite?", 1) => {
                                         // Always-false predicates: arg
                                         // is a Fixnum, which is exact /
                                         // not a flonum / not NaN / finite.
@@ -913,6 +909,120 @@ pub fn bytecode_to_rir_with_hints(
                                             == Some(Type::Any) =>
                                     {
                                         insts.push(RirInst::SymbolP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    // ADR 0012 D-2 (iter DE) — immediate-shape
+                                    // type predicates. Each does a 3-way
+                                    // dispatch on the operand's static type:
+                                    // matching-type → const true; Any →
+                                    // runtime helper; otherwise → const false.
+                                    // These catch-all arms supersede the
+                                    // always-true (fixnum?) / always-false
+                                    // (char?, boolean?, flonum?) entries in
+                                    // the earlier predicate tables for these
+                                    // four names.
+                                    ("char?", 1) => {
+                                        let t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        match t {
+                                            Type::Any => {
+                                                insts.push(RirInst::CharP(dst, args[0]));
+                                            }
+                                            Type::Character => {
+                                                let _ = args[0];
+                                                insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Boolean(true),
+                                                ));
+                                            }
+                                            _ => {
+                                                let _ = args[0];
+                                                insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Boolean(false),
+                                                ));
+                                            }
+                                        }
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("boolean?", 1) => {
+                                        let t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        match t {
+                                            Type::Any => {
+                                                insts.push(RirInst::BoolP(dst, args[0]));
+                                            }
+                                            Type::Boolean => {
+                                                let _ = args[0];
+                                                insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Boolean(true),
+                                                ));
+                                            }
+                                            _ => {
+                                                let _ = args[0];
+                                                insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Boolean(false),
+                                                ));
+                                            }
+                                        }
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("fixnum?", 1) => {
+                                        let t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        match t {
+                                            Type::Any => {
+                                                insts.push(RirInst::FixnumP(dst, args[0]));
+                                            }
+                                            Type::Fixnum => {
+                                                let _ = args[0];
+                                                insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Boolean(true),
+                                                ));
+                                            }
+                                            _ => {
+                                                let _ = args[0];
+                                                insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Boolean(false),
+                                                ));
+                                            }
+                                        }
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("flonum?", 1) => {
+                                        let t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        match t {
+                                            Type::Any => {
+                                                insts.push(RirInst::FlonumP(dst, args[0]));
+                                            }
+                                            Type::Flonum => {
+                                                let _ = args[0];
+                                                insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Boolean(true),
+                                                ));
+                                            }
+                                            _ => {
+                                                let _ = args[0];
+                                                insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Boolean(false),
+                                                ));
+                                            }
+                                        }
                                         value_types.insert(dst, Type::Boolean);
                                     }
                                     // ADR 0012 D-2 (iter CA) — list ops.
@@ -1888,9 +1998,7 @@ pub fn bytecode_to_rir_with_hints(
                                     // contract), so any predicate that
                                     // discriminates "is this a non-numeric
                                     // type?" reduces to Const(0).
-                                    ("boolean?", 1)
-                                    | ("char?", 1)
-                                    | ("pair?", 1)
+                                    ("pair?", 1)
                                     | ("null?", 1)
                                     | ("symbol?", 1)
                                     | ("string?", 1)
@@ -2471,7 +2579,11 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::ProcedureP(dst, _)
                 | RirInst::PortP(dst, _)
                 | RirInst::EofP(dst, _)
-                | RirInst::SymbolP(dst, _) => {
+                | RirInst::SymbolP(dst, _)
+                | RirInst::CharP(dst, _)
+                | RirInst::BoolP(dst, _)
+                | RirInst::FixnumP(dst, _)
+                | RirInst::FlonumP(dst, _) => {
                     bool_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {

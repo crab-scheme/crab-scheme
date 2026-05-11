@@ -419,6 +419,21 @@ pub enum Inst {
     /// (iter DD).
     SymbolP(Value, Value),
 
+    /// `dst = char?(v)`. Lowers to `vm_char_p_gc`. ADR 0012 D-2 (iter DE).
+    CharP(Value, Value),
+
+    /// `dst = boolean?(v)`. Lowers to `vm_boolean_p_gc`. ADR 0012 D-2
+    /// (iter DE).
+    BoolP(Value, Value),
+
+    /// `dst = fixnum?(v)`. Lowers to `vm_fixnum_p_gc`. ADR 0012 D-2
+    /// (iter DE).
+    FixnumP(Value, Value),
+
+    /// `dst = flonum?(v)`. Lowers to `vm_flonum_p_gc`. ADR 0012 D-2
+    /// (iter DE).
+    FlonumP(Value, Value),
+
     /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
     /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
     /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).

@@ -3705,3 +3705,48 @@ fn diff_jit_any_type_predicates() {
         other => panic!("expected (1, 0, 1, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_immediate_type_predicates_on_any() {
+    // ADR 0012 D-2 (iter DE) — char? / boolean? / fixnum? on Any.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (c? v) (if (char? v) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (b? v) (if (boolean? v) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fx? v) (if (fixnum? v) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (c? #\\a) (b? #t) (fx? 42) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let c_yes = rt.eval_str_via_vm("<diff>", "(c? #\\z)").unwrap();
+    let c_no = rt.eval_str_via_vm("<diff>", "(c? 42)").unwrap();
+    let b_yes = rt.eval_str_via_vm("<diff>", "(b? #t)").unwrap();
+    let b_no = rt.eval_str_via_vm("<diff>", "(b? 'foo)").unwrap();
+    let fx_yes = rt.eval_str_via_vm("<diff>", "(fx? 42)").unwrap();
+    let fx_no = rt.eval_str_via_vm("<diff>", "(fx? #\\a)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    // Not every variant reliably tiers up in this pattern (param
+    // type narrowing is per-closure); assert correctness on results
+    // and that at least one variant reached the JIT.
+    assert!(
+        after >= 1,
+        "type predicates never dispatched through JIT (count={after})"
+    );
+    match (&c_yes, &c_no, &b_yes, &b_no, &fx_yes, &fx_no) {
+        (
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (1,0,1,0,1,0), got {:?}", other),
+    }
+}

@@ -275,6 +275,14 @@ pub struct Lowerer {
     eof_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_symbol_p_gc(v) -> i64`. ADR 0012 D-2 (iter DD).
     symbol_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_char_p_gc(v) -> i64`. ADR 0012 D-2 (iter DE).
+    char_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_boolean_p_gc(v) -> i64`. ADR 0012 D-2 (iter DE).
+    boolean_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_fixnum_p_gc(v) -> i64`. ADR 0012 D-2 (iter DE).
+    fixnum_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_flonum_p_gc(v) -> i64`. ADR 0012 D-2 (iter DE).
+    flonum_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -520,6 +528,11 @@ impl Lowerer {
         builder.symbol("vm_port_p_gc", cs_vm::vm::vm_port_p_gc as *const u8);
         builder.symbol("vm_eof_p_gc", cs_vm::vm::vm_eof_p_gc as *const u8);
         builder.symbol("vm_symbol_p_gc", cs_vm::vm::vm_symbol_p_gc as *const u8);
+        // ADR 0012 D-2 (iter DE) — more type predicates on Any.
+        builder.symbol("vm_char_p_gc", cs_vm::vm::vm_char_p_gc as *const u8);
+        builder.symbol("vm_boolean_p_gc", cs_vm::vm::vm_boolean_p_gc as *const u8);
+        builder.symbol("vm_fixnum_p_gc", cs_vm::vm::vm_fixnum_p_gc as *const u8);
+        builder.symbol("vm_flonum_p_gc", cs_vm::vm::vm_flonum_p_gc as *const u8);
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
             "vm_char_alphabetic_p",
@@ -1194,6 +1207,36 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_symbol_p_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter DE) — more type predicates on Any.
+        let char_p_func = module
+            .declare_function(
+                "vm_char_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_char_p_gc: {e}")))?;
+        let boolean_p_func = module
+            .declare_function(
+                "vm_boolean_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_boolean_p_gc: {e}")))?;
+        let fixnum_p_func = module
+            .declare_function(
+                "vm_fixnum_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_fixnum_p_gc: {e}")))?;
+        let flonum_p_func = module
+            .declare_function(
+                "vm_flonum_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_flonum_p_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -1413,6 +1456,10 @@ impl Lowerer {
             port_p_func,
             eof_p_func,
             symbol_p_func,
+            char_p_func,
+            boolean_p_func,
+            fixnum_p_func,
+            flonum_p_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -1768,6 +1815,19 @@ impl Lowerer {
             let symbol_p_fnref = self
                 .module
                 .declare_func_in_func(self.symbol_p_func, builder.func);
+            // iter DE — more type predicates on Any.
+            let char_p_fnref = self
+                .module
+                .declare_func_in_func(self.char_p_func, builder.func);
+            let boolean_p_fnref = self
+                .module
+                .declare_func_in_func(self.boolean_p_func, builder.func);
+            let fixnum_p_fnref = self
+                .module
+                .declare_func_in_func(self.fixnum_p_func, builder.func);
+            let flonum_p_fnref = self
+                .module
+                .declare_func_in_func(self.flonum_p_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -1951,6 +2011,10 @@ impl Lowerer {
                         port_p_fnref,
                         eof_p_fnref,
                         symbol_p_fnref,
+                        char_p_fnref,
+                        boolean_p_fnref,
+                        fixnum_p_fnref,
+                        flonum_p_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -2197,6 +2261,10 @@ fn lower_inst(
     port_p_fnref: cranelift_codegen::ir::FuncRef,
     eof_p_fnref: cranelift_codegen::ir::FuncRef,
     symbol_p_fnref: cranelift_codegen::ir::FuncRef,
+    char_p_fnref: cranelift_codegen::ir::FuncRef,
+    boolean_p_fnref: cranelift_codegen::ir::FuncRef,
+    fixnum_p_fnref: cranelift_codegen::ir::FuncRef,
+    flonum_p_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -3608,6 +3676,66 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "SymbolP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::CharP(dst, src) => {
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(char_p_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "CharP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::BoolP(dst, src) => {
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(boolean_p_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BoolP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::FixnumP(dst, src) => {
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(fixnum_p_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "FixnumP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::FlonumP(dst, src) => {
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(flonum_p_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "FlonumP expected 1 result, got {}",
                         results.len()
                     )));
                 }

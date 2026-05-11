@@ -688,6 +688,53 @@ pub unsafe extern "C" fn vm_null_p_gc(r: i64) -> i64 {
     matches!(v, Value::Null) as i64
 }
 
+/// `(char? v)` — true iff `v` is a character. Consume-on-use; 0/1.
+/// ADR 0012 D-2 (iter DE).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_char_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Character(_)) as i64
+}
+
+/// `(boolean? v)` — true iff `v` is a boolean. ADR 0012 D-2 (iter DE).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_boolean_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Boolean(_)) as i64
+}
+
+/// `(fixnum? v)` — true iff `v` is a fixnum (i64 immediate).
+/// ADR 0012 D-2 (iter DE).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_fixnum_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Number(cs_core::Number::Fixnum(_))) as i64
+}
+
+/// `(flonum? v)` — true iff `v` is a flonum (f64). ADR 0012 D-2
+/// (iter DE).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Number(cs_core::Number::Flonum(_))) as i64
+}
+
 /// `(procedure? v)` — true iff `v` is a procedure (closure or
 /// builtin). Consume-on-use; 0/1 out. ADR 0012 D-2 (iter DD).
 ///
