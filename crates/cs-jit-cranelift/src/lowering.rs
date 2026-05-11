@@ -290,6 +290,12 @@ pub struct Lowerer {
     /// FuncId of `vm_list_to_string_gc(lst) -> i64`. ADR 0012 D-2
     /// (iter CX).
     list_to_string_func: cranelift_module::FuncId,
+    /// FuncId of `vm_symbol_to_string_gc(sym) -> i64`. ADR 0012 D-2
+    /// (iter CY).
+    symbol_to_string_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_to_symbol_gc(s) -> i64`. ADR 0012 D-2
+    /// (iter CY).
+    string_to_symbol_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -504,6 +510,15 @@ impl Lowerer {
         builder.symbol(
             "vm_list_to_string_gc",
             cs_vm::vm::vm_list_to_string_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter CY) — symbol<->string.
+        builder.symbol(
+            "vm_symbol_to_string_gc",
+            cs_vm::vm::vm_symbol_to_string_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_to_symbol_gc",
+            cs_vm::vm::vm_string_to_symbol_gc as *const u8,
         );
         let mut module = JITModule::new(builder);
 
@@ -1163,6 +1178,26 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_list_to_string_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter CY) — vm_symbol_to_string_gc / vm_string_to_symbol_gc.
+        let symbol_to_string_func = module
+            .declare_function(
+                "vm_symbol_to_string_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_symbol_to_string_gc: {e}"))
+            })?;
+        let string_to_symbol_func = module
+            .declare_function(
+                "vm_string_to_symbol_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_to_symbol_gc: {e}"))
+            })?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -1238,6 +1273,8 @@ impl Lowerer {
             list_to_vector_func,
             string_to_list_func,
             list_to_string_func,
+            symbol_to_string_func,
+            string_to_symbol_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -1590,6 +1627,13 @@ impl Lowerer {
             let list_to_string_fnref = self
                 .module
                 .declare_func_in_func(self.list_to_string_func, builder.func);
+            // iter CY — symbol<->string.
+            let symbol_to_string_fnref = self
+                .module
+                .declare_func_in_func(self.symbol_to_string_func, builder.func);
+            let string_to_symbol_fnref = self
+                .module
+                .declare_func_in_func(self.string_to_symbol_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -1722,6 +1766,8 @@ impl Lowerer {
                         list_to_vector_fnref,
                         string_to_list_fnref,
                         list_to_string_fnref,
+                        symbol_to_string_fnref,
+                        string_to_symbol_fnref,
                         inst,
                     )?;
                 }
@@ -1956,6 +2002,8 @@ fn lower_inst(
     list_to_vector_fnref: cranelift_codegen::ir::FuncRef,
     string_to_list_fnref: cranelift_codegen::ir::FuncRef,
     list_to_string_fnref: cranelift_codegen::ir::FuncRef,
+    symbol_to_string_fnref: cranelift_codegen::ir::FuncRef,
+    string_to_symbol_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -3423,6 +3471,43 @@ fn lower_inst(
                 results[0]
             };
             b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::SymbolToString(dst, src) => {
+            // ADR 0012 D-2 (iter CY) — vm_symbol_to_string_gc.
+            // Operand is a Symbol-shape Fixnum (no Gc); result is
+            // an Any-shape Gc handle.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(symbol_to_string_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "SymbolToString expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringToSymbol(dst, src) => {
+            // ADR 0012 D-2 (iter CY) — vm_string_to_symbol_gc.
+            // Operand is Any (Gc consumed); result is Symbol-shape
+            // Fixnum (no Gc).
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(string_to_symbol_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringToSymbol expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
             map.insert(*dst, result);
         }
         Inst::Call(_, _, _) | Inst::DeoptCheck(_, _) => {

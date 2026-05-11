@@ -431,6 +431,15 @@ pub enum Inst {
     /// D-2 (iter CX).
     ListToString(Value, Value),
 
+    /// `dst = symbol->string(sym)`. Lowers to `vm_symbol_to_string_gc`.
+    /// `sym` is Symbol-shape (Fixnum-shape i64 carrying sym id).
+    /// `dst` is Any (fresh String). ADR 0012 D-2 (iter CY).
+    SymbolToString(Value, Value),
+
+    /// `dst = string->symbol(s)`. Lowers to `vm_string_to_symbol_gc`.
+    /// `s` Any (consumed). `dst` is Symbol-shape. ADR 0012 D-2 (iter CY).
+    StringToSymbol(Value, Value),
+
     /// `dst = make-closure(lambda_idx)`. Lowers to `vm_make_closure`.
     /// The helper reads the enclosing closure's env and bc from the
     /// JIT thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`) so a

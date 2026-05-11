@@ -1549,6 +1549,21 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::ListToVector(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter CY) — symbol<->string.
+                                    ("symbol->string", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Symbol) =>
+                                    {
+                                        insts.push(RirInst::SymbolToString(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("string->symbol", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::StringToSymbol(dst, args[0]));
+                                        value_types.insert(dst, Type::Symbol);
+                                    }
                                     // ADR 0012 D-2 (iter CX) — string<->list.
                                     ("string->list", 1)
                                         if value_types.get(&args[0]).copied()
@@ -2401,6 +2416,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 RirInst::LoadConst(dst, Const::Symbol(_)) => {
                     sym_values.insert(*dst);
                 }
+                RirInst::StringToSymbol(dst, _) => {
+                    sym_values.insert(*dst);
+                }
                 RirInst::Cons(dst, _, _, _, _)
                 | RirInst::Car(dst, _)
                 | RirInst::Cdr(dst, _)
@@ -2432,7 +2450,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VectorToList(dst, _)
                 | RirInst::ListToVector(dst, _)
                 | RirInst::StringToList(dst, _)
-                | RirInst::ListToString(dst, _) => {
+                | RirInst::ListToString(dst, _)
+                | RirInst::SymbolToString(dst, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

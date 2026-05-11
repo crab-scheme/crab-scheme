@@ -970,6 +970,68 @@ pub unsafe extern "C" fn vm_substring_gc(s: i64, start: i64, end: i64) -> i64 {
     }
 }
 
+/// `(symbol->string sym)` — return a fresh `Value::String` carrying
+/// the symbol's name. Operand is a Symbol-shape i64 (sym id in low
+/// 32 bits, NOT a Gc handle). Looks up via `JIT_ACTIVE_SYMS`.
+/// On null TLS or out-of-range id, requests a deopt and returns
+/// Gc(Null). ADR 0012 D-2 (iter CY).
+///
+/// # Safety
+///
+/// `JIT_ACTIVE_SYMS` must be set by the runtime dispatch site
+/// (try_dispatch_jit ensures this).
+#[no_mangle]
+pub unsafe extern "C" fn vm_symbol_to_string_gc(sym: i64) -> i64 {
+    let syms_ptr = JIT_ACTIVE_SYMS.with(|c| c.get());
+    if syms_ptr.is_null() {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Null);
+    }
+    let syms = unsafe { &*syms_ptr };
+    let id = sym as u32;
+    if (id as usize) >= syms.len() {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Null);
+    }
+    let s = syms.name(Symbol(id)).to_string();
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+}
+
+/// `(string->symbol s)` — intern `s` into the symbol table and
+/// return the resulting Symbol. Consumes one strong refcount on `s`.
+/// Returns a Symbol-shape i64 (sym id in low 32 bits). On non-string
+/// or null TLS, requests a deopt and returns 0. ADR 0012 D-2
+/// (iter CY).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+/// `JIT_ACTIVE_SYMS` must be set.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_to_symbol_gc(s: i64) -> i64 {
+    let syms_ptr = JIT_ACTIVE_SYMS.with(|c| c.get());
+    if syms_ptr.is_null() {
+        // Consume the handle even on the error path so the refcount
+        // is correctly released.
+        let _ = unsafe { gc_i64_to_value(s) };
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return 0;
+    }
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sc) => {
+            let borrowed = sc.borrow();
+            let syms = unsafe { &mut *syms_ptr };
+            let sym = syms.intern(&borrowed);
+            sym.0 as i64
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
 /// `(string->list s)` — walk chars of `s` and build a freshly
 /// allocated list of `Value::Character`. Consumes one strong
 /// refcount on `s`. On non-string input, requests a deopt and

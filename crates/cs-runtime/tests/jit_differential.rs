@@ -3468,3 +3468,44 @@ fn diff_jit_string_list_conversions() {
         other => panic!("expected (5, 3, 90), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_symbol_string_conversions() {
+    // ADR 0012 D-2 (iter CY) — symbol->string / string->symbol.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s->str sym) (symbol->string sym))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (str->s s) (string->symbol s))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (s->str 'foo) (str->s (make-string 3 #\\a)) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let len = rt
+        .eval_str_via_vm("<diff>", "(string-length (s->str 'hello))")
+        .unwrap();
+    let first = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(string-ref (s->str (str->s (make-string 3 #\\Z))) 0)",
+        )
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    // Only one of the two functions reliably tiers up in this
+    // pattern (the str->s body returns Symbol-shape so it tiers up;
+    // the s->str body returns Any/String). Either way, semantic
+    // correctness on the result is what we assert.
+    assert!(
+        after >= 1,
+        "symbol<->string never dispatched through JIT (count={after})"
+    );
+    match (&len, &first) {
+        (Value::Number(cs_core::Number::Fixnum(5)), Value::Character('Z')) => {}
+        other => panic!("expected (5, #\\Z), got {:?}", other),
+    }
+}
