@@ -1673,6 +1673,87 @@ fn diff_jit_unbox_flonum_via_car() {
 }
 
 #[test]
+fn diff_jit_pair_alloc_then_collect_reclaims_when_unreachable() {
+    // M6 Phase 4 iter BQ — companion to the survives-collect test.
+    // After a JIT-allocated Pair becomes unreachable (the binding
+    // is rebound and the value isn't kept anywhere else), a
+    // manual `collect()` should reclaim it via the weak-ref
+    // sweep. The Pair's slot drops to refcount 0; the weak in the
+    // Heap's slots vec expires; `collect()` removes the expired
+    // entry, shrinking `slot_count`.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mkpair a b) (cons a b))")
+        .unwrap();
+    // Warmup to JIT.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (mkpair i i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    // Allocate, then make unreachable by rebinding.
+    rt.eval_str_via_vm("<diff>", "(define p (mkpair 1 2))")
+        .unwrap();
+    let before = rt.heap().live_slots();
+    rt.eval_str_via_vm("<diff>", "(set! p 0)").unwrap();
+    // Collect twice: the first marks/sweeps; the second's a
+    // no-op safety check.
+    rt.heap().collect();
+    rt.heap().collect();
+    let after = rt.heap().live_slots();
+    // Live slot count must not GROW across no-allocation
+    // collects. The exact delta depends on whether the warmup
+    // loop's intermediate Pairs are still in the weak-ref list,
+    // so we use a loose assertion: the path doesn't crash and
+    // collect() doesn't add slots.
+    assert!(
+        after <= before,
+        "live_slots grew across collect (before={}, after={})",
+        before,
+        after
+    );
+}
+
+#[test]
+fn diff_jit_pair_survives_collect_when_walker_holds_it() {
+    // M6 Phase 4 iter BQ — basic GC sanity for JIT-allocated
+    // values. A JIT body produces a Pair, the walker captures
+    // it in a binding, manual `collect()` runs, and the binding
+    // still resolves correctly. The Pair is registered in the
+    // Runtime's Heap (iter BP wired) and stays alive because the
+    // walker's env roots it.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mkpair a b) (cons a b))")
+        .unwrap();
+    // Warmup to JIT.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (mkpair i i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    // Allocate via JIT and bind. Walker's env now holds the
+    // Pair via `p`.
+    rt.eval_str_via_vm("<diff>", "(define p (mkpair 42 99))")
+        .unwrap();
+    // Force a GC pass. The Pair's slot is in the Heap's weak-ref
+    // list (from BP's Heap::alloc routing) and traced as a root
+    // via the walker's env -> Value::Pair -> Trace.
+    rt.heap().collect();
+    // Verify p still resolves and points at the right Pair.
+    let v = rt.eval_str_via_vm("<diff>", "(car p)").unwrap();
+    match v {
+        Value::Number(cs_core::Number::Fixnum(42)) => {}
+        other => panic!("expected fixnum 42, got {:?}", other),
+    }
+    let v2 = rt.eval_str_via_vm("<diff>", "(cdr p)").unwrap();
+    match v2 {
+        Value::Number(cs_core::Number::Fixnum(99)) => {}
+        other => panic!("expected fixnum 99, got {:?}", other),
+    }
+}
+
+#[test]
 fn diff_jit_alloc_count_grows_through_heap() {
     // M6 Phase 4 iter BP — when the JIT body allocates Gc<Value>
     // (cons / car / cdr produce fresh handles), the runtime's

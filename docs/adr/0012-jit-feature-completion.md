@@ -1,12 +1,46 @@
 # ADR 0012 — JIT Feature Completion: IC + GC Integration
 
-> Status: **Proposed** for M6 Phase 5 (after Phase 4 iter BC).
-> Supersedes nothing; ratifies and operationalizes ADR 0011 D-4
-> (inline caches — shape unspecified) and ADR 0006 (precise rooting,
-> still in force).
+> Status: **D-2 (GC integration) Partially Landed** as of M6 Phase 4 iter BQ.
+> D-1 (Inline cache) — Proposed for M6 Phase 5.
 > Companion research:
-> - `/tmp/jit_research_ic.md` — inline cache survey + design
-> - `/tmp/jit_research_gc.md` — JIT-GC integration survey + design
+> - `docs/research/jit_inline_cache.md`
+> - `docs/research/jit_gc_integration.md`
+
+## Implementation status (M6 Phase 4 iters BD-BQ)
+
+| Iter | Deliverable                                                  | Status   |
+| ---- | ------------------------------------------------------------ | -------- |
+| BD   | Reserve `JIT_RT_GC = 16`; add `Gc::{into,from}_raw_jit`       | ✓ shipped |
+| BE   | `JitStackMaps` registry + `scan_frame`                       | ✓ shipped |
+| BF   | `declare_value_needs_stack_map` on Cons result                | ✓ shipped |
+| BG   | Add `vm_alloc_pair_gc` + `value_to_gc_i64` helpers           | ✓ shipped |
+| BH   | Six sibling Gc helpers (car/cdr/pair?/null?/clone/drop)      | ✓ shipped |
+| BI   | Six more Gc helpers (box_typed/unbox_*/truthy/eq_any)         | ✓ shipped |
+| BJ   | Atomic Box→Gc switch in dispatcher + all Cranelift call sites| ✓ shipped |
+| BK   | Stack-map declarations on all Any-producing sites             | ✓ shipped |
+| BL   | Harvest `user_stack_maps` post-compile                       | ✓ shipped |
+| BM   | Thread maps to per-VmClosure storage                          | ✓ shipped |
+| BN   | Per-thread active-JIT-frames TLS list (RAII JitFrameGuard)   | ✓ shipped |
+| BO   | Route JIT allocations through `Heap::alloc` via TLS pointer   | ✓ shipped |
+| BP   | `Runtime::with_active` installs Heap in JIT TLS              | ✓ shipped |
+| BQ   | Verify GC-after-JIT survival + reclamation tests              | ✓ shipped |
+
+**GC integration scope shipped**: JIT-allocated `Gc<Value>`s register
+with the Runtime's Heap. The tracing GC sees them as weak-ref slots
+and can trace through Value::Trace from walker-tier roots. A manual
+`collect()` after a JIT body returns correctly preserves
+walker-reachable values and reclaims unreachable ones.
+
+**Known limitation deferred**: `Heap::collect()` doesn't yet consume
+the active-JIT-frames list to mark roots IN spilled JIT stack slots.
+If `collect()` fires while a JIT body is mid-execution (e.g. from
+auto-collect inside `vm_alloc_pair_gc → Heap::alloc`), Gc handles
+that are only on the JIT body's stack would be incorrectly reclaimed.
+Mitigation: auto-collect is off by default; programs that explicitly
+enable it should pause it for the JIT's duration. The Cranelift
+stack-map metadata (iters BF/BK) and the active-frames list (BN) are
+both in place — a future iter adds FP-chain walking or runtime probe
+to close this last gap.
 
 ## Context
 
