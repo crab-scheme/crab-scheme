@@ -790,24 +790,36 @@ pub fn bytecode_to_rir_with_hints(
                                     // is preserved by SSA but unused;
                                     // Cranelift's DCE removes it.
                                     // Always-true predicates: number? / real?
-                                    // / exact-integer? / exact-rational? /
-                                    // exact-real? are correct for both Fixnum
-                                    // and Flonum (Flonum is a number; per R7RS
-                                    // real? is true for any number; exact-X?
-                                    // implicitly checks exactness which is
-                                    // handled by the exact? arm below).
-                                    // integer? / rational? are split out via
-                                    // ADR 0012 D-2 iter EH — for Flonum
-                                    // operand they depend on the value:
-                                    //   integer? = f.is_finite() && fract==0
-                                    //   rational? = f.is_finite()
-                                    ("number?", 1)
-                                    | ("real?", 1)
-                                    | ("exact-integer?", 1)
-                                    | ("exact-rational?", 1)
-                                    | ("exact-real?", 1) => {
+                                    // are correct for both Fixnum and Flonum
+                                    // (Flonum is a number and real). exact-X?
+                                    // is split out below — Flonums are inexact
+                                    // by definition, so all three exact-X?
+                                    // predicates return #f for Flonum operand
+                                    // (ADR 0012 D-2 iter EI). integer? /
+                                    // rational? were split via iter EH.
+                                    ("number?", 1) | ("real?", 1) => {
                                         let _ = args[0]; // load preserved for SSA correctness
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
+                                    }
+                                    // ADR 0012 D-2 (iter EI) — exact-integer?
+                                    // and exact-rational? for Fixnum (or
+                                    // default) are #t. For Flonum, both are
+                                    // #f (flonums are inexact).
+                                    // (exact-real? is not a registered
+                                    // runtime builtin.)
+                                    ("exact-integer?", 1) | ("exact-rational?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        let _ = args[0];
+                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
+                                    }
+                                    ("exact-integer?", 1) | ("exact-rational?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        let _ = args[0];
+                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
                                     }
                                     // integer? / rational? gated on
                                     // !=Flonum default to const-true (Fixnum

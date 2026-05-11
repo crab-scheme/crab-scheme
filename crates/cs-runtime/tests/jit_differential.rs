@@ -5020,3 +5020,49 @@ fn diff_jit_integer_rational_flonum() {
         other => panic!("expected (T, F, F, T, F, F), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_exact_integer_rational_flonum() {
+    // ADR 0012 D-2 (iter EI) — exact-integer? / exact-rational?
+    // for Flonum operand both return #f (flonums are inexact).
+    // Separate Fixnum and Flonum warmups to keep parameter type
+    // stable within each function (matches EH pattern).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ei-fix n) (exact-integer? n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ei-flo x) (exact-integer? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (er-fix n) (exact-rational? n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (er-flo x) (exact-rational? x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (ei-fix 1) (ei-flo 1.0) \
+                      (er-fix 1) (er-flo 1.0) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let ei_fix = rt.eval_str_via_vm("<diff>", "(ei-fix 42)").unwrap();
+    let ei_flo = rt.eval_str_via_vm("<diff>", "(ei-flo 42.0)").unwrap();
+    let er_fix = rt.eval_str_via_vm("<diff>", "(er-fix 42)").unwrap();
+    let er_flo = rt.eval_str_via_vm("<diff>", "(er-flo 1.5)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    // Note: LoadConst-only bodies don't increment jit_call_count
+    // (which tracks vm_* helper invocations). Verify correctness
+    // by value alone.
+    let _ = after;
+    match (&ei_fix, &ei_flo, &er_fix, &er_flo) {
+        (
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (T, F, T, F), got {:?}", other),
+    }
+}
