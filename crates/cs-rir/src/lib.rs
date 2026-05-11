@@ -336,6 +336,12 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter CK).
     ListRef(Value, Value, Value),
 
+    /// `dst = list-copy(lst)`. Lowers to `vm_list_copy_gc`. `lst`
+    /// Any (consumed). `dst` is Any (fresh Gc — the spine is
+    /// freshly allocated; atoms return unchanged). ADR 0012 D-2
+    /// (iter CN).
+    ListCopy(Value, Value),
+
     /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
     /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
     /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).

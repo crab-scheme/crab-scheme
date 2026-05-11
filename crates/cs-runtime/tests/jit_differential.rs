@@ -3000,3 +3000,40 @@ fn diff_jit_substring_slices() {
         other => panic!("expected (5, 0, 5), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_list_copy_fresh_spine() {
+    // ADR 0012 D-2 (iter CN) — list-copy walks the spine and
+    // allocates fresh pairs.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (cp lst) (list-copy lst))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (cp (list 1 2 3)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let len = rt
+        .eval_str_via_vm("<diff>", "(length (cp (list 10 20 30 40)))")
+        .unwrap();
+    let first = rt
+        .eval_str_via_vm("<diff>", "(car (cp (list 100 200 300)))")
+        .unwrap();
+    let empty_len = rt.eval_str_via_vm("<diff>", "(length (cp '()))").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "list-copy never dispatched through JIT (count={after})"
+    );
+    match (&len, &first, &empty_len) {
+        (
+            Value::Number(cs_core::Number::Fixnum(4)),
+            Value::Number(cs_core::Number::Fixnum(100)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (4, 100, 0), got {:?}", other),
+    }
+}

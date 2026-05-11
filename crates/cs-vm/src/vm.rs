@@ -917,6 +917,37 @@ pub unsafe extern "C" fn vm_substring_gc(s: i64, start: i64, end: i64) -> i64 {
     }
 }
 
+/// `(list-copy lst)` — return a freshly allocated copy of `lst`'s
+/// spine. R6RS semantics: for improper lists, copy the spine but
+/// keep the terminating atom as the final cdr; for atoms, return
+/// the atom unmodified (no copy). Consumes one strong refcount on
+/// `lst`. Returns a Gc handle. ADR 0012 D-2 (iter CN).
+///
+/// # Safety
+///
+/// `lst` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_list_copy_gc(lst: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(lst) };
+    let mut elems: Vec<Value> = Vec::new();
+    let mut cur = v;
+    let tail = loop {
+        match cur {
+            Value::Pair(p) => {
+                elems.push(p.car.borrow().clone());
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            other => break other,
+        }
+    };
+    let mut acc = tail;
+    while let Some(e) = elems.pop() {
+        acc = Value::Pair(cs_core::Pair::new(e, acc));
+    }
+    value_to_gc_i64(acc)
+}
+
 /// `(list-tail lst n)` — walk `n` cdrs and return whatever's
 /// there. `lst` is consumed; `n` is a raw Fixnum-shape i64.
 /// On negative `n` or an out-of-range index (spine exhausted

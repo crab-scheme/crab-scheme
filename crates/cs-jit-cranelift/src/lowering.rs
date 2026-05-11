@@ -218,6 +218,9 @@ pub struct Lowerer {
     /// FuncId of `vm_substring_gc(s, start, end) -> i64`. Returns
     /// a fresh Gc<Value::String>. ADR 0012 D-2 (iter CM).
     substring_func: cranelift_module::FuncId,
+    /// FuncId of `vm_list_copy_gc(lst) -> i64`. Returns fresh Gc.
+    /// ADR 0012 D-2 (iter CN).
+    list_copy_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -372,6 +375,8 @@ impl Lowerer {
         builder.symbol("vm_list_ref_gc", cs_vm::vm::vm_list_ref_gc as *const u8);
         // ADR 0012 D-2 (iter CM) — substring.
         builder.symbol("vm_substring_gc", cs_vm::vm::vm_substring_gc as *const u8);
+        // ADR 0012 D-2 (iter CN) — list-copy.
+        builder.symbol("vm_list_copy_gc", cs_vm::vm::vm_list_copy_gc as *const u8);
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
             "vm_char_alphabetic_p",
@@ -834,6 +839,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_substring_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter CN) — vm_list_copy_gc(lst) -> i64.
+        let list_copy_func = module
+            .declare_function(
+                "vm_list_copy_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_list_copy_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -948,6 +962,7 @@ impl Lowerer {
             list_tail_func,
             list_ref_func,
             substring_func,
+            list_copy_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -1223,6 +1238,10 @@ impl Lowerer {
             let substring_fnref = self
                 .module
                 .declare_func_in_func(self.substring_func, builder.func);
+            // iter CN — list-copy.
+            let list_copy_fnref = self
+                .module
+                .declare_func_in_func(self.list_copy_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -1354,6 +1373,7 @@ impl Lowerer {
                         list_tail_fnref,
                         list_ref_fnref,
                         substring_fnref,
+                        list_copy_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -1571,6 +1591,7 @@ fn lower_inst(
     list_tail_fnref: cranelift_codegen::ir::FuncRef,
     list_ref_fnref: cranelift_codegen::ir::FuncRef,
     substring_fnref: cranelift_codegen::ir::FuncRef,
+    list_copy_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -2623,6 +2644,25 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "Substring expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::ListCopy(dst, lst) => {
+            // ADR 0012 D-2 (iter CN) — vm_list_copy_gc consumes the
+            // handle, returns a fresh Gc handle to a freshly-spined
+            // chain (or the atom unchanged for non-list input).
+            let lst_v = lookup(map, *lst)?;
+            let inst_ref = b.ins().call(list_copy_fnref, &[lst_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "ListCopy expected 1 result, got {}",
                         results.len()
                     )));
                 }
