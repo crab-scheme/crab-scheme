@@ -6227,3 +6227,49 @@ fn diff_jit_bytevector_utf8_conversion() {
         other => panic!("expected string, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_log2_atan2() {
+    // ADR 0012 D-2 (iter FM) — log 2-arg + atan 2-arg.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (lg n b) (log n b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (at y x) (atan y x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (lg 8.0 2.0) (at 1.0 1.0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let l8 = rt.eval_str_via_vm("<diff>", "(lg 8.0 2.0)").unwrap();
+    let l100 = rt.eval_str_via_vm("<diff>", "(lg 100.0 10.0)").unwrap();
+    let a45 = rt.eval_str_via_vm("<diff>", "(at 1.0 1.0)").unwrap();
+    let a0 = rt.eval_str_via_vm("<diff>", "(at 0.0 1.0)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    // log_2(8) = 3
+    match &l8 {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 3.0).abs() < 1e-9),
+        other => panic!("expected flonum 3.0, got {:?}", other),
+    }
+    // log_10(100) = 2
+    match &l100 {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 2.0).abs() < 1e-9),
+        other => panic!("expected flonum 2.0, got {:?}", other),
+    }
+    // atan2(1,1) = π/4 ≈ 0.7854
+    match &a45 {
+        Value::Number(cs_core::Number::Flonum(f)) => {
+            assert!((f - std::f64::consts::FRAC_PI_4).abs() < 1e-9)
+        }
+        other => panic!("expected π/4, got {:?}", other),
+    }
+    // atan2(0,1) = 0
+    match &a0 {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!(f.abs() < 1e-9),
+        other => panic!("expected 0.0, got {:?}", other),
+    }
+}

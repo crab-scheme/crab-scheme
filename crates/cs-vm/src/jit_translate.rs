@@ -2460,6 +2460,25 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::FlonumAtan(dst, args[0]));
                                         value_types.insert(dst, Type::Flonum);
                                     }
+                                    // ADR 0012 D-2 (iter FM) — log 2-arg, atan 2-arg.
+                                    ("log", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumLog2(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("atan", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumAtan2(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
                                     ("flmax", 2)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Flonum)
@@ -4238,7 +4257,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::FlonumExp(dst, _)
                 | RirInst::FlonumAsin(dst, _)
                 | RirInst::FlonumAcos(dst, _)
-                | RirInst::FlonumAtan(dst, _) => {
+                | RirInst::FlonumAtan(dst, _)
+                | RirInst::FlonumLog2(dst, _, _)
+                | RirInst::FlonumAtan2(dst, _, _) => {
                     flo_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Flonum(_)) => {

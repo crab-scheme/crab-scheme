@@ -955,6 +955,32 @@ pub unsafe extern "C" fn vm_flonum_exp(x: i64) -> i64 {
     f64::from_bits(x as u64).exp().to_bits() as i64
 }
 
+/// `(log n base)` — logarithm of `n` to base `base`. Both i64 bit
+/// patterns of f64. ADR 0012 D-2 (iter FM).
+///
+/// # Safety
+///
+/// Same as `vm_flonum_sin`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_log2(n: i64, base: i64) -> i64 {
+    f64::from_bits(n as u64)
+        .log(f64::from_bits(base as u64))
+        .to_bits() as i64
+}
+
+/// `(atan y x)` — two-argument arctangent (libm `atan2`). Both i64
+/// bit patterns of f64. ADR 0012 D-2 (iter FM).
+///
+/// # Safety
+///
+/// Same as `vm_flonum_sin`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_atan2(y: i64, x: i64) -> i64 {
+    f64::from_bits(y as u64)
+        .atan2(f64::from_bits(x as u64))
+        .to_bits() as i64
+}
+
 /// `(char-foldcase c)` — case-fold mapping for case-insensitive
 /// comparison. For ASCII this matches `char-downcase` (same as the
 /// bytecode `b_char_foldcase`). ADR 0012 D-2 (iter CS).

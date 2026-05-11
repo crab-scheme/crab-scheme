@@ -156,6 +156,11 @@ pub enum Inst {
     /// (iter DG).
     FlonumAtan(Value, Value),
 
+    /// `dst = log(n, base)` (2-arg logarithm). ADR 0012 D-2 (iter FM).
+    FlonumLog2(Value, Value, Value),
+    /// `dst = atan2(y, x)` (2-arg arctangent). ADR 0012 D-2 (iter FM).
+    FlonumAtan2(Value, Value, Value),
+
     /// `dst = |src|` (flonum). Lowers to Cranelift `fabs`. Strips
     /// the sign bit; NaN propagates unchanged.
     FlonumAbs(Value, Value),
