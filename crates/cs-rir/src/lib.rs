@@ -383,6 +383,12 @@ pub enum Inst {
     /// `dst` Any (Unspecified). ADR 0012 D-2 (iter CZ).
     BvFill(Value, Value, Value),
 
+    /// `dst = string-set!(s, k, ch)`. Lowers to `vm_string_set_gc`.
+    /// `s` Any (consumed), `k` Fixnum, `ch` Character (codepoint).
+    /// `dst` is Any (Unspecified). UTF-8 aware char index. ADR 0012
+    /// D-2 (iter DA).
+    StrSet(Value, Value, Value, Value),
+
     /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
     /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
     /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).

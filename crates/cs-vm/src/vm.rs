@@ -970,6 +970,48 @@ pub unsafe extern "C" fn vm_substring_gc(s: i64, start: i64, end: i64) -> i64 {
     }
 }
 
+/// `(string-set! s k ch)` — replace the k-th character of `s` with
+/// `ch` (UTF-8 aware: indexes are character positions, not byte
+/// offsets). Consumes one strong refcount on `s`. `k` and `ch` are
+/// raw Fixnum-shape i64 (the latter a codepoint). Returns
+/// Gc(Unspecified). On non-string, out-of-range, or invalid
+/// codepoint, requests a deopt. ADR 0012 D-2 (iter DA).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_set_gc(s: i64, k: i64, ch: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    let new_ch = match char::from_u32(ch as u32) {
+        Some(c) => c,
+        None => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+    };
+    if k < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Unspecified);
+    }
+    match v {
+        Value::String(sc) => {
+            let mut chars: Vec<char> = sc.borrow().chars().collect();
+            if (k as usize) >= chars.len() {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            chars[k as usize] = new_ch;
+            *sc.borrow_mut() = chars.into_iter().collect();
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(vector-fill! vec fill)` — overwrite every slot of `vec` with
 /// a clone of `fill`. Consumes one strong refcount on both `vec`
 /// and `fill`. Returns Gc(Unspecified). On non-vector input,

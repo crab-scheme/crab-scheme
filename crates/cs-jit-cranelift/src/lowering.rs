@@ -255,6 +255,9 @@ pub struct Lowerer {
     /// FuncId of `vm_bytevector_fill_gc(bv, fill) -> i64`. ADR 0012
     /// D-2 (iter CZ).
     bv_fill_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_set_gc(s, k, ch) -> i64`. ADR 0012 D-2
+    /// (iter DA).
+    str_set_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -476,6 +479,8 @@ impl Lowerer {
             "vm_bytevector_fill_gc",
             cs_vm::vm::vm_bytevector_fill_gc as *const u8,
         );
+        // ADR 0012 D-2 (iter DA) — string-set!.
+        builder.symbol("vm_string_set_gc", cs_vm::vm::vm_string_set_gc as *const u8);
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
             "vm_char_alphabetic_p",
@@ -1084,6 +1089,15 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_bytevector_fill_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter DA) — vm_string_set_gc(s, k, ch) -> i64.
+        let str_set_func = module
+            .declare_function(
+                "vm_string_set_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_set_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -1295,6 +1309,7 @@ impl Lowerer {
             bv_u8_set_func,
             vec_fill_func,
             bv_fill_func,
+            str_set_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -1622,6 +1637,10 @@ impl Lowerer {
             let bv_fill_fnref = self
                 .module
                 .declare_func_in_func(self.bv_fill_func, builder.func);
+            // iter DA — string-set!.
+            let str_set_fnref = self
+                .module
+                .declare_func_in_func(self.str_set_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -1797,6 +1816,7 @@ impl Lowerer {
                         bv_u8_set_fnref,
                         vec_fill_fnref,
                         bv_fill_fnref,
+                        str_set_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -2035,6 +2055,7 @@ fn lower_inst(
     bv_u8_set_fnref: cranelift_codegen::ir::FuncRef,
     vec_fill_fnref: cranelift_codegen::ir::FuncRef,
     bv_fill_fnref: cranelift_codegen::ir::FuncRef,
+    str_set_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -3314,6 +3335,25 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "BvFill expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StrSet(dst, s, k, ch) => {
+            // ADR 0012 D-2 (iter DA) — vm_string_set_gc.
+            let s_v = lookup(map, *s)?;
+            let k_v = lookup(map, *k)?;
+            let ch_v = lookup(map, *ch)?;
+            let inst_ref = b.ins().call(str_set_fnref, &[s_v, k_v, ch_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StrSet expected 1 result, got {}",
                         results.len()
                     )));
                 }

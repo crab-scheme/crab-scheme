@@ -3556,3 +3556,44 @@ fn diff_jit_vector_bytevector_fill() {
         other => panic!("expected (77, 200), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_set_mutates_char() {
+    // ADR 0012 D-2 (iter DA) — string-set! mutates the k-th
+    // character. Indexes are character (not byte) positions.
+    // Body sequences set! then string-ref to assert the new
+    // codepoint in a single JIT call.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (set-and-read s k n) \
+             (string-set! s k (integer->char n)) (string-ref s k))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (set-and-read (make-string 4 #\\a) 1 65) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // Mutate index 0 of \"aaaaa\" to 'Z' (90); read back as char.
+    let r0 = rt
+        .eval_str_via_vm("<diff>", "(set-and-read (make-string 5 #\\a) 0 90)")
+        .unwrap();
+    // Mutate index 3 to '!' (33).
+    let r3 = rt
+        .eval_str_via_vm("<diff>", "(set-and-read (make-string 5 #\\a) 3 33)")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "string-set! never dispatched through JIT (count={after})"
+    );
+    match (&r0, &r3) {
+        (Value::Character('Z'), Value::Character('!')) => {}
+        other => panic!("expected (#\\Z, #\\!), got {:?}", other),
+    }
+}
