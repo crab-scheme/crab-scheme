@@ -844,6 +844,43 @@ pub unsafe extern "C" fn vm_hashtable_p_gc(r: i64) -> i64 {
     matches!(v, Value::Hashtable(_)) as i64
 }
 
+/// `(hashtable-size ht)` — number of key/value pairs in `ht`.
+/// Deopts on non-hashtable. ADR 0012 D-2 (iter GG).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_size_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Hashtable(h) => h.items.borrow().len() as i64,
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+/// `(hashtable-mutable? ht)` — always #t for valid hashtables in
+/// CrabScheme. Deopts on non-hashtable (the bytecode raises a
+/// type error). Returns raw 0/1. ADR 0012 D-2 (iter GG).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_mutable_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Hashtable(_) => 1,
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
 /// `(div x y)` — R6RS Euclidean division. Result rounds toward -∞
 /// such that `mod` is always non-negative. Deopts on y == 0 (bytecode
 /// raises a condition we don't model here). Both args raw Fixnum-shape.

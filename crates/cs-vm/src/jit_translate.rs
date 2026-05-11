@@ -1808,6 +1808,22 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::HashtableP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter GG) — hashtable-size /
+                                    // hashtable-mutable?.
+                                    ("hashtable-size", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::HashtableSize(dst, args[0]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
+                                    ("hashtable-mutable?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::HashtableMutableP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     ("eof-object?", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
@@ -4982,6 +4998,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::TextualPortP(dst, _)
                 | RirInst::PromiseP(dst, _)
                 | RirInst::HashtableP(dst, _)
+                | RirInst::HashtableMutableP(dst, _)
                 | RirInst::CharNumericP(dst, _)
                 | RirInst::CharWhitespaceP(dst, _)
                 | RirInst::CharUpperCaseP(dst, _)

@@ -7303,3 +7303,45 @@ fn diff_jit_hashtable_p_and_valued_aliases() {
     assert!(matches!(&rv_flo_fin, Value::Boolean(true)));
     assert!(matches!(&rv_flo_inf, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_hashtable_size_and_mutable() {
+    // ADR 0012 D-2 (iter GG) — hashtable-size + hashtable-mutable?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sz ht) (hashtable-size ht))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mu ht) (hashtable-mutable? ht))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm-ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sz warm-ht) (mu warm-ht) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // Empty hashtable
+    let empty = rt
+        .eval_str_via_vm("<diff>", "(sz (make-eqv-hashtable))")
+        .unwrap();
+    // Populated hashtable
+    rt.eval_str_via_vm("<diff>", "(define ht2 (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht2 'a 1)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht2 'b 2)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht2 'c 3)")
+        .unwrap();
+    let pop = rt.eval_str_via_vm("<diff>", "(sz ht2)").unwrap();
+    let mutable = rt
+        .eval_str_via_vm("<diff>", "(mu (make-eqv-hashtable))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&empty, Value::Number(cs_core::Number::Fixnum(0))));
+    assert!(matches!(&pop, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&mutable, Value::Boolean(true)));
+}

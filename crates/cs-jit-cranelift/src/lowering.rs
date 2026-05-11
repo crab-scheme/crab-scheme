@@ -383,6 +383,11 @@ pub struct Lowerer {
     mod_euclid_func: cranelift_module::FuncId,
     /// FuncId of `vm_hashtable_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GF).
     hashtable_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_hashtable_size_gc(ht) -> i64`. ADR 0012 D-2 (iter GG).
+    hashtable_size_func: cranelift_module::FuncId,
+    /// FuncId of `vm_hashtable_mutable_p_gc(ht) -> i64` (0/1).
+    /// ADR 0012 D-2 (iter GG).
+    hashtable_mutable_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -944,6 +949,15 @@ impl Lowerer {
         builder.symbol(
             "vm_hashtable_p_gc",
             cs_vm::vm::vm_hashtable_p_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter GG) — hashtable-size / hashtable-mutable?.
+        builder.symbol(
+            "vm_hashtable_size_gc",
+            cs_vm::vm::vm_hashtable_size_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_hashtable_mutable_p_gc",
+            cs_vm::vm::vm_hashtable_mutable_p_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
@@ -2308,6 +2322,26 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_hashtable_p_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter GG) — hashtable-size / hashtable-mutable?.
+        let hashtable_size_func = module
+            .declare_function(
+                "vm_hashtable_size_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_hashtable_size_gc: {e}"))
+            })?;
+        let hashtable_mutable_p_func = module
+            .declare_function(
+                "vm_hashtable_mutable_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_hashtable_mutable_p_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
             .declare_function(
@@ -3269,6 +3303,8 @@ impl Lowerer {
             div_euclid_func,
             mod_euclid_func,
             hashtable_p_func,
+            hashtable_size_func,
+            hashtable_mutable_p_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -3862,6 +3898,13 @@ impl Lowerer {
             let hashtable_p_fnref = self
                 .module
                 .declare_func_in_func(self.hashtable_p_func, builder.func);
+            // iter GG — hashtable-size / hashtable-mutable?.
+            let hashtable_size_fnref = self
+                .module
+                .declare_func_in_func(self.hashtable_size_func, builder.func);
+            let hashtable_mutable_p_fnref = self
+                .module
+                .declare_func_in_func(self.hashtable_mutable_p_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4338,6 +4381,8 @@ impl Lowerer {
                         div_euclid_fnref,
                         mod_euclid_fnref,
                         hashtable_p_fnref,
+                        hashtable_size_fnref,
+                        hashtable_mutable_p_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -4703,6 +4748,8 @@ fn lower_inst(
     div_euclid_fnref: cranelift_codegen::ir::FuncRef,
     mod_euclid_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_p_fnref: cranelift_codegen::ir::FuncRef,
+    hashtable_size_fnref: cranelift_codegen::ir::FuncRef,
+    hashtable_mutable_p_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -6946,8 +6993,10 @@ fn lower_inst(
         | Inst::BinaryPortP(dst, src)
         | Inst::TextualPortP(dst, src)
         | Inst::PromiseP(dst, src)
-        | Inst::HashtableP(dst, src) => {
-            // ADR 0012 D-2 (iter DD/GC/GD/GF) — port + promise + hashtable.
+        | Inst::HashtableP(dst, src)
+        | Inst::HashtableSize(dst, src)
+        | Inst::HashtableMutableP(dst, src) => {
+            // ADR 0012 D-2 (iter DD/GC/GD/GF/GG) — port/promise/hashtable.
             let v_v = lookup(map, *src)?;
             let fnref = match inst {
                 Inst::PortP(..) => port_p_fnref,
@@ -6957,6 +7006,8 @@ fn lower_inst(
                 Inst::TextualPortP(..) => textual_port_p_fnref,
                 Inst::PromiseP(..) => promise_p_fnref,
                 Inst::HashtableP(..) => hashtable_p_fnref,
+                Inst::HashtableSize(..) => hashtable_size_fnref,
+                Inst::HashtableMutableP(..) => hashtable_mutable_p_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[v_v]);

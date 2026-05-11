@@ -675,6 +675,10 @@ pub enum Inst {
     PromiseP(Value, Value),
     /// `dst = hashtable?(v)`. ADR 0012 D-2 (iter GF).
     HashtableP(Value, Value),
+    /// `dst = hashtable-size(ht)`. ADR 0012 D-2 (iter GG).
+    HashtableSize(Value, Value),
+    /// `dst = hashtable-mutable?(ht)`. ADR 0012 D-2 (iter GG).
+    HashtableMutableP(Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).
