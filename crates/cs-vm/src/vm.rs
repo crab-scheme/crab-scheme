@@ -2912,6 +2912,48 @@ pub unsafe extern "C" fn vm_string_to_number_gc(s: i64) -> i64 {
     }
 }
 
+/// `(vector-copy! dest at src)` — 3-arg form. Copies all elements
+/// of `src` into `dest` starting at index `at`. Consumes both Gc
+/// handles. `at` is a raw Fixnum-shape i64. Returns a Gc handle to
+/// Unspecified. On type/range errors, requests a deopt and returns
+/// Unspecified. ADR 0012 D-2 (iter ER).
+///
+/// # Safety
+///
+/// `dest` and `src` must be live, owned `Gc<Value>` raw handles.
+/// `at` is raw i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_copy_bang_gc(dest: i64, at: i64, src: i64) -> i64 {
+    let dest_v = unsafe { gc_i64_to_value(dest) };
+    let src_v = unsafe { gc_i64_to_value(src) };
+    let (dest_g, src_g) = match (dest_v, src_v) {
+        (Value::Vector(d), Value::Vector(s)) => (d, s),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+    };
+    let src_items = src_g.borrow().clone();
+    let n = src_items.len();
+    if at < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Unspecified);
+    }
+    let at = at as usize;
+    {
+        let mut d = dest_g.borrow_mut();
+        if at + n > d.len() {
+            drop(d);
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+        for i in 0..n {
+            d[at + i] = src_items[i].clone();
+        }
+    }
+    value_to_gc_i64(Value::Unspecified)
+}
+
 /// `(last-pair lst)` — walk `lst` returning the final pair (i.e.
 /// the pair whose cdr is the list's terminator). Consumes the
 /// input Gc handle. On an empty list or improper structure that

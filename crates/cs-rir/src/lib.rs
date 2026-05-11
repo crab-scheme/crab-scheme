@@ -717,6 +717,13 @@ pub enum Inst {
     /// ADR 0012 D-2 (iter EO).
     Last(Value, Value),
 
+    /// `dst = vector-copy!(dest, at, src)`. 3-arg form. Lowers to
+    /// `vm_vector_copy_bang_gc`. `dest` and `src` Any-shape
+    /// (consumed). `at` Fixnum-shape. `dst` is Any (Gc handle to
+    /// Unspecified). Side effect: mutates `dest`. ADR 0012 D-2
+    /// (iter ER).
+    VecCopyBang(Value, Value, Value, Value),
+
     /// `dst = srem(lhs, rhs)`. R6RS `remainder` for fixnums.
     Remainder(Value, Value, Value),
 

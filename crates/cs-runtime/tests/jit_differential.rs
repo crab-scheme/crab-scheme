@@ -5359,3 +5359,44 @@ fn diff_jit_not_type_aware() {
         other => panic!("expected (T, F, F, F, T, F), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_vector_copy_bang_3arg() {
+    // ADR 0012 D-2 (iter ER) — (vector-copy! dest at src). Copies
+    // src into dest starting at index `at`.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (vcb dest at src) (vector-copy! dest at src) dest)",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (vcb (make-vector 4 0) 1 #(10 20)) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // dest = #(0 0 0 0 0), at=1, src=#(7 8 9) → dest becomes #(0 7 8 9 0).
+    let v = rt
+        .eval_str_via_vm("<diff>", "(vcb (make-vector 5 0) 1 #(7 8 9))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &v {
+        Value::Vector(vg) => {
+            let inner = vg.borrow();
+            assert_eq!(inner.len(), 5);
+            // index 0 stays 0, indices 1..=3 = 7, 8, 9, index 4 stays 0.
+            for (i, expected) in [0i64, 7, 8, 9, 0].iter().enumerate() {
+                match &inner[i] {
+                    Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(*n, *expected),
+                    other => panic!("at {i}: expected fixnum {expected}, got {:?}", other),
+                }
+            }
+        }
+        other => panic!("expected vector, got {:?}", other),
+    }
+}
