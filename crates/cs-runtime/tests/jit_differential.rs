@@ -5127,3 +5127,39 @@ fn diff_jit_square_flonum() {
         other => panic!("expected (49, 6.25), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_integer_ops_flonum_guard() {
+    // ADR 0012 D-2 (iter EL) — integer-only ops gated on !=Flonum.
+    // Verify Fixnum operands still JIT correctly and Flonum
+    // operands route to the VM error path.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (and2 a b) (bitwise-and a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mod2 a b) (modulo a b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (and2 12 10) (mod2 7 3) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let and_val = rt.eval_str_via_vm("<diff>", "(and2 12 10)").unwrap();
+    let mod_val = rt.eval_str_via_vm("<diff>", "(mod2 17 5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&and_val, &mod_val) {
+        (Value::Number(cs_core::Number::Fixnum(8)), Value::Number(cs_core::Number::Fixnum(2))) => {}
+        other => panic!("expected (8, 2), got {:?}", other),
+    }
+    // Flonum operand: bitwise-and 1.5 must error rather than
+    // silently produce a wrong i64.
+    let err = rt.eval_str_via_vm("<diff>", "(bitwise-and 1.5 255)");
+    assert!(
+        err.is_err(),
+        "(bitwise-and 1.5 255) should error, got {:?}",
+        err
+    );
+}

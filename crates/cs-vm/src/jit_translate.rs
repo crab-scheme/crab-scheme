@@ -674,30 +674,96 @@ pub fn bytecode_to_rir_with_hints(
                                 // remainder is an alias for modulo;
                                 // floor-quotient is a new FloorQuotient
                                 // RIR with sdiv+adjust lowering.
-                                ("quotient", 2) | ("truncate-quotient", 2) => {
+                                // ADR 0012 D-2 (iter EL) — integer-only ops
+                                // gated on !=Flonum to prevent silent
+                                // miscompile when a Flonum operand sneaks
+                                // through (e.g., from a parameter). Flonum
+                                // operands fall through to the multi-Inst
+                                // section (which doesn't handle them either),
+                                // then to the unsupported tail → deopt to VM
+                                // which gives a proper type-error.
+                                ("quotient", 2) | ("truncate-quotient", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
                                     Some(RirInst::Quotient(dst, args[0], args[1]))
                                 }
-                                ("remainder", 2) | ("truncate-remainder", 2) => {
+                                ("remainder", 2) | ("truncate-remainder", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
                                     Some(RirInst::Remainder(dst, args[0], args[1]))
                                 }
-                                ("modulo", 2) | ("floor-remainder", 2) => {
+                                ("modulo", 2) | ("floor-remainder", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
                                     Some(RirInst::Modulo(dst, args[0], args[1]))
                                 }
-                                ("floor-quotient", 2) => {
+                                ("floor-quotient", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
                                     Some(RirInst::FloorQuotient(dst, args[0], args[1]))
                                 }
-                                ("gcd", 2) => Some(RirInst::Gcd(dst, args[0], args[1])),
-                                ("lcm", 2) => Some(RirInst::Lcm(dst, args[0], args[1])),
-                                ("expt", 2) => Some(RirInst::Expt(dst, args[0], args[1])),
-                                ("arithmetic-shift", 2) | ("bitwise-arithmetic-shift", 2) => {
+                                ("gcd", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::Gcd(dst, args[0], args[1]))
+                                }
+                                ("lcm", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::Lcm(dst, args[0], args[1]))
+                                }
+                                ("expt", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::Expt(dst, args[0], args[1]))
+                                }
+                                ("arithmetic-shift", 2) | ("bitwise-arithmetic-shift", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
                                     Some(RirInst::ArithShift(dst, args[0], args[1]))
                                 }
-                                ("bitwise-and", 2) => Some(RirInst::BitAnd(dst, args[0], args[1])),
-                                ("bitwise-ior", 2) | ("bitwise-or", 2) => {
+                                ("bitwise-and", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitAnd(dst, args[0], args[1]))
+                                }
+                                ("bitwise-ior", 2) | ("bitwise-or", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
                                     Some(RirInst::BitOr(dst, args[0], args[1]))
                                 }
-                                ("bitwise-xor", 2) => Some(RirInst::BitXor(dst, args[0], args[1])),
-                                ("bitwise-not", 1) => Some(RirInst::BitNot(dst, args[0])),
+                                ("bitwise-xor", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitXor(dst, args[0], args[1]))
+                                }
+                                ("bitwise-not", 1)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitNot(dst, args[0]))
+                                }
                                 // ADR 0012 D-2 (iter EB) — abs/max/min are
                                 // Fixnum-only on this fast path. If any
                                 // operand is Flonum the multi-Inst section
