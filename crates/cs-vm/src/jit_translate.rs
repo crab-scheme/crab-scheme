@@ -1036,6 +1036,29 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::ListRef(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter CQ) — bytevector
+                                    // read ops. All gated on Any arg.
+                                    ("bytevector?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("bytevector-length", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvLength(dst, args[0]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
+                                    ("bytevector-u8-ref", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BvU8Ref(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
                                     // ADR 0012 D-2 (iter CN) — list-copy.
                                     ("list-copy", 1)
                                         if value_types.get(&args[0]).copied()
@@ -2164,7 +2187,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::CharNumericP(dst, _)
                 | RirInst::CharWhitespaceP(dst, _)
                 | RirInst::CharUpperCaseP(dst, _)
-                | RirInst::CharLowerCaseP(dst, _) => {
+                | RirInst::CharLowerCaseP(dst, _)
+                | RirInst::BvP(dst, _) => {
                     bool_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Boolean(_)) => {

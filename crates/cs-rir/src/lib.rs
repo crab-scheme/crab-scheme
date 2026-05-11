@@ -348,6 +348,20 @@ pub enum Inst {
     /// pair's car. ADR 0012 D-2 (iter CO).
     ListSet(Value, Value, Value, Value),
 
+    /// `dst = bytevector?(v)`. Lowers to `vm_bytevector_p_gc`.
+    /// `v` Any (consumed). `dst` is Boolean. ADR 0012 D-2 (iter CQ).
+    BvP(Value, Value),
+
+    /// `dst = bytevector-length(bv)`. Lowers to `vm_bytevector_length_gc`.
+    /// `bv` Any (consumed). `dst` is Fixnum (raw byte count).
+    /// ADR 0012 D-2 (iter CQ).
+    BvLength(Value, Value),
+
+    /// `dst = bytevector-u8-ref(bv, k)`. Lowers to
+    /// `vm_bytevector_u8_ref_gc`. `bv` Any (consumed), `k` Fixnum.
+    /// `dst` is Fixnum (the byte 0..=255). ADR 0012 D-2 (iter CQ).
+    BvU8Ref(Value, Value, Value),
+
     /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
     /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
     /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).

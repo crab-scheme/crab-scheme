@@ -230,6 +230,15 @@ pub struct Lowerer {
     /// FuncId of `vm_lcm_fx(a, b) -> i64`. Both operands Fixnum,
     /// result Fixnum. ADR 0012 D-2 (iter CP).
     lcm_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_p_gc(v) -> i64`. Returns 0/1.
+    /// ADR 0012 D-2 (iter CQ).
+    bv_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_length_gc(bv) -> i64`. Returns raw
+    /// Fixnum. ADR 0012 D-2 (iter CQ).
+    bv_length_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_u8_ref_gc(bv, k) -> i64`. Returns
+    /// raw Fixnum (byte). ADR 0012 D-2 (iter CQ).
+    bv_u8_ref_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -391,6 +400,19 @@ impl Lowerer {
         // ADR 0012 D-2 (iter CP) — gcd / lcm.
         builder.symbol("vm_gcd_fx", cs_vm::vm::vm_gcd_fx as *const u8);
         builder.symbol("vm_lcm_fx", cs_vm::vm::vm_lcm_fx as *const u8);
+        // ADR 0012 D-2 (iter CQ) — bytevector read ops.
+        builder.symbol(
+            "vm_bytevector_p_gc",
+            cs_vm::vm::vm_bytevector_p_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_bytevector_length_gc",
+            cs_vm::vm::vm_bytevector_length_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_bytevector_u8_ref_gc",
+            cs_vm::vm::vm_bytevector_u8_ref_gc as *const u8,
+        );
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
             "vm_char_alphabetic_p",
@@ -889,6 +911,33 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_lcm_fx: {e}")))?;
 
+        // ADR 0012 D-2 (iter CQ) — bytevector read ops.
+        let bv_p_func = module
+            .declare_function(
+                "vm_bytevector_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_bytevector_p_gc: {e}")))?;
+        let bv_length_func = module
+            .declare_function(
+                "vm_bytevector_length_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_length_gc: {e}"))
+            })?;
+        let bv_u8_ref_func = module
+            .declare_function(
+                "vm_bytevector_u8_ref_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_u8_ref_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -1007,6 +1056,9 @@ impl Lowerer {
             list_set_func,
             gcd_func,
             lcm_func,
+            bv_p_func,
+            bv_length_func,
+            bv_u8_ref_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -1297,6 +1349,16 @@ impl Lowerer {
             let lcm_fnref = self
                 .module
                 .declare_func_in_func(self.lcm_func, builder.func);
+            // iter CQ — bytevector read ops.
+            let bv_p_fnref = self
+                .module
+                .declare_func_in_func(self.bv_p_func, builder.func);
+            let bv_length_fnref = self
+                .module
+                .declare_func_in_func(self.bv_length_func, builder.func);
+            let bv_u8_ref_fnref = self
+                .module
+                .declare_func_in_func(self.bv_u8_ref_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -1432,6 +1494,9 @@ impl Lowerer {
                         list_set_fnref,
                         gcd_fnref,
                         lcm_fnref,
+                        bv_p_fnref,
+                        bv_length_fnref,
+                        bv_u8_ref_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -1653,6 +1718,9 @@ fn lower_inst(
     list_set_fnref: cranelift_codegen::ir::FuncRef,
     gcd_fnref: cranelift_codegen::ir::FuncRef,
     lcm_fnref: cranelift_codegen::ir::FuncRef,
+    bv_p_fnref: cranelift_codegen::ir::FuncRef,
+    bv_length_fnref: cranelift_codegen::ir::FuncRef,
+    bv_u8_ref_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -2782,6 +2850,55 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "Lcm expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::BvP(dst, src) => {
+            // ADR 0012 D-2 (iter CQ) — vm_bytevector_p_gc. Boolean.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(bv_p_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::BvLength(dst, src) => {
+            // ADR 0012 D-2 (iter CQ) — vm_bytevector_length_gc. Fixnum.
+            let v_v = lookup(map, *src)?;
+            let inst_ref = b.ins().call(bv_length_fnref, &[v_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvLength expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::BvU8Ref(dst, bv, k) => {
+            // ADR 0012 D-2 (iter CQ) — vm_bytevector_u8_ref_gc. Fixnum.
+            let bv_v = lookup(map, *bv)?;
+            let k_v = lookup(map, *k)?;
+            let inst_ref = b.ins().call(bv_u8_ref_fnref, &[bv_v, k_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvU8Ref expected 1 result, got {}",
                         results.len()
                     )));
                 }

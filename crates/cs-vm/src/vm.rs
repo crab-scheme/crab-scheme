@@ -948,6 +948,66 @@ pub unsafe extern "C" fn vm_list_copy_gc(lst: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(bytevector? v)` — true iff `v` is a bytevector. Consume-on-use;
+/// 0/1 out. Total predicate — non-bytevector returns 0 with no deopt.
+/// ADR 0012 D-2 (iter CQ).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::ByteVector(_)) as i64
+}
+
+/// `(bytevector-length bv)` — return length as a raw Fixnum-shape
+/// i64 (NOT a Gc handle). Consume-on-use. On non-bytevector,
+/// requests a deopt and returns 0. ADR 0012 D-2 (iter CQ).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_length_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::ByteVector(bv) => bv.borrow().len() as i64,
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+/// `(bytevector-u8-ref bv k)` — return the byte at index `k` as a
+/// raw Fixnum-shape i64 (0..=255). Consume-on-use on `bv`. On
+/// type miss or out-of-range, requests a deopt and returns 0.
+/// ADR 0012 D-2 (iter CQ).
+///
+/// # Safety
+///
+/// `bv` must be a live, owned `Gc<Value>` raw handle. `k` is a
+/// raw i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_u8_ref_gc(bv: i64, k: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let storage = bvc.borrow();
+            if k < 0 || (k as usize) >= storage.len() {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return 0;
+            }
+            storage[k as usize] as i64
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
 /// `(gcd a b)` — Euclidean GCD on the absolute values of `a` and
 /// `b`. Both operands are raw Fixnum-shape i64; the result is a
 /// raw Fixnum i64. No deopt (gcd is total on fixnums). Matches

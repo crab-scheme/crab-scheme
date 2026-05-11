@@ -3118,3 +3118,53 @@ fn diff_jit_gcd_lcm_pair() {
         other => panic!("expected (4, 4, 7, 24, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_bytevector_read_ops() {
+    // ADR 0012 D-2 (iter CQ) — bytevector? / bytevector-length /
+    // bytevector-u8-ref now lower to runtime helpers. Operand is
+    // Any (Gc handle); results are Boolean (bytevector?) or Fixnum
+    // (length / u8-ref).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bv-p? v) (if (bytevector? v) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bv-len bv) (bytevector-length bv))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bv-at bv k) (bytevector-u8-ref bv k))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (bv-p? (make-bytevector 4 0)) \
+                    (bv-len (make-bytevector 4 0)) \
+                    (bv-at (make-bytevector 4 42) 0) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let p_bv = rt
+        .eval_str_via_vm("<diff>", "(bv-p? (make-bytevector 4 0))")
+        .unwrap();
+    let p_other = rt.eval_str_via_vm("<diff>", "(bv-p? (list 1 2))").unwrap();
+    let len = rt
+        .eval_str_via_vm("<diff>", "(bv-len (make-bytevector 10 0))")
+        .unwrap();
+    let byte = rt
+        .eval_str_via_vm("<diff>", "(bv-at (make-bytevector 4 42) 2)")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "bytevector ops never dispatched through JIT (count={after})"
+    );
+    match (&p_bv, &p_other, &len, &byte) {
+        (
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(10)),
+            Value::Number(cs_core::Number::Fixnum(42)),
+        ) => {}
+        other => panic!("expected (1, 0, 10, 42), got {:?}", other),
+    }
+}
