@@ -4112,3 +4112,44 @@ fn diff_jit_variadic_vector() {
         other => panic!("expected (3, 20, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_variadic_string() {
+    // ADR 0012 D-2 (iter DP) — variadic `string` lowers via stack-
+    // buffer + vm_make_string_buf helper.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s3 a b c) (string a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s0) (string))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (s3 #\\a #\\b #\\c) (s0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let len = rt
+        .eval_str_via_vm("<diff>", "(string-length (s3 #\\x #\\y #\\z))")
+        .unwrap();
+    let ch = rt
+        .eval_str_via_vm("<diff>", "(string-ref (s3 #\\x #\\y #\\z) 1)")
+        .unwrap();
+    let empty_len = rt
+        .eval_str_via_vm("<diff>", "(string-length (s0))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "variadic string never dispatched through JIT (count={after})"
+    );
+    match (&len, &ch, &empty_len) {
+        (
+            Value::Number(cs_core::Number::Fixnum(3)),
+            Value::Character('y'),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (3, #\\y, 0), got {:?}", other),
+    }
+}

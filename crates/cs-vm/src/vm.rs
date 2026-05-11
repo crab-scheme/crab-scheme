@@ -1556,6 +1556,38 @@ pub unsafe extern "C" fn vm_make_vector_buf(buf: *const i64, n: usize) -> i64 {
     ))))
 }
 
+/// `(string c ...)` — variadic string constructor. `buf` points to
+/// `n` raw `Gc<Value>` handles (typically produced by BoxTyped from
+/// Character-shape primitives). Decodes each to a `char`, building a
+/// fresh `Value::String`. Each input handle is consumed (refcount
+/// dropped via `gc_i64_to_value`). On any non-character argument,
+/// requests a deopt and returns an empty-string handle.
+/// ADR 0012 D-2 (iter DP).
+///
+/// # Safety
+///
+/// `buf` must point to a valid array of `n` live, owned `Gc<Value>`
+/// raw handles. Caller manages buffer allocation lifetime (JIT body
+/// stack-allocates for the call duration).
+#[no_mangle]
+pub unsafe extern "C" fn vm_make_string_buf(buf: *const i64, n: usize) -> i64 {
+    let mut s = String::with_capacity(n);
+    for i in 0..n {
+        let raw = unsafe { *buf.add(i) };
+        let v = unsafe { gc_i64_to_value(raw) };
+        match v {
+            Value::Character(c) => s.push(c),
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                    String::new(),
+                ))));
+            }
+        }
+    }
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+}
+
 /// `(make-bytevector n fill)` — allocate a fresh `Value::ByteVector`
 /// of length `n` with every byte set to `fill & 0xFF`. Both args
 /// are raw Fixnum-shape i64 (not Gc handles). Negative `n` clamps
