@@ -1227,7 +1227,15 @@ pub fn bytecode_to_rir_with_hints(
                                     // integer? / rational? gated on
                                     // !=Flonum default to const-true (Fixnum
                                     // is always integer and always rational).
-                                    ("integer?", 1) | ("rational?", 1)
+                                    // ADR 0012 D-2 (iter GF) — integer-valued?
+                                    // and rational-valued? are aliases of
+                                    // integer? and rational? in the CrabScheme
+                                    // tower (no complex numbers; Flonum 5.0
+                                    // already satisfies integer? per iter EH).
+                                    ("integer?", 1)
+                                    | ("rational?", 1)
+                                    | ("integer-valued?", 1)
+                                    | ("rational-valued?", 1)
                                         if value_types.get(&args[0]).copied()
                                             != Some(Type::Flonum) =>
                                     {
@@ -1236,14 +1244,14 @@ pub fn bytecode_to_rir_with_hints(
                                     }
                                     // ADR 0012 D-2 (iter EH) — Flonum-typed
                                     // integer? and rational?.
-                                    ("integer?", 1)
+                                    ("integer?", 1) | ("integer-valued?", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Flonum) =>
                                     {
                                         insts.push(RirInst::FlonumIsInteger(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
-                                    ("rational?", 1)
+                                    ("rational?", 1) | ("rational-valued?", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Flonum) =>
                                     {
@@ -1790,6 +1798,14 @@ pub fn bytecode_to_rir_with_hints(
                                             == Some(Type::Any) =>
                                     {
                                         insts.push(RirInst::PromiseP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    // ADR 0012 D-2 (iter GF) — hashtable?.
+                                    ("hashtable?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::HashtableP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
                                     ("eof-object?", 1)
@@ -4965,6 +4981,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::BinaryPortP(dst, _)
                 | RirInst::TextualPortP(dst, _)
                 | RirInst::PromiseP(dst, _)
+                | RirInst::HashtableP(dst, _)
                 | RirInst::CharNumericP(dst, _)
                 | RirInst::CharWhitespaceP(dst, _)
                 | RirInst::CharUpperCaseP(dst, _)

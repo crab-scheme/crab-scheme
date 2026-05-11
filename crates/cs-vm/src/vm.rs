@@ -832,6 +832,18 @@ pub unsafe extern "C" fn vm_promise_p_gc(r: i64) -> i64 {
     matches!(v, Value::Promise(_)) as i64
 }
 
+/// `(hashtable? v)` — true iff `v` is a Hashtable. Consume-on-use;
+/// 0/1 out. Total predicate. ADR 0012 D-2 (iter GF).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    matches!(v, Value::Hashtable(_)) as i64
+}
+
 /// `(div x y)` — R6RS Euclidean division. Result rounds toward -∞
 /// such that `mod` is always non-negative. Deopts on y == 0 (bytecode
 /// raises a condition we don't model here). Both args raw Fixnum-shape.

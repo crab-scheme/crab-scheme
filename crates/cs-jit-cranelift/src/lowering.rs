@@ -381,6 +381,8 @@ pub struct Lowerer {
     div_euclid_func: cranelift_module::FuncId,
     /// FuncId of `vm_mod_euclid(x, y) -> i64`. ADR 0012 D-2 (iter GE).
     mod_euclid_func: cranelift_module::FuncId,
+    /// FuncId of `vm_hashtable_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GF).
+    hashtable_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -938,6 +940,11 @@ impl Lowerer {
         // ADR 0012 D-2 (iter GE) — R6RS div / mod.
         builder.symbol("vm_div_euclid", cs_vm::vm::vm_div_euclid as *const u8);
         builder.symbol("vm_mod_euclid", cs_vm::vm::vm_mod_euclid as *const u8);
+        // ADR 0012 D-2 (iter GF) — hashtable?.
+        builder.symbol(
+            "vm_hashtable_p_gc",
+            cs_vm::vm::vm_hashtable_p_gc as *const u8,
+        );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
             "vm_bitwise_bit_count",
@@ -2292,6 +2299,15 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_mod_euclid: {e}")))?;
 
+        // ADR 0012 D-2 (iter GF) — hashtable?.
+        let hashtable_p_func = module
+            .declare_function(
+                "vm_hashtable_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_hashtable_p_gc: {e}")))?;
+
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
             .declare_function(
@@ -3252,6 +3268,7 @@ impl Lowerer {
             promise_p_func,
             div_euclid_func,
             mod_euclid_func,
+            hashtable_p_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -3841,6 +3858,10 @@ impl Lowerer {
             let mod_euclid_fnref = self
                 .module
                 .declare_func_in_func(self.mod_euclid_func, builder.func);
+            // iter GF — hashtable?.
+            let hashtable_p_fnref = self
+                .module
+                .declare_func_in_func(self.hashtable_p_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4316,6 +4337,7 @@ impl Lowerer {
                         promise_p_fnref,
                         div_euclid_fnref,
                         mod_euclid_fnref,
+                        hashtable_p_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -4680,6 +4702,7 @@ fn lower_inst(
     promise_p_fnref: cranelift_codegen::ir::FuncRef,
     div_euclid_fnref: cranelift_codegen::ir::FuncRef,
     mod_euclid_fnref: cranelift_codegen::ir::FuncRef,
+    hashtable_p_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -6922,8 +6945,9 @@ fn lower_inst(
         | Inst::OutputPortP(dst, src)
         | Inst::BinaryPortP(dst, src)
         | Inst::TextualPortP(dst, src)
-        | Inst::PromiseP(dst, src) => {
-            // ADR 0012 D-2 (iter DD/GC/GD) — port family + promise?.
+        | Inst::PromiseP(dst, src)
+        | Inst::HashtableP(dst, src) => {
+            // ADR 0012 D-2 (iter DD/GC/GD/GF) — port + promise + hashtable.
             let v_v = lookup(map, *src)?;
             let fnref = match inst {
                 Inst::PortP(..) => port_p_fnref,
@@ -6932,6 +6956,7 @@ fn lower_inst(
                 Inst::BinaryPortP(..) => binary_port_p_fnref,
                 Inst::TextualPortP(..) => textual_port_p_fnref,
                 Inst::PromiseP(..) => promise_p_fnref,
+                Inst::HashtableP(..) => hashtable_p_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[v_v]);

@@ -7263,3 +7263,43 @@ fn diff_jit_div_mod_euclid() {
     assert!(matches!(&fd, Value::Number(cs_core::Number::Fixnum(3))));
     assert!(matches!(&fm, Value::Number(cs_core::Number::Fixnum(2))));
 }
+
+#[test]
+fn diff_jit_hashtable_p_and_valued_aliases() {
+    // ADR 0012 D-2 (iter GF) — hashtable? + integer-valued?/rational-valued?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ht v) (hashtable? v))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (iv n) (integer-valued? n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (rv n) (rational-valued? n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (ht 42) (iv 5) (rv 3.14) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let ht_no = rt.eval_str_via_vm("<diff>", "(ht 42)").unwrap();
+    let ht_yes = rt
+        .eval_str_via_vm("<diff>", "(ht (make-eqv-hashtable))")
+        .unwrap();
+    let iv_fix = rt.eval_str_via_vm("<diff>", "(iv 42)").unwrap();
+    let iv_flo_int = rt.eval_str_via_vm("<diff>", "(iv 5.0)").unwrap();
+    let iv_flo_frac = rt.eval_str_via_vm("<diff>", "(iv 3.14)").unwrap();
+    let rv_fix = rt.eval_str_via_vm("<diff>", "(rv 42)").unwrap();
+    let rv_flo_fin = rt.eval_str_via_vm("<diff>", "(rv 3.14)").unwrap();
+    let rv_flo_inf = rt.eval_str_via_vm("<diff>", "(rv (/ 1.0 0.0))").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&ht_no, Value::Boolean(false)));
+    assert!(matches!(&ht_yes, Value::Boolean(true)));
+    assert!(matches!(&iv_fix, Value::Boolean(true)));
+    assert!(matches!(&iv_flo_int, Value::Boolean(true)));
+    assert!(matches!(&iv_flo_frac, Value::Boolean(false)));
+    assert!(matches!(&rv_fix, Value::Boolean(true)));
+    assert!(matches!(&rv_flo_fin, Value::Boolean(true)));
+    assert!(matches!(&rv_flo_inf, Value::Boolean(false)));
+}

@@ -673,6 +673,8 @@ pub enum Inst {
     TextualPortP(Value, Value),
     /// `dst = promise?(v)`. ADR 0012 D-2 (iter GD).
     PromiseP(Value, Value),
+    /// `dst = hashtable?(v)`. ADR 0012 D-2 (iter GF).
+    HashtableP(Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).
