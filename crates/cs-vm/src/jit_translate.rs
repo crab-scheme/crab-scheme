@@ -2216,6 +2216,47 @@ pub fn bytecode_to_rir_with_hints(
                                             value_types.insert(dst, result_t);
                                         }
                                     }
+                                    // ADR 0012 D-2 (iter DJ) — variadic
+                                    // bitwise ops. Fixnum-only (no Flonum
+                                    // promotion). Identity element for
+                                    // 0-arg: bitwise-and = -1 (all bits set),
+                                    // bitwise-ior/-or = 0, bitwise-xor = 0.
+                                    ("bitwise-and", _)
+                                    | ("bitwise-ior", _)
+                                    | ("bitwise-or", _)
+                                    | ("bitwise-xor", _) => {
+                                        let ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
+                                            match name {
+                                                "bitwise-and" => RirInst::BitAnd,
+                                                "bitwise-ior" | "bitwise-or" => RirInst::BitOr,
+                                                "bitwise-xor" => RirInst::BitXor,
+                                                _ => unreachable!(),
+                                            };
+                                        if args.is_empty() {
+                                            let ident = match name {
+                                                "bitwise-and" => -1i64,
+                                                _ => 0i64,
+                                            };
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Fixnum(ident),
+                                            ));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        } else if args.len() == 1 {
+                                            insts.push(RirInst::Move(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        } else {
+                                            let mut acc = args[0];
+                                            for v in &args[1..args.len() - 1] {
+                                                let next = alloc();
+                                                insts.push(ctor(next, acc, *v));
+                                                value_types.insert(next, Type::Fixnum);
+                                                acc = next;
+                                            }
+                                            insts.push(ctor(dst, acc, *args.last().unwrap()));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                    }
                                     // ADR 0012 D-2 (iter DI) — variadic
                                     // min/max chain. Pattern mirrors +/-/*
                                     // above: Flonum-contagion promotion +

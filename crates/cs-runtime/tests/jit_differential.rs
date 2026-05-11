@@ -3883,3 +3883,42 @@ fn diff_jit_variadic_min_max() {
         other => panic!("expected (3, 9), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_variadic_bitwise() {
+    // ADR 0012 D-2 (iter DJ) — variadic bitwise-and / -ior / -xor.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (and3 a b c) (bitwise-and a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (or3 a b c) (bitwise-or a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (xor3 a b c) (bitwise-xor a b c))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (and3 1 2 3) (or3 1 2 4) (xor3 1 2 4) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let r_and = rt
+        .eval_str_via_vm("<diff>", "(and3 #xFF #x0F #x33)")
+        .unwrap();
+    let r_or = rt.eval_str_via_vm("<diff>", "(or3 1 2 4)").unwrap();
+    let r_xor = rt.eval_str_via_vm("<diff>", "(xor3 1 2 4)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "variadic bitwise never dispatched through JIT (count={after})"
+    );
+    match (&r_and, &r_or, &r_xor) {
+        (
+            Value::Number(cs_core::Number::Fixnum(3)),
+            Value::Number(cs_core::Number::Fixnum(7)),
+            Value::Number(cs_core::Number::Fixnum(7)),
+        ) => {}
+        other => panic!("expected (3, 7, 7), got {:?}", other),
+    }
+}
