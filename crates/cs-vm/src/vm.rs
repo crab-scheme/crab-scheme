@@ -391,6 +391,13 @@ pub fn clear_jit_active_heap() {
     JIT_ACTIVE_HEAP.with(|c| c.set(std::ptr::null()));
 }
 
+/// Read the current active Heap pointer. Returns null if no Heap
+/// is installed. Used by `with_active`-style guards that save the
+/// previous pointer before overwriting.
+pub fn current_jit_active_heap() -> *const cs_gc::Heap {
+    JIT_ACTIVE_HEAP.with(|c| c.get())
+}
+
 /// Encode a `Value` into a Gc-backed raw handle carried as a single
 /// i64 word. Companion to `value_to_any_i64` for the JIT_RT_GC ABI
 /// per ADR 0012 D-2.

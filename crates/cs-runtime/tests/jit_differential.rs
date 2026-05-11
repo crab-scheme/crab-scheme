@@ -1673,6 +1673,46 @@ fn diff_jit_unbox_flonum_via_car() {
 }
 
 #[test]
+fn diff_jit_alloc_count_grows_through_heap() {
+    // M6 Phase 4 iter BP — when the JIT body allocates Gc<Value>
+    // (cons / car / cdr produce fresh handles), the runtime's
+    // Heap should see each allocation because Runtime::with_active
+    // installs the heap pointer in JIT_ACTIVE_HEAP.
+    let defines = &["(define (mkpair a b) (cons a b))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    // Warm up so the body JITs.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (mkpair i i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    let before = rt.heap().alloc_count();
+    cs_vm::vm::reset_jit_call_count();
+    // Fire 200 JIT'd cons calls.
+    for _ in 0..200 {
+        let _ = rt.eval_str_via_vm("<diff>", "(mkpair 5 6)").unwrap();
+    }
+    let after_jit = cs_vm::vm::jit_call_count();
+    assert!(
+        after_jit >= 200,
+        "expected at least 200 JIT dispatches, got {}",
+        after_jit
+    );
+    let after = rt.heap().alloc_count();
+    let grew = after.saturating_sub(before);
+    assert!(
+        grew >= 200,
+        "Heap alloc_count grew by {} (before={}, after={}); expected at least 200 from the 200 JIT'd cons calls",
+        grew,
+        before,
+        after
+    );
+}
+
+#[test]
 fn diff_jit_truthiness_on_any() {
     // M6 Phase 4 iter BC: `(if any-value ...)` must treat
     // Boolean(false) as falsy even when boxed as Any. Pre-fix,

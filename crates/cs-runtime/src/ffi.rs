@@ -59,9 +59,23 @@ impl Runtime {
     /// Used by `Runtime::eval_str` / `eval_str_via_vm` to make
     /// the active runtime reachable from inside builtins that
     /// need it (`(load-shared-library)` etc.).
+    ///
+    /// Also installs this runtime's `Heap` pointer in the JIT
+    /// allocation TLS slot (ADR 0012 D-2, iter BP). JIT-allocated
+    /// Gc<Value> handles produced by Cranelift-emitted code go
+    /// through `Heap::alloc` instead of unregistered `Gc::new`,
+    /// so the tracing GC sees them. The pointer is cleared on
+    /// scope exit.
     pub fn with_active<R>(&mut self, f: impl FnOnce(&mut Runtime) -> R) -> R {
         let prev = ACTIVE_RUNTIME.with(|c| c.replace(self as *mut Runtime));
+        // SAFETY: `self.heap` is owned by this Runtime and `self`
+        // outlives the closure call below.
+        let prev_heap = cs_vm::vm::current_jit_active_heap();
+        unsafe { cs_vm::vm::set_jit_active_heap(&self.heap as *const cs_gc::Heap) };
         let result = f(self);
+        // Restore previous heap pointer (typically null) so nested
+        // with_active calls work correctly.
+        unsafe { cs_vm::vm::set_jit_active_heap(prev_heap) };
         ACTIVE_RUNTIME.with(|c| c.set(prev));
         result
     }
