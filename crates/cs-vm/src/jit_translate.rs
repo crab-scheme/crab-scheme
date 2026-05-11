@@ -2467,7 +2467,17 @@ pub fn bytecode_to_rir_with_hints(
                                     // Box pointers; if one side is a typed
                                     // immediate (Fixnum / Boolean / Symbol /
                                     // ...) we wrap it first via BoxTyped.
-                                    ("eq?", 2) | ("eqv?", 2)
+                                    // ADR 0012 D-2 (iter EG) — extend the Any-
+                                    // arg eq routing to boolean=?/char=?/
+                                    // symbol=?. Closes a latent gap where
+                                    // integer Eq would compare Gc pointers
+                                    // instead of inner values when either side
+                                    // is Any-shape.
+                                    ("eq?", 2)
+                                    | ("eqv?", 2)
+                                    | ("boolean=?", 2)
+                                    | ("char=?", 2)
+                                    | ("symbol=?", 2)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any)
                                             || value_types.get(&args[1]).copied()

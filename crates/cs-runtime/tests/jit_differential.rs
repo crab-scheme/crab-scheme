@@ -4920,3 +4920,51 @@ fn diff_jit_nan_infinite_finite_flo() {
         other => panic!("expected (T, F, T, F, T, F, F), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_typed_eq_any_args() {
+    // ADR 0012 D-2 (iter EG) — boolean=?/char=?/symbol=? on
+    // Any-shape args route through EqAny. Function parameters are
+    // Any-shape until proven otherwise, so the integer-Eq fast
+    // path would compare Gc pointers — wrong. EqAny decodes both
+    // boxes and compares inner values.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (b= a b) (boolean=? a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (c= a b) (char=? a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s= a b) (symbol=? a b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (b= #t #t) (c= #\\a #\\a) (s= 'x 'x) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let bt = rt.eval_str_via_vm("<diff>", "(b= #t #t)").unwrap();
+    let bf = rt.eval_str_via_vm("<diff>", "(b= #t #f)").unwrap();
+    let ct = rt.eval_str_via_vm("<diff>", "(c= #\\a #\\a)").unwrap();
+    let cf = rt.eval_str_via_vm("<diff>", "(c= #\\a #\\b)").unwrap();
+    let st = rt.eval_str_via_vm("<diff>", "(s= 'foo 'foo)").unwrap();
+    let sf = rt.eval_str_via_vm("<diff>", "(s= 'foo 'bar)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "boolean=?/char=?/symbol=? never dispatched through JIT (count={after})"
+    );
+    match (&bt, &bf, &ct, &cf, &st, &sf) {
+        (
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (T, F, T, F, T, F), got {:?}", other),
+    }
+}
