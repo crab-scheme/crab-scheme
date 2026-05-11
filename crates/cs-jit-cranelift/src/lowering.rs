@@ -239,6 +239,12 @@ pub struct Lowerer {
     /// FuncId of `vm_bytevector_u8_ref_gc(bv, k) -> i64`. Returns
     /// raw Fixnum (byte). ADR 0012 D-2 (iter CQ).
     bv_u8_ref_func: cranelift_module::FuncId,
+    /// FuncId of `vm_alloc_bytevector_gc(n, fill) -> i64`. Returns
+    /// a fresh Gc<Value::ByteVector>. ADR 0012 D-2 (iter CR).
+    bv_alloc_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_u8_set_gc(bv, k, val) -> i64`. Returns
+    /// Gc(Unspecified). ADR 0012 D-2 (iter CR).
+    bv_u8_set_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -412,6 +418,15 @@ impl Lowerer {
         builder.symbol(
             "vm_bytevector_u8_ref_gc",
             cs_vm::vm::vm_bytevector_u8_ref_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter CR) — bytevector write ops.
+        builder.symbol(
+            "vm_alloc_bytevector_gc",
+            cs_vm::vm::vm_alloc_bytevector_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_bytevector_u8_set_gc",
+            cs_vm::vm::vm_bytevector_u8_set_gc as *const u8,
         );
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
@@ -938,6 +953,26 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_bytevector_u8_ref_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter CR) — bytevector write ops.
+        let bv_alloc_func = module
+            .declare_function(
+                "vm_alloc_bytevector_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_alloc_bytevector_gc: {e}"))
+            })?;
+        let bv_u8_set_func = module
+            .declare_function(
+                "vm_bytevector_u8_set_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_u8_set_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -1059,6 +1094,8 @@ impl Lowerer {
             bv_p_func,
             bv_length_func,
             bv_u8_ref_func,
+            bv_alloc_func,
+            bv_u8_set_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -1359,6 +1396,13 @@ impl Lowerer {
             let bv_u8_ref_fnref = self
                 .module
                 .declare_func_in_func(self.bv_u8_ref_func, builder.func);
+            // iter CR — bytevector write ops.
+            let bv_alloc_fnref = self
+                .module
+                .declare_func_in_func(self.bv_alloc_func, builder.func);
+            let bv_u8_set_fnref = self
+                .module
+                .declare_func_in_func(self.bv_u8_set_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -1497,6 +1541,8 @@ impl Lowerer {
                         bv_p_fnref,
                         bv_length_fnref,
                         bv_u8_ref_fnref,
+                        bv_alloc_fnref,
+                        bv_u8_set_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -1721,6 +1767,8 @@ fn lower_inst(
     bv_p_fnref: cranelift_codegen::ir::FuncRef,
     bv_length_fnref: cranelift_codegen::ir::FuncRef,
     bv_u8_ref_fnref: cranelift_codegen::ir::FuncRef,
+    bv_alloc_fnref: cranelift_codegen::ir::FuncRef,
+    bv_u8_set_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -2904,6 +2952,45 @@ fn lower_inst(
                 }
                 results[0]
             };
+            map.insert(*dst, result);
+        }
+        Inst::BvAlloc(dst, n, fill) => {
+            // ADR 0012 D-2 (iter CR) — vm_alloc_bytevector_gc. Returns
+            // a fresh Gc<Value::ByteVector>; mark for stack-map tracking.
+            let n_v = lookup(map, *n)?;
+            let fill_v = lookup(map, *fill)?;
+            let inst_ref = b.ins().call(bv_alloc_fnref, &[n_v, fill_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvAlloc expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::BvU8Set(dst, bv, k, val) => {
+            // ADR 0012 D-2 (iter CR) — vm_bytevector_u8_set_gc.
+            // Consumes bv, returns Gc(Unspecified).
+            let bv_v = lookup(map, *bv)?;
+            let k_v = lookup(map, *k)?;
+            let val_v = lookup(map, *val)?;
+            let inst_ref = b.ins().call(bv_u8_set_fnref, &[bv_v, k_v, val_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvU8Set expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
         Inst::CharAlphabeticP(dst, src) => {

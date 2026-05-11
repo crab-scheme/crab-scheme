@@ -1059,6 +1059,19 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::BvU8Ref(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Fixnum);
                                     }
+                                    // ADR 0012 D-2 (iter CR) — bytevector write ops.
+                                    ("make-bytevector", 2) => {
+                                        insts.push(RirInst::BvAlloc(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("bytevector-u8-set!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts
+                                            .push(RirInst::BvU8Set(dst, args[0], args[1], args[2]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter CN) — list-copy.
                                     ("list-copy", 1)
                                         if value_types.get(&args[0]).copied()
@@ -2258,7 +2271,9 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::ListRef(dst, _, _)
                 | RirInst::Substring(dst, _, _, _)
                 | RirInst::ListCopy(dst, _)
-                | RirInst::ListSet(dst, _, _, _) => {
+                | RirInst::ListSet(dst, _, _, _)
+                | RirInst::BvAlloc(dst, _, _)
+                | RirInst::BvU8Set(dst, _, _, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

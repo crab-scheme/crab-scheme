@@ -3168,3 +3168,53 @@ fn diff_jit_bytevector_read_ops() {
         other => panic!("expected (1, 0, 10, 42), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_bytevector_write_ops() {
+    // ADR 0012 D-2 (iter CR) — make-bytevector + bytevector-u8-set!.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mk-bv n fill) (make-bytevector n fill))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (set-and-read bv k v) \
+             (bytevector-u8-set! bv k v) (bytevector-u8-ref bv k))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (mk-bv 4 7) \
+                    (set-and-read (make-bytevector 4 0) 1 99) \
+                    (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let len = rt
+        .eval_str_via_vm("<diff>", "(bytevector-length (mk-bv 8 #xAB))")
+        .unwrap();
+    let byte0 = rt
+        .eval_str_via_vm("<diff>", "(bytevector-u8-ref (mk-bv 8 #xAB) 0)")
+        .unwrap();
+    let byte7 = rt
+        .eval_str_via_vm("<diff>", "(bytevector-u8-ref (mk-bv 8 #xAB) 7)")
+        .unwrap();
+    let mutated = rt
+        .eval_str_via_vm("<diff>", "(set-and-read (make-bytevector 5 0) 2 42)")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "bytevector write ops never dispatched through JIT (count={after})"
+    );
+    match (&len, &byte0, &byte7, &mutated) {
+        (
+            Value::Number(cs_core::Number::Fixnum(8)),
+            Value::Number(cs_core::Number::Fixnum(171)),
+            Value::Number(cs_core::Number::Fixnum(171)),
+            Value::Number(cs_core::Number::Fixnum(42)),
+        ) => {}
+        other => panic!("expected (8, 171, 171, 42), got {:?}", other),
+    }
+}

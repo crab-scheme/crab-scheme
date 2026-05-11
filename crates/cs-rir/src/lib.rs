@@ -362,6 +362,17 @@ pub enum Inst {
     /// `dst` is Fixnum (the byte 0..=255). ADR 0012 D-2 (iter CQ).
     BvU8Ref(Value, Value, Value),
 
+    /// `dst = make-bytevector(n, fill)`. Lowers to
+    /// `vm_alloc_bytevector_gc`. Both args Fixnum. `dst` is Any
+    /// (fresh Gc<Value::ByteVector>). ADR 0012 D-2 (iter CR).
+    BvAlloc(Value, Value, Value),
+
+    /// `dst = bytevector-u8-set!(bv, k, val)`. Lowers to
+    /// `vm_bytevector_u8_set_gc`. `bv` Any (consumed), `k` and
+    /// `val` Fixnum. `dst` is Any (Gc handle to Unspecified).
+    /// Side effect: mutates `bv[k]`. ADR 0012 D-2 (iter CR).
+    BvU8Set(Value, Value, Value, Value),
+
     /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
     /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
     /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).

@@ -948,6 +948,56 @@ pub unsafe extern "C" fn vm_list_copy_gc(lst: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(make-bytevector n fill)` — allocate a fresh `Value::ByteVector`
+/// of length `n` with every byte set to `fill & 0xFF`. Both args
+/// are raw Fixnum-shape i64 (not Gc handles). Negative `n` clamps
+/// to 0. Returns a Gc handle. ADR 0012 D-2 (iter CR).
+///
+/// # Safety
+///
+/// Arguments are raw i64; no Gc handle invariants.
+#[no_mangle]
+pub unsafe extern "C" fn vm_alloc_bytevector_gc(n: i64, fill: i64) -> i64 {
+    let len = if n < 0 { 0usize } else { n as usize };
+    let byte = (fill & 0xFF) as u8;
+    let storage: Vec<u8> = vec![byte; len];
+    value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(std::cell::RefCell::new(
+        storage,
+    ))))
+}
+
+/// `(bytevector-u8-set! bv k val)` — store `val & 0xFF` at index
+/// `k` of `bv`. Consumes one strong refcount on `bv`. `k` and `val`
+/// are raw Fixnum-shape i64. Returns a Gc handle to
+/// `Value::Unspecified`. On type miss or out-of-range, requests a
+/// deopt. ADR 0012 D-2 (iter CR).
+///
+/// # Safety
+///
+/// `bv` must be a live, owned `Gc<Value>` raw handle. `k` and
+/// `val` are raw i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_u8_set_gc(bv: i64, k: i64, val: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let mut storage = bvc.borrow_mut();
+            if k < 0 || (k as usize) >= storage.len() {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            storage[k as usize] = (val & 0xFF) as u8;
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(bytevector? v)` — true iff `v` is a bytevector. Consume-on-use;
 /// 0/1 out. Total predicate — non-bytevector returns 0 with no deopt.
 /// ADR 0012 D-2 (iter CQ).
