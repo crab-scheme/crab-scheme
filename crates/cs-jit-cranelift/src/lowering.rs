@@ -435,6 +435,16 @@ pub struct Lowerer {
     /// FuncId of `vm_string_replace_all_gc(s, from, to) -> i64`.
     /// ADR 0012 D-2 (iter FI).
     string_replace_all_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_take_gc(s, n) -> i64`. ADR 0012 D-2 (iter FJ).
+    string_take_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_drop_gc(s, n) -> i64`. ADR 0012 D-2 (iter FJ).
+    string_drop_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_take_right_gc(s, n) -> i64`.
+    /// ADR 0012 D-2 (iter FJ).
+    string_take_right_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_drop_right_gc(s, n) -> i64`.
+    /// ADR 0012 D-2 (iter FJ).
+    string_drop_right_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_list_fill_gc(n, fill) -> i64`. ADR 0012
     /// D-2 (iter EM).
     make_list_fill_func: cranelift_module::FuncId,
@@ -891,6 +901,23 @@ impl Lowerer {
         builder.symbol(
             "vm_string_replace_all_gc",
             cs_vm::vm::vm_string_replace_all_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter FJ) — string-take/-drop/-take-right/-drop-right.
+        builder.symbol(
+            "vm_string_take_gc",
+            cs_vm::vm::vm_string_take_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_drop_gc",
+            cs_vm::vm::vm_string_drop_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_take_right_gc",
+            cs_vm::vm::vm_string_take_right_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_string_drop_right_gc",
+            cs_vm::vm::vm_string_drop_right_gc as *const u8,
         );
         // ADR 0012 D-2 (iter EM) — make-list 2-arg.
         builder.symbol(
@@ -2160,6 +2187,40 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_string_replace_all_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter FJ) — string-take/-drop/-take-right/-drop-right.
+        let string_take_func = module
+            .declare_function(
+                "vm_string_take_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_take_gc: {e}")))?;
+        let string_drop_func = module
+            .declare_function(
+                "vm_string_drop_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_string_drop_gc: {e}")))?;
+        let string_take_right_func = module
+            .declare_function(
+                "vm_string_take_right_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_take_right_gc: {e}"))
+            })?;
+        let string_drop_right_func = module
+            .declare_function(
+                "vm_string_drop_right_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_drop_right_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter EM) — vm_make_list_fill_gc(n, fill) -> i64.
         // Same shape as vector_ref_sig (two i64 in, one out).
         let make_list_fill_func = module
@@ -2466,6 +2527,10 @@ impl Lowerer {
             string_trim_left_func,
             string_trim_right_func,
             string_replace_all_func,
+            string_take_func,
+            string_drop_func,
+            string_take_right_func,
+            string_drop_right_func,
             make_list_fill_func,
             iota_n_func,
             iota_ns_func,
@@ -3052,6 +3117,19 @@ impl Lowerer {
             let string_replace_all_fnref = self
                 .module
                 .declare_func_in_func(self.string_replace_all_func, builder.func);
+            // iter FJ — string-take/-drop/-take-right/-drop-right.
+            let string_take_fnref = self
+                .module
+                .declare_func_in_func(self.string_take_func, builder.func);
+            let string_drop_fnref = self
+                .module
+                .declare_func_in_func(self.string_drop_func, builder.func);
+            let string_take_right_fnref = self
+                .module
+                .declare_func_in_func(self.string_take_right_func, builder.func);
+            let string_drop_right_fnref = self
+                .module
+                .declare_func_in_func(self.string_drop_right_func, builder.func);
             // iter EM — make-list 2-arg.
             let make_list_fill_fnref = self
                 .module
@@ -3313,6 +3391,10 @@ impl Lowerer {
                         string_trim_left_fnref,
                         string_trim_right_fnref,
                         string_replace_all_fnref,
+                        string_take_fnref,
+                        string_drop_fnref,
+                        string_take_right_fnref,
+                        string_drop_right_fnref,
                         make_list_fill_fnref,
                         iota_n_fnref,
                         iota_ns_fnref,
@@ -3627,6 +3709,10 @@ fn lower_inst(
     string_trim_left_fnref: cranelift_codegen::ir::FuncRef,
     string_trim_right_fnref: cranelift_codegen::ir::FuncRef,
     string_replace_all_fnref: cranelift_codegen::ir::FuncRef,
+    string_take_fnref: cranelift_codegen::ir::FuncRef,
+    string_drop_fnref: cranelift_codegen::ir::FuncRef,
+    string_take_right_fnref: cranelift_codegen::ir::FuncRef,
+    string_drop_right_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
     iota_ns_fnref: cranelift_codegen::ir::FuncRef,
@@ -5999,6 +6085,34 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "StringSplit expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringTake(dst, s, n)
+        | Inst::StringDrop(dst, s, n)
+        | Inst::StringTakeRight(dst, s, n)
+        | Inst::StringDropRight(dst, s, n) => {
+            // ADR 0012 D-2 (iter FJ) — string-take/-drop/-take-right/-drop-right.
+            let sv = lookup(map, *s)?;
+            let nv = lookup(map, *n)?;
+            let fnref = match inst {
+                Inst::StringTake(..) => string_take_fnref,
+                Inst::StringDrop(..) => string_drop_fnref,
+                Inst::StringTakeRight(..) => string_take_right_fnref,
+                Inst::StringDropRight(..) => string_drop_right_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[sv, nv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringTake/Drop expected 1 result, got {}",
                         results.len()
                     )));
                 }

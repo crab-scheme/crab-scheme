@@ -6078,3 +6078,42 @@ fn diff_jit_string_replace_all() {
         other => panic!("expected three strings, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_take_drop_family() {
+    // ADR 0012 D-2 (iter FJ) — string-take/-drop/-take-right/-drop-right.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (st s n) (string-take s n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sd s n) (string-drop s n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (str s n) (string-take-right s n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sdr s n) (string-drop-right s n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (st \"abcdef\" 3) (sd \"abcdef\" 3) \
+                      (str \"abcdef\" 3) (sdr \"abcdef\" 3) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let t = rt.eval_str_via_vm("<diff>", "(st \"hello\" 3)").unwrap();
+    let d = rt.eval_str_via_vm("<diff>", "(sd \"hello\" 3)").unwrap();
+    let tr = rt.eval_str_via_vm("<diff>", "(str \"hello\" 3)").unwrap();
+    let dr = rt.eval_str_via_vm("<diff>", "(sdr \"hello\" 3)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&t, &d, &tr, &dr) {
+        (Value::String(a), Value::String(b), Value::String(c), Value::String(e)) => {
+            assert_eq!(&*a.borrow(), "hel");
+            assert_eq!(&*b.borrow(), "lo");
+            assert_eq!(&*c.borrow(), "llo");
+            assert_eq!(&*e.borrow(), "he");
+        }
+        other => panic!("expected four strings, got {:?}", other),
+    }
+}

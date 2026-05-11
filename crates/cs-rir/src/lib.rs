@@ -739,6 +739,15 @@ pub enum Inst {
     /// `dst = string-replace-all(s, from, to)`. ADR 0012 D-2 (iter FI).
     StringReplaceAll(Value, Value, Value, Value),
 
+    /// `dst = string-take(s, n)`. ADR 0012 D-2 (iter FJ).
+    StringTake(Value, Value, Value),
+    /// `dst = string-drop(s, n)`. ADR 0012 D-2 (iter FJ).
+    StringDrop(Value, Value, Value),
+    /// `dst = string-take-right(s, n)`. ADR 0012 D-2 (iter FJ).
+    StringTakeRight(Value, Value, Value),
+    /// `dst = string-drop-right(s, n)`. ADR 0012 D-2 (iter FJ).
+    StringDropRight(Value, Value, Value),
+
     /// `dst = make-list(n, fill)`. Lowers to `vm_make_list_fill_gc`.
     /// `n` Fixnum-shape (raw i64). `fill` Any-shape (consumed).
     /// `dst` is Any (fresh Gc handle to a Null-terminated list).

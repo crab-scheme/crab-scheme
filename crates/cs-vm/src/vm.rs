@@ -3614,6 +3614,122 @@ pub unsafe extern "C" fn vm_string_pad_right_gc(s: i64, width: i64) -> i64 {
     value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
 }
 
+/// `(string-take s n)` — SRFI-13. Take first `n` characters.
+/// ADR 0012 D-2 (iter FJ).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_take_gc(s: i64, n: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    let s_str = match v {
+        Value::String(sg) => sg.borrow().clone(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))));
+        }
+    };
+    if n < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            String::new(),
+        ))));
+    }
+    let out: String = s_str.chars().take(n as usize).collect();
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+}
+
+/// `(string-drop s n)` — SRFI-13. Drop the first `n` characters.
+/// ADR 0012 D-2 (iter FJ).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_drop_gc(s: i64, n: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    let s_str = match v {
+        Value::String(sg) => sg.borrow().clone(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))));
+        }
+    };
+    if n < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            String::new(),
+        ))));
+    }
+    let out: String = s_str.chars().skip(n as usize).collect();
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+}
+
+/// `(string-take-right s n)` — SRFI-13. Take the last `n` characters.
+/// ADR 0012 D-2 (iter FJ).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_take_right_gc(s: i64, n: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    let s_str = match v {
+        Value::String(sg) => sg.borrow().clone(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))));
+        }
+    };
+    if n < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            String::new(),
+        ))));
+    }
+    let total: usize = s_str.chars().count();
+    let n = (n as usize).min(total);
+    let out: String = s_str.chars().skip(total - n).collect();
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+}
+
+/// `(string-drop-right s n)` — SRFI-13. Drop the last `n` characters.
+/// ADR 0012 D-2 (iter FJ).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_drop_right_gc(s: i64, n: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    let s_str = match v {
+        Value::String(sg) => sg.borrow().clone(),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))));
+        }
+    };
+    if n < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            String::new(),
+        ))));
+    }
+    let total: usize = s_str.chars().count();
+    let keep = total.saturating_sub(n as usize);
+    let out: String = s_str.chars().take(keep).collect();
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn vm_string_split_gc(s: i64, sep: i64) -> i64 {
     let s_v = unsafe { gc_i64_to_value(s) };

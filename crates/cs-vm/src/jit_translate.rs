@@ -2704,6 +2704,45 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StringPadRight(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter FJ) — string-take/-drop/
+                                    // -take-right/-drop-right. All take (String,
+                                    // Fixnum) and return a fresh String.
+                                    ("string-take", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::StringTake(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("string-drop", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::StringDrop(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("string-take-right", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::StringTakeRight(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("string-drop-right", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::StringDropRight(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter FF) — string-split 2-arg.
                                     // sep may be String (Any) or Character;
                                     // BoxTyped if Character so the helper sees
@@ -4212,6 +4251,10 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StringTrimLeft(dst, _)
                 | RirInst::StringTrimRight(dst, _)
                 | RirInst::StringReplaceAll(dst, _, _, _)
+                | RirInst::StringTake(dst, _, _)
+                | RirInst::StringDrop(dst, _, _)
+                | RirInst::StringTakeRight(dst, _, _)
+                | RirInst::StringDropRight(dst, _, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)
