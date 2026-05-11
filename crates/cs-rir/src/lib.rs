@@ -168,6 +168,16 @@ pub enum Inst {
     /// (iter FN).
     BitwiseLength(Value, Value),
 
+    /// `dst = bitwise-arithmetic-shift-left(n, count)`. (Fixnum,
+    /// Fixnum) -> Fixnum. ADR 0012 D-2 (iter FO).
+    BitwiseArithShiftLeft(Value, Value, Value),
+    /// `dst = bitwise-arithmetic-shift-right(n, count)`. (Fixnum,
+    /// Fixnum) -> Fixnum. ADR 0012 D-2 (iter FO).
+    BitwiseArithShiftRight(Value, Value, Value),
+    /// `dst = bitwise-bit-set?(n, bit)`. (Fixnum, Fixnum) ->
+    /// Boolean (raw 0/1). ADR 0012 D-2 (iter FO).
+    BitwiseBitSetP(Value, Value, Value),
+
     /// `dst = |src|` (flonum). Lowers to Cranelift `fabs`. Strips
     /// the sign bit; NaN propagates unchanged.
     FlonumAbs(Value, Value),

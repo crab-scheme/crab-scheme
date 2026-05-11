@@ -1016,6 +1016,69 @@ pub unsafe extern "C" fn vm_bitwise_length(n: i64) -> i64 {
     }
 }
 
+/// `(bitwise-arithmetic-shift-left n count)` — left shift with
+/// R6RS semantics: count ≥ 0 required; count ≥ 64 saturates to 0.
+/// Matches `b_bitwise_arith_shift_left`. Negative count deopts (the
+/// bytecode raises a condition). ADR 0012 D-2 (iter FO).
+///
+/// # Safety
+///
+/// Both args are raw Fixnum-shape i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bitwise_arith_shift_left(n: i64, count: i64) -> i64 {
+    if count < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return 0;
+    }
+    if count >= 64 {
+        0
+    } else {
+        n.wrapping_shl(count as u32)
+    }
+}
+
+/// `(bitwise-arithmetic-shift-right n count)` — arithmetic right
+/// shift (sign-extends). count ≥ 64 saturates to -1/0 based on the
+/// sign of `n`. Matches `b_bitwise_arith_shift_right`. Negative
+/// count deopts. ADR 0012 D-2 (iter FO).
+///
+/// # Safety
+///
+/// Same as `vm_bitwise_arith_shift_left`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bitwise_arith_shift_right(n: i64, count: i64) -> i64 {
+    if count < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return 0;
+    }
+    if count >= 64 {
+        if n < 0 {
+            -1
+        } else {
+            0
+        }
+    } else {
+        n.wrapping_shr(count as u32)
+    }
+}
+
+/// `(bitwise-bit-set? n bit)` — test whether bit `bit` is set in
+/// `n`. Returns raw 0/1 (Boolean shape). Out-of-range `bit`
+/// (negative or ≥ 64) returns 0 — matches the bytecode. ADR 0012
+/// D-2 (iter FO).
+///
+/// # Safety
+///
+/// Both args are raw Fixnum-shape i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bitwise_bit_set_p(n: i64, bit: i64) -> i64 {
+    if !(0..64).contains(&bit) {
+        0
+    } else {
+        ((n >> bit) & 1) as i64
+    }
+}
+
 /// `(char-foldcase c)` — case-fold mapping for case-insensitive
 /// comparison. For ASCII this matches `char-downcase` (same as the
 /// bytecode `b_char_foldcase`). ADR 0012 D-2 (iter CS).

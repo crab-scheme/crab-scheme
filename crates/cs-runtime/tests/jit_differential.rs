@@ -6309,3 +6309,50 @@ fn diff_jit_bitwise_bit_count_length() {
     assert!(matches!(&l1, Value::Number(cs_core::Number::Fixnum(1))));
     assert!(matches!(&l0, Value::Number(cs_core::Number::Fixnum(0))));
 }
+
+#[test]
+fn diff_jit_bitwise_shift_and_bit_set_p() {
+    // ADR 0012 D-2 (iter FO) — bitwise shift-left/-right + bit-set?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (sl n c) (bitwise-arithmetic-shift-left n c))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (sr n c) (bitwise-arithmetic-shift-right n c))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bs n b) (bitwise-bit-set? n b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sl 1 3) (sr 16 2) (bs 5 0) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // 1 << 3 = 8
+    let s1 = rt.eval_str_via_vm("<diff>", "(sl 1 3)").unwrap();
+    // 16 >> 2 = 4
+    let s2 = rt.eval_str_via_vm("<diff>", "(sr 16 2)").unwrap();
+    // -8 >> 2 = -2 (arithmetic / sign-extending)
+    let s3 = rt.eval_str_via_vm("<diff>", "(sr -8 2)").unwrap();
+    // 5 = 0b101: bit 0 set, bit 1 not set, bit 2 set
+    let b0 = rt.eval_str_via_vm("<diff>", "(bs 5 0)").unwrap();
+    let b1 = rt.eval_str_via_vm("<diff>", "(bs 5 1)").unwrap();
+    let b2 = rt.eval_str_via_vm("<diff>", "(bs 5 2)").unwrap();
+    // Out-of-range
+    let bo = rt.eval_str_via_vm("<diff>", "(bs 5 100)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&s1, Value::Number(cs_core::Number::Fixnum(8))));
+    assert!(matches!(&s2, Value::Number(cs_core::Number::Fixnum(4))));
+    assert!(matches!(&s3, Value::Number(cs_core::Number::Fixnum(-2))));
+    assert!(matches!(&b0, Value::Boolean(true)));
+    assert!(matches!(&b1, Value::Boolean(false)));
+    assert!(matches!(&b2, Value::Boolean(true)));
+    assert!(matches!(&bo, Value::Boolean(false)));
+}

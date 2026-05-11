@@ -358,6 +358,15 @@ pub struct Lowerer {
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_length_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bitwise_arith_shift_left(n, count) -> i64`.
+    /// ADR 0012 D-2 (iter FO).
+    bitwise_arith_shift_left_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bitwise_arith_shift_right(n, count) -> i64`.
+    /// ADR 0012 D-2 (iter FO).
+    bitwise_arith_shift_right_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bitwise_bit_set_p(n, bit) -> i64` (raw 0/1).
+    /// ADR 0012 D-2 (iter FO).
+    bitwise_bit_set_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_char_alphabetic_p(c) -> i64`. Returns 0/1.
     /// ADR 0012 D-2 (iter CI).
     char_alphabetic_p_func: cranelift_module::FuncId,
@@ -814,6 +823,19 @@ impl Lowerer {
         builder.symbol(
             "vm_bitwise_length",
             cs_vm::vm::vm_bitwise_length as *const u8,
+        );
+        // ADR 0012 D-2 (iter FO).
+        builder.symbol(
+            "vm_bitwise_arith_shift_left",
+            cs_vm::vm::vm_bitwise_arith_shift_left as *const u8,
+        );
+        builder.symbol(
+            "vm_bitwise_arith_shift_right",
+            cs_vm::vm::vm_bitwise_arith_shift_right as *const u8,
+        );
+        builder.symbol(
+            "vm_bitwise_bit_set_p",
+            cs_vm::vm::vm_bitwise_bit_set_p as *const u8,
         );
         // ADR 0012 D-2 (iter CI) — char Unicode predicates.
         builder.symbol(
@@ -1978,6 +2000,37 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_bitwise_length: {e}")))?;
 
+        // ADR 0012 D-2 (iter FO) — bitwise shift-left/-right + bit-set?.
+        let bitwise_arith_shift_left_func = module
+            .declare_function(
+                "vm_bitwise_arith_shift_left",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bitwise_arith_shift_left: {e}"))
+            })?;
+        let bitwise_arith_shift_right_func = module
+            .declare_function(
+                "vm_bitwise_arith_shift_right",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_bitwise_arith_shift_right: {e}"
+                ))
+            })?;
+        let bitwise_bit_set_p_func = module
+            .declare_function(
+                "vm_bitwise_bit_set_p",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bitwise_bit_set_p: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter CI) — char Unicode predicates. One i64
         // in (codepoint), one i64 out (0/1) — pair_accessor_sig shape.
         let char_alphabetic_p_func = module
@@ -2665,6 +2718,9 @@ impl Lowerer {
             flonum_atan2_func,
             bitwise_bit_count_func,
             bitwise_length_func,
+            bitwise_arith_shift_left_func,
+            bitwise_arith_shift_right_func,
+            bitwise_bit_set_p_func,
             char_alphabetic_p_func,
             char_numeric_p_func,
             char_whitespace_p_func,
@@ -3193,6 +3249,16 @@ impl Lowerer {
             let bitwise_length_fnref = self
                 .module
                 .declare_func_in_func(self.bitwise_length_func, builder.func);
+            // iter FO — bitwise shift-left/-right + bit-set?.
+            let bitwise_arith_shift_left_fnref = self
+                .module
+                .declare_func_in_func(self.bitwise_arith_shift_left_func, builder.func);
+            let bitwise_arith_shift_right_fnref = self
+                .module
+                .declare_func_in_func(self.bitwise_arith_shift_right_func, builder.func);
+            let bitwise_bit_set_p_fnref = self
+                .module
+                .declare_func_in_func(self.bitwise_bit_set_p_func, builder.func);
             // iter CI — char predicates.
             let char_alphabetic_p_fnref = self
                 .module
@@ -3577,6 +3643,9 @@ impl Lowerer {
                         flonum_atan2_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
+                        bitwise_arith_shift_left_fnref,
+                        bitwise_arith_shift_right_fnref,
+                        bitwise_bit_set_p_fnref,
                         char_alphabetic_p_fnref,
                         char_numeric_p_fnref,
                         char_whitespace_p_fnref,
@@ -3906,6 +3975,9 @@ fn lower_inst(
     flonum_atan2_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
+    bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
+    bitwise_arith_shift_right_fnref: cranelift_codegen::ir::FuncRef,
+    bitwise_bit_set_p_fnref: cranelift_codegen::ir::FuncRef,
     char_alphabetic_p_fnref: cranelift_codegen::ir::FuncRef,
     char_numeric_p_fnref: cranelift_codegen::ir::FuncRef,
     char_whitespace_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -4551,6 +4623,31 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "FlonumAcos expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::BitwiseArithShiftLeft(dst, n, count)
+        | Inst::BitwiseArithShiftRight(dst, n, count)
+        | Inst::BitwiseBitSetP(dst, n, count) => {
+            // ADR 0012 D-2 (iter FO) — bitwise shift-left/-right + bit-set?.
+            let nv = lookup(map, *n)?;
+            let cv = lookup(map, *count)?;
+            let fnref = match inst {
+                Inst::BitwiseArithShiftLeft(..) => bitwise_arith_shift_left_fnref,
+                Inst::BitwiseArithShiftRight(..) => bitwise_arith_shift_right_fnref,
+                Inst::BitwiseBitSetP(..) => bitwise_bit_set_p_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[nv, cv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BitwiseShift/BitSetP expected 1 result, got {}",
                         results.len()
                     )));
                 }

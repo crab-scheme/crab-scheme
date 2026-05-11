@@ -799,6 +799,21 @@ pub fn bytecode_to_rir_with_hints(
                                 {
                                     Some(RirInst::BitwiseLength(dst, args[0]))
                                 }
+                                // ADR 0012 D-2 (iter FO) — bitwise-arithmetic-shift-{left,right}.
+                                ("bitwise-arithmetic-shift-left", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitwiseArithShiftLeft(dst, args[0], args[1]))
+                                }
+                                ("bitwise-arithmetic-shift-right", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::BitwiseArithShiftRight(dst, args[0], args[1]))
+                                }
                                 _ => None,
                             };
                             if let Some(inst) = single {
@@ -2528,6 +2543,17 @@ pub fn bytecode_to_rir_with_hints(
                                     // via `char::from_u32(...).map_or(0, ...)`
                                     // so invalid codepoints simply return 0
                                     // (no deopt).
+                                    // ADR 0012 D-2 (iter FO) — bitwise-bit-set?.
+                                    // (Fixnum, Fixnum) -> Boolean.
+                                    ("bitwise-bit-set?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::BitwiseBitSetP(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     ("char-alphabetic?", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Character) =>
@@ -4211,6 +4237,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::NotPairP(dst, _)
                 | RirInst::ListP(dst, _)
                 | RirInst::CharAlphabeticP(dst, _)
+                | RirInst::BitwiseBitSetP(dst, _, _)
                 | RirInst::CharNumericP(dst, _)
                 | RirInst::CharWhitespaceP(dst, _)
                 | RirInst::CharUpperCaseP(dst, _)
