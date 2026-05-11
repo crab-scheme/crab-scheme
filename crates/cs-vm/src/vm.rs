@@ -744,6 +744,38 @@ pub unsafe extern "C" fn vm_list_p_gc(r: i64) -> i64 {
     }
 }
 
+/// `(memq item lst)` — return the first sublist of `lst` whose
+/// `car` is `eq?` to `item`, or `#f` if not found. Consume-on-use
+/// for both args; returns an Any-shape Gc handle (either a
+/// `Value::Pair` referencing the matched sublist or
+/// `Value::Boolean(false)`). Improper lists / atoms in `lst`
+/// position return `#f` (most Scheme implementations match this
+/// behaviour; the bytecode VM is the source of truth on
+/// R6RS-compliant signalling). ADR 0012 D-2 (iter CC).
+///
+/// # Safety
+///
+/// Both `item` and `lst` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_memq_gc(item: i64, lst: i64) -> i64 {
+    let needle = unsafe { gc_i64_to_value(item) };
+    let v = unsafe { gc_i64_to_value(lst) };
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                if cs_core::eq::eq(&needle, &car) {
+                    return value_to_gc_i64(Value::Pair(p.clone()));
+                }
+                let next = p.cdr.borrow().clone();
+                cur = next;
+            }
+            _ => return value_to_gc_i64(Value::Boolean(false)),
+        }
+    }
+}
+
 /// `(reverse lst)` — return a freshly allocated reversed list.
 /// Consume-on-use; returns an Any-shape Gc handle. Walks the spine
 /// of the input, accumulating `(cons car acc)` pairs; the final

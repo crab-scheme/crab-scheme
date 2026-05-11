@@ -185,6 +185,9 @@ pub struct Lowerer {
     /// FuncId of `vm_reverse_gc(lst) -> i64`. Returns a fresh Gc
     /// handle to a reversed list. ADR 0012 D-2 (iter CB).
     reverse_func: cranelift_module::FuncId,
+    /// FuncId of `vm_memq_gc(item, lst) -> i64`. Returns a Gc
+    /// handle (matched sublist or `#f`). ADR 0012 D-2 (iter CC).
+    memq_func: cranelift_module::FuncId,
     /// Per-module inline-cache slot storage. Indices into this
     /// table identify call sites; the slot's address is intended
     /// to be baked into JIT bodies as a constant pointer (ADR
@@ -301,6 +304,8 @@ impl Lowerer {
         builder.symbol("vm_list_p_gc", cs_vm::vm::vm_list_p_gc as *const u8);
         // ADR 0012 D-2 (iter CB) — reverse.
         builder.symbol("vm_reverse_gc", cs_vm::vm::vm_reverse_gc as *const u8);
+        // ADR 0012 D-2 (iter CC) — memq.
+        builder.symbol("vm_memq_gc", cs_vm::vm::vm_memq_gc as *const u8);
         let mut module = JITModule::new(builder);
 
         // Import vm_env_lookup_fixnum: extern "C" fn(i64) -> i64.
@@ -642,6 +647,16 @@ impl Lowerer {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_reverse_gc: {e}")))?;
 
+        // ADR 0012 D-2 (iter CC) — vm_memq_gc(item, lst) -> i64.
+        // Two i64 in, one i64 out (same shape as vector_ref_sig).
+        let memq_func = module
+            .declare_function(
+                "vm_memq_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_memq_gc: {e}")))?;
+
         let ctx = module.make_context();
         Ok(Self {
             module,
@@ -682,6 +697,7 @@ impl Lowerer {
             length_func,
             list_p_func,
             reverse_func,
+            memq_func,
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
@@ -910,6 +926,10 @@ impl Lowerer {
             let reverse_fnref = self
                 .module
                 .declare_func_in_func(self.reverse_func, builder.func);
+            // iter CC — memq.
+            let memq_fnref = self
+                .module
+                .declare_func_in_func(self.memq_func, builder.func);
 
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::with_capacity(rir.blocks.len());
@@ -1007,6 +1027,7 @@ impl Lowerer {
                         length_fnref,
                         list_p_fnref,
                         reverse_fnref,
+                        memq_fnref,
                         inst,
                     )?;
                 }
@@ -1206,6 +1227,7 @@ fn lower_inst(
     length_fnref: cranelift_codegen::ir::FuncRef,
     list_p_fnref: cranelift_codegen::ir::FuncRef,
     reverse_fnref: cranelift_codegen::ir::FuncRef,
+    memq_fnref: cranelift_codegen::ir::FuncRef,
     inst: &Inst,
 ) -> Result<(), JitError> {
     match inst {
@@ -2016,6 +2038,26 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "Reverse expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::Memq(dst, item, lst) => {
+            // ADR 0012 D-2 (iter CC) — vm_memq_gc consumes both
+            // operands and returns a Gc handle (matched sublist or
+            // boolean #f). Mark for stack-map tracking.
+            let item_v = lookup(map, *item)?;
+            let lst_v = lookup(map, *lst)?;
+            let inst_ref = b.ins().call(memq_fnref, &[item_v, lst_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "Memq expected 1 result, got {}",
                         results.len()
                     )));
                 }

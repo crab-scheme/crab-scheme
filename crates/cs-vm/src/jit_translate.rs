@@ -901,6 +901,35 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::Reverse(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter CC) — memq. Both
+                                    // args must be Any at the helper boundary;
+                                    // typed-immediate items (Symbol literals,
+                                    // Fixnums) are boxed first. The list arg
+                                    // is required to be Any (came from cons /
+                                    // list / env-lookup-any).
+                                    ("memq", 2)
+                                        if value_types.get(&args[1]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        let item_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let item = if item_t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(item_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::Memq(dst, item, args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter BV) — vector ops.
                                     // make-vector requires the fill to be
                                     // Any. If the user passed a typed
@@ -1839,7 +1868,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VecSet(dst, _, _, _)
                 | RirInst::StrAlloc(dst, _, _)
                 | RirInst::MakeClosure(dst, _)
-                | RirInst::Reverse(dst, _) => {
+                | RirInst::Reverse(dst, _)
+                | RirInst::Memq(dst, _, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

@@ -2452,3 +2452,43 @@ fn diff_jit_reverse_allocates_new_spine() {
         other => panic!("expected (4, 3), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_memq_matches_by_eq() {
+    // ADR 0012 D-2 (iter CC) — `(memq item lst)` lowers to
+    // vm_memq_gc. Walks spine, eq?-compares each car against item,
+    // returns the matched sublist or #f. Symbol identity comparison
+    // is the typical use case.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (find item lst) (memq item lst))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (find 'b (list 'a 'b 'c)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // Hit: 'b at position 1 → returns '(b c).
+    let hit = rt
+        .eval_str_via_vm("<diff>", "(car (find 'b (list 'a 'b 'c)))")
+        .unwrap();
+    // Miss: 'z is not in the list → returns #f.
+    let miss = rt
+        .eval_str_via_vm("<diff>", "(find 'z (list 'a 'b 'c))")
+        .unwrap();
+    // Length of matched sublist: '(b c) → 2.
+    let len = rt
+        .eval_str_via_vm("<diff>", "(length (find 'b (list 'a 'b 'c)))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 3,
+        "find never dispatched through JIT (count={after})"
+    );
+    match (&hit, &miss, &len) {
+        (Value::Symbol(_), Value::Boolean(false), Value::Number(cs_core::Number::Fixnum(2))) => {}
+        other => panic!("expected (Symbol(b), #f, 2), got {:?}", other),
+    }
+}
