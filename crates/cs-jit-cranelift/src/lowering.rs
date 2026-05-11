@@ -412,6 +412,8 @@ pub struct Lowerer {
     string_downcase_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_foldcase_gc(s) -> i64`. ADR 0012 D-2 (iter ET).
     string_foldcase_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_contains_gc(h, n) -> i64`. ADR 0012 D-2 (iter EU).
+    string_contains_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_list_fill_gc(n, fill) -> i64`. ADR 0012
     /// D-2 (iter EM).
     make_list_fill_func: cranelift_module::FuncId,
@@ -800,6 +802,11 @@ impl Lowerer {
         builder.symbol(
             "vm_string_foldcase_gc",
             cs_vm::vm::vm_string_foldcase_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter EU) — string-contains.
+        builder.symbol(
+            "vm_string_contains_gc",
+            cs_vm::vm::vm_string_contains_gc as *const u8,
         );
         // ADR 0012 D-2 (iter EM) — make-list 2-arg.
         builder.symbol(
@@ -1934,6 +1941,17 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function vm_string_foldcase_gc: {e}"))
             })?;
 
+        // ADR 0012 D-2 (iter EU) — vm_string_contains_gc(h, n) -> i64.
+        let string_contains_func = module
+            .declare_function(
+                "vm_string_contains_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_contains_gc: {e}"))
+            })?;
+
         // ADR 0012 D-2 (iter EM) — vm_make_list_fill_gc(n, fill) -> i64.
         // Same shape as vector_ref_sig (two i64 in, one out).
         let make_list_fill_func = module
@@ -2147,6 +2165,7 @@ impl Lowerer {
             string_upcase_func,
             string_downcase_func,
             string_foldcase_func,
+            string_contains_func,
             make_list_fill_func,
             iota_n_func,
             last_pair_func,
@@ -2683,6 +2702,10 @@ impl Lowerer {
             let string_foldcase_fnref = self
                 .module
                 .declare_func_in_func(self.string_foldcase_func, builder.func);
+            // iter EU — string-contains.
+            let string_contains_fnref = self
+                .module
+                .declare_func_in_func(self.string_contains_func, builder.func);
             // iter EM — make-list 2-arg.
             let make_list_fill_fnref = self
                 .module
@@ -2898,6 +2921,7 @@ impl Lowerer {
                         string_upcase_fnref,
                         string_downcase_fnref,
                         string_foldcase_fnref,
+                        string_contains_fnref,
                         make_list_fill_fnref,
                         iota_n_fnref,
                         last_pair_fnref,
@@ -3191,6 +3215,7 @@ fn lower_inst(
     string_upcase_fnref: cranelift_codegen::ir::FuncRef,
     string_downcase_fnref: cranelift_codegen::ir::FuncRef,
     string_foldcase_fnref: cranelift_codegen::ir::FuncRef,
+    string_contains_fnref: cranelift_codegen::ir::FuncRef,
     make_list_fill_fnref: cranelift_codegen::ir::FuncRef,
     iota_n_fnref: cranelift_codegen::ir::FuncRef,
     last_pair_fnref: cranelift_codegen::ir::FuncRef,
@@ -5499,6 +5524,24 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "StringToNumber expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringContains(dst, h, n) => {
+            // ADR 0012 D-2 (iter EU) — vm_string_contains_gc(h, n).
+            let hv = lookup(map, *h)?;
+            let nv = lookup(map, *n)?;
+            let inst_ref = b.ins().call(string_contains_fnref, &[hv, nv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringContains expected 1 result, got {}",
                         results.len()
                     )));
                 }

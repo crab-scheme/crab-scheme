@@ -3152,6 +3152,36 @@ pub unsafe extern "C" fn vm_make_list_fill_gc(n: i64, fill: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(string-contains haystack needle)` — returns the char index of
+/// the first occurrence of `needle` in `haystack`, or #f if not
+/// found. Consumes both Gc handles. Returns a Gc handle (Fixnum or
+/// Boolean). On non-string args, requests a deopt and returns #f.
+/// ADR 0012 D-2 (iter EU).
+///
+/// # Safety
+///
+/// `haystack` and `needle` must be live, owned `Gc<Value>` raw
+/// handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_contains_gc(haystack: i64, needle: i64) -> i64 {
+    let h_v = unsafe { gc_i64_to_value(haystack) };
+    let n_v = unsafe { gc_i64_to_value(needle) };
+    let (h, n) = match (h_v, n_v) {
+        (Value::String(h), Value::String(n)) => (h.borrow().clone(), n.borrow().clone()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Boolean(false));
+        }
+    };
+    match h.find(&n) {
+        Some(byte_idx) => {
+            let char_idx = h[..byte_idx].chars().count() as i64;
+            value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(char_idx)))
+        }
+        None => value_to_gc_i64(Value::Boolean(false)),
+    }
+}
+
 /// `(string-upcase s)` — return a fresh uppercased string.
 /// ADR 0012 D-2 (iter ET).
 ///

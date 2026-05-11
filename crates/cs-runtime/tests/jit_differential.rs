@@ -5486,3 +5486,41 @@ fn diff_jit_string_case_conversion() {
         other => panic!("expected three strings, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_contains() {
+    // ADR 0012 D-2 (iter EU) — (string-contains haystack needle).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sc h n) (string-contains h n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sc \"hello\" \"ll\") (sc \"foo\" \"bar\") \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let hit = rt
+        .eval_str_via_vm("<diff>", "(sc \"hello world\" \"world\")")
+        .unwrap();
+    let miss = rt
+        .eval_str_via_vm("<diff>", "(sc \"hello\" \"xyz\")")
+        .unwrap();
+    let head = rt
+        .eval_str_via_vm("<diff>", "(sc \"abcdef\" \"abc\")")
+        .unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(sc \"hello\" \"\")").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match (&hit, &miss, &head, &empty) {
+        (
+            Value::Number(cs_core::Number::Fixnum(6)),
+            Value::Boolean(false),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+        ) => {}
+        other => panic!("expected (6, #f, 0, 0), got {:?}", other),
+    }
+}
