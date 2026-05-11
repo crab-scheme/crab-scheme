@@ -686,6 +686,11 @@ pub enum Inst {
     /// ordered comparison). `dst` is Boolean. ADR 0012 D-2 (iter EF).
     FlonumIsFinite(Value, Value),
 
+    /// `dst = integer?(x)` for Flonum-typed `x`. Lowers to
+    /// `vm_flonum_is_integer` which checks `x.is_finite() &&
+    /// x.fract() == 0.0`. `dst` is Boolean. ADR 0012 D-2 (iter EH).
+    FlonumIsInteger(Value, Value),
+
     /// `dst = srem(lhs, rhs)`. R6RS `remainder` for fixnums.
     Remainder(Value, Value, Value),
 

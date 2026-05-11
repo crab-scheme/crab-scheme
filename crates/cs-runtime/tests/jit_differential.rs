@@ -4968,3 +4968,55 @@ fn diff_jit_typed_eq_any_args() {
         other => panic!("expected (T, F, T, F, T, F), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_integer_rational_flonum() {
+    // ADR 0012 D-2 (iter EH) — integer?/rational? type-aware for
+    // Flonum operand. Closes a latent gap where the JIT previously
+    // emitted always-true regardless of value (e.g. (integer? 3.14)
+    // would return #t).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (int-flo x) (integer? x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (rat-flo x) (rational? x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (int-flo 1.0) (int-flo 1.5) \
+                      (rat-flo 1.0) (rat-flo (/ 1.0 0.0)) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let i_whole = rt.eval_str_via_vm("<diff>", "(int-flo 4.0)").unwrap();
+    let i_frac = rt.eval_str_via_vm("<diff>", "(int-flo 3.14)").unwrap();
+    let i_inf = rt
+        .eval_str_via_vm("<diff>", "(int-flo (/ 1.0 0.0))")
+        .unwrap();
+    let r_finite = rt.eval_str_via_vm("<diff>", "(rat-flo 1.5)").unwrap();
+    let r_inf = rt
+        .eval_str_via_vm("<diff>", "(rat-flo (/ 1.0 0.0))")
+        .unwrap();
+    let r_nan = rt
+        .eval_str_via_vm("<diff>", "(rat-flo (/ 0.0 0.0))")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "integer?/rational? never dispatched through JIT (count={after})"
+    );
+    match (&i_whole, &i_frac, &i_inf, &r_finite, &r_inf, &r_nan) {
+        (
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (T, F, F, T, F, F), got {:?}", other),
+    }
+}

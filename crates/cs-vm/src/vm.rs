@@ -2912,6 +2912,21 @@ pub unsafe extern "C" fn vm_string_to_number_gc(s: i64) -> i64 {
     }
 }
 
+/// `(integer? x)` — Flonum-typed fast path. Takes the raw i64 bit
+/// pattern of an f64 (Flonum-shape carrier, not a Gc handle).
+/// Returns 1 iff `x` is finite and has zero fractional part.
+/// ADR 0012 D-2 (iter EH).
+///
+/// # Safety
+///
+/// `x_bits` must be a Flonum-shape i64 (the f64 bit pattern). No
+/// Gc handle invariants.
+#[no_mangle]
+pub unsafe extern "C" fn vm_flonum_is_integer(x_bits: i64) -> i64 {
+    let f = f64::from_bits(x_bits as u64);
+    (f.is_finite() && f.fract() == 0.0) as i64
+}
+
 /// `(equal? a b)` — structural deep equality (R7RS). Defers to
 /// `cs_core::eq::equal` which handles cycles. Consumes both Gc
 /// handles. Returns 0 or 1. ADR 0012 D-2 (iter DZ).

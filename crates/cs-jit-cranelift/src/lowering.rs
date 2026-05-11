@@ -333,6 +333,9 @@ pub struct Lowerer {
     flonum_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_flonum_sin(x) -> i64`. ADR 0012 D-2 (iter DF).
     flonum_sin_func: cranelift_module::FuncId,
+    /// FuncId of `vm_flonum_is_integer(x_bits) -> i64`. Returns 0/1.
+    /// ADR 0012 D-2 (iter EH).
+    flonum_is_integer_func: cranelift_module::FuncId,
     /// FuncId of `vm_flonum_cos(x) -> i64`. ADR 0012 D-2 (iter DF).
     flonum_cos_func: cranelift_module::FuncId,
     /// FuncId of `vm_flonum_tan(x) -> i64`. ADR 0012 D-2 (iter DF).
@@ -681,6 +684,11 @@ impl Lowerer {
         builder.symbol("vm_flonum_p_gc", cs_vm::vm::vm_flonum_p_gc as *const u8);
         // ADR 0012 D-2 (iter DF) — flonum transcendentals.
         builder.symbol("vm_flonum_sin", cs_vm::vm::vm_flonum_sin as *const u8);
+        // ADR 0012 D-2 (iter EH) — Flonum integer? helper.
+        builder.symbol(
+            "vm_flonum_is_integer",
+            cs_vm::vm::vm_flonum_is_integer as *const u8,
+        );
         builder.symbol("vm_flonum_cos", cs_vm::vm::vm_flonum_cos as *const u8);
         builder.symbol("vm_flonum_tan", cs_vm::vm::vm_flonum_tan as *const u8);
         builder.symbol("vm_flonum_log", cs_vm::vm::vm_flonum_log as *const u8);
@@ -1588,6 +1596,17 @@ impl Lowerer {
                 &pair_accessor_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_flonum_sin: {e}")))?;
+
+        // ADR 0012 D-2 (iter EH) — Flonum integer? helper.
+        let flonum_is_integer_func = module
+            .declare_function(
+                "vm_flonum_is_integer",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_flonum_is_integer: {e}"))
+            })?;
         let flonum_cos_func = module
             .declare_function(
                 "vm_flonum_cos",
@@ -1923,6 +1942,7 @@ impl Lowerer {
             fixnum_p_func,
             flonum_p_func,
             flonum_sin_func,
+            flonum_is_integer_func,
             flonum_cos_func,
             flonum_tan_func,
             flonum_log_func,
@@ -2375,6 +2395,10 @@ impl Lowerer {
             let flonum_sin_fnref = self
                 .module
                 .declare_func_in_func(self.flonum_sin_func, builder.func);
+            // iter EH — Flonum integer? helper.
+            let flonum_is_integer_fnref = self
+                .module
+                .declare_func_in_func(self.flonum_is_integer_func, builder.func);
             let flonum_cos_fnref = self
                 .module
                 .declare_func_in_func(self.flonum_cos_func, builder.func);
@@ -2618,6 +2642,7 @@ impl Lowerer {
                         fixnum_p_fnref,
                         flonum_p_fnref,
                         flonum_sin_fnref,
+                        flonum_is_integer_fnref,
                         flonum_cos_fnref,
                         flonum_tan_fnref,
                         flonum_log_fnref,
@@ -2899,6 +2924,7 @@ fn lower_inst(
     fixnum_p_fnref: cranelift_codegen::ir::FuncRef,
     flonum_p_fnref: cranelift_codegen::ir::FuncRef,
     flonum_sin_fnref: cranelift_codegen::ir::FuncRef,
+    flonum_is_integer_fnref: cranelift_codegen::ir::FuncRef,
     flonum_cos_fnref: cranelift_codegen::ir::FuncRef,
     flonum_tan_fnref: cranelift_codegen::ir::FuncRef,
     flonum_log_fnref: cranelift_codegen::ir::FuncRef,
@@ -3390,6 +3416,23 @@ fn lower_inst(
             );
             let widened = b.ins().uextend(I64, cmp);
             map.insert(*dst, widened);
+        }
+        Inst::FlonumIsInteger(dst, src) => {
+            // ADR 0012 D-2 (iter EH) — call vm_flonum_is_integer
+            // which checks `x.is_finite() && x.fract() == 0.0`.
+            let s = lookup(map, *src)?;
+            let inst_ref = b.ins().call(flonum_is_integer_fnref, &[s]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "FlonumIsInteger expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
         }
         Inst::FlonumSin(dst, src) => {
             // ADR 0012 D-2 (iter DF) — Cranelift has no native sin;

@@ -789,21 +789,51 @@ pub fn bytecode_to_rir_with_hints(
                                     // arg — the upstream load of `args[0]`
                                     // is preserved by SSA but unused;
                                     // Cranelift's DCE removes it.
-                                    // Always-true predicates: arg is a Fixnum
-                                    // (or default-typed), which is a number
-                                    // and integer / rational / real /
-                                    // exact-integer / exact-rational /
-                                    // exact-real. exact? is split out below
-                                    // since it depends on Flonum-vs-Fixnum.
+                                    // Always-true predicates: number? / real?
+                                    // / exact-integer? / exact-rational? /
+                                    // exact-real? are correct for both Fixnum
+                                    // and Flonum (Flonum is a number; per R7RS
+                                    // real? is true for any number; exact-X?
+                                    // implicitly checks exactness which is
+                                    // handled by the exact? arm below).
+                                    // integer? / rational? are split out via
+                                    // ADR 0012 D-2 iter EH — for Flonum
+                                    // operand they depend on the value:
+                                    //   integer? = f.is_finite() && fract==0
+                                    //   rational? = f.is_finite()
                                     ("number?", 1)
-                                    | ("integer?", 1)
-                                    | ("rational?", 1)
                                     | ("real?", 1)
                                     | ("exact-integer?", 1)
                                     | ("exact-rational?", 1)
                                     | ("exact-real?", 1) => {
                                         let _ = args[0]; // load preserved for SSA correctness
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
+                                    }
+                                    // integer? / rational? gated on
+                                    // !=Flonum default to const-true (Fixnum
+                                    // is always integer and always rational).
+                                    ("integer?", 1) | ("rational?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        let _ = args[0];
+                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
+                                    }
+                                    // ADR 0012 D-2 (iter EH) — Flonum-typed
+                                    // integer? and rational?.
+                                    ("integer?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumIsInteger(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("rational?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumIsFinite(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
                                     }
                                     // ADR 0012 D-2 (iter EE) — exact?/inexact?
                                     // are Fixnum-vs-Flonum sensitive. Other
@@ -3483,6 +3513,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::FlonumIsNan(dst, _)
                 | RirInst::FlonumIsInfinite(dst, _)
                 | RirInst::FlonumIsFinite(dst, _)
+                | RirInst::FlonumIsInteger(dst, _)
                 | RirInst::PairP(dst, _)
                 | RirInst::NullP(dst, _)
                 | RirInst::EqAny(dst, _, _)
