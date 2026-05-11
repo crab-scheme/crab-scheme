@@ -1839,6 +1839,33 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::HashtableValues(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter GI) — hashtable-clear! (1-arg).
+                                    ("hashtable-clear!", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::HashtableClear(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    // ADR 0012 D-2 (iter GI) — numerator/denominator
+                                    // for Fixnum: numerator is identity, denominator
+                                    // is 1.
+                                    ("numerator", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        // Identity: copy via Add(0, x)? Simplest: LoadConst+Add.
+                                        // Actually we can just alias by Sub(x, 0).
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Add(dst, args[0], zero));
+                                    }
+                                    ("denominator", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::LoadConst(dst, Const::Fixnum(1)));
+                                    }
                                     ("eof-object?", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
@@ -5171,6 +5198,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StringTitlecase(dst, _)
                 | RirInst::HashtableKeys(dst, _)
                 | RirInst::HashtableValues(dst, _)
+                | RirInst::HashtableClear(dst, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)

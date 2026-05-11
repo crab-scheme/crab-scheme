@@ -927,6 +927,28 @@ pub unsafe extern "C" fn vm_hashtable_values_gc(r: i64) -> i64 {
     }
 }
 
+/// `(hashtable-clear! ht)` (1-arg) — empty the hashtable, return
+/// Unspecified Gc handle. Deopts on non-hashtable. ADR 0012 D-2
+/// (iter GI).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_clear_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Hashtable(h) => {
+            h.items.borrow_mut().clear();
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(div x y)` — R6RS Euclidean division. Result rounds toward -∞
 /// such that `mod` is always non-negative. Deopts on y == 0 (bytecode
 /// raises a condition we don't model here). Both args raw Fixnum-shape.

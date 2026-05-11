@@ -7398,3 +7398,56 @@ fn diff_jit_hashtable_keys_values() {
         other => panic!("expected vector, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_numerator_denominator_and_clear() {
+    // ADR 0012 D-2 (iter GI) — numerator/denominator + hashtable-clear!.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (nu n) (numerator n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (de n) (denominator n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (sz-after-clear ht) \
+           (hashtable-clear! ht) \
+           (hashtable-size ht))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm-ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! warm-ht 'a 1)")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (nu 42) (de 42) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let num42 = rt.eval_str_via_vm("<diff>", "(nu 42)").unwrap();
+    let num_neg = rt.eval_str_via_vm("<diff>", "(nu -7)").unwrap();
+    let den42 = rt.eval_str_via_vm("<diff>", "(de 42)").unwrap();
+    // Populate then clear
+    rt.eval_str_via_vm("<diff>", "(define ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'a 1)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'b 2)")
+        .unwrap();
+    let cleared = rt.eval_str_via_vm("<diff>", "(sz-after-clear ht)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&num42, Value::Number(cs_core::Number::Fixnum(42))));
+    assert!(matches!(
+        &num_neg,
+        Value::Number(cs_core::Number::Fixnum(-7))
+    ));
+    assert!(matches!(&den42, Value::Number(cs_core::Number::Fixnum(1))));
+    assert!(matches!(
+        &cleared,
+        Value::Number(cs_core::Number::Fixnum(0))
+    ));
+}

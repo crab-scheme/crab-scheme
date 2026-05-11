@@ -392,6 +392,8 @@ pub struct Lowerer {
     hashtable_keys_func: cranelift_module::FuncId,
     /// FuncId of `vm_hashtable_values_gc(ht) -> i64`. ADR 0012 D-2 (iter GH).
     hashtable_values_func: cranelift_module::FuncId,
+    /// FuncId of `vm_hashtable_clear_gc(ht) -> i64`. ADR 0012 D-2 (iter GI).
+    hashtable_clear_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -971,6 +973,11 @@ impl Lowerer {
         builder.symbol(
             "vm_hashtable_values_gc",
             cs_vm::vm::vm_hashtable_values_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter GI) — hashtable-clear!.
+        builder.symbol(
+            "vm_hashtable_clear_gc",
+            cs_vm::vm::vm_hashtable_clear_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
@@ -2374,6 +2381,16 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_hashtable_values_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter GI) — hashtable-clear!.
+        let hashtable_clear_func = module
+            .declare_function(
+                "vm_hashtable_clear_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_hashtable_clear_gc: {e}"))
+            })?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3340,6 +3357,7 @@ impl Lowerer {
             hashtable_mutable_p_func,
             hashtable_keys_func,
             hashtable_values_func,
+            hashtable_clear_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -3947,6 +3965,10 @@ impl Lowerer {
             let hashtable_values_fnref = self
                 .module
                 .declare_func_in_func(self.hashtable_values_func, builder.func);
+            // iter GI — hashtable-clear!.
+            let hashtable_clear_fnref = self
+                .module
+                .declare_func_in_func(self.hashtable_clear_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4427,6 +4449,7 @@ impl Lowerer {
                         hashtable_mutable_p_fnref,
                         hashtable_keys_fnref,
                         hashtable_values_fnref,
+                        hashtable_clear_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -4796,6 +4819,7 @@ fn lower_inst(
     hashtable_mutable_p_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_keys_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_values_fnref: cranelift_codegen::ir::FuncRef,
+    hashtable_clear_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -5521,7 +5545,8 @@ fn lower_inst(
         }
         Inst::StringTitlecase(dst, src)
         | Inst::HashtableKeys(dst, src)
-        | Inst::HashtableValues(dst, src) => {
+        | Inst::HashtableValues(dst, src)
+        | Inst::HashtableClear(dst, src) => {
             // ADR 0012 D-2 (iter GB/GH) — 1-arg ops returning fresh
             // Gc handles (string for titlecase, vector for hashtable
             // keys/values).
@@ -5530,6 +5555,7 @@ fn lower_inst(
                 Inst::StringTitlecase(..) => string_titlecase_fnref,
                 Inst::HashtableKeys(..) => hashtable_keys_fnref,
                 Inst::HashtableValues(..) => hashtable_values_fnref,
+                Inst::HashtableClear(..) => hashtable_clear_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[sv]);
