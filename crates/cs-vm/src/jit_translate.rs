@@ -799,6 +799,64 @@ pub fn bytecode_to_rir_with_hints(
                                 {
                                     Some(RirInst::BitwiseLength(dst, args[0]))
                                 }
+                                // ADR 0012 D-2 (iter FV) — fx arithmetic +
+                                // comparison + max/min (Fixnum-only aliases).
+                                ("fx+", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::Add(dst, args[0], args[1]))
+                                }
+                                ("fx-", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::Sub(dst, args[0], args[1]))
+                                }
+                                ("fx*", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::Mul(dst, args[0], args[1]))
+                                }
+                                ("fxmax", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::MaxFixnum(dst, args[0], args[1]))
+                                }
+                                ("fxmin", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::MinFixnum(dst, args[0], args[1]))
+                                }
+                                ("fx=?", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::Eq(dst, args[0], args[1]))
+                                }
+                                ("fx<?", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::Lt(dst, args[0], args[1]))
+                                }
+                                ("fx>?", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::Lt(dst, args[1], args[0]))
+                                }
                                 // ADR 0012 D-2 (iter FO) — bitwise-arithmetic-shift-{left,right}.
                                 ("bitwise-arithmetic-shift-left", 2)
                                     if value_types.get(&args[0]).copied() != Some(Type::Flonum)
@@ -884,6 +942,35 @@ pub fn bytecode_to_rir_with_hints(
                                         let zero = alloc();
                                         insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
                                         insts.push(RirInst::Lt(dst, args[0], zero));
+                                    }
+                                    // ADR 0012 D-2 (iter FV) — fx<=? and fx>=?.
+                                    // Multi-Inst because R6RS 2-arg form needs
+                                    // NOT(Lt) — Lt + LoadConst(0) + Eq.
+                                    ("fx<=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        // a <= b  ≡  not(b < a)
+                                        let lt = alloc();
+                                        insts.push(RirInst::Lt(lt, args[1], args[0]));
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Eq(dst, lt, zero));
+                                    }
+                                    ("fx>=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        // a >= b  ≡  not(a < b)
+                                        let lt = alloc();
+                                        insts.push(RirInst::Lt(lt, args[0], args[1]));
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        insts.push(RirInst::Eq(dst, lt, zero));
                                     }
                                     // ADR 0012 D-2 (iter FU) — fx predicate aliases.
                                     // R6RS fixnum-specific; refuse Flonum, lower

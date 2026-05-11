@@ -6674,3 +6674,71 @@ fn diff_jit_fx_predicates() {
     assert!(matches!(&o_t, Value::Boolean(true)));
     assert!(matches!(&o_f, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_fx_arith_and_compare() {
+    // ADR 0012 D-2 (iter FV) — fx arithmetic + comparison + max/min.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (a b c) (fx+ b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (s b c) (fx- b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (m b c) (fx* b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mx b c) (fxmax b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mn b c) (fxmin b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (e b c) (fx=? b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (l b c) (fx<? b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (g b c) (fx>? b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (le b c) (fx<=? b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ge b c) (fx>=? b c))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (a 3 4) (s 5 2) (m 6 7) (mx 9 4) (mn 9 4) \
+                      (e 5 5) (l 1 2) (g 3 1) (le 4 4) (ge 4 4) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let plus = rt.eval_str_via_vm("<diff>", "(a 10 32)").unwrap();
+    let minus = rt.eval_str_via_vm("<diff>", "(s 50 8)").unwrap();
+    let times = rt.eval_str_via_vm("<diff>", "(m 6 7)").unwrap();
+    let mx = rt.eval_str_via_vm("<diff>", "(mx 12 5)").unwrap();
+    let mn = rt.eval_str_via_vm("<diff>", "(mn 12 5)").unwrap();
+    let eq_t = rt.eval_str_via_vm("<diff>", "(e 5 5)").unwrap();
+    let eq_f = rt.eval_str_via_vm("<diff>", "(e 5 6)").unwrap();
+    let lt = rt.eval_str_via_vm("<diff>", "(l 1 2)").unwrap();
+    let gt = rt.eval_str_via_vm("<diff>", "(g 3 1)").unwrap();
+    let le_eq = rt.eval_str_via_vm("<diff>", "(le 4 4)").unwrap();
+    let le_lt = rt.eval_str_via_vm("<diff>", "(le 3 4)").unwrap();
+    let le_gt = rt.eval_str_via_vm("<diff>", "(le 5 4)").unwrap();
+    let ge_eq = rt.eval_str_via_vm("<diff>", "(ge 4 4)").unwrap();
+    let ge_gt = rt.eval_str_via_vm("<diff>", "(ge 5 4)").unwrap();
+    let ge_lt = rt.eval_str_via_vm("<diff>", "(ge 3 4)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&plus, Value::Number(cs_core::Number::Fixnum(42))));
+    assert!(matches!(&minus, Value::Number(cs_core::Number::Fixnum(42))));
+    assert!(matches!(&times, Value::Number(cs_core::Number::Fixnum(42))));
+    assert!(matches!(&mx, Value::Number(cs_core::Number::Fixnum(12))));
+    assert!(matches!(&mn, Value::Number(cs_core::Number::Fixnum(5))));
+    assert!(matches!(&eq_t, Value::Boolean(true)));
+    assert!(matches!(&eq_f, Value::Boolean(false)));
+    assert!(matches!(&lt, Value::Boolean(true)));
+    assert!(matches!(&gt, Value::Boolean(true)));
+    assert!(matches!(&le_eq, Value::Boolean(true)));
+    assert!(matches!(&le_lt, Value::Boolean(true)));
+    assert!(matches!(&le_gt, Value::Boolean(false)));
+    assert!(matches!(&ge_eq, Value::Boolean(true)));
+    assert!(matches!(&ge_gt, Value::Boolean(true)));
+    assert!(matches!(&ge_lt, Value::Boolean(false)));
+}
