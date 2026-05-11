@@ -948,6 +948,52 @@ pub unsafe extern "C" fn vm_list_copy_gc(lst: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(list-set! lst n val)` — walk `n` cdrs, then mutate the
+/// resulting pair's car to `val`. Consumes one strong refcount
+/// on both `lst` and `val`. Returns a Gc handle to
+/// `Value::Unspecified`. On negative `n`, out-of-range walk, or
+/// non-pair tail, requests a deopt and returns Gc(Unspecified)
+/// as placeholder. ADR 0012 D-2 (iter CO).
+///
+/// # Safety
+///
+/// `lst` and `val` must be live, owned `Gc<Value>` raw handles.
+/// `n` is a raw i64.
+#[no_mangle]
+pub unsafe extern "C" fn vm_list_set_gc(lst: i64, n: i64, val: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(lst) };
+    let new_v = unsafe { gc_i64_to_value(val) };
+    if n < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Unspecified);
+    }
+    let mut cur = v;
+    let mut i: i64 = 0;
+    while i < n {
+        match cur {
+            Value::Pair(p) => {
+                let next = p.cdr.borrow().clone();
+                cur = next;
+                i += 1;
+            }
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+        }
+    }
+    match cur {
+        Value::Pair(p) => {
+            *p.car.borrow_mut() = new_v;
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(list-tail lst n)` — walk `n` cdrs and return whatever's
 /// there. `lst` is consumed; `n` is a raw Fixnum-shape i64.
 /// On negative `n` or an out-of-range index (spine exhausted

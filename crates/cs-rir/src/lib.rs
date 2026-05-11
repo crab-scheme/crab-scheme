@@ -342,6 +342,12 @@ pub enum Inst {
     /// (iter CN).
     ListCopy(Value, Value),
 
+    /// `dst = list-set!(lst, n, val)`. Lowers to `vm_list_set_gc`.
+    /// `lst` and `val` Any (consumed); `n` Fixnum. `dst` is Any
+    /// (Gc handle to Unspecified). Side effect: mutates the n-th
+    /// pair's car. ADR 0012 D-2 (iter CO).
+    ListSet(Value, Value, Value, Value),
+
     /// `dst = char-alphabetic?(c)`. `c` is a Character-typed
     /// Fixnum-shape codepoint i64. `dst` is Boolean. Lowers to
     /// `vm_char_alphabetic_p`. ADR 0012 D-2 (iter CI).

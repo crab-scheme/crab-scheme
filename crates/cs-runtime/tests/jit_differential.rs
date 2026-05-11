@@ -3037,3 +3037,45 @@ fn diff_jit_list_copy_fresh_spine() {
         other => panic!("expected (4, 100, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_list_set_mutates_indexed_pair() {
+    // ADR 0012 D-2 (iter CO) — list-set! walks n cdrs then mutates
+    // the resulting pair's car. The mutation is observable through
+    // a subsequent list-ref. Body sequences list-set! then list-ref
+    // so we can assert the new value in a single JIT call.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (set-and-read lst n v) (list-set! lst n v) (list-ref lst n))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done \
+             (begin (set-and-read (list 1 2 3) 1 99) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // Mutate index 0 to 42; read it back.
+    let r0 = rt
+        .eval_str_via_vm("<diff>", "(set-and-read (list 1 2 3) 0 42)")
+        .unwrap();
+    // Mutate index 2 to 99; read it back.
+    let r2 = rt
+        .eval_str_via_vm("<diff>", "(set-and-read (list 10 20 30) 2 99)")
+        .unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "list-set! never dispatched through JIT (count={after})"
+    );
+    match (&r0, &r2) {
+        (
+            Value::Number(cs_core::Number::Fixnum(42)),
+            Value::Number(cs_core::Number::Fixnum(99)),
+        ) => {}
+        other => panic!("expected (42, 99), got {:?}", other),
+    }
+}
