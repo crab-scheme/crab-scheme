@@ -1992,6 +1992,28 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::FlonumSqrt(dst, args[0]));
                                         value_types.insert(dst, Type::Flonum);
                                     }
+                                    // ADR 0012 D-2 (iter EA) — sqrt for typed
+                                    // numeric args. Result is always Flonum
+                                    // (R7RS: unary_flonum semantics — the
+                                    // runtime promotes fixnum to flonum before
+                                    // sqrt).
+                                    ("sqrt", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        insts.push(RirInst::FlonumSqrt(dst, args[0]));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("sqrt", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Fixnum) =>
+                                    {
+                                        let promoted = alloc();
+                                        insts.push(RirInst::FixToFlo(promoted, args[0]));
+                                        value_types.insert(promoted, Type::Flonum);
+                                        insts.push(RirInst::FlonumSqrt(dst, promoted));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
                                     ("flabs", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Flonum) =>

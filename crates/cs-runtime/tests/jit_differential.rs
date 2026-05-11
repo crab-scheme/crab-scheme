@@ -4645,3 +4645,44 @@ fn diff_jit_equal_deep() {
         other => panic!("expected (T, F, T, T, F), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_sqrt_flo_and_fix() {
+    // ADR 0012 D-2 (iter EA) — sqrt for typed numeric args lowers
+    // via FlonumSqrt (with FixToFlo for Fixnum). Result always
+    // Flonum.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sqrt-flo x) (sqrt x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sqrt-fix n) (sqrt n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sqrt-flo 4.0) (sqrt-fix 16) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let f9 = rt.eval_str_via_vm("<diff>", "(sqrt-flo 9.0)").unwrap();
+    let f25 = rt.eval_str_via_vm("<diff>", "(sqrt-fix 25)").unwrap();
+    let f2 = rt.eval_str_via_vm("<diff>", "(sqrt-flo 2.0)").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 2,
+        "sqrt never dispatched through JIT (count={after})"
+    );
+    match (&f9, &f25, &f2) {
+        (
+            Value::Number(cs_core::Number::Flonum(a)),
+            Value::Number(cs_core::Number::Flonum(b)),
+            Value::Number(cs_core::Number::Flonum(c)),
+        ) => {
+            assert!((a - 3.0).abs() < 1e-12, "sqrt(9.0) = {a}");
+            assert!((b - 5.0).abs() < 1e-12, "sqrt(25) = {b}");
+            assert!((c - 2.0_f64.sqrt()).abs() < 1e-12, "sqrt(2.0) = {c}");
+        }
+        other => panic!("expected three flonums, got {:?}", other),
+    }
+}
