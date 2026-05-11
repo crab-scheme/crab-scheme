@@ -4597,3 +4597,51 @@ fn diff_jit_string_vector_conversion() {
         other => panic!("expected (vector, string), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_equal_deep() {
+    // ADR 0012 D-2 (iter DZ) — equal? deep structural equality.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (eq2 a b) (equal? a b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (eq2 '(1 2) '(1 2)) \
+                      (eq2 #(1 2) #(1 2)) \
+                      (eq2 \"abc\" \"abc\") \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let list_t = rt
+        .eval_str_via_vm("<diff>", "(eq2 '(1 (2 3)) '(1 (2 3)))")
+        .unwrap();
+    let list_f = rt
+        .eval_str_via_vm("<diff>", "(eq2 '(1 (2 3)) '(1 (2 4)))")
+        .unwrap();
+    let vec_t = rt
+        .eval_str_via_vm("<diff>", "(eq2 #(1 2 #(3 4)) #(1 2 #(3 4)))")
+        .unwrap();
+    let str_t = rt
+        .eval_str_via_vm("<diff>", "(eq2 \"hello\" \"hello\")")
+        .unwrap();
+    let mixed_f = rt.eval_str_via_vm("<diff>", "(eq2 1 \"1\")").unwrap();
+    let after = cs_vm::vm::jit_call_count();
+    assert!(
+        after >= 4,
+        "equal? never dispatched through JIT (count={after})"
+    );
+    match (&list_t, &list_f, &vec_t, &str_t, &mixed_f) {
+        (
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(false),
+        ) => {}
+        other => panic!("expected (T, F, T, T, F), got {:?}", other),
+    }
+}

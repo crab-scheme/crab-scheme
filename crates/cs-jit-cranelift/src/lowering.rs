@@ -131,6 +131,9 @@ pub struct Lowerer {
     /// FuncId of `vm_eq_any(a, b) -> i64`. `Inst::EqAny` lowers
     /// to this. Consumes both boxes; returns 0/1.
     eq_any_func: cranelift_module::FuncId,
+    /// FuncId of `vm_equal_gc(a, b) -> i64`. `Inst::EqualAny` lowers
+    /// to this. R7RS deep structural equality. ADR 0012 D-2 (iter DZ).
+    equal_func: cranelift_module::FuncId,
     /// FuncId of `vm_any_truthy(r) -> i64`. `Inst::AnyTruthy`
     /// lowers to this. Consumes the box; returns 0 iff inner is
     /// `Boolean(false)`.
@@ -474,6 +477,8 @@ impl Lowerer {
             cs_vm::vm::vm_unbox_flonum_gc as *const u8,
         );
         builder.symbol("vm_eq_any", cs_vm::vm::vm_eq_any_gc as *const u8);
+        // ADR 0012 D-2 (iter DZ) — equal? deep structural equality.
+        builder.symbol("vm_equal_gc", cs_vm::vm::vm_equal_gc as *const u8);
         builder.symbol("vm_any_truthy", cs_vm::vm::vm_any_truthy_gc as *const u8);
         // ADR 0012 D-1 (iter BU) — slow-path general Call. Lowered
         // from `Inst::CallGeneral` whenever the bytecode's call
@@ -906,6 +911,15 @@ impl Lowerer {
                 &box_typed_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_eq_any: {e}")))?;
+
+        // ADR 0012 D-2 (iter DZ) — vm_equal_gc(a, b) -> i64. Same shape.
+        let equal_func = module
+            .declare_function(
+                "vm_equal_gc",
+                cranelift_module::Linkage::Import,
+                &box_typed_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_equal_gc: {e}")))?;
 
         // vm_any_truthy(r) -> i64 — same shape as accessors.
         let any_truthy_func = module
@@ -1802,6 +1816,7 @@ impl Lowerer {
             unbox_boolean_func,
             unbox_flonum_func,
             eq_any_func,
+            equal_func,
             any_truthy_func,
             call_general_func,
             closure_id_peek_func,
@@ -2070,6 +2085,10 @@ impl Lowerer {
             let eq_any_fnref = self
                 .module
                 .declare_func_in_func(self.eq_any_func, builder.func);
+            // iter DZ — equal? deep equality.
+            let equal_fnref = self
+                .module
+                .declare_func_in_func(self.equal_func, builder.func);
             let any_truthy_fnref = self
                 .module
                 .declare_func_in_func(self.any_truthy_func, builder.func);
@@ -2483,6 +2502,7 @@ impl Lowerer {
                         unbox_boolean_fnref,
                         unbox_flonum_fnref,
                         eq_any_fnref,
+                        equal_fnref,
                         any_truthy_fnref,
                         call_general_fnref,
                         closure_id_peek_fnref,
@@ -2761,6 +2781,7 @@ fn lower_inst(
     unbox_boolean_fnref: cranelift_codegen::ir::FuncRef,
     unbox_flonum_fnref: cranelift_codegen::ir::FuncRef,
     eq_any_fnref: cranelift_codegen::ir::FuncRef,
+    equal_fnref: cranelift_codegen::ir::FuncRef,
     any_truthy_fnref: cranelift_codegen::ir::FuncRef,
     call_general_fnref: cranelift_codegen::ir::FuncRef,
     closure_id_peek_fnref: cranelift_codegen::ir::FuncRef,
@@ -3173,6 +3194,20 @@ fn lower_inst(
             if results.len() != 1 {
                 return Err(JitError::Codegen(format!(
                     "EqAny expected 1 result, got {}",
+                    results.len()
+                )));
+            }
+            map.insert(*dst, results[0]);
+        }
+        Inst::EqualAny(dst, lhs, rhs) => {
+            // ADR 0012 D-2 (iter DZ) — vm_equal_gc deep equality.
+            let l = lookup(map, *lhs)?;
+            let r = lookup(map, *rhs)?;
+            let inst_ref = b.ins().call(equal_fnref, &[l, r]);
+            let results = b.inst_results(inst_ref);
+            if results.len() != 1 {
+                return Err(JitError::Codegen(format!(
+                    "EqualAny expected 1 result, got {}",
                     results.len()
                 )));
             }

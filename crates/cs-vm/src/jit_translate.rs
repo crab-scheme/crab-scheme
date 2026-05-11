@@ -2289,6 +2289,46 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::EqAny(dst, lhs, rhs));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter DZ) — equal? deep
+                                    // structural equality. Same BoxTyped
+                                    // fallback as eq?/eqv?; helper defers to
+                                    // cs_core::eq::equal.
+                                    ("equal?", 2) => {
+                                        let lhs_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let rhs_t = value_types
+                                            .get(&args[1])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let lhs = if lhs_t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(lhs_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        let rhs = if rhs_t == Type::Any {
+                                            args[1]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[1],
+                                                type_to_jit_rt_tag(rhs_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::EqualAny(dst, lhs, rhs));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     ("eq?", 2)
                                     | ("eqv?", 2)
                                     | ("boolean=?", 2)
@@ -3214,6 +3254,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::PairP(dst, _)
                 | RirInst::NullP(dst, _)
                 | RirInst::EqAny(dst, _, _)
+                | RirInst::EqualAny(dst, _, _)
                 | RirInst::VecP(dst, _)
                 | RirInst::StrP(dst, _)
                 | RirInst::StrEq(dst, _, _)

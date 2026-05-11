@@ -2838,6 +2838,20 @@ pub unsafe extern "C" fn vm_string_to_vector_gc(s: i64) -> i64 {
     }
 }
 
+/// `(equal? a b)` — structural deep equality (R7RS). Defers to
+/// `cs_core::eq::equal` which handles cycles. Consumes both Gc
+/// handles. Returns 0 or 1. ADR 0012 D-2 (iter DZ).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_equal_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    cs_core::eq::equal(&av, &bv) as i64
+}
+
 /// `(vector->string v)` — 1-arg form. Returns a fresh
 /// `Value::String` built from the characters in `v`. Consumes the
 /// input Gc handle. On non-vector input or any non-character

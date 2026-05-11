@@ -344,6 +344,12 @@ pub enum Inst {
     /// is Any (fresh Gc<Value::String>). ADR 0012 D-2 (iter DY).
     VectorToString(Value, Value),
 
+    /// `dst = equal?(a, b)`. R7RS deep structural equality. Lowers
+    /// to `vm_equal_gc` (which defers to `cs_core::eq::equal`).
+    /// Both args Any-shape (consumed); `dst` is Boolean.
+    /// ADR 0012 D-2 (iter DZ).
+    EqualAny(Value, Value, Value),
+
     /// `dst = substring(s, start, end)`. Lowers to `vm_substring_gc`.
     /// `s` Any (consumed), `start` and `end` Fixnum. `dst` is Any
     /// (fresh Gc<Value::String>). ADR 0012 D-2 (iter CM).
