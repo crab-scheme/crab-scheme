@@ -503,6 +503,44 @@ pub fn current_jit_active_heap() -> *const cs_gc::Heap {
     JIT_ACTIVE_HEAP.with(|c| c.get())
 }
 
+// ---- Iter BW — deopt-instead-of-panic sentinel ----------------------
+//
+// When a JIT runtime helper (vm_unbox_*, vm_pair_car_gc, etc.)
+// detects a type-mismatch that pre-BW would have panicked through
+// `extern "C"` and aborted the process, it now sets this thread-
+// local sentinel and returns a placeholder value. `try_dispatch_jit`
+// reads + clears the sentinel after each native call; a non-zero
+// value bumps the closure's deopt counter and (past threshold)
+// clears the JIT pointer so the next call re-tiers through bytecode.
+
+thread_local! {
+    static JIT_DEOPT_REQUESTED: Cell<u8> = const { Cell::new(0) };
+}
+
+/// Deopt reason codes. Distinct values let post-deopt logs decode
+/// which helper fired the sentinel without piping a string through
+/// `extern "C"`. Values are arbitrary but stable.
+pub const DEOPT_REASON_FIXNUM_MISS: u8 = 1;
+pub const DEOPT_REASON_BOOLEAN_MISS: u8 = 2;
+pub const DEOPT_REASON_FLONUM_MISS: u8 = 3;
+pub const DEOPT_REASON_PAIR_MISS: u8 = 4;
+#[allow(dead_code)]
+pub const DEOPT_REASON_NULL_MISS: u8 = 5;
+
+/// Set the deopt sentinel. Called by JIT runtime helpers on a
+/// type miss before they return a placeholder value.
+#[inline]
+pub fn jit_request_deopt(reason: u8) {
+    JIT_DEOPT_REQUESTED.with(|c| c.set(reason));
+}
+
+/// Read and clear the deopt sentinel. Returns the previous value
+/// (0 means "no deopt requested").
+#[inline]
+pub fn jit_take_deopt() -> u8 {
+    JIT_DEOPT_REQUESTED.with(|c| c.replace(0))
+}
+
 /// Encode a `Value` into a Gc-backed raw handle carried as a single
 /// i64 word. Companion to `value_to_any_i64` for the JIT_RT_GC ABI
 /// per ADR 0012 D-2.
@@ -582,7 +620,13 @@ pub unsafe extern "C" fn vm_pair_car_gc(pair: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(pair) };
     match v {
         Value::Pair(p) => value_to_gc_i64(p.car.borrow().clone()),
-        other => panic!("vm_pair_car_gc: not a pair ({})", other.type_name()),
+        _ => {
+            // Iter BW — type miss. Set sentinel + return a safe
+            // placeholder (Gc-wrapped Unspecified). Dispatcher sees
+            // the sentinel post-call and tiers back down.
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
     }
 }
 
@@ -593,7 +637,10 @@ pub unsafe extern "C" fn vm_pair_cdr_gc(pair: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(pair) };
     match v {
         Value::Pair(p) => value_to_gc_i64(p.cdr.borrow().clone()),
-        other => panic!("vm_pair_cdr_gc: not a pair ({})", other.type_name()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
     }
 }
 
@@ -857,30 +904,39 @@ pub unsafe extern "C" fn vm_unbox_fixnum(r: i64) -> i64 {
     let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
     match *boxed {
         Value::Number(cs_core::Number::Fixnum(n)) => n,
-        ref other => panic!("vm_unbox_fixnum: not a fixnum ({})", other.type_name()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_FIXNUM_MISS);
+            0
+        }
     }
 }
 
 /// Consume an Any-tagged box and return its inner Boolean as 0/1.
-/// Panics on non-Boolean. Symmetric with `vm_unbox_fixnum`.
+/// On type miss: sets the deopt sentinel and returns 0 (false).
 #[no_mangle]
 pub unsafe extern "C" fn vm_unbox_boolean(r: i64) -> i64 {
     let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
     match *boxed {
         Value::Boolean(b) => b as i64,
-        ref other => panic!("vm_unbox_boolean: not a boolean ({})", other.type_name()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_BOOLEAN_MISS);
+            0
+        }
     }
 }
 
 /// Consume an Any-tagged box and return its inner Flonum's bit
-/// pattern (matches the i64-ABI encoding for Flonum). Panics on
-/// non-Flonum.
+/// pattern (matches the i64-ABI encoding for Flonum). On type
+/// miss: sets the deopt sentinel and returns NaN bits.
 #[no_mangle]
 pub unsafe extern "C" fn vm_unbox_flonum(r: i64) -> i64 {
     let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
     match *boxed {
         Value::Number(cs_core::Number::Flonum(f)) => f.to_bits() as i64,
-        ref other => panic!("vm_unbox_flonum: not a flonum ({})", other.type_name()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_FLONUM_MISS);
+            f64::NAN.to_bits() as i64
+        }
     }
 }
 
@@ -958,7 +1014,10 @@ pub unsafe extern "C" fn vm_unbox_fixnum_gc(r: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(r) };
     match v {
         Value::Number(cs_core::Number::Fixnum(n)) => n,
-        ref other => panic!("vm_unbox_fixnum_gc: not a fixnum ({})", other.type_name()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_FIXNUM_MISS);
+            0
+        }
     }
 }
 
@@ -968,7 +1027,10 @@ pub unsafe extern "C" fn vm_unbox_boolean_gc(r: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(r) };
     match v {
         Value::Boolean(b) => b as i64,
-        ref other => panic!("vm_unbox_boolean_gc: not a boolean ({})", other.type_name()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_BOOLEAN_MISS);
+            0
+        }
     }
 }
 
@@ -978,7 +1040,10 @@ pub unsafe extern "C" fn vm_unbox_flonum_gc(r: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(r) };
     match v {
         Value::Number(cs_core::Number::Flonum(f)) => f.to_bits() as i64,
-        ref other => panic!("vm_unbox_flonum_gc: not a flonum ({})", other.type_name()),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_FLONUM_MISS);
+            f64::NAN.to_bits() as i64
+        }
     }
 }
 
@@ -1203,6 +1268,22 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value], syms: &mut SymbolTable)
         }
         _ => return None,
     };
+    // Iter BW — check if a runtime helper requested deopt during
+    // the native call. Non-zero means some helper (vm_unbox_*,
+    // vm_pair_car_gc, etc.) hit a type miss; the JIT body's return
+    // value is a placeholder. Bump the closure's deopt counter;
+    // past threshold, clear the JIT pointer so the next call hits
+    // bytecode. Either way, we return None so the caller retries
+    // through the bytecode VM with the original args (it has them
+    // — `args: &[Value]` is owned by the dispatch caller).
+    let deopt_reason = jit_take_deopt();
+    if deopt_reason != 0 {
+        let n = closure.bump_jit_deopt();
+        if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
+            closure.clear_jit_for_recompile();
+        }
+        return None;
+    }
     Some(decode_jit_return(closure.jit_return_type(), r))
 }
 

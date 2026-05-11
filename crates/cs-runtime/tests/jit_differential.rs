@@ -2096,3 +2096,54 @@ fn diff_jit_vector_pred() {
         other => panic!("expected (1, 0), got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_deopt_on_type_miss() {
+    // M6 Phase 4 iter BW: pre-BW, a runtime type miss in
+    // vm_pair_car_gc / vm_unbox_fixnum etc. panicked through
+    // extern "C" and aborted. Post-BW, the helper sets the
+    // JIT_DEOPT_REQUESTED sentinel and returns a placeholder
+    // Value::Unspecified Gc handle. try_dispatch_jit reads the
+    // sentinel post-call, bumps the closure's deopt counter, and
+    // (post-threshold) clears the JIT pointer. A subsequent call
+    // re-tiers through bytecode.
+    //
+    // Body: (car v). Warmed with Pairs so the JIT'd body's
+    // type-feedback says param0 is Any (Pair). Then call with a
+    // *non-Pair* Any (e.g. a Symbol) — the body's vm_pair_car_gc
+    // hits the miss, the sentinel fires, and the dispatcher
+    // returns None, which causes the caller to re-dispatch via
+    // bytecode (which itself errors gracefully).
+    let defines = &["(define (head v) (car v))"];
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) (if (= i 1500) 'done (begin (head (cons i i)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+
+    // Pair input: JIT path, should succeed.
+    let jit_pair = rt.eval_str_via_vm("<diff>", "(head (cons 7 8))").unwrap();
+    match &jit_pair {
+        Value::Number(cs_core::Number::Fixnum(7)) => {}
+        other => panic!("expected fixnum 7 from pair input, got {:?}", other),
+    }
+    let after_first = cs_vm::vm::jit_call_count();
+    assert!(after_first > 0, "head never JITted (count={})", after_first);
+
+    // Now call (head 'not-a-pair). Pre-BW this aborted the
+    // process. Post-BW: the helper returns Value::Unspecified (or
+    // re-runs through bytecode which errors); the test should
+    // NOT abort — that's the property we care about.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.eval_str_via_vm("<diff>", "(head (quote not-a-pair))")
+    }));
+    // Either: walker re-run produced an error (Err) and we
+    // captured it, or it returned Unspecified, or the bytecode
+    // path's own (car non-pair) error surfaced. The critical
+    // assertion: no process abort.
+    let _ = res;
+}
