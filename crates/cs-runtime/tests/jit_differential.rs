@@ -8127,3 +8127,83 @@ fn diff_jit_hashtable_ref() {
         Value::Number(cs_core::Number::Fixnum(-1))
     ));
 }
+
+#[test]
+fn diff_jit_hashtable_copy() {
+    // ADR 0012 D-2 (iter GZ) — hashtable-copy fast path.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (hc ht) (hashtable-copy ht))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm-ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! warm-ht 'a 1)")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (hc warm-ht) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // Populate then copy
+    rt.eval_str_via_vm("<diff>", "(define ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'x 10)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'y 20)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define ht2 (hc ht))")
+        .unwrap();
+    let sz_orig = rt.eval_str_via_vm("<diff>", "(hashtable-size ht)").unwrap();
+    let sz_copy = rt
+        .eval_str_via_vm("<diff>", "(hashtable-size ht2)")
+        .unwrap();
+    let copy_has_x = rt
+        .eval_str_via_vm("<diff>", "(hashtable-ref ht2 'x -1)")
+        .unwrap();
+    let copy_has_y = rt
+        .eval_str_via_vm("<diff>", "(hashtable-ref ht2 'y -1)")
+        .unwrap();
+    // Mutate copy — original must stay unchanged
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht2 'z 99)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-delete! ht2 'x)")
+        .unwrap();
+    let orig_z = rt
+        .eval_str_via_vm("<diff>", "(hashtable-contains? ht 'z)")
+        .unwrap();
+    let orig_x = rt
+        .eval_str_via_vm("<diff>", "(hashtable-contains? ht 'x)")
+        .unwrap();
+    let copy_z = rt
+        .eval_str_via_vm("<diff>", "(hashtable-contains? ht2 'z)")
+        .unwrap();
+    let copy_x = rt
+        .eval_str_via_vm("<diff>", "(hashtable-contains? ht2 'x)")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(
+        &sz_orig,
+        Value::Number(cs_core::Number::Fixnum(2))
+    ));
+    assert!(matches!(
+        &sz_copy,
+        Value::Number(cs_core::Number::Fixnum(2))
+    ));
+    assert!(matches!(
+        &copy_has_x,
+        Value::Number(cs_core::Number::Fixnum(10))
+    ));
+    assert!(matches!(
+        &copy_has_y,
+        Value::Number(cs_core::Number::Fixnum(20))
+    ));
+    // Original unchanged after copy mutation
+    assert!(matches!(&orig_z, Value::Boolean(false)));
+    assert!(matches!(&orig_x, Value::Boolean(true)));
+    // Copy reflects its own mutations
+    assert!(matches!(&copy_z, Value::Boolean(true)));
+    assert!(matches!(&copy_x, Value::Boolean(false)));
+}

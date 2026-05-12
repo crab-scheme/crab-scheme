@@ -727,6 +727,9 @@ pub enum Inst {
     /// `dst = hashtable-ref(ht, key, default)` returns value or default.
     /// ADR 0012 D-2 (iter GY).
     HashtableRef(Value, Value, Value, Value),
+    /// `dst = hashtable-copy(ht)` returns fresh hashtable copy.
+    /// ADR 0012 D-2 (iter GZ).
+    HashtableCopy(Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

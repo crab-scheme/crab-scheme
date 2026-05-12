@@ -1166,6 +1166,37 @@ pub unsafe extern "C" fn vm_force_forced_gc(r: i64) -> i64 {
     }
 }
 
+/// `(hashtable-copy ht)` — returns a fresh hashtable with the same
+/// eq_kind (preserving Custom hash/equiv procs if present) and a
+/// deep-cloned items vector. Deopts on non-hashtable. ADR 0012 D-2
+/// (iter GZ).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_copy_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Hashtable(h) => {
+            let items = h.items.borrow().clone();
+            let new_ht = match h.eq_kind {
+                cs_core::HtEqKind::Custom => {
+                    let c = h.custom.as_ref().expect("custom kind has procs");
+                    cs_core::Hashtable::new_custom(c.hash.clone(), c.equiv.clone())
+                }
+                kind => cs_core::Hashtable::new(kind),
+            };
+            *new_ht.items.borrow_mut() = items;
+            value_to_gc_i64(Value::Hashtable(new_ht))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(hashtable-ref ht key default)` — returns the value bound to
 /// `key` under the table's eq kind, or `default` on miss. Deopts on
 /// non-hashtable or Custom eq_kind (which needs ctx). The default is

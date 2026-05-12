@@ -1999,6 +1999,15 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::HashtableDelete(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter GZ) — hashtable-copy.
+                                    // 1-arg form (mutable copy).
+                                    ("hashtable-copy", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::HashtableCopy(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter GY) — hashtable-ref.
                                     // 3-arg; ht and key must be Any; default
                                     // gets BoxTyped if not Any.
@@ -5455,6 +5464,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::HashtableDelete(dst, _, _)
                 | RirInst::HashtableSet(dst, _, _, _)
                 | RirInst::HashtableRef(dst, _, _, _)
+                | RirInst::HashtableCopy(dst, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)
