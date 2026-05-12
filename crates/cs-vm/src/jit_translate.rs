@@ -4513,6 +4513,24 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter IU) — bytevector-copy! 5-arg.
+                                    ("bytevector-copy!", 5)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Fixnum)
+                                            && value_types.get(&args[2]).copied()
+                                                == Some(Type::Any)
+                                            && value_types.get(&args[3]).copied()
+                                                == Some(Type::Fixnum)
+                                            && value_types.get(&args[4]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::BvCopyBangSlice(
+                                            dst, args[0], args[1], args[2], args[3], args[4],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter IS) — string-copy! 4-arg.
                                     ("string-copy!", 4)
                                         if value_types.get(&args[0]).copied()
@@ -6114,6 +6132,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::BvCopyBangFrom(dst, _, _, _, _)
                 | RirInst::StrCopyBangFrom(dst, _, _, _, _)
                 | RirInst::VecCopyBangSlice(dst, _, _, _, _, _)
+                | RirInst::BvCopyBangSlice(dst, _, _, _, _, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::MakeHashtableEqual(dst)

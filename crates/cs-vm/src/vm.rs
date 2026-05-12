@@ -5588,6 +5588,58 @@ pub unsafe extern "C" fn vm_string_to_number_radix_gc(s: i64, radix: i64) -> i64
     }
 }
 
+/// `(bytevector-copy! dest at src start end)` — 5-arg form: copies
+/// `src[start..end]` into `dest` starting at index `at`. Consumes
+/// both Gc handles. ADR 0012 D-2 (iter IU).
+///
+/// # Safety
+///
+/// `dest` and `src` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_copy_bang_slice_gc(
+    dest: i64,
+    at: i64,
+    src: i64,
+    src_start: i64,
+    src_end: i64,
+) -> i64 {
+    let dest_v = unsafe { gc_i64_to_value(dest) };
+    let src_v = unsafe { gc_i64_to_value(src) };
+    let (dest_g, src_g) = match (dest_v, src_v) {
+        (Value::ByteVector(d), Value::ByteVector(s)) => (d, s),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+    };
+    let src_bytes = src_g.borrow().clone();
+    let src_len = src_bytes.len();
+    if at < 0
+        || src_start < 0
+        || src_end < 0
+        || (src_start as usize) > src_len
+        || (src_end as usize) > src_len
+        || src_start > src_end
+    {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Unspecified);
+    }
+    let at = at as usize;
+    let start = src_start as usize;
+    let end = src_end as usize;
+    let n = end - start;
+    {
+        let mut d = dest_g.borrow_mut();
+        if at + n > d.len() {
+            drop(d);
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+        d[at..at + n].copy_from_slice(&src_bytes[start..end]);
+    }
+    value_to_gc_i64(Value::Unspecified)
+}
+
 /// `(bytevector-copy! dest at src start)` — 4-arg form: copies
 /// `src[start..]` into `dest` starting at index `at`. Consumes both
 /// Gc handles. ADR 0012 D-2 (iter IR).
