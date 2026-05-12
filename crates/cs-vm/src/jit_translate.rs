@@ -1999,6 +1999,39 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::HashtableDelete(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter GY) — hashtable-ref.
+                                    // 3-arg; ht and key must be Any; default
+                                    // gets BoxTyped if not Any.
+                                    ("hashtable-ref", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        let dt = value_types
+                                            .get(&args[2])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let default_arg = if dt == Type::Any {
+                                            args[2]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[2],
+                                                type_to_jit_rt_tag(dt),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::HashtableRef(
+                                            dst,
+                                            args[0],
+                                            args[1],
+                                            default_arg,
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter GX) — hashtable-set!.
                                     // 3-arg mutator; ht/key must be Any.
                                     // Value operand gets BoxTyped if not Any.
@@ -5421,6 +5454,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::ForceForced(dst, _)
                 | RirInst::HashtableDelete(dst, _, _)
                 | RirInst::HashtableSet(dst, _, _, _)
+                | RirInst::HashtableRef(dst, _, _, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)

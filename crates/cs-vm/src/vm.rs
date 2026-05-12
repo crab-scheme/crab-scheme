@@ -1166,6 +1166,43 @@ pub unsafe extern "C" fn vm_force_forced_gc(r: i64) -> i64 {
     }
 }
 
+/// `(hashtable-ref ht key default)` — returns the value bound to
+/// `key` under the table's eq kind, or `default` on miss. Deopts on
+/// non-hashtable or Custom eq_kind (which needs ctx). The default is
+/// returned by value (no thunk invocation here — that's a R6RS
+/// extension routed through the slow path). ADR 0012 D-2 (iter GY).
+///
+/// # Safety
+///
+/// `ht_raw`, `key_raw`, and `default_raw` must be live, owned
+/// `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_ref_gc(ht_raw: i64, key_raw: i64, default_raw: i64) -> i64 {
+    let ht_v = unsafe { gc_i64_to_value(ht_raw) };
+    let key_v = unsafe { gc_i64_to_value(key_raw) };
+    let default_v = unsafe { gc_i64_to_value(default_raw) };
+    match ht_v {
+        Value::Hashtable(h) if h.eq_kind != cs_core::HtEqKind::Custom => {
+            let kind = h.eq_kind;
+            let items = h.items.borrow();
+            if let Some((_, v)) = items.iter().find(|(k, _)| match kind {
+                cs_core::HtEqKind::Eq => cs_core::eq::eq(k, &key_v),
+                cs_core::HtEqKind::Eqv => cs_core::eq::eqv(k, &key_v),
+                cs_core::HtEqKind::Equal => cs_core::eq::equal(k, &key_v),
+                cs_core::HtEqKind::Custom => unreachable!(),
+            }) {
+                value_to_gc_i64(v.clone())
+            } else {
+                value_to_gc_i64(default_v)
+            }
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(default_v)
+        }
+    }
+}
+
 /// `(hashtable-set! ht key val)` — sets or replaces the entry for
 /// `key`. Returns a Gc handle to Unspecified. Deopts on non-hashtable
 /// or Custom eq_kind (which needs ctx). ADR 0012 D-2 (iter GX).

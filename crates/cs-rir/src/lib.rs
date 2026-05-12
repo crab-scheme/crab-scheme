@@ -724,6 +724,9 @@ pub enum Inst {
     /// `dst = hashtable-set!(ht, key, val)` returns Unspecified.
     /// ADR 0012 D-2 (iter GX).
     HashtableSet(Value, Value, Value, Value),
+    /// `dst = hashtable-ref(ht, key, default)` returns value or default.
+    /// ADR 0012 D-2 (iter GY).
+    HashtableRef(Value, Value, Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

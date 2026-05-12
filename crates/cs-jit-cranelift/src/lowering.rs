@@ -432,6 +432,8 @@ pub struct Lowerer {
     hashtable_delete_func: cranelift_module::FuncId,
     /// FuncId of `vm_hashtable_set_gc(ht, k, v) -> i64`. ADR 0012 D-2 (iter GX).
     hashtable_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_hashtable_ref_gc(ht, k, d) -> i64`. ADR 0012 D-2 (iter GY).
+    hashtable_ref_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -1087,6 +1089,11 @@ impl Lowerer {
         builder.symbol(
             "vm_hashtable_set_gc",
             cs_vm::vm::vm_hashtable_set_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter GY) — hashtable-ref.
+        builder.symbol(
+            "vm_hashtable_ref_gc",
+            cs_vm::vm::vm_hashtable_ref_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
@@ -2659,6 +2666,14 @@ impl Lowerer {
                 &vector_set_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_hashtable_set_gc: {e}")))?;
+        // ADR 0012 D-2 (iter GY) — hashtable-ref.
+        let hashtable_ref_func = module
+            .declare_function(
+                "vm_hashtable_ref_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_hashtable_ref_gc: {e}")))?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3644,6 +3659,7 @@ impl Lowerer {
             hashtable_contains_p_func,
             hashtable_delete_func,
             hashtable_set_func,
+            hashtable_ref_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4323,6 +4339,10 @@ impl Lowerer {
             let hashtable_set_fnref = self
                 .module
                 .declare_func_in_func(self.hashtable_set_func, builder.func);
+            // iter GY — hashtable-ref.
+            let hashtable_ref_fnref = self
+                .module
+                .declare_func_in_func(self.hashtable_ref_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4822,6 +4842,7 @@ impl Lowerer {
                         hashtable_contains_p_fnref,
                         hashtable_delete_fnref,
                         hashtable_set_fnref,
+                        hashtable_ref_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -5210,6 +5231,7 @@ fn lower_inst(
     hashtable_contains_p_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_delete_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_set_fnref: cranelift_codegen::ir::FuncRef,
+    hashtable_ref_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -6083,6 +6105,26 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "HashtableSet expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::HashtableRef(dst, ht, key, default) => {
+            // ADR 0012 D-2 (iter GY) — hashtable-ref. Returns matching
+            // value or default. Deopts on non-hashtable or Custom eq_kind.
+            let htv = lookup(map, *ht)?;
+            let kv = lookup(map, *key)?;
+            let dv = lookup(map, *default)?;
+            let inst_ref = b.ins().call(hashtable_ref_fnref, &[htv, kv, dv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "HashtableRef expected 1 result, got {}",
                         results.len()
                     )));
                 }

@@ -8066,3 +8066,64 @@ fn diff_jit_hashtable_set() {
     assert!(matches!(&eq_v, Value::Number(cs_core::Number::Fixnum(200))));
     assert!(matches!(&eq_sz, Value::Number(cs_core::Number::Fixnum(1))));
 }
+
+#[test]
+fn diff_jit_hashtable_ref() {
+    // ADR 0012 D-2 (iter GY) — hashtable-ref fast path.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (hr ht k d) (hashtable-ref ht k d))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm-ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! warm-ht 'a 7)")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (hr warm-ht 'a 0) (hr warm-ht 'missing -1) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'k1 10)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'k2 20)")
+        .unwrap();
+    let hit = rt.eval_str_via_vm("<diff>", "(hr ht 'k1 -1)").unwrap();
+    let hit2 = rt.eval_str_via_vm("<diff>", "(hr ht 'k2 -1)").unwrap();
+    let miss = rt.eval_str_via_vm("<diff>", "(hr ht 'absent -1)").unwrap();
+    // Default with non-fixnum boxed type
+    let str_def = rt
+        .eval_str_via_vm("<diff>", "(hr ht 'absent \"fallback\")")
+        .unwrap();
+    // Equal-hashtable structural key
+    rt.eval_str_via_vm("<diff>", "(define eqht (make-hashtable equal-hash equal?))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! eqht (list 'x 1) 99)")
+        .unwrap();
+    let eq_hit = rt
+        .eval_str_via_vm("<diff>", "(hr eqht (list 'x 1) -1)")
+        .unwrap();
+    let eq_miss = rt
+        .eval_str_via_vm("<diff>", "(hr eqht (list 'y 2) -1)")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&hit, Value::Number(cs_core::Number::Fixnum(10))));
+    assert!(matches!(&hit2, Value::Number(cs_core::Number::Fixnum(20))));
+    assert!(matches!(&miss, Value::Number(cs_core::Number::Fixnum(-1))));
+    match &str_def {
+        Value::String(sg) => assert_eq!(&*sg.borrow(), "fallback"),
+        other => panic!("expected string fallback, got {:?}", other),
+    }
+    assert!(matches!(
+        &eq_hit,
+        Value::Number(cs_core::Number::Fixnum(99))
+    ));
+    assert!(matches!(
+        &eq_miss,
+        Value::Number(cs_core::Number::Fixnum(-1))
+    ));
+}
