@@ -6877,6 +6877,46 @@ pub unsafe extern "C" fn vm_vector_to_string_gc(v: i64) -> i64 {
     }
 }
 
+/// `(string->vector s start)` — 2-arg slice-from form. Returns a
+/// fresh `Value::Vector` of chars at codepoint positions `start..`.
+/// Char-based indexing (multibyte UTF-8). Consumes `s`. `start` is
+/// a raw Fixnum i64. Non-string or out-of-range deopt. ADR 0012
+/// D-2 (iter IP).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_to_vector_slice_from_gc(s: i64, start: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            let chars: Vec<char> = sg.borrow().chars().collect();
+            let len = chars.len();
+            if start < 0 || (start as usize) > len {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+                    Vec::new(),
+                ))));
+            }
+            let slice: Vec<Value> = chars[(start as usize)..]
+                .iter()
+                .copied()
+                .map(Value::Character)
+                .collect();
+            value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+                slice,
+            ))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+                Vec::new(),
+            ))))
+        }
+    }
+}
+
 /// `(string->vector s start end)` — 3-arg slice form. Returns a fresh
 /// `Value::Vector` of the chars at codepoint positions `start..end`.
 /// Char-based indexing (multibyte UTF-8). Consumes `s`. `start` and

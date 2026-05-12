@@ -4638,6 +4638,18 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter IP) — string->vector 2-arg slice-from.
+                                    ("string->vector", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::StringToVectorSliceFrom(
+                                            dst, args[0], args[1],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter ID) — vector->string 3-arg slice.
                                     ("vector->string", 3)
                                         if value_types.get(&args[0]).copied()
@@ -6031,6 +6043,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StringToListSliceFrom(dst, _, _)
                 | RirInst::BytevectorToListSliceFrom(dst, _, _)
                 | RirInst::VectorToStringSliceFrom(dst, _, _)
+                | RirInst::StringToVectorSliceFrom(dst, _, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::MakeHashtableEqual(dst)

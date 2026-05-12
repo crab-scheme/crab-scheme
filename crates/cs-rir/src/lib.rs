@@ -829,6 +829,9 @@ pub enum Inst {
     /// `dst = vector->string(v, start)` — 2-arg slice-from form.
     /// ADR 0012 D-2 (iter IO).
     VectorToStringSliceFrom(Value, Value, Value),
+    /// `dst = string->vector(s, start)` — 2-arg slice-from form.
+    /// ADR 0012 D-2 (iter IP).
+    StringToVectorSliceFrom(Value, Value, Value),
     /// `dst = mod0(x, y)` R6RS centered mod.
     /// ADR 0012 D-2 (iter HO).
     Mod0(Value, Value, Value),

@@ -9861,3 +9861,54 @@ fn diff_jit_vector_to_string_slice_from() {
     assert_eq!(str_of(full), "hello");
     assert_eq!(str_of(empty), "");
 }
+
+#[test]
+fn diff_jit_string_to_vector_slice_from() {
+    // ADR 0012 D-2 (iter IP) — string->vector 2-arg slice-from form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (stvf s a) (string->vector s a))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define src \"hello\")")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (stvf src 2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let tail = rt.eval_str_via_vm("<diff>", "(stvf src 2)").unwrap();
+    let full = rt.eval_str_via_vm("<diff>", "(stvf src 0)").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(stvf src 5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn vec_chars(v: &Value) -> Vec<char> {
+        match v {
+            Value::Vector(vc) => vc
+                .borrow()
+                .iter()
+                .map(|e| match e {
+                    Value::Character(c) => *c,
+                    other => panic!("expected char, got {:?}", other),
+                })
+                .collect(),
+            other => panic!("expected vector, got {:?}", other),
+        }
+    }
+    assert_eq!(vec_chars(&tail), vec!['l', 'l', 'o']);
+    assert_eq!(vec_chars(&full), vec!['h', 'e', 'l', 'l', 'o']);
+    assert_eq!(vec_chars(&empty), Vec::<char>::new());
+
+    // Multibyte UTF-8 — codepoint indexing.
+    rt.eval_str_via_vm("<diff>", "(define utf \"αβγδε\")").unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (stvf utf 2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    let utf_tail = rt.eval_str_via_vm("<diff>", "(stvf utf 2)").unwrap();
+    assert_eq!(vec_chars(&utf_tail), vec!['γ', 'δ', 'ε']);
+}
