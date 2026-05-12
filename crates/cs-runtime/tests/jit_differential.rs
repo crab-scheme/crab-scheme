@@ -10261,3 +10261,60 @@ fn diff_jit_variadic_fxminmax() {
     assert_eq!(fix_of(mn3), 2);
     assert_eq!(fix_of(mx3), 8);
 }
+
+#[test]
+fn diff_jit_variadic_eq_predicates() {
+    // ADR 0012 D-2 (iter JA) — variadic boolean=? / char=? / symbol=? (3+ args).
+    // JIT returns 0/1 raw bits (Fixnum-tagged); wrap in (if ...) to test the
+    // branch semantics (same pattern as variadic-compares test for `=`/`<`).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (be3) (if (boolean=? #t #t #t) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (be3-mixed) (if (boolean=? #t #t #f) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ce3) (if (char=? #\\a #\\a #\\a) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (ce3-mixed) (if (char=? #\\a #\\a #\\b) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (se3) (if (symbol=? 'x 'x 'x) 1 0))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (se3-mixed) (if (symbol=? 'x 'x 'y) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (be3) (be3-mixed) (ce3) (ce3-mixed) (se3) (se3-mixed) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let be = rt.eval_str_via_vm("<diff>", "(be3)").unwrap();
+    let be_m = rt.eval_str_via_vm("<diff>", "(be3-mixed)").unwrap();
+    let ce = rt.eval_str_via_vm("<diff>", "(ce3)").unwrap();
+    let ce_m = rt.eval_str_via_vm("<diff>", "(ce3-mixed)").unwrap();
+    let se = rt.eval_str_via_vm("<diff>", "(se3)").unwrap();
+    let se_m = rt.eval_str_via_vm("<diff>", "(se3-mixed)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn fix_of(v: Value) -> i64 {
+        match v {
+            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            other => panic!("expected fixnum, got {:?}", other),
+        }
+    }
+    assert_eq!(fix_of(be), 1);
+    assert_eq!(fix_of(be_m), 0);
+    assert_eq!(fix_of(ce), 1);
+    assert_eq!(fix_of(ce_m), 0);
+    assert_eq!(fix_of(se), 1);
+    assert_eq!(fix_of(se_m), 0);
+}

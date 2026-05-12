@@ -4983,6 +4983,40 @@ pub fn bytecode_to_rir_with_hints(
                                     | ("symbol=?", 2) => {
                                         insts.push(RirInst::Eq(dst, args[0], args[1]));
                                     }
+                                    // ADR 0012 D-2 (iter JA) — variadic
+                                    // boolean=? / char=? / symbol=? for 3+ args
+                                    // where all args are the same primitive
+                                    // type. Pairwise Eq + BitAnd chain.
+                                    ("boolean=?", n) | ("char=?", n) | ("symbol=?", n)
+                                        if n >= 3
+                                            && args.iter().all(|v| {
+                                                let t = value_types.get(v).copied();
+                                                t == Some(Type::Boolean)
+                                                    || t == Some(Type::Character)
+                                                    || t == Some(Type::Symbol)
+                                            })
+                                            && {
+                                                let first = value_types.get(&args[0]).copied();
+                                                args.iter()
+                                                    .all(|v| value_types.get(v).copied() == first)
+                                            } =>
+                                    {
+                                        let first = alloc();
+                                        insts.push(RirInst::Eq(first, args[0], args[1]));
+                                        value_types.insert(first, Type::Boolean);
+                                        let mut acc = first;
+                                        for i in 1..args.len() - 1 {
+                                            let cmp = alloc();
+                                            insts.push(RirInst::Eq(cmp, args[i], args[i + 1]));
+                                            value_types.insert(cmp, Type::Boolean);
+                                            let new_acc = alloc();
+                                            insts.push(RirInst::BitAnd(new_acc, acc, cmp));
+                                            value_types.insert(new_acc, Type::Boolean);
+                                            acc = new_acc;
+                                        }
+                                        insts.push(RirInst::Move(dst, acc));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // ADR 0012 D-2 (iter CF) — char
                                     // ordered comparisons. Character carries
                                     // a codepoint in Fixnum-shape i64 lanes,
