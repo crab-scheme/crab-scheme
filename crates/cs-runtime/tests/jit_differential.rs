@@ -8681,3 +8681,32 @@ fn diff_jit_vector_eq() {
     assert!(matches!(&strs, Value::Boolean(true)));
     assert!(matches!(&nested, Value::Boolean(true)));
 }
+
+#[test]
+fn diff_jit_make_bytevector_one_arg() {
+    // ADR 0012 D-2 (iter HL) — make-bytevector 1-arg form (fill defaults
+    // to 0).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mbv n) (make-bytevector n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (mbv 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let bv5 = rt.eval_str_via_vm("<diff>", "(mbv 5)").unwrap();
+    let bv0 = rt.eval_str_via_vm("<diff>", "(mbv 0)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &bv5 {
+        Value::ByteVector(bg) => assert_eq!(&*bg.borrow(), &[0u8, 0, 0, 0, 0]),
+        other => panic!("expected bytevector, got {:?}", other),
+    }
+    match &bv0 {
+        Value::ByteVector(bg) => assert_eq!(bg.borrow().len(), 0),
+        other => panic!("expected bytevector, got {:?}", other),
+    }
+}

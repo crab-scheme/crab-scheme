@@ -2739,6 +2739,16 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::BvAlloc(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter HL) — make-bytevector 1-arg.
+                                    // Fill defaults to 0; reuse BvAlloc with a
+                                    // synthesized zero.
+                                    ("make-bytevector", 1) => {
+                                        let zero = alloc();
+                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                        value_types.insert(zero, Type::Fixnum);
+                                        insts.push(RirInst::BvAlloc(dst, args[0], zero));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     ("bytevector-u8-set!", 3)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
