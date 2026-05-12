@@ -8941,3 +8941,35 @@ fn diff_jit_vector_copy_from() {
     assert_eq!(vec_ints(&full), vec![10, 20, 30, 40, 50]);
     assert_eq!(vec_ints(&empty), Vec::<i64>::new());
 }
+
+#[test]
+fn diff_jit_bytevector_copy_from() {
+    // ADR 0012 D-2 (iter HU) — bytevector-copy 2-arg slice-to-end form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bcf v s) (bytevector-copy v s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define src (bytevector 1 2 3 4 5 6 7 8))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (bcf src 3) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let tail = rt.eval_str_via_vm("<diff>", "(bcf src 3)").unwrap();
+    let full = rt.eval_str_via_vm("<diff>", "(bcf src 0)").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(bcf src 8)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn bv_bytes(v: &Value) -> Vec<u8> {
+        match v {
+            Value::ByteVector(bg) => bg.borrow().clone(),
+            other => panic!("expected bytevector, got {:?}", other),
+        }
+    }
+    assert_eq!(bv_bytes(&tail), vec![4, 5, 6, 7, 8]);
+    assert_eq!(bv_bytes(&full), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(bv_bytes(&empty), Vec::<u8>::new());
+}

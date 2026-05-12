@@ -778,6 +778,9 @@ pub enum Inst {
     /// `dst = vector-copy(v, start)` — 2-arg slice-to-end form.
     /// ADR 0012 D-2 (iter HT).
     VecCopyFrom(Value, Value, Value),
+    /// `dst = bytevector-copy(bv, start)` — 2-arg slice-to-end form.
+    /// ADR 0012 D-2 (iter HU).
+    BvCopyFrom(Value, Value, Value),
     /// `dst = mod0(x, y)` R6RS centered mod.
     /// ADR 0012 D-2 (iter HO).
     Mod0(Value, Value, Value),

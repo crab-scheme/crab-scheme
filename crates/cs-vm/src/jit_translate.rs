@@ -2651,6 +2651,16 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter HU) — bytevector-copy 2-arg slice-to-end.
+                                    ("bytevector-copy", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::BvCopyFrom(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
                                     ("bytevector-copy", 3)
                                         if value_types.get(&args[0]).copied()
@@ -5733,6 +5743,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::HashtableCopy(dst, _)
                 | RirInst::VecCopySlice(dst, _, _, _)
                 | RirInst::VecCopyFrom(dst, _, _)
+                | RirInst::BvCopyFrom(dst, _, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::MakeHashtableEqual(dst)

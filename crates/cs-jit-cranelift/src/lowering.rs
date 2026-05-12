@@ -452,6 +452,8 @@ pub struct Lowerer {
     vector_copy_slice_func: cranelift_module::FuncId,
     /// FuncId of `vm_vector_copy_from_gc(v, s) -> i64`. ADR 0012 D-2 (iter HT).
     vector_copy_from_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_copy_from_gc(bv, s) -> i64`. ADR 0012 D-2 (iter HU).
+    bytevector_copy_from_func: cranelift_module::FuncId,
     /// FuncId of `vm_bytevector_copy_slice_gc(bv, s, e) -> i64`. ADR 0012 D-2 (iter HC).
     bytevector_copy_slice_func: cranelift_module::FuncId,
     /// FuncId of `vm_eof_object_gc() -> i64`. ADR 0012 D-2 (iter HD).
@@ -1171,6 +1173,11 @@ impl Lowerer {
         builder.symbol(
             "vm_vector_copy_from_gc",
             cs_vm::vm::vm_vector_copy_from_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter HU) — bytevector-copy 2-arg slice-to-end.
+        builder.symbol(
+            "vm_bytevector_copy_from_gc",
+            cs_vm::vm::vm_bytevector_copy_from_gc as *const u8,
         );
         // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
         builder.symbol(
@@ -2886,6 +2893,16 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_vector_copy_from_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter HU) — bytevector-copy 2-arg slice-to-end.
+        let bytevector_copy_from_func = module
+            .declare_function(
+                "vm_bytevector_copy_from_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_copy_from_gc: {e}"))
+            })?;
         // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
         let bytevector_copy_slice_func = module
             .declare_function(
@@ -3967,6 +3984,7 @@ impl Lowerer {
             hashtable_copy_func,
             vector_copy_slice_func,
             vector_copy_from_func,
+            bytevector_copy_from_func,
             bytevector_copy_slice_func,
             eof_object_func,
             bitwise_bit_count_func,
@@ -4693,6 +4711,10 @@ impl Lowerer {
             let vector_copy_from_fnref = self
                 .module
                 .declare_func_in_func(self.vector_copy_from_func, builder.func);
+            // iter HU — bytevector-copy 2-arg slice-to-end.
+            let bytevector_copy_from_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_copy_from_func, builder.func);
             // iter HC — bytevector-copy 3-arg slice.
             let bytevector_copy_slice_fnref = self
                 .module
@@ -5238,6 +5260,7 @@ impl Lowerer {
                         hashtable_copy_fnref,
                         vector_copy_slice_fnref,
                         vector_copy_from_fnref,
+                        bytevector_copy_from_fnref,
                         bytevector_copy_slice_fnref,
                         eof_object_fnref,
                         bitwise_bit_count_fnref,
@@ -5645,6 +5668,7 @@ fn lower_inst(
     hashtable_copy_fnref: cranelift_codegen::ir::FuncRef,
     vector_copy_slice_fnref: cranelift_codegen::ir::FuncRef,
     vector_copy_from_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_copy_from_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_copy_slice_fnref: cranelift_codegen::ir::FuncRef,
     eof_object_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
@@ -6631,6 +6655,24 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "VecCopyFrom expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::BvCopyFrom(dst, bv, start) => {
+            // ADR 0012 D-2 (iter HU) — bytevector-copy 2-arg slice-to-end.
+            let bvv = lookup(map, *bv)?;
+            let sv = lookup(map, *start)?;
+            let inst_ref = b.ins().call(bytevector_copy_from_fnref, &[bvv, sv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvCopyFrom expected 1 result, got {}",
                         results.len()
                     )));
                 }
