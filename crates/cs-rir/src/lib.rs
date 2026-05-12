@@ -784,6 +784,9 @@ pub enum Inst {
     /// `dst = string-copy(s, start)` — 2-arg slice-to-end form.
     /// ADR 0012 D-2 (iter HV).
     StrCopyFrom(Value, Value, Value),
+    /// `dst = bytevector-fill!(bv, fill, start)` — 3-arg fill-from form.
+    /// ADR 0012 D-2 (iter IA).
+    BvFillFrom(Value, Value, Value, Value),
     /// `dst = mod0(x, y)` R6RS centered mod.
     /// ADR 0012 D-2 (iter HO).
     Mod0(Value, Value, Value),

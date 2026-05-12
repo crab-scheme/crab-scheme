@@ -456,6 +456,8 @@ pub struct Lowerer {
     bytevector_copy_from_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_copy_from_gc(s, st) -> i64`. ADR 0012 D-2 (iter HV).
     string_copy_from_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_fill_from_gc(bv, f, st) -> i64`. ADR 0012 D-2 (iter IA).
+    bytevector_fill_from_func: cranelift_module::FuncId,
     /// FuncId of `vm_bytevector_copy_slice_gc(bv, s, e) -> i64`. ADR 0012 D-2 (iter HC).
     bytevector_copy_slice_func: cranelift_module::FuncId,
     /// FuncId of `vm_eof_object_gc() -> i64`. ADR 0012 D-2 (iter HD).
@@ -1185,6 +1187,11 @@ impl Lowerer {
         builder.symbol(
             "vm_string_copy_from_gc",
             cs_vm::vm::vm_string_copy_from_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter IA) — bytevector-fill! 3-arg fill-from.
+        builder.symbol(
+            "vm_bytevector_fill_from_gc",
+            cs_vm::vm::vm_bytevector_fill_from_gc as *const u8,
         );
         // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
         builder.symbol(
@@ -2920,6 +2927,16 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_string_copy_from_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter IA) — bytevector-fill! 3-arg fill-from.
+        let bytevector_fill_from_func = module
+            .declare_function(
+                "vm_bytevector_fill_from_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_fill_from_gc: {e}"))
+            })?;
         // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
         let bytevector_copy_slice_func = module
             .declare_function(
@@ -4003,6 +4020,7 @@ impl Lowerer {
             vector_copy_from_func,
             bytevector_copy_from_func,
             string_copy_from_func,
+            bytevector_fill_from_func,
             bytevector_copy_slice_func,
             eof_object_func,
             bitwise_bit_count_func,
@@ -4737,6 +4755,10 @@ impl Lowerer {
             let string_copy_from_fnref = self
                 .module
                 .declare_func_in_func(self.string_copy_from_func, builder.func);
+            // iter IA — bytevector-fill! 3-arg fill-from.
+            let bytevector_fill_from_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_fill_from_func, builder.func);
             // iter HC — bytevector-copy 3-arg slice.
             let bytevector_copy_slice_fnref = self
                 .module
@@ -5284,6 +5306,7 @@ impl Lowerer {
                         vector_copy_from_fnref,
                         bytevector_copy_from_fnref,
                         string_copy_from_fnref,
+                        bytevector_fill_from_fnref,
                         bytevector_copy_slice_fnref,
                         eof_object_fnref,
                         bitwise_bit_count_fnref,
@@ -5693,6 +5716,7 @@ fn lower_inst(
     vector_copy_from_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_copy_from_fnref: cranelift_codegen::ir::FuncRef,
     string_copy_from_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_fill_from_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_copy_slice_fnref: cranelift_codegen::ir::FuncRef,
     eof_object_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
@@ -6697,6 +6721,25 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "BvCopyFrom expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::BvFillFrom(dst, bv, fill, start) => {
+            // ADR 0012 D-2 (iter IA) — bytevector-fill! 3-arg fill-from.
+            let bvv = lookup(map, *bv)?;
+            let fv = lookup(map, *fill)?;
+            let sv = lookup(map, *start)?;
+            let inst_ref = b.ins().call(bytevector_fill_from_fnref, &[bvv, fv, sv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvFillFrom expected 1 result, got {}",
                         results.len()
                     )));
                 }

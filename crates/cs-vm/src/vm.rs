@@ -2875,6 +2875,41 @@ pub unsafe extern "C" fn vm_bytevector_fill_gc(bv: i64, fill: i64) -> i64 {
     }
 }
 
+/// `(bytevector-fill! bv fill start)` — 3-arg fill-from form. Fills
+/// `bv[start..len]` with `fill & 0xFF`. Consumes `bv`. `fill` and
+/// `start` are raw Fixnum i64. Non-bytevector or out-of-range
+/// (start < 0 or > len) deopt. Returns Gc(Unspecified). ADR 0012 D-2
+/// (iter IA).
+///
+/// # Safety
+///
+/// `bv` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_fill_from_gc(bv: i64, fill: i64, start: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    let byte = (fill & 0xFF) as u8;
+    match v {
+        Value::ByteVector(bvc) => {
+            let mut storage = bvc.borrow_mut();
+            let len = storage.len();
+            if start < 0 || (start as usize) > len {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            for slot in storage[(start as usize)..].iter_mut() {
+                *slot = byte;
+            }
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(bytevector-fill! bv fill start end)` — 4-arg slice-fill form.
 /// Overwrites `bv[start..end]` with `fill & 0xFF`. `bv` is consumed;
 /// `fill`, `start`, `end` are raw Fixnum i64. Returns Gc(Unspecified).
