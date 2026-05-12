@@ -696,6 +696,8 @@ pub enum Inst {
     CurrentSecond(Value),
     /// `dst = current-jiffy()` (0-arg, Fixnum). ADR 0012 D-2 (iter GL).
     CurrentJiffy(Value),
+    /// `dst = append-reverse(rev, tail)`. ADR 0012 D-2 (iter GN).
+    AppendReverse(Value, Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

@@ -7617,3 +7617,43 @@ fn diff_jit_bytevector_list_r7rs_aliases() {
         other => panic!("expected bytevector, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_append_reverse() {
+    // ADR 0012 D-2 (iter GN) — append-reverse.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ar a b) (append-reverse a b))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (ar (list 1 2 3) (list 4 5)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // (append-reverse '(1 2 3) '(4 5)) => (3 2 1 4 5)
+    let r = rt
+        .eval_str_via_vm("<diff>", "(ar (list 1 2 3) (list 4 5))")
+        .unwrap();
+    // (append-reverse '() '(a)) => (a)
+    let empty = rt.eval_str_via_vm("<diff>", "(ar '() (list 'a))").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &r {
+        Value::Pair(p) => {
+            // First element should be 3
+            assert!(matches!(
+                p.car.borrow().clone(),
+                Value::Number(cs_core::Number::Fixnum(3))
+            ));
+        }
+        other => panic!("expected pair, got {:?}", other),
+    }
+    match &empty {
+        Value::Pair(p) => {
+            assert!(matches!(p.car.borrow().clone(), Value::Symbol(_)));
+        }
+        other => panic!("expected pair, got {:?}", other),
+    }
+}

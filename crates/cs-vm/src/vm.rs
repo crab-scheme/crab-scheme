@@ -1036,6 +1036,35 @@ pub unsafe extern "C" fn vm_current_jiffy() -> i64 {
     }
 }
 
+/// `(append-reverse rev tail)` — SRFI-1. Walks `rev`, prepending
+/// each element to `tail`. Effectively `(append (reverse rev) tail)`.
+/// Deopts on improper list. ADR 0012 D-2 (iter GN).
+///
+/// # Safety
+///
+/// Both args must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_append_reverse_gc(rev: i64, tail: i64) -> i64 {
+    let rev_v = unsafe { gc_i64_to_value(rev) };
+    let mut acc = unsafe { gc_i64_to_value(tail) };
+    let mut cur = rev_v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                let cdr = p.cdr.borrow().clone();
+                acc = Value::Pair(cs_core::Pair::new(car, acc));
+                cur = cdr;
+            }
+            Value::Null => return value_to_gc_i64(acc),
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(acc);
+            }
+        }
+    }
+}
+
 /// `(file-exists? path)` — filesystem syscall via `Path::exists`.
 /// Returns raw 0/1 (Boolean shape). Deopts on non-String argument.
 /// ADR 0012 D-2 (iter GK).
