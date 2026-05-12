@@ -5679,6 +5679,56 @@ pub unsafe extern "C" fn vm_bytevector_copy_bang_gc(dest: i64, at: i64, src: i64
 ///
 /// `dest` and `src` must be live, owned `Gc<Value>` raw handles.
 /// `at` is raw i64.
+/// `(string-copy! dest at src start)` — 4-arg form: copies
+/// `src[start..]` (char-based) into `dest` starting at index `at`.
+/// Consumes both Gc handles. ADR 0012 D-2 (iter IS).
+///
+/// # Safety
+///
+/// `dest` and `src` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_copy_bang_from_gc(
+    dest: i64,
+    at: i64,
+    src: i64,
+    src_start: i64,
+) -> i64 {
+    let dest_v = unsafe { gc_i64_to_value(dest) };
+    let src_v = unsafe { gc_i64_to_value(src) };
+    let (dest_g, src_g) = match (dest_v, src_v) {
+        (Value::String(d), Value::String(s)) => (d, s),
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+    };
+    let src_str = src_g.borrow().clone();
+    let src_chars: Vec<char> = src_str.chars().collect();
+    let src_len = src_chars.len();
+    if at < 0 || src_start < 0 || (src_start as usize) > src_len {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Unspecified);
+    }
+    let at = at as usize;
+    let start = src_start as usize;
+    let n = src_len - start;
+    {
+        let mut d = dest_g.borrow_mut();
+        let dest_chars: Vec<char> = d.chars().collect();
+        if at + n > dest_chars.len() {
+            drop(d);
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+        let mut new_chars = dest_chars;
+        for (i, c) in src_chars[start..].iter().enumerate() {
+            new_chars[at + i] = *c;
+        }
+        *d = new_chars.into_iter().collect();
+    }
+    value_to_gc_i64(Value::Unspecified)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn vm_string_copy_bang_gc(dest: i64, at: i64, src: i64) -> i64 {
     let dest_v = unsafe { gc_i64_to_value(dest) };

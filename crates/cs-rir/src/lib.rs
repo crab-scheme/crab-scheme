@@ -838,6 +838,9 @@ pub enum Inst {
     /// `dst = bytevector-copy!(dest, at, src, src_start)` — 4-arg form.
     /// ADR 0012 D-2 (iter IR).
     BvCopyBangFrom(Value, Value, Value, Value, Value),
+    /// `dst = string-copy!(dest, at, src, src_start)` — 4-arg form.
+    /// ADR 0012 D-2 (iter IS).
+    StrCopyBangFrom(Value, Value, Value, Value, Value),
     /// `dst = mod0(x, y)` R6RS centered mod.
     /// ADR 0012 D-2 (iter HO).
     Mod0(Value, Value, Value),
