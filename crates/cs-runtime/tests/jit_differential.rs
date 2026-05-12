@@ -9453,3 +9453,59 @@ fn diff_jit_vector_to_list_slice() {
     assert_eq!(list_to_ints(full), vec![10, 20, 30, 40, 50]);
     assert_eq!(list_to_ints(empty), Vec::<i64>::new());
 }
+
+#[test]
+fn diff_jit_string_to_list_slice() {
+    // ADR 0012 D-2 (iter IG) — string->list 3-arg slice form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sts s a b) (string->list s a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define src \"hello\")")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sts src 1 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let mid = rt.eval_str_via_vm("<diff>", "(sts src 1 4)").unwrap();
+    let full = rt.eval_str_via_vm("<diff>", "(sts src 0 5)").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(sts src 2 2)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn list_to_chars(mut v: Value) -> Vec<char> {
+        let mut out = Vec::new();
+        loop {
+            match v {
+                Value::Null => return out,
+                Value::Pair(p) => {
+                    let car = p.car.borrow().clone();
+                    let cdr = p.cdr.borrow().clone();
+                    match car {
+                        Value::Character(c) => out.push(c),
+                        other => panic!("unexpected car: {:?}", other),
+                    }
+                    v = cdr;
+                }
+                other => panic!("expected pair or null, got {:?}", other),
+            }
+        }
+    }
+    assert_eq!(list_to_chars(mid), vec!['e', 'l', 'l']);
+    assert_eq!(list_to_chars(full), vec!['h', 'e', 'l', 'l', 'o']);
+    assert_eq!(list_to_chars(empty), Vec::<char>::new());
+
+    // Multibyte UTF-8 — codepoint indexing, not byte indexing.
+    rt.eval_str_via_vm("<diff>", "(define utf \"αβγδε\")").unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sts utf 1 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    let utf_mid = rt.eval_str_via_vm("<diff>", "(sts utf 1 4)").unwrap();
+    assert_eq!(list_to_chars(utf_mid), vec!['β', 'γ', 'δ']);
+}
