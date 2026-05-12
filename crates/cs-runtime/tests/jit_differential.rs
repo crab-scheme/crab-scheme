@@ -8508,3 +8508,49 @@ fn diff_jit_vector_fill_slice() {
         other => panic!("expected vector, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_string_fill_slice() {
+    // ADR 0012 D-2 (iter HH) — string-fill! 4-arg slice form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sf s ch a b) (string-fill! s ch a b) s)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm (make-string 8 #\\a))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sf warm #\\X 2 6) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define s1 (make-string 6 #\\.))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(sf s1 #\\* 1 5)").unwrap();
+    let after_mid = rt.eval_str_via_vm("<diff>", "s1").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define s2 (make-string 4 #\\z))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(sf s2 #\\Q 0 4)").unwrap();
+    let after_full = rt.eval_str_via_vm("<diff>", "s2").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define s3 (make-string 3 #\\.))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(sf s3 #\\x 1 1)").unwrap();
+    let after_empty = rt.eval_str_via_vm("<diff>", "s3").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define s4 (string #\\α #\\β #\\δ #\\ε))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(sf s4 #\\γ 1 3)").unwrap();
+    let after_utf = rt.eval_str_via_vm("<diff>", "s4").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn s_of(v: &Value) -> String {
+        match v {
+            Value::String(sg) => sg.borrow().clone(),
+            other => panic!("expected string, got {:?}", other),
+        }
+    }
+    assert_eq!(s_of(&after_mid), ".****.");
+    assert_eq!(s_of(&after_full), "QQQQ");
+    assert_eq!(s_of(&after_empty), "...");
+    assert_eq!(s_of(&after_utf), "αγγε");
+}

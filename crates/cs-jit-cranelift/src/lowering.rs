@@ -606,6 +606,9 @@ pub struct Lowerer {
     /// FuncId of `vm_vector_fill_slice_gc(v, fill, s, e) -> i64`.
     /// ADR 0012 D-2 (iter HG).
     vector_fill_slice_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_fill_slice_gc(s, ch, st, e) -> i64`.
+    /// ADR 0012 D-2 (iter HH).
+    string_fill_slice_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_take_gc(s, n) -> i64`. ADR 0012 D-2 (iter FJ).
     string_take_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_drop_gc(s, n) -> i64`. ADR 0012 D-2 (iter FJ).
@@ -1372,6 +1375,11 @@ impl Lowerer {
         builder.symbol(
             "vm_vector_fill_slice_gc",
             cs_vm::vm::vm_vector_fill_slice_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter HH) — string-fill! 4-arg slice.
+        builder.symbol(
+            "vm_string_fill_slice_gc",
+            cs_vm::vm::vm_string_fill_slice_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FJ) — string-take/-drop/-take-right/-drop-right.
         builder.symbol(
@@ -3371,6 +3379,16 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_vector_fill_slice_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter HH) — string-fill! 4-arg slice.
+        let string_fill_slice_func = module
+            .declare_function(
+                "vm_string_fill_slice_gc",
+                cranelift_module::Linkage::Import,
+                &four_arg_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_fill_slice_gc: {e}"))
+            })?;
 
         // ADR 0012 D-2 (iter FJ) — string-take/-drop/-take-right/-drop-right.
         let string_take_func = module
@@ -3848,6 +3866,7 @@ impl Lowerer {
             string_replace_first_func,
             bytevector_fill_slice_func,
             vector_fill_slice_func,
+            string_fill_slice_func,
             string_take_func,
             string_drop_func,
             string_take_right_func,
@@ -4698,6 +4717,10 @@ impl Lowerer {
             let vector_fill_slice_fnref = self
                 .module
                 .declare_func_in_func(self.vector_fill_slice_func, builder.func);
+            // iter HH — string-fill! 4-arg slice.
+            let string_fill_slice_fnref = self
+                .module
+                .declare_func_in_func(self.string_fill_slice_func, builder.func);
             // iter FJ — string-take/-drop/-take-right/-drop-right.
             let string_take_fnref = self
                 .module
@@ -5066,6 +5089,7 @@ impl Lowerer {
                         string_replace_first_fnref,
                         bytevector_fill_slice_fnref,
                         vector_fill_slice_fnref,
+                        string_fill_slice_fnref,
                         string_take_fnref,
                         string_drop_fnref,
                         string_take_right_fnref,
@@ -5462,6 +5486,7 @@ fn lower_inst(
     string_replace_first_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_fill_slice_fnref: cranelift_codegen::ir::FuncRef,
     vector_fill_slice_fnref: cranelift_codegen::ir::FuncRef,
+    string_fill_slice_fnref: cranelift_codegen::ir::FuncRef,
     string_take_fnref: cranelift_codegen::ir::FuncRef,
     string_drop_fnref: cranelift_codegen::ir::FuncRef,
     string_take_right_fnref: cranelift_codegen::ir::FuncRef,
@@ -8528,6 +8553,26 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "BvFillSlice expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StrFillSlice(dst, s, ch, start, end) => {
+            // ADR 0012 D-2 (iter HH) — string-fill! 4-arg slice.
+            let sv = lookup(map, *s)?;
+            let cv = lookup(map, *ch)?;
+            let stv = lookup(map, *start)?;
+            let ev = lookup(map, *end)?;
+            let inst_ref = b.ins().call(string_fill_slice_fnref, &[sv, cv, stv, ev]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StrFillSlice expected 1 result, got {}",
                         results.len()
                     )));
                 }
