@@ -7776,3 +7776,37 @@ fn diff_jit_port_eof_and_position() {
     assert!(matches!(&phsp_yes, Value::Boolean(true)));
     assert!(matches!(&phsp_out, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_port_position() {
+    // ADR 0012 D-2 (iter GR) — port-position.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (pp p) (port-position p))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm-p (open-input-string \"hello\"))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (pp warm-p) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let initial = rt
+        .eval_str_via_vm("<diff>", "(pp (open-input-string \"hello\"))")
+        .unwrap();
+    let out_empty = rt
+        .eval_str_via_vm("<diff>", "(pp (open-output-string))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(
+        &initial,
+        Value::Number(cs_core::Number::Fixnum(0))
+    ));
+    assert!(matches!(
+        &out_empty,
+        Value::Number(cs_core::Number::Fixnum(0))
+    ));
+}

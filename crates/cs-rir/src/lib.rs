@@ -677,6 +677,8 @@ pub enum Inst {
     PortEofP(Value, Value),
     /// `dst = port-has-set-port-position!?(p)`. ADR 0012 D-2 (iter GQ).
     PortHasSetPortPositionP(Value, Value),
+    /// `dst = port-position(p)` (Fixnum). ADR 0012 D-2 (iter GR).
+    PortPosition(Value, Value),
     /// `dst = promise?(v)`. ADR 0012 D-2 (iter GD).
     PromiseP(Value, Value),
     /// `dst = hashtable?(v)`. ADR 0012 D-2 (iter GF).

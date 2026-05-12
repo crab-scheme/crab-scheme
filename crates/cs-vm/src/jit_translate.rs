@@ -1828,6 +1828,14 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::PortHasSetPortPositionP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter GR) — port-position.
+                                    ("port-position", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::PortPosition(dst, args[0]));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
                                     // ADR 0012 D-2 (iter GD) — promise?.
                                     ("promise?", 1)
                                         if value_types.get(&args[0]).copied()

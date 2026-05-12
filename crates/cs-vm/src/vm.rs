@@ -820,6 +820,31 @@ pub unsafe extern "C" fn vm_textual_port_p_gc(r: i64) -> i64 {
     }
 }
 
+/// `(port-position p)` — R6RS. For input ports: current read pos.
+/// For output ports: bytes/chars written so far. Deopts on non-port.
+/// Returns raw Fixnum i64. ADR 0012 D-2 (iter GR).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_port_position_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Port(p) => match &*p {
+            cs_core::Port::StringInput(state) => state.borrow().pos as i64,
+            cs_core::Port::ByteVectorInput(state) => state.borrow().pos as i64,
+            cs_core::Port::StringOutput(buf) => buf.borrow().chars().count() as i64,
+            cs_core::Port::ByteVectorOutput(buf) => buf.borrow().len() as i64,
+            cs_core::Port::FileOutput(state) => state.borrow().buf.len() as i64,
+        },
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
 /// `(port-eof? p)` — R6RS. True iff the port's read position has
 /// reached the end. Only StringInput/ByteVectorInput track a pos;
 /// other ports always return #f. Errors on non-port (deopt).

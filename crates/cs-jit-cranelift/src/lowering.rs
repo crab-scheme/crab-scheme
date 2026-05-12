@@ -382,6 +382,9 @@ pub struct Lowerer {
     /// FuncId of `vm_port_has_set_port_position_p_gc(p) -> i64` (0/1).
     /// ADR 0012 D-2 (iter GQ).
     port_has_set_port_position_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_port_position_gc(p) -> i64` (Fixnum).
+    /// ADR 0012 D-2 (iter GR).
+    port_position_func: cranelift_module::FuncId,
     /// FuncId of `vm_promise_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GD).
     promise_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_div_euclid(x, y) -> i64`. ADR 0012 D-2 (iter GE).
@@ -977,6 +980,11 @@ impl Lowerer {
         builder.symbol(
             "vm_port_has_set_port_position_p_gc",
             cs_vm::vm::vm_port_has_set_port_position_p_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter GR) — port-position.
+        builder.symbol(
+            "vm_port_position_gc",
+            cs_vm::vm::vm_port_position_gc as *const u8,
         );
         // ADR 0012 D-2 (iter GD) — promise?.
         builder.symbol("vm_promise_p_gc", cs_vm::vm::vm_promise_p_gc as *const u8);
@@ -2395,6 +2403,14 @@ impl Lowerer {
                     "declare_function vm_port_has_set_port_position_p_gc: {e}"
                 ))
             })?;
+        // ADR 0012 D-2 (iter GR) — port-position.
+        let port_position_func = module
+            .declare_function(
+                "vm_port_position_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_port_position_gc: {e}")))?;
 
         // ADR 0012 D-2 (iter GD) — promise?.
         let promise_p_func = module
@@ -3498,6 +3514,7 @@ impl Lowerer {
             output_port_open_p_func,
             port_eof_p_func,
             port_has_set_port_position_p_func,
+            port_position_func,
             promise_p_func,
             div_euclid_func,
             mod_euclid_func,
@@ -4103,6 +4120,10 @@ impl Lowerer {
             let port_has_set_port_position_p_fnref = self
                 .module
                 .declare_func_in_func(self.port_has_set_port_position_p_func, builder.func);
+            // iter GR — port-position.
+            let port_position_fnref = self
+                .module
+                .declare_func_in_func(self.port_position_func, builder.func);
             // iter GD — promise?.
             let promise_p_fnref = self
                 .module
@@ -4637,6 +4658,7 @@ impl Lowerer {
                         output_port_open_p_fnref,
                         port_eof_p_fnref,
                         port_has_set_port_position_p_fnref,
+                        port_position_fnref,
                         promise_p_fnref,
                         div_euclid_fnref,
                         mod_euclid_fnref,
@@ -5017,6 +5039,7 @@ fn lower_inst(
     output_port_open_p_fnref: cranelift_codegen::ir::FuncRef,
     port_eof_p_fnref: cranelift_codegen::ir::FuncRef,
     port_has_set_port_position_p_fnref: cranelift_codegen::ir::FuncRef,
+    port_position_fnref: cranelift_codegen::ir::FuncRef,
     promise_p_fnref: cranelift_codegen::ir::FuncRef,
     div_euclid_fnref: cranelift_codegen::ir::FuncRef,
     mod_euclid_fnref: cranelift_codegen::ir::FuncRef,
@@ -7380,8 +7403,9 @@ fn lower_inst(
         | Inst::HashtableMutableP(dst, src)
         | Inst::OutputPortOpenP(dst, src)
         | Inst::PortEofP(dst, src)
-        | Inst::PortHasSetPortPositionP(dst, src) => {
-            // ADR 0012 D-2 (iter DD/GC/GD/GF/GG/GP/GQ) — port/promise/hashtable.
+        | Inst::PortHasSetPortPositionP(dst, src)
+        | Inst::PortPosition(dst, src) => {
+            // ADR 0012 D-2 (iter DD/GC/GD/GF/GG/GP/GQ/GR) — port/promise/hashtable.
             let v_v = lookup(map, *src)?;
             let fnref = match inst {
                 Inst::PortP(..) => port_p_fnref,
@@ -7396,6 +7420,7 @@ fn lower_inst(
                 Inst::OutputPortOpenP(..) => output_port_open_p_fnref,
                 Inst::PortEofP(..) => port_eof_p_fnref,
                 Inst::PortHasSetPortPositionP(..) => port_has_set_port_position_p_fnref,
+                Inst::PortPosition(..) => port_position_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[v_v]);
