@@ -9333,3 +9333,35 @@ fn diff_jit_string_fill_from() {
     assert_eq!(s_of(&after_empty), "...");
     assert_eq!(s_of(&after_utf), "αγγγ");
 }
+
+#[test]
+fn diff_jit_vector_to_string_slice() {
+    // ADR 0012 D-2 (iter ID) — vector->string 3-arg slice form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (vts v s e) (vector->string v s e))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define src (vector #\\h #\\e #\\l #\\l #\\o))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (vts src 0 5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let full = rt.eval_str_via_vm("<diff>", "(vts src 0 5)").unwrap();
+    let mid = rt.eval_str_via_vm("<diff>", "(vts src 1 4)").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(vts src 2 2)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn s_of(v: &Value) -> String {
+        match v {
+            Value::String(sg) => sg.borrow().clone(),
+            other => panic!("expected string, got {:?}", other),
+        }
+    }
+    assert_eq!(s_of(&full), "hello");
+    assert_eq!(s_of(&mid), "ell");
+    assert_eq!(s_of(&empty), "");
+}
