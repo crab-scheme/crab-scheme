@@ -1804,6 +1804,30 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::OutputPortOpenP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter GQ) — port-eof? +
+                                    // port-has-set-port-position!?.
+                                    // port-has-port-position? is just port?.
+                                    ("port-has-port-position?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::PortP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("port-eof?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::PortEofP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("port-has-set-port-position!?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::PortHasSetPortPositionP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // ADR 0012 D-2 (iter GD) — promise?.
                                     ("promise?", 1)
                                         if value_types.get(&args[0]).copied()
@@ -5111,6 +5135,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::BinaryPortP(dst, _)
                 | RirInst::TextualPortP(dst, _)
                 | RirInst::OutputPortOpenP(dst, _)
+                | RirInst::PortEofP(dst, _)
+                | RirInst::PortHasSetPortPositionP(dst, _)
                 | RirInst::PromiseP(dst, _)
                 | RirInst::HashtableP(dst, _)
                 | RirInst::HashtableMutableP(dst, _)

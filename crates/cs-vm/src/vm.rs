@@ -820,6 +820,56 @@ pub unsafe extern "C" fn vm_textual_port_p_gc(r: i64) -> i64 {
     }
 }
 
+/// `(port-eof? p)` — R6RS. True iff the port's read position has
+/// reached the end. Only StringInput/ByteVectorInput track a pos;
+/// other ports always return #f. Errors on non-port (deopt).
+/// ADR 0012 D-2 (iter GQ).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_port_eof_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Port(p) => match &*p {
+            cs_core::Port::StringInput(state) => {
+                let s = state.borrow();
+                (s.pos >= s.chars.len()) as i64
+            }
+            cs_core::Port::ByteVectorInput(state) => {
+                let s = state.borrow();
+                (s.pos >= s.bytes.len()) as i64
+            }
+            _ => 0,
+        },
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
+/// `(port-has-set-port-position!? p)` — R6RS. True iff the port is
+/// a StringInput or ByteVectorInput (the only port types whose
+/// position is mutable in CrabScheme). Non-port returns #f.
+/// ADR 0012 D-2 (iter GQ).
+///
+/// # Safety
+///
+/// Same as `vm_port_eof_p_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_port_has_set_port_position_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Port(p) => matches!(
+            &*p,
+            cs_core::Port::StringInput(_) | cs_core::Port::ByteVectorInput(_)
+        ) as i64,
+        _ => 0,
+    }
+}
+
 /// `(output-port-open? v)` — R7RS. True iff `v` is an output Port
 /// that hasn't been closed (only FileOutput tracks closed state;
 /// other output ports are always open). ADR 0012 D-2 (iter GP).

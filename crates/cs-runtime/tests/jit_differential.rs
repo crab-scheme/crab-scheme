@@ -7725,3 +7725,54 @@ fn diff_jit_port_open_predicates() {
     assert!(matches!(&iop_yes, Value::Boolean(true)));
     assert!(matches!(&oop_yes, Value::Boolean(true)));
 }
+
+#[test]
+fn diff_jit_port_eof_and_position() {
+    // ADR 0012 D-2 (iter GQ) — port-eof? + port-has-port-position? +
+    // port-has-set-port-position!?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (pe p) (port-eof? p))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (php p) (port-has-port-position? p))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (phsp p) (port-has-set-port-position!? p))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm-p (open-input-string \"\"))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (pe warm-p) (php warm-p) (phsp warm-p) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let eof_empty = rt
+        .eval_str_via_vm("<diff>", "(pe (open-input-string \"\"))")
+        .unwrap();
+    let eof_nonempty = rt
+        .eval_str_via_vm("<diff>", "(pe (open-input-string \"hi\"))")
+        .unwrap();
+    let php_no = rt.eval_str_via_vm("<diff>", "(php 42)").unwrap();
+    let php_yes = rt
+        .eval_str_via_vm("<diff>", "(php (open-input-string \"\"))")
+        .unwrap();
+    let phsp_yes = rt
+        .eval_str_via_vm("<diff>", "(phsp (open-input-string \"\"))")
+        .unwrap();
+    let phsp_out = rt
+        .eval_str_via_vm("<diff>", "(phsp (open-output-string))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&eof_empty, Value::Boolean(true)));
+    assert!(matches!(&eof_nonempty, Value::Boolean(false)));
+    assert!(matches!(&php_no, Value::Boolean(false)));
+    assert!(matches!(&php_yes, Value::Boolean(true)));
+    assert!(matches!(&phsp_yes, Value::Boolean(true)));
+    assert!(matches!(&phsp_out, Value::Boolean(false)));
+}

@@ -673,6 +673,10 @@ pub enum Inst {
     TextualPortP(Value, Value),
     /// `dst = output-port-open?(v)`. ADR 0012 D-2 (iter GP).
     OutputPortOpenP(Value, Value),
+    /// `dst = port-eof?(p)`. ADR 0012 D-2 (iter GQ).
+    PortEofP(Value, Value),
+    /// `dst = port-has-set-port-position!?(p)`. ADR 0012 D-2 (iter GQ).
+    PortHasSetPortPositionP(Value, Value),
     /// `dst = promise?(v)`. ADR 0012 D-2 (iter GD).
     PromiseP(Value, Value),
     /// `dst = hashtable?(v)`. ADR 0012 D-2 (iter GF).
