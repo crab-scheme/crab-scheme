@@ -2044,6 +2044,19 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::MakeHashtableEqv(dst));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter HY) — make-eq/eqv-hashtable 1-arg.
+                                    // R6RS allows an optional capacity hint
+                                    // (Vec storage ignores it).
+                                    ("make-eq-hashtable", 1) => {
+                                        let _ = args[0];
+                                        insts.push(RirInst::MakeHashtableEq(dst));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                    ("make-eqv-hashtable", 1) => {
+                                        let _ = args[0];
+                                        insts.push(RirInst::MakeHashtableEqv(dst));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter GN) — append-reverse.
                                     ("append-reverse", 2)
                                         if value_types.get(&args[0]).copied()

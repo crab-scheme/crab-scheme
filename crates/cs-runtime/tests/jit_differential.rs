@@ -9093,3 +9093,35 @@ fn diff_jit_hashtable_copy_with_flag() {
         Value::Number(cs_core::Number::Fixnum(99))
     ));
 }
+
+#[test]
+fn diff_jit_make_hashtable_with_capacity() {
+    // ADR 0012 D-2 (iter HY) — make-eq/eqv-hashtable 1-arg capacity hint.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (eqh n) (make-eq-hashtable n))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (eqvh n) (make-eqv-hashtable n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (eqh 8) (eqvh 16) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let h_eq = rt.eval_str_via_vm("<diff>", "(eqh 32)").unwrap();
+    let h_eqv = rt.eval_str_via_vm("<diff>", "(eqvh 64)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&h_eq, Value::Hashtable(_)));
+    assert!(matches!(&h_eqv, Value::Hashtable(_)));
+    // Round-trip works
+    rt.eval_str_via_vm("<diff>", "(define h (eqh 4))").unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! h 'a 1)")
+        .unwrap();
+    let v = rt
+        .eval_str_via_vm("<diff>", "(hashtable-ref h 'a #f)")
+        .unwrap();
+    assert!(matches!(&v, Value::Number(cs_core::Number::Fixnum(1))));
+}
