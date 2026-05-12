@@ -8004,3 +8004,65 @@ fn diff_jit_hashtable_delete() {
     assert!(matches!(&has_c, Value::Boolean(true)));
     assert!(matches!(&sz2, Value::Number(cs_core::Number::Fixnum(2))));
 }
+
+#[test]
+fn diff_jit_hashtable_set() {
+    // ADR 0012 D-2 (iter GX) — hashtable-set! fast path.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (hs ht k v) (hashtable-set! ht k v))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm-ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (hs warm-ht 'a 1) (hs warm-ht 'b 2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hs ht 'a 1)").unwrap();
+    rt.eval_str_via_vm("<diff>", "(hs ht 'b 2)").unwrap();
+    rt.eval_str_via_vm("<diff>", "(hs ht 'c 3)").unwrap();
+    let sz = rt.eval_str_via_vm("<diff>", "(hashtable-size ht)").unwrap();
+    let va = rt
+        .eval_str_via_vm("<diff>", "(hashtable-ref ht 'a #f)")
+        .unwrap();
+    let vb = rt
+        .eval_str_via_vm("<diff>", "(hashtable-ref ht 'b #f)")
+        .unwrap();
+    let vc = rt
+        .eval_str_via_vm("<diff>", "(hashtable-ref ht 'c #f)")
+        .unwrap();
+    // Overwrite existing key
+    rt.eval_str_via_vm("<diff>", "(hs ht 'b 42)").unwrap();
+    let vb2 = rt
+        .eval_str_via_vm("<diff>", "(hashtable-ref ht 'b #f)")
+        .unwrap();
+    let sz2 = rt.eval_str_via_vm("<diff>", "(hashtable-size ht)").unwrap();
+    // Equal-hashtable with structural-equal keys
+    rt.eval_str_via_vm("<diff>", "(define eqht (make-hashtable equal-hash equal?))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hs eqht (list 1 2) 100)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hs eqht (list 1 2) 200)")
+        .unwrap();
+    let eq_v = rt
+        .eval_str_via_vm("<diff>", "(hashtable-ref eqht (list 1 2) #f)")
+        .unwrap();
+    let eq_sz = rt
+        .eval_str_via_vm("<diff>", "(hashtable-size eqht)")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&sz, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&va, Value::Number(cs_core::Number::Fixnum(1))));
+    assert!(matches!(&vb, Value::Number(cs_core::Number::Fixnum(2))));
+    assert!(matches!(&vc, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&vb2, Value::Number(cs_core::Number::Fixnum(42))));
+    assert!(matches!(&sz2, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&eq_v, Value::Number(cs_core::Number::Fixnum(200))));
+    assert!(matches!(&eq_sz, Value::Number(cs_core::Number::Fixnum(1))));
+}

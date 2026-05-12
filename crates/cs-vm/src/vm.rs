@@ -1166,6 +1166,41 @@ pub unsafe extern "C" fn vm_force_forced_gc(r: i64) -> i64 {
     }
 }
 
+/// `(hashtable-set! ht key val)` — sets or replaces the entry for
+/// `key`. Returns a Gc handle to Unspecified. Deopts on non-hashtable
+/// or Custom eq_kind (which needs ctx). ADR 0012 D-2 (iter GX).
+///
+/// # Safety
+///
+/// `ht_raw`, `key_raw`, and `val_raw` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_set_gc(ht_raw: i64, key_raw: i64, val_raw: i64) -> i64 {
+    let ht_v = unsafe { gc_i64_to_value(ht_raw) };
+    let key_v = unsafe { gc_i64_to_value(key_raw) };
+    let val_v = unsafe { gc_i64_to_value(val_raw) };
+    match ht_v {
+        Value::Hashtable(h) if h.eq_kind != cs_core::HtEqKind::Custom => {
+            let kind = h.eq_kind;
+            let mut items = h.items.borrow_mut();
+            if let Some(slot) = items.iter_mut().find(|(k, _)| match kind {
+                cs_core::HtEqKind::Eq => cs_core::eq::eq(k, &key_v),
+                cs_core::HtEqKind::Eqv => cs_core::eq::eqv(k, &key_v),
+                cs_core::HtEqKind::Equal => cs_core::eq::equal(k, &key_v),
+                cs_core::HtEqKind::Custom => unreachable!(),
+            }) {
+                slot.1 = val_v;
+            } else {
+                items.push((key_v, val_v));
+            }
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(hashtable-delete! ht key)` — removes the entry whose key matches
 /// `key` under the table's eq kind, if present. Returns a Gc handle
 /// to Unspecified. Deopts on non-hashtable or Custom eq_kind (which

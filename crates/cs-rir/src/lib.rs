@@ -721,6 +721,9 @@ pub enum Inst {
     /// `dst = hashtable-delete!(ht, key)` returns Unspecified.
     /// ADR 0012 D-2 (iter GW).
     HashtableDelete(Value, Value, Value),
+    /// `dst = hashtable-set!(ht, key, val)` returns Unspecified.
+    /// ADR 0012 D-2 (iter GX).
+    HashtableSet(Value, Value, Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).
