@@ -4535,6 +4535,14 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::Last(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter IK) — (make-list n) 1-arg.
+                                    ("make-list", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::MakeListUnspec(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter EM) — (make-list n fill).
                                     // Length must be Fixnum-typed; fill is
                                     // boxed if a typed primitive.
@@ -5970,6 +5978,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::BytevectorToListSlice(dst, _, _, _)
                 | RirInst::NumberToStringRadix(dst, _, _)
                 | RirInst::StringToNumberRadix(dst, _, _)
+                | RirInst::MakeListUnspec(dst, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::MakeHashtableEqual(dst)

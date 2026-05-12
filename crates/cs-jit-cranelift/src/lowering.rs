@@ -605,6 +605,9 @@ pub struct Lowerer {
     /// FuncId of `vm_string_to_number_radix_gc(s, radix) -> i64`.
     /// ADR 0012 D-2 (iter IJ).
     string_to_number_radix_func: cranelift_module::FuncId,
+    /// FuncId of `vm_make_list_unspecified_gc(n) -> i64`.
+    /// ADR 0012 D-2 (iter IK).
+    make_list_unspec_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_reverse_gc(s) -> i64`. ADR 0012 D-2
     /// (iter EJ).
     string_reverse_func: cranelift_module::FuncId,
@@ -1427,6 +1430,11 @@ impl Lowerer {
         builder.symbol(
             "vm_string_to_number_radix_gc",
             cs_vm::vm::vm_string_to_number_radix_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter IK) — make-list 1-arg.
+        builder.symbol(
+            "vm_make_list_unspecified_gc",
+            cs_vm::vm::vm_make_list_unspecified_gc as *const u8,
         );
         // ADR 0012 D-2 (iter EJ) — string-reverse.
         builder.symbol(
@@ -3541,6 +3549,16 @@ impl Lowerer {
                     "declare_function vm_string_to_number_radix_gc: {e}"
                 ))
             })?;
+        // ADR 0012 D-2 (iter IK) — make-list 1-arg.
+        let make_list_unspec_func = module
+            .declare_function(
+                "vm_make_list_unspecified_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_make_list_unspecified_gc: {e}"))
+            })?;
         let string_to_number_func = module
             .declare_function(
                 "vm_string_to_number_gc",
@@ -4239,6 +4257,7 @@ impl Lowerer {
             number_to_string_radix_func,
             string_to_number_func,
             string_to_number_radix_func,
+            make_list_unspec_func,
             string_reverse_func,
             string_upcase_func,
             string_downcase_func,
@@ -5119,6 +5138,10 @@ impl Lowerer {
             let string_to_number_radix_fnref = self
                 .module
                 .declare_func_in_func(self.string_to_number_radix_func, builder.func);
+            // iter IK — make-list 1-arg.
+            let make_list_unspec_fnref = self
+                .module
+                .declare_func_in_func(self.make_list_unspec_func, builder.func);
             // iter EJ — string-reverse.
             let string_reverse_fnref = self
                 .module
@@ -5570,6 +5593,7 @@ impl Lowerer {
                         number_to_string_radix_fnref,
                         string_to_number_fnref,
                         string_to_number_radix_fnref,
+                        make_list_unspec_fnref,
                         string_reverse_fnref,
                         string_upcase_fnref,
                         string_downcase_fnref,
@@ -5989,6 +6013,7 @@ fn lower_inst(
     number_to_string_radix_fnref: cranelift_codegen::ir::FuncRef,
     string_to_number_fnref: cranelift_codegen::ir::FuncRef,
     string_to_number_radix_fnref: cranelift_codegen::ir::FuncRef,
+    make_list_unspec_fnref: cranelift_codegen::ir::FuncRef,
     string_reverse_fnref: cranelift_codegen::ir::FuncRef,
     string_upcase_fnref: cranelift_codegen::ir::FuncRef,
     string_downcase_fnref: cranelift_codegen::ir::FuncRef,
@@ -9158,6 +9183,23 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "NumberToStringRadix expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::MakeListUnspec(dst, n) => {
+            // ADR 0012 D-2 (iter IK) — vm_make_list_unspecified_gc.
+            let n_v = lookup(map, *n)?;
+            let inst_ref = b.ins().call(make_list_unspec_fnref, &[n_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "MakeListUnspec expected 1 result, got {}",
                         results.len()
                     )));
                 }

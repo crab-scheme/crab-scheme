@@ -6020,6 +6020,23 @@ pub unsafe extern "C" fn vm_make_list_fill_gc(n: i64, fill: i64) -> i64 {
     value_to_gc_i64(acc)
 }
 
+/// `(make-list n)` — 1-arg form: list of length `n` filled with
+/// `Value::Unspecified`. `n` is raw Fixnum i64. On negative `n`,
+/// requests a deopt and returns Null. ADR 0012 D-2 (iter IK).
+#[no_mangle]
+pub unsafe extern "C" fn vm_make_list_unspecified_gc(n: i64) -> i64 {
+    if n < 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::Null);
+    }
+    let len = n as usize;
+    let mut acc = Value::Null;
+    for _ in 0..len {
+        acc = Value::Pair(cs_core::Pair::new(Value::Unspecified, acc));
+    }
+    value_to_gc_i64(acc)
+}
+
 /// `(string-split s sep)` — split `s` on each occurrence of `sep`.
 /// `sep` may be a String or a Character. Returns a fresh list of
 /// String pieces. Both Gc handles consumed. ADR 0012 D-2 (iter FF).

@@ -9628,3 +9628,59 @@ fn diff_jit_string_to_number_radix() {
     assert_eq!(fix_of(neg), -255);
     assert!(matches!(bogus, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_make_list_1arg() {
+    // ADR 0012 D-2 (iter IK) — (make-list n) 1-arg, fills with Unspecified.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ml n) (make-list n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (ml 3) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let l3 = rt.eval_str_via_vm("<diff>", "(ml 3)").unwrap();
+    let l0 = rt.eval_str_via_vm("<diff>", "(ml 0)").unwrap();
+    let l5 = rt.eval_str_via_vm("<diff>", "(ml 5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn list_len(mut v: Value) -> usize {
+        let mut n = 0;
+        loop {
+            match v {
+                Value::Null => return n,
+                Value::Pair(p) => {
+                    let cdr = p.cdr.borrow().clone();
+                    n += 1;
+                    v = cdr;
+                }
+                other => panic!("expected pair or null, got {:?}", other),
+            }
+        }
+    }
+    fn all_unspec(mut v: Value) -> bool {
+        loop {
+            match v {
+                Value::Null => return true,
+                Value::Pair(p) => {
+                    let car = p.car.borrow().clone();
+                    let cdr = p.cdr.borrow().clone();
+                    if !matches!(car, Value::Unspecified) {
+                        return false;
+                    }
+                    v = cdr;
+                }
+                _ => return false,
+            }
+        }
+    }
+    assert_eq!(list_len(l3.clone()), 3);
+    assert!(all_unspec(l3));
+    assert!(matches!(l0, Value::Null));
+    assert_eq!(list_len(l5.clone()), 5);
+    assert!(all_unspec(l5));
+}

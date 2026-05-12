@@ -814,6 +814,9 @@ pub enum Inst {
     /// `dst = string->number(s, radix)` — 2-arg form, radix ∈ {2,8,10,16}.
     /// ADR 0012 D-2 (iter IJ).
     StringToNumberRadix(Value, Value, Value),
+    /// `dst = make-list(n)` — 1-arg form, fills with Unspecified.
+    /// ADR 0012 D-2 (iter IK).
+    MakeListUnspec(Value, Value),
     /// `dst = mod0(x, y)` R6RS centered mod.
     /// ADR 0012 D-2 (iter HO).
     Mod0(Value, Value, Value),
