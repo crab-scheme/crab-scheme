@@ -626,6 +626,9 @@ pub struct Lowerer {
     /// FuncId of `vm_vector_copy_bang_from_gc(dest, at, src, src_start) -> i64`.
     /// ADR 0012 D-2 (iter IQ).
     vector_copy_bang_from_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_copy_bang_from_gc(dest, at, src, src_start) -> i64`.
+    /// ADR 0012 D-2 (iter IR).
+    bytevector_copy_bang_from_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_reverse_gc(s) -> i64`. ADR 0012 D-2
     /// (iter EJ).
     string_reverse_func: cranelift_module::FuncId,
@@ -1478,6 +1481,11 @@ impl Lowerer {
         builder.symbol(
             "vm_vector_copy_bang_from_gc",
             cs_vm::vm::vm_vector_copy_bang_from_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter IR) — bytevector-copy! 4-arg.
+        builder.symbol(
+            "vm_bytevector_copy_bang_from_gc",
+            cs_vm::vm::vm_bytevector_copy_bang_from_gc as *const u8,
         );
         // ADR 0012 D-2 (iter IK) — make-list 1-arg.
         builder.symbol(
@@ -3677,6 +3685,18 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_vector_copy_bang_from_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter IR) — bytevector-copy! 4-arg.
+        let bytevector_copy_bang_from_func = module
+            .declare_function(
+                "vm_bytevector_copy_bang_from_gc",
+                cranelift_module::Linkage::Import,
+                &four_arg_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_bytevector_copy_bang_from_gc: {e}"
+                ))
+            })?;
         let string_to_number_func = module
             .declare_function(
                 "vm_string_to_number_gc",
@@ -4382,6 +4402,7 @@ impl Lowerer {
             vector_to_string_slice_from_func,
             string_to_vector_slice_from_func,
             vector_copy_bang_from_func,
+            bytevector_copy_bang_from_func,
             string_reverse_func,
             string_upcase_func,
             string_downcase_func,
@@ -5290,6 +5311,10 @@ impl Lowerer {
             let vector_copy_bang_from_fnref = self
                 .module
                 .declare_func_in_func(self.vector_copy_bang_from_func, builder.func);
+            // iter IR — bytevector-copy! 4-arg.
+            let bytevector_copy_bang_from_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_copy_bang_from_func, builder.func);
             // iter EJ — string-reverse.
             let string_reverse_fnref = self
                 .module
@@ -5748,6 +5773,7 @@ impl Lowerer {
                         vector_to_string_slice_from_fnref,
                         string_to_vector_slice_from_fnref,
                         vector_copy_bang_from_fnref,
+                        bytevector_copy_bang_from_fnref,
                         string_reverse_fnref,
                         string_upcase_fnref,
                         string_downcase_fnref,
@@ -6174,6 +6200,7 @@ fn lower_inst(
     vector_to_string_slice_from_fnref: cranelift_codegen::ir::FuncRef,
     string_to_vector_slice_from_fnref: cranelift_codegen::ir::FuncRef,
     vector_copy_bang_from_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_copy_bang_from_fnref: cranelift_codegen::ir::FuncRef,
     string_reverse_fnref: cranelift_codegen::ir::FuncRef,
     string_upcase_fnref: cranelift_codegen::ir::FuncRef,
     string_downcase_fnref: cranelift_codegen::ir::FuncRef,
@@ -9456,6 +9483,28 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "VecCopyBangFrom expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::BvCopyBangFrom(dst, dest_v, at_v, src_v, start_v) => {
+            // ADR 0012 D-2 (iter IR) — vm_bytevector_copy_bang_from_gc.
+            let dv = lookup(map, *dest_v)?;
+            let av = lookup(map, *at_v)?;
+            let sv = lookup(map, *src_v)?;
+            let stv = lookup(map, *start_v)?;
+            let inst_ref = b
+                .ins()
+                .call(bytevector_copy_bang_from_fnref, &[dv, av, sv, stv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvCopyBangFrom expected 1 result, got {}",
                         results.len()
                     )));
                 }

@@ -9956,3 +9956,42 @@ fn diff_jit_vector_copy_bang_from() {
     // First 3 slots get s[2..5] = 30,40,50; last 2 untouched (still 0).
     assert_eq!(vec_ints(&result), vec![30, 40, 50, 0, 0]);
 }
+
+#[test]
+fn diff_jit_bytevector_copy_bang_from() {
+    // ADR 0012 D-2 (iter IR) — bytevector-copy! 4-arg with src-start.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (bcb d at s start) (bytevector-copy! d at s start))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warmup-dst (make-bytevector 5 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warmup-src (bytevector 10 20 30 40 50))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (bcb warmup-dst 0 warmup-src 2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define dst (make-bytevector 5 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define s2 (bytevector 10 20 30 40 50))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(bcb dst 0 s2 2)").unwrap();
+    let result = rt.eval_str_via_vm("<diff>", "dst").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn bv_bytes(v: &Value) -> Vec<u8> {
+        match v {
+            Value::ByteVector(bc) => bc.borrow().clone(),
+            other => panic!("expected bytevector, got {:?}", other),
+        }
+    }
+    // First 3 slots get s[2..5] = 30,40,50; last 2 untouched (still 0).
+    assert_eq!(bv_bytes(&result), vec![30, 40, 50, 0, 0]);
+}
