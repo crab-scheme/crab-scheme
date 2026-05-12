@@ -3374,6 +3374,74 @@ pub fn bytecode_to_rir_with_hints(
                                     // pattern as string=?.
                                     // ADR 0012 D-2 (iter DX) — string-ci
                                     // family with same dispatch shape.
+                                    // ADR 0012 D-2 (iter JD) — variadic string
+                                    // comparisons. Box each arg if not Any,
+                                    // pairwise compare via Str* RIR + BitAnd
+                                    // chain. Covers string=? plus ordered and
+                                    // string-ci families.
+                                    ("string=?", n)
+                                    | ("string<?", n)
+                                    | ("string>?", n)
+                                    | ("string<=?", n)
+                                    | ("string>=?", n)
+                                    | ("string-ci=?", n)
+                                    | ("string-ci<?", n)
+                                    | ("string-ci>?", n)
+                                    | ("string-ci<=?", n)
+                                    | ("string-ci>=?", n)
+                                        if n >= 3 =>
+                                    {
+                                        let boxed: Vec<RirValue> = args
+                                            .iter()
+                                            .map(|v| {
+                                                let t = value_types
+                                                    .get(v)
+                                                    .copied()
+                                                    .unwrap_or(Type::Fixnum);
+                                                if t == Type::Any {
+                                                    *v
+                                                } else {
+                                                    let fresh = alloc();
+                                                    insts.push(RirInst::BoxTyped(
+                                                        fresh,
+                                                        *v,
+                                                        type_to_jit_rt_tag(t),
+                                                    ));
+                                                    value_types.insert(fresh, Type::Any);
+                                                    fresh
+                                                }
+                                            })
+                                            .collect();
+                                        let make_cmp =
+                                            |d: RirValue, a: RirValue, b: RirValue| match name {
+                                                "string=?" => RirInst::StrEq(d, a, b),
+                                                "string<?" => RirInst::StrLt(d, a, b),
+                                                "string>?" => RirInst::StrGt(d, a, b),
+                                                "string<=?" => RirInst::StrLe(d, a, b),
+                                                "string>=?" => RirInst::StrGe(d, a, b),
+                                                "string-ci=?" => RirInst::StrCiEq(d, a, b),
+                                                "string-ci<?" => RirInst::StrCiLt(d, a, b),
+                                                "string-ci>?" => RirInst::StrCiGt(d, a, b),
+                                                "string-ci<=?" => RirInst::StrCiLe(d, a, b),
+                                                "string-ci>=?" => RirInst::StrCiGe(d, a, b),
+                                                _ => unreachable!(),
+                                            };
+                                        let first = alloc();
+                                        insts.push(make_cmp(first, boxed[0], boxed[1]));
+                                        value_types.insert(first, Type::Boolean);
+                                        let mut acc = first;
+                                        for i in 1..boxed.len() - 1 {
+                                            let cmp = alloc();
+                                            insts.push(make_cmp(cmp, boxed[i], boxed[i + 1]));
+                                            value_types.insert(cmp, Type::Boolean);
+                                            let new_acc = alloc();
+                                            insts.push(RirInst::BitAnd(new_acc, acc, cmp));
+                                            value_types.insert(new_acc, Type::Boolean);
+                                            acc = new_acc;
+                                        }
+                                        insts.push(RirInst::Move(dst, acc));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     ("string<?", 2)
                                     | ("string>?", 2)
                                     | ("string<=?", 2)

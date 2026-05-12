@@ -10434,3 +10434,68 @@ fn diff_jit_variadic_char_ci_compares() {
     assert_eq!(fix_of(le), 1);
     assert_eq!(fix_of(ge), 1);
 }
+
+#[test]
+fn diff_jit_variadic_string_compares() {
+    // ADR 0012 D-2 (iter JD) — variadic string=?/<?/>?/<=?/>=? and string-ci-*
+    // for 3+ args.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (eq3) (if (string=? \"abc\" \"abc\" \"abc\") 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (eq3-bad) (if (string=? \"abc\" \"abc\" \"xyz\") 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (lt3) (if (string<? \"a\" \"b\" \"c\") 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (gt3) (if (string>? \"c\" \"b\" \"a\") 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (ci-eq3) (if (string-ci=? \"ABC\" \"abc\" \"AbC\") 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (ci-lt3) (if (string-ci<? \"A\" \"B\" \"c\") 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (eq3) (eq3-bad) (lt3) (gt3) (ci-eq3) (ci-lt3) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let eq = rt.eval_str_via_vm("<diff>", "(eq3)").unwrap();
+    let eq_bad = rt.eval_str_via_vm("<diff>", "(eq3-bad)").unwrap();
+    let lt = rt.eval_str_via_vm("<diff>", "(lt3)").unwrap();
+    let gt = rt.eval_str_via_vm("<diff>", "(gt3)").unwrap();
+    let ci_eq = rt.eval_str_via_vm("<diff>", "(ci-eq3)").unwrap();
+    let ci_lt = rt.eval_str_via_vm("<diff>", "(ci-lt3)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn fix_of(v: Value) -> i64 {
+        match v {
+            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            other => panic!("expected fixnum, got {:?}", other),
+        }
+    }
+    assert_eq!(fix_of(eq), 1);
+    assert_eq!(fix_of(eq_bad), 0);
+    assert_eq!(fix_of(lt), 1);
+    assert_eq!(fix_of(gt), 1);
+    assert_eq!(fix_of(ci_eq), 1);
+    assert_eq!(fix_of(ci_lt), 1);
+}
