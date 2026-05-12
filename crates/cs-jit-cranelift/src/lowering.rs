@@ -406,6 +406,8 @@ pub struct Lowerer {
     current_jiffy_func: cranelift_module::FuncId,
     /// FuncId of `vm_append_reverse_gc(rev, tail) -> i64`. ADR 0012 D-2 (iter GN).
     append_reverse_func: cranelift_module::FuncId,
+    /// FuncId of `vm_alist_copy_gc(lst) -> i64`. ADR 0012 D-2 (iter GO).
+    alist_copy_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -1013,6 +1015,8 @@ impl Lowerer {
             "vm_append_reverse_gc",
             cs_vm::vm::vm_append_reverse_gc as *const u8,
         );
+        // ADR 0012 D-2 (iter GO) — alist-copy.
+        builder.symbol("vm_alist_copy_gc", cs_vm::vm::vm_alist_copy_gc as *const u8);
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
             "vm_bitwise_bit_count",
@@ -2478,6 +2482,14 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_append_reverse_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter GO) — alist-copy.
+        let alist_copy_func = module
+            .declare_function(
+                "vm_alist_copy_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_alist_copy_gc: {e}")))?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3451,6 +3463,7 @@ impl Lowerer {
             current_second_func,
             current_jiffy_func,
             append_reverse_func,
+            alist_copy_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4084,6 +4097,10 @@ impl Lowerer {
             let append_reverse_fnref = self
                 .module
                 .declare_func_in_func(self.append_reverse_func, builder.func);
+            // iter GO — alist-copy.
+            let alist_copy_fnref = self
+                .module
+                .declare_func_in_func(self.alist_copy_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4571,6 +4588,7 @@ impl Lowerer {
                         current_second_fnref,
                         current_jiffy_fnref,
                         append_reverse_fnref,
+                        alist_copy_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -4947,6 +4965,7 @@ fn lower_inst(
     current_second_fnref: cranelift_codegen::ir::FuncRef,
     current_jiffy_fnref: cranelift_codegen::ir::FuncRef,
     append_reverse_fnref: cranelift_codegen::ir::FuncRef,
+    alist_copy_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -5668,6 +5687,23 @@ fn lower_inst(
                 }
                 results[0]
             };
+            map.insert(*dst, result);
+        }
+        Inst::AlistCopy(dst, src) => {
+            // ADR 0012 D-2 (iter GO) — alist-copy. Returns fresh Gc list.
+            let sv = lookup(map, *src)?;
+            let inst_ref = b.ins().call(alist_copy_fnref, &[sv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "AlistCopy expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
         Inst::AppendReverse(dst, rev, tail) => {

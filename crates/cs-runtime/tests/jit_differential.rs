@@ -7657,3 +7657,39 @@ fn diff_jit_append_reverse() {
         other => panic!("expected pair, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_alist_copy() {
+    // ADR 0012 D-2 (iter GO) — alist-copy.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ac al) (alist-copy al))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (ac (list (cons 'a 1) (cons 'b 2))) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let copied = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(ac (list (cons 'x 10) (cons 'y 20) (cons 'z 30)))",
+        )
+        .unwrap();
+    let nil = rt.eval_str_via_vm("<diff>", "(ac '())").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &copied {
+        Value::Pair(p) => match p.car.borrow().clone() {
+            Value::Pair(pe) => match pe.car.borrow().clone() {
+                Value::Symbol(_) => (),
+                other => panic!("expected symbol in first key, got {:?}", other),
+            },
+            other => panic!("expected pair entry, got {:?}", other),
+        },
+        other => panic!("expected pair list, got {:?}", other),
+    }
+    assert!(matches!(&nil, Value::Null));
+}

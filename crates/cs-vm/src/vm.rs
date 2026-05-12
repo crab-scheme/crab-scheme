@@ -1036,6 +1036,44 @@ pub unsafe extern "C" fn vm_current_jiffy() -> i64 {
     }
 }
 
+/// `(alist-copy alist)` — SRFI-1. Walks a proper list of pairs and
+/// allocates a fresh pair for each entry. Deopts on improper list
+/// or non-pair entry. ADR 0012 D-2 (iter GO).
+///
+/// # Safety
+///
+/// `lst` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_alist_copy_gc(lst: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(lst) };
+    let mut out: Vec<Value> = Vec::new();
+    let mut cur = v;
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let entry = p.car.borrow().clone();
+                match entry {
+                    Value::Pair(pe) => {
+                        let car = pe.car.borrow().clone();
+                        let cdr = pe.cdr.borrow().clone();
+                        out.push(Value::Pair(cs_core::Pair::new(car, cdr)));
+                    }
+                    _ => {
+                        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                        return value_to_gc_i64(Value::Null);
+                    }
+                }
+                cur = p.cdr.borrow().clone();
+            }
+            Value::Null => return value_to_gc_i64(Value::list(out)),
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+}
+
 /// `(append-reverse rev tail)` — SRFI-1. Walks `rev`, prepending
 /// each element to `tail`. Effectively `(append (reverse rev) tail)`.
 /// Deopts on improper list. ADR 0012 D-2 (iter GN).

@@ -698,6 +698,8 @@ pub enum Inst {
     CurrentJiffy(Value),
     /// `dst = append-reverse(rev, tail)`. ADR 0012 D-2 (iter GN).
     AppendReverse(Value, Value, Value),
+    /// `dst = alist-copy(lst)`. ADR 0012 D-2 (iter GO).
+    AlistCopy(Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

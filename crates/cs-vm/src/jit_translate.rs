@@ -1896,6 +1896,14 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::AppendReverse(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter GO) — alist-copy.
+                                    ("alist-copy", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::AlistCopy(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter GI) — numerator/denominator
                                     // for Fixnum: numerator is identity, denominator
                                     // is 1.
@@ -5255,6 +5263,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::HashtableClear(dst, _)
                 | RirInst::HashtableToAlist(dst, _)
                 | RirInst::AppendReverse(dst, _, _)
+                | RirInst::AlistCopy(dst, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)
