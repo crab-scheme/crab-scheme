@@ -2232,6 +2232,40 @@ pub unsafe extern "C" fn vm_string_copy_gc(r: i64) -> i64 {
     }
 }
 
+/// `(vector-copy v start end)` — 3-arg slice form. Returns a fresh
+/// vector containing `v[start..end]`. Consumes `v`. Non-vector or
+/// out-of-range indices (start > end, end > len) deopt to bytecode.
+/// `start` and `end` are raw Fixnums. ADR 0012 D-2 (iter HA).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_copy_slice_gc(r: i64, start: i64, end: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Vector(vc) => {
+            let storage = vc.borrow();
+            let len = storage.len();
+            if start < 0 || end < 0 || (start as usize) > len || (end as usize) > len || start > end
+            {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+            let slice: Vec<Value> = storage[(start as usize)..(end as usize)].to_vec();
+            drop(storage);
+            value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+                slice,
+            ))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
 /// `(vector-copy v)` — return a freshly allocated vector with the
 /// same slots as `v`. 1-arg form only. Consumes `v`. Non-vector
 /// deopts. ADR 0012 D-2 (iter DB).

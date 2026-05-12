@@ -436,6 +436,8 @@ pub struct Lowerer {
     hashtable_ref_func: cranelift_module::FuncId,
     /// FuncId of `vm_hashtable_copy_gc(ht) -> i64`. ADR 0012 D-2 (iter GZ).
     hashtable_copy_func: cranelift_module::FuncId,
+    /// FuncId of `vm_vector_copy_slice_gc(v, s, e) -> i64`. ADR 0012 D-2 (iter HA).
+    vector_copy_slice_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -1101,6 +1103,11 @@ impl Lowerer {
         builder.symbol(
             "vm_hashtable_copy_gc",
             cs_vm::vm::vm_hashtable_copy_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter HA) — vector-copy 3-arg slice.
+        builder.symbol(
+            "vm_vector_copy_slice_gc",
+            cs_vm::vm::vm_vector_copy_slice_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
@@ -2691,6 +2698,16 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_hashtable_copy_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter HA) — vector-copy 3-arg slice.
+        let vector_copy_slice_func = module
+            .declare_function(
+                "vm_vector_copy_slice_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_vector_copy_slice_gc: {e}"))
+            })?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3678,6 +3695,7 @@ impl Lowerer {
             hashtable_set_func,
             hashtable_ref_func,
             hashtable_copy_func,
+            vector_copy_slice_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4365,6 +4383,10 @@ impl Lowerer {
             let hashtable_copy_fnref = self
                 .module
                 .declare_func_in_func(self.hashtable_copy_func, builder.func);
+            // iter HA — vector-copy 3-arg slice.
+            let vector_copy_slice_fnref = self
+                .module
+                .declare_func_in_func(self.vector_copy_slice_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4866,6 +4888,7 @@ impl Lowerer {
                         hashtable_set_fnref,
                         hashtable_ref_fnref,
                         hashtable_copy_fnref,
+                        vector_copy_slice_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -5256,6 +5279,7 @@ fn lower_inst(
     hashtable_set_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_ref_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_copy_fnref: cranelift_codegen::ir::FuncRef,
+    vector_copy_slice_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -6129,6 +6153,26 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "HashtableSet expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::VecCopySlice(dst, vec, start, end) => {
+            // ADR 0012 D-2 (iter HA) — vector-copy 3-arg slice.
+            // Returns fresh vector. Deopts on non-vector or out-of-range.
+            let vv = lookup(map, *vec)?;
+            let sv = lookup(map, *start)?;
+            let ev = lookup(map, *end)?;
+            let inst_ref = b.ins().call(vector_copy_slice_fnref, &[vv, sv, ev]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "VecCopySlice expected 1 result, got {}",
                         results.len()
                     )));
                 }
