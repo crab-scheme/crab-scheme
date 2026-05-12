@@ -3112,6 +3112,39 @@ pub unsafe extern "C" fn vm_string_to_list_gc(r: i64) -> i64 {
     }
 }
 
+/// `(string->list s start)` — 2-arg slice-from form. Returns a
+/// fresh proper list of chars at codepoint positions `start..`.
+/// Char-based indexing (multibyte UTF-8). Consumes `s`. `start` is
+/// a raw Fixnum i64. Non-string or out-of-range deopt to bytecode.
+/// ADR 0012 D-2 (iter IM).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_to_list_slice_from_gc(r: i64, start: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::String(sc) => {
+            let chars: Vec<char> = sc.borrow().chars().collect();
+            let len = chars.len();
+            if start < 0 || (start as usize) > len {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+            let slice = chars[(start as usize)..]
+                .iter()
+                .copied()
+                .map(Value::Character);
+            value_to_gc_i64(Value::list(slice))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
 /// `(string->list s start end)` — 3-arg slice form. Returns a fresh
 /// proper list of chars at codepoint positions `start..end`. Char-
 /// based indexing (multibyte UTF-8). Consumes `s`. `start` and `end`

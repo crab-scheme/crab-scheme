@@ -611,6 +611,9 @@ pub struct Lowerer {
     /// FuncId of `vm_vector_to_list_slice_from_gc(v, start) -> i64`.
     /// ADR 0012 D-2 (iter IL).
     vector_to_list_slice_from_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_to_list_slice_from_gc(s, start) -> i64`.
+    /// ADR 0012 D-2 (iter IM).
+    string_to_list_slice_from_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_reverse_gc(s) -> i64`. ADR 0012 D-2
     /// (iter EJ).
     string_reverse_func: cranelift_module::FuncId,
@@ -1438,6 +1441,11 @@ impl Lowerer {
         builder.symbol(
             "vm_vector_to_list_slice_from_gc",
             cs_vm::vm::vm_vector_to_list_slice_from_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter IM) — string->list 2-arg slice-from.
+        builder.symbol(
+            "vm_string_to_list_slice_from_gc",
+            cs_vm::vm::vm_string_to_list_slice_from_gc as *const u8,
         );
         // ADR 0012 D-2 (iter IK) — make-list 1-arg.
         builder.symbol(
@@ -3579,6 +3587,18 @@ impl Lowerer {
                     "declare_function vm_vector_to_list_slice_from_gc: {e}"
                 ))
             })?;
+        // ADR 0012 D-2 (iter IM) — string->list 2-arg slice-from.
+        let string_to_list_slice_from_func = module
+            .declare_function(
+                "vm_string_to_list_slice_from_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_string_to_list_slice_from_gc: {e}"
+                ))
+            })?;
         let string_to_number_func = module
             .declare_function(
                 "vm_string_to_number_gc",
@@ -4279,6 +4299,7 @@ impl Lowerer {
             string_to_number_radix_func,
             make_list_unspec_func,
             vector_to_list_slice_from_func,
+            string_to_list_slice_from_func,
             string_reverse_func,
             string_upcase_func,
             string_downcase_func,
@@ -5167,6 +5188,10 @@ impl Lowerer {
             let vector_to_list_slice_from_fnref = self
                 .module
                 .declare_func_in_func(self.vector_to_list_slice_from_func, builder.func);
+            // iter IM — string->list 2-arg slice-from.
+            let string_to_list_slice_from_fnref = self
+                .module
+                .declare_func_in_func(self.string_to_list_slice_from_func, builder.func);
             // iter EJ — string-reverse.
             let string_reverse_fnref = self
                 .module
@@ -5620,6 +5645,7 @@ impl Lowerer {
                         string_to_number_radix_fnref,
                         make_list_unspec_fnref,
                         vector_to_list_slice_from_fnref,
+                        string_to_list_slice_from_fnref,
                         string_reverse_fnref,
                         string_upcase_fnref,
                         string_downcase_fnref,
@@ -6041,6 +6067,7 @@ fn lower_inst(
     string_to_number_radix_fnref: cranelift_codegen::ir::FuncRef,
     make_list_unspec_fnref: cranelift_codegen::ir::FuncRef,
     vector_to_list_slice_from_fnref: cranelift_codegen::ir::FuncRef,
+    string_to_list_slice_from_fnref: cranelift_codegen::ir::FuncRef,
     string_reverse_fnref: cranelift_codegen::ir::FuncRef,
     string_upcase_fnref: cranelift_codegen::ir::FuncRef,
     string_downcase_fnref: cranelift_codegen::ir::FuncRef,
@@ -9245,6 +9272,24 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "VectorToListSliceFrom expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringToListSliceFrom(dst, s, start) => {
+            // ADR 0012 D-2 (iter IM) — vm_string_to_list_slice_from_gc.
+            let sv = lookup(map, *s)?;
+            let stv = lookup(map, *start)?;
+            let inst_ref = b.ins().call(string_to_list_slice_from_fnref, &[sv, stv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringToListSliceFrom expected 1 result, got {}",
                         results.len()
                     )));
                 }
