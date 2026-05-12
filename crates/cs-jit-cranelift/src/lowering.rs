@@ -400,6 +400,10 @@ pub struct Lowerer {
     hashtable_to_alist_func: cranelift_module::FuncId,
     /// FuncId of `vm_file_exists_p_gc(path) -> i64` (0/1). ADR 0012 D-2 (iter GK).
     file_exists_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_current_second() -> i64` (Flonum bits). ADR 0012 D-2 (iter GL).
+    current_second_func: cranelift_module::FuncId,
+    /// FuncId of `vm_current_jiffy() -> i64` (Fixnum). ADR 0012 D-2 (iter GL).
+    current_jiffy_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -996,6 +1000,12 @@ impl Lowerer {
             "vm_file_exists_p_gc",
             cs_vm::vm::vm_file_exists_p_gc as *const u8,
         );
+        // ADR 0012 D-2 (iter GL) — current-second / current-jiffy.
+        builder.symbol(
+            "vm_current_second",
+            cs_vm::vm::vm_current_second as *const u8,
+        );
+        builder.symbol("vm_current_jiffy", cs_vm::vm::vm_current_jiffy as *const u8);
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
             "vm_bitwise_bit_count",
@@ -1404,6 +1414,9 @@ impl Lowerer {
         let mut pair_accessor_sig = module.make_signature();
         pair_accessor_sig.params.push(AbiParam::new(I64));
         pair_accessor_sig.returns.push(AbiParam::new(I64));
+        // ADR 0012 D-2 (iter GL) — 0-arg helpers returning one i64.
+        let mut zero_arg_sig = module.make_signature();
+        zero_arg_sig.returns.push(AbiParam::new(I64));
         let pair_car_func = module
             .declare_function(
                 "vm_pair_car",
@@ -2433,6 +2446,21 @@ impl Lowerer {
                 &pair_accessor_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_file_exists_p_gc: {e}")))?;
+        // ADR 0012 D-2 (iter GL) — current-second / current-jiffy.
+        let current_second_func = module
+            .declare_function(
+                "vm_current_second",
+                cranelift_module::Linkage::Import,
+                &zero_arg_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_current_second: {e}")))?;
+        let current_jiffy_func = module
+            .declare_function(
+                "vm_current_jiffy",
+                cranelift_module::Linkage::Import,
+                &zero_arg_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_current_jiffy: {e}")))?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3403,6 +3431,8 @@ impl Lowerer {
             equal_hash_func,
             hashtable_to_alist_func,
             file_exists_p_func,
+            current_second_func,
+            current_jiffy_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4025,6 +4055,13 @@ impl Lowerer {
             let file_exists_p_fnref = self
                 .module
                 .declare_func_in_func(self.file_exists_p_func, builder.func);
+            // iter GL — current-second / current-jiffy.
+            let current_second_fnref = self
+                .module
+                .declare_func_in_func(self.current_second_func, builder.func);
+            let current_jiffy_fnref = self
+                .module
+                .declare_func_in_func(self.current_jiffy_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4509,6 +4546,8 @@ impl Lowerer {
                         equal_hash_fnref,
                         hashtable_to_alist_fnref,
                         file_exists_p_fnref,
+                        current_second_fnref,
+                        current_jiffy_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -4882,6 +4921,8 @@ fn lower_inst(
     equal_hash_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_to_alist_fnref: cranelift_codegen::ir::FuncRef,
     file_exists_p_fnref: cranelift_codegen::ir::FuncRef,
+    current_second_fnref: cranelift_codegen::ir::FuncRef,
+    current_jiffy_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -5598,6 +5639,26 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "BitwiseShift/BitSetP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::CurrentSecond(dst) | Inst::CurrentJiffy(dst) => {
+            // ADR 0012 D-2 (iter GL) — 0-arg time helpers.
+            let fnref = match inst {
+                Inst::CurrentSecond(..) => current_second_fnref,
+                Inst::CurrentJiffy(..) => current_jiffy_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "CurrentSecond/CurrentJiffy expected 1 result, got {}",
                         results.len()
                     )));
                 }

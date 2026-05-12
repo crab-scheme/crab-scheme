@@ -692,6 +692,10 @@ pub enum Inst {
     HashtableToAlist(Value, Value),
     /// `dst = file-exists?(path)`. ADR 0012 D-2 (iter GK).
     FileExistsP(Value, Value),
+    /// `dst = current-second()` (0-arg, Flonum). ADR 0012 D-2 (iter GL).
+    CurrentSecond(Value),
+    /// `dst = current-jiffy()` (0-arg, Fixnum). ADR 0012 D-2 (iter GL).
+    CurrentJiffy(Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

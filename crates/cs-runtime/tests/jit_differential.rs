@@ -7539,3 +7539,42 @@ fn diff_jit_file_exists_and_jiffies_per_second() {
         Value::Number(cs_core::Number::Fixnum(1_000_000_000))
     ));
 }
+
+#[test]
+fn diff_jit_current_second_and_current_jiffy() {
+    // ADR 0012 D-2 (iter GL) — current-second + current-jiffy.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (cs) (current-second))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (cj) (current-jiffy))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (cs) (cj) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let s = rt.eval_str_via_vm("<diff>", "(cs)").unwrap();
+    let j1 = rt.eval_str_via_vm("<diff>", "(cj)").unwrap();
+    let j2 = rt.eval_str_via_vm("<diff>", "(cj)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    // current-second returns a positive flonum (Unix epoch seconds)
+    match &s {
+        Value::Number(cs_core::Number::Flonum(f)) => assert!(*f > 1_700_000_000.0),
+        other => panic!("expected positive flonum, got {:?}", other),
+    }
+    // current-jiffy returns non-negative Fixnum that's monotonically increasing
+    let jv1 = match &j1 {
+        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        other => panic!("expected fixnum, got {:?}", other),
+    };
+    let jv2 = match &j2 {
+        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        other => panic!("expected fixnum, got {:?}", other),
+    };
+    assert!(jv1 >= 0);
+    assert!(jv2 >= jv1, "current-jiffy monotonic");
+}

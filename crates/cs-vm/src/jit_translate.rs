@@ -1877,6 +1877,15 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Fixnum);
                                     }
+                                    // ADR 0012 D-2 (iter GL) — current-second / -jiffy.
+                                    ("current-second", 0) => {
+                                        insts.push(RirInst::CurrentSecond(dst));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    ("current-jiffy", 0) => {
+                                        insts.push(RirInst::CurrentJiffy(dst));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
                                     // ADR 0012 D-2 (iter GI) — numerator/denominator
                                     // for Fixnum: numerator is identity, denominator
                                     // is 1.
@@ -5135,7 +5144,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::FlonumAtan2(dst, _, _)
                 | RirInst::FlonumExpt(dst, _, _)
                 | RirInst::BvIeeeSingleNativeRef(dst, _, _)
-                | RirInst::BvIeeeDoubleNativeRef(dst, _, _) => {
+                | RirInst::BvIeeeDoubleNativeRef(dst, _, _)
+                | RirInst::CurrentSecond(dst) => {
                     flo_values.insert(*dst);
                 }
                 RirInst::LoadConst(dst, Const::Flonum(_)) => {

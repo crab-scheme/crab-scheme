@@ -999,6 +999,43 @@ pub unsafe extern "C" fn vm_equal_hash_gc(r: i64) -> i64 {
     (h as i64).wrapping_abs()
 }
 
+/// `(current-second)` — Unix epoch seconds as Flonum bit pattern.
+/// 0-arg helper. ADR 0012 D-2 (iter GL).
+///
+/// # Safety
+///
+/// No invariants; this is a syscall wrapper.
+#[no_mangle]
+pub unsafe extern "C" fn vm_current_second() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    secs.to_bits() as i64
+}
+
+/// `(current-jiffy)` — monotonic nanoseconds since process start as
+/// raw Fixnum i64. Deopts on overflow (process running >292 years).
+/// ADR 0012 D-2 (iter GL).
+///
+/// # Safety
+///
+/// No invariants beyond an unfortunate-overflow deopt path.
+#[no_mangle]
+pub unsafe extern "C" fn vm_current_jiffy() -> i64 {
+    use std::time::Instant;
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    let elapsed = epoch.elapsed().as_nanos();
+    if elapsed <= i64::MAX as u128 {
+        elapsed as i64
+    } else {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        0
+    }
+}
+
 /// `(file-exists? path)` — filesystem syscall via `Path::exists`.
 /// Returns raw 0/1 (Boolean shape). Deopts on non-String argument.
 /// ADR 0012 D-2 (iter GK).
