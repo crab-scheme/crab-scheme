@@ -5268,9 +5268,52 @@ pub unsafe extern "C" fn vm_make_list_fill_gc(n: i64, fill: i64) -> i64 {
 ///
 /// `s` and `sep` must be live, owned `Gc<Value>` raw handles.
 
-/// `(string-replace-all s from to)` — replace every occurrence of
-/// `from` in `s` with `to`. Consumes all three Gc handles. Errors
-/// on non-string args or empty `from`. ADR 0012 D-2 (iter FI).
+/// `(string-replace s from to)` — replace ONLY the first occurrence of
+/// `from` in `s` with `to`. Returns the original string when there's
+/// no match. Consumes all three Gc handles. Deopts on non-string args
+/// or empty `from`. ADR 0012 D-2 (iter HE).
+///
+/// # Safety
+///
+/// `s`, `from`, `to` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_replace_first_gc(s: i64, from: i64, to: i64) -> i64 {
+    let s_v = unsafe { gc_i64_to_value(s) };
+    let f_v = unsafe { gc_i64_to_value(from) };
+    let t_v = unsafe { gc_i64_to_value(to) };
+    let (s_str, f_str, t_str) = match (s_v, f_v, t_v) {
+        (Value::String(a), Value::String(b), Value::String(c)) => {
+            (a.borrow().clone(), b.borrow().clone(), c.borrow().clone())
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))));
+        }
+    };
+    if f_str.is_empty() {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+            String::new(),
+        ))));
+    }
+    let out = match s_str.find(&f_str) {
+        Some(idx) => {
+            let mut result = String::with_capacity(s_str.len() + t_str.len());
+            result.push_str(&s_str[..idx]);
+            result.push_str(&t_str);
+            result.push_str(&s_str[idx + f_str.len()..]);
+            result
+        }
+        None => s_str,
+    };
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+}
+
+/// `(string-replace-all s from to)` — SRFI-13 variant: replaces every
+/// occurrence of `from` with `to`. Consumes all three handles. Empty
+/// `from` deopts. ADR 0012 D-2 (iter FH).
 ///
 /// # Safety
 ///

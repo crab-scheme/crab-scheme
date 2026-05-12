@@ -739,6 +739,9 @@ pub enum Inst {
     /// `dst = (eof-object)` — 0-arg constant constructor.
     /// ADR 0012 D-2 (iter HD).
     EofObject(Value),
+    /// `dst = string-replace(s, from, to)` first-occurrence replace.
+    /// ADR 0012 D-2 (iter HE).
+    StringReplaceFirst(Value, Value, Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

@@ -8350,3 +8350,44 @@ fn diff_jit_eof_object() {
     assert!(matches!(&is_eof, Value::Boolean(true)));
     assert!(matches!(&not_eof, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_string_replace_first() {
+    // ADR 0012 D-2 (iter HE) — string-replace (first occurrence only).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sr s f t) (string-replace s f t))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sr \"abcabc\" \"a\" \"X\") (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let one_hit = rt
+        .eval_str_via_vm("<diff>", "(sr \"abcabc\" \"a\" \"X\")")
+        .unwrap();
+    let multi_target = rt
+        .eval_str_via_vm("<diff>", "(sr \"foo-foo-foo\" \"foo\" \"BAR\")")
+        .unwrap();
+    let no_match = rt
+        .eval_str_via_vm("<diff>", "(sr \"hello\" \"xyz\" \"!\")")
+        .unwrap();
+    let utf = rt
+        .eval_str_via_vm("<diff>", "(sr \"αβγαβγ\" \"α\" \"X\")")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn s_of(v: &Value) -> String {
+        match v {
+            Value::String(sg) => sg.borrow().clone(),
+            other => panic!("expected string, got {:?}", other),
+        }
+    }
+    // Only the FIRST occurrence is replaced
+    assert_eq!(s_of(&one_hit), "Xbcabc");
+    assert_eq!(s_of(&multi_target), "BAR-foo-foo");
+    assert_eq!(s_of(&no_match), "hello");
+    assert_eq!(s_of(&utf), "Xβγαβγ");
+}

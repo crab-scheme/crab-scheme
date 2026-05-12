@@ -597,6 +597,9 @@ pub struct Lowerer {
     /// FuncId of `vm_string_replace_all_gc(s, from, to) -> i64`.
     /// ADR 0012 D-2 (iter FI).
     string_replace_all_func: cranelift_module::FuncId,
+    /// FuncId of `vm_string_replace_first_gc(s, from, to) -> i64`.
+    /// ADR 0012 D-2 (iter HE).
+    string_replace_first_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_take_gc(s, n) -> i64`. ADR 0012 D-2 (iter FJ).
     string_take_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_drop_gc(s, n) -> i64`. ADR 0012 D-2 (iter FJ).
@@ -1348,6 +1351,11 @@ impl Lowerer {
         builder.symbol(
             "vm_string_replace_all_gc",
             cs_vm::vm::vm_string_replace_all_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter HE) — string-replace (first occurrence).
+        builder.symbol(
+            "vm_string_replace_first_gc",
+            cs_vm::vm::vm_string_replace_first_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FJ) — string-take/-drop/-take-right/-drop-right.
         builder.symbol(
@@ -3310,6 +3318,16 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_string_replace_all_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter HE) — string-replace (first occurrence).
+        let string_replace_first_func = module
+            .declare_function(
+                "vm_string_replace_first_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_string_replace_first_gc: {e}"))
+            })?;
 
         // ADR 0012 D-2 (iter FJ) — string-take/-drop/-take-right/-drop-right.
         let string_take_func = module
@@ -3784,6 +3802,7 @@ impl Lowerer {
             string_trim_left_func,
             string_trim_right_func,
             string_replace_all_func,
+            string_replace_first_func,
             string_take_func,
             string_drop_func,
             string_take_right_func,
@@ -4622,6 +4641,10 @@ impl Lowerer {
             let string_replace_all_fnref = self
                 .module
                 .declare_func_in_func(self.string_replace_all_func, builder.func);
+            // iter HE — string-replace (first occurrence).
+            let string_replace_first_fnref = self
+                .module
+                .declare_func_in_func(self.string_replace_first_func, builder.func);
             // iter FJ — string-take/-drop/-take-right/-drop-right.
             let string_take_fnref = self
                 .module
@@ -4987,6 +5010,7 @@ impl Lowerer {
                         string_trim_left_fnref,
                         string_trim_right_fnref,
                         string_replace_all_fnref,
+                        string_replace_first_fnref,
                         string_take_fnref,
                         string_drop_fnref,
                         string_take_right_fnref,
@@ -5380,6 +5404,7 @@ fn lower_inst(
     string_trim_left_fnref: cranelift_codegen::ir::FuncRef,
     string_trim_right_fnref: cranelift_codegen::ir::FuncRef,
     string_replace_all_fnref: cranelift_codegen::ir::FuncRef,
+    string_replace_first_fnref: cranelift_codegen::ir::FuncRef,
     string_take_fnref: cranelift_codegen::ir::FuncRef,
     string_drop_fnref: cranelift_codegen::ir::FuncRef,
     string_take_right_fnref: cranelift_codegen::ir::FuncRef,
@@ -8424,6 +8449,25 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "StringReplaceAll expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::StringReplaceFirst(dst, s, from, to) => {
+            // ADR 0012 D-2 (iter HE) — vm_string_replace_first_gc.
+            let sv = lookup(map, *s)?;
+            let fv = lookup(map, *from)?;
+            let tv = lookup(map, *to)?;
+            let inst_ref = b.ins().call(string_replace_first_fnref, &[sv, fv, tv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "StringReplaceFirst expected 1 result, got {}",
                         results.len()
                     )));
                 }
