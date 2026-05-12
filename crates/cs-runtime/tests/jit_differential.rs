@@ -9223,3 +9223,67 @@ fn diff_jit_bytevector_fill_from() {
     assert_eq!(bv_bytes(&after_full), vec![0, 0, 0, 0]);
     assert_eq!(bv_bytes(&after_empty), vec![5, 5, 5]);
 }
+
+#[test]
+fn diff_jit_vector_fill_from() {
+    // ADR 0012 D-2 (iter IB) — vector-fill! 3-arg fill-from form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (vf v fill s) (vector-fill! v fill s) v)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm (make-vector 8 0))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (vf warm 7 2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define v1 (make-vector 6 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(vf v1 99 2)").unwrap();
+    let after_tail = rt.eval_str_via_vm("<diff>", "v1").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define v2 (make-vector 4 'init))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(vf v2 \"x\" 0)").unwrap();
+    let after_full = rt.eval_str_via_vm("<diff>", "v2").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define v3 (make-vector 3 'a))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(vf v3 'z 3)").unwrap();
+    let after_empty = rt.eval_str_via_vm("<diff>", "v3").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn vec_ints(v: &Value) -> Vec<i64> {
+        match v {
+            Value::Vector(vg) => vg
+                .borrow()
+                .iter()
+                .map(|e| match e {
+                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    other => panic!("unexpected element: {:?}", other),
+                })
+                .collect(),
+            other => panic!("expected vector, got {:?}", other),
+        }
+    }
+    fn count_str(v: &Value, expected: &str) -> usize {
+        match v {
+            Value::Vector(vg) => vg
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e, Value::String(sg) if sg.borrow().as_str() == expected))
+                .count(),
+            other => panic!("expected vector, got {:?}", other),
+        }
+    }
+    // v1: 6 zeros, fill 2..len with 99 → [0,0,99,99,99,99]
+    assert_eq!(vec_ints(&after_tail), vec![0, 0, 99, 99, 99, 99]);
+    // v2: 4 'init, fill 0..len with "x" → 4× "x"
+    assert_eq!(count_str(&after_full, "x"), 4);
+    // v3: 3 'a, fill 3..3 (empty) — length preserved
+    match &after_empty {
+        Value::Vector(vg) => assert_eq!(vg.borrow().len(), 3),
+        other => panic!("expected vector, got {:?}", other),
+    }
+}

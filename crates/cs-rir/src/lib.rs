@@ -787,6 +787,9 @@ pub enum Inst {
     /// `dst = bytevector-fill!(bv, fill, start)` — 3-arg fill-from form.
     /// ADR 0012 D-2 (iter IA).
     BvFillFrom(Value, Value, Value, Value),
+    /// `dst = vector-fill!(v, fill, start)` — 3-arg fill-from form.
+    /// ADR 0012 D-2 (iter IB).
+    VecFillFrom(Value, Value, Value, Value),
     /// `dst = mod0(x, y)` R6RS centered mod.
     /// ADR 0012 D-2 (iter HO).
     Mod0(Value, Value, Value),

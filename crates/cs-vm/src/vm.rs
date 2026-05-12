@@ -2811,6 +2811,41 @@ pub unsafe extern "C" fn vm_vector_fill_gc(vec: i64, fill: i64) -> i64 {
     }
 }
 
+/// `(vector-fill! v fill start)` — 3-arg fill-from form. Fills
+/// `v[start..len]` with clones of `fill`. Consumes `vec` and `fill`
+/// Gc handles; `start` is a raw Fixnum. Non-vector or out-of-range
+/// (start < 0 or > len) deopts. Returns Gc(Unspecified). ADR 0012 D-2
+/// (iter IB).
+///
+/// # Safety
+///
+/// `vec` and `fill` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_fill_from_gc(vec: i64, fill: i64, start: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(vec) };
+    let f = unsafe { gc_i64_to_value(fill) };
+    match v {
+        Value::Vector(vc) => {
+            let mut storage = vc.borrow_mut();
+            let len = storage.len();
+            if start < 0 || (start as usize) > len {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            for slot in storage[(start as usize)..].iter_mut() {
+                *slot = f.clone();
+            }
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(vector-fill! v fill start end)` — 4-arg slice-fill form. Fills
 /// `v[start..end]` with clones of `fill`. Consumes `vec` and `fill`
 /// Gc handles; `start` and `end` are raw Fixnum i64. Non-vector or
