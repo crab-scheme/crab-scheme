@@ -10325,21 +10325,15 @@ fn diff_jit_variadic_char_compares() {
     // (if ...) since JIT returns 0/1 raw Fixnum bits.
     let mut rt = Runtime::new();
     rt.install_jit().unwrap();
-    rt.eval_str_via_vm(
-        "<diff>",
-        "(define (lt3) (if (char<? #\\a #\\b #\\c) 1 0))",
-    )
-    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (lt3) (if (char<? #\\a #\\b #\\c) 1 0))")
+        .unwrap();
     rt.eval_str_via_vm(
         "<diff>",
         "(define (lt3-bad) (if (char<? #\\a #\\c #\\b) 1 0))",
     )
     .unwrap();
-    rt.eval_str_via_vm(
-        "<diff>",
-        "(define (gt3) (if (char>? #\\c #\\b #\\a) 1 0))",
-    )
-    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (gt3) (if (char>? #\\c #\\b #\\a) 1 0))")
+        .unwrap();
     rt.eval_str_via_vm(
         "<diff>",
         "(define (le3-eq) (if (char<=? #\\a #\\a #\\b) 1 0))",
@@ -10372,6 +10366,70 @@ fn diff_jit_variadic_char_compares() {
     }
     assert_eq!(fix_of(lt), 1);
     assert_eq!(fix_of(lt_bad), 0);
+    assert_eq!(fix_of(gt), 1);
+    assert_eq!(fix_of(le), 1);
+    assert_eq!(fix_of(ge), 1);
+}
+
+#[test]
+fn diff_jit_variadic_char_ci_compares() {
+    // ADR 0012 D-2 (iter JC) — variadic char-ci=? / <? / >? / <=? / >=? (3+).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (eq3) (if (char-ci=? #\\A #\\a #\\A) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (eq3-bad) (if (char-ci=? #\\A #\\a #\\B) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (lt3) (if (char-ci<? #\\A #\\B #\\c) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (gt3) (if (char-ci>? #\\C #\\b #\\A) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (le3) (if (char-ci<=? #\\A #\\a #\\b) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (ge3) (if (char-ci>=? #\\B #\\b #\\a) 1 0))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (eq3) (eq3-bad) (lt3) (gt3) (le3) (ge3) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let eq = rt.eval_str_via_vm("<diff>", "(eq3)").unwrap();
+    let eq_bad = rt.eval_str_via_vm("<diff>", "(eq3-bad)").unwrap();
+    let lt = rt.eval_str_via_vm("<diff>", "(lt3)").unwrap();
+    let gt = rt.eval_str_via_vm("<diff>", "(gt3)").unwrap();
+    let le = rt.eval_str_via_vm("<diff>", "(le3)").unwrap();
+    let ge = rt.eval_str_via_vm("<diff>", "(ge3)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn fix_of(v: Value) -> i64 {
+        match v {
+            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            other => panic!("expected fixnum, got {:?}", other),
+        }
+    }
+    assert_eq!(fix_of(eq), 1);
+    assert_eq!(fix_of(eq_bad), 0);
+    assert_eq!(fix_of(lt), 1);
     assert_eq!(fix_of(gt), 1);
     assert_eq!(fix_of(le), 1);
     assert_eq!(fix_of(ge), 1);

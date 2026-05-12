@@ -5222,6 +5222,94 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::Eq(dst, lt, zero));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter JC) — variadic char-ci
+                                    // ordered comparisons. Foldcase each arg
+                                    // once, then pairwise compare + BitAnd
+                                    // chain (mirrors JB for plain char</>).
+                                    ("char-ci=?", n)
+                                    | ("char-ci<?", n)
+                                    | ("char-ci>?", n)
+                                    | ("char-ci<=?", n)
+                                    | ("char-ci>=?", n)
+                                        if n >= 3
+                                            && args.iter().all(|v| {
+                                                value_types.get(v).copied() == Some(Type::Character)
+                                            }) =>
+                                    {
+                                        let folded: Vec<RirValue> = args
+                                            .iter()
+                                            .map(|v| {
+                                                let f = alloc();
+                                                insts.push(RirInst::CharFoldcase(f, *v));
+                                                value_types.insert(f, Type::Character);
+                                                f
+                                            })
+                                            .collect();
+                                        let emit_cmp =
+                                            |insts: &mut Vec<RirInst>,
+                                             value_types: &mut HashMap<RirValue, Type>,
+                                             alloc: &mut dyn FnMut() -> RirValue,
+                                             a: RirValue,
+                                             b: RirValue|
+                                             -> RirValue {
+                                                let d = alloc();
+                                                value_types.insert(d, Type::Boolean);
+                                                match name {
+                                                    "char-ci=?" => insts.push(RirInst::Eq(d, a, b)),
+                                                    "char-ci<?" => insts.push(RirInst::Lt(d, a, b)),
+                                                    "char-ci>?" => insts.push(RirInst::Lt(d, b, a)),
+                                                    "char-ci<=?" => {
+                                                        let lt = alloc();
+                                                        insts.push(RirInst::Lt(lt, b, a));
+                                                        value_types.insert(lt, Type::Boolean);
+                                                        let zero = alloc();
+                                                        insts.push(RirInst::LoadConst(
+                                                            zero,
+                                                            Const::Fixnum(0),
+                                                        ));
+                                                        value_types.insert(zero, Type::Fixnum);
+                                                        insts.push(RirInst::Eq(d, lt, zero));
+                                                    }
+                                                    "char-ci>=?" => {
+                                                        let lt = alloc();
+                                                        insts.push(RirInst::Lt(lt, a, b));
+                                                        value_types.insert(lt, Type::Boolean);
+                                                        let zero = alloc();
+                                                        insts.push(RirInst::LoadConst(
+                                                            zero,
+                                                            Const::Fixnum(0),
+                                                        ));
+                                                        value_types.insert(zero, Type::Fixnum);
+                                                        insts.push(RirInst::Eq(d, lt, zero));
+                                                    }
+                                                    _ => unreachable!(),
+                                                }
+                                                d
+                                            };
+                                        let first = emit_cmp(
+                                            &mut insts,
+                                            &mut value_types,
+                                            &mut alloc,
+                                            folded[0],
+                                            folded[1],
+                                        );
+                                        let mut acc = first;
+                                        for i in 1..folded.len() - 1 {
+                                            let cmp = emit_cmp(
+                                                &mut insts,
+                                                &mut value_types,
+                                                &mut alloc,
+                                                folded[i],
+                                                folded[i + 1],
+                                            );
+                                            let new_acc = alloc();
+                                            insts.push(RirInst::BitAnd(new_acc, acc, cmp));
+                                            value_types.insert(new_acc, Type::Boolean);
+                                            acc = new_acc;
+                                        }
+                                        insts.push(RirInst::Move(dst, acc));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // Always-false predicates: JIT bodies
                                     // are only entered when every arg is
                                     // a Fixnum (the type guard's
