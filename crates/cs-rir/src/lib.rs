@@ -686,6 +686,10 @@ pub enum Inst {
     /// `dst = hashtable-clear!(ht)` (1-arg). Mutation; returns
     /// Unspecified Gc handle. ADR 0012 D-2 (iter GI).
     HashtableClear(Value, Value),
+    /// `dst = equal-hash(v)`. Returns Fixnum. ADR 0012 D-2 (iter GJ).
+    EqualHash(Value, Value),
+    /// `dst = hashtable->alist(ht)`. ADR 0012 D-2 (iter GJ).
+    HashtableToAlist(Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

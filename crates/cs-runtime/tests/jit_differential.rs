@@ -7451,3 +7451,59 @@ fn diff_jit_numerator_denominator_and_clear() {
         Value::Number(cs_core::Number::Fixnum(0))
     ));
 }
+
+#[test]
+fn diff_jit_equal_hash_and_hashtable_to_alist() {
+    // ADR 0012 D-2 (iter GJ) — equal-hash + hashtable->alist.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (eh v) (equal-hash v))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (h2a ht) (hashtable->alist ht))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm-ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! warm-ht 'a 1)")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (eh \"hello\") (h2a warm-ht) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let h_str = rt.eval_str_via_vm("<diff>", "(eh \"hello\")").unwrap();
+    let h_str2 = rt.eval_str_via_vm("<diff>", "(eh \"hello\")").unwrap();
+    let h_diff = rt.eval_str_via_vm("<diff>", "(eh \"world\")").unwrap();
+    let h_list = rt.eval_str_via_vm("<diff>", "(eh (list 1 2 3))").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'x 100)")
+        .unwrap();
+    let alist = rt.eval_str_via_vm("<diff>", "(h2a ht)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    let h1 = match &h_str {
+        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        other => panic!("expected fixnum, got {:?}", other),
+    };
+    let h2 = match &h_str2 {
+        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        other => panic!("expected fixnum, got {:?}", other),
+    };
+    let h3 = match &h_diff {
+        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        other => panic!("expected fixnum, got {:?}", other),
+    };
+    assert_eq!(h1, h2, "equal-hash deterministic");
+    assert_ne!(h1, h3, "different strings hash differently");
+    assert!(h1 >= 0);
+    assert!(matches!(&h_list, Value::Number(cs_core::Number::Fixnum(v)) if *v >= 0));
+    match &alist {
+        Value::Pair(p) => match p.car.borrow().clone() {
+            Value::Pair(_) => (),
+            other => panic!("expected pair entry, got {:?}", other),
+        },
+        other => panic!("expected pair list, got {:?}", other),
+    }
+}

@@ -949,6 +949,81 @@ pub unsafe extern "C" fn vm_hashtable_clear_gc(r: i64) -> i64 {
     }
 }
 
+fn equal_hash_rec(v: &Value, acc: &mut u64) {
+    let mix = |h: &mut u64, x: u64| {
+        *h ^= x;
+        *h = h.wrapping_mul(0x100000001b3);
+    };
+    match v {
+        Value::Null => mix(acc, 0x01),
+        Value::Boolean(b) => mix(acc, 0x10 | (*b as u64)),
+        Value::Number(n) => mix(acc, fnv1a_hash_jit(format!("{}", n).as_bytes()) as u64),
+        Value::Character(c) => mix(acc, 0x20 | (*c as u64)),
+        Value::String(s) => {
+            mix(acc, 0x30);
+            for b in s.borrow().as_bytes() {
+                mix(acc, *b as u64);
+            }
+        }
+        Value::Symbol(s) => {
+            mix(acc, 0x40);
+            mix(acc, s.0 as u64);
+        }
+        Value::Pair(p) => {
+            mix(acc, 0x50);
+            equal_hash_rec(&p.car.borrow(), acc);
+            equal_hash_rec(&p.cdr.borrow(), acc);
+        }
+        Value::Vector(vc) => {
+            mix(acc, 0x60);
+            for slot in vc.borrow().iter() {
+                equal_hash_rec(slot, acc);
+            }
+        }
+        _ => mix(acc, 0xff),
+    }
+}
+
+/// `(equal-hash v)` — FNV-1a hash over the structure-equality
+/// projection of `v`. Returns a non-negative Fixnum. ADR 0012 D-2
+/// (iter GJ).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_equal_hash_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    let mut h: u64 = 0xcbf29ce484222325;
+    equal_hash_rec(&v, &mut h);
+    (h as i64).wrapping_abs()
+}
+
+/// `(hashtable->alist ht)` — fresh list of (key . value) pairs from
+/// the hashtable. Deopts on non-hashtable. ADR 0012 D-2 (iter GJ).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_to_alist_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Hashtable(h) => {
+            let items = h.items.borrow();
+            let pairs: Vec<Value> = items
+                .iter()
+                .map(|(k, v)| Value::Pair(cs_core::Pair::new(k.clone(), v.clone())))
+                .collect();
+            value_to_gc_i64(Value::list(pairs))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
 /// `(div x y)` — R6RS Euclidean division. Result rounds toward -∞
 /// such that `mod` is always non-negative. Deopts on y == 0 (bytecode
 /// raises a condition we don't model here). Both args raw Fixnum-shape.
