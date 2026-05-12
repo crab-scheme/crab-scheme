@@ -1098,6 +1098,17 @@ pub unsafe extern "C" fn vm_equal_hash_gc(r: i64) -> i64 {
     (h as i64).wrapping_abs()
 }
 
+/// `(eof-object)` — 0-arg constructor for `Value::Eof`. Returns a
+/// Gc handle. No deopt path. ADR 0012 D-2 (iter HD).
+///
+/// # Safety
+///
+/// No invariants — pure constant constructor.
+#[no_mangle]
+pub unsafe extern "C" fn vm_eof_object_gc() -> i64 {
+    value_to_gc_i64(Value::Eof)
+}
+
 /// `(current-second)` — Unix epoch seconds as Flonum bit pattern.
 /// 0-arg helper. ADR 0012 D-2 (iter GL).
 ///

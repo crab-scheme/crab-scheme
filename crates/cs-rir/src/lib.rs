@@ -736,6 +736,9 @@ pub enum Inst {
     /// `dst = bytevector-copy(bv, start, end)` returns fresh slice.
     /// ADR 0012 D-2 (iter HC).
     BvCopySlice(Value, Value, Value, Value),
+    /// `dst = (eof-object)` — 0-arg constant constructor.
+    /// ADR 0012 D-2 (iter HD).
+    EofObject(Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

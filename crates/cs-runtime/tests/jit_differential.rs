@@ -8326,3 +8326,27 @@ fn diff_jit_bytevector_copy_slice() {
     assert_eq!(bv_to_bytes(&prefix), vec![1, 2, 3]);
     assert_eq!(bv_to_bytes(&suffix), vec![6, 7, 8]);
 }
+
+#[test]
+fn diff_jit_eof_object() {
+    // ADR 0012 D-2 (iter HD) — eof-object 0-arg constructor.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mke) (eof-object))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (mke) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let v = rt.eval_str_via_vm("<diff>", "(mke)").unwrap();
+    let is_eof = rt.eval_str_via_vm("<diff>", "(eof-object? (mke))").unwrap();
+    let not_eof = rt.eval_str_via_vm("<diff>", "(eof-object? 42)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&v, Value::Eof));
+    assert!(matches!(&is_eof, Value::Boolean(true)));
+    assert!(matches!(&not_eof, Value::Boolean(false)));
+}

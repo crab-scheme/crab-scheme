@@ -440,6 +440,8 @@ pub struct Lowerer {
     vector_copy_slice_func: cranelift_module::FuncId,
     /// FuncId of `vm_bytevector_copy_slice_gc(bv, s, e) -> i64`. ADR 0012 D-2 (iter HC).
     bytevector_copy_slice_func: cranelift_module::FuncId,
+    /// FuncId of `vm_eof_object_gc() -> i64`. ADR 0012 D-2 (iter HD).
+    eof_object_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -1116,6 +1118,8 @@ impl Lowerer {
             "vm_bytevector_copy_slice_gc",
             cs_vm::vm::vm_bytevector_copy_slice_gc as *const u8,
         );
+        // ADR 0012 D-2 (iter HD) — eof-object constructor.
+        builder.symbol("vm_eof_object_gc", cs_vm::vm::vm_eof_object_gc as *const u8);
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
             "vm_bitwise_bit_count",
@@ -2725,6 +2729,14 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_bytevector_copy_slice_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter HD) — eof-object constructor.
+        let eof_object_func = module
+            .declare_function(
+                "vm_eof_object_gc",
+                cranelift_module::Linkage::Import,
+                &zero_arg_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_eof_object_gc: {e}")))?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3714,6 +3726,7 @@ impl Lowerer {
             hashtable_copy_func,
             vector_copy_slice_func,
             bytevector_copy_slice_func,
+            eof_object_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4409,6 +4422,10 @@ impl Lowerer {
             let bytevector_copy_slice_fnref = self
                 .module
                 .declare_func_in_func(self.bytevector_copy_slice_func, builder.func);
+            // iter HD — eof-object constructor.
+            let eof_object_fnref = self
+                .module
+                .declare_func_in_func(self.eof_object_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4912,6 +4929,7 @@ impl Lowerer {
                         hashtable_copy_fnref,
                         vector_copy_slice_fnref,
                         bytevector_copy_slice_fnref,
+                        eof_object_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -5304,6 +5322,7 @@ fn lower_inst(
     hashtable_copy_fnref: cranelift_codegen::ir::FuncRef,
     vector_copy_slice_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_copy_slice_fnref: cranelift_codegen::ir::FuncRef,
+    eof_object_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -6177,6 +6196,23 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "HashtableSet expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::EofObject(dst) => {
+            // ADR 0012 D-2 (iter HD) — eof-object constructor. 0-arg.
+            // No deopt; returns a fresh Gc handle to Value::Eof.
+            let inst_ref = b.ins().call(eof_object_fnref, &[]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "EofObject expected 1 result, got {}",
                         results.len()
                     )));
                 }
