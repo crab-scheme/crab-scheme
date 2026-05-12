@@ -2485,6 +2485,16 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter HV) — string-copy 2-arg slice-to-end.
+                                    ("string-copy", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::StrCopyFrom(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter HB) — string-copy 3-arg
                                     // is identical to substring in R7RS (char-
                                     // based slicing, returns fresh string). Reuse
@@ -5744,6 +5754,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VecCopySlice(dst, _, _, _)
                 | RirInst::VecCopyFrom(dst, _, _)
                 | RirInst::BvCopyFrom(dst, _, _)
+                | RirInst::StrCopyFrom(dst, _, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::MakeHashtableEqual(dst)

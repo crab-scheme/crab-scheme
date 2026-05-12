@@ -8973,3 +8973,39 @@ fn diff_jit_bytevector_copy_from() {
     assert_eq!(bv_bytes(&full), vec![1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(bv_bytes(&empty), Vec::<u8>::new());
 }
+
+#[test]
+fn diff_jit_string_copy_from() {
+    // ADR 0012 D-2 (iter HV) — string-copy 2-arg slice-to-end form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (scf s a) (string-copy s a))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define src \"hello-world\")")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (scf src 6) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let tail = rt.eval_str_via_vm("<diff>", "(scf src 6)").unwrap();
+    let full = rt.eval_str_via_vm("<diff>", "(scf src 0)").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(scf src 11)").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define utf \"αβγδε\")")
+        .unwrap();
+    let utf_tail = rt.eval_str_via_vm("<diff>", "(scf utf 2)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn s_of(v: &Value) -> String {
+        match v {
+            Value::String(sg) => sg.borrow().clone(),
+            other => panic!("expected string, got {:?}", other),
+        }
+    }
+    assert_eq!(s_of(&tail), "world");
+    assert_eq!(s_of(&full), "hello-world");
+    assert_eq!(s_of(&empty), "");
+    assert_eq!(s_of(&utf_tail), "γδε");
+}

@@ -2522,9 +2522,41 @@ pub unsafe extern "C" fn vm_bytevector_copy_slice_gc(r: i64, start: i64, end: i6
     }
 }
 
+/// `(string-copy s start)` — 2-arg slice-to-end form. R7RS char-based
+/// indexing (multibyte UTF-8 sliced on codepoint boundaries). Consumes
+/// `s`. Non-string or out-of-range (start < 0 or > char-count) deopt.
+/// `start` is a raw Fixnum. ADR 0012 D-2 (iter HV).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_copy_from_gc(r: i64, start: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::String(sc) => {
+            let chars: Vec<char> = sc.borrow().chars().collect();
+            let len = chars.len();
+            if start < 0 || (start as usize) > len {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                    String::new(),
+                ))));
+            }
+            let sub: String = chars[(start as usize)..].iter().collect();
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(sub))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
 /// `(string-copy s)` — return a freshly allocated copy of `s`.
-/// 1-arg form only; variadic (start, end slice) variants are
-/// deferred. Consumes `s`. Non-string deopts. ADR 0012 D-2
+/// 1-arg form only. Consumes `s`. Non-string deopts. ADR 0012 D-2
 /// (iter DB).
 ///
 /// # Safety
