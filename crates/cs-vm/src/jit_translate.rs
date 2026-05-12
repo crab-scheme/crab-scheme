@@ -1943,6 +1943,14 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::HashtableMutableP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter HQ) — hashtable-hash-function.
+                                    ("hashtable-hash-function", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::HashtableHashFn(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter GH) — hashtable-keys/values.
                                     ("hashtable-keys", 1)
                                         if value_types.get(&args[0]).copied()
@@ -5725,7 +5733,8 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::BytevectorToU8List(dst, _)
                 | RirInst::U8ListToBytevector(dst, _)
                 | RirInst::StringToUtf8(dst, _)
-                | RirInst::Utf8ToString(dst, _) => {
+                | RirInst::Utf8ToString(dst, _)
+                | RirInst::HashtableHashFn(dst, _) => {
                     any_values.insert(*dst);
                 }
                 _ => {}

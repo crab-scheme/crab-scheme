@@ -391,6 +391,8 @@ pub struct Lowerer {
     div_euclid_func: cranelift_module::FuncId,
     /// FuncId of `vm_div0(x, y) -> i64`. ADR 0012 D-2 (iter HO).
     div0_func: cranelift_module::FuncId,
+    /// FuncId of `vm_hashtable_hash_function_gc(ht) -> i64`. ADR 0012 D-2 (iter HQ).
+    hashtable_hash_function_func: cranelift_module::FuncId,
     /// FuncId of `vm_mod0(x, y) -> i64`. ADR 0012 D-2 (iter HO).
     mod0_func: cranelift_module::FuncId,
     /// FuncId of `vm_mod_euclid(x, y) -> i64`. ADR 0012 D-2 (iter GE).
@@ -1039,6 +1041,11 @@ impl Lowerer {
         // ADR 0012 D-2 (iter HO) — div0 / mod0.
         builder.symbol("vm_div0", cs_vm::vm::vm_div0 as *const u8);
         builder.symbol("vm_mod0", cs_vm::vm::vm_mod0 as *const u8);
+        // ADR 0012 D-2 (iter HQ) — hashtable-hash-function.
+        builder.symbol(
+            "vm_hashtable_hash_function_gc",
+            cs_vm::vm::vm_hashtable_hash_function_gc as *const u8,
+        );
         builder.symbol("vm_mod_euclid", cs_vm::vm::vm_mod_euclid as *const u8);
         // ADR 0012 D-2 (iter GF) — hashtable?.
         builder.symbol(
@@ -2595,6 +2602,18 @@ impl Lowerer {
                 &vector_ref_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_mod0: {e}")))?;
+        // ADR 0012 D-2 (iter HQ) — hashtable-hash-function.
+        let hashtable_hash_function_func = module
+            .declare_function(
+                "vm_hashtable_hash_function_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_hashtable_hash_function_gc: {e}"
+                ))
+            })?;
 
         // ADR 0012 D-2 (iter GF) — hashtable?.
         let hashtable_p_func = module
@@ -3853,6 +3872,7 @@ impl Lowerer {
             div_euclid_func,
             div0_func,
             mod0_func,
+            hashtable_hash_function_func,
             mod_euclid_func,
             hashtable_p_func,
             hashtable_size_func,
@@ -4497,6 +4517,10 @@ impl Lowerer {
             let mod0_fnref = self
                 .module
                 .declare_func_in_func(self.mod0_func, builder.func);
+            // iter HQ — hashtable-hash-function.
+            let hashtable_hash_function_fnref = self
+                .module
+                .declare_func_in_func(self.hashtable_hash_function_func, builder.func);
             // iter GF — hashtable?.
             let hashtable_p_fnref = self
                 .module
@@ -5101,6 +5125,7 @@ impl Lowerer {
                         mod_euclid_fnref,
                         div0_fnref,
                         mod0_fnref,
+                        hashtable_hash_function_fnref,
                         hashtable_p_fnref,
                         hashtable_size_fnref,
                         hashtable_mutable_p_fnref,
@@ -5503,6 +5528,7 @@ fn lower_inst(
     mod_euclid_fnref: cranelift_codegen::ir::FuncRef,
     div0_fnref: cranelift_codegen::ir::FuncRef,
     mod0_fnref: cranelift_codegen::ir::FuncRef,
+    hashtable_hash_function_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_p_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_size_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_mutable_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -6209,6 +6235,25 @@ fn lower_inst(
                 }
                 results[0]
             };
+            map.insert(*dst, result);
+        }
+        Inst::HashtableHashFn(dst, src) => {
+            // ADR 0012 D-2 (iter HQ) — hashtable-hash-function. Returns
+            // a Gc handle to the proc (Custom) or #f (Eq/Eqv/Equal).
+            // Deopts on non-hashtable.
+            let sv = lookup(map, *src)?;
+            let inst_ref = b.ins().call(hashtable_hash_function_fnref, &[sv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "HashtableHashFn expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
         Inst::DivEuclid(dst, x, y)

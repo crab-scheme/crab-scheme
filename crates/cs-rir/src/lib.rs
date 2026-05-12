@@ -763,6 +763,9 @@ pub enum Inst {
     /// `dst = div0(x, y)` R6RS centered div.
     /// ADR 0012 D-2 (iter HO).
     Div0(Value, Value, Value),
+    /// `dst = hashtable-hash-function(ht)` returns proc or #f.
+    /// ADR 0012 D-2 (iter HQ).
+    HashtableHashFn(Value, Value),
     /// `dst = mod0(x, y)` R6RS centered mod.
     /// ADR 0012 D-2 (iter HO).
     Mod0(Value, Value, Value),

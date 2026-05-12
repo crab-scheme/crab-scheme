@@ -8806,3 +8806,41 @@ fn diff_jit_fxdiv0_fxmod0() {
     assert!(matches!(&d14_4, Value::Number(cs_core::Number::Fixnum(4))));
     assert!(matches!(&m14_4, Value::Number(cs_core::Number::Fixnum(-2))));
 }
+
+#[test]
+fn diff_jit_hashtable_hash_function() {
+    // ADR 0012 D-2 (iter HQ) — hashtable-hash-function.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (hhf ht) (hashtable-hash-function ht))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define eqh (make-eq-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (hhf eqh) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let on_eq = rt.eval_str_via_vm("<diff>", "(hhf eqh)").unwrap();
+    let on_eqv = rt
+        .eval_str_via_vm("<diff>", "(hhf (make-eqv-hashtable))")
+        .unwrap();
+    let on_equal = rt
+        .eval_str_via_vm("<diff>", "(hhf (make-hashtable))")
+        .unwrap();
+    let on_custom = rt
+        .eval_str_via_vm("<diff>", "(hhf (make-hashtable string-hash string=?))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&on_eq, Value::Boolean(false)));
+    assert!(matches!(&on_eqv, Value::Boolean(false)));
+    assert!(matches!(&on_equal, Value::Boolean(false)));
+    assert!(
+        !matches!(&on_custom, Value::Boolean(false)),
+        "expected custom hash proc, got {:?}",
+        on_custom
+    );
+}

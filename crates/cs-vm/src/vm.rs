@@ -1635,6 +1635,37 @@ pub unsafe extern "C" fn vm_mod_euclid(x: i64, y: i64) -> i64 {
     x.rem_euclid(y)
 }
 
+/// `(hashtable-hash-function ht)` — R6RS. Returns the stored hash
+/// procedure for Custom hashtables, or #f for Eq/Eqv/Equal kinds.
+/// Returns a Gc handle. Deopts on non-hashtable. ADR 0012 D-2
+/// (iter HQ).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_hash_function_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Hashtable(h) => match h.eq_kind {
+            cs_core::HtEqKind::Custom => {
+                let proc = h
+                    .custom
+                    .as_ref()
+                    .expect("custom kind has procs")
+                    .hash
+                    .clone();
+                value_to_gc_i64(proc)
+            }
+            _ => value_to_gc_i64(Value::Boolean(false)),
+        },
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Boolean(false))
+        }
+    }
+}
+
 /// `(div0 x y)` — R6RS centered division. Returns the quotient `d`
 /// such that the remainder `m = x - d*y` is in `[-|y|/2, |y|/2)`.
 /// Raw i64 Fixnum operands and result. Deopts on `y == 0` or
