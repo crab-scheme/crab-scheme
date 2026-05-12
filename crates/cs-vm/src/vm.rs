@@ -2464,6 +2464,47 @@ pub unsafe extern "C" fn vm_bytevector_fill_gc(bv: i64, fill: i64) -> i64 {
     }
 }
 
+/// `(bytevector-fill! bv fill start end)` — 4-arg slice-fill form.
+/// Overwrites `bv[start..end]` with `fill & 0xFF`. `bv` is consumed;
+/// `fill`, `start`, `end` are raw Fixnum i64. Returns Gc(Unspecified).
+/// Non-bytevector or out-of-range (start > end, end > len, negative)
+/// deopt. ADR 0012 D-2 (iter HF).
+///
+/// # Safety
+///
+/// `bv` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_fill_slice_gc(
+    bv: i64,
+    fill: i64,
+    start: i64,
+    end: i64,
+) -> i64 {
+    let v = unsafe { gc_i64_to_value(bv) };
+    let byte = (fill & 0xFF) as u8;
+    match v {
+        Value::ByteVector(bvc) => {
+            let mut storage = bvc.borrow_mut();
+            let len = storage.len();
+            if start < 0 || end < 0 || (start as usize) > len || (end as usize) > len || start > end
+            {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            for slot in storage[(start as usize)..(end as usize)].iter_mut() {
+                *slot = byte;
+            }
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(symbol->string sym)` — return a fresh `Value::String` carrying
 /// the symbol's name. Operand is a Symbol-shape i64 (sym id in low
 /// 32 bits, NOT a Gc handle). Looks up via `JIT_ACTIVE_SYMS`.

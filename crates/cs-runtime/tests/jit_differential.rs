@@ -8391,3 +8391,50 @@ fn diff_jit_string_replace_first() {
     assert_eq!(s_of(&no_match), "hello");
     assert_eq!(s_of(&utf), "Xβγαβγ");
 }
+
+#[test]
+fn diff_jit_bytevector_fill_slice() {
+    // ADR 0012 D-2 (iter HF) — bytevector-fill! 4-arg slice form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (bf v fill s e) (bytevector-fill! v fill s e) v)",
+    )
+    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm (make-bytevector 8 0))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (bf warm 7 2 6) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define bv (make-bytevector 8 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(bf bv 9 2 6)").unwrap();
+    let after_mid = rt.eval_str_via_vm("<diff>", "bv").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define bv2 (make-bytevector 6 1))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(bf bv2 0 0 6)").unwrap();
+    let after_full = rt.eval_str_via_vm("<diff>", "bv2").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define bv3 (make-bytevector 4 5))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(bf bv3 99 2 2)").unwrap();
+    let after_empty = rt.eval_str_via_vm("<diff>", "bv3").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn bv_bytes(v: &Value) -> Vec<u8> {
+        match v {
+            Value::ByteVector(bg) => bg.borrow().clone(),
+            other => panic!("expected bytevector, got {:?}", other),
+        }
+    }
+    // bv: 8 zeros, fill 2..6 with 9
+    assert_eq!(bv_bytes(&after_mid), vec![0, 0, 9, 9, 9, 9, 0, 0]);
+    // bv2: 6 ones, fill 0..6 with 0
+    assert_eq!(bv_bytes(&after_full), vec![0, 0, 0, 0, 0, 0]);
+    // bv3: 4 fives, fill 2..2 (empty range) — unchanged
+    assert_eq!(bv_bytes(&after_empty), vec![5, 5, 5, 5]);
+}

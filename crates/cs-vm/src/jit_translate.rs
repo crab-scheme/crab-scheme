@@ -2621,6 +2621,22 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::BvFill(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter HF) — bytevector-fill! 4-arg slice.
+                                    ("bytevector-fill!", 4)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Fixnum)
+                                            && value_types.get(&args[2]).copied()
+                                                == Some(Type::Fixnum)
+                                            && value_types.get(&args[3]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::BvFillSlice(
+                                            dst, args[0], args[1], args[2], args[3],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter CR) — bytevector write ops.
                                     ("make-bytevector", 2) => {
                                         insts.push(RirInst::BvAlloc(dst, args[0], args[1]));
@@ -5531,6 +5547,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::StringReplaceFirst(dst, _, _, _)
+                | RirInst::BvFillSlice(dst, _, _, _, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)
