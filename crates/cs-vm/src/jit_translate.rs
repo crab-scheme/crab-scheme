@@ -1224,6 +1224,36 @@ pub fn bytecode_to_rir_with_hints(
                                         let _ = args[0];
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
                                     }
+                                    // ADR 0012 D-2 (iter HI) — exact-nonnegative-integer?.
+                                    // Flonum is always #f. Otherwise call the
+                                    // helper (operand BoxTyped if not Any).
+                                    ("exact-nonnegative-integer?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Flonum) =>
+                                    {
+                                        let _ = args[0];
+                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
+                                    }
+                                    ("exact-nonnegative-integer?", 1) => {
+                                        let t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let arg = if t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::ExactNonNegIntP(dst, arg));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // integer? / rational? gated on
                                     // !=Flonum default to const-true (Fixnum
                                     // is always integer and always rational).
@@ -5419,6 +5449,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::HashtableP(dst, _)
                 | RirInst::HashtableMutableP(dst, _)
                 | RirInst::HashtableContainsP(dst, _, _)
+                | RirInst::ExactNonNegIntP(dst, _)
                 | RirInst::FileExistsP(dst, _)
                 | RirInst::CharNumericP(dst, _)
                 | RirInst::CharWhitespaceP(dst, _)

@@ -468,6 +468,7 @@ dependencies = [
  "cs-ir",
  "cs-jit",
  "cs-rir",
+ "num-traits",
 ]
 
 [[package]]

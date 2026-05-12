@@ -943,6 +943,27 @@ pub unsafe extern "C" fn vm_hashtable_p_gc(r: i64) -> i64 {
     matches!(v, Value::Hashtable(_)) as i64
 }
 
+/// `(exact-nonnegative-integer? x)` — R6RS-ish predicate. Returns
+/// raw 0/1. Non-negative for Fixnum, Big (non-negative BigInt), and
+/// Rat (when integer and numerator non-negative). All other types
+/// return 0. No deopt path. ADR 0012 D-2 (iter HI).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_exact_nonneg_int_p_gc(r: i64) -> i64 {
+    use num_traits::Signed;
+    let v = unsafe { gc_i64_to_value(r) };
+    let ok = match v {
+        Value::Number(cs_core::Number::Fixnum(n)) => n >= 0,
+        Value::Number(cs_core::Number::Big(b)) => !b.is_negative(),
+        Value::Number(cs_core::Number::Rat(r)) => r.is_integer() && !r.numer().is_negative(),
+        _ => false,
+    };
+    ok as i64
+}
+
 /// `(hashtable-size ht)` — number of key/value pairs in `ht`.
 /// Deopts on non-hashtable. ADR 0012 D-2 (iter GG).
 ///

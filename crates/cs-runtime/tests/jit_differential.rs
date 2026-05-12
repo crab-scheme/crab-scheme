@@ -8554,3 +8554,41 @@ fn diff_jit_string_fill_slice() {
     assert_eq!(s_of(&after_empty), "...");
     assert_eq!(s_of(&after_utf), "αγγε");
 }
+
+#[test]
+fn diff_jit_exact_nonneg_int() {
+    // ADR 0012 D-2 (iter HI) — exact-nonnegative-integer?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (eni x) (exact-nonnegative-integer? x))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (eni 7) (eni -3) (eni \"hi\") (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let zero = rt.eval_str_via_vm("<diff>", "(eni 0)").unwrap();
+    let pos = rt.eval_str_via_vm("<diff>", "(eni 42)").unwrap();
+    let neg = rt.eval_str_via_vm("<diff>", "(eni -1)").unwrap();
+    let flo = rt.eval_str_via_vm("<diff>", "(eni 3.14)").unwrap();
+    let str_ = rt.eval_str_via_vm("<diff>", "(eni \"hi\")").unwrap();
+    let bool_ = rt.eval_str_via_vm("<diff>", "(eni #t)").unwrap();
+    let big = rt
+        .eval_str_via_vm("<diff>", "(eni (* 99999999999 99999999999))")
+        .unwrap();
+    let big_neg = rt
+        .eval_str_via_vm("<diff>", "(eni (- 0 (* 99999999999 99999999999)))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&zero, Value::Boolean(true)));
+    assert!(matches!(&pos, Value::Boolean(true)));
+    assert!(matches!(&neg, Value::Boolean(false)));
+    assert!(matches!(&flo, Value::Boolean(false)));
+    assert!(matches!(&str_, Value::Boolean(false)));
+    assert!(matches!(&bool_, Value::Boolean(false)));
+    assert!(matches!(&big, Value::Boolean(true)));
+    assert!(matches!(&big_neg, Value::Boolean(false)));
+}
