@@ -1862,6 +1862,21 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::HashtableToAlist(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter GK) — file-exists? + jiffies-per-second.
+                                    ("file-exists?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::FileExistsP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    ("jiffies-per-second", 0) => {
+                                        insts.push(RirInst::LoadConst(
+                                            dst,
+                                            Const::Fixnum(1_000_000_000),
+                                        ));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
                                     // ADR 0012 D-2 (iter GI) — numerator/denominator
                                     // for Fixnum: numerator is identity, denominator
                                     // is 1.
@@ -5056,6 +5071,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::PromiseP(dst, _)
                 | RirInst::HashtableP(dst, _)
                 | RirInst::HashtableMutableP(dst, _)
+                | RirInst::FileExistsP(dst, _)
                 | RirInst::CharNumericP(dst, _)
                 | RirInst::CharWhitespaceP(dst, _)
                 | RirInst::CharUpperCaseP(dst, _)

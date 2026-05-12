@@ -999,6 +999,28 @@ pub unsafe extern "C" fn vm_equal_hash_gc(r: i64) -> i64 {
     (h as i64).wrapping_abs()
 }
 
+/// `(file-exists? path)` — filesystem syscall via `Path::exists`.
+/// Returns raw 0/1 (Boolean shape). Deopts on non-String argument.
+/// ADR 0012 D-2 (iter GK).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_file_exists_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::String(s) => {
+            let path = s.borrow().clone();
+            std::path::Path::new(&path).exists() as i64
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
 /// `(hashtable->alist ht)` — fresh list of (key . value) pairs from
 /// the hashtable. Deopts on non-hashtable. ADR 0012 D-2 (iter GJ).
 ///

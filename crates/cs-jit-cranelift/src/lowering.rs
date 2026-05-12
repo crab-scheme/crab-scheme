@@ -398,6 +398,8 @@ pub struct Lowerer {
     equal_hash_func: cranelift_module::FuncId,
     /// FuncId of `vm_hashtable_to_alist_gc(ht) -> i64`. ADR 0012 D-2 (iter GJ).
     hashtable_to_alist_func: cranelift_module::FuncId,
+    /// FuncId of `vm_file_exists_p_gc(path) -> i64` (0/1). ADR 0012 D-2 (iter GK).
+    file_exists_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -988,6 +990,11 @@ impl Lowerer {
         builder.symbol(
             "vm_hashtable_to_alist_gc",
             cs_vm::vm::vm_hashtable_to_alist_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter GK) — file-exists?.
+        builder.symbol(
+            "vm_file_exists_p_gc",
+            cs_vm::vm::vm_file_exists_p_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
@@ -2418,6 +2425,14 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_hashtable_to_alist_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter GK) — file-exists?.
+        let file_exists_p_func = module
+            .declare_function(
+                "vm_file_exists_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_file_exists_p_gc: {e}")))?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3387,6 +3402,7 @@ impl Lowerer {
             hashtable_clear_func,
             equal_hash_func,
             hashtable_to_alist_func,
+            file_exists_p_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4005,6 +4021,10 @@ impl Lowerer {
             let hashtable_to_alist_fnref = self
                 .module
                 .declare_func_in_func(self.hashtable_to_alist_func, builder.func);
+            // iter GK — file-exists?.
+            let file_exists_p_fnref = self
+                .module
+                .declare_func_in_func(self.file_exists_p_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4488,6 +4508,7 @@ impl Lowerer {
                         hashtable_clear_fnref,
                         equal_hash_fnref,
                         hashtable_to_alist_fnref,
+                        file_exists_p_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -4860,6 +4881,7 @@ fn lower_inst(
     hashtable_clear_fnref: cranelift_codegen::ir::FuncRef,
     equal_hash_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_to_alist_fnref: cranelift_codegen::ir::FuncRef,
+    file_exists_p_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -5576,6 +5598,22 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "BitwiseShift/BitSetP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::FileExistsP(dst, src) => {
+            // ADR 0012 D-2 (iter GK) — file-exists?. Returns raw 0/1.
+            let sv = lookup(map, *src)?;
+            let inst_ref = b.ins().call(file_exists_p_fnref, &[sv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "FileExistsP expected 1 result, got {}",
                         results.len()
                     )));
                 }

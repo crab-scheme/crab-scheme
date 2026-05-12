@@ -690,6 +690,8 @@ pub enum Inst {
     EqualHash(Value, Value),
     /// `dst = hashtable->alist(ht)`. ADR 0012 D-2 (iter GJ).
     HashtableToAlist(Value, Value),
+    /// `dst = file-exists?(path)`. ADR 0012 D-2 (iter GK).
+    FileExistsP(Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

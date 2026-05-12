@@ -7507,3 +7507,35 @@ fn diff_jit_equal_hash_and_hashtable_to_alist() {
         other => panic!("expected pair list, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_file_exists_and_jiffies_per_second() {
+    // ADR 0012 D-2 (iter GK) — file-exists? + jiffies-per-second.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fe p) (file-exists? p))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (jps) (jiffies-per-second))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (fe \"/nonexistent-path-xyz\") (jps) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let missing = rt
+        .eval_str_via_vm("<diff>", "(fe \"/nonexistent-path-zzz-12345\")")
+        .unwrap();
+    // /tmp should exist on Unix
+    let exists = rt.eval_str_via_vm("<diff>", "(fe \"/tmp\")").unwrap();
+    let jps = rt.eval_str_via_vm("<diff>", "(jps)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&missing, Value::Boolean(false)));
+    assert!(matches!(&exists, Value::Boolean(true)));
+    assert!(matches!(
+        &jps,
+        Value::Number(cs_core::Number::Fixnum(1_000_000_000))
+    ));
+}
