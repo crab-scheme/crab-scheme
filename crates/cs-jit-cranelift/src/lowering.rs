@@ -613,6 +613,8 @@ pub struct Lowerer {
     exact_nonneg_int_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_bytevector_eq_p_gc(a, b) -> i64`. ADR 0012 D-2 (iter HJ).
     bytevector_eq_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_vector_eq_p_gc(a, b) -> i64`. ADR 0012 D-2 (iter HK).
+    vector_eq_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_take_gc(s, n) -> i64`. ADR 0012 D-2 (iter FJ).
     string_take_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_drop_gc(s, n) -> i64`. ADR 0012 D-2 (iter FJ).
@@ -1394,6 +1396,11 @@ impl Lowerer {
         builder.symbol(
             "vm_bytevector_eq_p_gc",
             cs_vm::vm::vm_bytevector_eq_p_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter HK) — vector=?.
+        builder.symbol(
+            "vm_vector_eq_p_gc",
+            cs_vm::vm::vm_vector_eq_p_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FJ) — string-take/-drop/-take-right/-drop-right.
         builder.symbol(
@@ -3423,6 +3430,14 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_bytevector_eq_p_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter HK) — vector=?.
+        let vector_eq_p_func = module
+            .declare_function(
+                "vm_vector_eq_p_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_vector_eq_p_gc: {e}")))?;
 
         // ADR 0012 D-2 (iter FJ) — string-take/-drop/-take-right/-drop-right.
         let string_take_func = module
@@ -3903,6 +3918,7 @@ impl Lowerer {
             string_fill_slice_func,
             exact_nonneg_int_p_func,
             bytevector_eq_p_func,
+            vector_eq_p_func,
             string_take_func,
             string_drop_func,
             string_take_right_func,
@@ -4765,6 +4781,10 @@ impl Lowerer {
             let bytevector_eq_p_fnref = self
                 .module
                 .declare_func_in_func(self.bytevector_eq_p_func, builder.func);
+            // iter HK — vector=?.
+            let vector_eq_p_fnref = self
+                .module
+                .declare_func_in_func(self.vector_eq_p_func, builder.func);
             // iter FJ — string-take/-drop/-take-right/-drop-right.
             let string_take_fnref = self
                 .module
@@ -5136,6 +5156,7 @@ impl Lowerer {
                         string_fill_slice_fnref,
                         exact_nonneg_int_p_fnref,
                         bytevector_eq_p_fnref,
+                        vector_eq_p_fnref,
                         string_take_fnref,
                         string_drop_fnref,
                         string_take_right_fnref,
@@ -5535,6 +5556,7 @@ fn lower_inst(
     string_fill_slice_fnref: cranelift_codegen::ir::FuncRef,
     exact_nonneg_int_p_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_eq_p_fnref: cranelift_codegen::ir::FuncRef,
+    vector_eq_p_fnref: cranelift_codegen::ir::FuncRef,
     string_take_fnref: cranelift_codegen::ir::FuncRef,
     string_drop_fnref: cranelift_codegen::ir::FuncRef,
     string_take_right_fnref: cranelift_codegen::ir::FuncRef,
@@ -8620,6 +8642,24 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "BytevectorEqP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::VectorEqP(dst, a_v, b_v) => {
+            // ADR 0012 D-2 (iter HK) — vector=?. Returns raw 0/1.
+            // Deopts on non-vector.
+            let av = lookup(map, *a_v)?;
+            let bv = lookup(map, *b_v)?;
+            let inst_ref = b.ins().call(vector_eq_p_fnref, &[av, bv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "VectorEqP expected 1 result, got {}",
                         results.len()
                     )));
                 }

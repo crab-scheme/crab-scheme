@@ -8631,3 +8631,53 @@ fn diff_jit_bytevector_eq() {
     assert!(matches!(&diff_length, Value::Boolean(false)));
     assert!(matches!(&empty, Value::Boolean(true)));
 }
+
+#[test]
+fn diff_jit_vector_eq() {
+    // ADR 0012 D-2 (iter HK) — vector=?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ve a b) (vector=? a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define a (vector 1 2 3))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define b (vector 1 2 3))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (ve a b) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let same = rt.eval_str_via_vm("<diff>", "(ve a b)").unwrap();
+    let diff_content = rt
+        .eval_str_via_vm("<diff>", "(ve a (vector 1 2 4))")
+        .unwrap();
+    let diff_length = rt.eval_str_via_vm("<diff>", "(ve a (vector 1 2))").unwrap();
+    let empty = rt
+        .eval_str_via_vm("<diff>", "(ve (vector) (vector))")
+        .unwrap();
+    // Structural equality: vectors of strings
+    let strs = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(ve (vector \"hi\" \"world\") (vector \"hi\" \"world\"))",
+        )
+        .unwrap();
+    // Nested vectors (recursive)
+    let nested = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(ve (vector (vector 1 2) 3) (vector (vector 1 2) 3))",
+        )
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&same, Value::Boolean(true)));
+    assert!(matches!(&diff_content, Value::Boolean(false)));
+    assert!(matches!(&diff_length, Value::Boolean(false)));
+    assert!(matches!(&empty, Value::Boolean(true)));
+    assert!(matches!(&strs, Value::Boolean(true)));
+    assert!(matches!(&nested, Value::Boolean(true)));
+}

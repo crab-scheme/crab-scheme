@@ -282,6 +282,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // vectors
         ("make-vector", b_make_vector),
         ("vector", b_vector),
+        ("vector=?", b_vector_eq),
         ("string", b_string_ctor),
         ("vector-length", b_vector_length),
         ("vector-ref", b_vector_ref),
@@ -3555,6 +3556,31 @@ fn b_make_vector(args: &[Value]) -> Result<Value, String> {
 fn b_vector(args: &[Value]) -> Result<Value, String> {
     let v: Vec<Value> = args.to_vec();
     Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(v))))
+}
+
+/// `(vector=? a b)` — R7RS element-wise structural equality. Compares
+/// element-by-element with `equal?` (handles recursive structures).
+fn b_vector_eq(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("vector=?", "2", args.len()));
+    }
+    let a = match &args[0] {
+        Value::Vector(v) => v.borrow().clone(),
+        v => return Err(type_err("vector=?", "vector", v)),
+    };
+    let b = match &args[1] {
+        Value::Vector(v) => v.borrow().clone(),
+        v => return Err(type_err("vector=?", "vector", v)),
+    };
+    if a.len() != b.len() {
+        return Ok(Value::Boolean(false));
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        if !eq::equal(x, y) {
+            return Ok(Value::Boolean(false));
+        }
+    }
+    Ok(Value::Boolean(true))
 }
 
 /// R7RS `(string char ...)` — return a string composed of the given chars.

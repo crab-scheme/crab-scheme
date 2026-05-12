@@ -943,6 +943,38 @@ pub unsafe extern "C" fn vm_hashtable_p_gc(r: i64) -> i64 {
     matches!(v, Value::Hashtable(_)) as i64
 }
 
+/// `(vector=? a b)` — R7RS element-wise structural equality. Returns
+/// raw 0/1. Element comparison uses `cs_core::eq::equal` (handles
+/// cycles). Deopts on non-vector. ADR 0012 D-2 (iter HK).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_eq_p_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::Vector(ag), Value::Vector(bg)) => {
+            let a_s = ag.borrow();
+            let b_s = bg.borrow();
+            if a_s.len() != b_s.len() {
+                return 0;
+            }
+            for (x, y) in a_s.iter().zip(b_s.iter()) {
+                if !cs_core::eq::equal(x, y) {
+                    return 0;
+                }
+            }
+            1
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
 /// `(bytevector=? a b)` — element-wise bytewise equality. Returns
 /// raw 0/1. Deopts on non-bytevector. ADR 0012 D-2 (iter HJ).
 ///
