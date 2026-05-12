@@ -1195,6 +1195,32 @@ pub unsafe extern "C" fn vm_make_hashtable_equal_gc() -> i64 {
     )))
 }
 
+/// `(make-eq-hashtable)` — R6RS 0-arg constructor for an Eq-kind
+/// hashtable. ADR 0012 D-2 (iter HS).
+///
+/// # Safety
+///
+/// No invariants — pure constructor.
+#[no_mangle]
+pub unsafe extern "C" fn vm_make_hashtable_eq_gc() -> i64 {
+    value_to_gc_i64(Value::Hashtable(cs_core::Hashtable::new(
+        cs_core::HtEqKind::Eq,
+    )))
+}
+
+/// `(make-eqv-hashtable)` — R6RS 0-arg constructor for an Eqv-kind
+/// hashtable. ADR 0012 D-2 (iter HS).
+///
+/// # Safety
+///
+/// No invariants — pure constructor.
+#[no_mangle]
+pub unsafe extern "C" fn vm_make_hashtable_eqv_gc() -> i64 {
+    value_to_gc_i64(Value::Hashtable(cs_core::Hashtable::new(
+        cs_core::HtEqKind::Eqv,
+    )))
+}
+
 /// `(current-second)` — Unix epoch seconds as Flonum bit pattern.
 /// 0-arg helper. ADR 0012 D-2 (iter GL).
 ///

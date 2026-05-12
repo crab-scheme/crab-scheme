@@ -8870,3 +8870,35 @@ fn diff_jit_make_hashtable_zero_arg() {
     assert!(matches!(&is_ht, Value::Boolean(true)));
     assert!(matches!(&sz, Value::Number(cs_core::Number::Fixnum(0))));
 }
+
+#[test]
+fn diff_jit_make_hashtable_eq_eqv() {
+    // ADR 0012 D-2 (iter HS) — make-eq/eqv-hashtable 0-arg constructors.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (eqh) (make-eq-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (eqvh) (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (eqh) (eqvh) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let h_eq = rt.eval_str_via_vm("<diff>", "(eqh)").unwrap();
+    let h_eqv = rt.eval_str_via_vm("<diff>", "(eqvh)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&h_eq, Value::Hashtable(_)));
+    assert!(matches!(&h_eqv, Value::Hashtable(_)));
+    // Round-trip: set+get works
+    rt.eval_str_via_vm("<diff>", "(define h1 (eqh))").unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! h1 'a 1)")
+        .unwrap();
+    let v = rt
+        .eval_str_via_vm("<diff>", "(hashtable-ref h1 'a #f)")
+        .unwrap();
+    assert!(matches!(&v, Value::Number(cs_core::Number::Fixnum(1))));
+}

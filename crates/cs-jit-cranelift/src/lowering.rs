@@ -395,6 +395,10 @@ pub struct Lowerer {
     hashtable_hash_function_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_hashtable_equal_gc() -> i64`. ADR 0012 D-2 (iter HR).
     make_hashtable_equal_func: cranelift_module::FuncId,
+    /// FuncId of `vm_make_hashtable_eq_gc() -> i64`. ADR 0012 D-2 (iter HS).
+    make_hashtable_eq_func: cranelift_module::FuncId,
+    /// FuncId of `vm_make_hashtable_eqv_gc() -> i64`. ADR 0012 D-2 (iter HS).
+    make_hashtable_eqv_func: cranelift_module::FuncId,
     /// FuncId of `vm_mod0(x, y) -> i64`. ADR 0012 D-2 (iter HO).
     mod0_func: cranelift_module::FuncId,
     /// FuncId of `vm_mod_euclid(x, y) -> i64`. ADR 0012 D-2 (iter GE).
@@ -1052,6 +1056,15 @@ impl Lowerer {
         builder.symbol(
             "vm_make_hashtable_equal_gc",
             cs_vm::vm::vm_make_hashtable_equal_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter HS) — make-eq/eqv-hashtable.
+        builder.symbol(
+            "vm_make_hashtable_eq_gc",
+            cs_vm::vm::vm_make_hashtable_eq_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_make_hashtable_eqv_gc",
+            cs_vm::vm::vm_make_hashtable_eqv_gc as *const u8,
         );
         builder.symbol("vm_mod_euclid", cs_vm::vm::vm_mod_euclid as *const u8);
         // ADR 0012 D-2 (iter GF) — hashtable?.
@@ -2631,6 +2644,25 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_make_hashtable_equal_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter HS) — make-eq-hashtable / make-eqv-hashtable.
+        let make_hashtable_eq_func = module
+            .declare_function(
+                "vm_make_hashtable_eq_gc",
+                cranelift_module::Linkage::Import,
+                &zero_arg_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_make_hashtable_eq_gc: {e}"))
+            })?;
+        let make_hashtable_eqv_func = module
+            .declare_function(
+                "vm_make_hashtable_eqv_gc",
+                cranelift_module::Linkage::Import,
+                &zero_arg_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_make_hashtable_eqv_gc: {e}"))
+            })?;
 
         // ADR 0012 D-2 (iter GF) — hashtable?.
         let hashtable_p_func = module
@@ -3891,6 +3923,8 @@ impl Lowerer {
             mod0_func,
             hashtable_hash_function_func,
             make_hashtable_equal_func,
+            make_hashtable_eq_func,
+            make_hashtable_eqv_func,
             mod_euclid_func,
             hashtable_p_func,
             hashtable_size_func,
@@ -4543,6 +4577,13 @@ impl Lowerer {
             let make_hashtable_equal_fnref = self
                 .module
                 .declare_func_in_func(self.make_hashtable_equal_func, builder.func);
+            // iter HS — make-eq/eqv-hashtable.
+            let make_hashtable_eq_fnref = self
+                .module
+                .declare_func_in_func(self.make_hashtable_eq_func, builder.func);
+            let make_hashtable_eqv_fnref = self
+                .module
+                .declare_func_in_func(self.make_hashtable_eqv_func, builder.func);
             // iter GF — hashtable?.
             let hashtable_p_fnref = self
                 .module
@@ -5149,6 +5190,8 @@ impl Lowerer {
                         mod0_fnref,
                         hashtable_hash_function_fnref,
                         make_hashtable_equal_fnref,
+                        make_hashtable_eq_fnref,
+                        make_hashtable_eqv_fnref,
                         hashtable_p_fnref,
                         hashtable_size_fnref,
                         hashtable_mutable_p_fnref,
@@ -5553,6 +5596,8 @@ fn lower_inst(
     mod0_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_hash_function_fnref: cranelift_codegen::ir::FuncRef,
     make_hashtable_equal_fnref: cranelift_codegen::ir::FuncRef,
+    make_hashtable_eq_fnref: cranelift_codegen::ir::FuncRef,
+    make_hashtable_eqv_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_p_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_size_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_mutable_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -6261,15 +6306,22 @@ fn lower_inst(
             };
             map.insert(*dst, result);
         }
-        Inst::MakeHashtableEqual(dst) => {
-            // ADR 0012 D-2 (iter HR) — make-hashtable 0-arg.
-            // Returns a fresh Gc handle to a Hashtable with eq_kind=Equal.
-            let inst_ref = b.ins().call(make_hashtable_equal_fnref, &[]);
+        Inst::MakeHashtableEqual(dst)
+        | Inst::MakeHashtableEq(dst)
+        | Inst::MakeHashtableEqv(dst) => {
+            // ADR 0012 D-2 (iter HR/HS) — make-hashtable* 0-arg.
+            let fnref = match inst {
+                Inst::MakeHashtableEqual(..) => make_hashtable_equal_fnref,
+                Inst::MakeHashtableEq(..) => make_hashtable_eq_fnref,
+                Inst::MakeHashtableEqv(..) => make_hashtable_eqv_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[]);
             let result = {
                 let results = b.inst_results(inst_ref);
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
-                        "MakeHashtableEqual expected 1 result, got {}",
+                        "MakeHashtable* expected 1 result, got {}",
                         results.len()
                     )));
                 }

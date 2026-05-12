@@ -769,6 +769,12 @@ pub enum Inst {
     /// `dst = (make-hashtable)` — 0-arg Equal-kind constructor.
     /// ADR 0012 D-2 (iter HR).
     MakeHashtableEqual(Value),
+    /// `dst = (make-eq-hashtable)` — 0-arg Eq-kind constructor.
+    /// ADR 0012 D-2 (iter HS).
+    MakeHashtableEq(Value),
+    /// `dst = (make-eqv-hashtable)` — 0-arg Eqv-kind constructor.
+    /// ADR 0012 D-2 (iter HS).
+    MakeHashtableEqv(Value),
     /// `dst = mod0(x, y)` R6RS centered mod.
     /// ADR 0012 D-2 (iter HO).
     Mod0(Value, Value, Value),
