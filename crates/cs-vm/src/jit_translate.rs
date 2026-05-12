@@ -1974,6 +1974,18 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::HashtableClear(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter HW) — hashtable-clear! 2-arg.
+                                    // Second operand is an R6RS capacity hint
+                                    // that CrabScheme's Vec-backed storage
+                                    // ignores. Reuses HashtableClear lowering.
+                                    ("hashtable-clear!", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        let _ = args[1];
+                                        insts.push(RirInst::HashtableClear(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter GJ) — equal-hash + hashtable->alist.
                                     ("equal-hash", 1)
                                         if value_types.get(&args[0]).copied()

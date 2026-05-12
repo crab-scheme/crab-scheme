@@ -9009,3 +9009,38 @@ fn diff_jit_string_copy_from() {
     assert_eq!(s_of(&empty), "");
     assert_eq!(s_of(&utf_tail), "γδε");
 }
+
+#[test]
+fn diff_jit_hashtable_clear_with_hint() {
+    // ADR 0012 D-2 (iter HW) — hashtable-clear! 2-arg with capacity hint.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (hc ht n) (hashtable-clear! ht n) ht)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! warm 'a 1)")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (hc warm 8) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define h (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! h 'a 1)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! h 'b 2)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! h 'c 3)")
+        .unwrap();
+    let before = rt.eval_str_via_vm("<diff>", "(hashtable-size h)").unwrap();
+    rt.eval_str_via_vm("<diff>", "(hc h 16)").unwrap();
+    let after = rt.eval_str_via_vm("<diff>", "(hashtable-size h)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&before, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&after, Value::Number(cs_core::Number::Fixnum(0))));
+}
