@@ -428,6 +428,8 @@ pub struct Lowerer {
     force_forced_func: cranelift_module::FuncId,
     /// FuncId of `vm_hashtable_contains_p_gc(ht, k) -> i64`. ADR 0012 D-2 (iter GV).
     hashtable_contains_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_hashtable_delete_gc(ht, k) -> i64`. ADR 0012 D-2 (iter GW).
+    hashtable_delete_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -1073,6 +1075,11 @@ impl Lowerer {
         builder.symbol(
             "vm_hashtable_contains_p_gc",
             cs_vm::vm::vm_hashtable_contains_p_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter GW) — hashtable-delete!.
+        builder.symbol(
+            "vm_hashtable_delete_gc",
+            cs_vm::vm::vm_hashtable_delete_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
@@ -2627,6 +2634,16 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_hashtable_contains_p_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter GW) — hashtable-delete!.
+        let hashtable_delete_func = module
+            .declare_function(
+                "vm_hashtable_delete_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_hashtable_delete_gc: {e}"))
+            })?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3610,6 +3627,7 @@ impl Lowerer {
             make_promise_func,
             force_forced_func,
             hashtable_contains_p_func,
+            hashtable_delete_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4281,6 +4299,10 @@ impl Lowerer {
             let hashtable_contains_p_fnref = self
                 .module
                 .declare_func_in_func(self.hashtable_contains_p_func, builder.func);
+            // iter GW — hashtable-delete!.
+            let hashtable_delete_fnref = self
+                .module
+                .declare_func_in_func(self.hashtable_delete_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4778,6 +4800,7 @@ impl Lowerer {
                         make_promise_fnref,
                         force_forced_fnref,
                         hashtable_contains_p_fnref,
+                        hashtable_delete_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -5164,6 +5187,7 @@ fn lower_inst(
     make_promise_fnref: cranelift_codegen::ir::FuncRef,
     force_forced_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_contains_p_fnref: cranelift_codegen::ir::FuncRef,
+    hashtable_delete_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -6002,6 +6026,26 @@ fn lower_inst(
                 }
                 results[0]
             };
+            map.insert(*dst, result);
+        }
+        Inst::HashtableDelete(dst, ht, key) => {
+            // ADR 0012 D-2 (iter GW) — hashtable-delete!. Returns a Gc
+            // handle to Unspecified. Deopts on non-hashtable or Custom
+            // eq_kind.
+            let htv = lookup(map, *ht)?;
+            let kv = lookup(map, *key)?;
+            let inst_ref = b.ins().call(hashtable_delete_fnref, &[htv, kv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "HashtableDelete expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
         Inst::EqualHash(dst, src) => {

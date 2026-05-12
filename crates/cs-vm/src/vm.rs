@@ -1166,6 +1166,39 @@ pub unsafe extern "C" fn vm_force_forced_gc(r: i64) -> i64 {
     }
 }
 
+/// `(hashtable-delete! ht key)` — removes the entry whose key matches
+/// `key` under the table's eq kind, if present. Returns a Gc handle
+/// to Unspecified. Deopts on non-hashtable or Custom eq_kind (which
+/// needs ctx). ADR 0012 D-2 (iter GW).
+///
+/// # Safety
+///
+/// `ht_raw` and `key_raw` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_hashtable_delete_gc(ht_raw: i64, key_raw: i64) -> i64 {
+    let ht_v = unsafe { gc_i64_to_value(ht_raw) };
+    let key_v = unsafe { gc_i64_to_value(key_raw) };
+    match ht_v {
+        Value::Hashtable(h) if h.eq_kind != cs_core::HtEqKind::Custom => {
+            let kind = h.eq_kind;
+            let mut items = h.items.borrow_mut();
+            if let Some(idx) = items.iter().position(|(k, _)| match kind {
+                cs_core::HtEqKind::Eq => cs_core::eq::eq(k, &key_v),
+                cs_core::HtEqKind::Eqv => cs_core::eq::eqv(k, &key_v),
+                cs_core::HtEqKind::Equal => cs_core::eq::equal(k, &key_v),
+                cs_core::HtEqKind::Custom => unreachable!(),
+            }) {
+                items.swap_remove(idx);
+            }
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(hashtable-contains? ht key)` — returns raw 0/1. Deopts on
 /// non-hashtable or on Custom eq_kind (which needs ctx). Supports
 /// Eq/Eqv/Equal hashtables natively. ADR 0012 D-2 (iter GV).

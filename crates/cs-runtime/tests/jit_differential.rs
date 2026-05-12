@@ -7958,3 +7958,49 @@ fn diff_jit_hashtable_contains() {
     assert!(matches!(&eq_yes, Value::Boolean(true)));
     assert!(matches!(&eq_no, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_hashtable_delete() {
+    // ADR 0012 D-2 (iter GW) — hashtable-delete! fast path.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (hd ht k) (hashtable-delete! ht k))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm-ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (hd warm-ht 'absent) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'a 1)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'b 2)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'c 3)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hd ht 'b)").unwrap();
+    let sz = rt.eval_str_via_vm("<diff>", "(hashtable-size ht)").unwrap();
+    let has_a = rt
+        .eval_str_via_vm("<diff>", "(hashtable-contains? ht 'a)")
+        .unwrap();
+    let has_b = rt
+        .eval_str_via_vm("<diff>", "(hashtable-contains? ht 'b)")
+        .unwrap();
+    let has_c = rt
+        .eval_str_via_vm("<diff>", "(hashtable-contains? ht 'c)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hd ht 'z)").unwrap();
+    let sz2 = rt.eval_str_via_vm("<diff>", "(hashtable-size ht)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&sz, Value::Number(cs_core::Number::Fixnum(2))));
+    assert!(matches!(&has_a, Value::Boolean(true)));
+    assert!(matches!(&has_b, Value::Boolean(false)));
+    assert!(matches!(&has_c, Value::Boolean(true)));
+    assert!(matches!(&sz2, Value::Number(cs_core::Number::Fixnum(2))));
+}

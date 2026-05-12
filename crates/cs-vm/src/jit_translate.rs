@@ -1988,6 +1988,17 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Boolean);
                                     }
+                                    // ADR 0012 D-2 (iter GW) — hashtable-delete!.
+                                    // Mutates table; result is Unspecified.
+                                    ("hashtable-delete!", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::HashtableDelete(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter GT) — make-promise.
                                     // Accepts any operand; BoxTyped if not Any.
                                     ("make-promise", 1) => {
@@ -5378,6 +5389,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::DeleteDuplicates(dst, _)
                 | RirInst::MakePromise(dst, _)
                 | RirInst::ForceForced(dst, _)
+                | RirInst::HashtableDelete(dst, _, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)
