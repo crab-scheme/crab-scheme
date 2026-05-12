@@ -5383,6 +5383,37 @@ pub fn bytecode_to_rir_with_hints(
                                             value_types.insert(dst, Type::Fixnum);
                                         }
                                     }
+                                    // ADR 0012 D-2 (iter IY) — variadic fxmin/fxmax.
+                                    // Fixnum-only (Flonum operands cause deopt
+                                    // via the unsupported tail). 1-arg → Move;
+                                    // 3+ args → left-fold over MinFixnum/MaxFixnum.
+                                    ("fxmin", _) | ("fxmax", _)
+                                        if args.len() >= 1
+                                            && args.iter().all(|v| {
+                                                value_types.get(v).copied() != Some(Type::Flonum)
+                                            }) =>
+                                    {
+                                        let ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
+                                            match name {
+                                                "fxmin" => RirInst::MinFixnum,
+                                                "fxmax" => RirInst::MaxFixnum,
+                                                _ => unreachable!(),
+                                            };
+                                        if args.len() == 1 {
+                                            insts.push(RirInst::Move(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        } else {
+                                            let mut acc = args[0];
+                                            for v in &args[1..args.len() - 1] {
+                                                let next = alloc();
+                                                insts.push(ctor(next, acc, *v));
+                                                value_types.insert(next, Type::Fixnum);
+                                                acc = next;
+                                            }
+                                            insts.push(ctor(dst, acc, *args.last().unwrap()));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                    }
                                     // ADR 0012 D-2 (iter DI) — variadic
                                     // min/max chain. Pattern mirrors +/-/*
                                     // above: Flonum-contagion promotion +

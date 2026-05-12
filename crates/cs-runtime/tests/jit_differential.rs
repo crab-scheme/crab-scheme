@@ -10223,3 +10223,41 @@ fn diff_jit_inexact_alias() {
     assert_eq!(flo_of(neg), -7.0);
     assert_eq!(flo_of(zero), 0.0);
 }
+
+#[test]
+fn diff_jit_variadic_fxminmax() {
+    // ADR 0012 D-2 (iter IY) — variadic fxmin/fxmax (1-arg and 3+).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fmn1 a) (fxmin a))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fmx1 a) (fxmax a))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fmn3 a b c) (fxmin a b c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fmx3 a b c) (fxmax a b c))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (fmn1 i) (fmx1 i) (fmn3 i (+ i 1) (- i 1)) (fmx3 i (+ i 1) (- i 1)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let mn1 = rt.eval_str_via_vm("<diff>", "(fmn1 42)").unwrap();
+    let mx1 = rt.eval_str_via_vm("<diff>", "(fmx1 42)").unwrap();
+    let mn3 = rt.eval_str_via_vm("<diff>", "(fmn3 5 2 8)").unwrap();
+    let mx3 = rt.eval_str_via_vm("<diff>", "(fmx3 5 2 8)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn fix_of(v: Value) -> i64 {
+        match v {
+            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            other => panic!("expected fixnum, got {:?}", other),
+        }
+    }
+    assert_eq!(fix_of(mn1), 42);
+    assert_eq!(fix_of(mx1), 42);
+    assert_eq!(fix_of(mn3), 2);
+    assert_eq!(fix_of(mx3), 8);
+}
