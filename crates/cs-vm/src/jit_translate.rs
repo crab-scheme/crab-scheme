@@ -4631,6 +4631,32 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::NumberToString(dst, boxed));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter II) — number->string 2-arg radix.
+                                    ("number->string", 2)
+                                        if value_types.get(&args[1]).copied()
+                                            == Some(Type::Fixnum) =>
+                                    {
+                                        let t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let boxed = if t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::NumberToStringRadix(
+                                            dst, boxed, args[1],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     ("string->number", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
@@ -5930,6 +5956,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VectorToListSlice(dst, _, _, _)
                 | RirInst::StringToListSlice(dst, _, _, _)
                 | RirInst::BytevectorToListSlice(dst, _, _, _)
+                | RirInst::NumberToStringRadix(dst, _, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::MakeHashtableEqual(dst)

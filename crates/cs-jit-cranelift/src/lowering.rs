@@ -596,6 +596,9 @@ pub struct Lowerer {
     /// FuncId of `vm_number_to_string_gc(n) -> i64`. ADR 0012 D-2
     /// (iter EC).
     number_to_string_func: cranelift_module::FuncId,
+    /// FuncId of `vm_number_to_string_radix_gc(n, radix) -> i64`.
+    /// ADR 0012 D-2 (iter II).
+    number_to_string_radix_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_to_number_gc(s) -> i64`. ADR 0012 D-2
     /// (iter EC).
     string_to_number_func: cranelift_module::FuncId,
@@ -1407,6 +1410,11 @@ impl Lowerer {
         builder.symbol(
             "vm_number_to_string_gc",
             cs_vm::vm::vm_number_to_string_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter II) — number->string 2-arg radix.
+        builder.symbol(
+            "vm_number_to_string_radix_gc",
+            cs_vm::vm::vm_number_to_string_radix_gc as *const u8,
         );
         builder.symbol(
             "vm_string_to_number_gc",
@@ -3501,6 +3509,18 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_number_to_string_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter II) — number->string 2-arg radix.
+        let number_to_string_radix_func = module
+            .declare_function(
+                "vm_number_to_string_radix_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_number_to_string_radix_gc: {e}"
+                ))
+            })?;
         let string_to_number_func = module
             .declare_function(
                 "vm_string_to_number_gc",
@@ -4196,6 +4216,7 @@ impl Lowerer {
             string_to_vector_func,
             vector_to_string_func,
             number_to_string_func,
+            number_to_string_radix_func,
             string_to_number_func,
             string_reverse_func,
             string_upcase_func,
@@ -5066,6 +5087,10 @@ impl Lowerer {
             let number_to_string_fnref = self
                 .module
                 .declare_func_in_func(self.number_to_string_func, builder.func);
+            // iter II — number->string 2-arg radix.
+            let number_to_string_radix_fnref = self
+                .module
+                .declare_func_in_func(self.number_to_string_radix_func, builder.func);
             let string_to_number_fnref = self
                 .module
                 .declare_func_in_func(self.string_to_number_func, builder.func);
@@ -5517,6 +5542,7 @@ impl Lowerer {
                         string_to_vector_fnref,
                         vector_to_string_fnref,
                         number_to_string_fnref,
+                        number_to_string_radix_fnref,
                         string_to_number_fnref,
                         string_reverse_fnref,
                         string_upcase_fnref,
@@ -5934,6 +5960,7 @@ fn lower_inst(
     string_to_vector_fnref: cranelift_codegen::ir::FuncRef,
     vector_to_string_fnref: cranelift_codegen::ir::FuncRef,
     number_to_string_fnref: cranelift_codegen::ir::FuncRef,
+    number_to_string_radix_fnref: cranelift_codegen::ir::FuncRef,
     string_to_number_fnref: cranelift_codegen::ir::FuncRef,
     string_reverse_fnref: cranelift_codegen::ir::FuncRef,
     string_upcase_fnref: cranelift_codegen::ir::FuncRef,
@@ -9086,6 +9113,24 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "NumberToString expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::NumberToStringRadix(dst, src, radix) => {
+            // ADR 0012 D-2 (iter II) — vm_number_to_string_radix_gc.
+            let v_v = lookup(map, *src)?;
+            let r_v = lookup(map, *radix)?;
+            let inst_ref = b.ins().call(number_to_string_radix_fnref, &[v_v, r_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "NumberToStringRadix expected 1 result, got {}",
                         results.len()
                     )));
                 }

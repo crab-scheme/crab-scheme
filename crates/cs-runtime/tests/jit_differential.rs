@@ -9498,7 +9498,8 @@ fn diff_jit_string_to_list_slice() {
     assert_eq!(list_to_chars(empty), Vec::<char>::new());
 
     // Multibyte UTF-8 — codepoint indexing, not byte indexing.
-    rt.eval_str_via_vm("<diff>", "(define utf \"αβγδε\")").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define utf \"αβγδε\")")
+        .unwrap();
     rt.eval_str_via_vm(
         "<diff>",
         "(let loop ((i 0)) \
@@ -9552,4 +9553,42 @@ fn diff_jit_bytevector_to_list_slice() {
     assert_eq!(list_to_ints(mid), vec![20, 30, 40]);
     assert_eq!(list_to_ints(full), vec![10, 20, 30, 40, 50]);
     assert_eq!(list_to_ints(empty), Vec::<i64>::new());
+}
+
+#[test]
+fn diff_jit_number_to_string_radix() {
+    // ADR 0012 D-2 (iter II) — number->string 2-arg with radix.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (nts n r) (number->string n r))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (nts 255 16) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let hex = rt.eval_str_via_vm("<diff>", "(nts 255 16)").unwrap();
+    let bin = rt.eval_str_via_vm("<diff>", "(nts 10 2)").unwrap();
+    let oct = rt.eval_str_via_vm("<diff>", "(nts 64 8)").unwrap();
+    let dec = rt.eval_str_via_vm("<diff>", "(nts 42 10)").unwrap();
+    let neg = rt.eval_str_via_vm("<diff>", "(nts -42 10)").unwrap();
+    let neg_hex = rt.eval_str_via_vm("<diff>", "(nts -255 16)").unwrap();
+    let zero = rt.eval_str_via_vm("<diff>", "(nts 0 16)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn str_of(v: Value) -> String {
+        match v {
+            Value::String(sc) => sc.borrow().clone(),
+            other => panic!("expected string, got {:?}", other),
+        }
+    }
+    assert_eq!(str_of(hex), "ff");
+    assert_eq!(str_of(bin), "1010");
+    assert_eq!(str_of(oct), "100");
+    assert_eq!(str_of(dec), "42");
+    assert_eq!(str_of(neg), "-42");
+    assert_eq!(str_of(neg_hex), "-ff");
+    assert_eq!(str_of(zero), "0");
 }

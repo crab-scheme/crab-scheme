@@ -808,6 +808,9 @@ pub enum Inst {
     /// `dst = bytevector->list(bv, start, end)` — 3-arg slice form.
     /// ADR 0012 D-2 (iter IH).
     BytevectorToListSlice(Value, Value, Value, Value),
+    /// `dst = number->string(n, radix)` — 2-arg form, radix ∈ {2,8,10,16}.
+    /// ADR 0012 D-2 (iter II).
+    NumberToStringRadix(Value, Value, Value),
     /// `dst = mod0(x, y)` R6RS centered mod.
     /// ADR 0012 D-2 (iter HO).
     Mod0(Value, Value, Value),

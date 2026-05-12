@@ -5346,6 +5346,63 @@ pub unsafe extern "C" fn vm_number_to_string_gc(n: i64) -> i64 {
     }
 }
 
+/// `(number->string n radix)` — 2-arg form. Formats `n` in the
+/// given radix (only Fixnum integers in radix ∈ {2, 8, 10, 16}
+/// are fast-pathed; other inputs deopt). Consumes `n`; `radix`
+/// is a raw Fixnum i64. ADR 0012 D-2 (iter II).
+///
+/// # Safety
+///
+/// `n` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_number_to_string_radix_gc(n: i64, radix: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(n) };
+    match v {
+        Value::Number(cs_core::Number::Fixnum(i)) => {
+            let s = match radix {
+                2 | 8 | 16 => format_radix(i, radix as u32),
+                10 => format!("{}", i),
+                _ => {
+                    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                    return value_to_gc_i64(Value::String(cs_gc::Gc::new(
+                        std::cell::RefCell::new(String::new()),
+                    )));
+                }
+            };
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
+/// Helper: format a signed integer in binary with R6RS leading-`-`
+/// sign convention. Used by `vm_number_to_string_radix_gc` for
+/// radix 2. Decimal/octal/hex use `format!` directly.
+fn format_radix(mut i: i64, radix: u32) -> String {
+    if i == 0 {
+        return "0".to_string();
+    }
+    let neg = i < 0;
+    if neg {
+        i = -i;
+    }
+    let mut s = String::new();
+    while i > 0 {
+        let d = (i % radix as i64) as u32;
+        s.insert(0, std::char::from_digit(d, radix).unwrap());
+        i /= radix as i64;
+    }
+    if neg {
+        s.insert(0, '-');
+    }
+    s
+}
+
 /// `(string->number s)` — 1-arg form, decimal radix. Tries Fixnum
 /// parse first, then Flonum. For strings containing R7RS prefixes
 /// (`#x`, `#i`, etc.) or special tokens (`+inf.0`, `+nan.0`),
