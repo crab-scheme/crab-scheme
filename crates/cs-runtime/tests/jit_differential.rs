@@ -10193,3 +10193,33 @@ fn diff_jit_fixnum_constants() {
     assert_eq!(fix_of(least), i64::MIN);
     assert_eq!(fix_of(greatest), i64::MAX);
 }
+
+#[test]
+fn diff_jit_inexact_alias() {
+    // ADR 0012 D-2 (iter IX) — inexact 1-arg as R7RS alias of exact->inexact.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (ix n) (inexact n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (ix i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let pos = rt.eval_str_via_vm("<diff>", "(ix 42)").unwrap();
+    let neg = rt.eval_str_via_vm("<diff>", "(ix -7)").unwrap();
+    let zero = rt.eval_str_via_vm("<diff>", "(ix 0)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn flo_of(v: Value) -> f64 {
+        match v {
+            Value::Number(cs_core::Number::Flonum(f)) => f,
+            other => panic!("expected flonum, got {:?}", other),
+        }
+    }
+    assert_eq!(flo_of(pos), 42.0);
+    assert_eq!(flo_of(neg), -7.0);
+    assert_eq!(flo_of(zero), 0.0);
+}

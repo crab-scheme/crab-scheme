@@ -3450,6 +3450,7 @@ pub fn bytecode_to_rir_with_hints(
                                     }
                                     ("real->flonum", 1)
                                     | ("exact->inexact", 1)
+                                    | ("inexact", 1)
                                     | ("fixnum->flonum", 1) => {
                                         // Convert the i64 Fixnum into f64
                                         // bits via Cranelift's
