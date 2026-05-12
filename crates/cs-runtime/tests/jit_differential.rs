@@ -7693,3 +7693,35 @@ fn diff_jit_alist_copy() {
     }
     assert!(matches!(&nil, Value::Null));
 }
+
+#[test]
+fn diff_jit_port_open_predicates() {
+    // ADR 0012 D-2 (iter GP) — input-port-open? + output-port-open?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (iop p) (input-port-open? p))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (oop p) (output-port-open? p))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (iop 42) (oop 42) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let iop_no = rt.eval_str_via_vm("<diff>", "(iop 42)").unwrap();
+    let oop_no = rt.eval_str_via_vm("<diff>", "(oop 42)").unwrap();
+    let iop_yes = rt
+        .eval_str_via_vm("<diff>", "(iop (open-input-string \"hi\"))")
+        .unwrap();
+    let oop_yes = rt
+        .eval_str_via_vm("<diff>", "(oop (open-output-string))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&iop_no, Value::Boolean(false)));
+    assert!(matches!(&oop_no, Value::Boolean(false)));
+    assert!(matches!(&iop_yes, Value::Boolean(true)));
+    assert!(matches!(&oop_yes, Value::Boolean(true)));
+}

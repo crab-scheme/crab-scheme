@@ -671,6 +671,8 @@ pub enum Inst {
     BinaryPortP(Value, Value),
     /// `dst = textual-port?(v)`. ADR 0012 D-2 (iter GC).
     TextualPortP(Value, Value),
+    /// `dst = output-port-open?(v)`. ADR 0012 D-2 (iter GP).
+    OutputPortOpenP(Value, Value),
     /// `dst = promise?(v)`. ADR 0012 D-2 (iter GD).
     PromiseP(Value, Value),
     /// `dst = hashtable?(v)`. ADR 0012 D-2 (iter GF).

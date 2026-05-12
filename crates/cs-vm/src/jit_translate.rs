@@ -1764,7 +1764,11 @@ pub fn bytecode_to_rir_with_hints(
                                         value_types.insert(dst, Type::Boolean);
                                     }
                                     // ADR 0012 D-2 (iter GC) — port-subtype predicates.
-                                    ("input-port?", 1)
+                                    // ADR 0012 D-2 (iter GP) — input-port-open? is
+                                    // an alias of input-port? because the runtime
+                                    // never closes input ports (they're alive until
+                                    // GC). R7RS-conformant.
+                                    ("input-port?", 1) | ("input-port-open?", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
                                     {
@@ -1790,6 +1794,14 @@ pub fn bytecode_to_rir_with_hints(
                                             == Some(Type::Any) =>
                                     {
                                         insts.push(RirInst::TextualPortP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
+                                    // ADR 0012 D-2 (iter GP) — output-port-open?.
+                                    ("output-port-open?", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::OutputPortOpenP(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
                                     // ADR 0012 D-2 (iter GD) — promise?.
@@ -5098,6 +5110,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::OutputPortP(dst, _)
                 | RirInst::BinaryPortP(dst, _)
                 | RirInst::TextualPortP(dst, _)
+                | RirInst::OutputPortOpenP(dst, _)
                 | RirInst::PromiseP(dst, _)
                 | RirInst::HashtableP(dst, _)
                 | RirInst::HashtableMutableP(dst, _)

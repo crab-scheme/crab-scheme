@@ -820,6 +820,30 @@ pub unsafe extern "C" fn vm_textual_port_p_gc(r: i64) -> i64 {
     }
 }
 
+/// `(output-port-open? v)` — R7RS. True iff `v` is an output Port
+/// that hasn't been closed (only FileOutput tracks closed state;
+/// other output ports are always open). ADR 0012 D-2 (iter GP).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_output_port_open_p_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Port(p) => {
+            if !p.is_output() {
+                return 0;
+            }
+            match &*p {
+                cs_core::Port::FileOutput(state) => (!state.borrow().closed) as i64,
+                _ => 1,
+            }
+        }
+        _ => 0,
+    }
+}
+
 /// `(promise? v)` — true iff `v` is a Promise. Consume-on-use; 0/1
 /// out. Total predicate. ADR 0012 D-2 (iter GD).
 ///

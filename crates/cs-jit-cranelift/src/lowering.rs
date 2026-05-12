@@ -375,6 +375,8 @@ pub struct Lowerer {
     binary_port_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_textual_port_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GC).
     textual_port_p_func: cranelift_module::FuncId,
+    /// FuncId of `vm_output_port_open_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GP).
+    output_port_open_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_promise_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GD).
     promise_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_div_euclid(x, y) -> i64`. ADR 0012 D-2 (iter GE).
@@ -959,6 +961,11 @@ impl Lowerer {
         builder.symbol(
             "vm_textual_port_p_gc",
             cs_vm::vm::vm_textual_port_p_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter GP) — output-port-open?.
+        builder.symbol(
+            "vm_output_port_open_p_gc",
+            cs_vm::vm::vm_output_port_open_p_gc as *const u8,
         );
         // ADR 0012 D-2 (iter GD) — promise?.
         builder.symbol("vm_promise_p_gc", cs_vm::vm::vm_promise_p_gc as *const u8);
@@ -2348,6 +2355,16 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_textual_port_p_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter GP) — output-port-open?.
+        let output_port_open_p_func = module
+            .declare_function(
+                "vm_output_port_open_p_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_output_port_open_p_gc: {e}"))
+            })?;
 
         // ADR 0012 D-2 (iter GD) — promise?.
         let promise_p_func = module
@@ -3448,6 +3465,7 @@ impl Lowerer {
             output_port_p_func,
             binary_port_p_func,
             textual_port_p_func,
+            output_port_open_p_func,
             promise_p_func,
             div_euclid_func,
             mod_euclid_func,
@@ -4042,6 +4060,10 @@ impl Lowerer {
             let textual_port_p_fnref = self
                 .module
                 .declare_func_in_func(self.textual_port_p_func, builder.func);
+            // iter GP — output-port-open?.
+            let output_port_open_p_fnref = self
+                .module
+                .declare_func_in_func(self.output_port_open_p_func, builder.func);
             // iter GD — promise?.
             let promise_p_fnref = self
                 .module
@@ -4573,6 +4595,7 @@ impl Lowerer {
                         output_port_p_fnref,
                         binary_port_p_fnref,
                         textual_port_p_fnref,
+                        output_port_open_p_fnref,
                         promise_p_fnref,
                         div_euclid_fnref,
                         mod_euclid_fnref,
@@ -4950,6 +4973,7 @@ fn lower_inst(
     output_port_p_fnref: cranelift_codegen::ir::FuncRef,
     binary_port_p_fnref: cranelift_codegen::ir::FuncRef,
     textual_port_p_fnref: cranelift_codegen::ir::FuncRef,
+    output_port_open_p_fnref: cranelift_codegen::ir::FuncRef,
     promise_p_fnref: cranelift_codegen::ir::FuncRef,
     div_euclid_fnref: cranelift_codegen::ir::FuncRef,
     mod_euclid_fnref: cranelift_codegen::ir::FuncRef,
@@ -7310,8 +7334,9 @@ fn lower_inst(
         | Inst::PromiseP(dst, src)
         | Inst::HashtableP(dst, src)
         | Inst::HashtableSize(dst, src)
-        | Inst::HashtableMutableP(dst, src) => {
-            // ADR 0012 D-2 (iter DD/GC/GD/GF/GG) — port/promise/hashtable.
+        | Inst::HashtableMutableP(dst, src)
+        | Inst::OutputPortOpenP(dst, src) => {
+            // ADR 0012 D-2 (iter DD/GC/GD/GF/GG/GP) — port/promise/hashtable.
             let v_v = lookup(map, *src)?;
             let fnref = match inst {
                 Inst::PortP(..) => port_p_fnref,
@@ -7323,6 +7348,7 @@ fn lower_inst(
                 Inst::HashtableP(..) => hashtable_p_fnref,
                 Inst::HashtableSize(..) => hashtable_size_fnref,
                 Inst::HashtableMutableP(..) => hashtable_mutable_p_fnref,
+                Inst::OutputPortOpenP(..) => output_port_open_p_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[v_v]);
