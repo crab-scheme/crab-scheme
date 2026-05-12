@@ -4535,6 +4535,23 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::VectorToString(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter IE) — string->vector 3-arg slice.
+                                    // Strict Fixnum guards on start/end avoid
+                                    // the JIT call-site cache issue that bit
+                                    // iter HN.
+                                    ("string->vector", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Fixnum)
+                                            && value_types.get(&args[2]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::StringToVectorSlice(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter ID) — vector->string 3-arg slice.
                                     ("vector->string", 3)
                                         if value_types.get(&args[0]).copied()
@@ -5867,6 +5884,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VecFillFrom(dst, _, _, _)
                 | RirInst::StrFillFrom(dst, _, _, _)
                 | RirInst::VectorToStringSlice(dst, _, _, _)
+                | RirInst::StringToVectorSlice(dst, _, _, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::MakeHashtableEqual(dst)

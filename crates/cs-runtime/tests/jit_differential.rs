@@ -9365,3 +9365,47 @@ fn diff_jit_vector_to_string_slice() {
     assert_eq!(s_of(&mid), "ell");
     assert_eq!(s_of(&empty), "");
 }
+
+#[test]
+fn diff_jit_string_to_vector_slice_v2() {
+    // ADR 0012 D-2 (iter IE) — string->vector 3-arg slice (retry of
+    // reverted HN with strict Fixnum guards).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sv s a b) (string->vector s a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define src \"hello\")")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sv src 0 5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let full = rt.eval_str_via_vm("<diff>", "(sv src 0 5)").unwrap();
+    let mid = rt.eval_str_via_vm("<diff>", "(sv src 1 4)").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(sv src 2 2)").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define utf \"αβγδε\")")
+        .unwrap();
+    let utf_mid = rt.eval_str_via_vm("<diff>", "(sv utf 1 4)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn vec_chars(v: &Value) -> Vec<char> {
+        match v {
+            Value::Vector(vg) => vg
+                .borrow()
+                .iter()
+                .map(|e| match e {
+                    Value::Character(c) => *c,
+                    other => panic!("unexpected element: {:?}", other),
+                })
+                .collect(),
+            other => panic!("expected vector, got {:?}", other),
+        }
+    }
+    assert_eq!(vec_chars(&full), vec!['h', 'e', 'l', 'l', 'o']);
+    assert_eq!(vec_chars(&mid), vec!['e', 'l', 'l']);
+    assert_eq!(vec_chars(&empty), Vec::<char>::new());
+    assert_eq!(vec_chars(&utf_mid), vec!['β', 'γ', 'δ']);
+}
