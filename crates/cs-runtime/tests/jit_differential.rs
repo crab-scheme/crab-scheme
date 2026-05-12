@@ -10158,3 +10158,38 @@ fn diff_jit_string_copy_bang_slice() {
     // dst[1..4] = s[1..4] = "bcd". dst[0] and dst[4] untouched.
     assert_eq!(str_of(result), ".bcd.");
 }
+
+#[test]
+fn diff_jit_fixnum_constants() {
+    // ADR 0012 D-2 (iter IW) — 0-arg fixnum constants.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (fw) (fixnum-width)) \
+         (define (lf) (least-fixnum)) \
+         (define (gf) (greatest-fixnum))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (fw) (lf) (gf) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let width = rt.eval_str_via_vm("<diff>", "(fw)").unwrap();
+    let least = rt.eval_str_via_vm("<diff>", "(lf)").unwrap();
+    let greatest = rt.eval_str_via_vm("<diff>", "(gf)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn fix_of(v: Value) -> i64 {
+        match v {
+            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            other => panic!("expected fixnum, got {:?}", other),
+        }
+    }
+    assert_eq!(fix_of(width), 64);
+    assert_eq!(fix_of(least), i64::MIN);
+    assert_eq!(fix_of(greatest), i64::MAX);
+}

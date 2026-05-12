@@ -2016,6 +2016,21 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Fixnum);
                                     }
+                                    // ADR 0012 D-2 (iter IW) — fixnum constants.
+                                    ("fixnum-width", 0) => {
+                                        insts.push(RirInst::LoadConst(dst, Const::Fixnum(64)));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
+                                    ("least-fixnum", 0) => {
+                                        insts
+                                            .push(RirInst::LoadConst(dst, Const::Fixnum(i64::MIN)));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
+                                    ("greatest-fixnum", 0) => {
+                                        insts
+                                            .push(RirInst::LoadConst(dst, Const::Fixnum(i64::MAX)));
+                                        value_types.insert(dst, Type::Fixnum);
+                                    }
                                     // ADR 0012 D-2 (iter GL) — current-second / -jiffy.
                                     ("current-second", 0) => {
                                         insts.push(RirInst::CurrentSecond(dst));
