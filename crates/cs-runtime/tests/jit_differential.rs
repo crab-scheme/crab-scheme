@@ -8739,3 +8739,42 @@ fn diff_jit_make_string_one_arg() {
         other => panic!("expected string, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_div0_mod0() {
+    // ADR 0012 D-2 (iter HO) — R6RS centered div0 / mod0.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (d x y) (div0 x y))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (m x y) (mod0 x y))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (d 13 4) (m 13 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let d13_4 = rt.eval_str_via_vm("<diff>", "(d 13 4)").unwrap();
+    let m13_4 = rt.eval_str_via_vm("<diff>", "(m 13 4)").unwrap();
+    let d14_4 = rt.eval_str_via_vm("<diff>", "(d 14 4)").unwrap();
+    let m14_4 = rt.eval_str_via_vm("<diff>", "(m 14 4)").unwrap();
+    let d13_n4 = rt.eval_str_via_vm("<diff>", "(d 13 -4)").unwrap();
+    let m13_n4 = rt.eval_str_via_vm("<diff>", "(m 13 -4)").unwrap();
+    let d0_5 = rt.eval_str_via_vm("<diff>", "(d 0 5)").unwrap();
+    let m0_5 = rt.eval_str_via_vm("<diff>", "(m 0 5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&d13_4, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&m13_4, Value::Number(cs_core::Number::Fixnum(1))));
+    assert!(matches!(&d14_4, Value::Number(cs_core::Number::Fixnum(4))));
+    assert!(matches!(&m14_4, Value::Number(cs_core::Number::Fixnum(-2))));
+    assert!(matches!(
+        &d13_n4,
+        Value::Number(cs_core::Number::Fixnum(-3))
+    ));
+    assert!(matches!(&m13_n4, Value::Number(cs_core::Number::Fixnum(1))));
+    assert!(matches!(&d0_5, Value::Number(cs_core::Number::Fixnum(0))));
+    assert!(matches!(&m0_5, Value::Number(cs_core::Number::Fixnum(0))));
+}

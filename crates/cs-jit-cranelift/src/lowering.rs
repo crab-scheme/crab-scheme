@@ -389,6 +389,10 @@ pub struct Lowerer {
     promise_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_div_euclid(x, y) -> i64`. ADR 0012 D-2 (iter GE).
     div_euclid_func: cranelift_module::FuncId,
+    /// FuncId of `vm_div0(x, y) -> i64`. ADR 0012 D-2 (iter HO).
+    div0_func: cranelift_module::FuncId,
+    /// FuncId of `vm_mod0(x, y) -> i64`. ADR 0012 D-2 (iter HO).
+    mod0_func: cranelift_module::FuncId,
     /// FuncId of `vm_mod_euclid(x, y) -> i64`. ADR 0012 D-2 (iter GE).
     mod_euclid_func: cranelift_module::FuncId,
     /// FuncId of `vm_hashtable_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GF).
@@ -1032,6 +1036,9 @@ impl Lowerer {
         builder.symbol("vm_promise_p_gc", cs_vm::vm::vm_promise_p_gc as *const u8);
         // ADR 0012 D-2 (iter GE) — R6RS div / mod.
         builder.symbol("vm_div_euclid", cs_vm::vm::vm_div_euclid as *const u8);
+        // ADR 0012 D-2 (iter HO) — div0 / mod0.
+        builder.symbol("vm_div0", cs_vm::vm::vm_div0 as *const u8);
+        builder.symbol("vm_mod0", cs_vm::vm::vm_mod0 as *const u8);
         builder.symbol("vm_mod_euclid", cs_vm::vm::vm_mod_euclid as *const u8);
         // ADR 0012 D-2 (iter GF) — hashtable?.
         builder.symbol(
@@ -2573,6 +2580,21 @@ impl Lowerer {
                 &vector_ref_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_mod_euclid: {e}")))?;
+        // ADR 0012 D-2 (iter HO) — div0 / mod0.
+        let div0_func = module
+            .declare_function(
+                "vm_div0",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_div0: {e}")))?;
+        let mod0_func = module
+            .declare_function(
+                "vm_mod0",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_mod0: {e}")))?;
 
         // ADR 0012 D-2 (iter GF) — hashtable?.
         let hashtable_p_func = module
@@ -3829,6 +3851,8 @@ impl Lowerer {
             port_position_func,
             promise_p_func,
             div_euclid_func,
+            div0_func,
+            mod0_func,
             mod_euclid_func,
             hashtable_p_func,
             hashtable_size_func,
@@ -4466,6 +4490,13 @@ impl Lowerer {
             let mod_euclid_fnref = self
                 .module
                 .declare_func_in_func(self.mod_euclid_func, builder.func);
+            // iter HO — div0/mod0 (centered).
+            let div0_fnref = self
+                .module
+                .declare_func_in_func(self.div0_func, builder.func);
+            let mod0_fnref = self
+                .module
+                .declare_func_in_func(self.mod0_func, builder.func);
             // iter GF — hashtable?.
             let hashtable_p_fnref = self
                 .module
@@ -5068,6 +5099,8 @@ impl Lowerer {
                         promise_p_fnref,
                         div_euclid_fnref,
                         mod_euclid_fnref,
+                        div0_fnref,
+                        mod0_fnref,
                         hashtable_p_fnref,
                         hashtable_size_fnref,
                         hashtable_mutable_p_fnref,
@@ -5468,6 +5501,8 @@ fn lower_inst(
     promise_p_fnref: cranelift_codegen::ir::FuncRef,
     div_euclid_fnref: cranelift_codegen::ir::FuncRef,
     mod_euclid_fnref: cranelift_codegen::ir::FuncRef,
+    div0_fnref: cranelift_codegen::ir::FuncRef,
+    mod0_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_p_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_size_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_mutable_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -6176,13 +6211,18 @@ fn lower_inst(
             };
             map.insert(*dst, result);
         }
-        Inst::DivEuclid(dst, x, y) | Inst::ModEuclid(dst, x, y) => {
-            // ADR 0012 D-2 (iter GE) — R6RS div / mod.
+        Inst::DivEuclid(dst, x, y)
+        | Inst::ModEuclid(dst, x, y)
+        | Inst::Div0(dst, x, y)
+        | Inst::Mod0(dst, x, y) => {
+            // ADR 0012 D-2 (iter GE / HO) — R6RS div/mod and div0/mod0.
             let xv = lookup(map, *x)?;
             let yv = lookup(map, *y)?;
             let fnref = match inst {
                 Inst::DivEuclid(..) => div_euclid_fnref,
                 Inst::ModEuclid(..) => mod_euclid_fnref,
+                Inst::Div0(..) => div0_fnref,
+                Inst::Mod0(..) => mod0_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[xv, yv]);
@@ -6190,7 +6230,7 @@ fn lower_inst(
                 let results = b.inst_results(inst_ref);
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
-                        "DivEuclid/ModEuclid expected 1 result, got {}",
+                        "DivEuclid/ModEuclid/Div0/Mod0 expected 1 result, got {}",
                         results.len()
                     )));
                 }

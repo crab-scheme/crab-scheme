@@ -760,6 +760,12 @@ pub enum Inst {
     /// `dst = vector=?(a, b)` returns raw 0/1.
     /// ADR 0012 D-2 (iter HK).
     VectorEqP(Value, Value, Value),
+    /// `dst = div0(x, y)` R6RS centered div.
+    /// ADR 0012 D-2 (iter HO).
+    Div0(Value, Value, Value),
+    /// `dst = mod0(x, y)` R6RS centered mod.
+    /// ADR 0012 D-2 (iter HO).
+    Mod0(Value, Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

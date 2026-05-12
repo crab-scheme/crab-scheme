@@ -1635,6 +1635,98 @@ pub unsafe extern "C" fn vm_mod_euclid(x: i64, y: i64) -> i64 {
     x.rem_euclid(y)
 }
 
+/// `(div0 x y)` — R6RS centered division. Returns the quotient `d`
+/// such that the remainder `m = x - d*y` is in `[-|y|/2, |y|/2)`.
+/// Raw i64 Fixnum operands and result. Deopts on `y == 0` or
+/// overflow. ADR 0012 D-2 (iter HO).
+///
+/// # Safety
+///
+/// `x` and `y` are raw i64 Fixnums.
+#[no_mangle]
+pub unsafe extern "C" fn vm_div0(x: i64, y: i64) -> i64 {
+    if y == 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return 0;
+    }
+    let d = x.div_euclid(y);
+    // Compute remainder m = x - d*y using checked arithmetic; deopt
+    // on overflow (rare with i64 inputs but possible at extremes).
+    let dy = match d.checked_mul(y) {
+        Some(v) => v,
+        None => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return 0;
+        }
+    };
+    let m = match x.checked_sub(dy) {
+        Some(v) => v,
+        None => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return 0;
+        }
+    };
+    let abs_y = y.unsigned_abs() as i128;
+    let two_m = (m as i128) * 2;
+    let shift = two_m > abs_y as i128 || (two_m == abs_y as i128 && abs_y % 2 == 0);
+    if shift {
+        if y > 0 {
+            match d.checked_add(1) {
+                Some(v) => v,
+                None => {
+                    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                    0
+                }
+            }
+        } else {
+            match d.checked_sub(1) {
+                Some(v) => v,
+                None => {
+                    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                    0
+                }
+            }
+        }
+    } else {
+        d
+    }
+}
+
+/// `(mod0 x y)` — R6RS centered remainder. Result in `[-|y|/2, |y|/2)`.
+/// Computes `x - d0*y` where `d0 = vm_div0(x, y)`. Deopts on `y == 0`
+/// or overflow. ADR 0012 D-2 (iter HO).
+///
+/// # Safety
+///
+/// `x` and `y` are raw i64 Fixnums.
+#[no_mangle]
+pub unsafe extern "C" fn vm_mod0(x: i64, y: i64) -> i64 {
+    if y == 0 {
+        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+        return 0;
+    }
+    let d0 = unsafe { vm_div0(x, y) };
+    // If the deopt sentinel was tripped by vm_div0, just return 0; the
+    // bytecode tier will redo the computation correctly.
+    if JIT_DEOPT_REQUESTED.with(|c| c.get()) != 0 {
+        return 0;
+    }
+    let dy = match d0.checked_mul(y) {
+        Some(v) => v,
+        None => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return 0;
+        }
+    };
+    match x.checked_sub(dy) {
+        Some(v) => v,
+        None => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
 /// `(eof-object? v)` — true iff `v` is the eof object. Consume-on-use;
 /// 0/1 out. ADR 0012 D-2 (iter DD).
 ///
