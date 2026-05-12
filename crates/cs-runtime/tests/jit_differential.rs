@@ -8710,3 +8710,32 @@ fn diff_jit_make_bytevector_one_arg() {
         other => panic!("expected bytevector, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_make_string_one_arg() {
+    // ADR 0012 D-2 (iter HM) — make-string 1-arg form (fill defaults
+    // to #\space).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mks n) (make-string n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (mks 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let s5 = rt.eval_str_via_vm("<diff>", "(mks 5)").unwrap();
+    let s0 = rt.eval_str_via_vm("<diff>", "(mks 0)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &s5 {
+        Value::String(sg) => assert_eq!(sg.borrow().as_str(), "     "),
+        other => panic!("expected string, got {:?}", other),
+    }
+    match &s0 {
+        Value::String(sg) => assert_eq!(sg.borrow().as_str(), ""),
+        other => panic!("expected string, got {:?}", other),
+    }
+}

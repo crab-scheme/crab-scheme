@@ -3093,6 +3093,27 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StrAlloc(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter HM) — make-string 1-arg.
+                                    // Fill defaults to #\space; reuse StrAlloc
+                                    // with a synthesized space character.
+                                    ("make-string", 1) => {
+                                        let len_t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        if len_t != Type::Fixnum {
+                                            return Err(TranslateError::Unsupported(
+                                                "make-string: length must be Fixnum-typed at JIT translate"
+                                                    .into(),
+                                            ));
+                                        }
+                                        let space = alloc();
+                                        insts
+                                            .push(RirInst::LoadConst(space, Const::Character(' ')));
+                                        value_types.insert(space, Type::Character);
+                                        insts.push(RirInst::StrAlloc(dst, args[0], space));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     ("string-ref", 2)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
