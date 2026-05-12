@@ -9044,3 +9044,52 @@ fn diff_jit_hashtable_clear_with_hint() {
     assert!(matches!(&before, Value::Number(cs_core::Number::Fixnum(3))));
     assert!(matches!(&after, Value::Number(cs_core::Number::Fixnum(0))));
 }
+
+#[test]
+fn diff_jit_hashtable_copy_with_flag() {
+    // ADR 0012 D-2 (iter HX) — hashtable-copy 2-arg with mutability flag.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (hc ht m) (hashtable-copy ht m))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (hc warm #t) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define h (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! h 'a 10)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! h 'b 20)")
+        .unwrap();
+    let copy_t = rt.eval_str_via_vm("<diff>", "(hc h #t)").unwrap();
+    let copy_f = rt.eval_str_via_vm("<diff>", "(hc h #f)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&copy_t, Value::Hashtable(_)));
+    assert!(matches!(&copy_f, Value::Hashtable(_)));
+    // Mutate the copy — original must stay unchanged
+    rt.eval_str_via_vm("<diff>", "(define c (hc h #t))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! c 'a 99)")
+        .unwrap();
+    let orig_a = rt
+        .eval_str_via_vm("<diff>", "(hashtable-ref h 'a -1)")
+        .unwrap();
+    let copy_a = rt
+        .eval_str_via_vm("<diff>", "(hashtable-ref c 'a -1)")
+        .unwrap();
+    assert!(matches!(
+        &orig_a,
+        Value::Number(cs_core::Number::Fixnum(10))
+    ));
+    assert!(matches!(
+        &copy_a,
+        Value::Number(cs_core::Number::Fixnum(99))
+    ));
+}

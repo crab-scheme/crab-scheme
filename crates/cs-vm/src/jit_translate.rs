@@ -2122,6 +2122,18 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::HashtableCopy(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter HX) — hashtable-copy 2-arg.
+                                    // Second operand is an R6RS mutability hint
+                                    // that CrabScheme's mutable-only hashtables
+                                    // ignore. Reuses HashtableCopy lowering.
+                                    ("hashtable-copy", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        let _ = args[1];
+                                        insts.push(RirInst::HashtableCopy(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter GY) — hashtable-ref.
                                     // 3-arg; ht and key must be Any; default
                                     // gets BoxTyped if not Any.
