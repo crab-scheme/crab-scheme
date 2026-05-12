@@ -438,6 +438,8 @@ pub struct Lowerer {
     hashtable_copy_func: cranelift_module::FuncId,
     /// FuncId of `vm_vector_copy_slice_gc(v, s, e) -> i64`. ADR 0012 D-2 (iter HA).
     vector_copy_slice_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_copy_slice_gc(bv, s, e) -> i64`. ADR 0012 D-2 (iter HC).
+    bytevector_copy_slice_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -1108,6 +1110,11 @@ impl Lowerer {
         builder.symbol(
             "vm_vector_copy_slice_gc",
             cs_vm::vm::vm_vector_copy_slice_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
+        builder.symbol(
+            "vm_bytevector_copy_slice_gc",
+            cs_vm::vm::vm_bytevector_copy_slice_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
@@ -2708,6 +2715,16 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_vector_copy_slice_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
+        let bytevector_copy_slice_func = module
+            .declare_function(
+                "vm_bytevector_copy_slice_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_bytevector_copy_slice_gc: {e}"))
+            })?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3696,6 +3713,7 @@ impl Lowerer {
             hashtable_ref_func,
             hashtable_copy_func,
             vector_copy_slice_func,
+            bytevector_copy_slice_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4387,6 +4405,10 @@ impl Lowerer {
             let vector_copy_slice_fnref = self
                 .module
                 .declare_func_in_func(self.vector_copy_slice_func, builder.func);
+            // iter HC — bytevector-copy 3-arg slice.
+            let bytevector_copy_slice_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_copy_slice_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4889,6 +4911,7 @@ impl Lowerer {
                         hashtable_ref_fnref,
                         hashtable_copy_fnref,
                         vector_copy_slice_fnref,
+                        bytevector_copy_slice_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -5280,6 +5303,7 @@ fn lower_inst(
     hashtable_ref_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_copy_fnref: cranelift_codegen::ir::FuncRef,
     vector_copy_slice_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_copy_slice_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -6153,6 +6177,27 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "HashtableSet expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::BvCopySlice(dst, bv, start, end) => {
+            // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
+            // Returns fresh bytevector. Deopts on non-bytevector or
+            // out-of-range.
+            let bvv = lookup(map, *bv)?;
+            let sv = lookup(map, *start)?;
+            let ev = lookup(map, *end)?;
+            let inst_ref = b.ins().call(bytevector_copy_slice_fnref, &[bvv, sv, ev]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BvCopySlice expected 1 result, got {}",
                         results.len()
                     )));
                 }

@@ -2539,6 +2539,20 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
+                                    ("bytevector-copy", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Fixnum)
+                                            && value_types.get(&args[2]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::BvCopySlice(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter DC) — bytevector-copy.
                                     ("bytevector-copy", 1)
                                         if value_types.get(&args[0]).copied()
@@ -5494,6 +5508,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::HashtableRef(dst, _, _, _)
                 | RirInst::HashtableCopy(dst, _)
                 | RirInst::VecCopySlice(dst, _, _, _)
+                | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)

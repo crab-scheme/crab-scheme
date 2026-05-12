@@ -2209,6 +2209,40 @@ pub unsafe extern "C" fn vm_bytevector_copy_gc(r: i64) -> i64 {
     }
 }
 
+/// `(bytevector-copy bv start end)` — 3-arg slice form. Returns a
+/// fresh bytevector containing `bv[start..end]`. Consumes `bv`.
+/// Non-bytevector, out-of-range, or `start > end` deopt. `start` and
+/// `end` are raw Fixnums. ADR 0012 D-2 (iter HC).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_copy_slice_gc(r: i64, start: i64, end: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::ByteVector(bvc) => {
+            let storage = bvc.borrow();
+            let len = storage.len();
+            if start < 0 || end < 0 || (start as usize) > len || (end as usize) > len || start > end
+            {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+            let slice: Vec<u8> = storage[(start as usize)..(end as usize)].to_vec();
+            drop(storage);
+            value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(std::cell::RefCell::new(
+                slice,
+            ))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
 /// `(string-copy s)` — return a freshly allocated copy of `s`.
 /// 1-arg form only; variadic (start, end slice) variants are
 /// deferred. Consumes `s`. Non-string deopts. ADR 0012 D-2

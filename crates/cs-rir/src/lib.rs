@@ -733,6 +733,9 @@ pub enum Inst {
     /// `dst = vector-copy(v, start, end)` returns fresh slice.
     /// ADR 0012 D-2 (iter HA).
     VecCopySlice(Value, Value, Value, Value),
+    /// `dst = bytevector-copy(bv, start, end)` returns fresh slice.
+    /// ADR 0012 D-2 (iter HC).
+    BvCopySlice(Value, Value, Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).
