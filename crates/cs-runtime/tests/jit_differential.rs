@@ -10527,10 +10527,7 @@ fn diff_jit_make_vector_1arg() {
     }
     fn all_unspec(v: &Value) -> bool {
         match v {
-            Value::Vector(vc) => vc
-                .borrow()
-                .iter()
-                .all(|e| matches!(e, Value::Unspecified)),
+            Value::Vector(vc) => vc.borrow().iter().all(|e| matches!(e, Value::Unspecified)),
             _ => false,
         }
     }
@@ -10539,4 +10536,44 @@ fn diff_jit_make_vector_1arg() {
     assert_eq!(vec_len(&v0), 0);
     assert_eq!(vec_len(&v5), 5);
     assert!(all_unspec(&v5));
+}
+
+#[test]
+fn diff_jit_variadic_flminmax() {
+    // ADR 0012 D-2 (iter JF) — variadic flmin/flmax (1-arg and 3+).
+    // 1-arg uses self-application of FlonumMin/Max to preserve Flonum
+    // tagging (Move alone is type-neutral); 3-arg uses left-fold.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fln1) (flmin 3.14))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (flx1) (flmax 3.14))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fln3) (flmin 5.0 2.0 8.0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (flx3) (flmax 5.0 2.0 8.0))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (fln1) (flx1) (fln3) (flx3) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let mn1 = rt.eval_str_via_vm("<diff>", "(fln1)").unwrap();
+    let mx1 = rt.eval_str_via_vm("<diff>", "(flx1)").unwrap();
+    let mn3 = rt.eval_str_via_vm("<diff>", "(fln3)").unwrap();
+    let mx3 = rt.eval_str_via_vm("<diff>", "(flx3)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn flo_of(v: Value) -> f64 {
+        match v {
+            Value::Number(cs_core::Number::Flonum(f)) => f,
+            other => panic!("expected flonum, got {:?}", other),
+        }
+    }
+    assert_eq!(flo_of(mn1), 3.14);
+    assert_eq!(flo_of(mx1), 3.14);
+    assert_eq!(flo_of(mn3), 2.0);
+    assert_eq!(flo_of(mx3), 8.0);
 }

@@ -5655,6 +5655,43 @@ pub fn bytecode_to_rir_with_hints(
                                             value_types.insert(dst, Type::Fixnum);
                                         }
                                     }
+                                    // ADR 0012 D-2 (iter JF) — variadic flmin/flmax
+                                    // for 1+ args. Strict Flonum-typed args.
+                                    // 1-arg case uses self-application (x.max(x))
+                                    // rather than Move so the post-pass tags dst
+                                    // as Flonum via the FlonumMin/FlonumMax arm —
+                                    // Move is type-neutral and would leave dst
+                                    // decoded as Fixnum.
+                                    ("flmin", _) | ("flmax", _)
+                                        if args.len() >= 1
+                                            && args.iter().all(|v| {
+                                                value_types.get(v).copied() == Some(Type::Flonum)
+                                            }) =>
+                                    {
+                                        let ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
+                                            match name {
+                                                "flmin" => RirInst::FlonumMin,
+                                                "flmax" => RirInst::FlonumMax,
+                                                _ => unreachable!(),
+                                            };
+                                        if args.len() == 1 {
+                                            // Self-application: x.min(x) == x and
+                                            // x.max(x) == x for all finite x; NaN
+                                            // semantics match the underlying op.
+                                            insts.push(ctor(dst, args[0], args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        } else {
+                                            let mut acc = args[0];
+                                            for v in &args[1..args.len() - 1] {
+                                                let next = alloc();
+                                                insts.push(ctor(next, acc, *v));
+                                                value_types.insert(next, Type::Flonum);
+                                                acc = next;
+                                            }
+                                            insts.push(ctor(dst, acc, *args.last().unwrap()));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                    }
                                     // ADR 0012 D-2 (iter IY) — variadic fxmin/fxmax.
                                     // Fixnum-only (Flonum operands cause deopt
                                     // via the unsupported tail). 1-arg → Move;
