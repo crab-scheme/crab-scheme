@@ -9125,3 +9125,57 @@ fn diff_jit_make_hashtable_with_capacity() {
         .unwrap();
     assert!(matches!(&v, Value::Number(cs_core::Number::Fixnum(1))));
 }
+
+#[test]
+fn diff_jit_hashtable_keys_values_custom() {
+    // ADR 0012 D-2 (iter HZ) — audit: hashtable-keys/values work on
+    // Custom-kind hashtables (same Vec iteration, no special case).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (hk ht) (hashtable-keys ht))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (hv ht) (hashtable-values ht))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define cust (make-hashtable string-hash string=?))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! cust \"a\" 1)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! cust \"b\" 2)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! cust \"c\" 3)")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (hk cust) (hv cust) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let keys = rt.eval_str_via_vm("<diff>", "(hk cust)").unwrap();
+    let vals = rt.eval_str_via_vm("<diff>", "(hv cust)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &keys {
+        Value::Vector(vg) => assert_eq!(vg.borrow().len(), 3),
+        other => panic!("expected vector of keys, got {:?}", other),
+    }
+    match &vals {
+        Value::Vector(vg) => {
+            let nums: Vec<i64> = vg
+                .borrow()
+                .iter()
+                .map(|e| match e {
+                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    other => panic!("unexpected value element: {:?}", other),
+                })
+                .collect();
+            let mut sorted = nums.clone();
+            sorted.sort();
+            assert_eq!(sorted, vec![1, 2, 3]);
+        }
+        other => panic!("expected vector of vals, got {:?}", other),
+    }
+}
