@@ -980,6 +980,22 @@ pub fn bytecode_to_rir_with_hints(
                                 {
                                     Some(RirInst::Mod0(dst, args[0], args[1]))
                                 }
+                                // ADR 0012 D-2 (iter HP) — R6RS fxdiv0 / fxmod0.
+                                // Same numerics, reuse Div0 / Mod0 lowering.
+                                ("fxdiv0", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::Div0(dst, args[0], args[1]))
+                                }
+                                ("fxmod0", 2)
+                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
+                                        && value_types.get(&args[1]).copied()
+                                            != Some(Type::Flonum) =>
+                                {
+                                    Some(RirInst::Mod0(dst, args[0], args[1]))
+                                }
                                 _ => None,
                             };
                             if let Some(inst) = single {
