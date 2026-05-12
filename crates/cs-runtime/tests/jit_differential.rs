@@ -9509,3 +9509,47 @@ fn diff_jit_string_to_list_slice() {
     let utf_mid = rt.eval_str_via_vm("<diff>", "(sts utf 1 4)").unwrap();
     assert_eq!(list_to_chars(utf_mid), vec!['β', 'γ', 'δ']);
 }
+
+#[test]
+fn diff_jit_bytevector_to_list_slice() {
+    // ADR 0012 D-2 (iter IH) — bytevector->list 3-arg slice form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bts bv a b) (bytevector->list bv a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define src (bytevector 10 20 30 40 50))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (bts src 1 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let mid = rt.eval_str_via_vm("<diff>", "(bts src 1 4)").unwrap();
+    let full = rt.eval_str_via_vm("<diff>", "(bts src 0 5)").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(bts src 2 2)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn list_to_ints(mut v: Value) -> Vec<i64> {
+        let mut out = Vec::new();
+        loop {
+            match v {
+                Value::Null => return out,
+                Value::Pair(p) => {
+                    let car = p.car.borrow().clone();
+                    let cdr = p.cdr.borrow().clone();
+                    match car {
+                        Value::Number(cs_core::Number::Fixnum(n)) => out.push(n),
+                        other => panic!("unexpected car: {:?}", other),
+                    }
+                    v = cdr;
+                }
+                other => panic!("expected pair or null, got {:?}", other),
+            }
+        }
+    }
+    assert_eq!(list_to_ints(mid), vec![20, 30, 40]);
+    assert_eq!(list_to_ints(full), vec![10, 20, 30, 40, 50]);
+    assert_eq!(list_to_ints(empty), Vec::<i64>::new());
+}
