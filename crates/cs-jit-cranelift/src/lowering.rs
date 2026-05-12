@@ -466,6 +466,8 @@ pub struct Lowerer {
     vector_to_string_slice_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_to_vector_slice_gc(s, st, e) -> i64`. ADR 0012 D-2 (iter IE).
     string_to_vector_slice_func: cranelift_module::FuncId,
+    /// FuncId of `vm_vector_to_list_slice_gc(v, s, e) -> i64`. ADR 0012 D-2 (iter IF).
+    vector_to_list_slice_func: cranelift_module::FuncId,
     /// FuncId of `vm_bytevector_copy_slice_gc(bv, s, e) -> i64`. ADR 0012 D-2 (iter HC).
     bytevector_copy_slice_func: cranelift_module::FuncId,
     /// FuncId of `vm_eof_object_gc() -> i64`. ADR 0012 D-2 (iter HD).
@@ -1220,6 +1222,11 @@ impl Lowerer {
         builder.symbol(
             "vm_string_to_vector_slice_gc",
             cs_vm::vm::vm_string_to_vector_slice_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter IF) — vector->list 3-arg slice.
+        builder.symbol(
+            "vm_vector_to_list_slice_gc",
+            cs_vm::vm::vm_vector_to_list_slice_gc as *const u8,
         );
         // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
         builder.symbol(
@@ -3009,6 +3016,16 @@ impl Lowerer {
                     "declare_function vm_string_to_vector_slice_gc: {e}"
                 ))
             })?;
+        // ADR 0012 D-2 (iter IF) — vector->list 3-arg slice.
+        let vector_to_list_slice_func = module
+            .declare_function(
+                "vm_vector_to_list_slice_gc",
+                cranelift_module::Linkage::Import,
+                &vector_set_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_vector_to_list_slice_gc: {e}"))
+            })?;
         // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
         let bytevector_copy_slice_func = module
             .declare_function(
@@ -4097,6 +4114,7 @@ impl Lowerer {
             string_fill_from_func,
             vector_to_string_slice_func,
             string_to_vector_slice_func,
+            vector_to_list_slice_func,
             bytevector_copy_slice_func,
             eof_object_func,
             bitwise_bit_count_func,
@@ -4851,6 +4869,10 @@ impl Lowerer {
             let string_to_vector_slice_fnref = self
                 .module
                 .declare_func_in_func(self.string_to_vector_slice_func, builder.func);
+            // iter IF — vector->list 3-arg slice.
+            let vector_to_list_slice_fnref = self
+                .module
+                .declare_func_in_func(self.vector_to_list_slice_func, builder.func);
             // iter HC — bytevector-copy 3-arg slice.
             let bytevector_copy_slice_fnref = self
                 .module
@@ -5403,6 +5425,7 @@ impl Lowerer {
                         string_fill_from_fnref,
                         vector_to_string_slice_fnref,
                         string_to_vector_slice_fnref,
+                        vector_to_list_slice_fnref,
                         bytevector_copy_slice_fnref,
                         eof_object_fnref,
                         bitwise_bit_count_fnref,
@@ -5817,6 +5840,7 @@ fn lower_inst(
     string_fill_from_fnref: cranelift_codegen::ir::FuncRef,
     vector_to_string_slice_fnref: cranelift_codegen::ir::FuncRef,
     string_to_vector_slice_fnref: cranelift_codegen::ir::FuncRef,
+    vector_to_list_slice_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_copy_slice_fnref: cranelift_codegen::ir::FuncRef,
     eof_object_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
@@ -6897,6 +6921,25 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "StringToVectorSlice expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::VectorToListSlice(dst, vec, start, end) => {
+            // ADR 0012 D-2 (iter IF) — vector->list 3-arg slice.
+            let vv = lookup(map, *vec)?;
+            let sv = lookup(map, *start)?;
+            let ev = lookup(map, *end)?;
+            let inst_ref = b.ins().call(vector_to_list_slice_fnref, &[vv, sv, ev]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "VectorToListSlice expected 1 result, got {}",
                         results.len()
                     )));
                 }

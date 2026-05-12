@@ -799,6 +799,9 @@ pub enum Inst {
     /// `dst = string->vector(s, start, end)` — 3-arg slice form.
     /// ADR 0012 D-2 (iter IE; retry of HN with strict guards).
     StringToVectorSlice(Value, Value, Value, Value),
+    /// `dst = vector->list(v, start, end)` — 3-arg slice form.
+    /// ADR 0012 D-2 (iter IF).
+    VectorToListSlice(Value, Value, Value, Value),
     /// `dst = mod0(x, y)` R6RS centered mod.
     /// ADR 0012 D-2 (iter HO).
     Mod0(Value, Value, Value),

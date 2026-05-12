@@ -3173,6 +3173,38 @@ pub unsafe extern "C" fn vm_vector_to_list_gc(r: i64) -> i64 {
     }
 }
 
+/// `(vector->list v start end)` — 3-arg slice form. Returns a fresh
+/// proper list of v[start..end]. Consumes `v`. `start` and `end` are
+/// raw Fixnum i64. Non-vector or out-of-range deopt to bytecode.
+/// ADR 0012 D-2 (iter IF).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_to_list_slice_gc(r: i64, start: i64, end: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Vector(vc) => {
+            let storage = vc.borrow();
+            let len = storage.len();
+            if start < 0 || end < 0 || (start as usize) > len || (end as usize) > len || start > end
+            {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+            let slice: Vec<Value> = storage[(start as usize)..(end as usize)].to_vec();
+            drop(storage);
+            value_to_gc_i64(Value::list(slice))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
 /// `(list->vector lst)` — walk the spine and collect cars into a
 /// fresh `Value::Vector`. Consumes `lst`. Improper-list terminus
 /// (non-pair, non-null) requests a deopt; non-list returns
