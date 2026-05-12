@@ -3516,14 +3516,17 @@ pub fn bytecode_to_rir_with_hints(
                                         value_types.insert(dst, Type::Any);
                                     }
                                     // ADR 0012 D-2 (iter FL) — bytevector/utf8 conversion.
-                                    ("bytevector->u8-list", 1)
+                                    // ADR 0012 D-2 (iter GM) — bytevector->list /
+                                    // list->bytevector (1-arg) are R7RS aliases of
+                                    // bytevector->u8-list / u8-list->bytevector.
+                                    ("bytevector->u8-list", 1) | ("bytevector->list", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
                                     {
                                         insts.push(RirInst::BytevectorToU8List(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
-                                    ("u8-list->bytevector", 1)
+                                    ("u8-list->bytevector", 1) | ("list->bytevector", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
                                     {

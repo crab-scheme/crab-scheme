@@ -7578,3 +7578,42 @@ fn diff_jit_current_second_and_current_jiffy() {
     assert!(jv1 >= 0);
     assert!(jv2 >= jv1, "current-jiffy monotonic");
 }
+
+#[test]
+fn diff_jit_bytevector_list_r7rs_aliases() {
+    // ADR 0012 D-2 (iter GM) — bytevector->list / list->bytevector aliases.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (b2l bv) (bytevector->list bv))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (l2b l) (list->bytevector l))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (b2l (bytevector 1 2 3)) \
+                      (l2b (list 1 2 3)) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let lst = rt
+        .eval_str_via_vm("<diff>", "(b2l (bytevector 10 20 30))")
+        .unwrap();
+    let bv = rt
+        .eval_str_via_vm("<diff>", "(l2b (list 100 200))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    match &lst {
+        Value::Pair(p) => assert!(matches!(
+            p.car.borrow().clone(),
+            Value::Number(cs_core::Number::Fixnum(10))
+        )),
+        other => panic!("expected pair, got {:?}", other),
+    }
+    match &bv {
+        Value::ByteVector(b) => assert_eq!(&*b.borrow(), &vec![100u8, 200]),
+        other => panic!("expected bytevector, got {:?}", other),
+    }
+}
