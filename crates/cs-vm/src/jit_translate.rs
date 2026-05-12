@@ -1965,6 +1965,15 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::DeleteDuplicates(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter GU) — force (fast path).
+                                    // Pending promises deopt to bytecode.
+                                    ("force", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::ForceForced(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter GT) — make-promise.
                                     // Accepts any operand; BoxTyped if not Any.
                                     ("make-promise", 1) => {
@@ -5353,6 +5362,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::Delete(dst, _, _)
                 | RirInst::DeleteDuplicates(dst, _)
                 | RirInst::MakePromise(dst, _)
+                | RirInst::ForceForced(dst, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)

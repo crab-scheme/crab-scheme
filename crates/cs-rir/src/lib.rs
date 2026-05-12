@@ -714,6 +714,8 @@ pub enum Inst {
     DeleteDuplicates(Value, Value),
     /// `dst = make-promise(v)`. ADR 0012 D-2 (iter GT).
     MakePromise(Value, Value),
+    /// `dst = force(p)` (forced-only fast path). ADR 0012 D-2 (iter GU).
+    ForceForced(Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

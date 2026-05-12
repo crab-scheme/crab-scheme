@@ -1135,6 +1135,37 @@ pub unsafe extern "C" fn vm_current_jiffy() -> i64 {
     }
 }
 
+/// `(force p)` — fast path for already-forced promises. Returns the
+/// memoized inner value. Deopts on Pending state (the bytecode runs
+/// the thunk via ctx). Non-promise values pass through unchanged
+/// (R6RS-style). ADR 0012 D-2 (iter GU).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_force_forced_gc(r: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::Promise(p) => {
+            let state = p.state.borrow();
+            match &*state {
+                cs_core::PromiseState::Forced(inner) => {
+                    let inner = inner.clone();
+                    drop(state);
+                    value_to_gc_i64(inner)
+                }
+                cs_core::PromiseState::Pending(_) => {
+                    drop(state);
+                    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                    value_to_gc_i64(Value::Unspecified)
+                }
+            }
+        }
+        other => value_to_gc_i64(other),
+    }
+}
+
 /// `(make-promise v)` — R7RS. Returns a Promise already in the
 /// Forced state holding `v`. ADR 0012 D-2 (iter GT).
 ///

@@ -424,6 +424,8 @@ pub struct Lowerer {
     delete_duplicates_func: cranelift_module::FuncId,
     /// FuncId of `vm_make_promise_gc(v) -> i64`. ADR 0012 D-2 (iter GT).
     make_promise_func: cranelift_module::FuncId,
+    /// FuncId of `vm_force_forced_gc(p) -> i64`. ADR 0012 D-2 (iter GU).
+    force_forced_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -1059,6 +1061,11 @@ impl Lowerer {
         builder.symbol(
             "vm_make_promise_gc",
             cs_vm::vm::vm_make_promise_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter GU) — force fast-path.
+        builder.symbol(
+            "vm_force_forced_gc",
+            cs_vm::vm::vm_force_forced_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
@@ -2595,6 +2602,14 @@ impl Lowerer {
                 &pair_accessor_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_make_promise_gc: {e}")))?;
+        // ADR 0012 D-2 (iter GU) — force fast-path.
+        let force_forced_func = module
+            .declare_function(
+                "vm_force_forced_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_force_forced_gc: {e}")))?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3576,6 +3591,7 @@ impl Lowerer {
             delete_func,
             delete_duplicates_func,
             make_promise_func,
+            force_forced_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4239,6 +4255,10 @@ impl Lowerer {
             let make_promise_fnref = self
                 .module
                 .declare_func_in_func(self.make_promise_func, builder.func);
+            // iter GU — force fast-path.
+            let force_forced_fnref = self
+                .module
+                .declare_func_in_func(self.force_forced_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4734,6 +4754,7 @@ impl Lowerer {
                         delete_fnref,
                         delete_duplicates_fnref,
                         make_promise_fnref,
+                        force_forced_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -5118,6 +5139,7 @@ fn lower_inst(
     delete_fnref: cranelift_codegen::ir::FuncRef,
     delete_duplicates_fnref: cranelift_codegen::ir::FuncRef,
     make_promise_fnref: cranelift_codegen::ir::FuncRef,
+    force_forced_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -5861,13 +5883,15 @@ fn lower_inst(
         }
         Inst::AlistCopy(dst, src)
         | Inst::DeleteDuplicates(dst, src)
-        | Inst::MakePromise(dst, src) => {
-            // ADR 0012 D-2 (iter GO/GS/GT) — 1-arg ops returning fresh Gc handles.
+        | Inst::MakePromise(dst, src)
+        | Inst::ForceForced(dst, src) => {
+            // ADR 0012 D-2 (iter GO/GS/GT/GU) — 1-arg ops returning fresh Gc handles.
             let sv = lookup(map, *src)?;
             let fnref = match inst {
                 Inst::AlistCopy(..) => alist_copy_fnref,
                 Inst::DeleteDuplicates(..) => delete_duplicates_fnref,
                 Inst::MakePromise(..) => make_promise_fnref,
+                Inst::ForceForced(..) => force_forced_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[sv]);

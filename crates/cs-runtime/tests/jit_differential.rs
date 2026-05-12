@@ -7883,3 +7883,37 @@ fn diff_jit_make_promise() {
         Value::Number(cs_core::Number::Fixnum(99))
     ));
 }
+
+#[test]
+fn diff_jit_force_forced() {
+    // ADR 0012 D-2 (iter GU) — force fast-path on already-forced promises.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (fp x) (force x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define p1 (make-promise 42))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define p2 (make-promise \"hi\"))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (fp p1) (fp p2) (fp 7) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let v_int = rt.eval_str_via_vm("<diff>", "(fp p1)").unwrap();
+    let v_str = rt.eval_str_via_vm("<diff>", "(fp p2)").unwrap();
+    let v_passthrough = rt.eval_str_via_vm("<diff>", "(fp 7)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&v_int, Value::Number(cs_core::Number::Fixnum(42))));
+    match &v_str {
+        Value::String(sg) => assert_eq!(&*sg.borrow(), "hi"),
+        other => panic!("expected string, got {:?}", other),
+    }
+    assert!(matches!(
+        &v_passthrough,
+        Value::Number(cs_core::Number::Fixnum(7))
+    ));
+}
