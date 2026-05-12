@@ -7856,3 +7856,30 @@ fn diff_jit_delete_and_delete_duplicates() {
     assert_eq!(list_to_vec(&no_2), vec![1, 3, 4]);
     assert_eq!(list_to_vec(&uniq), vec![1, 2, 3, 4]);
 }
+
+#[test]
+fn diff_jit_make_promise() {
+    // ADR 0012 D-2 (iter GT) — make-promise.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mp v) (make-promise v))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (mp 42) (mp \"hello\") (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let p_int = rt.eval_str_via_vm("<diff>", "(mp 42)").unwrap();
+    let p_str = rt.eval_str_via_vm("<diff>", "(mp \"hello\")").unwrap();
+    let forced = rt.eval_str_via_vm("<diff>", "(force (mp 99))").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&p_int, Value::Promise(_)));
+    assert!(matches!(&p_str, Value::Promise(_)));
+    assert!(matches!(
+        &forced,
+        Value::Number(cs_core::Number::Fixnum(99))
+    ));
+}

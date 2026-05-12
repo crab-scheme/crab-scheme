@@ -422,6 +422,8 @@ pub struct Lowerer {
     delete_func: cranelift_module::FuncId,
     /// FuncId of `vm_delete_duplicates_gc(lst) -> i64`. ADR 0012 D-2 (iter GS).
     delete_duplicates_func: cranelift_module::FuncId,
+    /// FuncId of `vm_make_promise_gc(v) -> i64`. ADR 0012 D-2 (iter GT).
+    make_promise_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -1052,6 +1054,11 @@ impl Lowerer {
         builder.symbol(
             "vm_delete_duplicates_gc",
             cs_vm::vm::vm_delete_duplicates_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter GT) — make-promise.
+        builder.symbol(
+            "vm_make_promise_gc",
+            cs_vm::vm::vm_make_promise_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
@@ -2580,6 +2587,14 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_delete_duplicates_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter GT) — make-promise.
+        let make_promise_func = module
+            .declare_function(
+                "vm_make_promise_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_make_promise_gc: {e}")))?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3560,6 +3575,7 @@ impl Lowerer {
             alist_copy_func,
             delete_func,
             delete_duplicates_func,
+            make_promise_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4219,6 +4235,10 @@ impl Lowerer {
             let delete_duplicates_fnref = self
                 .module
                 .declare_func_in_func(self.delete_duplicates_func, builder.func);
+            // iter GT — make-promise.
+            let make_promise_fnref = self
+                .module
+                .declare_func_in_func(self.make_promise_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4713,6 +4733,7 @@ impl Lowerer {
                         alist_copy_fnref,
                         delete_fnref,
                         delete_duplicates_fnref,
+                        make_promise_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -5096,6 +5117,7 @@ fn lower_inst(
     alist_copy_fnref: cranelift_codegen::ir::FuncRef,
     delete_fnref: cranelift_codegen::ir::FuncRef,
     delete_duplicates_fnref: cranelift_codegen::ir::FuncRef,
+    make_promise_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -5837,12 +5859,15 @@ fn lower_inst(
             b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
-        Inst::AlistCopy(dst, src) | Inst::DeleteDuplicates(dst, src) => {
-            // ADR 0012 D-2 (iter GO/GS) — 1-arg list builders.
+        Inst::AlistCopy(dst, src)
+        | Inst::DeleteDuplicates(dst, src)
+        | Inst::MakePromise(dst, src) => {
+            // ADR 0012 D-2 (iter GO/GS/GT) — 1-arg ops returning fresh Gc handles.
             let sv = lookup(map, *src)?;
             let fnref = match inst {
                 Inst::AlistCopy(..) => alist_copy_fnref,
                 Inst::DeleteDuplicates(..) => delete_duplicates_fnref,
+                Inst::MakePromise(..) => make_promise_fnref,
                 _ => unreachable!(),
             };
             let inst_ref = b.ins().call(fnref, &[sv]);

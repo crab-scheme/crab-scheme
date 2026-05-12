@@ -712,6 +712,8 @@ pub enum Inst {
     Delete(Value, Value, Value),
     /// `dst = delete-duplicates(lst)`. ADR 0012 D-2 (iter GS).
     DeleteDuplicates(Value, Value),
+    /// `dst = make-promise(v)`. ADR 0012 D-2 (iter GT).
+    MakePromise(Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

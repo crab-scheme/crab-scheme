@@ -1965,6 +1965,28 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::DeleteDuplicates(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter GT) — make-promise.
+                                    // Accepts any operand; BoxTyped if not Any.
+                                    ("make-promise", 1) => {
+                                        let t = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let boxed = if t == Type::Any {
+                                            args[0]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[0],
+                                                type_to_jit_rt_tag(t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::MakePromise(dst, boxed));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter GI) — numerator/denominator
                                     // for Fixnum: numerator is identity, denominator
                                     // is 1.
@@ -5330,6 +5352,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::AlistCopy(dst, _)
                 | RirInst::Delete(dst, _, _)
                 | RirInst::DeleteDuplicates(dst, _)
+                | RirInst::MakePromise(dst, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)

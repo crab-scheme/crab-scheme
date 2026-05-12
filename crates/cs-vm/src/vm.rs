@@ -1135,6 +1135,20 @@ pub unsafe extern "C" fn vm_current_jiffy() -> i64 {
     }
 }
 
+/// `(make-promise v)` — R7RS. Returns a Promise already in the
+/// Forced state holding `v`. ADR 0012 D-2 (iter GT).
+///
+/// # Safety
+///
+/// `v` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_make_promise_gc(v: i64) -> i64 {
+    let inner = unsafe { gc_i64_to_value(v) };
+    let p = cs_core::Promise::pending(inner.clone());
+    *p.state.borrow_mut() = cs_core::PromiseState::Forced(inner);
+    value_to_gc_i64(Value::Promise(p))
+}
+
 /// `(delete target lst)` — SRFI-1. Removes every element equal? to
 /// target. Deopts on improper list. ADR 0012 D-2 (iter GS).
 ///
