@@ -632,6 +632,9 @@ pub struct Lowerer {
     /// FuncId of `vm_string_copy_bang_from_gc(dest, at, src, src_start) -> i64`.
     /// ADR 0012 D-2 (iter IS).
     string_copy_bang_from_func: cranelift_module::FuncId,
+    /// FuncId of `vm_vector_copy_bang_slice_gc(dest, at, src, src_start, src_end) -> i64`.
+    /// ADR 0012 D-2 (iter IT).
+    vector_copy_bang_slice_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_reverse_gc(s) -> i64`. ADR 0012 D-2
     /// (iter EJ).
     string_reverse_func: cranelift_module::FuncId,
@@ -1495,6 +1498,11 @@ impl Lowerer {
             "vm_string_copy_bang_from_gc",
             cs_vm::vm::vm_string_copy_bang_from_gc as *const u8,
         );
+        // ADR 0012 D-2 (iter IT) — vector-copy! 5-arg.
+        builder.symbol(
+            "vm_vector_copy_bang_slice_gc",
+            cs_vm::vm::vm_vector_copy_bang_slice_gc as *const u8,
+        );
         // ADR 0012 D-2 (iter IK) — make-list 1-arg.
         builder.symbol(
             "vm_make_list_unspecified_gc",
@@ -1976,6 +1984,14 @@ impl Lowerer {
         four_arg_sig.params.push(AbiParam::new(I64));
         four_arg_sig.params.push(AbiParam::new(I64));
         four_arg_sig.returns.push(AbiParam::new(I64));
+        // 5-arg helpers (5 i64 in, 1 i64 out). ADR 0012 D-2 (iter IT).
+        let mut five_arg_sig = module.make_signature();
+        five_arg_sig.params.push(AbiParam::new(I64));
+        five_arg_sig.params.push(AbiParam::new(I64));
+        five_arg_sig.params.push(AbiParam::new(I64));
+        five_arg_sig.params.push(AbiParam::new(I64));
+        five_arg_sig.params.push(AbiParam::new(I64));
+        five_arg_sig.returns.push(AbiParam::new(I64));
         let vector_set_func = module
             .declare_function(
                 "vm_vector_set_gc",
@@ -3715,6 +3731,18 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_string_copy_bang_from_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter IT) — vector-copy! 5-arg.
+        let vector_copy_bang_slice_func = module
+            .declare_function(
+                "vm_vector_copy_bang_slice_gc",
+                cranelift_module::Linkage::Import,
+                &five_arg_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_vector_copy_bang_slice_gc: {e}"
+                ))
+            })?;
         let string_to_number_func = module
             .declare_function(
                 "vm_string_to_number_gc",
@@ -4422,6 +4450,7 @@ impl Lowerer {
             vector_copy_bang_from_func,
             bytevector_copy_bang_from_func,
             string_copy_bang_from_func,
+            vector_copy_bang_slice_func,
             string_reverse_func,
             string_upcase_func,
             string_downcase_func,
@@ -5338,6 +5367,10 @@ impl Lowerer {
             let string_copy_bang_from_fnref = self
                 .module
                 .declare_func_in_func(self.string_copy_bang_from_func, builder.func);
+            // iter IT — vector-copy! 5-arg.
+            let vector_copy_bang_slice_fnref = self
+                .module
+                .declare_func_in_func(self.vector_copy_bang_slice_func, builder.func);
             // iter EJ — string-reverse.
             let string_reverse_fnref = self
                 .module
@@ -5798,6 +5831,7 @@ impl Lowerer {
                         vector_copy_bang_from_fnref,
                         bytevector_copy_bang_from_fnref,
                         string_copy_bang_from_fnref,
+                        vector_copy_bang_slice_fnref,
                         string_reverse_fnref,
                         string_upcase_fnref,
                         string_downcase_fnref,
@@ -6226,6 +6260,7 @@ fn lower_inst(
     vector_copy_bang_from_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_copy_bang_from_fnref: cranelift_codegen::ir::FuncRef,
     string_copy_bang_from_fnref: cranelift_codegen::ir::FuncRef,
+    vector_copy_bang_slice_fnref: cranelift_codegen::ir::FuncRef,
     string_reverse_fnref: cranelift_codegen::ir::FuncRef,
     string_upcase_fnref: cranelift_codegen::ir::FuncRef,
     string_downcase_fnref: cranelift_codegen::ir::FuncRef,
@@ -9508,6 +9543,29 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "VecCopyBangFrom expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::VecCopyBangSlice(dst, dest_v, at_v, src_v, start_v, end_v) => {
+            // ADR 0012 D-2 (iter IT) — vm_vector_copy_bang_slice_gc.
+            let dv = lookup(map, *dest_v)?;
+            let av = lookup(map, *at_v)?;
+            let sv = lookup(map, *src_v)?;
+            let stv = lookup(map, *start_v)?;
+            let ev = lookup(map, *end_v)?;
+            let inst_ref = b
+                .ins()
+                .call(vector_copy_bang_slice_fnref, &[dv, av, sv, stv, ev]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "VecCopyBangSlice expected 1 result, got {}",
                         results.len()
                     )));
                 }

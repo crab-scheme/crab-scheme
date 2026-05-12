@@ -10034,3 +10034,49 @@ fn diff_jit_string_copy_bang_from() {
     // First 3 chars get s[2..5] = "cde"; last 2 untouched (still '.').
     assert_eq!(str_of(result), "cde..");
 }
+
+#[test]
+fn diff_jit_vector_copy_bang_slice() {
+    // ADR 0012 D-2 (iter IT) — vector-copy! 5-arg with src-start and src-end.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (vcb d at s start end) (vector-copy! d at s start end))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warmup-dst (make-vector 5 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warmup-src #(10 20 30 40 50))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (vcb warmup-dst 0 warmup-src 1 4) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define dst (make-vector 5 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define s2 #(10 20 30 40 50))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(vcb dst 1 s2 1 4)").unwrap();
+    let result = rt.eval_str_via_vm("<diff>", "dst").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn vec_ints(v: &Value) -> Vec<i64> {
+        match v {
+            Value::Vector(vc) => vc
+                .borrow()
+                .iter()
+                .map(|e| match e {
+                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    other => panic!("expected fixnum, got {:?}", other),
+                })
+                .collect(),
+            other => panic!("expected vector, got {:?}", other),
+        }
+    }
+    // dst[1..4] = s[1..4] = 20,30,40. dst[0] and dst[4] untouched.
+    assert_eq!(vec_ints(&result), vec![0, 20, 30, 40, 0]);
+}
