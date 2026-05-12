@@ -418,6 +418,10 @@ pub struct Lowerer {
     append_reverse_func: cranelift_module::FuncId,
     /// FuncId of `vm_alist_copy_gc(lst) -> i64`. ADR 0012 D-2 (iter GO).
     alist_copy_func: cranelift_module::FuncId,
+    /// FuncId of `vm_delete_gc(target, lst) -> i64`. ADR 0012 D-2 (iter GS).
+    delete_func: cranelift_module::FuncId,
+    /// FuncId of `vm_delete_duplicates_gc(lst) -> i64`. ADR 0012 D-2 (iter GS).
+    delete_duplicates_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -1043,6 +1047,12 @@ impl Lowerer {
         );
         // ADR 0012 D-2 (iter GO) — alist-copy.
         builder.symbol("vm_alist_copy_gc", cs_vm::vm::vm_alist_copy_gc as *const u8);
+        // ADR 0012 D-2 (iter GS) — delete + delete-duplicates.
+        builder.symbol("vm_delete_gc", cs_vm::vm::vm_delete_gc as *const u8);
+        builder.symbol(
+            "vm_delete_duplicates_gc",
+            cs_vm::vm::vm_delete_duplicates_gc as *const u8,
+        );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
             "vm_bitwise_bit_count",
@@ -2553,6 +2563,23 @@ impl Lowerer {
                 &pair_accessor_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_alist_copy_gc: {e}")))?;
+        // ADR 0012 D-2 (iter GS) — delete + delete-duplicates.
+        let delete_func = module
+            .declare_function(
+                "vm_delete_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_delete_gc: {e}")))?;
+        let delete_duplicates_func = module
+            .declare_function(
+                "vm_delete_duplicates_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_delete_duplicates_gc: {e}"))
+            })?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3531,6 +3558,8 @@ impl Lowerer {
             current_jiffy_func,
             append_reverse_func,
             alist_copy_func,
+            delete_func,
+            delete_duplicates_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4183,6 +4212,13 @@ impl Lowerer {
             let alist_copy_fnref = self
                 .module
                 .declare_func_in_func(self.alist_copy_func, builder.func);
+            // iter GS — delete + delete-duplicates.
+            let delete_fnref = self
+                .module
+                .declare_func_in_func(self.delete_func, builder.func);
+            let delete_duplicates_fnref = self
+                .module
+                .declare_func_in_func(self.delete_duplicates_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4675,6 +4711,8 @@ impl Lowerer {
                         current_jiffy_fnref,
                         append_reverse_fnref,
                         alist_copy_fnref,
+                        delete_fnref,
+                        delete_duplicates_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -5056,6 +5094,8 @@ fn lower_inst(
     current_jiffy_fnref: cranelift_codegen::ir::FuncRef,
     append_reverse_fnref: cranelift_codegen::ir::FuncRef,
     alist_copy_fnref: cranelift_codegen::ir::FuncRef,
+    delete_fnref: cranelift_codegen::ir::FuncRef,
+    delete_duplicates_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -5779,15 +5819,38 @@ fn lower_inst(
             };
             map.insert(*dst, result);
         }
-        Inst::AlistCopy(dst, src) => {
-            // ADR 0012 D-2 (iter GO) — alist-copy. Returns fresh Gc list.
-            let sv = lookup(map, *src)?;
-            let inst_ref = b.ins().call(alist_copy_fnref, &[sv]);
+        Inst::Delete(dst, target, lst) => {
+            // ADR 0012 D-2 (iter GS) — delete (2-arg).
+            let tv = lookup(map, *target)?;
+            let lv = lookup(map, *lst)?;
+            let inst_ref = b.ins().call(delete_fnref, &[tv, lv]);
             let result = {
                 let results = b.inst_results(inst_ref);
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
-                        "AlistCopy expected 1 result, got {}",
+                        "Delete expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::AlistCopy(dst, src) | Inst::DeleteDuplicates(dst, src) => {
+            // ADR 0012 D-2 (iter GO/GS) — 1-arg list builders.
+            let sv = lookup(map, *src)?;
+            let fnref = match inst {
+                Inst::AlistCopy(..) => alist_copy_fnref,
+                Inst::DeleteDuplicates(..) => delete_duplicates_fnref,
+                _ => unreachable!(),
+            };
+            let inst_ref = b.ins().call(fnref, &[sv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "AlistCopy/DeleteDuplicates expected 1 result, got {}",
                         results.len()
                     )));
                 }

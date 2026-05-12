@@ -708,6 +708,10 @@ pub enum Inst {
     AppendReverse(Value, Value, Value),
     /// `dst = alist-copy(lst)`. ADR 0012 D-2 (iter GO).
     AlistCopy(Value, Value),
+    /// `dst = delete(target, lst)`. ADR 0012 D-2 (iter GS).
+    Delete(Value, Value, Value),
+    /// `dst = delete-duplicates(lst)`. ADR 0012 D-2 (iter GS).
+    DeleteDuplicates(Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

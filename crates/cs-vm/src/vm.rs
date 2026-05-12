@@ -1135,6 +1135,66 @@ pub unsafe extern "C" fn vm_current_jiffy() -> i64 {
     }
 }
 
+/// `(delete target lst)` — SRFI-1. Removes every element equal? to
+/// target. Deopts on improper list. ADR 0012 D-2 (iter GS).
+///
+/// # Safety
+///
+/// Both args must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_delete_gc(target: i64, lst: i64) -> i64 {
+    let target_v = unsafe { gc_i64_to_value(target) };
+    let mut out: Vec<Value> = Vec::new();
+    let mut cur = unsafe { gc_i64_to_value(lst) };
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                let cdr = p.cdr.borrow().clone();
+                if !cs_core::eq::equal(&car, &target_v) {
+                    out.push(car);
+                }
+                cur = cdr;
+            }
+            Value::Null => return value_to_gc_i64(Value::list(out)),
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+}
+
+/// `(delete-duplicates lst)` — SRFI-1. Removes equal? duplicates,
+/// preserving first-occurrence order. Deopts on improper list.
+/// ADR 0012 D-2 (iter GS).
+///
+/// # Safety
+///
+/// `lst` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_delete_duplicates_gc(lst: i64) -> i64 {
+    let mut seen: Vec<Value> = Vec::new();
+    let mut cur = unsafe { gc_i64_to_value(lst) };
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                let cdr = p.cdr.borrow().clone();
+                if !seen.iter().any(|s| cs_core::eq::equal(s, &car)) {
+                    seen.push(car);
+                }
+                cur = cdr;
+            }
+            Value::Null => return value_to_gc_i64(Value::list(seen)),
+            _ => {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+        }
+    }
+}
+
 /// `(alist-copy alist)` — SRFI-1. Walks a proper list of pairs and
 /// allocates a fresh pair for each entry. Deopts on improper list
 /// or non-pair entry. ADR 0012 D-2 (iter GO).

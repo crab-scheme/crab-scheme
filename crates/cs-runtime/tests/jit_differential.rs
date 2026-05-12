@@ -7810,3 +7810,49 @@ fn diff_jit_port_position() {
         Value::Number(cs_core::Number::Fixnum(0))
     ));
 }
+
+#[test]
+fn diff_jit_delete_and_delete_duplicates() {
+    // ADR 0012 D-2 (iter GS) — delete + delete-duplicates.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (d x l) (delete x l))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (dd l) (delete-duplicates l))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (d 2 (list 1 2 3)) \
+                      (dd (list 1 2 1 3)) \
+                      (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let no_2 = rt
+        .eval_str_via_vm("<diff>", "(d 2 (list 1 2 3 2 4))")
+        .unwrap();
+    let uniq = rt
+        .eval_str_via_vm("<diff>", "(dd (list 1 2 1 3 2 4))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn list_to_vec(v: &Value) -> Vec<i64> {
+        let mut out = Vec::new();
+        let mut cur = v.clone();
+        loop {
+            match cur {
+                Value::Pair(p) => {
+                    if let Value::Number(cs_core::Number::Fixnum(n)) = p.car.borrow().clone() {
+                        out.push(n);
+                    }
+                    cur = p.cdr.borrow().clone();
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+    assert_eq!(list_to_vec(&no_2), vec![1, 3, 4]);
+    assert_eq!(list_to_vec(&uniq), vec![1, 2, 3, 4]);
+}
