@@ -8592,3 +8592,42 @@ fn diff_jit_exact_nonneg_int() {
     assert!(matches!(&big, Value::Boolean(true)));
     assert!(matches!(&big_neg, Value::Boolean(false)));
 }
+
+#[test]
+fn diff_jit_bytevector_eq() {
+    // ADR 0012 D-2 (iter HJ) — bytevector=?.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (bve a b) (bytevector=? a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define a (bytevector 1 2 3))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define b (bytevector 1 2 3))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (bve a b) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let same = rt.eval_str_via_vm("<diff>", "(bve a b)").unwrap();
+    let diff_content = rt
+        .eval_str_via_vm("<diff>", "(bve a (bytevector 1 2 4))")
+        .unwrap();
+    let diff_length = rt
+        .eval_str_via_vm("<diff>", "(bve a (bytevector 1 2))")
+        .unwrap();
+    let empty = rt
+        .eval_str_via_vm(
+            "<diff>",
+            "(bve (make-bytevector 0 0) (make-bytevector 0 0))",
+        )
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&same, Value::Boolean(true)));
+    assert!(matches!(&diff_content, Value::Boolean(false)));
+    assert!(matches!(&diff_length, Value::Boolean(false)));
+    assert!(matches!(&empty, Value::Boolean(true)));
+}

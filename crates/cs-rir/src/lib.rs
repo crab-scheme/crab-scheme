@@ -754,6 +754,9 @@ pub enum Inst {
     /// `dst = exact-nonnegative-integer?(x)` returns raw 0/1.
     /// ADR 0012 D-2 (iter HI).
     ExactNonNegIntP(Value, Value),
+    /// `dst = bytevector=?(a, b)` returns raw 0/1.
+    /// ADR 0012 D-2 (iter HJ).
+    BytevectorEqP(Value, Value, Value),
     /// `dst = div(x, y)` (R6RS Euclidean div). ADR 0012 D-2 (iter GE).
     DivEuclid(Value, Value, Value),
     /// `dst = mod(x, y)` (R6RS Euclidean mod). ADR 0012 D-2 (iter GE).

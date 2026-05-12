@@ -1224,6 +1224,16 @@ pub fn bytecode_to_rir_with_hints(
                                         let _ = args[0];
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
                                     }
+                                    // ADR 0012 D-2 (iter HJ) — bytevector=?.
+                                    ("bytevector=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::BytevectorEqP(dst, args[0], args[1]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // ADR 0012 D-2 (iter HI) — exact-nonnegative-integer?.
                                     // Flonum is always #f. Otherwise call the
                                     // helper (operand BoxTyped if not Any).
@@ -5450,6 +5460,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::HashtableMutableP(dst, _)
                 | RirInst::HashtableContainsP(dst, _, _)
                 | RirInst::ExactNonNegIntP(dst, _)
+                | RirInst::BytevectorEqP(dst, _, _)
                 | RirInst::FileExistsP(dst, _)
                 | RirInst::CharNumericP(dst, _)
                 | RirInst::CharWhitespaceP(dst, _)

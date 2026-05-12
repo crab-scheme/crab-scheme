@@ -943,6 +943,25 @@ pub unsafe extern "C" fn vm_hashtable_p_gc(r: i64) -> i64 {
     matches!(v, Value::Hashtable(_)) as i64
 }
 
+/// `(bytevector=? a b)` — element-wise bytewise equality. Returns
+/// raw 0/1. Deopts on non-bytevector. ADR 0012 D-2 (iter HJ).
+///
+/// # Safety
+///
+/// `a` and `b` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_eq_p_gc(a: i64, b: i64) -> i64 {
+    let av = unsafe { gc_i64_to_value(a) };
+    let bv = unsafe { gc_i64_to_value(b) };
+    match (av, bv) {
+        (Value::ByteVector(ab), Value::ByteVector(bb)) => (*ab.borrow() == *bb.borrow()) as i64,
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            0
+        }
+    }
+}
+
 /// `(exact-nonnegative-integer? x)` — R6RS-ish predicate. Returns
 /// raw 0/1. Non-negative for Fixnum, Big (non-negative BigInt), and
 /// Rat (when integer and numerator non-negative). All other types

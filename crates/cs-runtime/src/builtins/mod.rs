@@ -491,6 +491,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("make-bytevector", b_make_bytevector),
         ("bytevector", b_bytevector),
         ("bytevector?", b_bytevector_p),
+        ("bytevector=?", b_bytevector_eq),
         ("bytevector-length", b_bytevector_length),
         ("bytevector-u8-ref", b_bytevector_u8_ref),
         ("bytevector-u8-set!", b_bytevector_u8_set),
@@ -8600,6 +8601,23 @@ fn b_bytevector_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("bytevector?", "1", args.len()));
     }
     Ok(Value::Boolean(matches!(args[0], Value::ByteVector(_))))
+}
+
+/// `(bytevector=? a b)` — element-wise bytewise equality.
+/// R6RS-style 2-arg form. Errors on non-bytevector args.
+fn b_bytevector_eq(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("bytevector=?", "2", args.len()));
+    }
+    let a = match &args[0] {
+        Value::ByteVector(bv) => bv.borrow().clone(),
+        v => return Err(type_err("bytevector=?", "bytevector", v)),
+    };
+    let b = match &args[1] {
+        Value::ByteVector(bv) => bv.borrow().clone(),
+        v => return Err(type_err("bytevector=?", "bytevector", v)),
+    };
+    Ok(Value::Boolean(a == b))
 }
 
 fn b_bytevector_length(args: &[Value]) -> Result<Value, String> {
