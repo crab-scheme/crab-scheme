@@ -2752,6 +2752,20 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StrFill(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter IC) — string-fill! 3-arg fill-from.
+                                    ("string-fill!", 3)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Character)
+                                            && value_types.get(&args[2]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::StrFillFrom(
+                                            dst, args[0], args[1], args[2],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter HH) — string-fill! 4-arg slice.
                                     ("string-fill!", 4)
                                         if value_types.get(&args[0]).copied()
@@ -5837,6 +5851,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StrCopyFrom(dst, _, _)
                 | RirInst::BvFillFrom(dst, _, _, _)
                 | RirInst::VecFillFrom(dst, _, _, _)
+                | RirInst::StrFillFrom(dst, _, _, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::MakeHashtableEqual(dst)

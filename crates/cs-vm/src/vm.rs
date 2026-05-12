@@ -2699,6 +2699,47 @@ pub unsafe extern "C" fn vm_string_fill_gc(s: i64, ch: i64) -> i64 {
     }
 }
 
+/// `(string-fill! s ch start)` — 3-arg fill-from form. Replaces the
+/// chars at positions `start..char-count` with `ch`. Char-based
+/// indexing (multibyte UTF-8 boundaries). Consumes `s`. `ch` and
+/// `start` are raw Fixnum-shape i64. Non-string, invalid codepoint,
+/// or out-of-range (start < 0 or > char-count) deopt. ADR 0012 D-2
+/// (iter IC).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_fill_from_gc(s: i64, ch: i64, start: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    let new_ch = match char::from_u32(ch as u32) {
+        Some(c) => c,
+        None => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            return value_to_gc_i64(Value::Unspecified);
+        }
+    };
+    match v {
+        Value::String(sc) => {
+            let mut chars: Vec<char> = sc.borrow().chars().collect();
+            let len = chars.len();
+            if start < 0 || (start as usize) > len {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            for slot in chars[(start as usize)..].iter_mut() {
+                *slot = new_ch;
+            }
+            *sc.borrow_mut() = chars.into_iter().collect();
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(string-fill! s ch start end)` — 4-arg slice-fill form. Replaces
 /// the chars at positions `start..end` with `ch`. Char-based indexing
 /// — multibyte UTF-8 is sliced on codepoint boundaries. Consumes `s`.
