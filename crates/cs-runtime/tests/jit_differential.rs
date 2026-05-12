@@ -9592,3 +9592,39 @@ fn diff_jit_number_to_string_radix() {
     assert_eq!(str_of(neg_hex), "-ff");
     assert_eq!(str_of(zero), "0");
 }
+
+#[test]
+fn diff_jit_string_to_number_radix() {
+    // ADR 0012 D-2 (iter IJ) — string->number 2-arg with radix.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (stn s r) (string->number s r))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (stn \"ff\" 16) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let hex = rt.eval_str_via_vm("<diff>", "(stn \"ff\" 16)").unwrap();
+    let bin = rt.eval_str_via_vm("<diff>", "(stn \"1010\" 2)").unwrap();
+    let oct = rt.eval_str_via_vm("<diff>", "(stn \"100\" 8)").unwrap();
+    let dec = rt.eval_str_via_vm("<diff>", "(stn \"42\" 10)").unwrap();
+    let neg = rt.eval_str_via_vm("<diff>", "(stn \"-ff\" 16)").unwrap();
+    let bogus = rt.eval_str_via_vm("<diff>", "(stn \"zz\" 16)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn fix_of(v: Value) -> i64 {
+        match v {
+            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            other => panic!("expected fixnum, got {:?}", other),
+        }
+    }
+    assert_eq!(fix_of(hex), 255);
+    assert_eq!(fix_of(bin), 10);
+    assert_eq!(fix_of(oct), 64);
+    assert_eq!(fix_of(dec), 42);
+    assert_eq!(fix_of(neg), -255);
+    assert!(matches!(bogus, Value::Boolean(false)));
+}

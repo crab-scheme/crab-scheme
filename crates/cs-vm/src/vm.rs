@@ -5451,6 +5451,47 @@ pub unsafe extern "C" fn vm_string_to_number_gc(s: i64) -> i64 {
     }
 }
 
+/// `(string->number s radix)` — 2-arg form, radix ∈ {2, 8, 10, 16}.
+/// Parses `s` as a Fixnum in the given radix; returns `Gc<Fixnum>`
+/// on success or `Gc<Boolean(false)>` on parse failure. R6RS sign
+/// handling (leading `+` or `-`). Strings with R7RS prefixes
+/// (`#x`, `#i`, etc.) or non-supported radices deopt to bytecode.
+/// Consumes `s`; `radix` is a raw Fixnum i64. ADR 0012 D-2 (iter IJ).
+///
+/// # Safety
+///
+/// `s` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_string_to_number_radix_gc(s: i64, radix: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(s) };
+    match v {
+        Value::String(sg) => {
+            if !matches!(radix, 2 | 8 | 10 | 16) {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Boolean(false));
+            }
+            let raw = sg.borrow().clone();
+            if raw.starts_with('#')
+                || raw == "+inf.0"
+                || raw == "-inf.0"
+                || raw == "+nan.0"
+                || raw == "-nan.0"
+            {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Boolean(false));
+            }
+            match i64::from_str_radix(&raw, radix as u32) {
+                Ok(n) => value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(n))),
+                Err(_) => value_to_gc_i64(Value::Boolean(false)),
+            }
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Boolean(false))
+        }
+    }
+}
+
 /// `(bytevector-copy! dest at src)` — 3-arg form. Copies all bytes
 /// of `src` into `dest` starting at index `at`. Consumes both Gc
 /// handles. ADR 0012 D-2 (iter ES).

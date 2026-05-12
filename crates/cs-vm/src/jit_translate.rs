@@ -4664,6 +4664,18 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::StringToNumber(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter IJ) — string->number 2-arg radix.
+                                    ("string->number", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::StringToNumberRadix(
+                                            dst, args[0], args[1],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter CV) — digit-value.
                                     // Mixed return (Fixnum or #f) so dst is Any.
                                     ("digit-value", 1)
@@ -5957,6 +5969,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::StringToListSlice(dst, _, _, _)
                 | RirInst::BytevectorToListSlice(dst, _, _, _)
                 | RirInst::NumberToStringRadix(dst, _, _)
+                | RirInst::StringToNumberRadix(dst, _, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::MakeHashtableEqual(dst)
