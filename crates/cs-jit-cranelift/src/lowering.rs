@@ -614,6 +614,9 @@ pub struct Lowerer {
     /// FuncId of `vm_string_to_list_slice_from_gc(s, start) -> i64`.
     /// ADR 0012 D-2 (iter IM).
     string_to_list_slice_from_func: cranelift_module::FuncId,
+    /// FuncId of `vm_bytevector_to_list_slice_from_gc(bv, start) -> i64`.
+    /// ADR 0012 D-2 (iter IN).
+    bytevector_to_list_slice_from_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_reverse_gc(s) -> i64`. ADR 0012 D-2
     /// (iter EJ).
     string_reverse_func: cranelift_module::FuncId,
@@ -1446,6 +1449,11 @@ impl Lowerer {
         builder.symbol(
             "vm_string_to_list_slice_from_gc",
             cs_vm::vm::vm_string_to_list_slice_from_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter IN) — bytevector->list 2-arg slice-from.
+        builder.symbol(
+            "vm_bytevector_to_list_slice_from_gc",
+            cs_vm::vm::vm_bytevector_to_list_slice_from_gc as *const u8,
         );
         // ADR 0012 D-2 (iter IK) — make-list 1-arg.
         builder.symbol(
@@ -3599,6 +3607,18 @@ impl Lowerer {
                     "declare_function vm_string_to_list_slice_from_gc: {e}"
                 ))
             })?;
+        // ADR 0012 D-2 (iter IN) — bytevector->list 2-arg slice-from.
+        let bytevector_to_list_slice_from_func = module
+            .declare_function(
+                "vm_bytevector_to_list_slice_from_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!(
+                    "declare_function vm_bytevector_to_list_slice_from_gc: {e}"
+                ))
+            })?;
         let string_to_number_func = module
             .declare_function(
                 "vm_string_to_number_gc",
@@ -4300,6 +4320,7 @@ impl Lowerer {
             make_list_unspec_func,
             vector_to_list_slice_from_func,
             string_to_list_slice_from_func,
+            bytevector_to_list_slice_from_func,
             string_reverse_func,
             string_upcase_func,
             string_downcase_func,
@@ -5192,6 +5213,10 @@ impl Lowerer {
             let string_to_list_slice_from_fnref = self
                 .module
                 .declare_func_in_func(self.string_to_list_slice_from_func, builder.func);
+            // iter IN — bytevector->list 2-arg slice-from.
+            let bytevector_to_list_slice_from_fnref = self
+                .module
+                .declare_func_in_func(self.bytevector_to_list_slice_from_func, builder.func);
             // iter EJ — string-reverse.
             let string_reverse_fnref = self
                 .module
@@ -5646,6 +5671,7 @@ impl Lowerer {
                         make_list_unspec_fnref,
                         vector_to_list_slice_from_fnref,
                         string_to_list_slice_from_fnref,
+                        bytevector_to_list_slice_from_fnref,
                         string_reverse_fnref,
                         string_upcase_fnref,
                         string_downcase_fnref,
@@ -6068,6 +6094,7 @@ fn lower_inst(
     make_list_unspec_fnref: cranelift_codegen::ir::FuncRef,
     vector_to_list_slice_from_fnref: cranelift_codegen::ir::FuncRef,
     string_to_list_slice_from_fnref: cranelift_codegen::ir::FuncRef,
+    bytevector_to_list_slice_from_fnref: cranelift_codegen::ir::FuncRef,
     string_reverse_fnref: cranelift_codegen::ir::FuncRef,
     string_upcase_fnref: cranelift_codegen::ir::FuncRef,
     string_downcase_fnref: cranelift_codegen::ir::FuncRef,
@@ -9290,6 +9317,26 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "StringToListSliceFrom expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::BytevectorToListSliceFrom(dst, bv, start) => {
+            // ADR 0012 D-2 (iter IN) — vm_bytevector_to_list_slice_from_gc.
+            let bvv = lookup(map, *bv)?;
+            let stv = lookup(map, *start)?;
+            let inst_ref = b
+                .ins()
+                .call(bytevector_to_list_slice_from_fnref, &[bvv, stv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "BytevectorToListSliceFrom expected 1 result, got {}",
                         results.len()
                     )));
                 }

@@ -3179,6 +3179,38 @@ pub unsafe extern "C" fn vm_string_to_list_slice_gc(r: i64, start: i64, end: i64
     }
 }
 
+/// `(bytevector->list bv start)` — 2-arg slice-from form. Returns
+/// a fresh proper list of u8 Fixnum elements at byte positions
+/// `start..`. Consumes `bv`. `start` is a raw Fixnum i64.
+/// Non-bytevector or out-of-range deopt to bytecode. ADR 0012 D-2
+/// (iter IN).
+///
+/// # Safety
+///
+/// `r` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_bytevector_to_list_slice_from_gc(r: i64, start: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(r) };
+    match v {
+        Value::ByteVector(b) => {
+            let bv = b.borrow();
+            let len = bv.len();
+            if start < 0 || (start as usize) > len {
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Null);
+            }
+            let slice = bv[(start as usize)..]
+                .iter()
+                .map(|byte| Value::fixnum(*byte as i64));
+            value_to_gc_i64(Value::list(slice))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Null)
+        }
+    }
+}
+
 /// `(bytevector->list bv start end)` — 3-arg slice form. Returns a
 /// fresh proper list of u8 Fixnum elements at byte positions
 /// `start..end`. Consumes `bv`. `start` and `end` are raw Fixnum

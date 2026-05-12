@@ -4111,6 +4111,18 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter IN) — bytevector->list 2-arg slice-from.
+                                    ("bytevector->list", 2) | ("bytevector->u8-list", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::BytevectorToListSliceFrom(
+                                            dst, args[0], args[1],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter IH) — bytevector->list 3-arg slice.
                                     ("bytevector->list", 3) | ("bytevector->u8-list", 3)
                                         if value_types.get(&args[0]).copied()
@@ -6005,6 +6017,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::MakeListUnspec(dst, _)
                 | RirInst::VectorToListSliceFrom(dst, _, _)
                 | RirInst::StringToListSliceFrom(dst, _, _)
+                | RirInst::BytevectorToListSliceFrom(dst, _, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::MakeHashtableEqual(dst)
