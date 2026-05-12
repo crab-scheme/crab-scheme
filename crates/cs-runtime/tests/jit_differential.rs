@@ -7917,3 +7917,44 @@ fn diff_jit_force_forced() {
         Value::Number(cs_core::Number::Fixnum(7))
     ));
 }
+
+#[test]
+fn diff_jit_hashtable_contains() {
+    // ADR 0012 D-2 (iter GV) — hashtable-contains? fast path on Eq/Eqv/Equal.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (hc ht k) (hashtable-contains? ht k))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define ht (make-eqv-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'a 1)")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! ht 'b 2)")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (hc ht 'a) (hc ht 'z) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let yes = rt.eval_str_via_vm("<diff>", "(hc ht 'a)").unwrap();
+    let no = rt.eval_str_via_vm("<diff>", "(hc ht 'z)").unwrap();
+    // equal hashtable handles structural equality
+    rt.eval_str_via_vm("<diff>", "(define eqht (make-hashtable equal-hash equal?))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(hashtable-set! eqht (list 1 2) 'found)")
+        .unwrap();
+    let eq_yes = rt
+        .eval_str_via_vm("<diff>", "(hc eqht (list 1 2))")
+        .unwrap();
+    let eq_no = rt
+        .eval_str_via_vm("<diff>", "(hc eqht (list 3 4))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&yes, Value::Boolean(true)));
+    assert!(matches!(&no, Value::Boolean(false)));
+    assert!(matches!(&eq_yes, Value::Boolean(true)));
+    assert!(matches!(&eq_no, Value::Boolean(false)));
+}

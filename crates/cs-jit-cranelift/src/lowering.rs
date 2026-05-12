@@ -426,6 +426,8 @@ pub struct Lowerer {
     make_promise_func: cranelift_module::FuncId,
     /// FuncId of `vm_force_forced_gc(p) -> i64`. ADR 0012 D-2 (iter GU).
     force_forced_func: cranelift_module::FuncId,
+    /// FuncId of `vm_hashtable_contains_p_gc(ht, k) -> i64`. ADR 0012 D-2 (iter GV).
+    hashtable_contains_p_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_bit_count(n) -> i64`. ADR 0012 D-2 (iter FN).
     bitwise_bit_count_func: cranelift_module::FuncId,
     /// FuncId of `vm_bitwise_length(n) -> i64`. ADR 0012 D-2 (iter FN).
@@ -1066,6 +1068,11 @@ impl Lowerer {
         builder.symbol(
             "vm_force_forced_gc",
             cs_vm::vm::vm_force_forced_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter GV) — hashtable-contains?.
+        builder.symbol(
+            "vm_hashtable_contains_p_gc",
+            cs_vm::vm::vm_hashtable_contains_p_gc as *const u8,
         );
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         builder.symbol(
@@ -2610,6 +2617,16 @@ impl Lowerer {
                 &pair_accessor_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_force_forced_gc: {e}")))?;
+        // ADR 0012 D-2 (iter GV) — hashtable-contains?.
+        let hashtable_contains_p_func = module
+            .declare_function(
+                "vm_hashtable_contains_p_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_hashtable_contains_p_gc: {e}"))
+            })?;
 
         // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
         let bitwise_bit_count_func = module
@@ -3592,6 +3609,7 @@ impl Lowerer {
             delete_duplicates_func,
             make_promise_func,
             force_forced_func,
+            hashtable_contains_p_func,
             bitwise_bit_count_func,
             bitwise_length_func,
             bitwise_arith_shift_left_func,
@@ -4259,6 +4277,10 @@ impl Lowerer {
             let force_forced_fnref = self
                 .module
                 .declare_func_in_func(self.force_forced_func, builder.func);
+            // iter GV — hashtable-contains?.
+            let hashtable_contains_p_fnref = self
+                .module
+                .declare_func_in_func(self.hashtable_contains_p_func, builder.func);
             // iter FN — bitwise-bit-count / -length.
             let bitwise_bit_count_fnref = self
                 .module
@@ -4755,6 +4777,7 @@ impl Lowerer {
                         delete_duplicates_fnref,
                         make_promise_fnref,
                         force_forced_fnref,
+                        hashtable_contains_p_fnref,
                         bitwise_bit_count_fnref,
                         bitwise_length_fnref,
                         bitwise_arith_shift_left_fnref,
@@ -5140,6 +5163,7 @@ fn lower_inst(
     delete_duplicates_fnref: cranelift_codegen::ir::FuncRef,
     make_promise_fnref: cranelift_codegen::ir::FuncRef,
     force_forced_fnref: cranelift_codegen::ir::FuncRef,
+    hashtable_contains_p_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_bit_count_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_length_fnref: cranelift_codegen::ir::FuncRef,
     bitwise_arith_shift_left_fnref: cranelift_codegen::ir::FuncRef,
@@ -5955,6 +5979,24 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "FileExistsP expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            map.insert(*dst, result);
+        }
+        Inst::HashtableContainsP(dst, ht, key) => {
+            // ADR 0012 D-2 (iter GV) — hashtable-contains?. Returns raw 0/1.
+            // Deopts on non-hashtable or Custom eq_kind.
+            let htv = lookup(map, *ht)?;
+            let kv = lookup(map, *key)?;
+            let inst_ref = b.ins().call(hashtable_contains_p_fnref, &[htv, kv]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "HashtableContainsP expected 1 result, got {}",
                         results.len()
                     )));
                 }

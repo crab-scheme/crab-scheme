@@ -1974,6 +1974,20 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::ForceForced(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter GV) — hashtable-contains?.
+                                    // Both operands must be Any; Custom-kind
+                                    // hashtables deopt at runtime.
+                                    ("hashtable-contains?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::HashtableContainsP(
+                                            dst, args[0], args[1],
+                                        ));
+                                        value_types.insert(dst, Type::Boolean);
+                                    }
                                     // ADR 0012 D-2 (iter GT) — make-promise.
                                     // Accepts any operand; BoxTyped if not Any.
                                     ("make-promise", 1) => {
@@ -5196,6 +5210,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::PromiseP(dst, _)
                 | RirInst::HashtableP(dst, _)
                 | RirInst::HashtableMutableP(dst, _)
+                | RirInst::HashtableContainsP(dst, _, _)
                 | RirInst::FileExistsP(dst, _)
                 | RirInst::CharNumericP(dst, _)
                 | RirInst::CharWhitespaceP(dst, _)
