@@ -4989,6 +4989,17 @@ pub unsafe extern "C" fn vm_alloc_vector_gc(n: i64, fill: i64) -> i64 {
     ))))
 }
 
+/// `(make-vector n)` — 1-arg form: vector of length `n` filled with
+/// `Value::Unspecified`. `n` is raw Fixnum i64. ADR 0012 D-2 (iter JE).
+#[no_mangle]
+pub unsafe extern "C" fn vm_alloc_vector_unspec_gc(n: i64) -> i64 {
+    let len = if n < 0 { 0usize } else { n as usize };
+    let storage: Vec<Value> = vec![Value::Unspecified; len];
+    value_to_gc_i64(Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(
+        storage,
+    ))))
+}
+
 /// Inner (non-FFI) implementation of `vm_vector_ref_gc`. Same
 /// contract — consumes one strong refcount on `vec`, panics on
 /// type mismatch or out-of-bounds. Split out so unit tests can

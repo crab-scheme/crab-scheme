@@ -3174,6 +3174,14 @@ pub fn bytecode_to_rir_with_hints(
                                     // Any. If the user passed a typed
                                     // immediate (e.g. Fixnum), box it via
                                     // BoxTyped first.
+                                    // ADR 0012 D-2 (iter JE) — (make-vector n) 1-arg.
+                                    ("make-vector", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::MakeVectorUnspec(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     ("make-vector", 2) => {
                                         let len_t = value_types
                                             .get(&args[0])
@@ -6452,6 +6460,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::NumberToStringRadix(dst, _, _)
                 | RirInst::StringToNumberRadix(dst, _, _)
                 | RirInst::MakeListUnspec(dst, _)
+                | RirInst::MakeVectorUnspec(dst, _)
                 | RirInst::VectorToListSliceFrom(dst, _, _)
                 | RirInst::StringToListSliceFrom(dst, _, _)
                 | RirInst::BytevectorToListSliceFrom(dst, _, _)

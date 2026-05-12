@@ -10499,3 +10499,44 @@ fn diff_jit_variadic_string_compares() {
     assert_eq!(fix_of(ci_eq), 1);
     assert_eq!(fix_of(ci_lt), 1);
 }
+
+#[test]
+fn diff_jit_make_vector_1arg() {
+    // ADR 0012 D-2 (iter JE) — (make-vector n) 1-arg, fills with Unspecified.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mv n) (make-vector n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (mv 3) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let v3 = rt.eval_str_via_vm("<diff>", "(mv 3)").unwrap();
+    let v0 = rt.eval_str_via_vm("<diff>", "(mv 0)").unwrap();
+    let v5 = rt.eval_str_via_vm("<diff>", "(mv 5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn vec_len(v: &Value) -> usize {
+        match v {
+            Value::Vector(vc) => vc.borrow().len(),
+            other => panic!("expected vector, got {:?}", other),
+        }
+    }
+    fn all_unspec(v: &Value) -> bool {
+        match v {
+            Value::Vector(vc) => vc
+                .borrow()
+                .iter()
+                .all(|e| matches!(e, Value::Unspecified)),
+            _ => false,
+        }
+    }
+    assert_eq!(vec_len(&v3), 3);
+    assert!(all_unspec(&v3));
+    assert_eq!(vec_len(&v0), 0);
+    assert_eq!(vec_len(&v5), 5);
+    assert!(all_unspec(&v5));
+}

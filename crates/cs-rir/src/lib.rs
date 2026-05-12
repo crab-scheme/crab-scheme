@@ -817,6 +817,9 @@ pub enum Inst {
     /// `dst = make-list(n)` — 1-arg form, fills with Unspecified.
     /// ADR 0012 D-2 (iter IK).
     MakeListUnspec(Value, Value),
+    /// `dst = make-vector(n)` — 1-arg form, fills with Unspecified.
+    /// ADR 0012 D-2 (iter JE).
+    MakeVectorUnspec(Value, Value),
     /// `dst = vector->list(v, start)` — 2-arg slice-from form.
     /// ADR 0012 D-2 (iter IL).
     VectorToListSliceFrom(Value, Value, Value),

@@ -608,6 +608,9 @@ pub struct Lowerer {
     /// FuncId of `vm_make_list_unspecified_gc(n) -> i64`.
     /// ADR 0012 D-2 (iter IK).
     make_list_unspec_func: cranelift_module::FuncId,
+    /// FuncId of `vm_alloc_vector_unspec_gc(n) -> i64`.
+    /// ADR 0012 D-2 (iter JE).
+    make_vector_unspec_func: cranelift_module::FuncId,
     /// FuncId of `vm_vector_to_list_slice_from_gc(v, start) -> i64`.
     /// ADR 0012 D-2 (iter IL).
     vector_to_list_slice_from_func: cranelift_module::FuncId,
@@ -1523,6 +1526,11 @@ impl Lowerer {
         builder.symbol(
             "vm_make_list_unspecified_gc",
             cs_vm::vm::vm_make_list_unspecified_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter JE) — make-vector 1-arg.
+        builder.symbol(
+            "vm_alloc_vector_unspec_gc",
+            cs_vm::vm::vm_alloc_vector_unspec_gc as *const u8,
         );
         // ADR 0012 D-2 (iter EJ) — string-reverse.
         builder.symbol(
@@ -3655,6 +3663,16 @@ impl Lowerer {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_make_list_unspecified_gc: {e}"))
             })?;
+        // ADR 0012 D-2 (iter JE) — make-vector 1-arg.
+        let make_vector_unspec_func = module
+            .declare_function(
+                "vm_alloc_vector_unspec_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_alloc_vector_unspec_gc: {e}"))
+            })?;
         // ADR 0012 D-2 (iter IL) — vector->list 2-arg slice-from.
         let vector_to_list_slice_from_func = module
             .declare_function(
@@ -4482,6 +4500,7 @@ impl Lowerer {
             string_to_number_func,
             string_to_number_radix_func,
             make_list_unspec_func,
+            make_vector_unspec_func,
             vector_to_list_slice_from_func,
             string_to_list_slice_from_func,
             bytevector_to_list_slice_from_func,
@@ -5377,6 +5396,10 @@ impl Lowerer {
             let make_list_unspec_fnref = self
                 .module
                 .declare_func_in_func(self.make_list_unspec_func, builder.func);
+            // iter JE — make-vector 1-arg.
+            let make_vector_unspec_fnref = self
+                .module
+                .declare_func_in_func(self.make_vector_unspec_func, builder.func);
             // iter IL — vector->list 2-arg slice-from.
             let vector_to_list_slice_from_fnref = self
                 .module
@@ -5873,6 +5896,7 @@ impl Lowerer {
                         string_to_number_fnref,
                         string_to_number_radix_fnref,
                         make_list_unspec_fnref,
+                        make_vector_unspec_fnref,
                         vector_to_list_slice_from_fnref,
                         string_to_list_slice_from_fnref,
                         bytevector_to_list_slice_from_fnref,
@@ -6304,6 +6328,7 @@ fn lower_inst(
     string_to_number_fnref: cranelift_codegen::ir::FuncRef,
     string_to_number_radix_fnref: cranelift_codegen::ir::FuncRef,
     make_list_unspec_fnref: cranelift_codegen::ir::FuncRef,
+    make_vector_unspec_fnref: cranelift_codegen::ir::FuncRef,
     vector_to_list_slice_from_fnref: cranelift_codegen::ir::FuncRef,
     string_to_list_slice_from_fnref: cranelift_codegen::ir::FuncRef,
     bytevector_to_list_slice_from_fnref: cranelift_codegen::ir::FuncRef,
@@ -9501,6 +9526,23 @@ fn lower_inst(
                 if results.len() != 1 {
                     return Err(JitError::Codegen(format!(
                         "MakeListUnspec expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        Inst::MakeVectorUnspec(dst, n) => {
+            // ADR 0012 D-2 (iter JE) — vm_alloc_vector_unspec_gc.
+            let n_v = lookup(map, *n)?;
+            let inst_ref = b.ins().call(make_vector_unspec_fnref, &[n_v]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "MakeVectorUnspec expected 1 result, got {}",
                         results.len()
                     )));
                 }
