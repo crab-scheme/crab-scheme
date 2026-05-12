@@ -9684,3 +9684,47 @@ fn diff_jit_make_list_1arg() {
     assert_eq!(list_len(l5.clone()), 5);
     assert!(all_unspec(l5));
 }
+
+#[test]
+fn diff_jit_vector_to_list_slice_from() {
+    // ADR 0012 D-2 (iter IL) — vector->list 2-arg slice-from form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (vtsf v s) (vector->list v s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define src #(10 20 30 40 50))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (vtsf src 2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let tail = rt.eval_str_via_vm("<diff>", "(vtsf src 2)").unwrap();
+    let full = rt.eval_str_via_vm("<diff>", "(vtsf src 0)").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(vtsf src 5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn list_to_ints(mut v: Value) -> Vec<i64> {
+        let mut out = Vec::new();
+        loop {
+            match v {
+                Value::Null => return out,
+                Value::Pair(p) => {
+                    let car = p.car.borrow().clone();
+                    let cdr = p.cdr.borrow().clone();
+                    match car {
+                        Value::Number(cs_core::Number::Fixnum(n)) => out.push(n),
+                        other => panic!("unexpected car: {:?}", other),
+                    }
+                    v = cdr;
+                }
+                other => panic!("expected pair or null, got {:?}", other),
+            }
+        }
+    }
+    assert_eq!(list_to_ints(tail), vec![30, 40, 50]);
+    assert_eq!(list_to_ints(full), vec![10, 20, 30, 40, 50]);
+    assert_eq!(list_to_ints(empty), Vec::<i64>::new());
+}
