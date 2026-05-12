@@ -4652,6 +4652,18 @@ pub fn bytecode_to_rir_with_hints(
                                         ));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter IO) — vector->string 2-arg slice-from.
+                                    ("vector->string", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[1]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        insts.push(RirInst::VectorToStringSliceFrom(
+                                            dst, args[0], args[1],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter EC) — number<->string
                                     // 1-arg forms. Box typed numeric immediates
                                     // first; string->number's arg is always Any.
@@ -6018,6 +6030,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VectorToListSliceFrom(dst, _, _)
                 | RirInst::StringToListSliceFrom(dst, _, _)
                 | RirInst::BytevectorToListSliceFrom(dst, _, _)
+                | RirInst::VectorToStringSliceFrom(dst, _, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
                 | RirInst::MakeHashtableEqual(dst)

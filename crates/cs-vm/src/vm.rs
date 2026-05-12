@@ -6918,6 +6918,53 @@ pub unsafe extern "C" fn vm_string_to_vector_slice_gc(s: i64, start: i64, end: i
     }
 }
 
+/// `(vector->string v start)` — 2-arg slice-from form. Returns a
+/// fresh `Value::String` from the chars at vector positions
+/// `start..`. Consumes `v`. `start` is a raw Fixnum i64. Non-vector,
+/// non-Character element, or out-of-range deopt. ADR 0012 D-2 (iter IO).
+///
+/// # Safety
+///
+/// `v` must be a live, owned `Gc<Value>` raw handle.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_to_string_slice_from_gc(v: i64, start: i64) -> i64 {
+    let val = unsafe { gc_i64_to_value(v) };
+    match val {
+        Value::Vector(vg) => {
+            let storage = vg.borrow();
+            let len = storage.len();
+            if start < 0 || (start as usize) > len {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                    String::new(),
+                ))));
+            }
+            let mut s = String::with_capacity(len - start as usize);
+            for item in &storage[(start as usize)..] {
+                match item {
+                    Value::Character(c) => s.push(*c),
+                    _ => {
+                        drop(storage);
+                        jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                        return value_to_gc_i64(Value::String(cs_gc::Gc::new(
+                            std::cell::RefCell::new(String::new()),
+                        )));
+                    }
+                }
+            }
+            drop(storage);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                String::new(),
+            ))))
+        }
+    }
+}
+
 /// `(vector->string v start end)` — 3-arg slice form. Returns a fresh
 /// `Value::String` from the chars at vector positions `start..end`.
 /// Consumes `v`. `start` and `end` are raw Fixnum i64. Non-vector,

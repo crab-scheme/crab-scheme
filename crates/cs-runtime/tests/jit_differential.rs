@@ -9773,7 +9773,8 @@ fn diff_jit_string_to_list_slice_from() {
     assert_eq!(list_to_chars(empty), Vec::<char>::new());
 
     // Multibyte UTF-8 — codepoint indexing.
-    rt.eval_str_via_vm("<diff>", "(define utf \"αβγδε\")").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define utf \"αβγδε\")")
+        .unwrap();
     rt.eval_str_via_vm(
         "<diff>",
         "(let loop ((i 0)) \
@@ -9827,4 +9828,36 @@ fn diff_jit_bytevector_to_list_slice_from() {
     assert_eq!(list_to_ints(tail), vec![30, 40, 50]);
     assert_eq!(list_to_ints(full), vec![10, 20, 30, 40, 50]);
     assert_eq!(list_to_ints(empty), Vec::<i64>::new());
+}
+
+#[test]
+fn diff_jit_vector_to_string_slice_from() {
+    // ADR 0012 D-2 (iter IO) — vector->string 2-arg slice-from form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (vtsf v s) (vector->string v s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define src #(#\\h #\\e #\\l #\\l #\\o))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (vtsf src 2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let tail = rt.eval_str_via_vm("<diff>", "(vtsf src 2)").unwrap();
+    let full = rt.eval_str_via_vm("<diff>", "(vtsf src 0)").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(vtsf src 5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn str_of(v: Value) -> String {
+        match v {
+            Value::String(sc) => sc.borrow().clone(),
+            other => panic!("expected string, got {:?}", other),
+        }
+    }
+    assert_eq!(str_of(tail), "llo");
+    assert_eq!(str_of(full), "hello");
+    assert_eq!(str_of(empty), "");
 }
