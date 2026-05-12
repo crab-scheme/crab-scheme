@@ -8250,3 +8250,43 @@ fn diff_jit_vector_copy_slice() {
     assert_eq!(vec_to_ints(&prefix), vec![10, 20]);
     assert_eq!(vec_to_ints(&suffix), vec![40, 50]);
 }
+
+#[test]
+fn diff_jit_string_copy_slice() {
+    // ADR 0012 D-2 (iter HB) — string-copy 3-arg reuses the substring
+    // lowering (R7RS char-based slicing).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (sc s a b) (string-copy s a b))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define src \"hello-world\")")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (sc src 0 5) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let mid = rt.eval_str_via_vm("<diff>", "(sc src 6 11)").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(sc src 3 3)").unwrap();
+    let full = rt.eval_str_via_vm("<diff>", "(sc src 0 11)").unwrap();
+    let prefix = rt.eval_str_via_vm("<diff>", "(sc src 0 5)").unwrap();
+    // Multibyte: char-based slicing must skip bytes correctly
+    rt.eval_str_via_vm("<diff>", "(define utf \"αβγδε\")")
+        .unwrap();
+    let utf_mid = rt.eval_str_via_vm("<diff>", "(sc utf 1 4)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn s_of(v: &Value) -> String {
+        match v {
+            Value::String(sg) => sg.borrow().clone(),
+            other => panic!("expected string, got {:?}", other),
+        }
+    }
+    assert_eq!(s_of(&mid), "world");
+    assert_eq!(s_of(&empty), "");
+    assert_eq!(s_of(&full), "hello-world");
+    assert_eq!(s_of(&prefix), "hello");
+    assert_eq!(s_of(&utf_mid), "βγδ");
+}
