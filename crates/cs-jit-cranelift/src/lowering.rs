@@ -393,6 +393,8 @@ pub struct Lowerer {
     div0_func: cranelift_module::FuncId,
     /// FuncId of `vm_hashtable_hash_function_gc(ht) -> i64`. ADR 0012 D-2 (iter HQ).
     hashtable_hash_function_func: cranelift_module::FuncId,
+    /// FuncId of `vm_make_hashtable_equal_gc() -> i64`. ADR 0012 D-2 (iter HR).
+    make_hashtable_equal_func: cranelift_module::FuncId,
     /// FuncId of `vm_mod0(x, y) -> i64`. ADR 0012 D-2 (iter HO).
     mod0_func: cranelift_module::FuncId,
     /// FuncId of `vm_mod_euclid(x, y) -> i64`. ADR 0012 D-2 (iter GE).
@@ -1045,6 +1047,11 @@ impl Lowerer {
         builder.symbol(
             "vm_hashtable_hash_function_gc",
             cs_vm::vm::vm_hashtable_hash_function_gc as *const u8,
+        );
+        // ADR 0012 D-2 (iter HR) — make-hashtable 0-arg.
+        builder.symbol(
+            "vm_make_hashtable_equal_gc",
+            cs_vm::vm::vm_make_hashtable_equal_gc as *const u8,
         );
         builder.symbol("vm_mod_euclid", cs_vm::vm::vm_mod_euclid as *const u8);
         // ADR 0012 D-2 (iter GF) — hashtable?.
@@ -2614,6 +2621,16 @@ impl Lowerer {
                     "declare_function vm_hashtable_hash_function_gc: {e}"
                 ))
             })?;
+        // ADR 0012 D-2 (iter HR) — make-hashtable 0-arg (Equal kind).
+        let make_hashtable_equal_func = module
+            .declare_function(
+                "vm_make_hashtable_equal_gc",
+                cranelift_module::Linkage::Import,
+                &zero_arg_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_make_hashtable_equal_gc: {e}"))
+            })?;
 
         // ADR 0012 D-2 (iter GF) — hashtable?.
         let hashtable_p_func = module
@@ -3873,6 +3890,7 @@ impl Lowerer {
             div0_func,
             mod0_func,
             hashtable_hash_function_func,
+            make_hashtable_equal_func,
             mod_euclid_func,
             hashtable_p_func,
             hashtable_size_func,
@@ -4521,6 +4539,10 @@ impl Lowerer {
             let hashtable_hash_function_fnref = self
                 .module
                 .declare_func_in_func(self.hashtable_hash_function_func, builder.func);
+            // iter HR — make-hashtable 0-arg.
+            let make_hashtable_equal_fnref = self
+                .module
+                .declare_func_in_func(self.make_hashtable_equal_func, builder.func);
             // iter GF — hashtable?.
             let hashtable_p_fnref = self
                 .module
@@ -5126,6 +5148,7 @@ impl Lowerer {
                         div0_fnref,
                         mod0_fnref,
                         hashtable_hash_function_fnref,
+                        make_hashtable_equal_fnref,
                         hashtable_p_fnref,
                         hashtable_size_fnref,
                         hashtable_mutable_p_fnref,
@@ -5529,6 +5552,7 @@ fn lower_inst(
     div0_fnref: cranelift_codegen::ir::FuncRef,
     mod0_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_hash_function_fnref: cranelift_codegen::ir::FuncRef,
+    make_hashtable_equal_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_p_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_size_fnref: cranelift_codegen::ir::FuncRef,
     hashtable_mutable_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -6235,6 +6259,23 @@ fn lower_inst(
                 }
                 results[0]
             };
+            map.insert(*dst, result);
+        }
+        Inst::MakeHashtableEqual(dst) => {
+            // ADR 0012 D-2 (iter HR) — make-hashtable 0-arg.
+            // Returns a fresh Gc handle to a Hashtable with eq_kind=Equal.
+            let inst_ref = b.ins().call(make_hashtable_equal_fnref, &[]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "MakeHashtableEqual expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
         }
         Inst::HashtableHashFn(dst, src) => {

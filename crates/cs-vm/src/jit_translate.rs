@@ -2018,6 +2018,11 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::EofObject(dst));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter HR) — make-hashtable 0-arg.
+                                    ("make-hashtable", 0) => {
+                                        insts.push(RirInst::MakeHashtableEqual(dst));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     // ADR 0012 D-2 (iter GN) — append-reverse.
                                     ("append-reverse", 2)
                                         if value_types.get(&args[0]).copied()
@@ -5710,6 +5715,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::VecCopySlice(dst, _, _, _)
                 | RirInst::BvCopySlice(dst, _, _, _)
                 | RirInst::EofObject(dst)
+                | RirInst::MakeHashtableEqual(dst)
                 | RirInst::StringReplaceFirst(dst, _, _, _)
                 | RirInst::BvFillSlice(dst, _, _, _, _)
                 | RirInst::VecFillSlice(dst, _, _, _, _)

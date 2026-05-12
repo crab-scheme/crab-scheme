@@ -1181,6 +1181,20 @@ pub unsafe extern "C" fn vm_eof_object_gc() -> i64 {
     value_to_gc_i64(Value::Eof)
 }
 
+/// `(make-hashtable)` — R6RS 0-arg constructor returning a fresh
+/// hashtable with eq_kind = Equal. Returns a Gc handle. No deopt
+/// path. ADR 0012 D-2 (iter HR).
+///
+/// # Safety
+///
+/// No invariants — pure constructor.
+#[no_mangle]
+pub unsafe extern "C" fn vm_make_hashtable_equal_gc() -> i64 {
+    value_to_gc_i64(Value::Hashtable(cs_core::Hashtable::new(
+        cs_core::HtEqKind::Equal,
+    )))
+}
+
 /// `(current-second)` — Unix epoch seconds as Flonum bit pattern.
 /// 0-arg helper. ADR 0012 D-2 (iter GL).
 ///

@@ -766,6 +766,9 @@ pub enum Inst {
     /// `dst = hashtable-hash-function(ht)` returns proc or #f.
     /// ADR 0012 D-2 (iter HQ).
     HashtableHashFn(Value, Value),
+    /// `dst = (make-hashtable)` — 0-arg Equal-kind constructor.
+    /// ADR 0012 D-2 (iter HR).
+    MakeHashtableEqual(Value),
     /// `dst = mod0(x, y)` R6RS centered mod.
     /// ADR 0012 D-2 (iter HO).
     Mod0(Value, Value, Value),

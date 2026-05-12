@@ -8844,3 +8844,29 @@ fn diff_jit_hashtable_hash_function() {
         on_custom
     );
 }
+
+#[test]
+fn diff_jit_make_hashtable_zero_arg() {
+    // ADR 0012 D-2 (iter HR) — (make-hashtable) 0-arg = Equal-kind.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (mh) (make-hashtable))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (mh) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let h = rt.eval_str_via_vm("<diff>", "(mh)").unwrap();
+    let is_ht = rt.eval_str_via_vm("<diff>", "(hashtable? (mh))").unwrap();
+    let sz = rt
+        .eval_str_via_vm("<diff>", "(hashtable-size (mh))")
+        .unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    assert!(matches!(&h, Value::Hashtable(_)));
+    assert!(matches!(&is_ht, Value::Boolean(true)));
+    assert!(matches!(&sz, Value::Number(cs_core::Number::Fixnum(0))));
+}
