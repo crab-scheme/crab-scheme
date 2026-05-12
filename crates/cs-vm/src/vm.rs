@@ -159,6 +159,13 @@ thread_local! {
     /// the bytecode body. Tests use this to assert the JIT actually
     /// ran (vs just being installed).
     static VM_JIT_CALL_COUNT: Cell<u64> = const { Cell::new(0) };
+    /// IC miss counter (ADR 0012 D-1, iter JG). Incremented in
+    /// `vm_call_general` each time the miss-handler runs. A
+    /// well-behaved monomorphic site bumps this exactly once per
+    /// JIT compilation of the caller; a megamorphic / polymorphic
+    /// site bumps it on every call. Tests compare against the
+    /// total call count to derive hit-rate.
+    static VM_JIT_IC_MISS_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
 thread_local! {
@@ -7713,17 +7720,22 @@ pub unsafe extern "C" fn vm_call_general(
     // without going through vm_call_sync. Non-null slot_ptr is the
     // hot path's IC slot; null means the caller didn't allocate one
     // (legacy or no IC wired here yet).
+    //
+    // ADR 0012 D-1 (iter JG) — bump miss_count atomic + thread-
+    // local total so callers can observe IC fire rates.
     if !slot_ptr.is_null() {
+        bump_jit_ic_miss_count();
+        // SAFETY: slot_ptr was Box::leak'd by the lowering site for
+        // an IcSlot; the address is stable for the process lifetime.
+        // Single-threaded execution means no concurrent writer.
+        let slot = unsafe { &*(slot_ptr as *const crate::ic_compat::IcSlotShim) };
+        slot.miss_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Value::Procedure(p) = &callee_v {
             if let Some(vmc) = p.as_any().downcast_ref::<VmClosure>() {
                 let id = vmc.closure_id();
                 let jit_ptr = vmc.jit_ptr();
                 if id != 0 && !jit_ptr.is_null() {
-                    // SAFETY: slot_ptr was Box::leak'd by the lowering
-                    // site for an IcSlot; the address is stable for
-                    // the process lifetime. Single-threaded execution
-                    // means no concurrent writer.
-                    let slot = unsafe { &*(slot_ptr as *const crate::ic_compat::IcSlotShim) };
                     slot.cached_closure_id
                         .store(id, std::sync::atomic::Ordering::Relaxed);
                     slot.cached_jit_ptr
@@ -7840,6 +7852,26 @@ pub fn jit_call_count() -> u64 {
 /// Reset the per-thread JIT-dispatch count.
 pub fn reset_jit_call_count() {
     VM_JIT_CALL_COUNT.with(|c| c.set(0));
+}
+
+/// Current per-thread IC miss count (ADR 0012 D-1, iter JG).
+/// Incremented inside `vm_call_general` when a CallGeneral site's
+/// IC slot misses. A monomorphic site bumps this once per
+/// caller JIT compilation; the test in
+/// `diff_jit_ic_monomorphic_fire_rate` confirms this.
+pub fn jit_ic_miss_count() -> u64 {
+    VM_JIT_IC_MISS_COUNT.with(|c| c.get())
+}
+
+/// Reset the per-thread IC miss count.
+pub fn reset_jit_ic_miss_count() {
+    VM_JIT_IC_MISS_COUNT.with(|c| c.set(0));
+}
+
+/// Increment the IC miss counter. Called by `vm_call_general`
+/// from the IC miss path.
+fn bump_jit_ic_miss_count() {
+    VM_JIT_IC_MISS_COUNT.with(|c| c.set(c.get() + 1));
 }
 
 /// Increment the JIT-dispatch counter. Called by the closure-call

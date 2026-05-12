@@ -10577,3 +10577,63 @@ fn diff_jit_variadic_flminmax() {
     assert_eq!(flo_of(mn3), 2.0);
     assert_eq!(flo_of(mx3), 8.0);
 }
+
+#[test]
+fn diff_jit_ic_miss_counter_api() {
+    // ADR 0012 D-1 (iter JG) — verify the IC miss counter API
+    // works end-to-end through the bytecode→JIT→ic_miss path.
+    //
+    // What this test asserts:
+    //   - `jit_ic_miss_count()` / `reset_jit_ic_miss_count()` are
+    //     thread-local and behave as expected.
+    //   - A monomorphic caller→callee site does NOT produce O(N)
+    //     misses for N calls.
+    //
+    // What this test does NOT verify (deferred to a follow-up iter):
+    //   - That CallGeneral is actually emitted for caller→callee.
+    //     The bytecode compiler folds global procedure refs to
+    //     Const(Procedure(...)); the JIT translator then takes the
+    //     BuiltinRef path, which can't dispatch user closures and
+    //     so the lambda doesn't JIT-compile at all. Today miss=0
+    //     means "the IC site never executed" rather than "the IC
+    //     hit every time". Two cleanups needed before this test
+    //     becomes a real fire-rate check:
+    //       (a) unfold VmClosure refs in compiler.rs so they go
+    //           through LoadVar → EnvLookup → CallGeneral,
+    //       (b) fix the IC hot path to install JitEnvGuard /
+    //           JitBcGuard / JitFrameGuard / JitSymsGuard before
+    //           call_indirect (currently it bypasses
+    //           try_dispatch_jit and TLS setup, so any non-leaf
+    //           callee SIGSEGVs).
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (callee x) (+ x 1))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (caller n) (callee n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (caller i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_ic_miss_count();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 10000) 'done \
+               (begin (caller i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    let calls = cs_vm::vm::jit_call_count();
+    let misses = cs_vm::vm::jit_ic_miss_count();
+    eprintln!("IC stats: jit_calls={} ic_misses={}", calls, misses);
+    assert!(calls > 1000, "no JIT dispatch happened (calls={calls})");
+    // O(1), not O(N=10000).
+    assert!(
+        misses < 100,
+        "IC miss count grew faster than expected: misses={misses}"
+    );
+}

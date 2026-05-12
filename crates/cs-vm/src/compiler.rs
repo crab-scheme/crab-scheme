@@ -306,6 +306,15 @@ fn compile_expr(
             // preserves correctness for the JIT's env-lookup path —
             // free-var refs to user globals stay as LoadVar in the
             // bytecode and translate to Inst::EnvLookup at JIT time.)
+            //
+            // ADR 0012 D-1 iter JG note: this fold blocks JIT
+            // compilation of caller→callee patterns where callee is a
+            // user-defined VmClosure (the folded Const(Procedure(VmClosure))
+            // pushes a BuiltinRef("vm-closure") sentinel in the JIT
+            // translator, which can't dispatch). Un-folding for
+            // VmClosure procedures enables JIT but exposes a latent
+            // bug in self-recursive JIT compilation (fact-12 stack
+            // overflow) that needs separate investigation.
             if !is_locally_bound(scope, *name) {
                 if let Some(v) = globals.get(name) {
                     if matches!(v, Value::Procedure(_)) {
