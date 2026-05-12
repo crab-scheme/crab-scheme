@@ -2614,6 +2614,37 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::VecFill(dst, args[0], fill));
                                         value_types.insert(dst, Type::Any);
                                     }
+                                    // ADR 0012 D-2 (iter HG) — vector-fill! 4-arg slice.
+                                    ("vector-fill!", 4)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any)
+                                            && value_types.get(&args[2]).copied()
+                                                == Some(Type::Fixnum)
+                                            && value_types.get(&args[3]).copied()
+                                                == Some(Type::Fixnum) =>
+                                    {
+                                        // fill arg: BoxTyped if not Any.
+                                        let f_t = value_types
+                                            .get(&args[1])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        let fill = if f_t == Type::Any {
+                                            args[1]
+                                        } else {
+                                            let fresh = alloc();
+                                            insts.push(RirInst::BoxTyped(
+                                                fresh,
+                                                args[1],
+                                                type_to_jit_rt_tag(f_t),
+                                            ));
+                                            value_types.insert(fresh, Type::Any);
+                                            fresh
+                                        };
+                                        insts.push(RirInst::VecFillSlice(
+                                            dst, args[0], fill, args[2], args[3],
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                     ("bytevector-fill!", 2)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
@@ -5548,6 +5579,7 @@ fn infer_return_type(func: &cs_rir::Function) -> Type {
                 | RirInst::EofObject(dst)
                 | RirInst::StringReplaceFirst(dst, _, _, _)
                 | RirInst::BvFillSlice(dst, _, _, _, _)
+                | RirInst::VecFillSlice(dst, _, _, _, _)
                 | RirInst::MakeList(dst, _, _)
                 | RirInst::IotaN(dst, _)
                 | RirInst::IotaNs(dst, _, _)

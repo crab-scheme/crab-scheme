@@ -2436,6 +2436,42 @@ pub unsafe extern "C" fn vm_vector_fill_gc(vec: i64, fill: i64) -> i64 {
     }
 }
 
+/// `(vector-fill! v fill start end)` — 4-arg slice-fill form. Fills
+/// `v[start..end]` with clones of `fill`. Consumes `vec` and `fill`
+/// Gc handles; `start` and `end` are raw Fixnum i64. Non-vector or
+/// out-of-range (start > end, end > len, negative) deopts. Returns
+/// Gc(Unspecified). ADR 0012 D-2 (iter HG).
+///
+/// # Safety
+///
+/// `vec` and `fill` must be live, owned `Gc<Value>` raw handles.
+#[no_mangle]
+pub unsafe extern "C" fn vm_vector_fill_slice_gc(vec: i64, fill: i64, start: i64, end: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(vec) };
+    let f = unsafe { gc_i64_to_value(fill) };
+    match v {
+        Value::Vector(vc) => {
+            let mut storage = vc.borrow_mut();
+            let len = storage.len();
+            if start < 0 || end < 0 || (start as usize) > len || (end as usize) > len || start > end
+            {
+                drop(storage);
+                jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+                return value_to_gc_i64(Value::Unspecified);
+            }
+            for slot in storage[(start as usize)..(end as usize)].iter_mut() {
+                *slot = f.clone();
+            }
+            drop(storage);
+            value_to_gc_i64(Value::Unspecified)
+        }
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            value_to_gc_i64(Value::Unspecified)
+        }
+    }
+}
+
 /// `(bytevector-fill! bv fill)` — overwrite every byte of `bv` with
 /// `fill & 0xFF`. `bv` is consumed (Gc handle); `fill` is a raw
 /// Fixnum-shape i64. Returns Gc(Unspecified). Non-bytevector deopts.

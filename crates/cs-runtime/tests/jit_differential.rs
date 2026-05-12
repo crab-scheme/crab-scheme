@@ -8438,3 +8438,73 @@ fn diff_jit_bytevector_fill_slice() {
     // bv3: 4 fives, fill 2..2 (empty range) — unchanged
     assert_eq!(bv_bytes(&after_empty), vec![5, 5, 5, 5]);
 }
+
+#[test]
+fn diff_jit_vector_fill_slice() {
+    // ADR 0012 D-2 (iter HG) — vector-fill! 4-arg slice form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (vf v fill s e) (vector-fill! v fill s e) v)",
+    )
+    .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define warm (make-vector 8 0))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (vf warm 7 2 6) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    // Fixnum fill (BoxTyped from Fixnum to Any)
+    rt.eval_str_via_vm("<diff>", "(define v1 (make-vector 6 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(vf v1 99 1 5)").unwrap();
+    let after_mid = rt.eval_str_via_vm("<diff>", "v1").unwrap();
+    // String fill (Any operand, no BoxTyped needed)
+    rt.eval_str_via_vm("<diff>", "(define v2 (make-vector 4 'init))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(vf v2 \"x\" 0 4)").unwrap();
+    let after_str = rt.eval_str_via_vm("<diff>", "v2").unwrap();
+    // Empty range (start == end) — source unchanged
+    rt.eval_str_via_vm("<diff>", "(define v3 (make-vector 3 'a))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(vf v3 'z 1 1)").unwrap();
+    let after_empty = rt.eval_str_via_vm("<diff>", "v3").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn vec_ints(v: &Value) -> Vec<i64> {
+        match v {
+            Value::Vector(vg) => vg
+                .borrow()
+                .iter()
+                .map(|e| match e {
+                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    other => panic!("unexpected element: {:?}", other),
+                })
+                .collect(),
+            other => panic!("expected vector, got {:?}", other),
+        }
+    }
+    fn vec_string_count(v: &Value, expected: &str) -> usize {
+        match v {
+            Value::Vector(vg) => vg
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e, Value::String(sg) if sg.borrow().as_str() == expected))
+                .count(),
+            other => panic!("expected vector, got {:?}", other),
+        }
+    }
+    // v1: 6 zeros, fill 1..5 with 99
+    assert_eq!(vec_ints(&after_mid), vec![0, 99, 99, 99, 99, 0]);
+    // v2: 4 symbols 'init', fill all 4 slots with "x"
+    assert_eq!(vec_string_count(&after_str, "x"), 4);
+    // v3: 3 symbols 'a, fill 1..1 (empty) — vector unchanged length 3
+    match &after_empty {
+        Value::Vector(vg) => assert_eq!(vg.borrow().len(), 3),
+        other => panic!("expected vector, got {:?}", other),
+    }
+}
