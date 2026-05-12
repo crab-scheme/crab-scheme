@@ -9901,7 +9901,8 @@ fn diff_jit_string_to_vector_slice_from() {
     assert_eq!(vec_chars(&empty), Vec::<char>::new());
 
     // Multibyte UTF-8 — codepoint indexing.
-    rt.eval_str_via_vm("<diff>", "(define utf \"αβγδε\")").unwrap();
+    rt.eval_str_via_vm("<diff>", "(define utf \"αβγδε\")")
+        .unwrap();
     rt.eval_str_via_vm(
         "<diff>",
         "(let loop ((i 0)) \
@@ -9911,4 +9912,47 @@ fn diff_jit_string_to_vector_slice_from() {
     .unwrap();
     let utf_tail = rt.eval_str_via_vm("<diff>", "(stvf utf 2)").unwrap();
     assert_eq!(vec_chars(&utf_tail), vec!['γ', 'δ', 'ε']);
+}
+
+#[test]
+fn diff_jit_vector_copy_bang_from() {
+    // ADR 0012 D-2 (iter IQ) — vector-copy! 4-arg with src-start.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (vcb d at s start) (vector-copy! d at s start))",
+    )
+    .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (let ((d (make-vector 5 0)) (s #(10 20 30 40 50))) \
+                 (vcb d 0 s 2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    rt.eval_str_via_vm("<diff>", "(define dst (make-vector 5 0))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define s2 #(10 20 30 40 50))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(vcb dst 0 s2 2)").unwrap();
+    let result = rt.eval_str_via_vm("<diff>", "dst").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn vec_ints(v: &Value) -> Vec<i64> {
+        match v {
+            Value::Vector(vc) => vc
+                .borrow()
+                .iter()
+                .map(|e| match e {
+                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    other => panic!("expected fixnum, got {:?}", other),
+                })
+                .collect(),
+            other => panic!("expected vector, got {:?}", other),
+        }
+    }
+    // First 3 slots get s[2..5] = 30,40,50; last 2 untouched (still 0).
+    assert_eq!(vec_ints(&result), vec![30, 40, 50, 0, 0]);
 }
