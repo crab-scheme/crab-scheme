@@ -8902,3 +8902,42 @@ fn diff_jit_make_hashtable_eq_eqv() {
         .unwrap();
     assert!(matches!(&v, Value::Number(cs_core::Number::Fixnum(1))));
 }
+
+#[test]
+fn diff_jit_vector_copy_from() {
+    // ADR 0012 D-2 (iter HT) — vector-copy 2-arg slice-to-end form.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (vcf v s) (vector-copy v s))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define src #(10 20 30 40 50))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (vcf src 2) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_call_count();
+    let tail = rt.eval_str_via_vm("<diff>", "(vcf src 2)").unwrap();
+    let full = rt.eval_str_via_vm("<diff>", "(vcf src 0)").unwrap();
+    let empty = rt.eval_str_via_vm("<diff>", "(vcf src 5)").unwrap();
+    let _ = cs_vm::vm::jit_call_count();
+    fn vec_ints(v: &Value) -> Vec<i64> {
+        match v {
+            Value::Vector(vg) => vg
+                .borrow()
+                .iter()
+                .map(|e| match e {
+                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    other => panic!("unexpected element: {:?}", other),
+                })
+                .collect(),
+            other => panic!("expected vector, got {:?}", other),
+        }
+    }
+    assert_eq!(vec_ints(&tail), vec![30, 40, 50]);
+    assert_eq!(vec_ints(&full), vec![10, 20, 30, 40, 50]);
+    assert_eq!(vec_ints(&empty), Vec::<i64>::new());
+}
