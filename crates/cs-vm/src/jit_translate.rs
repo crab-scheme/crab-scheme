@@ -432,7 +432,6 @@ pub fn bytecode_to_rir_with_hints(
                     };
                     let target_block = lookup_block(&offset_to_block, *target, "JumpIfFalse")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "JumpIfFalse fall")?;
-                    let stack_height = sim_stack.len();
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -458,7 +457,6 @@ pub fn bytecode_to_rir_with_hints(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnGeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGeFx2 fall")?;
-                    let height = sim_stack.len();
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -483,7 +481,6 @@ pub fn bytecode_to_rir_with_hints(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, b, a);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnGtFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGtFx2 fall")?;
-                    let height = sim_stack.len();
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -508,7 +505,6 @@ pub fn bytecode_to_rir_with_hints(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, b, a);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnLeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLeFx2 fall")?;
-                    let height = sim_stack.len();
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -533,7 +529,6 @@ pub fn bytecode_to_rir_with_hints(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnLtFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLtFx2 fall")?;
-                    let height = sim_stack.len();
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -558,7 +553,6 @@ pub fn bytecode_to_rir_with_hints(
                     let cond = emit_typed_eq(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnNeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnNeFx2 fall")?;
-                    let height = sim_stack.len();
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
