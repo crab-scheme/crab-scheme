@@ -7723,6 +7723,19 @@ pub unsafe extern "C" fn vm_call_general(
     //
     // ADR 0012 D-1 (iter JG) — bump miss_count atomic + thread-
     // local total so callers can observe IC fire rates.
+    //
+    // ADR 0012 D-1 (iter JH) — IC soundness gate. The CallGeneral
+    // site always passes Any-boxed args (the JIT translator boxes
+    // every arg before CallGeneral). The IC hot path's
+    // `call_indirect` passes those Any handles straight through to
+    // `cached_jit_ptr` *without* the Any→typed unboxing that
+    // `try_dispatch_jit` does on the miss path. So we may only
+    // cache a `jit_ptr` whose body was compiled for *all-Any*
+    // params — otherwise the body reinterprets a Gc pointer as a
+    // raw Fixnum/Flonum and silently miscompiles (observed:
+    // unbounded self-recursion → stack overflow). Callees compiled
+    // for typed params simply never populate the slot; every call
+    // from this site stays on the (correct) `vm_call_sync` path.
     if !slot_ptr.is_null() {
         bump_jit_ic_miss_count();
         // SAFETY: slot_ptr was Box::leak'd by the lowering site for
@@ -7735,15 +7748,17 @@ pub unsafe extern "C" fn vm_call_general(
             if let Some(vmc) = p.as_any().downcast_ref::<VmClosure>() {
                 let id = vmc.closure_id();
                 let jit_ptr = vmc.jit_ptr();
-                if id != 0 && !jit_ptr.is_null() {
+                let param_types = vmc.jit_param_types();
+                let arity = vmc.jit_arity();
+                if id != 0 && !jit_ptr.is_null() && jit_param_types_all_any(param_types, arity) {
                     slot.cached_closure_id
                         .store(id, std::sync::atomic::Ordering::Relaxed);
                     slot.cached_jit_ptr
                         .store(jit_ptr as *mut (), std::sync::atomic::Ordering::Relaxed);
                     slot.cached_arity
-                        .store(vmc.jit_arity(), std::sync::atomic::Ordering::Relaxed);
+                        .store(arity, std::sync::atomic::Ordering::Relaxed);
                     slot.cached_param_types
-                        .store(vmc.jit_param_types(), std::sync::atomic::Ordering::Relaxed);
+                        .store(param_types, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -8315,6 +8330,16 @@ pub const JIT_RT_GC: u8 = 16;
 
 /// Default `jit_param_types` value: every nibble = JIT_RT_FIXNUM (0).
 pub const JIT_PARAM_TYPES_ALL_FIXNUM: u32 = 0;
+
+/// True iff every one of the `arity` low nibbles of `param_types`
+/// is `JIT_RT_ANY` (0xF). Used by the IC miss handler (ADR 0012
+/// D-1, iter JH) to decide whether a `jit_ptr` is safe to cache:
+/// the `CallGeneral` site only ever passes Any-boxed args, so a
+/// cached body must accept Any-shaped params or it will reinterpret
+/// a Gc pointer as a raw immediate.
+pub fn jit_param_types_all_any(param_types: u32, arity: u32) -> bool {
+    (0..arity).all(|i| ((param_types >> (i * 4)) & 0xF) as u8 == JIT_RT_ANY)
+}
 
 /// Process-wide monotonic counter for [`VmClosure::closure_id`]. Each
 /// `MakeClosure` site bumps this and stamps the result into the new

@@ -10589,22 +10589,12 @@ fn diff_jit_ic_miss_counter_api() {
     //   - A monomorphic caller→callee site does NOT produce O(N)
     //     misses for N calls.
     //
-    // What this test does NOT verify (deferred to a follow-up iter):
-    //   - That CallGeneral is actually emitted for caller→callee.
-    //     The bytecode compiler folds global procedure refs to
-    //     Const(Procedure(...)); the JIT translator then takes the
-    //     BuiltinRef path, which can't dispatch user closures and
-    //     so the lambda doesn't JIT-compile at all. Today miss=0
-    //     means "the IC site never executed" rather than "the IC
-    //     hit every time". Two cleanups needed before this test
-    //     becomes a real fire-rate check:
-    //       (a) unfold VmClosure refs in compiler.rs so they go
-    //           through LoadVar → EnvLookup → CallGeneral,
-    //       (b) fix the IC hot path to install JitEnvGuard /
-    //           JitBcGuard / JitFrameGuard / JitSymsGuard before
-    //           call_indirect (currently it bypasses
-    //           try_dispatch_jit and TLS setup, so any non-leaf
-    //           callee SIGSEGVs).
+    // Note: the bytecode compiler folds global procedure refs to
+    // Const(Procedure(...)), so `(define (caller n) (callee n))`
+    // never actually emits a CallGeneral site (the JIT translator
+    // can't dispatch the BuiltinRef("vm-closure") sentinel and the
+    // lambda stays on bytecode). For a test that *does* exercise a
+    // live CallGeneral / IC site, see diff_jit_ic_hof_soundness.
     let mut rt = Runtime::new();
     rt.install_jit().unwrap();
     rt.eval_str_via_vm("<diff>", "(define (callee x) (+ x 1))")
@@ -10636,4 +10626,44 @@ fn diff_jit_ic_miss_counter_api() {
         misses < 100,
         "IC miss count grew faster than expected: misses={misses}"
     );
+}
+
+#[test]
+fn diff_jit_ic_hof_soundness() {
+    // ADR 0012 D-1 (iter JH) — IC soundness gate.
+    //
+    // A higher-order caller `(caller f n)` takes the callee as a
+    // *parameter*, so the JIT translator emits a real CallGeneral
+    // (no Const(Procedure) fold — the fold only catches globals).
+    // The callee `inc` is compiled for a typed Fixnum param, but
+    // CallGeneral passes Any-boxed args. Before the soundness gate,
+    // vm_call_general would cache `inc`'s typed jit_ptr; the IC hot
+    // path then call_indirect'd it with a Gc pointer in the arg
+    // slot, `inc` reinterpreted the pointer as a raw Fixnum, and
+    // (for self-recursive callees like fact) looped unbounded into
+    // a stack overflow. The gate refuses to cache a jit_ptr whose
+    // param types aren't all-Any, so this site always takes the
+    // (correct) vm_call_sync miss path.
+    //
+    // This test just has to *not crash* and produce the right
+    // answer — that proves the gate holds.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (inc x) (+ x 1))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (caller f n) (f n))")
+        .unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0) (acc 0)) \
+           (if (= i 4000) acc \
+               (loop (+ i 1) (caller inc i))))",
+    )
+    .unwrap();
+    // The last (caller inc 3999) returns (inc 3999) = 4000.
+    let result = rt.eval_str_via_vm("<diff>", "(caller inc 41)").unwrap();
+    match result {
+        Value::Number(cs_core::Number::Fixnum(42)) => {}
+        other => panic!("expected (caller inc 41) = 42, got {:?}", other),
+    }
 }
