@@ -386,12 +386,21 @@ pub extern "C" fn vm_env_lookup_fixnum(sym: i64) -> i64 {
     let sym = Symbol(sym as u32);
     match env.get(sym) {
         Some(Value::Number(cs_core::Number::Fixnum(n))) => n,
-        Some(other) => panic!(
-            "vm_env_lookup_fixnum: symbol {:?} bound to non-Fixnum ({})",
-            sym,
-            other.type_name()
-        ),
-        None => panic!("vm_env_lookup_fixnum: unbound symbol {:?}", sym),
+        // ADR 0012 D-1 (iter JK) — deopt-instead-of-panic. The JIT
+        // translator emits this Fixnum-only lookup for *every* free
+        // variable (it can't know a free var's runtime type
+        // statically). A non-Fixnum binding — or an unbound symbol —
+        // used to abort the process through `extern "C"`. Now it
+        // sets the deopt sentinel and returns a placeholder 0; the
+        // JIT body runs to completion with garbage, `try_dispatch_jit`
+        // sees the sentinel, discards the result, and re-runs the
+        // closure on the bytecode VM (which produces the correct
+        // value, or the correct "undefined variable" error). Past
+        // the deopt-retry budget the closure stays on bytecode.
+        Some(_) | None => {
+            jit_request_deopt(DEOPT_REASON_FIXNUM_MISS);
+            0
+        }
     }
 }
 

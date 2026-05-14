@@ -10667,3 +10667,49 @@ fn diff_jit_ic_hof_soundness() {
         other => panic!("expected (caller inc 41) = 42, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_env_lookup_non_fixnum_deopts() {
+    // ADR 0012 D-1 (iter JK) — vm_env_lookup_fixnum deopts instead
+    // of aborting when a free var is bound to a non-Fixnum value.
+    //
+    // `(lambda () captured)` translates to EnvLookup(captured) +
+    // Return. The translator can't know `captured`'s runtime type,
+    // so it emits the Fixnum-only helper. When `captured` is a
+    // vector, the old helper panicked through `extern "C"` and
+    // aborted. Now it sets the deopt sentinel; try_dispatch_jit
+    // discards the placeholder result and re-runs on bytecode,
+    // which returns the vector correctly.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (make-getter c) (lambda () c))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define get-vec (make-getter (vector 7 8 9)))")
+        .unwrap();
+    // Warm the inner lambda past the tier-up threshold.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 2000) 'done (begin (get-vec) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    // After tier-up the JIT body does EnvLookup(captured) on a
+    // vector → deopt → bytecode re-run. Result must still be the
+    // vector, and the process must not abort.
+    let result = rt.eval_str_via_vm("<diff>", "(get-vec)").unwrap();
+    match &result {
+        Value::Vector(v) => {
+            let v = v.borrow();
+            assert_eq!(v.len(), 3);
+            match (&v[0], &v[1], &v[2]) {
+                (
+                    Value::Number(cs_core::Number::Fixnum(7)),
+                    Value::Number(cs_core::Number::Fixnum(8)),
+                    Value::Number(cs_core::Number::Fixnum(9)),
+                ) => {}
+                other => panic!("expected #(7 8 9), got {:?}", other),
+            }
+        }
+        other => panic!("expected vector, got {:?}", other),
+    }
+}
