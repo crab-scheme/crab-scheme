@@ -10713,3 +10713,64 @@ fn diff_jit_env_lookup_non_fixnum_deopts() {
         other => panic!("expected vector, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_ic_dispatch_fires_with_guards() {
+    // ADR 0012 D-1 (iter JI) — the IC hot path routes a slot hit
+    // through vm_ic_dispatch, which installs the callee's TLS
+    // guards (env / bytecode / stack-map frame) before running the
+    // cached native body.
+    //
+    // `dup` has an all-Any param (called with a pair) so the iter-JH
+    // soundness gate lets vm_call_general cache its jit_ptr. `dup`
+    // also allocates (`cons`) — so it genuinely needs the frame
+    // guard installed. A bare call_indirect (pre-JI) ran the body
+    // with no frame registered; vm_ic_dispatch fixes that.
+    //
+    // The test proves three things:
+    //   1. the IC actually fires (jit_ic_hit_count > 0),
+    //   2. the result through the hot path is correct,
+    //   3. the process does not crash.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (dup x) (cons x x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (apply-it f x) (f x))")
+        .unwrap();
+    // Warm both: apply-it's body has a CallGeneral on `f`; dup gets
+    // JIT-compiled with an Any param; the IcSlot fills once and then
+    // hits for the rest of the loop.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 4000) 'done \
+               (begin (apply-it dup (list i)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_ic_hit_count();
+    cs_vm::vm::reset_jit_ic_miss_count();
+    let result = rt
+        .eval_str_via_vm("<diff>", "(apply-it dup (list 7))")
+        .unwrap();
+    let hits = cs_vm::vm::jit_ic_hit_count();
+    let misses = cs_vm::vm::jit_ic_miss_count();
+    eprintln!("IC dispatch: hits={} misses={}", hits, misses);
+    // The IC must have hit at least once on this final call.
+    assert!(
+        hits >= 1,
+        "IC hot path never fired through vm_ic_dispatch \
+         (hits={hits}, misses={misses})"
+    );
+    // (dup (list 7)) = (cons '(7) '(7)) = ((7) 7)
+    match &result {
+        Value::Pair(p) => {
+            let car = p.car.borrow().clone();
+            let cdr = p.cdr.borrow().clone();
+            match (&car, &cdr) {
+                (Value::Pair(_), Value::Pair(_)) => {}
+                other => panic!("expected ((7) 7) shape, got {:?}", other),
+            }
+        }
+        other => panic!("expected pair, got {:?}", other),
+    }
+}

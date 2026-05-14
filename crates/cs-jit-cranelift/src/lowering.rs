@@ -145,6 +145,12 @@ pub struct Lowerer {
     /// `usize` is modeled as `i64` in the Cranelift signature; the
     /// helper truncates internally.
     call_general_func: cranelift_module::FuncId,
+    /// FuncId of `vm_ic_dispatch(callee: i64, args_ptr: *const i64,
+    /// n_args: usize, jit_ptr: *const u8) -> i64`. The IC hot path
+    /// (`Inst::CallGeneral` hit branch) calls this instead of a bare
+    /// `call_indirect`: it installs the callee's env / bytecode /
+    /// stack-map-frame TLS guards first (ADR 0012 D-1, iter JI).
+    ic_dispatch_func: cranelift_module::FuncId,
     /// FuncId of `vm_closure_id_peek(callee: i64) -> u32`. Used by
     /// the IC hot path (ADR 0012 D-1, iter BY) to read a callee's
     /// closure id without consuming the Gc handle.
@@ -850,6 +856,8 @@ impl Lowerer {
         // from `Inst::CallGeneral` whenever the bytecode's call
         // target is neither `self` nor a known builtin.
         builder.symbol("vm_call_general", cs_vm::vm::vm_call_general as *const u8);
+        // ADR 0012 D-1 (iter JI) — IC hot-path dispatch helper.
+        builder.symbol("vm_ic_dispatch", cs_vm::vm::vm_ic_dispatch as *const u8);
         builder.symbol(
             "vm_closure_id_peek",
             cs_vm::vm::vm_closure_id_peek as *const u8,
@@ -1953,6 +1961,25 @@ impl Lowerer {
                 &call_general_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_call_general: {e}")))?;
+
+        // ADR 0012 D-1 (iter JI) — vm_ic_dispatch(callee: i64,
+        // args_ptr: i64, n_args: i64, jit_ptr: i64) -> i64. The IC
+        // hot path calls this on a slot hit instead of a bare
+        // `call_indirect`: it installs the callee's env / bytecode /
+        // stack-map-frame TLS guards before running the cached body.
+        let mut ic_dispatch_sig = module.make_signature();
+        ic_dispatch_sig.params.push(AbiParam::new(I64)); // callee Gc handle
+        ic_dispatch_sig.params.push(AbiParam::new(I64)); // args buffer pointer
+        ic_dispatch_sig.params.push(AbiParam::new(I64)); // n_args
+        ic_dispatch_sig.params.push(AbiParam::new(I64)); // cached jit_ptr
+        ic_dispatch_sig.returns.push(AbiParam::new(I64));
+        let ic_dispatch_func = module
+            .declare_function(
+                "vm_ic_dispatch",
+                cranelift_module::Linkage::Import,
+                &ic_dispatch_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_ic_dispatch: {e}")))?;
 
         // vm_closure_id_peek(i64) -> i32 (u32 zero-extends).
         let mut closure_id_peek_sig = module.make_signature();
@@ -4317,6 +4344,7 @@ impl Lowerer {
             equal_func,
             any_truthy_func,
             call_general_func,
+            ic_dispatch_func,
             closure_id_peek_func,
             alloc_vector_func,
             vector_ref_func,
@@ -4746,6 +4774,10 @@ impl Lowerer {
             let call_general_fnref = self
                 .module
                 .declare_func_in_func(self.call_general_func, builder.func);
+            // iter JI — IC hot-path dispatch (installs TLS guards).
+            let ic_dispatch_fnref = self
+                .module
+                .declare_func_in_func(self.ic_dispatch_func, builder.func);
             let closure_id_peek_fnref = self
                 .module
                 .declare_func_in_func(self.closure_id_peek_func, builder.func);
@@ -5713,6 +5745,7 @@ impl Lowerer {
                         equal_fnref,
                         any_truthy_fnref,
                         call_general_fnref,
+                        ic_dispatch_fnref,
                         closure_id_peek_fnref,
                         alloc_vector_fnref,
                         vector_ref_fnref,
@@ -6145,6 +6178,7 @@ fn lower_inst(
     equal_fnref: cranelift_codegen::ir::FuncRef,
     any_truthy_fnref: cranelift_codegen::ir::FuncRef,
     call_general_fnref: cranelift_codegen::ir::FuncRef,
+    ic_dispatch_fnref: cranelift_codegen::ir::FuncRef,
     closure_id_peek_fnref: cranelift_codegen::ir::FuncRef,
     alloc_vector_fnref: cranelift_codegen::ir::FuncRef,
     vector_ref_fnref: cranelift_codegen::ir::FuncRef,
@@ -7827,10 +7861,18 @@ fn lower_inst(
             // ===== Hit block =====
             b.switch_to_block(hit_block);
             b.seal_block(hit_block);
-            // Drop the callee handle — the cached jit_ptr's body
-            // doesn't consume callee (it consumes args only); we own
-            // the strong ref. Use vm_value_drop_gc.
-            b.ins().call(value_drop_fnref, &[callee_v]);
+            // ADR 0012 D-1 (iter JI) — route the hit through
+            // `vm_ic_dispatch` rather than a bare `call_indirect`.
+            // A bare indirect call ran the cached body *without* the
+            // env / bytecode / stack-map-frame TLS guards that
+            // `try_dispatch_jit` installs — so a callee that did an
+            // `EnvLookup`, built a nested closure, or triggered GC
+            // misbehaved or crashed. `vm_ic_dispatch` installs those
+            // guards, runs the body, decodes the return per the
+            // callee's `jit_return_type`, and handles a mid-body
+            // deopt. It takes the callee handle (consumed there) and
+            // the same args buffer + count the miss path uses.
+            //
             // Load cached_jit_ptr (offset_of cached_jit_ptr inside
             // IcSlot, #[repr(C)]). Field order:
             //   cached_closure_id  AtomicU32  offset 0, 4 bytes
@@ -7843,25 +7885,14 @@ fn lower_inst(
             let cached_jit_ptr_v =
                 b.ins()
                     .load(I64, cranelift_codegen::ir::MemFlags::new(), slot_addr_v, 8);
-            // call_indirect with a signature matching args.len().
-            let mut hit_sig = b.func.import_signature({
-                let mut s = cranelift_codegen::ir::Signature::new(
-                    cranelift_codegen::isa::CallConv::SystemV,
-                );
-                for _ in 0..n {
-                    s.params.push(AbiParam::new(I64));
-                }
-                s.returns.push(AbiParam::new(I64));
-                s
-            });
-            let _ = &mut hit_sig;
-            let hit_inst = b.ins().call_indirect(hit_sig, cached_jit_ptr_v, &arg_vs);
+            let hit_inst = b.ins().call(
+                ic_dispatch_fnref,
+                &[callee_v, buf_addr, n_args_v, cached_jit_ptr_v],
+            );
             let hit_result = {
                 let rs = b.inst_results(hit_inst);
                 if rs.len() != 1 {
-                    return Err(JitError::Codegen(
-                        "IC hit call_indirect expected 1 result".into(),
-                    ));
+                    return Err(JitError::Codegen("vm_ic_dispatch expected 1 result".into()));
                 }
                 rs[0]
             };

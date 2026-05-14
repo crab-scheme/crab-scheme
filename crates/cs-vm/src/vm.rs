@@ -166,6 +166,12 @@ thread_local! {
     /// site bumps it on every call. Tests compare against the
     /// total call count to derive hit-rate.
     static VM_JIT_IC_MISS_COUNT: Cell<u64> = const { Cell::new(0) };
+    /// IC hit counter (ADR 0012 D-1, iter JI). Incremented in
+    /// `vm_ic_dispatch` — i.e. every time a CallGeneral site's
+    /// IcSlot hits and routes through the guard-installing hot
+    /// path. Pairs with `VM_JIT_IC_MISS_COUNT` so tests can prove
+    /// the IC actually fires (not just that it stays sound).
+    static VM_JIT_IC_HIT_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
 thread_local! {
@@ -7779,6 +7785,169 @@ pub unsafe extern "C" fn vm_call_general(
     }
 }
 
+/// IC hot-path dispatch helper (ADR 0012 D-1, iter JI).
+///
+/// The JIT-emitted CallGeneral hot path calls this on an IcSlot
+/// hit instead of doing a bare `call_indirect` to `cached_jit_ptr`.
+/// A bare indirect call was *unsound*: the callee body runs without
+/// the TLS context `try_dispatch_jit` normally installs, so —
+///   - `vm_env_lookup_*` reads the *caller's* env, not the callee's;
+///   - `vm_make_closure` reads the caller's bytecode;
+///   - a GC during the call can't see the callee's frame roots.
+///
+/// This helper installs the same env / bytecode / stack-map-frame
+/// guards `try_dispatch_jit` uses, runs the cached native body, and
+/// decodes the return per the callee's `jit_return_type`. It still
+/// beats the full `vm_call_general` miss path: the closure id is
+/// already verified by the hot path, so there's no symbol-table
+/// dispatch and no `vm_call_sync` indirection on the success path.
+///
+/// Deopt safety: each arg handle is decoded once into an owned
+/// `Value`; the JIT body gets a *fresh* clone-handle, and the
+/// owned `Value`s are retained so a mid-body deopt can fall back
+/// to `vm_call_sync` without a use-after-free — the same shape as
+/// `try_dispatch_jit`'s arg handling.
+///
+/// The symbol-table guard is intentionally *not* re-installed: the
+/// enclosing JIT frame (dispatched through `try_dispatch_jit`)
+/// already holds `JIT_ACTIVE_SYMS` live for the duration of this
+/// nested call, and there is only one `SymbolTable` per runtime.
+///
+/// # Safety
+///
+/// - `callee` is a live owned Gc handle to a `Value::Procedure`
+///   wrapping a `VmClosure` whose `closure_id` the hot path already
+///   matched against the slot. Consumed.
+/// - `args_ptr` points to `n_args` live owned Any-tagged Gc handles
+///   (the iter-JH soundness gate guarantees the cached callee has
+///   all-Any params). Each is consumed.
+/// - `jit_ptr` is the slot's `cached_jit_ptr` — the callee's
+///   SystemV `outer` trampoline, compiled for arity `n_args`.
+/// - `JIT_ACTIVE_SYMS` is installed by the enclosing JIT frame.
+#[no_mangle]
+pub unsafe extern "C" fn vm_ic_dispatch(
+    callee: i64,
+    args_ptr: *const i64,
+    n_args: usize,
+    jit_ptr: *const u8,
+) -> i64 {
+    let callee_v = unsafe { gc_i64_to_value(callee) };
+    let closure = match &callee_v {
+        Value::Procedure(p) => match p.as_any().downcast_ref::<VmClosure>() {
+            Some(c) => c,
+            None => panic!("vm_ic_dispatch: callee is not a VmClosure"),
+        },
+        _ => panic!("vm_ic_dispatch: callee is not a procedure"),
+    };
+    // Decode each arg handle once. `value_args` keeps owned clones
+    // for the deopt fallback; `jit_args` are fresh handles the JIT
+    // body consumes linearly.
+    let mut value_args: Vec<Value> = Vec::with_capacity(n_args);
+    let mut jit_args: [i64; 6] = [0; 6];
+    if n_args > jit_args.len() {
+        // Beyond the fast-path arity window — re-decode and route
+        // through the general path. (try_dispatch_jit caps at 6
+        // too, so the IC slot is never filled for wider arities;
+        // this branch is defensive.)
+        for i in 0..n_args {
+            let v = unsafe { gc_i64_to_value(*args_ptr.add(i)) };
+            value_args.push(v);
+        }
+        let syms_ptr = JIT_ACTIVE_SYMS.with(|c| c.get());
+        if syms_ptr.is_null() {
+            panic!("vm_ic_dispatch: JIT_ACTIVE_SYMS is null");
+        }
+        let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
+        return match vm_call_sync(&callee_v, &value_args, syms) {
+            Ok(v) => value_to_gc_i64(v),
+            Err(e) => panic!("vm_ic_dispatch: {}", e.message),
+        };
+    }
+    for i in 0..n_args {
+        let v = unsafe { gc_i64_to_value(*args_ptr.add(i)) };
+        value_args.push(v.clone());
+        jit_args[i] = value_to_gc_i64(v);
+    }
+    bump_jit_call_count();
+    bump_jit_ic_hit_count();
+    closure.bump_jit_call_count_self();
+    let raw: i64 = {
+        // Same TLS context try_dispatch_jit installs. Guards drop
+        // (reverse order) before `callee_v` at function exit, so the
+        // raw `Rc::as_ptr` pointers they hold stay valid throughout.
+        let _env_guard = JitEnvGuard::install(&closure.env);
+        let _bc_guard = JitBcGuard::install(&closure.bc);
+        let _frame_guard = JitFrameGuard::install(closure.jit_stack_maps());
+        match n_args {
+            0 => {
+                let f: extern "C" fn() -> i64 = unsafe { std::mem::transmute(jit_ptr) };
+                f()
+            }
+            1 => {
+                let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(jit_ptr) };
+                f(jit_args[0])
+            }
+            2 => {
+                let f: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(jit_ptr) };
+                f(jit_args[0], jit_args[1])
+            }
+            3 => {
+                let f: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(jit_ptr) };
+                f(jit_args[0], jit_args[1], jit_args[2])
+            }
+            4 => {
+                let f: extern "C" fn(i64, i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(jit_ptr) };
+                f(jit_args[0], jit_args[1], jit_args[2], jit_args[3])
+            }
+            5 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(jit_ptr) };
+                f(
+                    jit_args[0],
+                    jit_args[1],
+                    jit_args[2],
+                    jit_args[3],
+                    jit_args[4],
+                )
+            }
+            6 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(jit_ptr) };
+                f(
+                    jit_args[0],
+                    jit_args[1],
+                    jit_args[2],
+                    jit_args[3],
+                    jit_args[4],
+                    jit_args[5],
+                )
+            }
+            _ => unreachable!("n_args > 6 handled above"),
+        }
+    };
+    // Iter BW deopt sentinel: if the JIT body bailed, `jit_args`
+    // were consumed by it — re-dispatch from the `value_args`
+    // clones via the bytecode VM.
+    if jit_take_deopt() != 0 {
+        let n = closure.bump_jit_deopt();
+        if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
+            closure.clear_jit_for_recompile();
+        }
+        let syms_ptr = JIT_ACTIVE_SYMS.with(|c| c.get());
+        if syms_ptr.is_null() {
+            panic!("vm_ic_dispatch: JIT_ACTIVE_SYMS is null");
+        }
+        let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
+        return match vm_call_sync(&callee_v, &value_args, syms) {
+            Ok(v) => value_to_gc_i64(v),
+            Err(e) => panic!("vm_ic_dispatch: {}", e.message),
+        };
+    }
+    value_to_gc_i64(decode_jit_return(closure.jit_return_type(), raw))
+}
+
 /// Peek a closure's `closure_id` without consuming the Gc handle.
 /// Returns 0 if `callee` is not a `Value::Procedure(VmClosure)`.
 /// Used by JIT-emitted IC hot path: load the id, compare against
@@ -7896,6 +8065,25 @@ pub fn reset_jit_ic_miss_count() {
 /// from the IC miss path.
 fn bump_jit_ic_miss_count() {
     VM_JIT_IC_MISS_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+/// Current per-thread IC hit count (ADR 0012 D-1, iter JI).
+/// Incremented inside `vm_ic_dispatch` — every time a CallGeneral
+/// site's IC slot hits and routes through the guard-installing
+/// hot path. Pairs with `jit_ic_miss_count` to derive a real
+/// hit-rate.
+pub fn jit_ic_hit_count() -> u64 {
+    VM_JIT_IC_HIT_COUNT.with(|c| c.get())
+}
+
+/// Reset the per-thread IC hit count.
+pub fn reset_jit_ic_hit_count() {
+    VM_JIT_IC_HIT_COUNT.with(|c| c.set(0));
+}
+
+/// Increment the IC hit counter. Called by `vm_ic_dispatch`.
+fn bump_jit_ic_hit_count() {
+    VM_JIT_IC_HIT_COUNT.with(|c| c.set(c.get() + 1));
 }
 
 /// Increment the JIT-dispatch counter. Called by the closure-call
