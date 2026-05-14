@@ -141,12 +141,20 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
         Ok(r) => r,
         Err(_) => return,
     };
+    // ADR 0012 D-1 (closure-env capture fix) — record whether the
+    // body builds a nested closure. If so, `try_dispatch_jit` must
+    // install a params-bound invocation-frame env on JIT_CALLER_ENV
+    // (not the bare definition env) so `vm_make_closure` captures
+    // this invocation's parameters. Computed before `compile_*`
+    // since the lowerer may drain parts of the RIR.
+    let builds_closures = rir.builds_closures();
     let ptr = match lowerer.compile_pure_fixnum(&rir) {
         Ok(p) => p,
         Err(_) => return,
     };
     closure.set_jit_ptr(ptr, lam.params.len() as u32);
     closure.set_jit_param_types(&param_tags);
+    closure.set_jit_needs_frame_env(builds_closures);
     // ADR 0012 D-2 (iter BM) — install the harvested stack-map
     // registry on the closure. Empty record-set is fine (means no
     // call inside the body kept a Gc handle live across it). The

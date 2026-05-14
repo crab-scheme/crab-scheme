@@ -8031,6 +8031,7 @@ pub unsafe extern "C" fn vm_make_closure(lambda_idx: i64) -> i64 {
         jit_deopt_count: Cell::new(0),
         jit_call_count: Cell::new(0),
         jit_stack_maps: std::cell::RefCell::new(None),
+        jit_needs_frame_env: Cell::new(false),
         closure_id: alloc_closure_id(),
     };
     let p: Rc<dyn Procedure> = Rc::new(cl);
@@ -8157,7 +8158,32 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value], syms: &mut SymbolTable)
     // Inst::EnvLookup the body emits can read free vars. The
     // guard restores the previous value (or null) on drop, even
     // on panic from inside the JIT body.
-    let _env_guard = JitEnvGuard::install(&closure.env);
+    //
+    // ADR 0012 D-1 (closure-env capture fix): the bare definition-
+    // time `closure.env` is wrong when the body builds a nested
+    // closure. `vm_make_closure` captures whatever `JIT_CALLER_ENV`
+    // points at; a nested lambda's free vars include *this*
+    // invocation's parameters, which are otherwise passed only as
+    // native registers and live in no env. So when the body has a
+    // `MakeClosure` (flag set by the tier-up hook), build a real
+    // invocation-frame env — params bound, parented to the
+    // definition env — exactly as the bytecode VM's closure-call
+    // path does. Pure-arithmetic bodies (no `MakeClosure`) keep the
+    // zero-alloc fast path: `closure.env` directly.
+    let frame_env_holder: Option<Rc<Env>> = if closure.jit_needs_frame_env() {
+        let env = Env::child(closure.env.clone());
+        let lam = &closure.bc.lambdas[closure.lambda_idx];
+        for (name, v) in lam.params.iter().zip(args.iter()) {
+            env.define(*name, v.clone());
+        }
+        Some(env)
+    } else {
+        None
+    };
+    let _env_guard = match &frame_env_holder {
+        Some(e) => JitEnvGuard::install(e),
+        None => JitEnvGuard::install(&closure.env),
+    };
     // Install the closure's bytecode in the JIT thread-local so
     // `vm_make_closure` (iter BZ) can build a `VmClosure` for a
     // nested-lambda site using the same `Rc<Bytecode>` the
@@ -8455,6 +8481,18 @@ pub struct VmClosure {
     /// map. None until the tier-up hook installs both the JIT ptr
     /// and the maps. ADR 0012 D-2 (iter BM).
     jit_stack_maps: std::cell::RefCell<Option<std::rc::Rc<crate::jit_stackmap::JitStackMaps>>>,
+    /// Whether the JIT body needs a real *invocation-frame* env
+    /// installed on `JIT_CALLER_ENV` (params bound, parented to
+    /// `self.env`) rather than the bare definition-time `self.env`.
+    /// Set by the tier-up hook when the translated body contains a
+    /// `MakeClosure` inst: a nested lambda built via
+    /// `vm_make_closure` captures `JIT_CALLER_ENV`, and that capture
+    /// must include the JIT function's *parameters* (which are
+    /// otherwise passed only as native registers, not via any env).
+    /// Pure-arithmetic bodies (fib/tak/ack — no `MakeClosure`) leave
+    /// this false and keep the zero-alloc fast path. ADR 0012 D-1
+    /// (closure-env capture fix).
+    jit_needs_frame_env: Cell<bool>,
     /// Stable, process-wide unique identity. Stamped once at
     /// construction (the `Inst::MakeClosure` site in `run_dispatch`)
     /// from [`NEXT_CLOSURE_ID`] and never mutated thereafter — the
@@ -8594,6 +8632,20 @@ impl VmClosure {
     /// borrow across GC operations.
     pub fn jit_stack_maps(&self) -> Option<std::rc::Rc<crate::jit_stackmap::JitStackMaps>> {
         self.jit_stack_maps.borrow().clone()
+    }
+
+    /// Record whether the JIT body needs a full invocation-frame env
+    /// (params bound) installed on `JIT_CALLER_ENV`. Set by the
+    /// tier-up hook when the translated body contains a `MakeClosure`
+    /// — see the field doc on [`VmClosure::jit_needs_frame_env`].
+    pub fn set_jit_needs_frame_env(&self, needs: bool) {
+        self.jit_needs_frame_env.set(needs);
+    }
+
+    /// Whether `try_dispatch_jit` must build a params-bound frame env
+    /// before entering this closure's JIT body.
+    pub fn jit_needs_frame_env(&self) -> bool {
+        self.jit_needs_frame_env.get()
     }
 
     /// Bake per-param type tags from a slice (low nibble = arg 0).
@@ -10609,6 +10661,7 @@ fn run_dispatch(
                     jit_deopt_count: Cell::new(0),
                     jit_call_count: Cell::new(0),
                     jit_stack_maps: std::cell::RefCell::new(None),
+                    jit_needs_frame_env: Cell::new(false),
                     closure_id: alloc_closure_id(),
                 };
                 let p: Rc<dyn Procedure> = Rc::new(cl);

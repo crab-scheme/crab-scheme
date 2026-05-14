@@ -1374,6 +1374,20 @@ impl Function {
     pub fn inst_count(&self) -> usize {
         self.blocks.iter().map(|b| b.insts.len()).sum()
     }
+
+    /// True if the body builds a nested closure (`MakeClosure`).
+    /// The runtime uses this to decide whether the JIT dispatch
+    /// path must materialize a params-bound invocation-frame env on
+    /// `JIT_CALLER_ENV` before entering the body: `vm_make_closure`
+    /// captures that env, and a nested lambda's free vars include
+    /// the enclosing JIT function's parameters (ADR 0012 D-1
+    /// closure-env capture fix).
+    pub fn builds_closures(&self) -> bool {
+        self.blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, Inst::MakeClosure(_, _)))
+    }
 }
 
 #[cfg(test)]

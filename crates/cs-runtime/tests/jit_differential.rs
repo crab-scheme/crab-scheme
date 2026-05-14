@@ -10774,3 +10774,58 @@ fn diff_jit_ic_dispatch_fires_with_guards() {
         other => panic!("expected pair, got {:?}", other),
     }
 }
+
+#[test]
+fn diff_jit_nested_closure_captures_params() {
+    // ADR 0012 D-1 (closure-env capture fix) — a JIT-compiled
+    // function that builds a nested closure must capture its own
+    // *invocation parameters*, not just its definition-time env.
+    //
+    // Before the fix, try_dispatch_jit installed the bare
+    // `closure.env` (definition env) on JIT_CALLER_ENV, so
+    // vm_make_closure built the nested lambda capturing an env that
+    // lacked the enclosing JIT function's params. The nested
+    // lambda's free-var lookup then failed:
+    //   `vm_call_general: undefined variable: <param>`
+    // (the nqueens / mandelbrot / spectral-norm benchmark crash).
+    //
+    // `apply-captured` takes param `n`, builds `(lambda (x) (+ x n))`
+    // capturing `n`, and calls it. Correct result through the JIT
+    // proves the frame env is installed.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(define (apply-captured n) \
+           (let ((f (lambda (x) (+ x n)))) \
+             (f 1000)))",
+    )
+    .unwrap();
+    // Warm apply-captured past the tier-up threshold so it JIT-compiles
+    // (its body has a MakeClosure → needs the frame env).
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 2000) 'done \
+               (begin (apply-captured i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    // After tier-up: apply-captured's JIT body builds the inner
+    // lambda via vm_make_closure; the frame env must carry `n`.
+    let result = rt.eval_str_via_vm("<diff>", "(apply-captured 7)").unwrap();
+    match result {
+        Value::Number(cs_core::Number::Fixnum(1007)) => {}
+        other => panic!("expected (apply-captured 7) = 1007, got {:?}", other),
+    }
+    // Cross-check against the walker tier.
+    let walker = walker_eval(
+        &["(define (apply-captured n) \
+             (let ((f (lambda (x) (+ x n)))) \
+               (f 1000)))"],
+        "(apply-captured 7)",
+    );
+    match walker {
+        Value::Number(cs_core::Number::Fixnum(1007)) => {}
+        other => panic!("walker disagreed: {:?}", other),
+    }
+}
