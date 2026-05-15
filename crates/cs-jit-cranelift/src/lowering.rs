@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 
+use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     types::{F64, I64},
     AbiParam, Function as ClifFunction, InstBuilder, Signature, StackSlotData, StackSlotKind,
@@ -4842,10 +4843,12 @@ impl Lowerer {
         Ok(self.module.get_finalized_function(outer_id))
     }
 
-    /// Iter 3.1 body lowering — minimal `LoadConst` / `Add` / `Return`.
-    /// All values flow as raw NanboxValue i64s; `Add` delegates to
-    /// `vm_value_add_nb` (which does its own Fixnum fast path). Future
-    /// iters inline the tag check and add more ops.
+    /// Body lowering for the uniform-NB tier. Iter 3.1 supported only
+    /// `LoadConst`/`Add`/`Return`; iter 3.2 adds `Sub`/`Mul`/`Lt`/`Eq`
+    /// with inline Fixnum fast paths (NB tag check + 47-bit payload
+    /// extract + checked op + Fixnum NB re-encode), `Term::Jump`, and
+    /// `Term::Branch` (NB truthiness check vs the `Boolean(false)` NB
+    /// constant). Slow paths still delegate to `vm_value_*_nb`.
     fn compile_inner_body_uniform_nb(
         &mut self,
         rir: &RirFunction,
@@ -4858,36 +4861,44 @@ impl Lowerer {
         let mut value_map: HashMap<RirValue, cranelift_codegen::ir::Value> = HashMap::new();
         {
             let mut builder = FunctionBuilder::new(&mut clif, &mut self.func_ctx);
-            let value_add_nb_fnref = self
-                .module
-                .declare_func_in_func(self.value_add_nb_func, builder.func);
+            let nb_helpers = NbHelpers {
+                add: self
+                    .module
+                    .declare_func_in_func(self.value_add_nb_func, builder.func),
+                sub: self
+                    .module
+                    .declare_func_in_func(self.value_sub_nb_func, builder.func),
+                mul: self
+                    .module
+                    .declare_func_in_func(self.value_mul_nb_func, builder.func),
+                lt: self
+                    .module
+                    .declare_func_in_func(self.value_lt_nb_func, builder.func),
+                eq: self
+                    .module
+                    .declare_func_in_func(self.value_eq_nb_func, builder.func),
+            };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
             let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
                 HashMap::new();
             for blk in &rir.blocks {
                 let cb = builder.create_block();
-                // Block params get appended in lower_block below. The
-                // entry block also gets the function's actual params
-                // (one slot per `rir.params`).
                 block_map.insert(blk.id, cb);
             }
             let entry_block = *block_map
                 .get(&rir.entry)
                 .ok_or_else(|| JitError::Codegen("entry block missing".into()))?;
-            // Wire function params into the entry block's signature.
             for _ in &rir.params {
                 builder.append_block_param(entry_block, I64);
             }
             builder.switch_to_block(entry_block);
             builder.seal_block(entry_block);
-            // Bind RIR Value(i) for params to the entry block params.
             for (i, (rv, _ty)) in rir.params.iter().enumerate() {
                 let p = builder.block_params(entry_block)[i];
                 value_map.insert(*rv, p);
             }
 
-            // Append per-block params for non-entry blocks.
             for blk in &rir.blocks {
                 if blk.id == rir.entry {
                     continue;
@@ -4898,19 +4909,17 @@ impl Lowerer {
                 }
             }
 
-            // Lower each block.
             for blk in &rir.blocks {
                 let cb = block_map[&blk.id];
                 if blk.id != rir.entry {
                     builder.switch_to_block(cb);
-                    // Bind RIR block params to the Cranelift block params.
                     for (i, (rv, _ty)) in blk.params.iter().enumerate() {
                         let p = builder.block_params(cb)[i];
                         value_map.insert(*rv, p);
                     }
                     builder.seal_block(cb);
                 }
-                lower_inst_uniform_nb(&mut builder, &mut value_map, value_add_nb_fnref, blk)?;
+                lower_inst_uniform_nb(&mut builder, &mut value_map, &nb_helpers, blk)?;
                 lower_terminator_uniform_nb(&mut builder, &value_map, &block_map, &blk.terminator)?;
             }
 
@@ -6339,6 +6348,17 @@ fn detect_tail_call_self<'a>(
     }
 }
 
+/// Bundle of `FuncRef`s for the Stage 3 NB-typed slow-path helpers.
+/// Threaded through the body-lowering free functions so they don't
+/// need an enormous arg list.
+struct NbHelpers {
+    add: cranelift_codegen::ir::FuncRef,
+    sub: cranelift_codegen::ir::FuncRef,
+    mul: cranelift_codegen::ir::FuncRef,
+    lt: cranelift_codegen::ir::FuncRef,
+    eq: cranelift_codegen::ir::FuncRef,
+}
+
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
 /// instructions and emits Cranelift IR for the supported subset.
 /// Returns `JitError::Unsupported(...)` on RIR variants the iter
@@ -6347,7 +6367,7 @@ fn detect_tail_call_self<'a>(
 fn lower_inst_uniform_nb(
     b: &mut FunctionBuilder,
     map: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
-    value_add_nb_fnref: cranelift_codegen::ir::FuncRef,
+    helpers: &NbHelpers,
     blk: &cs_rir::Block,
 ) -> Result<(), JitError> {
     for inst in &blk.insts {
@@ -6358,19 +6378,45 @@ fn lower_inst_uniform_nb(
                 map.insert(*dst, v);
             }
             &Inst::Add(dst, lhs, rhs) => {
-                let a = *map.get(&lhs).ok_or_else(|| {
-                    JitError::Codegen(format!("Add: lhs SSA value {:?} unbound", lhs))
-                })?;
-                let bv = *map.get(&rhs).ok_or_else(|| {
-                    JitError::Codegen(format!("Add: rhs SSA value {:?} unbound", rhs))
-                })?;
-                let call = b.ins().call(value_add_nb_fnref, &[a, bv]);
-                let r = b.inst_results(call)[0];
+                let a = lookup(map, lhs)?;
+                let bv = lookup(map, rhs)?;
+                let r =
+                    emit_nb_arith_fixnum_fast(b, helpers.add, a, bv, |b, l, r| b.ins().iadd(l, r));
+                map.insert(dst, r);
+            }
+            &Inst::Sub(dst, lhs, rhs) => {
+                let a = lookup(map, lhs)?;
+                let bv = lookup(map, rhs)?;
+                let r =
+                    emit_nb_arith_fixnum_fast(b, helpers.sub, a, bv, |b, l, r| b.ins().isub(l, r));
+                map.insert(dst, r);
+            }
+            &Inst::Mul(dst, lhs, rhs) => {
+                let a = lookup(map, lhs)?;
+                let bv = lookup(map, rhs)?;
+                let r =
+                    emit_nb_arith_fixnum_fast(b, helpers.mul, a, bv, |b, l, r| b.ins().imul(l, r));
+                map.insert(dst, r);
+            }
+            &Inst::Lt(dst, lhs, rhs) => {
+                let a = lookup(map, lhs)?;
+                let bv = lookup(map, rhs)?;
+                let r = emit_nb_cmp_fixnum_fast(b, helpers.lt, a, bv, |b, l, r| {
+                    b.ins().icmp(IntCC::SignedLessThan, l, r)
+                });
+                map.insert(dst, r);
+            }
+            &Inst::Eq(dst, lhs, rhs) => {
+                let a = lookup(map, lhs)?;
+                let bv = lookup(map, rhs)?;
+                let r = emit_nb_cmp_fixnum_fast(b, helpers.eq, a, bv, |b, l, r| {
+                    b.ins().icmp(IntCC::Equal, l, r)
+                });
                 map.insert(dst, r);
             }
             other => {
                 return Err(JitError::Unsupported(format!(
-                    "uniform-nb skeleton: Inst {:?} not yet supported",
+                    "uniform-nb: Inst {:?} not yet supported",
                     other
                 )));
             }
@@ -6379,27 +6425,188 @@ fn lower_inst_uniform_nb(
     Ok(())
 }
 
-/// Stage 3 baseline-tier terminator lowering. Returns
-/// `JitError::Unsupported` on variants the iter hasn't covered.
+/// Stage 3 baseline-tier terminator lowering. Supports `Return`,
+/// `Jump` (with block params), and `Branch` (NB truthiness check
+/// against `Value::Boolean(false)` bit pattern).
 fn lower_terminator_uniform_nb(
     b: &mut FunctionBuilder,
     map: &HashMap<RirValue, cranelift_codegen::ir::Value>,
-    _block_map: &HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block>,
+    block_map: &HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block>,
     term: &Term,
 ) -> Result<(), JitError> {
     match term {
         Term::Return(v) => {
-            let val = *map
-                .get(v)
-                .ok_or_else(|| JitError::Codegen(format!("Return: SSA value {:?} unbound", v)))?;
+            let val = lookup(map, *v)?;
             b.ins().return_(&[val]);
             Ok(())
         }
-        other => Err(JitError::Unsupported(format!(
-            "uniform-nb skeleton: Term {:?} not yet supported",
-            other
-        ))),
+        Term::Jump(target, args) => {
+            let tb = *block_map
+                .get(target)
+                .ok_or_else(|| JitError::Codegen(format!("unknown jump target {:?}", target)))?;
+            let cargs: Vec<cranelift_codegen::ir::BlockArg> = args
+                .iter()
+                .map(|a| lookup(map, *a).map(cranelift_codegen::ir::BlockArg::Value))
+                .collect::<Result<_, _>>()?;
+            b.ins().jump(tb, &cargs);
+            Ok(())
+        }
+        Term::Branch(cond, then_b, else_b) => {
+            let cv = lookup(map, *cond)?;
+            let tb = *block_map
+                .get(then_b)
+                .ok_or_else(|| JitError::Codegen(format!("unknown then target {:?}", then_b)))?;
+            let eb = *block_map
+                .get(else_b)
+                .ok_or_else(|| JitError::Codegen(format!("unknown else target {:?}", else_b)))?;
+            // NB truthiness: falsy IFF the bit pattern equals NB_FALSE
+            // (Value::Boolean(false) NB). Anything else is truthy.
+            let nb_false_bits = cs_vm::vm::NanboxValue::FALSE.into_raw();
+            let truthy = b.ins().icmp_imm(IntCC::NotEqual, cv, nb_false_bits);
+            b.ins().brif(truthy, tb, &[], eb, &[]);
+            Ok(())
+        }
     }
+}
+
+/// Emit the inline Fixnum-Fixnum fast path for an NB-typed binary
+/// arithmetic op (`Add`/`Sub`/`Mul`). On Fixnum/Fixnum operands and no
+/// 47-bit overflow, the op runs as a single i64 instruction and the
+/// result is re-encoded as a Fixnum NB. Otherwise (mixed types or
+/// overflow) the slow-path helper is called.
+fn emit_nb_arith_fixnum_fast(
+    b: &mut FunctionBuilder,
+    slow_fnref: cranelift_codegen::ir::FuncRef,
+    a: cranelift_codegen::ir::Value,
+    bv: cranelift_codegen::ir::Value,
+    fast_op: impl FnOnce(
+        &mut FunctionBuilder,
+        cranelift_codegen::ir::Value,
+        cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    use cs_vm::vm::{NB_PAYLOAD_MASK, NB_SIGNATURE_BITS, NB_SIGNATURE_MASK, NB_TAG_MASK};
+
+    let combined_mask = (NB_SIGNATURE_MASK | NB_TAG_MASK) as i64;
+    let fixnum_pattern = NB_SIGNATURE_BITS as i64; // NB_TAG_FIXNUM == 0.
+
+    let a_masked = b.ins().band_imm(a, combined_mask);
+    let b_masked = b.ins().band_imm(bv, combined_mask);
+    let a_fix = b.ins().icmp_imm(IntCC::Equal, a_masked, fixnum_pattern);
+    let b_fix = b.ins().icmp_imm(IntCC::Equal, b_masked, fixnum_pattern);
+    let both_fix = b.ins().band(a_fix, b_fix);
+
+    let fast_bb = b.create_block();
+    let slow_bb = b.create_block();
+    let join_bb = b.create_block();
+    b.append_block_param(join_bb, I64);
+
+    b.ins().brif(both_fix, fast_bb, &[], slow_bb, &[]);
+
+    // FAST: extract Fixnum payloads, do op, check overflow.
+    b.switch_to_block(fast_bb);
+    b.seal_block(fast_bb);
+    let a_payload = b.ins().band_imm(a, NB_PAYLOAD_MASK as i64);
+    let b_payload = b.ins().band_imm(bv, NB_PAYLOAD_MASK as i64);
+    let a_shl = b.ins().ishl_imm(a_payload, 17);
+    let av = b.ins().sshr_imm(a_shl, 17);
+    let b_shl = b.ins().ishl_imm(b_payload, 17);
+    let bvv = b.ins().sshr_imm(b_shl, 17);
+    let raw = fast_op(b, av, bvv);
+    let raw_shl = b.ins().ishl_imm(raw, 17);
+    let raw_ext = b.ins().sshr_imm(raw_shl, 17);
+    let fits = b.ins().icmp(IntCC::Equal, raw, raw_ext);
+    let ok_bb = b.create_block();
+    let ov_bb = b.create_block();
+    b.ins().brif(fits, ok_bb, &[], ov_bb, &[]);
+
+    b.switch_to_block(ok_bb);
+    b.seal_block(ok_bb);
+    let payload_only = b.ins().band_imm(raw, NB_PAYLOAD_MASK as i64);
+    let encoded = b.ins().bor_imm(payload_only, NB_SIGNATURE_BITS as i64);
+    b.ins()
+        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(encoded)]);
+
+    b.switch_to_block(ov_bb);
+    b.seal_block(ov_bb);
+    let call_ov = b.ins().call(slow_fnref, &[a, bv]);
+    let r_ov = b.inst_results(call_ov)[0];
+    b.ins()
+        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(r_ov)]);
+
+    b.switch_to_block(slow_bb);
+    b.seal_block(slow_bb);
+    let call_slow = b.ins().call(slow_fnref, &[a, bv]);
+    let r_slow = b.inst_results(call_slow)[0];
+    b.ins()
+        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(r_slow)]);
+
+    b.switch_to_block(join_bb);
+    b.seal_block(join_bb);
+    b.block_params(join_bb)[0]
+}
+
+/// Emit the inline Fixnum-Fixnum fast path for an NB-typed comparison
+/// (`Lt`/`Eq`). The 0/1 result of the underlying `icmp` is or'd with
+/// the `Boolean(false)` NB bit pattern — adding the low bit if true,
+/// leaving it clear if false, matching `NanboxValue::boolean(b)`.
+fn emit_nb_cmp_fixnum_fast(
+    b: &mut FunctionBuilder,
+    slow_fnref: cranelift_codegen::ir::FuncRef,
+    a: cranelift_codegen::ir::Value,
+    bv: cranelift_codegen::ir::Value,
+    fast_cmp: impl FnOnce(
+        &mut FunctionBuilder,
+        cranelift_codegen::ir::Value,
+        cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    use cs_vm::vm::{
+        NanboxValue, NB_PAYLOAD_MASK, NB_SIGNATURE_BITS, NB_SIGNATURE_MASK, NB_TAG_MASK,
+    };
+
+    let combined_mask = (NB_SIGNATURE_MASK | NB_TAG_MASK) as i64;
+    let fixnum_pattern = NB_SIGNATURE_BITS as i64;
+
+    let a_masked = b.ins().band_imm(a, combined_mask);
+    let b_masked = b.ins().band_imm(bv, combined_mask);
+    let a_fix = b.ins().icmp_imm(IntCC::Equal, a_masked, fixnum_pattern);
+    let b_fix = b.ins().icmp_imm(IntCC::Equal, b_masked, fixnum_pattern);
+    let both_fix = b.ins().band(a_fix, b_fix);
+
+    let fast_bb = b.create_block();
+    let slow_bb = b.create_block();
+    let join_bb = b.create_block();
+    b.append_block_param(join_bb, I64);
+
+    b.ins().brif(both_fix, fast_bb, &[], slow_bb, &[]);
+
+    b.switch_to_block(fast_bb);
+    b.seal_block(fast_bb);
+    let a_payload = b.ins().band_imm(a, NB_PAYLOAD_MASK as i64);
+    let b_payload = b.ins().band_imm(bv, NB_PAYLOAD_MASK as i64);
+    let a_shl = b.ins().ishl_imm(a_payload, 17);
+    let av = b.ins().sshr_imm(a_shl, 17);
+    let b_shl = b.ins().ishl_imm(b_payload, 17);
+    let bvv = b.ins().sshr_imm(b_shl, 17);
+    let cmp = fast_cmp(b, av, bvv); // i8 (icmp result) of 0/1.
+                                    // Widen to i64 so we can or-in the NB_FALSE pattern.
+    let cmp_w = b.ins().uextend(I64, cmp);
+    let nb_false = NanboxValue::FALSE.into_raw();
+    let result = b.ins().bor_imm(cmp_w, nb_false);
+    b.ins()
+        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(result)]);
+
+    b.switch_to_block(slow_bb);
+    b.seal_block(slow_bb);
+    let call_slow = b.ins().call(slow_fnref, &[a, bv]);
+    let r_slow = b.inst_results(call_slow)[0];
+    b.ins()
+        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(r_slow)]);
+
+    b.switch_to_block(join_bb);
+    b.seal_block(join_bb);
+    b.block_params(join_bb)[0]
 }
 
 /// Encode an RIR `Const` to its `NanboxValue` bit pattern as an i64

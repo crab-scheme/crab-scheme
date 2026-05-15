@@ -176,6 +176,271 @@ fn uniform_nb_loadconst_plus_param() {
 }
 
 #[test]
+fn uniform_nb_sub_two_fixnums() {
+    use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("sub_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.params.push((cs_rir::Value(1), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![RirInst::Sub(
+            cs_rir::Value(2),
+            cs_rir::Value(0),
+            cs_rir::Value(1),
+        )],
+        terminator: Term::Return(cs_rir::Value(2)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64, i64) -> i64 = unsafe { transmute(ptr) };
+
+    let r = func(
+        NanboxValue::fixnum(100).into_raw(),
+        NanboxValue::fixnum(58).into_raw(),
+    );
+    match unsafe { NanboxValue(r).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 42),
+        other => panic!("expected Fixnum(42), got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_mul_two_fixnums() {
+    use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("mul_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.params.push((cs_rir::Value(1), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![RirInst::Mul(
+            cs_rir::Value(2),
+            cs_rir::Value(0),
+            cs_rir::Value(1),
+        )],
+        terminator: Term::Return(cs_rir::Value(2)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64, i64) -> i64 = unsafe { transmute(ptr) };
+
+    let r = func(
+        NanboxValue::fixnum(6).into_raw(),
+        NanboxValue::fixnum(7).into_raw(),
+    );
+    match unsafe { NanboxValue(r).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 42),
+        other => panic!("expected Fixnum(42), got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_lt_returns_boolean_nb() {
+    use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("lt_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.params.push((cs_rir::Value(1), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![RirInst::Lt(
+            cs_rir::Value(2),
+            cs_rir::Value(0),
+            cs_rir::Value(1),
+        )],
+        terminator: Term::Return(cs_rir::Value(2)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64, i64) -> i64 = unsafe { transmute(ptr) };
+
+    let r_true = func(
+        NanboxValue::fixnum(1).into_raw(),
+        NanboxValue::fixnum(2).into_raw(),
+    );
+    match unsafe { NanboxValue(r_true).to_value() } {
+        cs_core::Value::Boolean(b) => assert!(b),
+        other => panic!("expected Boolean(true), got {:?}", other),
+    }
+    let r_false = func(
+        NanboxValue::fixnum(2).into_raw(),
+        NanboxValue::fixnum(2).into_raw(),
+    );
+    match unsafe { NanboxValue(r_false).to_value() } {
+        cs_core::Value::Boolean(b) => assert!(!b),
+        other => panic!("expected Boolean(false), got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_branch_clamp() {
+    // Multi-block clamp: if x < 10 then x else x * 2.
+    use cs_rir::{Block, BlockId, Const as RirConst, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("clamp_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            RirInst::LoadConst(cs_rir::Value(1), RirConst::Fixnum(10)),
+            RirInst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
+        ],
+        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2)),
+    });
+    f.blocks.push(Block {
+        id: BlockId(1),
+        params: vec![],
+        insts: vec![],
+        terminator: Term::Return(cs_rir::Value(0)),
+    });
+    f.blocks.push(Block {
+        id: BlockId(2),
+        params: vec![],
+        insts: vec![
+            RirInst::LoadConst(cs_rir::Value(3), RirConst::Fixnum(2)),
+            RirInst::Mul(cs_rir::Value(4), cs_rir::Value(0), cs_rir::Value(3)),
+        ],
+        terminator: Term::Return(cs_rir::Value(4)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
+
+    // x=5 < 10 → return x = 5.
+    let r5 = func(NanboxValue::fixnum(5).into_raw());
+    match unsafe { NanboxValue(r5).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 5),
+        other => panic!("expected Fixnum(5), got {:?}", other),
+    }
+    // x=15 ≥ 10 → return x*2 = 30.
+    let r15 = func(NanboxValue::fixnum(15).into_raw());
+    match unsafe { NanboxValue(r15).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 30),
+        other => panic!("expected Fixnum(30), got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_jump_with_block_param() {
+    // (fn (x) (let join ([v (if (< x 0) (- 0 x) x)]) v))
+    use cs_rir::{Block, BlockId, Const as RirConst, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("abs_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            RirInst::LoadConst(cs_rir::Value(1), RirConst::Fixnum(0)),
+            RirInst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
+        ],
+        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2)),
+    });
+    // Negative branch: 0 - x.
+    f.blocks.push(Block {
+        id: BlockId(1),
+        params: vec![],
+        insts: vec![
+            RirInst::LoadConst(cs_rir::Value(3), RirConst::Fixnum(0)),
+            RirInst::Sub(cs_rir::Value(4), cs_rir::Value(3), cs_rir::Value(0)),
+        ],
+        terminator: Term::Jump(BlockId(3), vec![cs_rir::Value(4)]),
+    });
+    // Positive branch: pass x through.
+    f.blocks.push(Block {
+        id: BlockId(2),
+        params: vec![],
+        insts: vec![],
+        terminator: Term::Jump(BlockId(3), vec![cs_rir::Value(0)]),
+    });
+    // Join.
+    f.blocks.push(Block {
+        id: BlockId(3),
+        params: vec![(cs_rir::Value(5), Type::Any)],
+        insts: vec![],
+        terminator: Term::Return(cs_rir::Value(5)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
+
+    let r_neg = func(NanboxValue::fixnum(-7).into_raw());
+    match unsafe { NanboxValue(r_neg).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 7),
+        other => panic!("expected Fixnum(7), got {:?}", other),
+    }
+    let r_pos = func(NanboxValue::fixnum(5).into_raw());
+    match unsafe { NanboxValue(r_pos).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 5),
+        other => panic!("expected Fixnum(5), got {:?}", other),
+    }
+    let r_zero = func(NanboxValue::fixnum(0).into_raw());
+    match unsafe { NanboxValue(r_zero).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 0),
+        other => panic!("expected Fixnum(0), got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_mul_overflow_falls_to_helper() {
+    // (* a b) where a*b overflows 47-bit Fixnum. The fast path's
+    // overflow check fires and the slow helper does the BigInt math
+    // (or oversized Fixnum encode via Gc<Value>). Either way, no
+    // panic, and we get a Number-typed result.
+    use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::{NanboxValue, NB_FIXNUM_MAX};
+
+    let mut f = Function::new("mul_overflow");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.params.push((cs_rir::Value(1), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![RirInst::Mul(
+            cs_rir::Value(2),
+            cs_rir::Value(0),
+            cs_rir::Value(1),
+        )],
+        terminator: Term::Return(cs_rir::Value(2)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64, i64) -> i64 = unsafe { transmute(ptr) };
+
+    let r = func(
+        NanboxValue::fixnum(NB_FIXNUM_MAX).into_raw(),
+        NanboxValue::fixnum(2).into_raw(),
+    );
+    // Result is a Number — Fixnum (oversized, wrapped) or Big.
+    match unsafe { NanboxValue(r).to_value() } {
+        cs_core::Value::Number(_) => { /* ok */ }
+        other => panic!("expected Number, got {:?}", other),
+    }
+}
+
+#[test]
 fn uniform_nb_add_mixed_fixnum_flonum_slow_path() {
     use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
     use cs_vm::vm::NanboxValue;
