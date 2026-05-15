@@ -13,3 +13,4 @@ cs-ir = { workspace = true }
 cs-jit = { workspace = true }
 cs-rir = { workspace = true }
 num-traits = { workspace = true }
+rustc-hash = { workspace = true }

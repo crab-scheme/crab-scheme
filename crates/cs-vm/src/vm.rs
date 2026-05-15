@@ -8773,10 +8773,17 @@ impl cs_gc::Trace for VmClosure {
 /// the root env (~80 builtins, plus user-defined globals) stays O(1).
 const SMALL_THRESHOLD: usize = 12;
 
+/// `Symbol`-keyed map for the `Large` binding tier. `Symbol` is a
+/// `u32` from a trusted intern table, so std's DoS-resistant SipHash
+/// is pure overhead — `FxBuildHasher` (the hasher rustc itself uses)
+/// is ~2-5x faster on small integer keys. Every global / free-var
+/// lookup that walks up to the root env hits this map.
+type SymbolMap = HashMap<Symbol, Value, rustc_hash::FxBuildHasher>;
+
 #[derive(Debug)]
 enum Bindings {
     Small(Vec<(Symbol, Value)>),
-    Large(HashMap<Symbol, Value>),
+    Large(SymbolMap),
 }
 
 impl Default for Bindings {
@@ -8837,10 +8844,14 @@ impl Bindings {
                     return;
                 }
                 v.push((name, value));
-                // Promote to HashMap once we exceed the threshold.
+                // Promote to a (Fx-hashed) HashMap once we exceed the
+                // threshold.
                 if v.len() > SMALL_THRESHOLD {
                     let drained: Vec<(Symbol, Value)> = v.drain(..).collect();
-                    let mut m = HashMap::with_capacity(drained.len() * 2);
+                    let mut m: SymbolMap = HashMap::with_capacity_and_hasher(
+                        drained.len() * 2,
+                        rustc_hash::FxBuildHasher,
+                    );
                     for (k, val) in drained {
                         m.insert(k, val);
                     }

@@ -59,6 +59,12 @@ cranelift-module = "0.131"
 cranelift-native = "0.131"
 libloading = "0.8"
 proptest = "1"
+# Fast non-cryptographic hasher for Symbol(u32)-keyed maps (the
+# interpreter's lexical environments). FxHash — what rustc itself
+# uses — is ~2-5x faster than std's SipHash on small integer keys;
+# DoS resistance is irrelevant since symbols come from a trusted
+# intern table, never untrusted input keyed directly.
+rustc-hash = "2.1"
 
 [profile.release]
 lto = "thin"
