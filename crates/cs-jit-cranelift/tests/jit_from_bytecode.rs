@@ -45,6 +45,7 @@ fn fib_lambda(syms: &mut SymbolTable) -> (CompiledLambda, cs_core::Symbol) {
         body: Rc::new(body),
         spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
         fast: None,
+        profile: Default::default(),
     };
     (l, fib)
 }
@@ -85,6 +86,7 @@ fn add_one_bytecode_translates_and_jits() {
         body: Rc::new(body),
         spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
         fast: None,
+        profile: Default::default(),
     };
     let rir = bytecode_to_rir(&lam, "addone", None).unwrap();
     let mut lowerer = Lowerer::new().unwrap();

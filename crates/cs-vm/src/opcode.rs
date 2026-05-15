@@ -109,6 +109,14 @@ pub struct CompiledLambda {
     /// is still populated (kept for the no-fast-path fallback in apply,
     /// arity errors, error spans, and future tooling).
     pub fast: Option<FastPrimopBody>,
+    /// Shared per-lambda JIT profile: tier-up counter, compiled
+    /// native pointer, type signature, stack maps. Exactly one
+    /// `LambdaProfile` per `CompiledLambda`, shared (via `Rc`) by
+    /// every `VmClosure` instance of this lambda — so a lambda
+    /// constructed fresh on every call still accumulates one
+    /// aggregate hotness counter and tiers up. See
+    /// [`crate::vm::LambdaProfile`]. (Post-M8 JIT plan, Stage 0.)
+    pub profile: Rc<crate::vm::LambdaProfile>,
 }
 
 /// Either a positional reference to one of the lambda's params, or an

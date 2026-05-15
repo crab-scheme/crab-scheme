@@ -1462,6 +1462,31 @@ pub fn bytecode_to_rir_with_hints(
                                         // decodes operands correctly.
                                         // dst is Type::Any (the i64
                                         // carries Box::into_raw(Box<Value>)).
+                                        //
+                                        // Free-var args may be
+                                        // Fixnum-defaulted EnvLookups
+                                        // (no `value_types` entry). The
+                                        // free var can hold *any* value
+                                        // — typically a list cdr like
+                                        // n-queens' `placed`. Promote
+                                        // each operand's producing
+                                        // `EnvLookup` to `EnvLookupAny`
+                                        // before tagging, so the cons
+                                        // helper sees a real Gc handle
+                                        // and not a `vm_env_lookup_fixnum`
+                                        // deopt placeholder. Same pattern
+                                        // as the CallGeneral callee/arg
+                                        // promotions. (Post-M8 Stage 0.)
+                                        promote_envlookup_to_any(
+                                            &mut insts,
+                                            &mut value_types,
+                                            args[0],
+                                        );
+                                        promote_envlookup_to_any(
+                                            &mut insts,
+                                            &mut value_types,
+                                            args[1],
+                                        );
                                         let car_t = value_types
                                             .get(&args[0])
                                             .copied()
@@ -5827,32 +5852,14 @@ pub fn bytecode_to_rir_with_hints(
                             // common case for `(define inner ...)
                             // (define (outer y) (inner y))`.
                             let mut callee_box = callee_v;
-                            let mut promoted = false;
-                            // Scan backwards through `insts` to find
-                            // the EnvLookup that produced
-                            // `callee_v`. We can replace it in-place
-                            // with `EnvLookupAny` because:
-                            //   (1) `Value` ids are SSA-style — the
-                            //       producer is unique;
-                            //   (2) no other RIR instruction takes
-                            //       `callee_v`'s Fixnum interpretation
-                            //       between the EnvLookup and this
-                            //       Call (LoadConst etc. produce
-                            //       fresh Values; the only consumer
-                            //       of `callee_v` is the Call itself
-                            //       — guaranteed by the
-                            //       simulated-stack discipline above).
-                            for inst in insts.iter_mut().rev() {
-                                if let RirInst::EnvLookup(d, sym) = inst {
-                                    if *d == callee_v {
-                                        let new = RirInst::EnvLookupAny(*d, *sym);
-                                        *inst = new;
-                                        value_types.insert(callee_v, Type::Any);
-                                        promoted = true;
-                                        break;
-                                    }
-                                }
-                            }
+                            // Free-var callee may be Fixnum-defaulted
+                            // (no `value_types` entry). Promote its
+                            // producing `EnvLookup` in-place so the
+                            // runtime returns a Gc handle for any
+                            // binding — Procedure, Pair, whatever.
+                            // (Helper documents the SSA-safety argument.)
+                            let promoted =
+                                promote_envlookup_to_any(&mut insts, &mut value_types, callee_v);
                             if !promoted {
                                 let callee_t =
                                     value_types.get(&callee_v).copied().unwrap_or(Type::Fixnum);
@@ -5869,6 +5876,24 @@ pub fn bytecode_to_rir_with_hints(
                             }
                             // Box each arg to Any if it's not
                             // already.
+                            //
+                            // Free-var args get the same in-place
+                            // `EnvLookup` → `EnvLookupAny` promotion
+                            // the callee path uses above. Without it,
+                            // a free-var-bound list / closure / etc.
+                            // would default-type as `Fixnum` (no
+                            // `value_types` entry for free-var loads),
+                            // its `vm_env_lookup_fixnum` would deopt
+                            // and return 0, then `BoxTyped(Fixnum)`
+                            // would wrap that 0 into a real
+                            // `Value::Number(Fixnum(0))` and feed it
+                            // to the callee. Discovered when n-queens'
+                            // inner `(lambda (col) ...)` started
+                            // tiering up under the shared
+                            // `LambdaProfile` (post-M8 Stage 0): its
+                            // free var `placed` (a list) was
+                            // box-as-Fixnum'd into the `safe?` call,
+                            // which then `car`-ed `0` and raised.
                             let mut args: Vec<RirValue> = Vec::with_capacity(*n);
                             for e in args_entries {
                                 let av = match e {
@@ -5881,6 +5906,9 @@ pub fn bytecode_to_rir_with_hints(
                                 };
                                 let at = value_types.get(&av).copied().unwrap_or(Type::Fixnum);
                                 let abox = if at == Type::Any {
+                                    av
+                                } else if promote_envlookup_to_any(&mut insts, &mut value_types, av)
+                                {
                                     av
                                 } else {
                                     let fresh = alloc();
@@ -6190,6 +6218,43 @@ fn type_to_jit_rt_tag(t: Type) -> u8 {
         Type::Null => 14,
         Type::Any => 15,
     }
+}
+
+/// If `av` was produced by a free-var [`RirInst::EnvLookup`] in
+/// `insts`, rewrite that producer in-place to [`RirInst::EnvLookupAny`]
+/// so the runtime returns a Gc handle for *any* value (list, closure,
+/// pair, ...), not just a Fixnum. Marks `av` as [`Type::Any`] in
+/// `value_types` and returns `true`. Returns `false` if `av` did not
+/// come from an `EnvLookup` (e.g. it's a constant or arithmetic
+/// result).
+///
+/// Free-var loads default-type as `Fixnum` because the translator
+/// never inserts into `value_types` for them. Any downstream
+/// consumer that needs the operand in an Any-shape slot (CallGeneral
+/// callee/arg, `cons`'s car/cdr, …) must call this first; otherwise
+/// the operand gets `BoxTyped(Fixnum)`-wrapped, the runtime
+/// `vm_env_lookup_fixnum` deopts on a non-Fixnum binding, and the
+/// body silently feeds garbage `Value::Number(Fixnum(0))` to the
+/// consumer (which then crashes — e.g. `car` of `0` raises). This
+/// promotion is SSA-safe: each `EnvLookup` result has a unique
+/// producer (the bytecode->RIR translator allocates a fresh dst per
+/// `LoadVar`) and a single consumer (enforced by the stack-machine
+/// simulation that drives translation).
+fn promote_envlookup_to_any(
+    insts: &mut Vec<RirInst>,
+    value_types: &mut HashMap<RirValue, Type>,
+    av: RirValue,
+) -> bool {
+    for inst in insts.iter_mut().rev() {
+        if let RirInst::EnvLookup(d, sym) = inst {
+            if *d == av {
+                *inst = RirInst::EnvLookupAny(*d, *sym);
+                value_types.insert(av, Type::Any);
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn infer_return_type(func: &cs_rir::Function) -> Type {
@@ -7043,6 +7108,7 @@ mod tests {
             body: Rc::new(body),
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None as Option<FastPrimopBody>,
+            profile: Default::default(),
         };
         (l, fib)
     }
@@ -7089,6 +7155,7 @@ mod tests {
             body: Rc::new(body),
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None,
+            profile: Default::default(),
         };
         let f = bytecode_to_rir(&lam, "addone", None).unwrap();
         assert_eq!(f.blocks.len(), 1);
@@ -7118,6 +7185,7 @@ mod tests {
             body: Rc::new(body),
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None,
+            profile: Default::default(),
         };
         let f = bytecode_to_rir(&lam, "f", None).expect("free-var LoadVar should translate");
         // Look for the EnvLookup in block 0's insts.
@@ -7152,6 +7220,7 @@ mod tests {
             body: Rc::new(body),
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None,
+            profile: Default::default(),
         };
         let f = bytecode_to_rir(&lam, "f", None).expect("translate succeeded");
         let has_general = f
@@ -7188,6 +7257,7 @@ mod tests {
             body: Rc::new(body),
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None,
+            profile: Default::default(),
         };
         match bytecode_to_rir(&lam, "f", None) {
             Err(TranslateError::Unsupported(msg)) => assert!(msg.contains("rest")),

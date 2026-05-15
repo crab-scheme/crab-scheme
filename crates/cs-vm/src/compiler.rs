@@ -444,6 +444,7 @@ fn compile_expr(
                 body: Rc::new(body_insts),
                 spans: Rc::new(body_spans),
                 fast,
+                profile: Default::default(),
             });
             out.push(Inst::MakeClosure(lambda_idx), *s);
             Ok(())
@@ -475,6 +476,7 @@ fn compile_expr(
                 body: Rc::new(body_insts),
                 spans: Rc::new(body_spans),
                 fast: None,
+                profile: Default::default(),
             });
             out.push(Inst::MakeClosure(lambda_idx), *s);
             if is_tail {

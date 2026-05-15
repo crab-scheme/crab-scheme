@@ -593,6 +593,16 @@ pub fn jit_take_deopt() -> u8 {
     JIT_DEOPT_REQUESTED.with(|c| c.replace(0))
 }
 
+/// Peek the deopt sentinel WITHOUT clearing it. Lets a runtime
+/// helper bail early on a pending deopt while leaving the sentinel
+/// set for `try_dispatch_jit`'s end-of-call check to consume — so
+/// the body's result still gets discarded and the call falls back
+/// to bytecode.
+#[inline]
+pub fn jit_peek_deopt() -> u8 {
+    JIT_DEOPT_REQUESTED.with(|c| c.get())
+}
+
 /// Encode a `Value` into a Gc-backed raw handle carried as a single
 /// i64 word. Companion to `value_to_any_i64` for the JIT_RT_GC ABI
 /// per ADR 0012 D-2.
@@ -7717,6 +7727,21 @@ pub unsafe extern "C" fn vm_call_general(
         let v = unsafe { gc_i64_to_value(slot) };
         args.push(v);
     }
+    // Deopt-soundness gate: a runtime helper earlier in this JIT
+    // body may have already requested deopt (e.g.
+    // `vm_env_lookup_fixnum` saw a non-Fixnum binding, set the
+    // sentinel, and returned 0). The args we just materialized are
+    // then *garbage* — typically `Value::Number(Fixnum(0))` wrapping
+    // a stale 0 — and running `vm_call_sync` on them would crash a
+    // legitimate callee (e.g. `safe?` does `car` of the bogus 0 and
+    // raises `__raised__`), which then comes back here and panics.
+    // Bail cleanly instead: leave the sentinel set so
+    // `try_dispatch_jit`'s end-of-body check fires the fallback to
+    // bytecode (where the original args are re-evaluated against
+    // the real bindings). The owned `Value`s in `args` drop here.
+    if jit_peek_deopt() != 0 {
+        return 0;
+    }
     let syms_ptr = JIT_ACTIVE_SYMS.with(|c| c.get());
     if syms_ptr.is_null() {
         panic!("vm_call_general: JIT_ACTIVE_SYMS is null (no outer VM dispatch)");
@@ -8018,20 +8043,17 @@ pub unsafe extern "C" fn vm_make_closure(lambda_idx: i64) -> i64 {
         std::mem::forget(raw_rc);
         cloned
     };
+    let lambda_idx = lambda_idx as usize;
+    // Share the per-lambda JIT profile with every other closure
+    // instance of this lambda — cloning is a cheap `Rc` refcount
+    // bump. (Post-M8 JIT plan, Stage 0.)
+    let profile = bc_rc.lambdas[lambda_idx].profile.clone();
     let cl = VmClosure {
-        lambda_idx: lambda_idx as usize,
+        lambda_idx,
         env: env_rc,
         bc: bc_rc,
-        tier: cs_jit::Tier::default(),
-        jit_ptr: Cell::new(std::ptr::null()),
-        jit_arity: Cell::new(0),
+        profile,
         self_name: Cell::new(None),
-        jit_return_type: Cell::new(JIT_RT_FIXNUM),
-        jit_param_types: Cell::new(JIT_PARAM_TYPES_ALL_FIXNUM),
-        jit_deopt_count: Cell::new(0),
-        jit_call_count: Cell::new(0),
-        jit_stack_maps: std::cell::RefCell::new(None),
-        jit_needs_frame_env: Cell::new(false),
         closure_id: alloc_closure_id(),
     };
     let p: Rc<dyn Procedure> = Rc::new(cl);
@@ -8416,6 +8438,195 @@ impl VmError {
     }
 }
 
+/// Shared per-*lambda* JIT profile — one per [`CompiledLambda`],
+/// shared (via `Rc`) by every [`VmClosure`] instance of that lambda.
+///
+/// **Why shared.** The tier-up counter and compiled native pointer
+/// are properties of the *code*, not of any one closure instance.
+/// A lambda constructed fresh on every call — n-queens' inner
+/// `(lambda (col) ...)`, rebuilt inside each `place` activation —
+/// used to get a brand-new zeroed counter per instance, so it never
+/// reached the tier-up threshold and ran on the bytecode VM
+/// forever. With the counter on the shared profile, every
+/// instance's call bumps the *same* counter, so a genuinely hot
+/// lambda tiers up no matter how its closures are allocated. The
+/// compiled `jit_ptr` is likewise shared: the JIT body reads
+/// captured free vars indirectly through `JIT_CALLER_ENV`, so one
+/// native body is correct for every instance.
+///
+/// Mirrors the code/closure split every production VM enforces —
+/// V8's `SharedFunctionInfo`, JSC's `CodeBlock`, SpiderMonkey's
+/// `JSScript`, LuaJIT's `GCproto` all carry the hotness counter and
+/// compiled-code pointer on the shared code object, never the
+/// per-call closure instance.
+#[derive(Debug)]
+pub struct LambdaProfile {
+    /// Shared tier-up call counter. Bumped on every call to any
+    /// closure instance of this lambda; crossing the threshold
+    /// fires the tier-up hook once.
+    pub tier: cs_jit::Tier,
+    /// Native function pointer once JIT-compiled, else null. Lazy:
+    /// filled by the tier-up hook (M6 iter 6).
+    jit_ptr: Cell<*const u8>,
+    /// Arity at which `jit_ptr` was compiled. Caller checks this
+    /// before transmuting.
+    jit_arity: Cell<u32>,
+    /// Logical return type of the JIT'd body, encoded for the
+    /// dispatcher (see the `JIT_RT_*` tags).
+    jit_return_type: Cell<u8>,
+    /// Per-param JIT-expected types, packed 4 bits per param (low
+    /// nibble = arg 0). The dispatcher checks each arg against the
+    /// matching nibble before transmuting to the `extern "C"`
+    /// function pointer.
+    jit_param_types: Cell<u32>,
+    /// Type-guard miss counter. Incremented by `try_dispatch_jit`
+    /// whenever an arg fails the stored signature. Past
+    /// [`JIT_DEOPT_RECOMPILE_THRESHOLD`] the dispatch site clears
+    /// `jit_ptr` so the next call's tier-up hook recompiles with
+    /// fresh type feedback. Aggregated across all instances — a
+    /// body consistently mistyped from *any* call site recompiles.
+    jit_deopt_count: Cell<u32>,
+    /// JIT call counter. Bumped each time `try_dispatch_jit`
+    /// successfully runs the native body. Exposed via `jit-status`;
+    /// counts across every instance of the lambda (the native body
+    /// is shared, so a per-instance count no longer has a distinct
+    /// meaning).
+    jit_call_count: Cell<u64>,
+    /// Stack-map registry harvested from Cranelift after this
+    /// lambda's body was compiled. Used by `Heap::collect` to walk
+    /// JIT frames and root Gc<Value> handles spilled to the host
+    /// stack. None until the tier-up hook installs it. ADR 0012
+    /// D-2 (iter BM).
+    jit_stack_maps: std::cell::RefCell<Option<std::rc::Rc<crate::jit_stackmap::JitStackMaps>>>,
+    /// Whether the JIT body needs a real *invocation-frame* env
+    /// installed on `JIT_CALLER_ENV` (params bound) rather than the
+    /// bare definition-time env. Set by the tier-up hook when the
+    /// translated body contains a `MakeClosure`. ADR 0012 D-1
+    /// (closure-env capture fix).
+    jit_needs_frame_env: Cell<bool>,
+}
+
+impl Default for LambdaProfile {
+    fn default() -> Self {
+        Self {
+            tier: cs_jit::Tier::default(),
+            jit_ptr: Cell::new(std::ptr::null()),
+            jit_arity: Cell::new(0),
+            jit_return_type: Cell::new(JIT_RT_FIXNUM),
+            jit_param_types: Cell::new(JIT_PARAM_TYPES_ALL_FIXNUM),
+            jit_deopt_count: Cell::new(0),
+            jit_call_count: Cell::new(0),
+            jit_stack_maps: std::cell::RefCell::new(None),
+            jit_needs_frame_env: Cell::new(false),
+        }
+    }
+}
+
+impl LambdaProfile {
+    /// Install a native function pointer compiled by the JIT, with
+    /// the matching parameter count. Called (via the `VmClosure`
+    /// forwarder) by the tier-up hook on successful compilation.
+    pub fn set_jit_ptr(&self, ptr: *const u8, arity: u32) {
+        self.jit_ptr.set(ptr);
+        self.jit_arity.set(arity);
+        // Default — callers that know the JIT'd body returns Boolean
+        // should call `set_jit_return_type` after this.
+        self.jit_return_type.set(JIT_RT_FIXNUM);
+    }
+
+    /// Currently-installed JIT pointer, or null.
+    pub fn jit_ptr(&self) -> *const u8 {
+        self.jit_ptr.get()
+    }
+
+    /// Arity the JIT pointer was compiled for. Meaningful only when
+    /// [`jit_ptr`](Self::jit_ptr) is non-null.
+    pub fn jit_arity(&self) -> u32 {
+        self.jit_arity.get()
+    }
+
+    /// Tell the dispatcher how to decode the i64 the JIT'd body
+    /// returns. Defaults to Fixnum.
+    pub fn set_jit_return_type(&self, rt: u8) {
+        self.jit_return_type.set(rt);
+    }
+
+    pub fn jit_return_type(&self) -> u8 {
+        self.jit_return_type.get()
+    }
+
+    /// Bake per-param type tags from a slice (low nibble = arg 0).
+    /// Extra tags past 8 get truncated at the 32-bit boundary.
+    pub fn set_jit_param_types(&self, tags: &[u8]) {
+        let mut packed: u32 = 0;
+        for (i, t) in tags.iter().take(8).enumerate() {
+            packed |= ((*t as u32) & 0xF) << (i * 4);
+        }
+        self.jit_param_types.set(packed);
+    }
+
+    pub fn jit_param_types(&self) -> u32 {
+        self.jit_param_types.get()
+    }
+
+    /// Bump the deopt counter; returns the new value.
+    pub fn bump_jit_deopt(&self) -> u32 {
+        let n = self.jit_deopt_count.get().saturating_add(1);
+        self.jit_deopt_count.set(n);
+        n
+    }
+
+    pub fn jit_deopt_count(&self) -> u32 {
+        self.jit_deopt_count.get()
+    }
+
+    pub fn jit_call_count(&self) -> u64 {
+        self.jit_call_count.get()
+    }
+
+    /// Bump the JIT-dispatch counter for this lambda.
+    pub fn bump_jit_call_count(&self) {
+        let n = self.jit_call_count.get().saturating_add(1);
+        self.jit_call_count.set(n);
+    }
+
+    /// Install the stack-map registry harvested when this lambda
+    /// was JIT-compiled. ADR 0012 D-2 (iter BM).
+    pub fn set_jit_stack_maps(&self, maps: std::rc::Rc<crate::jit_stackmap::JitStackMaps>) {
+        *self.jit_stack_maps.borrow_mut() = Some(maps);
+    }
+
+    /// Read the stack-map registry, if any. Returns a cloned Rc so
+    /// callers don't hold a `RefCell` borrow across GC operations.
+    pub fn jit_stack_maps(&self) -> Option<std::rc::Rc<crate::jit_stackmap::JitStackMaps>> {
+        self.jit_stack_maps.borrow().clone()
+    }
+
+    /// Record whether the JIT body needs a full invocation-frame
+    /// env (params bound) installed on `JIT_CALLER_ENV`.
+    pub fn set_jit_needs_frame_env(&self, needs: bool) {
+        self.jit_needs_frame_env.set(needs);
+    }
+
+    /// Whether `try_dispatch_jit` must build a params-bound frame
+    /// env before entering this lambda's JIT body.
+    pub fn jit_needs_frame_env(&self) -> bool {
+        self.jit_needs_frame_env.get()
+    }
+
+    /// Clear the JIT pointer + deopt counter so the next call's
+    /// tier-up hook recompiles with fresh type feedback. The
+    /// profile stays alive; only the cached native function
+    /// pointer is dropped. Tier counter is primed to threshold-1
+    /// via `Tier::reset_for_recompile` so the very next call
+    /// re-fires the hook.
+    pub fn clear_jit_for_recompile(&self) {
+        self.jit_ptr.set(std::ptr::null());
+        self.jit_deopt_count.set(0);
+        self.tier.reset_for_recompile();
+    }
+}
+
 /// VM closure: a compiled lambda + the env at the point of construction.
 ///
 /// Each closure carries a [`cs_jit::Tier`] counter that bumps on
@@ -8434,71 +8645,33 @@ pub struct VmClosure {
     pub lambda_idx: usize,
     pub env: Rc<Env>,
     pub bc: Rc<Bytecode>,
-    /// Per-closure tier counter. Owned, not shared — each freshly
-    /// allocated closure starts at 0. (M6 iter 3.)
-    pub tier: cs_jit::Tier,
-    /// Native function pointer once JIT-compiled, else null.
-    /// Lazy: filled by the tier-up hook (M6 iter 6).
-    jit_ptr: Cell<*const u8>,
-    /// Arity at which `jit_ptr` was compiled. Caller checks this
-    /// before transmuting.
-    jit_arity: Cell<u32>,
+    /// Shared per-*lambda* JIT profile: tier-up counter, native
+    /// pointer, type signature, stack maps. Cloned — a cheap `Rc`
+    /// refcount bump — from `bc.lambdas[lambda_idx].profile` at
+    /// construction, so every closure instance of one lambda shares
+    /// one profile. This is what lets a lambda built fresh on each
+    /// call (e.g. an inner `(lambda (col) ...)` rebuilt every
+    /// recursion) still tier up: the hotness counter aggregates
+    /// across all instances instead of resetting per instance. The
+    /// JIT accessor methods below (`set_jit_ptr`, `jit_ptr`, …) are
+    /// thin forwarders to this. See [`LambdaProfile`]. (Post-M8 JIT
+    /// plan, Stage 0.)
+    pub profile: Rc<LambdaProfile>,
     /// Symbol the closure was first bound to (via Define / Set),
     /// if any. The bytecode→RIR translator uses this to detect
     /// `LoadVar(self_name)` patterns inside the body and emit
     /// `Inst::CallSelf` so recursive functions JIT. (M6 iter 7.)
+    /// Stays per-instance: it's a property of the binding, and the
+    /// tier-up hook reads it from whichever instance triggered it.
     self_name: Cell<Option<Symbol>>,
-    /// Logical return type of the JIT'd body, encoded for the
-    /// dispatcher. 0 = Fixnum (default; back-compat with iter-6),
-    /// 1 = Boolean. Stored as u8 because `cs_rir::Type` lives in a
-    /// crate cs-vm doesn't depend on at this layer.
-    jit_return_type: Cell<u8>,
-    /// Per-param JIT-expected types, packed 4 bits per param (low
-    /// nibble = arg 0). 0xF = unset/unused. Default all-Fixnum
-    /// matches iter-W behavior. The dispatcher checks each arg
-    /// against the matching nibble before transmuting to the
-    /// `extern "C"` function pointer.
-    jit_param_types: Cell<u32>,
-    /// Per-closure type-guard miss counter. Incremented by
-    /// `try_dispatch_jit` whenever an arg fails the stored
-    /// signature. When the count exceeds [`JIT_DEOPT_RECOMPILE_THRESHOLD`]
-    /// the dispatch site fires the tier-up hook again with the
-    /// current args; the hook clears `jit_ptr`, recompiles with
-    /// fresh signature, and the next call retries against the
-    /// new layout. (Item 12 of the JIT roadmap — feedback-driven
-    /// recompile.)
-    jit_deopt_count: Cell<u32>,
-    /// Per-closure JIT call counter. Bumped each time
-    /// `try_dispatch_jit` successfully runs the native body.
-    /// Exposed via the `jit-status` builtin so tests/benchmarks
-    /// can pin down which specific closures are tier'd up vs
-    /// just having a JIT pointer that nobody dispatches through.
-    jit_call_count: Cell<u64>,
-    /// Stack-map registry harvested from Cranelift after this
-    /// closure's body was compiled. Used by `Heap::collect` to
-    /// walk JIT frames and root Gc<Value> handles spilled to the
-    /// host stack. Rc-shared so closure clones don't duplicate the
-    /// map. None until the tier-up hook installs both the JIT ptr
-    /// and the maps. ADR 0012 D-2 (iter BM).
-    jit_stack_maps: std::cell::RefCell<Option<std::rc::Rc<crate::jit_stackmap::JitStackMaps>>>,
-    /// Whether the JIT body needs a real *invocation-frame* env
-    /// installed on `JIT_CALLER_ENV` (params bound, parented to
-    /// `self.env`) rather than the bare definition-time `self.env`.
-    /// Set by the tier-up hook when the translated body contains a
-    /// `MakeClosure` inst: a nested lambda built via
-    /// `vm_make_closure` captures `JIT_CALLER_ENV`, and that capture
-    /// must include the JIT function's *parameters* (which are
-    /// otherwise passed only as native registers, not via any env).
-    /// Pure-arithmetic bodies (fib/tak/ack — no `MakeClosure`) leave
-    /// this false and keep the zero-alloc fast path. ADR 0012 D-1
-    /// (closure-env capture fix).
-    jit_needs_frame_env: Cell<bool>,
     /// Stable, process-wide unique identity. Stamped once at
     /// construction (the `Inst::MakeClosure` site in `run_dispatch`)
     /// from [`NEXT_CLOSURE_ID`] and never mutated thereafter — the
     /// IC infrastructure (ADR 0012 D-1, iter BR) relies on this
     /// invariant when comparing a closure against a cached id.
     /// Always non-zero; the IC reserves 0 as "miss/uninitialized".
+    /// Stays per-instance even though `profile` is shared — the IC
+    /// keys on the exact closure instance.
     closure_id: u32,
 }
 
@@ -8597,55 +8770,57 @@ fn alloc_closure_id() -> u32 {
 }
 
 impl VmClosure {
+    // The JIT accessors below all forward to the shared
+    // [`LambdaProfile`] (`self.profile`). Keeping them on `VmClosure`
+    // means every existing call site — the dispatch path, the
+    // tier-up hook, the `jit-status` builtin — is unchanged: the
+    // counter/pointer just moved from per-instance to per-lambda
+    // storage underneath. (Post-M8 JIT plan, Stage 0.)
+
     /// Install a native function pointer compiled by the JIT, with
     /// the matching parameter count. Called by the tier-up hook on
-    /// successful compilation. After this, the closure-call dispatch
-    /// will route through native code when arg types match.
+    /// successful compilation. After this, every closure instance
+    /// of this lambda dispatches through native code on type match.
     pub fn set_jit_ptr(&self, ptr: *const u8, arity: u32) {
-        self.jit_ptr.set(ptr);
-        self.jit_arity.set(arity);
-        // Default — callers that know the JIT'd body returns Boolean
-        // should call `set_jit_return_type` after this.
-        self.jit_return_type.set(JIT_RT_FIXNUM);
+        self.profile.set_jit_ptr(ptr, arity);
     }
 
     /// Tell the dispatcher how to decode the i64 the JIT'd body
     /// returns. Defaults to Fixnum; predicate procedures should set
     /// this to Boolean before the closure is dispatched.
     pub fn set_jit_return_type(&self, rt: u8) {
-        self.jit_return_type.set(rt);
+        self.profile.set_jit_return_type(rt);
     }
 
     pub fn jit_return_type(&self) -> u8 {
-        self.jit_return_type.get()
+        self.profile.jit_return_type()
     }
 
-    /// Install the stack-map registry harvested when this closure
-    /// was JIT-compiled. Stored as `Rc` so the registry can be
-    /// shared if the closure is cloned. ADR 0012 D-2 (iter BM).
+    /// Install the stack-map registry harvested when this lambda
+    /// was JIT-compiled. ADR 0012 D-2 (iter BM).
     pub fn set_jit_stack_maps(&self, maps: std::rc::Rc<crate::jit_stackmap::JitStackMaps>) {
-        *self.jit_stack_maps.borrow_mut() = Some(maps);
+        self.profile.set_jit_stack_maps(maps);
     }
 
     /// Read the stack-map registry, if any. Returns a cloned Rc
     /// (cheap refcount bump) so callers don't hold a `RefCell`
     /// borrow across GC operations.
     pub fn jit_stack_maps(&self) -> Option<std::rc::Rc<crate::jit_stackmap::JitStackMaps>> {
-        self.jit_stack_maps.borrow().clone()
+        self.profile.jit_stack_maps()
     }
 
     /// Record whether the JIT body needs a full invocation-frame env
     /// (params bound) installed on `JIT_CALLER_ENV`. Set by the
     /// tier-up hook when the translated body contains a `MakeClosure`
-    /// — see the field doc on [`VmClosure::jit_needs_frame_env`].
+    /// — see the field doc on [`LambdaProfile::jit_needs_frame_env`].
     pub fn set_jit_needs_frame_env(&self, needs: bool) {
-        self.jit_needs_frame_env.set(needs);
+        self.profile.set_jit_needs_frame_env(needs);
     }
 
     /// Whether `try_dispatch_jit` must build a params-bound frame env
     /// before entering this closure's JIT body.
     pub fn jit_needs_frame_env(&self) -> bool {
-        self.jit_needs_frame_env.get()
+        self.profile.jit_needs_frame_env()
     }
 
     /// Bake per-param type tags from a slice (low nibble = arg 0).
@@ -8653,62 +8828,53 @@ impl VmClosure {
     /// the JIT'd body was compiled with — extra tags get truncated
     /// at the 8-arg / 32-bit boundary.
     pub fn set_jit_param_types(&self, tags: &[u8]) {
-        let mut packed: u32 = 0;
-        for (i, t) in tags.iter().take(8).enumerate() {
-            packed |= ((*t as u32) & 0xF) << (i * 4);
-        }
-        self.jit_param_types.set(packed);
+        self.profile.set_jit_param_types(tags);
     }
 
     pub fn jit_param_types(&self) -> u32 {
-        self.jit_param_types.get()
+        self.profile.jit_param_types()
     }
 
     /// Bump the deopt counter; returns the new value. Called from
     /// the dispatch path each time `try_dispatch_jit` rejects on a
     /// type-guard mismatch.
     pub fn bump_jit_deopt(&self) -> u32 {
-        let n = self.jit_deopt_count.get().saturating_add(1);
-        self.jit_deopt_count.set(n);
-        n
+        self.profile.bump_jit_deopt()
     }
 
     pub fn jit_deopt_count(&self) -> u32 {
-        self.jit_deopt_count.get()
+        self.profile.jit_deopt_count()
     }
 
     pub fn jit_call_count(&self) -> u64 {
-        self.jit_call_count.get()
+        self.profile.jit_call_count()
     }
 
     pub(crate) fn bump_jit_call_count_self(&self) {
-        let n = self.jit_call_count.get().saturating_add(1);
-        self.jit_call_count.set(n);
+        self.profile.bump_jit_call_count();
     }
 
     /// Clear the JIT pointer + deopt counter so the next call's
     /// tier-up hook recompiles with fresh type feedback. The
-    /// closure stays alive; only the cached native function
+    /// profile stays alive; only the cached native function
     /// pointer is dropped. Tier counter is primed to threshold-1
     /// via `Tier::reset_for_recompile` so the very next call
     /// re-fires the hook.
     pub fn clear_jit_for_recompile(&self) {
-        self.jit_ptr.set(std::ptr::null());
-        self.jit_deopt_count.set(0);
-        self.tier.reset_for_recompile();
+        self.profile.clear_jit_for_recompile();
     }
 
     /// Currently-installed JIT pointer, if any. `None` until the
-    /// tier-up hook fires + succeeds; persists for the closure's
+    /// tier-up hook fires + succeeds; persists for the lambda's
     /// lifetime once set.
     pub fn jit_ptr(&self) -> *const u8 {
-        self.jit_ptr.get()
+        self.profile.jit_ptr()
     }
 
     /// Arity the JIT pointer was compiled for. Meaningful only when
-    /// [`jit_ptr`] is non-null.
+    /// [`jit_ptr`](Self::jit_ptr) is non-null.
     pub fn jit_arity(&self) -> u32 {
-        self.jit_arity.get()
+        self.profile.jit_arity()
     }
 
     /// Stamp the closure's `self_name` if it isn't already set.
@@ -8760,8 +8926,9 @@ impl cs_gc::Trace for VmClosure {
     fn trace(&self, marker: &mut cs_gc::Marker) {
         // Trace the captured environment chain. Bytecode is immutable
         // shared `Rc<Bytecode>` containing only Symbols and opcodes —
-        // no Values to trace. Tier is leaf data (atomics + u32) —
-        // nothing to trace.
+        // no Values to trace. The shared `LambdaProfile` is leaf JIT
+        // state (counters, raw pointers, stack maps) — no Values to
+        // trace either.
         self.env.trace(marker);
     }
 }
@@ -9137,7 +9304,7 @@ fn run_dispatch(
                 {
                     let any = func_proc.as_any();
                     if let Some(closure) = any.downcast_ref::<VmClosure>() {
-                        if closure.tier.bump() {
+                        if closure.profile.tier.bump() {
                             fire_tier_up_hook(closure, &stack[args_start..stack_len]);
                         }
                         // JIT fast path: if a native pointer is
@@ -10565,7 +10732,7 @@ fn run_dispatch(
                             continue;
                         }
                         if let Some(closure) = any.downcast_ref::<VmClosure>() {
-                            if closure.tier.bump() {
+                            if closure.profile.tier.bump() {
                                 fire_tier_up_hook(closure, &args);
                             }
                             if !closure.jit_ptr().is_null() {
@@ -10672,16 +10839,10 @@ fn run_dispatch(
                     lambda_idx: *idx,
                     env: frame.env.clone(),
                     bc: frame.bc.clone(),
-                    tier: cs_jit::Tier::default(),
-                    jit_ptr: Cell::new(std::ptr::null()),
-                    jit_arity: Cell::new(0),
+                    // Share the per-lambda JIT profile across every
+                    // instance of this lambda. (Post-M8 plan, Stage 0.)
+                    profile: frame.bc.lambdas[*idx].profile.clone(),
                     self_name: Cell::new(None),
-                    jit_return_type: Cell::new(JIT_RT_FIXNUM),
-                    jit_param_types: Cell::new(JIT_PARAM_TYPES_ALL_FIXNUM),
-                    jit_deopt_count: Cell::new(0),
-                    jit_call_count: Cell::new(0),
-                    jit_stack_maps: std::cell::RefCell::new(None),
-                    jit_needs_frame_env: Cell::new(false),
                     closure_id: alloc_closure_id(),
                 };
                 let p: Rc<dyn Procedure> = Rc::new(cl);
@@ -11782,7 +11943,7 @@ pub fn vm_call_sync(
                 return (h.f)(args).map_err(|e| VmError::new(format!("{}: {}", h.name, e)));
             }
             if let Some(c) = any.downcast_ref::<VmClosure>() {
-                if c.tier.bump() {
+                if c.profile.tier.bump() {
                     fire_tier_up_hook(c, args);
                 }
                 if !c.jit_ptr().is_null() {
