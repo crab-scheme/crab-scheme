@@ -9338,42 +9338,49 @@ fn try_dispatch_jit_nb(
     if args.len() > argv.len() {
         return None;
     }
-    let param_types = closure.jit_param_types();
-    for (i, nb) in args.iter().enumerate() {
-        let expected = ((param_types >> (i * 4)) & 0xF) as u8;
-        let bits = nb.into_raw() as u64;
-        let tagged = nb_is_tagged(bits);
-        let tag = if tagged { nb_tag_of(bits) } else { u64::MAX };
-        let payload = nb_payload_of(bits);
-        match expected {
-            JIT_RT_FIXNUM if tagged && tag == NB_TAG_FIXNUM => {
-                argv[i] = nb_sign_extend_47(payload);
-            }
-            JIT_RT_FLONUM if !tagged => {
-                argv[i] = bits as i64;
-            }
-            JIT_RT_BOOLEAN if tagged && tag == NB_TAG_BOOLEAN => {
-                argv[i] = if payload != 0 { 1 } else { 0 };
-            }
-            JIT_RT_CHARACTER if tagged && tag == NB_TAG_CHARACTER => {
-                argv[i] = payload as i64;
-            }
-            JIT_RT_ANY => {
-                // Body's ABI expects a `Gc<Value>` raw handle (one
-                // owned strong refcount) in the i64 slot. The slot
-                // we're reading still owns its NB ref, so we must
-                // produce a fresh strong ref on a `Gc<Value>` wrap
-                // containing the decoded `Value`.
-                let cloned_bits = unsafe { vm_value_clone_gc(nb.into_raw()) };
-                let v = unsafe { NanboxValue(cloned_bits).to_value() };
-                argv[i] = value_to_gc_i64(v);
-            }
-            _ => {
-                let n = closure.bump_jit_deopt();
-                if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
-                    closure.clear_jit_for_recompile();
+    // Stage 3 baseline tier: when the body was compiled by
+    // `compile_uniform_nb`, its return-type tag is `JIT_RT_NB` and
+    // every param is NB-shaped. Pass the NB i64s through unchanged
+    // and incref any pointer-typed payloads so the body owns its
+    // refs independently of the caller's stack slots.
+    let body_is_uniform_nb = closure.jit_return_type() == JIT_RT_NB;
+    if body_is_uniform_nb {
+        for (i, nb) in args.iter().enumerate() {
+            argv[i] = unsafe { vm_value_clone_gc(nb.into_raw()) };
+        }
+    } else {
+        let param_types = closure.jit_param_types();
+        for (i, nb) in args.iter().enumerate() {
+            let expected = ((param_types >> (i * 4)) & 0xF) as u8;
+            let bits = nb.into_raw() as u64;
+            let tagged = nb_is_tagged(bits);
+            let tag = if tagged { nb_tag_of(bits) } else { u64::MAX };
+            let payload = nb_payload_of(bits);
+            match expected {
+                JIT_RT_FIXNUM if tagged && tag == NB_TAG_FIXNUM => {
+                    argv[i] = nb_sign_extend_47(payload);
                 }
-                return None;
+                JIT_RT_FLONUM if !tagged => {
+                    argv[i] = bits as i64;
+                }
+                JIT_RT_BOOLEAN if tagged && tag == NB_TAG_BOOLEAN => {
+                    argv[i] = if payload != 0 { 1 } else { 0 };
+                }
+                JIT_RT_CHARACTER if tagged && tag == NB_TAG_CHARACTER => {
+                    argv[i] = payload as i64;
+                }
+                JIT_RT_ANY => {
+                    let cloned_bits = unsafe { vm_value_clone_gc(nb.into_raw()) };
+                    let v = unsafe { NanboxValue(cloned_bits).to_value() };
+                    argv[i] = value_to_gc_i64(v);
+                }
+                _ => {
+                    let n = closure.bump_jit_deopt();
+                    if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
+                        closure.clear_jit_for_recompile();
+                    }
+                    return None;
+                }
             }
         }
     }
@@ -9452,6 +9459,12 @@ fn decode_jit_return_nb(rt: u8, r: i64) -> NanboxValue {
         JIT_RT_FLONUM => NanboxValue::flonum(f64::from_bits(r as u64)),
         JIT_RT_NULL => NanboxValue::NULL,
         JIT_RT_SYMBOL => NanboxValue::symbol(cs_core::Symbol(r as u32)),
+        JIT_RT_NB => {
+            // Stage 3 baseline tier: the body's i64 is already an NB
+            // bit pattern carrying one owned strong refcount on its
+            // payload. No translation needed.
+            NanboxValue(r)
+        }
         JIT_RT_ANY => {
             // The body produced `Gc::into_raw_jit(Gc<Value>)` carrying
             // one owned strong ref. Decode into Value (consuming the

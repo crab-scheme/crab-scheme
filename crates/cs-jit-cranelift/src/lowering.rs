@@ -4812,6 +4812,29 @@ impl Lowerer {
             return Err(JitError::Codegen("function has no blocks".into()));
         }
 
+        // Bodies with non-tail-position `CallSelf` recursion would emit a
+        // regular Cranelift `call` (host stack frame) per inner recursive
+        // call, blowing host stack on deep recursions like `tak` or the
+        // binary-trees Pair-walks. The baseline tier only handles tail-
+        // position CallSelf safely (via `return_call`); decline anything
+        // that has a non-tail CallSelf so the closure falls back to
+        // bytecode where the VM's frame discipline handles it. The
+        // specialized tier remains the path for fully recursive bodies
+        // it can fully type-specialize.
+        for blk in &rir.blocks {
+            let last_idx = blk.insts.len().saturating_sub(1);
+            for (i, inst) in blk.insts.iter().enumerate() {
+                if matches!(inst, Inst::CallSelf(_, _)) {
+                    let is_tail = i == last_idx && detect_tail_call_self(rir, blk).is_some();
+                    if !is_tail {
+                        return Err(JitError::Unsupported(
+                            "uniform-nb: non-tail CallSelf would burn host stack".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
         let outer_sig = {
             let mut sig = Signature::new(CallConv::SystemV);
             for _ in &rir.params {
@@ -4968,8 +4991,35 @@ impl Lowerer {
                     }
                     builder.seal_block(cb);
                 }
-                lower_inst_uniform_nb(&mut builder, &mut value_map, &nb_helpers, blk)?;
-                lower_terminator_uniform_nb(&mut builder, &value_map, &block_map, &blk.terminator)?;
+                // Tail-position CallSelf detection — mirrors
+                // compile_inner_body. Emits `return_call` instead of a
+                // regular `call` so deeply recursive bodies (tak, etc.)
+                // don't burn host stack.
+                let tail = detect_tail_call_self(rir, blk);
+                if tail.is_some() {
+                    // Lower all but the last inst (the CallSelf).
+                    let truncated = cs_rir::Block {
+                        id: blk.id,
+                        params: blk.params.clone(),
+                        insts: blk.insts[..blk.insts.len() - 1].to_vec(),
+                        terminator: blk.terminator.clone(),
+                    };
+                    lower_inst_uniform_nb(&mut builder, &mut value_map, &nb_helpers, &truncated)?;
+                    let args = tail.unwrap();
+                    let cargs: Vec<cranelift_codegen::ir::Value> = args
+                        .iter()
+                        .map(|a| lookup(&value_map, *a))
+                        .collect::<Result<_, _>>()?;
+                    builder.ins().return_call(nb_helpers.self_fn, &cargs);
+                } else {
+                    lower_inst_uniform_nb(&mut builder, &mut value_map, &nb_helpers, blk)?;
+                    lower_terminator_uniform_nb(
+                        &mut builder,
+                        &value_map,
+                        &block_map,
+                        &blk.terminator,
+                    )?;
+                }
             }
 
             builder.finalize();

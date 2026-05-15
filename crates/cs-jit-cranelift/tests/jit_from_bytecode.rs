@@ -693,15 +693,18 @@ fn uniform_nb_call_self_countdown() {
 }
 
 #[test]
-fn uniform_nb_call_self_fib() {
+fn uniform_nb_rejects_non_tail_callself() {
     // (define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+    // — has two non-tail CallSelfs in the same block. The baseline
+    // tier rejects this so the closure falls back to bytecode rather
+    // than risking host stack overflow. (Specialized tier handles
+    // it via different recursion plumbing — different problem.)
+    use cs_jit::JitError;
     use cs_rir::{Block, BlockId, Const as RirConst, Function, Inst as RirInst, Term, Type};
-    use cs_vm::vm::NanboxValue;
 
     let mut f = Function::new("fib_nb");
     f.params.push((cs_rir::Value(0), Type::Any));
     f.entry = BlockId(0);
-    // Block 0: (< n 2)?
     f.blocks.push(Block {
         id: BlockId(0),
         params: vec![],
@@ -711,14 +714,12 @@ fn uniform_nb_call_self_fib() {
         ],
         terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2)),
     });
-    // Block 1: base, return n.
     f.blocks.push(Block {
         id: BlockId(1),
         params: vec![],
         insts: vec![],
         terminator: Term::Return(cs_rir::Value(0)),
     });
-    // Block 2: (+ (fib (- n 1)) (fib (- n 2))).
     f.blocks.push(Block {
         id: BlockId(2),
         params: vec![],
@@ -735,19 +736,12 @@ fn uniform_nb_call_self_fib() {
     });
 
     let mut lowerer = Lowerer::new().unwrap();
-    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
-    let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
-
-    let expect = [(0i64, 0i64), (1, 1), (2, 1), (5, 5), (10, 55), (15, 610)];
-    for (n, want) in expect {
-        let r = func(NanboxValue::fixnum(n).into_raw());
-        match unsafe { NanboxValue(r).to_value() } {
-            cs_core::Value::Number(cs_core::Number::Fixnum(got)) => {
-                assert_eq!(got, want, "fib({}) want {} got {}", n, want, got);
-            }
-            other => panic!("fib({}): expected Fixnum, got {:?}", n, other),
-        }
-    }
+    let result = lowerer.compile_uniform_nb(&f);
+    assert!(
+        matches!(result, Err(JitError::Unsupported(_))),
+        "expected Unsupported (non-tail CallSelf), got {:?}",
+        result
+    );
 }
 
 #[test]

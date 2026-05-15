@@ -148,8 +148,25 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     // this invocation's parameters. Computed before `compile_*`
     // since the lowerer may drain parts of the RIR.
     let builds_closures = rir.builds_closures();
-    let ptr = match lowerer.compile_pure_fixnum(&rir) {
-        Ok(p) => p,
+    // Stage 3 iter 3.6 status: the uniform-NB baseline tier is
+    // fully built (see `Lowerer::compile_uniform_nb`) but NOT yet
+    // wired as the default tier-up target. Two prerequisites remain:
+    //   1. Non-tail `CallSelf` would emit a regular Cranelift `call`
+    //      and burn host stack on deep recursions. The lowerer
+    //      rejects those bodies via an upfront check, but
+    //      compounding that with the specialized tier's coverage
+    //      story needs careful sequencing.
+    //   2. The GC stack-map walker expects `Gc<Value>` raw handles
+    //      at marked SSA slots; uniform-NB bodies carry direct
+    //      `NB_TAG_PAIR` payloads (raw `Gc<Pair>` ptrs). A `collect()`
+    //      mid-body crashes when the walker reads the slot. Fix is
+    //      to teach the walker about NB encoding (or hold off marking
+    //      pointer-tagged NBs as roots until then).
+    // Both items are tracked as follow-ups. Keep specialized as the
+    // sole tier for now — uniform-NB is callable from tests/benches
+    // via `compile_uniform_nb` directly.
+    let (ptr, return_tag_override) = match lowerer.compile_pure_fixnum(&rir) {
+        Ok(p) => (p, None),
         Err(_) => return,
     };
     closure.set_jit_ptr(ptr, lam.params.len() as u32);
@@ -166,17 +183,20 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
         }
         closure.set_jit_stack_maps(std::rc::Rc::new(maps));
     }
-    // Phase-2 ABI generalization: tell the dispatcher how to decode
-    // the i64 return. Defaults to Fixnum; flip to Boolean when the
-    // RIR's inferred return type says so.
-    let rt_tag = match rir.return_type {
-        RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
-        RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,
-        RirType::Flonum => cs_vm::vm::JIT_RT_FLONUM,
-        RirType::Null => cs_vm::vm::JIT_RT_NULL,
-        RirType::Symbol => cs_vm::vm::JIT_RT_SYMBOL,
-        RirType::Any => cs_vm::vm::JIT_RT_ANY,
-        _ => cs_vm::vm::JIT_RT_FIXNUM,
+    // For the uniform-NB tier the return type tag is `JIT_RT_NB`
+    // (the boundary passes the i64 through unchanged). For the
+    // specialized tier, decode per `rir.return_type` as before.
+    let rt_tag = match return_tag_override {
+        Some(t) => t,
+        None => match rir.return_type {
+            RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
+            RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,
+            RirType::Flonum => cs_vm::vm::JIT_RT_FLONUM,
+            RirType::Null => cs_vm::vm::JIT_RT_NULL,
+            RirType::Symbol => cs_vm::vm::JIT_RT_SYMBOL,
+            RirType::Any => cs_vm::vm::JIT_RT_ANY,
+            _ => cs_vm::vm::JIT_RT_FIXNUM,
+        },
     };
     closure.set_jit_return_type(rt_tag);
 }
