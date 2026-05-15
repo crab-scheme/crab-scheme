@@ -4812,25 +4812,63 @@ impl Lowerer {
             return Err(JitError::Codegen("function has no blocks".into()));
         }
 
-        // Bodies with non-tail-position `CallSelf` recursion would emit a
-        // regular Cranelift `call` (host stack frame) per inner recursive
-        // call, blowing host stack on deep recursions like `tak` or the
-        // binary-trees Pair-walks. The baseline tier only handles tail-
-        // position CallSelf safely (via `return_call`); decline anything
-        // that has a non-tail CallSelf so the closure falls back to
-        // bytecode where the VM's frame discipline handles it. The
-        // specialized tier remains the path for fully recursive bodies
-        // it can fully type-specialize.
+        // Eligibility prewalk — return `Err` before any FunctionBuilder
+        // is created so a fallback to `compile_pure_fixnum` finds the
+        // Lowerer's `func_ctx` clean. If the prewalk passes, the actual
+        // lowering is guaranteed not to hit an `Unsupported` case (every
+        // Inst arm has a handler).
+        //
+        // Catches two classes:
+        //  - RIR variants the baseline tier doesn't yet lower (most of
+        //    the wide builtin surface — VecAlloc/StrRef/FlonumAdd/etc.
+        //    plus Inst::Call and DeoptCheck).
+        //  - Non-tail-position `CallSelf` which would emit a regular
+        //    Cranelift `call` and burn host stack on deep recursions.
         for blk in &rir.blocks {
             let last_idx = blk.insts.len().saturating_sub(1);
             for (i, inst) in blk.insts.iter().enumerate() {
-                if matches!(inst, Inst::CallSelf(_, _)) {
-                    let is_tail = i == last_idx && detect_tail_call_self(rir, blk).is_some();
-                    if !is_tail {
-                        return Err(JitError::Unsupported(
-                            "uniform-nb: non-tail CallSelf would burn host stack".into(),
-                        ));
+                match inst {
+                    Inst::LoadConst(_, _)
+                    | Inst::Add(_, _, _)
+                    | Inst::Sub(_, _, _)
+                    | Inst::Mul(_, _, _)
+                    | Inst::Lt(_, _, _)
+                    | Inst::Eq(_, _, _)
+                    | Inst::Cons(_, _, _, _, _)
+                    | Inst::Car(_, _)
+                    | Inst::Cdr(_, _)
+                    | Inst::PairP(_, _)
+                    | Inst::NullP(_, _)
+                    | Inst::AnyClone(_, _)
+                    | Inst::AnyDrop(_)
+                    | Inst::MakeClosure(_, _)
+                    | Inst::EnvLookup(_, _)
+                    | Inst::EnvLookupAny(_, _)
+                    | Inst::EnvSet(_, _)
+                    | Inst::CallGeneral(_, _, _) => {}
+                    Inst::CallSelf(_, _) => {
+                        let is_tail = i == last_idx && detect_tail_call_self(rir, blk).is_some();
+                        if !is_tail {
+                            return Err(JitError::Unsupported(
+                                "uniform-nb: non-tail CallSelf would burn host stack".into(),
+                            ));
+                        }
                     }
+                    other => {
+                        return Err(JitError::Unsupported(format!(
+                            "uniform-nb: Inst {:?} not yet supported",
+                            other
+                        )));
+                    }
+                }
+            }
+            match &blk.terminator {
+                Term::Return(_) | Term::Jump(_, _) | Term::Branch(_, _, _) => {}
+                other => {
+                    return Err(JitError::Unsupported(format!(
+                        "uniform-nb: Term {:?} not yet supported",
+                        other
+                    )));
                 }
             }
         }

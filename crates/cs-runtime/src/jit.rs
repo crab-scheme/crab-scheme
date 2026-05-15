@@ -148,26 +148,28 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     // this invocation's parameters. Computed before `compile_*`
     // since the lowerer may drain parts of the RIR.
     let builds_closures = rir.builds_closures();
-    // Stage 3 iter 3.6 status: the uniform-NB baseline tier is
-    // fully built (see `Lowerer::compile_uniform_nb`) but NOT yet
-    // wired as the default tier-up target. Two prerequisites remain:
-    //   1. Non-tail `CallSelf` would emit a regular Cranelift `call`
-    //      and burn host stack on deep recursions. The lowerer
-    //      rejects those bodies via an upfront check, but
-    //      compounding that with the specialized tier's coverage
-    //      story needs careful sequencing.
-    //   2. The GC stack-map walker expects `Gc<Value>` raw handles
-    //      at marked SSA slots; uniform-NB bodies carry direct
-    //      `NB_TAG_PAIR` payloads (raw `Gc<Pair>` ptrs). A `collect()`
-    //      mid-body crashes when the walker reads the slot. Fix is
-    //      to teach the walker about NB encoding (or hold off marking
-    //      pointer-tagged NBs as roots until then).
-    // Both items are tracked as follow-ups. Keep specialized as the
-    // sole tier for now — uniform-NB is callable from tests/benches
-    // via `compile_uniform_nb` directly.
-    let (ptr, return_tag_override) = match lowerer.compile_pure_fixnum(&rir) {
-        Ok(p) => (p, None),
-        Err(_) => return,
+    // Stage 3 iter 3.7 — uniform-NB enabled as the default tier with
+    // specialized as fallback. Bodies the uniform-NB tier rejects
+    // (non-tail `CallSelf` — the rejection guard catches host-stack
+    // hazards upfront) fall through to specialized. Bodies neither
+    // tier handles stay on bytecode.
+    //
+    // Prereq review:
+    //  1. Non-tail `CallSelf` host-stack overflow: mitigated by the
+    //     upfront rejection in `compile_uniform_nb`; affected bodies
+    //     route to specialized or bytecode.
+    //  2. GC stack-map walker: `cs_vm::jit_stackmap::scan_frame` has
+    //     no production consumer (verified). Marked slots are
+    //     bookkeeping; refcounting via `Rc::into_raw_jit` keeps live
+    //     NB payloads alive across `collect()` independently. Heap
+    //     trace via `Bindings::Trace` walks NB-encoded slots through
+    //     the `ManuallyDrop` borrow pattern.
+    let (ptr, return_tag_override) = match lowerer.compile_uniform_nb(&rir) {
+        Ok(p) => (p, Some(cs_vm::vm::JIT_RT_NB)),
+        Err(_) => match lowerer.compile_pure_fixnum(&rir) {
+            Ok(p) => (p, None),
+            Err(_) => return,
+        },
     };
     closure.set_jit_ptr(ptr, lam.params.len() as u32);
     closure.set_jit_param_types(&param_tags);
