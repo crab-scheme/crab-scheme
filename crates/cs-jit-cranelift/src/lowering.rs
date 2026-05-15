@@ -4877,6 +4877,27 @@ impl Lowerer {
                 eq: self
                     .module
                     .declare_func_in_func(self.value_eq_nb_func, builder.func),
+                alloc_pair: self
+                    .module
+                    .declare_func_in_func(self.alloc_pair_func, builder.func),
+                pair_car: self
+                    .module
+                    .declare_func_in_func(self.pair_car_func, builder.func),
+                pair_cdr: self
+                    .module
+                    .declare_func_in_func(self.pair_cdr_func, builder.func),
+                pair_p: self
+                    .module
+                    .declare_func_in_func(self.pair_p_func, builder.func),
+                null_p: self
+                    .module
+                    .declare_func_in_func(self.null_p_func, builder.func),
+                value_clone: self
+                    .module
+                    .declare_func_in_func(self.value_clone_func, builder.func),
+                value_drop: self
+                    .module
+                    .declare_func_in_func(self.value_drop_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -6348,15 +6369,27 @@ fn detect_tail_call_self<'a>(
     }
 }
 
-/// Bundle of `FuncRef`s for the Stage 3 NB-typed slow-path helpers.
-/// Threaded through the body-lowering free functions so they don't
-/// need an enormous arg list.
+/// Bundle of `FuncRef`s for the Stage 3 NB-typed slow-path helpers
+/// plus the existing Gc-shape Pair / refcount helpers (which already
+/// speak the NB i64 ABI thanks to K1 step 2b). Threaded through the
+/// body-lowering free functions so they don't need an enormous arg
+/// list.
 struct NbHelpers {
+    // Arithmetic / comparison slow paths.
     add: cranelift_codegen::ir::FuncRef,
     sub: cranelift_codegen::ir::FuncRef,
     mul: cranelift_codegen::ir::FuncRef,
     lt: cranelift_codegen::ir::FuncRef,
     eq: cranelift_codegen::ir::FuncRef,
+    // Pair primitives.
+    alloc_pair: cranelift_codegen::ir::FuncRef,
+    pair_car: cranelift_codegen::ir::FuncRef,
+    pair_cdr: cranelift_codegen::ir::FuncRef,
+    pair_p: cranelift_codegen::ir::FuncRef,
+    null_p: cranelift_codegen::ir::FuncRef,
+    // Refcount management for Any-shape values.
+    value_clone: cranelift_codegen::ir::FuncRef,
+    value_drop: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -6413,6 +6446,69 @@ fn lower_inst_uniform_nb(
                     b.ins().icmp(IntCC::Equal, l, r)
                 });
                 map.insert(dst, r);
+            }
+            &Inst::Cons(dst, car, _car_tag, cdr, _cdr_tag) => {
+                // Uniform-NB ignores the per-operand tags emitted by the
+                // specialized-tier translator: both operands are NB i64,
+                // so we pass `JIT_RT_ANY` (which `vm_alloc_pair_gc`
+                // routes through `gc_i64_to_value` = `to_value`).
+                let car_v = lookup(map, car)?;
+                let cdr_v = lookup(map, cdr)?;
+                let any_tag = b.ins().iconst(I64, cs_vm::vm::JIT_RT_ANY as i64);
+                let call = b
+                    .ins()
+                    .call(helpers.alloc_pair, &[car_v, any_tag, cdr_v, any_tag]);
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(dst, result);
+            }
+            &Inst::Car(dst, src) => {
+                // `vm_pair_car_gc` already decodes via `NanboxValue::to_value`
+                // so it accepts NB_TAG_PAIR inputs natively. Returns an NB
+                // (encoded via `value_to_gc_i64`).
+                let v = lookup(map, src)?;
+                let call = b.ins().call(helpers.pair_car, &[v]);
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(dst, result);
+            }
+            &Inst::Cdr(dst, src) => {
+                let v = lookup(map, src)?;
+                let call = b.ins().call(helpers.pair_cdr, &[v]);
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(dst, result);
+            }
+            &Inst::PairP(dst, src) => {
+                // `vm_pair_p_gc` returns 0/1 i64; or in the NB_FALSE
+                // pattern to land a `Boolean` NB.
+                let v = lookup(map, src)?;
+                let call = b.ins().call(helpers.pair_p, &[v]);
+                let raw = b.inst_results(call)[0];
+                let nb_false = cs_vm::vm::NanboxValue::FALSE.into_raw();
+                let result = b.ins().bor_imm(raw, nb_false);
+                map.insert(dst, result);
+            }
+            &Inst::NullP(dst, src) => {
+                let v = lookup(map, src)?;
+                let call = b.ins().call(helpers.null_p, &[v]);
+                let raw = b.inst_results(call)[0];
+                let nb_false = cs_vm::vm::NanboxValue::FALSE.into_raw();
+                let result = b.ins().bor_imm(raw, nb_false);
+                map.insert(dst, result);
+            }
+            &Inst::AnyClone(dst, src) => {
+                // `vm_value_clone_gc` increfs the NB payload (no-op for
+                // inline immediates) and returns the same i64.
+                let v = lookup(map, src)?;
+                let call = b.ins().call(helpers.value_clone, &[v]);
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(dst, result);
+            }
+            &Inst::AnyDrop(src) => {
+                let v = lookup(map, src)?;
+                b.ins().call(helpers.value_drop, &[v]);
             }
             other => {
                 return Err(JitError::Unsupported(format!(

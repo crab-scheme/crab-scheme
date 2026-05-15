@@ -441,6 +441,201 @@ fn uniform_nb_mul_overflow_falls_to_helper() {
 }
 
 #[test]
+fn uniform_nb_cons_car_cdr_roundtrip() {
+    // (fn (a b) (car (cons a b))) — must return a.
+    use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("cons_car_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.params.push((cs_rir::Value(1), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            // tags are baked at translate time for the specialized
+            // tier; uniform-NB ignores them.
+            RirInst::Cons(
+                cs_rir::Value(2),
+                cs_rir::Value(0),
+                cs_vm::vm::JIT_RT_ANY,
+                cs_rir::Value(1),
+                cs_vm::vm::JIT_RT_ANY,
+            ),
+            RirInst::Car(cs_rir::Value(3), cs_rir::Value(2)),
+        ],
+        terminator: Term::Return(cs_rir::Value(3)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64, i64) -> i64 = unsafe { transmute(ptr) };
+
+    let a_nb = NanboxValue::fixnum(7).into_raw();
+    let b_nb = NanboxValue::fixnum(13).into_raw();
+    let r = func(a_nb, b_nb);
+    match unsafe { NanboxValue(r).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 7),
+        other => panic!("expected Fixnum(7) from (car (cons 7 13)), got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_cdr_returns_cdr() {
+    use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("cons_cdr_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.params.push((cs_rir::Value(1), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            RirInst::Cons(
+                cs_rir::Value(2),
+                cs_rir::Value(0),
+                cs_vm::vm::JIT_RT_ANY,
+                cs_rir::Value(1),
+                cs_vm::vm::JIT_RT_ANY,
+            ),
+            RirInst::Cdr(cs_rir::Value(3), cs_rir::Value(2)),
+        ],
+        terminator: Term::Return(cs_rir::Value(3)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64, i64) -> i64 = unsafe { transmute(ptr) };
+
+    let r = func(
+        NanboxValue::fixnum(7).into_raw(),
+        NanboxValue::fixnum(13).into_raw(),
+    );
+    match unsafe { NanboxValue(r).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 13),
+        other => panic!("expected Fixnum(13), got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_pair_p_yes_and_no() {
+    // (fn (x) (pair? x)) — for a Pair input it returns #t,
+    // for a Fixnum it returns #f.
+    use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("pair_p_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![RirInst::PairP(cs_rir::Value(1), cs_rir::Value(0))],
+        terminator: Term::Return(cs_rir::Value(1)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
+
+    // Build a Pair through the runtime helper.
+    let car_nb = NanboxValue::fixnum(1).into_raw();
+    let cdr_nb = NanboxValue::fixnum(2).into_raw();
+    let pair_nb = unsafe {
+        cs_vm::vm::vm_alloc_pair_gc(car_nb, cs_vm::vm::JIT_RT_ANY, cdr_nb, cs_vm::vm::JIT_RT_ANY)
+    };
+    let r_pair = func(pair_nb);
+    match unsafe { NanboxValue(r_pair).to_value() } {
+        cs_core::Value::Boolean(b) => assert!(b),
+        other => panic!("expected Boolean(true) for pair, got {:?}", other),
+    }
+
+    // Fixnum is not a pair.
+    let r_fix = func(NanboxValue::fixnum(42).into_raw());
+    match unsafe { NanboxValue(r_fix).to_value() } {
+        cs_core::Value::Boolean(b) => assert!(!b),
+        other => panic!("expected Boolean(false) for fixnum, got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_null_p_yes_and_no() {
+    use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("null_p_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![RirInst::NullP(cs_rir::Value(1), cs_rir::Value(0))],
+        terminator: Term::Return(cs_rir::Value(1)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
+
+    // '() is null.
+    let r_null = func(NanboxValue::NULL.into_raw());
+    match unsafe { NanboxValue(r_null).to_value() } {
+        cs_core::Value::Boolean(b) => assert!(b),
+        other => panic!("expected #t for null, got {:?}", other),
+    }
+    // Fixnum is not null.
+    let r_fix = func(NanboxValue::fixnum(0).into_raw());
+    match unsafe { NanboxValue(r_fix).to_value() } {
+        cs_core::Value::Boolean(b) => assert!(!b),
+        other => panic!("expected #f for fixnum 0, got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_any_clone_preserves_pair() {
+    // (fn (x) (car (clone x))) — clone increfs, then car extracts
+    // the first slot. Result should match the pair's car.
+    use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("clone_car_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            RirInst::AnyClone(cs_rir::Value(1), cs_rir::Value(0)),
+            RirInst::Car(cs_rir::Value(2), cs_rir::Value(1)),
+            // Drop the original `x` (the clone got consumed by Car).
+            RirInst::AnyDrop(cs_rir::Value(0)),
+        ],
+        terminator: Term::Return(cs_rir::Value(2)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
+
+    let pair_nb = unsafe {
+        cs_vm::vm::vm_alloc_pair_gc(
+            NanboxValue::fixnum(99).into_raw(),
+            cs_vm::vm::JIT_RT_ANY,
+            NanboxValue::fixnum(100).into_raw(),
+            cs_vm::vm::JIT_RT_ANY,
+        )
+    };
+    let r = func(pair_nb);
+    match unsafe { NanboxValue(r).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 99),
+        other => panic!("expected Fixnum(99), got {:?}", other),
+    }
+}
+
+#[test]
 fn uniform_nb_add_mixed_fixnum_flonum_slow_path() {
     use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
     use cs_vm::vm::NanboxValue;
