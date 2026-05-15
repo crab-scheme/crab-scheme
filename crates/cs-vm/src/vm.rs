@@ -1170,35 +1170,41 @@ impl PartialEq for NanboxValue {
 }
 impl Eq for NanboxValue {}
 
-// ===== ValueStack (Stage 2 K1 step 3 — VM dispatch stack wrapper) =====
+// ===== ValueStack (Stage 2 K1 step 3b — NanboxValue-backed dispatch stack) =====
 //
-// Wrapper around the VM dispatch stack. Currently storage is
-// `Vec<Value>` (24-byte enum slots, unchanged from pre-K1) — the
-// **storage migration to `Vec<NanboxValue>` did not land** in this
-// iteration. Bench showed the per-push/pop NaN-box encode/decode
-// cost regressed VM-tier perf by 1.3×–2.0× on every benchmark
-// because Inst handlers still operate on `Value`, so every dispatch
-// would pay the conversion. The storage migration must happen *with*
-// hot-Inst-handler migration (each handler operating directly on
-// NanboxValue via `push_nb` / `pop_nb`) in the same iteration to
-// avoid the regression — that's the work-unit for a future step.
+// Storage is `Vec<NanboxValue>` — 8-byte slots, three slots per
+// cache line vs the previous one. NanboxValue is repr(transparent)
+// over i64 and is `Copy`, but the bit pattern can carry an *owned*
+// strong refcount on a `Gc<T>` allocation (when the variant tag is
+// pointer-typed). The stack OWNS the strong ref for every pointer-
+// tagged slot; the `Drop` impl decrefs each remaining slot on stack
+// teardown, and `truncate` decrefs the slots it discards.
 //
-// What this wrapper provides today:
-// - The Vec<Value>-shaped API the call sites already use (push, pop,
-//   truncate, len, is_empty).
-// - Explicit method-call shape for the formerly-indexed sites
-//   (`at_as_value(i)` instead of `stack[i].clone()`,
-//   `slice_as_values(range)` instead of `&stack[range]`,
-//   `drain_to_values(start)` instead of
-//   `stack.drain(start..).collect()`).
-// - `restore_from_value_slice` for call/cc snapshot restore.
-// - `push_nb` / `pop_nb` for future hot-handler migration.
-//
-// The shape is unchanged from the (reverted) NanboxValue storage
-// version. When the migration lands, the only change is the
-// internal `raw` type — all call sites stay as-is.
+// API conventions:
+// - `push(Value)` / `pop() -> Option<Value>` — encode/decode at the
+//   boundary. Use these in cold paths where the caller wants a
+//   `Value`.
+// - `push_nb(NanboxValue)` / `pop_nb() -> Option<NanboxValue>` —
+//   direct i64-memcpy. Hot Inst handlers use these to skip the
+//   Value enum entirely.
+// - `at_nb(i)` / `slice_nb(range)` — zero-cost borrow-shaped views
+//   over the NanboxValue storage (NanboxValue is `Copy`).
+// - `at_as_value(i)` — clone-decode: bumps the slot's refcount and
+//   reconstitutes a `Value`, leaving the slot intact. Used by the
+//   Call dispatch site that needs to peek at the function value.
+// - `slice_as_values(range)` — materialize an owned `Vec<Value>` by
+//   clone-decoding each slot in the range. Used by call dispatch
+//   to hand `&[Value]` to builtin / JIT bridges that haven't been
+//   migrated to a NanboxValue ABI yet (K3 follow-up).
+// - `drain_to_values(start)` — pop+decode each slot, transferring
+//   ownership of the strong refs into the returned `Vec<Value>`.
+//   The stack shrinks to `start`; no decref happens for the drained
+//   range (the Vec<Value> destructor takes over).
+// - `restore_from_value_slice(&[Value])` — clear (drop decrefs each
+//   slot) then encode each `Value` (cloned, since input is borrowed)
+//   into the stack. Used by call/cc restore.
 pub struct ValueStack {
-    raw: Vec<Value>,
+    raw: Vec<NanboxValue>,
 }
 
 impl ValueStack {
@@ -1207,22 +1213,28 @@ impl ValueStack {
         Self { raw: Vec::new() }
     }
 
-    /// Push a `Value` onto the stack.
+    /// Push a `Value` onto the stack. Encodes via `NanboxValue::from_value`,
+    /// transferring ownership of any strong ref in `v` into the new slot.
     #[inline]
     pub fn push(&mut self, v: Value) {
-        self.raw.push(v);
+        self.raw.push(NanboxValue::from_value(v));
     }
 
-    /// Pop the top slot as a `Value`.
+    /// Pop the top slot as a `Value`. Decodes via `to_value`, transferring
+    /// ownership of any strong ref from the slot into the returned `Value`.
     #[inline]
     pub fn pop(&mut self) -> Option<Value> {
-        self.raw.pop()
+        self.raw.pop().map(|nb| unsafe { nb.to_value() })
     }
 
-    /// Drop the top slots, shrinking to `new_len`.
+    /// Drop the top slots, shrinking to `new_len`. Each discarded slot's
+    /// strong refcount (if pointer-typed) is decremented.
     #[inline]
     pub fn truncate(&mut self, new_len: usize) {
-        self.raw.truncate(new_len);
+        while self.raw.len() > new_len {
+            let nb = self.raw.pop().unwrap();
+            unsafe { vm_value_drop_gc(nb.into_raw()) };
+        }
     }
 
     #[inline]
@@ -1235,79 +1247,103 @@ impl ValueStack {
         self.raw.is_empty()
     }
 
-    /// Read slot `idx` as a `Value`, with clone semantics — the
-    /// original slot stays intact.
+    /// Read slot `idx` as a `Value`, with clone semantics — the slot
+    /// stays intact. Bumps the slot's strong refcount (if pointer-typed)
+    /// and reconstitutes a `Value` owning the new ref.
     #[inline]
     pub fn at_as_value(&self, idx: usize) -> Value {
-        self.raw[idx].clone()
+        let nb = self.raw[idx];
+        let cloned_bits = unsafe { vm_value_clone_gc(nb.into_raw()) };
+        unsafe { NanboxValue(cloned_bits).to_value() }
     }
 
-    /// Borrow slot `idx` as `&Value`. Zero-cost while the storage
-    /// stays `Vec<Value>`; the NanboxValue migration will replace
-    /// this with a different mechanism.
+    /// Read slot `idx` as a `NanboxValue` (`Copy`, no refcount touched).
+    /// The returned `NanboxValue` does NOT own a strong ref — the slot
+    /// retains its ref. Callers must NOT pass this to `to_value` or
+    /// `vm_value_drop_gc` (would double-free).
     #[inline]
-    pub fn at(&self, idx: usize) -> &Value {
-        &self.raw[idx]
+    pub fn at_nb(&self, idx: usize) -> NanboxValue {
+        self.raw[idx]
     }
 
-    /// Zero-cost slice borrow over a range. Today's storage is
-    /// `Vec<Value>` so this is a direct subslice. The NanboxValue
-    /// storage migration will replace this with a closure-style
-    /// `with_slice<R>(&self, range, f: FnOnce(&[Value]) -> R)`
-    /// that buffers into a thread-local — at which point call
-    /// sites switch shape.
+    /// Zero-cost slice over the `NanboxValue` storage. Each slot
+    /// retains its strong ref (the slice is purely a borrow).
     #[inline]
-    pub fn slice(&self, range: std::ops::Range<usize>) -> &[Value] {
+    pub fn slice_nb(&self, range: std::ops::Range<usize>) -> &[NanboxValue] {
         &self.raw[range]
     }
 
-    /// Snapshot a contiguous range of slots as an owned `Vec<Value>`.
-    /// Each slot is cloned, leaving the stack unchanged. Used where
-    /// the consumer needs ownership (e.g. `call/cc` snapshot).
+    /// Materialize an owned `Vec<Value>` over a range. Each slot is
+    /// clone-decoded (refcount bumped, Value owns the new ref); the
+    /// stack is unchanged. Used by call dispatch to hand a `&[Value]`
+    /// to builtin/JIT bridges.
     pub fn slice_as_values(&self, range: std::ops::Range<usize>) -> Vec<Value> {
-        self.raw[range].to_vec()
+        let mut out = Vec::with_capacity(range.len());
+        for i in range {
+            out.push(self.at_as_value(i));
+        }
+        out
     }
 
-    /// Drain slots from `start` to the end, transferring slot
-    /// ownership into a `Vec<Value>`. The stack shrinks to `start`.
-    /// Mirrors `Vec<Value>::drain(start..).collect()`.
+    /// Drain slots from `start` to the end, transferring slot ownership
+    /// into a `Vec<Value>`. The stack shrinks to `start`; no decref is
+    /// performed for the drained range (the new owners are the Values).
     pub fn drain_to_values(&mut self, start: usize) -> Vec<Value> {
-        self.raw.drain(start..).collect()
+        let mut out = Vec::with_capacity(self.raw.len() - start);
+        for nb in self.raw.drain(start..) {
+            out.push(unsafe { nb.to_value() });
+        }
+        out
     }
 
-    /// Clear the stack and push each value from `values`. Used by
-    /// call/cc snapshot restore — the snapshot's `Rc<Vec<Value>>`
-    /// stays intact (re-invocable).
+    /// Clear the stack (decrefing each slot) then push each value from
+    /// `values` (encoded into a fresh slot owning a new ref). Used by
+    /// call/cc snapshot restore — the snapshot's `Rc<Vec<Value>>` stays
+    /// intact (re-invocable).
     pub fn restore_from_value_slice(&mut self, values: &[Value]) {
-        self.raw.clear();
-        self.raw.extend(values.iter().cloned());
+        // Drain & decref existing slots.
+        self.truncate(0);
+        self.raw.reserve(values.len());
+        for v in values {
+            self.raw.push(NanboxValue::from_value(v.clone()));
+        }
     }
 
-    /// Direct push of a `NanboxValue` for the future migration —
-    /// today this decodes via the same path as `push(Value)`.
-    /// Hot Inst handlers in a future step will use this to skip the
-    /// Value round-trip once the underlying storage is `Vec<NanboxValue>`.
+    /// Direct push of a `NanboxValue`. Caller transfers strong-ref
+    /// ownership of `nb` to the slot. After this call, `nb` must not
+    /// be passed to `to_value` or `vm_value_drop_gc`.
     #[inline]
     pub fn push_nb(&mut self, nb: NanboxValue) {
-        // SAFETY: caller produced `nb` via a valid encoding; pushing
-        // through the decode preserves the strong-ref ownership
-        // contract (the slot now owns what the NanboxValue did).
-        self.raw.push(unsafe { nb.to_value() });
+        self.raw.push(nb);
     }
 
-    /// Direct pop returning a `NanboxValue`. Today's body encodes
-    /// the popped Value; future storage migration makes this a
-    /// pure memcpy.
+    /// Direct pop returning a `NanboxValue` carrying the slot's owned
+    /// strong ref. Caller is responsible for eventually consuming it
+    /// (via `to_value`, `push_nb`, or `vm_value_drop_gc`).
     #[inline]
     pub fn pop_nb(&mut self) -> Option<NanboxValue> {
-        self.raw.pop().map(NanboxValue::from_value)
+        self.raw.pop()
+    }
+
+    /// Replace slot `idx` with `nb`, returning the prior slot. Caller
+    /// transfers ownership of the new ref to the slot and receives
+    /// ownership of the prior slot's ref.
+    #[inline]
+    pub fn replace_nb(&mut self, idx: usize, nb: NanboxValue) -> NanboxValue {
+        std::mem::replace(&mut self.raw[idx], nb)
     }
 }
 
-// `Vec<Value>` already drops its slots correctly; the explicit
-// `Drop` impl was only needed when the storage was `Vec<NanboxValue>`
-// (which is `Copy` and has no destructor). Re-add when the storage
-// migration lands.
+impl Drop for ValueStack {
+    fn drop(&mut self) {
+        // Decref every slot's payload. `Vec` itself would just drop
+        // each `NanboxValue` (which is Copy — no destructor), so we
+        // have to walk the slots ourselves to release the strong refs.
+        while let Some(nb) = self.raw.pop() {
+            unsafe { vm_value_drop_gc(nb.into_raw()) };
+        }
+    }
+}
 
 impl Default for ValueStack {
     #[inline]
@@ -9891,15 +9927,17 @@ const SMALL_THRESHOLD: usize = 12;
 /// Fx-hashed `Large` map.
 const SMALL_INLINE: usize = 4;
 
-/// `SmallVec` backing the `Small` binding tier.
-type SmallBindings = smallvec::SmallVec<[(Symbol, Value); SMALL_INLINE]>;
+/// `SmallVec` backing the `Small` binding tier. Slots hold
+/// `NanboxValue` (each owns a strong ref on its pointer payload —
+/// see `Bindings::Drop` for cleanup).
+type SmallBindings = smallvec::SmallVec<[(Symbol, NanboxValue); SMALL_INLINE]>;
 
 /// `Symbol`-keyed map for the `Large` binding tier. `Symbol` is a
 /// `u32` from a trusted intern table, so std's DoS-resistant SipHash
 /// is pure overhead — `FxBuildHasher` (the hasher rustc itself uses)
 /// is ~2-5x faster on small integer keys. Every global / free-var
 /// lookup that walks up to the root env hits this map.
-type SymbolMap = HashMap<Symbol, Value, rustc_hash::FxBuildHasher>;
+type SymbolMap = HashMap<Symbol, NanboxValue, rustc_hash::FxBuildHasher>;
 
 #[derive(Debug)]
 enum Bindings {
@@ -9913,17 +9951,103 @@ impl Default for Bindings {
     }
 }
 
-impl cs_gc::Trace for Bindings {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
+impl Drop for Bindings {
+    fn drop(&mut self) {
+        // Each slot owns one strong ref on its NB payload (if pointer-
+        // typed). Release them. `vm_value_drop_gc` is a no-op for
+        // inline immediates and Flonums.
         match self {
             Bindings::Small(v) => {
-                for (_, val) in v {
-                    val.trace(marker);
+                for (_, nb) in v.drain(..) {
+                    unsafe { vm_value_drop_gc(nb.into_raw()) };
                 }
             }
             Bindings::Large(m) => {
-                for (_, val) in m {
-                    val.trace(marker);
+                for (_, nb) in m.drain() {
+                    unsafe { vm_value_drop_gc(nb.into_raw()) };
+                }
+            }
+        }
+    }
+}
+
+impl cs_gc::Trace for Bindings {
+    fn trace(&self, marker: &mut cs_gc::Marker) {
+        // Borrow each slot's Gc<T> handle without touching the
+        // refcount (ManuallyDrop pattern), trace it, then let the
+        // ManuallyDrop wrapper forget the temporary handle. The
+        // slot still owns the strong ref.
+        let trace_nb = |nb: &NanboxValue, marker: &mut cs_gc::Marker| {
+            let bits = nb.into_raw() as u64;
+            if !nb_is_tagged(bits) {
+                return; // Flonum — leaf.
+            }
+            let tag = nb_tag_of(bits);
+            let payload = nb_payload_of(bits);
+            let ptr = payload as *const ();
+            match tag {
+                t if t == NB_TAG_PAIR => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<cs_core::Pair>::from_raw_jit(ptr)
+                    });
+                    (*g).trace(marker);
+                }
+                t if t == NB_TAG_VECTOR => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<std::cell::RefCell<Vec<Value>>>::from_raw_jit(ptr)
+                    });
+                    (*g).trace(marker);
+                }
+                t if t == NB_TAG_STRING => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<std::cell::RefCell<String>>::from_raw_jit(ptr)
+                    });
+                    (*g).trace(marker);
+                }
+                t if t == NB_TAG_BYTEVECTOR => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<std::cell::RefCell<Vec<u8>>>::from_raw_jit(ptr)
+                    });
+                    (*g).trace(marker);
+                }
+                t if t == NB_TAG_HASHTABLE => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<cs_core::Hashtable>::from_raw_jit(ptr)
+                    });
+                    (*g).trace(marker);
+                }
+                t if t == NB_TAG_PORT => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<cs_core::Port>::from_raw_jit(ptr)
+                    });
+                    (*g).trace(marker);
+                }
+                t if t == NB_TAG_PROMISE => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<cs_core::Promise>::from_raw_jit(ptr)
+                    });
+                    (*g).trace(marker);
+                }
+                _ => {
+                    // NB_TAG_GC_VALUE (or any other pointer tag routed
+                    // through the Gc<Value> wrap fallback). Trace the
+                    // wrap, which in turn traces the inner Value.
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<Value>::from_raw_jit(ptr)
+                    });
+                    (*g).trace(marker);
+                }
+            }
+        };
+        match self {
+            Bindings::Small(v) => {
+                for (_, nb) in v {
+                    trace_nb(nb, marker);
+                }
+            }
+            Bindings::Large(m) => {
+                for (_, nb) in m {
+                    trace_nb(nb, marker);
                 }
             }
         }
@@ -9940,14 +10064,24 @@ impl cs_gc::Trace for Env {
 }
 
 impl Bindings {
-    fn get(&self, name: Symbol) -> Option<Value> {
-        match self {
+    /// Fast-path NB lookup: returns the stored NanboxValue with an
+    /// incref'd strong ref (clone semantics, slot stays intact).
+    fn get_nb(&self, name: Symbol) -> Option<NanboxValue> {
+        let raw = match self {
             Bindings::Small(v) => v
                 .iter()
                 .find(|(k, _)| *k == name)
-                .map(|(_, val)| val.clone()),
-            Bindings::Large(m) => m.get(&name).cloned(),
-        }
+                .map(|(_, nb)| nb.into_raw()),
+            Bindings::Large(m) => m.get(&name).map(|nb| nb.into_raw()),
+        };
+        raw.map(|r| {
+            let inc = unsafe { vm_value_clone_gc(r) };
+            NanboxValue(inc)
+        })
+    }
+
+    fn get(&self, name: Symbol) -> Option<Value> {
+        self.get_nb(name).map(|nb| unsafe { nb.to_value() })
     }
 
     fn contains(&self, name: Symbol) -> bool {
@@ -9957,35 +10091,50 @@ impl Bindings {
         }
     }
 
-    fn insert(&mut self, name: Symbol, value: Value) {
+    /// Insert / replace by `NanboxValue`. Caller transfers ownership
+    /// of the new slot's strong ref; the prior slot (if any) has its
+    /// ref released here.
+    fn insert_nb(&mut self, name: Symbol, value: NanboxValue) {
         match self {
             Bindings::Small(v) => {
                 if let Some(slot) = v.iter_mut().find(|(k, _)| *k == name) {
-                    slot.1 = value;
+                    let old = std::mem::replace(&mut slot.1, value);
+                    unsafe { vm_value_drop_gc(old.into_raw()) };
                     return;
                 }
                 v.push((name, value));
-                // Promote to a (Fx-hashed) HashMap once we exceed the
-                // threshold.
                 if v.len() > SMALL_THRESHOLD {
                     let mut m: SymbolMap =
                         HashMap::with_capacity_and_hasher(v.len() * 2, rustc_hash::FxBuildHasher);
-                    for (k, val) in v.drain(..) {
-                        m.insert(k, val);
+                    for (k, nb) in v.drain(..) {
+                        m.insert(k, nb);
                     }
                     *self = Bindings::Large(m);
                 }
             }
             Bindings::Large(m) => {
-                m.insert(name, value);
+                if let Some(old) = m.insert(name, value) {
+                    unsafe { vm_value_drop_gc(old.into_raw()) };
+                }
             }
         }
     }
 
+    fn insert(&mut self, name: Symbol, value: Value) {
+        self.insert_nb(name, NanboxValue::from_value(value));
+    }
+
+    /// Iterate, decoding each NanboxValue into a `Value` (with refcount
+    /// bumps). Used by `Env::snapshot_bindings` for the compiler's
+    /// known-globals fold — cold path.
     fn iter(&self) -> Box<dyn Iterator<Item = (Symbol, Value)> + '_> {
+        let decode = |nb: &NanboxValue| -> Value {
+            let inc = unsafe { vm_value_clone_gc(nb.into_raw()) };
+            unsafe { NanboxValue(inc).to_value() }
+        };
         match self {
-            Bindings::Small(v) => Box::new(v.iter().map(|(k, val)| (*k, val.clone()))),
-            Bindings::Large(m) => Box::new(m.iter().map(|(k, v)| (*k, v.clone()))),
+            Bindings::Small(v) => Box::new(v.iter().map(move |(k, nb)| (*k, decode(nb)))),
+            Bindings::Large(m) => Box::new(m.iter().map(move |(k, nb)| (*k, decode(nb)))),
         }
     }
 }
@@ -10018,6 +10167,19 @@ impl Env {
         None
     }
 
+    /// Fast-path lookup returning a `NanboxValue` (with refcount bumped
+    /// for pointer-typed payloads). Used by `Inst::LoadVar` to push
+    /// the binding's NB directly without a `Value` round-trip.
+    pub fn get_nb(&self, name: Symbol) -> Option<NanboxValue> {
+        if let Some(nb) = self.bindings.borrow().get_nb(name) {
+            return Some(nb);
+        }
+        if let Some(p) = &self.parent {
+            return p.get_nb(name);
+        }
+        None
+    }
+
     pub fn set_existing(&self, name: Symbol, value: Value) -> bool {
         if self.bindings.borrow().contains(name) {
             self.bindings.borrow_mut().insert(name, value);
@@ -10029,8 +10191,28 @@ impl Env {
         false
     }
 
+    /// `set!`-style update for an existing binding, by `NanboxValue`.
+    /// Returns false if no binding exists (caller falls back to
+    /// `define`/`define_nb` at the root, matching the Value version).
+    pub fn set_existing_nb(&self, name: Symbol, value: NanboxValue) -> bool {
+        if self.bindings.borrow().contains(name) {
+            self.bindings.borrow_mut().insert_nb(name, value);
+            return true;
+        }
+        if let Some(p) = &self.parent {
+            return p.set_existing_nb(name, value);
+        }
+        false
+    }
+
     pub fn define(&self, name: Symbol, value: Value) {
         self.bindings.borrow_mut().insert(name, value);
+    }
+
+    /// `define`-style binding install by `NanboxValue`. Caller transfers
+    /// strong-ref ownership of `value` to the binding slot.
+    pub fn define_nb(&self, name: Symbol, value: NanboxValue) {
+        self.bindings.borrow_mut().insert_nb(name, value);
     }
 
     /// Snapshot the bindings of this env (and all parents) into a flat
@@ -10160,11 +10342,11 @@ fn run_dispatch(
             Inst::Const(v) => stack.push(v.clone()),
             Inst::LoadVar(s) => {
                 let s = *s;
-                let v = frame.env.get(s).ok_or_else(|| {
+                let nb = frame.env.get_nb(s).ok_or_else(|| {
                     let span = frame.spans.get(inst_ip).copied().unwrap_or(Span::DUMMY);
                     VmError::new(format!("undefined variable: {}", syms.name(s))).with_span(span)
                 })?;
-                stack.push(v);
+                stack.push_nb(nb);
             }
             Inst::SetVar(s) => {
                 let s = *s;
@@ -10224,18 +10406,21 @@ fn run_dispatch(
                 frame.env = parent;
             }
             Inst::Pop => {
-                stack
-                    .pop()
+                let nb = stack
+                    .pop_nb()
                     .ok_or_else(|| VmError::new("stack underflow on Pop"))?;
+                // Release the slot's owned ref (no-op for inline immediates).
+                unsafe { vm_value_drop_gc(nb.into_raw()) };
             }
             Inst::JumpIfFalse(target) => {
                 let target = *target;
-                let v = stack
-                    .pop()
+                let nb = stack
+                    .pop_nb()
                     .ok_or_else(|| VmError::new("stack underflow on JumpIfFalse"))?;
-                if !v.is_truthy() {
+                if !nb.is_truthy() {
                     frame.ip = target;
                 }
+                unsafe { vm_value_drop_gc(nb.into_raw()) };
             }
             Inst::Jump(target) => {
                 frame.ip = *target;
@@ -10249,40 +10434,54 @@ fn run_dispatch(
                 }
                 let func_idx = stack_len - n - 1;
                 let args_start = func_idx + 1;
-                // FAST PATH: peek at func without popping; pass args as a
-                // slice into the stack — no per-Call Vec<Value> allocation.
-                // Covers closure / builtin / builtinSyms / parameter (the
-                // overwhelming majority of Call sites).
                 // Capture the call-site span up front so error paths can
                 // attach it cheaply (one Rc deref + indexed read per Call).
                 let call_span = frame.spans.get(inst_ip).copied().unwrap_or(Span::DUMMY);
-                // Zero-cost borrow into the slot — only clone the
-                // `Rc<dyn Procedure>` we actually need. Pre-step-3a
-                // this was `&stack[func_idx]`; the `.at()` method
-                // gives the same shape via the wrapper.
-                let func_proc = match stack.at(func_idx) {
-                    Value::Procedure(p) => p.clone(),
-                    other => {
+                // Inspect the func slot without consuming its strong ref:
+                // `ManuallyDrop` lets us borrow through the `Gc<Value>` wrap
+                // (NB_TAG_GC_VALUE) and clone just the inner `Rc<dyn Procedure>`,
+                // skipping the wrap incref/decref pair `at_as_value` would do.
+                // For non-pointer-typed slots (or pointer tags other than
+                // GC_VALUE), it cannot be a Procedure, so we fail fast with
+                // an informative error.
+                let func_proc: Rc<dyn cs_core::Procedure> = {
+                    let nb = stack.at_nb(func_idx);
+                    let bits = nb.into_raw() as u64;
+                    if !nb_is_tagged(bits) || nb_tag_of(bits) != NB_TAG_GC_VALUE {
+                        // Decode for the error message — cold path.
+                        let v = stack.at_as_value(func_idx);
                         return Err(VmError::new(format!(
                             "call to non-procedure ({})",
-                            other.type_name()
+                            v.type_name()
                         ))
                         .with_span(call_span));
+                    }
+                    let payload = nb_payload_of(bits);
+                    // ManuallyDrop: borrow the wrap allocation, do NOT
+                    // decref it. The slot still owns the strong ref.
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<Value>::from_raw_jit(payload as *const ())
+                    });
+                    match &**g {
+                        Value::Procedure(p) => p.clone(),
+                        other => {
+                            let tn = other.type_name();
+                            return Err(VmError::new(format!("call to non-procedure ({})", tn))
+                                .with_span(call_span));
+                        }
                     }
                 };
                 {
                     let any = func_proc.as_any();
                     if let Some(closure) = any.downcast_ref::<VmClosure>() {
-                        if closure.profile.tier.bump() {
-                            fire_tier_up_hook(closure, stack.slice(args_start..stack_len));
+                        let tier_bumped = closure.profile.tier.bump();
+                        if tier_bumped {
+                            let args = stack.slice_as_values(args_start..stack_len);
+                            fire_tier_up_hook(closure, &args);
                         }
-                        // JIT fast path: if a native pointer is
-                        // installed and every arg is a Fixnum, run
-                        // the JIT body. Falls through to bytecode on
-                        // ABI mismatch or non-Fixnum args.
                         if !closure.jit_ptr().is_null() {
-                            let arg_slice = stack.slice(args_start..stack_len);
-                            if let Some(result) = try_dispatch_jit(closure, arg_slice, syms) {
+                            let args = stack.slice_as_values(args_start..stack_len);
+                            if let Some(result) = try_dispatch_jit(closure, &args, syms) {
                                 stack.truncate(func_idx);
                                 stack.push(result);
                                 if is_tail {
@@ -10307,19 +10506,13 @@ fn run_dispatch(
                             ))
                             .with_span(call_span));
                         }
-                        // Fast path: lambda body is a single 2-arg primop on
-                        // params/consts. Skip Env+Frame allocation; just run
-                        // the primop directly on the args sitting on the stack.
                         if let Some(fp) = &lam.fast {
-                            let result =
-                                apply_fast_primop(fp, stack.slice(args_start..stack_len), syms)
-                                    .map_err(|e| e.with_span(call_span))?;
+                            let args = stack.slice_as_values(args_start..stack_len);
+                            let result = apply_fast_primop(fp, &args, syms)
+                                .map_err(|e| e.with_span(call_span))?;
                             stack.truncate(func_idx);
                             stack.push(result);
                             if is_tail {
-                                // Tail-call into a fast-primop body: result is
-                                // the return value of the *current* frame too,
-                                // so pop the frame just like Inst::Return would.
                                 frames.pop();
                                 if frames.is_empty() {
                                     return stack
@@ -10329,13 +10522,21 @@ fn run_dispatch(
                             }
                             continue;
                         }
+                        // Slow path (hot for recursive funcs): bind params
+                        // directly from stack via NanboxValue, no `Vec<Value>`
+                        // materialization. Each `at_nb` is a copy; the
+                        // `vm_value_clone_gc` incref transfers a fresh
+                        // strong ref to the new env slot.
                         let new_env = Env::child(closure.env.clone());
                         for (i, name) in lam.params.iter().enumerate() {
-                            new_env.define(*name, stack.at_as_value(args_start + i));
+                            let nb = stack.at_nb(args_start + i);
+                            let inc = unsafe { vm_value_clone_gc(nb.into_raw()) };
+                            new_env.define_nb(*name, NanboxValue(inc));
                         }
                         if let Some(rest_name) = lam.rest {
-                            let rest = stack.slice(args_start + lam.params.len()..stack_len);
-                            new_env.define(rest_name, Value::list(rest.iter().cloned()));
+                            let rest =
+                                stack.slice_as_values(args_start + lam.params.len()..stack_len);
+                            new_env.define(rest_name, Value::list(rest.into_iter()));
                         }
                         stack.truncate(func_idx);
                         if is_tail {
@@ -10358,7 +10559,8 @@ fn run_dispatch(
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltin>() {
                         let name = b.name;
-                        let raw = (b.f)(stack.slice(args_start..stack_len));
+                        let args = stack.slice_as_values(args_start..stack_len);
+                        let raw = (b.f)(&args);
                         let r = match raw {
                             Ok(v) => v,
                             Err(e) => {
@@ -10379,7 +10581,8 @@ fn run_dispatch(
                     }
                     if let Some(h) = any.downcast_ref::<VmHostBuiltin>() {
                         let name = h.name;
-                        let raw = (h.f)(stack.slice(args_start..stack_len));
+                        let args = stack.slice_as_values(args_start..stack_len);
+                        let raw = (h.f)(&args);
                         let r = match raw {
                             Ok(v) => v,
                             Err(e) => {
@@ -10400,7 +10603,8 @@ fn run_dispatch(
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltinSyms>() {
                         let name = b.name;
-                        let raw = (b.f)(stack.slice(args_start..stack_len), syms);
+                        let args = stack.slice_as_values(args_start..stack_len);
+                        let raw = (b.f)(&args, syms);
                         let r = match raw {
                             Ok(v) => v,
                             Err(e) => {
@@ -11832,57 +12036,82 @@ fn run_dispatch(
             // path; otherwise falls back to the generic Number arithmetic
             // (which handles bignum/rational/flonum + reports type errors).
             Inst::AddFx2 => {
-                fixnum_binop2(stack, &mut |a: i64, b: i64| a.checked_add(b)).or_else(|args| {
-                    let r = generic_arith2(args, GenericArith::Add, inst_ip, &frame.spans, syms)?;
-                    stack.push(r);
-                    Ok::<(), VmError>(())
-                })?;
+                fixnum_binop2_nb(stack, &mut |a: i64, b: i64| a.checked_add(b)).or_else(
+                    |(an, bn)| {
+                        let a = unsafe { an.to_value() };
+                        let b = unsafe { bn.to_value() };
+                        let r =
+                            generic_arith2((a, b), GenericArith::Add, inst_ip, &frame.spans, syms)?;
+                        stack.push(r);
+                        Ok::<(), VmError>(())
+                    },
+                )?;
             }
             Inst::SubFx2 => {
-                fixnum_binop2(stack, &mut |a: i64, b: i64| a.checked_sub(b)).or_else(|args| {
-                    let r = generic_arith2(args, GenericArith::Sub, inst_ip, &frame.spans, syms)?;
-                    stack.push(r);
-                    Ok::<(), VmError>(())
-                })?;
+                fixnum_binop2_nb(stack, &mut |a: i64, b: i64| a.checked_sub(b)).or_else(
+                    |(an, bn)| {
+                        let a = unsafe { an.to_value() };
+                        let b = unsafe { bn.to_value() };
+                        let r =
+                            generic_arith2((a, b), GenericArith::Sub, inst_ip, &frame.spans, syms)?;
+                        stack.push(r);
+                        Ok::<(), VmError>(())
+                    },
+                )?;
             }
             Inst::MulFx2 => {
-                fixnum_binop2(stack, &mut |a: i64, b: i64| a.checked_mul(b)).or_else(|args| {
-                    let r = generic_arith2(args, GenericArith::Mul, inst_ip, &frame.spans, syms)?;
-                    stack.push(r);
-                    Ok::<(), VmError>(())
-                })?;
+                fixnum_binop2_nb(stack, &mut |a: i64, b: i64| a.checked_mul(b)).or_else(
+                    |(an, bn)| {
+                        let a = unsafe { an.to_value() };
+                        let b = unsafe { bn.to_value() };
+                        let r =
+                            generic_arith2((a, b), GenericArith::Mul, inst_ip, &frame.spans, syms)?;
+                        stack.push(r);
+                        Ok::<(), VmError>(())
+                    },
+                )?;
             }
             Inst::LtFx2 => {
-                fixnum_cmp2(stack, &mut |a: i64, b: i64| a < b).or_else(|args| {
-                    let r = generic_cmp2(args, GenericCmp::Lt, inst_ip, &frame.spans, syms)?;
+                fixnum_cmp2_nb(stack, &mut |a: i64, b: i64| a < b).or_else(|(an, bn)| {
+                    let a = unsafe { an.to_value() };
+                    let b = unsafe { bn.to_value() };
+                    let r = generic_cmp2((a, b), GenericCmp::Lt, inst_ip, &frame.spans, syms)?;
                     stack.push(r);
                     Ok::<(), VmError>(())
                 })?;
             }
             Inst::LeFx2 => {
-                fixnum_cmp2(stack, &mut |a: i64, b: i64| a <= b).or_else(|args| {
-                    let r = generic_cmp2(args, GenericCmp::Le, inst_ip, &frame.spans, syms)?;
+                fixnum_cmp2_nb(stack, &mut |a: i64, b: i64| a <= b).or_else(|(an, bn)| {
+                    let a = unsafe { an.to_value() };
+                    let b = unsafe { bn.to_value() };
+                    let r = generic_cmp2((a, b), GenericCmp::Le, inst_ip, &frame.spans, syms)?;
                     stack.push(r);
                     Ok::<(), VmError>(())
                 })?;
             }
             Inst::GtFx2 => {
-                fixnum_cmp2(stack, &mut |a: i64, b: i64| a > b).or_else(|args| {
-                    let r = generic_cmp2(args, GenericCmp::Gt, inst_ip, &frame.spans, syms)?;
+                fixnum_cmp2_nb(stack, &mut |a: i64, b: i64| a > b).or_else(|(an, bn)| {
+                    let a = unsafe { an.to_value() };
+                    let b = unsafe { bn.to_value() };
+                    let r = generic_cmp2((a, b), GenericCmp::Gt, inst_ip, &frame.spans, syms)?;
                     stack.push(r);
                     Ok::<(), VmError>(())
                 })?;
             }
             Inst::GeFx2 => {
-                fixnum_cmp2(stack, &mut |a: i64, b: i64| a >= b).or_else(|args| {
-                    let r = generic_cmp2(args, GenericCmp::Ge, inst_ip, &frame.spans, syms)?;
+                fixnum_cmp2_nb(stack, &mut |a: i64, b: i64| a >= b).or_else(|(an, bn)| {
+                    let a = unsafe { an.to_value() };
+                    let b = unsafe { bn.to_value() };
+                    let r = generic_cmp2((a, b), GenericCmp::Ge, inst_ip, &frame.spans, syms)?;
                     stack.push(r);
                     Ok::<(), VmError>(())
                 })?;
             }
             Inst::EqFx2 => {
-                fixnum_cmp2(stack, &mut |a: i64, b: i64| a == b).or_else(|args| {
-                    let r = generic_cmp2(args, GenericCmp::Eq, inst_ip, &frame.spans, syms)?;
+                fixnum_cmp2_nb(stack, &mut |a: i64, b: i64| a == b).or_else(|(an, bn)| {
+                    let a = unsafe { an.to_value() };
+                    let b = unsafe { bn.to_value() };
+                    let r = generic_cmp2((a, b), GenericCmp::Eq, inst_ip, &frame.spans, syms)?;
                     stack.push(r);
                     Ok::<(), VmError>(())
                 })?;
@@ -11894,8 +12123,8 @@ fn run_dispatch(
             // JumpIfFalse.
             Inst::BranchOnGeFx2(target) => {
                 let target = *target;
-                if !fxbranch(stack, |a, b| a >= b, target, &mut frame.ip) {
-                    fallback_branch(
+                if !fxbranch_nb(stack, |a, b| a >= b, target, &mut frame.ip) {
+                    fallback_branch_nb(
                         stack,
                         GenericCmp::Lt,
                         target,
@@ -11908,8 +12137,8 @@ fn run_dispatch(
             }
             Inst::BranchOnGtFx2(target) => {
                 let target = *target;
-                if !fxbranch(stack, |a, b| a > b, target, &mut frame.ip) {
-                    fallback_branch(
+                if !fxbranch_nb(stack, |a, b| a > b, target, &mut frame.ip) {
+                    fallback_branch_nb(
                         stack,
                         GenericCmp::Le,
                         target,
@@ -11922,8 +12151,8 @@ fn run_dispatch(
             }
             Inst::BranchOnLeFx2(target) => {
                 let target = *target;
-                if !fxbranch(stack, |a, b| a <= b, target, &mut frame.ip) {
-                    fallback_branch(
+                if !fxbranch_nb(stack, |a, b| a <= b, target, &mut frame.ip) {
+                    fallback_branch_nb(
                         stack,
                         GenericCmp::Gt,
                         target,
@@ -11936,8 +12165,8 @@ fn run_dispatch(
             }
             Inst::BranchOnLtFx2(target) => {
                 let target = *target;
-                if !fxbranch(stack, |a, b| a < b, target, &mut frame.ip) {
-                    fallback_branch(
+                if !fxbranch_nb(stack, |a, b| a < b, target, &mut frame.ip) {
+                    fallback_branch_nb(
                         stack,
                         GenericCmp::Ge,
                         target,
@@ -11950,8 +12179,8 @@ fn run_dispatch(
             }
             Inst::BranchOnNeFx2(target) => {
                 let target = *target;
-                if !fxbranch(stack, |a, b| a != b, target, &mut frame.ip) {
-                    fallback_branch(
+                if !fxbranch_nb(stack, |a, b| a != b, target, &mut frame.ip) {
+                    fallback_branch_nb(
                         stack,
                         GenericCmp::Eq,
                         target,
@@ -11966,39 +12195,44 @@ fn run_dispatch(
     }
 }
 
-/// Fast-path fused branch: pop b, pop a; on (Fixnum, Fixnum), set ip to
-/// target if `op(a, b)` and return true. Returns false if either arg
-/// wasn't a fixnum — caller falls back to generic_cmp2.
-fn fxbranch(
+/// Fast-path fused branch on raw NanboxValue slots. Pops b then a;
+/// if both are Fixnum-tagged, branches to `target` when `op(a, b)`
+/// holds and returns true. Returns false if either arg wasn't a
+/// fixnum (and re-pushes both via `push_nb` so the slow path can
+/// re-pop them).
+fn fxbranch_nb(
     stack: &mut ValueStack,
     op: impl Fn(i64, i64) -> bool,
     target: usize,
     ip: &mut usize,
 ) -> bool {
-    let b = stack.pop().expect("stack underflow on fxbranch");
-    let a = stack.pop().expect("stack underflow on fxbranch");
-    if let (
-        Value::Number(cs_core::Number::Fixnum(av)),
-        Value::Number(cs_core::Number::Fixnum(bv)),
-    ) = (&a, &b)
+    let bn = stack.pop_nb().expect("stack underflow on fxbranch");
+    let an = stack.pop_nb().expect("stack underflow on fxbranch");
+    let ab = an.into_raw() as u64;
+    let bb = bn.into_raw() as u64;
+    if nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM
     {
-        if op(*av, *bv) {
+        let av = nb_sign_extend_47(nb_payload_of(ab));
+        let bv = nb_sign_extend_47(nb_payload_of(bb));
+        if op(av, bv) {
             *ip = target;
         }
         return true;
     }
-    // Non-fixnum: re-push so the slow path can recover.
-    stack.push(a);
-    stack.push(b);
+    // Non-fixnum: push back so the slow path can re-pop. Strong refs
+    // (if any) are transferred back to the slots.
+    stack.push_nb(an);
+    stack.push_nb(bn);
     false
 }
 
 /// Slow-path fallback for compare+branch when args aren't both fixnums.
-/// Computes the original (un-negated) comparison via generic_cmp2; if it
-/// is false, branches to target. (`op` here is the *original* comparison,
-/// not the negated branch trigger — matches the un-fused
-/// `generic_cmp2 + JumpIfFalse` semantics.)
-fn fallback_branch(
+/// Pops both, decodes them into `Value`s, runs the original comparison
+/// via `generic_cmp2`, and branches if the result was falsy.
+fn fallback_branch_nb(
     stack: &mut ValueStack,
     op: GenericCmp,
     target: usize,
@@ -12007,8 +12241,10 @@ fn fallback_branch(
     syms: &mut SymbolTable,
     ip: &mut usize,
 ) -> Result<(), VmError> {
-    let b = stack.pop().expect("stack underflow on fallback");
-    let a = stack.pop().expect("stack underflow on fallback");
+    let bn = stack.pop_nb().expect("stack underflow on fallback");
+    let an = stack.pop_nb().expect("stack underflow on fallback");
+    let a = unsafe { an.to_value() };
+    let b = unsafe { bn.to_value() };
     let result = generic_cmp2((a, b), op, inst_ip, spans, syms)?;
     if !result.is_truthy() {
         *ip = target;
@@ -12087,40 +12323,60 @@ fn apply_fast_primop(
     }
 }
 
-fn fixnum_binop2(
+/// Fast-path arithmetic on two NanboxValue slots. Pops b then a from the
+/// stack; if both are tagged Fixnums, runs `op` and pushes the result as
+/// a fresh Fixnum NanboxValue. Returns `Err((a, b))` (consuming the slots'
+/// owned refs) so the slow path can decode and run generic arith. The
+/// returned `NanboxValue`s carry the strong refs the slots had before
+/// the pop, so the caller MUST consume them (via `to_value`, push_nb,
+/// or `vm_value_drop_gc`) — leaking them double-frees on Drop.
+fn fixnum_binop2_nb(
     stack: &mut ValueStack,
     op: &mut dyn FnMut(i64, i64) -> Option<i64>,
-) -> Result<(), (Value, Value)> {
-    let b = stack.pop().expect("stack underflow on fxop");
-    let a = stack.pop().expect("stack underflow on fxop");
-    if let (
-        Value::Number(cs_core::Number::Fixnum(av)),
-        Value::Number(cs_core::Number::Fixnum(bv)),
-    ) = (&a, &b)
+) -> Result<(), (NanboxValue, NanboxValue)> {
+    let bn = stack.pop_nb().expect("stack underflow on fxop");
+    let an = stack.pop_nb().expect("stack underflow on fxop");
+    let ab = an.into_raw() as u64;
+    let bb = bn.into_raw() as u64;
+    if nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM
     {
-        if let Some(r) = op(*av, *bv) {
-            stack.push(Value::fixnum(r));
+        let av = nb_sign_extend_47(nb_payload_of(ab));
+        let bv = nb_sign_extend_47(nb_payload_of(bb));
+        if let Some(r) = op(av, bv) {
+            // Fixnum slots own nothing (inline immediates), so the
+            // popped `an`/`bn` need no drop — falling out of scope is
+            // a no-op since they're Copy.
+            stack.push_nb(NanboxValue::fixnum(r));
             return Ok(());
         }
     }
-    Err((a, b))
+    Err((an, bn))
 }
 
-fn fixnum_cmp2(
+/// Fast-path comparison on two NanboxValue slots. Same shape as
+/// `fixnum_binop2_nb` but always pushes a `Boolean` on success.
+fn fixnum_cmp2_nb(
     stack: &mut ValueStack,
     op: &mut dyn FnMut(i64, i64) -> bool,
-) -> Result<(), (Value, Value)> {
-    let b = stack.pop().expect("stack underflow on fxcmp");
-    let a = stack.pop().expect("stack underflow on fxcmp");
-    if let (
-        Value::Number(cs_core::Number::Fixnum(av)),
-        Value::Number(cs_core::Number::Fixnum(bv)),
-    ) = (&a, &b)
+) -> Result<(), (NanboxValue, NanboxValue)> {
+    let bn = stack.pop_nb().expect("stack underflow on fxcmp");
+    let an = stack.pop_nb().expect("stack underflow on fxcmp");
+    let ab = an.into_raw() as u64;
+    let bb = bn.into_raw() as u64;
+    if nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM
     {
-        stack.push(Value::Boolean(op(*av, *bv)));
+        let av = nb_sign_extend_47(nb_payload_of(ab));
+        let bv = nb_sign_extend_47(nb_payload_of(bb));
+        stack.push_nb(NanboxValue::boolean(op(av, bv)));
         return Ok(());
     }
-    Err((a, b))
+    Err((an, bn))
 }
 
 #[derive(Clone, Copy)]
