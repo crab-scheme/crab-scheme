@@ -6002,6 +6002,41 @@ pub fn bytecode_to_rir_with_hints(
         }
     }
 
+    // Phase 4 post-keystone fix — patch operand tags on Insts that
+    // were emitted with `value_types.get(...).unwrap_or(Type::Fixnum)`
+    // before the CallSelf-dst propagation above ran. Without this, a
+    // body like `make-tree` (which feeds two `CallSelf` results into
+    // a `Cons`) emits `Cons(v_self, JIT_RT_FIXNUM, v_self,
+    // JIT_RT_FIXNUM)` because `v_self`'s type isn't in `value_types`
+    // yet at block-translation time. The specialized tier's lowering
+    // then treats each pointer-typed payload as a raw Fixnum, and
+    // the resulting Pair has Fixnum-wrapped-pointer slots — a
+    // silent miscompile that produces garbage trees and, when a
+    // downstream consumer (`check-tree`) recurses through those
+    // slots, blows the host stack.
+    //
+    // The patch re-derives each Inst's operand tags from the now-
+    // finalized `value_types` map. Only Inst variants that carry
+    // per-operand tags are scanned (`Cons`, `BoxTyped`); everything
+    // else is unaffected.
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            match inst {
+                RirInst::Cons(_dst, car, car_tag, cdr, cdr_tag) => {
+                    let car_t = value_types.get(car).copied().unwrap_or(Type::Fixnum);
+                    let cdr_t = value_types.get(cdr).copied().unwrap_or(Type::Fixnum);
+                    *car_tag = type_to_jit_rt_tag(car_t);
+                    *cdr_tag = type_to_jit_rt_tag(cdr_t);
+                }
+                RirInst::BoxTyped(_dst, src, tag) => {
+                    let t = value_types.get(src).copied().unwrap_or(Type::Fixnum);
+                    *tag = type_to_jit_rt_tag(t);
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Phase 4 iter AW — control-flow-join widening. When two
     // predecessors of a block push different-typed values, widen the
     // join's params to Any and insert BoxTyped on the immediate-typed
