@@ -7908,7 +7908,12 @@ pub unsafe extern "C" fn vm_call_general(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Value::Procedure(p) = &callee_v {
             if let Some(vmc) = p.as_any().downcast_ref::<VmClosure>() {
-                let id = vmc.closure_id();
+                // Stage 2d — IC key is now `lambda_id` (shared across
+                // every closure instance of the lambda), not the
+                // per-instance `closure_id`. The slot field name
+                // `cached_closure_id` is kept for diff-size reasons;
+                // it now caches a lambda_id.
+                let id = vmc.lambda_id();
                 let jit_ptr = vmc.jit_ptr();
                 let param_types = vmc.jit_param_types();
                 let arity = vmc.jit_arity();
@@ -8203,10 +8208,25 @@ pub unsafe extern "C" fn vm_ic_dispatch(
     value_to_gc_i64(decode_jit_return(closure.jit_return_type(), raw))
 }
 
-/// Peek a closure's `closure_id` without consuming the Gc handle.
+/// Peek a closure's *lambda* id without consuming the Gc handle.
 /// Returns 0 if `callee` is not a `Value::Procedure(VmClosure)`.
 /// Used by JIT-emitted IC hot path: load the id, compare against
 /// the slot's cached value, branch on match.
+///
+/// Stage 2d: returns `vmc.lambda_id()` (the shared per-lambda id
+/// from `LambdaProfile`) rather than the per-instance `closure_id`.
+/// Two closure instances of the same lambda now collide as one IC
+/// identity, which is what we want: the cached `jit_ptr` is also
+/// shared (Stage 0), so the IC hit dispatches to a body that is
+/// correct for *any* instance of this lambda. Polymorphic-by-
+/// instance call sites (e.g. n-queens' `count-from-1-to-n` loop
+/// calling the fresh inner-lambda per `place` activation) hit the
+/// IC fast path instead of missing every dispatch.
+///
+/// The exported symbol name (`vm_closure_id_peek`) is preserved
+/// because Cranelift's `JITBuilder::symbol` resolution and the
+/// declared `closure_id_peek_func` already refer to this name; only
+/// its semantics change.
 ///
 /// # Safety
 ///
@@ -8230,7 +8250,7 @@ pub unsafe extern "C" fn vm_closure_id_peek(callee: i64) -> u32 {
         Value::Procedure(p) => p
             .as_any()
             .downcast_ref::<VmClosure>()
-            .map(|c| c.closure_id())
+            .map(|c| c.lambda_id())
             .unwrap_or(0),
         _ => 0,
     };
@@ -8747,6 +8767,27 @@ pub struct LambdaProfile {
     /// translated body contains a `MakeClosure`. ADR 0012 D-1
     /// (closure-env capture fix).
     jit_needs_frame_env: Cell<bool>,
+    /// Stable, process-wide unique identifier for this lambda.
+    /// Stamped at construction from [`NEXT_LAMBDA_ID`]; never mutates.
+    /// Used as the inline-cache identity key (Stage 2d): the IC slot
+    /// caches a lambda_id rather than the per-instance closure_id,
+    /// so polymorphic-by-instance, monomorphic-by-code call sites —
+    /// n-queens' `count-from-1-to-n` loop calling the *fresh* inner
+    /// `(lambda (col) ...)` constructed by each `place` activation —
+    /// see a stable identity and hit the IC fast path. Always non-
+    /// zero; 0 is reserved as the IC's "uninitialized" sentinel.
+    pub lambda_id: u32,
+}
+
+/// Process-wide monotonic counter for [`LambdaProfile::lambda_id`].
+/// Starts at 1 so 0 stays as the IC's "miss/uninitialized" sentinel.
+/// Each `LambdaProfile::default()` bumps it and stamps the result.
+static NEXT_LAMBDA_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Allocate the next process-wide lambda id. Exposed at module scope
+/// so tests can observe monotonicity.
+fn alloc_lambda_id() -> u32 {
+    NEXT_LAMBDA_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Default for LambdaProfile {
@@ -8761,6 +8802,7 @@ impl Default for LambdaProfile {
             jit_call_count: Cell::new(0),
             jit_stack_maps: std::cell::RefCell::new(None),
             jit_needs_frame_env: Cell::new(false),
+            lambda_id: alloc_lambda_id(),
         }
     }
 }
@@ -9135,13 +9177,26 @@ impl VmClosure {
         self.self_name.get()
     }
 
-    /// Stable, process-wide unique identifier. Stamped at
-    /// construction; never mutates over the closure's lifetime.
-    /// Always non-zero — the inline-cache infrastructure (ADR 0012
-    /// D-1, iter BR) reserves `0` to mean "miss/uninitialized" in
-    /// [`cs_jit_cranelift::ic::IcSlot::cached_closure_id`].
+    /// Stable, process-wide unique identifier for this closure
+    /// *instance*. Stamped at construction; never mutates. Always
+    /// non-zero. (Pre-Stage-2d this was the inline-cache identity
+    /// key; the IC now uses [`Self::lambda_id`] instead — see that
+    /// accessor's doc for why.)
     pub fn closure_id(&self) -> u32 {
         self.closure_id
+    }
+
+    /// Stable, process-wide unique identifier for the *lambda* this
+    /// closure was constructed from. Reaches through the shared
+    /// `LambdaProfile`, so every closure instance of one lambda
+    /// reports the same id. Used as the inline-cache identity key
+    /// (Stage 2d) so polymorphic-by-instance, monomorphic-by-code
+    /// call sites — n-queens' `count-from-1-to-n` loop calling
+    /// fresh inner `(lambda (col) …)` instances — hit the IC fast
+    /// path. Always non-zero; 0 is the IC's "uninitialized"
+    /// sentinel.
+    pub fn lambda_id(&self) -> u32 {
+        self.profile.lambda_id
     }
 }
 
