@@ -4,9 +4,27 @@
 > Predecessor: M6 Phase 3 (`docs/milestones/m6-phase3-exit.md`, tag `m6-phase3-complete`).
 > Spec slug: `jit-cranelift` (Phase 4 work; the spec doc continues to point at Phase 1's requirements / design — Phase 2/3/4 are tracked entirely through exit reports).
 
+## Phase 4 scope
+
+Phase 4 ran two parallel tracks under one umbrella:
+
+**Track A — JIT builtin coverage expansion** (iters AR through JK + supporting perf and bugfix commits; commits `4de64aa` through `0c06002`, ~200 iters total, May 10-14). Broadened the specialized tier's coverage from the typed-numerics core that Phase 3 closed out to real-world workloads. Key threads:
+
+- Pair primitives in the JIT — `cons`, `car`, `cdr`, `pair?`, `null?` (iters AR-AU).
+- Any-typed parameters with type widening / narrowing — `AnyClone` / `AnyDrop` for multi-use, `AnyToFix` for unboxing, `BoxTyped` for re-widening (iters AV-AX).
+- Recursive list functions JIT'ing end-to-end (iter AY).
+- Const::Null + always-widen-on-disagreement (iter AZ); Symbol literals + tail-recursive accumulators (iter BA).
+- JIT lowering for ~150 builtins: variadic arith (AE, IY), char/string/symbol comparisons (JA-JD), variadic flmin/flmax (JF), make-vector/list (IK, JE), vector/string/bytevector slice operations (IL-IV), number↔string conversions with radix (II, IJ), `string-copy!` / `vector-copy!` / `bytevector-copy!` with start/end slicing (IS-IV).
+- IC hot path infrastructure — IC slot ownership, miss observability, soundness gate (iters JG, JH, JI, JK).
+- Perf wins: `SmallVec` for `Bindings::Small` inline lexical frames; `FxHashMap` for `Bindings::Large` Symbol-keyed env maps.
+
+**Track B — Uniform value representation + baseline NB JIT tier** (25 commits, May 14-15). The structural refactor + new baseline tier built on top of Track A's broader coverage. Details below.
+
+This exit report focuses on Track B in detail because Track A predates the keystone and its 200 individual iters are too fine-grained to enumerate here. Track A's iteration log is the commit log itself between `4de64aa` and `0c06002` — `git log --grep='M6 Phase 4 iter'` shows the full progression.
+
 ## Decision
 
-**Close M6 Phase 4 as the unified-value-representation + baseline-NB JIT tier milestone.** Twenty-four commits since `m9-foundation-complete` collapsed three layered investments into a coherent JIT engineering arc:
+**Close M6 Phase 4 as the unified-value-representation + baseline-NB JIT tier milestone.** Twenty-five Track B commits since the Track A handoff collapsed three layered investments into a coherent JIT engineering arc:
 
 1. **JIT Stage 1+2 prep** (Sep 2025, 5 commits): inline-Fixnum encoding extension to immediates, IC keyed on per-lambda identity instead of per-closure instance, JIT-call TLS consolidated into one `JitCallContext` struct. Built the infrastructure the keystone needed.
 2. **Stage 2 — NanboxValue keystone** (`8d25acf`, 6 commits): full NaN-boxing encoding rolled into the bytecode VM. `ValueStack` storage moved from `Vec<Value>` to `Vec<NanboxValue>`; `Env::Bindings` mirrored the change. Hot Inst handlers (`AddFx2`, `BranchOn*`, etc.) operate on raw i64 NBs. Dispatch boundary unified — the same i64 NB flows from VM stack → env → JIT body without per-call encode/decode.
@@ -121,7 +139,9 @@ The vm-jit gap to `gambit` interpreted is ~5× — the IC hot path is the single
 
 ---
 
-## Iteration log
+## Iteration log (Track B — uniform NB + baseline tier)
+
+For Track A (~200 builtin-coverage iters AR through JK + perf + bugfix commits) see `git log --grep='M6 Phase 4 iter' m9-foundation-complete..HEAD` — too fine-grained to enumerate inline.
 
 | Date       | Commit    | Deliverable |
 |------------|-----------|-------------|
@@ -187,12 +207,13 @@ The vm-jit gap to `gambit` interpreted is ~5× — the IC hot path is the single
 ## Counts at exit
 
 - 0 new workspace crates.
-- 24 commits between `m9-foundation-complete` and this exit.
-- ~1700 lines added in `cs-jit-cranelift/src/lowering.rs` (uniform-NB tier + helpers).
-- ~600 lines added in `cs-vm/src/vm.rs` (NB helpers, encoding constants, helper functions).
-- 18 new uniform-NB-tier unit tests in `cs-jit-cranelift/tests/jit_from_bytecode.rs`.
-- 3 new bench files (`nbody.scm`, `nbody.rs`, `warmup_curve.sh`).
-- **634 total passing assertions** in workspace at exit (was 568 at M9-foundation close).
+- **~250 commits** between `m9-foundation-complete` and this exit, split as: Track A (~225 commits, JIT builtin coverage + perf + bugfix; iters AR through JK) plus Track B (25 commits, uniform NB + baseline tier; this session).
+- Track B specifically:
+  - ~1700 lines added in `cs-jit-cranelift/src/lowering.rs` (uniform-NB tier + helpers).
+  - ~600 lines added in `cs-vm/src/vm.rs` (NB helpers, encoding constants, helper functions).
+  - 18 new uniform-NB-tier unit tests in `cs-jit-cranelift/tests/jit_from_bytecode.rs`.
+  - 3 new bench files (`nbody.scm`, `nbody.rs`, `warmup_curve.sh`).
+- **634 total passing assertions** in workspace at exit (was 568 at M9-foundation close — 66 net new tests).
 - **2 failing test targets**: `gc_memory` (pre-existing) and `jit_differential` (regression bisected to keystone).
 
 ---
