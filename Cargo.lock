@@ -470,6 +470,7 @@ dependencies = [
  "cs-rir",
  "num-traits",
  "rustc-hash",
+ "smallvec",
 ]
 
 [[package]]

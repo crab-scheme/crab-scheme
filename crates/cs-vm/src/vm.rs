@@ -8767,11 +8767,23 @@ impl cs_gc::Trace for VmClosure {
 }
 
 /// Hybrid binding storage: small frames (the overwhelming majority — function
-/// params, letrec bindings, let bindings) live in a `Vec<(Symbol, Value)>`
-/// with linear scan, which beats HashMap overhead for ≤~12 entries. Once a
-/// frame grows past `SMALL_THRESHOLD` entries we promote to a HashMap so
-/// the root env (~80 builtins, plus user-defined globals) stays O(1).
+/// params, letrec bindings, let bindings) live in a `SmallVec` with linear
+/// scan, which beats HashMap overhead for ≤~12 entries. Once a frame grows
+/// past `SMALL_THRESHOLD` entries we promote to a HashMap so the root env
+/// (~80 builtins, plus user-defined globals) stays O(1).
 const SMALL_THRESHOLD: usize = 12;
+
+/// Inline capacity for the `Small` binding tier. Most lexical frames
+/// (lambda params, `let` bindings) hold ≤4 entries, so a
+/// `SmallVec<[_; 4]>` keeps them entirely inline — zero heap
+/// allocation for the per-call frame env on the hot closure-call
+/// path. Frames with 5..=`SMALL_THRESHOLD` entries spill to the heap
+/// (same as a plain `Vec`); past the threshold they promote to the
+/// Fx-hashed `Large` map.
+const SMALL_INLINE: usize = 4;
+
+/// `SmallVec` backing the `Small` binding tier.
+type SmallBindings = smallvec::SmallVec<[(Symbol, Value); SMALL_INLINE]>;
 
 /// `Symbol`-keyed map for the `Large` binding tier. `Symbol` is a
 /// `u32` from a trusted intern table, so std's DoS-resistant SipHash
@@ -8782,13 +8794,13 @@ type SymbolMap = HashMap<Symbol, Value, rustc_hash::FxBuildHasher>;
 
 #[derive(Debug)]
 enum Bindings {
-    Small(Vec<(Symbol, Value)>),
+    Small(SmallBindings),
     Large(SymbolMap),
 }
 
 impl Default for Bindings {
     fn default() -> Self {
-        Bindings::Small(Vec::new())
+        Bindings::Small(SmallBindings::new())
     }
 }
 
@@ -8847,12 +8859,9 @@ impl Bindings {
                 // Promote to a (Fx-hashed) HashMap once we exceed the
                 // threshold.
                 if v.len() > SMALL_THRESHOLD {
-                    let drained: Vec<(Symbol, Value)> = v.drain(..).collect();
-                    let mut m: SymbolMap = HashMap::with_capacity_and_hasher(
-                        drained.len() * 2,
-                        rustc_hash::FxBuildHasher,
-                    );
-                    for (k, val) in drained {
+                    let mut m: SymbolMap =
+                        HashMap::with_capacity_and_hasher(v.len() * 2, rustc_hash::FxBuildHasher);
+                    for (k, val) in v.drain(..) {
                         m.insert(k, val);
                     }
                     *self = Bindings::Large(m);

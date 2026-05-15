@@ -65,6 +65,11 @@ proptest = "1"
 # DoS resistance is irrelevant since symbols come from a trusted
 # intern table, never untrusted input keyed directly.
 rustc-hash = "2.1"
+# Inline-storage Vec for small lexical frames (function params,
+# let bindings). The `union` feature drops the tag word so a
+# SmallVec is the same size as a Vec; ≤4 bindings stay inline,
+# eliminating the per-call frame heap allocation.
+smallvec = { version = "1", features = ["union"] }
 
 [profile.release]
 lto = "thin"
