@@ -174,64 +174,12 @@ thread_local! {
     static VM_JIT_IC_HIT_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
-thread_local! {
-    /// Pointer to the current closure's captured `Env`, set by
-    /// `try_dispatch_jit` before calling into JITted code and
-    /// cleared on return. The JIT calls `vm_env_lookup_fixnum`
-    /// (below) which reads from this. Per-thread because the
-    /// runtime is single-threaded.
-    static JIT_CALLER_ENV: Cell<*const Env> = const { Cell::new(std::ptr::null()) };
-
-    /// Pointer to the current closure's `Rc<Bytecode>`, set by
-    /// `try_dispatch_jit` for the duration of a JIT call. Read by
-    /// `vm_make_closure` (iter BZ) so a nested-lambda site inside
-    /// a JIT body can build a `VmClosure` whose `bc` matches the
-    /// enclosing bytecode (i.e. the same `Rc<Bytecode>` instance,
-    /// so `lambda_idx` continues to resolve).
-    static JIT_CALLER_BC: Cell<*const Bytecode> = const { Cell::new(std::ptr::null()) };
-}
-
-/// RAII helper: set `JIT_CALLER_ENV` for the duration of a JIT
-/// call, restore on drop.
-struct JitEnvGuard {
-    prev: *const Env,
-}
-
-impl JitEnvGuard {
-    fn install(env: &Rc<Env>) -> Self {
-        let prev = JIT_CALLER_ENV.with(|c| c.get());
-        JIT_CALLER_ENV.with(|c| c.set(Rc::as_ptr(env)));
-        Self { prev }
-    }
-}
-
-impl Drop for JitEnvGuard {
-    fn drop(&mut self) {
-        JIT_CALLER_ENV.with(|c| c.set(self.prev));
-    }
-}
-
-/// RAII helper: set `JIT_CALLER_BC` for the duration of a JIT
-/// call, restore on drop. Mirrors `JitEnvGuard`; the bytecode is
-/// the second piece of context `vm_make_closure` (iter BZ) needs
-/// to reconstitute a `VmClosure` for a nested lambda.
-struct JitBcGuard {
-    prev: *const Bytecode,
-}
-
-impl JitBcGuard {
-    fn install(bc: &Rc<Bytecode>) -> Self {
-        let prev = JIT_CALLER_BC.with(|c| c.get());
-        JIT_CALLER_BC.with(|c| c.set(Rc::as_ptr(bc)));
-        Self { prev }
-    }
-}
-
-impl Drop for JitBcGuard {
-    fn drop(&mut self) {
-        JIT_CALLER_BC.with(|c| c.set(self.prev));
-    }
-}
+// Per-crossing JIT context (env, bc, syms) lives in the consolidated
+// `JitCtxGuard` / `JIT_CTX` machinery below — see the definition
+// after `JitFrameGuard`. Post-M8 Stage 1 collapsed three separate
+// thread-locals (`JIT_CALLER_ENV`, `JIT_CALLER_BC`, `JIT_ACTIVE_SYMS`)
+// into one struct + one TLS slot, replacing three install/drop
+// writes per crossing with one.
 
 /// RAII guard that pushes a `JitStackMaps` onto the per-thread
 /// active-JIT-frames list on construction and pops on drop. Used by
@@ -295,31 +243,94 @@ impl Drop for JitFrameGuard {
     }
 }
 
-/// RAII helper: set `JIT_ACTIVE_SYMS` for the duration of a JIT
-/// call, restore on drop. Used by `try_dispatch_jit` so that the
-/// `vm_call_general` slow-path helper (ADR 0012 D-1 miss path,
-/// iter BU) can re-enter `vm_call_sync` with the same `SymbolTable`
-/// the outer VM dispatch loop is holding.
+/// Consolidated JIT call context — env + bytecode + symbol-table
+/// pointer all in one struct. `try_dispatch_jit` constructs one on
+/// stack and installs a pointer to it on [`JIT_CTX`] (one TLS write
+/// per crossing instead of three separate writes for ENV / BC /
+/// SYMS). Nested JIT entries (`vm_ic_dispatch`, the slow-path return
+/// through `vm_call_general`) save the previous pointer and restore
+/// on drop, mirroring the old triple of `JitEnvGuard` /
+/// `JitBcGuard` / `JitSymsGuard` this replaces. (Post-M8 Stage 1.)
 ///
-/// The pointer is `*mut SymbolTable` (not `*const`) because
-/// `vm_call_sync` and downstream HO builtins mutate the symbol
-/// table (interning, gensym, etc.). Single-threaded use is the
-/// rule today, so a raw pointer is sufficient — no synchronization.
-struct JitSymsGuard {
-    prev: *mut SymbolTable,
+/// The frame-stack-map list is kept separate (`JitFrameGuard`):
+/// it's a per-thread *stack* (push/pop on nested JIT calls), not a
+/// scalar replace, so it doesn't compose into a single-slot struct.
+///
+/// Pointers, not Rc clones: the context lives on the caller's
+/// stack frame for the duration of the native call; the caller
+/// holds the owning `Rc`s and outlives the body.
+struct JitCallContext {
+    env: *const Env,
+    bc: *const Bytecode,
+    syms: *mut SymbolTable,
 }
 
-impl JitSymsGuard {
-    fn install(syms: *mut SymbolTable) -> Self {
-        let prev = JIT_ACTIVE_SYMS.with(|c| c.get());
-        JIT_ACTIVE_SYMS.with(|c| c.set(syms));
+thread_local! {
+    /// Pointer to the current `JitCallContext`. Null when no JIT
+    /// call is in flight. Installed by [`JitCtxGuard`] for the
+    /// duration of each native JIT body call.
+    static JIT_CTX: Cell<*const JitCallContext> = const { Cell::new(std::ptr::null()) };
+}
+
+/// RAII guard for [`JIT_CTX`]: install a context for the duration of
+/// a JIT call; restore the previous pointer on drop. The borrowed
+/// `ctx` must outlive the guard — `try_dispatch_jit` and
+/// `vm_ic_dispatch` keep it on the stack frame that owns this
+/// guard, which holds the underlying `Rc`s in scope.
+struct JitCtxGuard {
+    prev: *const JitCallContext,
+}
+
+impl JitCtxGuard {
+    fn install(ctx: &JitCallContext) -> Self {
+        let prev = JIT_CTX.with(|c| c.get());
+        JIT_CTX.with(|c| c.set(ctx as *const JitCallContext));
         Self { prev }
     }
 }
 
-impl Drop for JitSymsGuard {
+impl Drop for JitCtxGuard {
     fn drop(&mut self) {
-        JIT_ACTIVE_SYMS.with(|c| c.set(self.prev));
+        JIT_CTX.with(|c| c.set(self.prev));
+    }
+}
+
+/// Read the current JIT caller's captured `Env`. Returns null when
+/// no JIT call is in flight on this thread.
+#[inline]
+fn jit_caller_env() -> *const Env {
+    let p = JIT_CTX.with(|c| c.get());
+    if p.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { (*p).env }
+    }
+}
+
+/// Read the current JIT caller's `Bytecode` (used by
+/// `vm_make_closure` to reconstitute a nested closure against the
+/// enclosing `Rc<Bytecode>`).
+#[inline]
+fn jit_caller_bc() -> *const Bytecode {
+    let p = JIT_CTX.with(|c| c.get());
+    if p.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { (*p).bc }
+    }
+}
+
+/// Read the active symbol-table pointer for slow-path runtime
+/// helpers (`vm_call_general`, the symbol-lookup helpers) that need
+/// to re-enter `vm_call_sync` with the outer VM dispatch's
+/// `SymbolTable`.
+#[inline]
+fn jit_active_syms() -> *mut SymbolTable {
+    let p = JIT_CTX.with(|c| c.get());
+    if p.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*p).syms }
     }
 }
 
@@ -334,7 +345,7 @@ impl Drop for JitSymsGuard {
 /// be set by the runtime dispatch site.
 #[no_mangle]
 pub extern "C" fn vm_env_set_fixnum(sym: i64, value: i64) {
-    let env_ptr = JIT_CALLER_ENV.with(|c| c.get());
+    let env_ptr = jit_caller_env();
     if env_ptr.is_null() {
         panic!("vm_env_set_fixnum: JIT_CALLER_ENV is null");
     }
@@ -382,7 +393,7 @@ pub extern "C" fn vm_env_set_fixnum(sym: i64, value: i64) {
 /// `extern "C"` so Cranelift can call it via a function pointer.
 #[no_mangle]
 pub extern "C" fn vm_env_lookup_fixnum(sym: i64) -> i64 {
-    let env_ptr = JIT_CALLER_ENV.with(|c| c.get());
+    let env_ptr = jit_caller_env();
     if env_ptr.is_null() {
         panic!("vm_env_lookup_fixnum: JIT_CALLER_ENV is null");
     }
@@ -434,7 +445,7 @@ pub extern "C" fn vm_env_lookup_fixnum(sym: i64) -> i64 {
 /// default; matches the existing helper convention.
 #[no_mangle]
 pub unsafe extern "C" fn vm_env_lookup_any(sym: i64) -> i64 {
-    let env_ptr = JIT_CALLER_ENV.with(|c| c.get());
+    let env_ptr = jit_caller_env();
     if env_ptr.is_null() {
         panic!("vm_env_lookup_any: JIT_CALLER_ENV is null");
     }
@@ -519,14 +530,6 @@ thread_local! {
     /// installed — helpers fall back to unregistered `Gc::new`.
     /// ADR 0012 D-2 (iter BO).
     static JIT_ACTIVE_HEAP: Cell<*const cs_gc::Heap> = const { Cell::new(std::ptr::null()) };
-    /// Pointer to the active `SymbolTable` for the current thread,
-    /// used by the `vm_call_general` slow-path helper (iter BU) to
-    /// re-enter `vm_call_sync` for non-self closure calls embedded in
-    /// JIT bodies. `try_dispatch_jit` installs the pointer for the
-    /// duration of each native call and restores the previous value
-    /// on return (RAII via `JitSymsGuard`); the pointer is null when
-    /// no JIT call is in flight.
-    static JIT_ACTIVE_SYMS: Cell<*mut SymbolTable> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// Install a `Heap` pointer for use by JIT runtime helpers on the
@@ -3071,7 +3074,7 @@ pub unsafe extern "C" fn vm_bytevector_fill_slice_gc(
 /// (try_dispatch_jit ensures this).
 #[no_mangle]
 pub unsafe extern "C" fn vm_symbol_to_string_gc(sym: i64) -> i64 {
-    let syms_ptr = JIT_ACTIVE_SYMS.with(|c| c.get());
+    let syms_ptr = jit_active_syms();
     if syms_ptr.is_null() {
         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
         return value_to_gc_i64(Value::Null);
@@ -3098,7 +3101,7 @@ pub unsafe extern "C" fn vm_symbol_to_string_gc(sym: i64) -> i64 {
 /// `JIT_ACTIVE_SYMS` must be set.
 #[no_mangle]
 pub unsafe extern "C" fn vm_string_to_symbol_gc(s: i64) -> i64 {
-    let syms_ptr = JIT_ACTIVE_SYMS.with(|c| c.get());
+    let syms_ptr = jit_active_syms();
     if syms_ptr.is_null() {
         // Consume the handle even on the error path so the refcount
         // is correctly released.
@@ -7742,7 +7745,7 @@ pub unsafe extern "C" fn vm_call_general(
     if jit_peek_deopt() != 0 {
         return 0;
     }
-    let syms_ptr = JIT_ACTIVE_SYMS.with(|c| c.get());
+    let syms_ptr = jit_active_syms();
     if syms_ptr.is_null() {
         panic!("vm_call_general: JIT_ACTIVE_SYMS is null (no outer VM dispatch)");
     }
@@ -7878,7 +7881,7 @@ pub unsafe extern "C" fn vm_ic_dispatch(
             let v = unsafe { gc_i64_to_value(*args_ptr.add(i)) };
             value_args.push(v);
         }
-        let syms_ptr = JIT_ACTIVE_SYMS.with(|c| c.get());
+        let syms_ptr = jit_active_syms();
         if syms_ptr.is_null() {
             panic!("vm_ic_dispatch: JIT_ACTIVE_SYMS is null");
         }
@@ -7897,11 +7900,19 @@ pub unsafe extern "C" fn vm_ic_dispatch(
     bump_jit_ic_hit_count();
     closure.bump_jit_call_count_self();
     let raw: i64 = {
-        // Same TLS context try_dispatch_jit installs. Guards drop
-        // (reverse order) before `callee_v` at function exit, so the
-        // raw `Rc::as_ptr` pointers they hold stay valid throughout.
-        let _env_guard = JitEnvGuard::install(&closure.env);
-        let _bc_guard = JitBcGuard::install(&closure.bc);
+        // Same TLS context try_dispatch_jit installs, in one shot
+        // via the consolidated JitCallContext (Stage 1). vm_ic_dispatch
+        // is nested inside a try_dispatch_jit invocation that already
+        // installed `syms`, so we just inherit it via `jit_active_syms()`.
+        // The context outlives the guard via this block's stack frame;
+        // `closure.env` / `closure.bc` are held alive by `callee_v` at
+        // the outer scope.
+        let ctx = JitCallContext {
+            env: Rc::as_ptr(&closure.env),
+            bc: Rc::as_ptr(&closure.bc),
+            syms: jit_active_syms(),
+        };
+        let _ctx_guard = JitCtxGuard::install(&ctx);
         let _frame_guard = JitFrameGuard::install(closure.jit_stack_maps());
         match n_args {
             0 => {
@@ -7960,7 +7971,7 @@ pub unsafe extern "C" fn vm_ic_dispatch(
         if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
             closure.clear_jit_for_recompile();
         }
-        let syms_ptr = JIT_ACTIVE_SYMS.with(|c| c.get());
+        let syms_ptr = jit_active_syms();
         if syms_ptr.is_null() {
             panic!("vm_ic_dispatch: JIT_ACTIVE_SYMS is null");
         }
@@ -8018,8 +8029,8 @@ pub unsafe extern "C" fn vm_closure_id_peek(callee: i64) -> u32 {
 /// runtime dispatch site for the duration of the JIT call.
 #[no_mangle]
 pub unsafe extern "C" fn vm_make_closure(lambda_idx: i64) -> i64 {
-    let env_ptr = JIT_CALLER_ENV.with(|c| c.get());
-    let bc_ptr = JIT_CALLER_BC.with(|c| c.get());
+    let env_ptr = jit_caller_env();
+    let bc_ptr = jit_caller_bc();
     if env_ptr.is_null() || bc_ptr.is_null() {
         // Without env+bc context we can't build a faithful closure.
         // Request deopt; the bytecode VM will re-run the MakeClosure
@@ -8202,25 +8213,31 @@ fn try_dispatch_jit(closure: &VmClosure, args: &[Value], syms: &mut SymbolTable)
     } else {
         None
     };
-    let _env_guard = match &frame_env_holder {
-        Some(e) => JitEnvGuard::install(e),
-        None => JitEnvGuard::install(&closure.env),
+    // Stage 1: consolidate the three per-crossing TLS installs (env,
+    // bc, syms) into one. The frame-stack-map list stays separate —
+    // it's a stack (push/pop on nested JIT calls), not a scalar
+    // replace. The env we point at depends on jit_needs_frame_env:
+    // a body with a `MakeClosure` needs the invocation-frame env
+    // (params bound, see ADR 0012 D-1); pure-arithmetic bodies use
+    // the bare definition-time env. Both Rc<Env>s outlive `ctx_guard`:
+    // `frame_env_holder` is owned by this stack frame, and
+    // `closure.env` is held alive by `closure: &VmClosure` here.
+    let env_ref: &Rc<Env> = match &frame_env_holder {
+        Some(e) => e,
+        None => &closure.env,
     };
-    // Install the closure's bytecode in the JIT thread-local so
-    // `vm_make_closure` (iter BZ) can build a `VmClosure` for a
-    // nested-lambda site using the same `Rc<Bytecode>` the
-    // enclosing closure was compiled against.
-    let _bc_guard = JitBcGuard::install(&closure.bc);
+    let ctx = JitCallContext {
+        env: Rc::as_ptr(env_ref),
+        bc: Rc::as_ptr(&closure.bc),
+        syms: syms as *mut SymbolTable,
+    };
+    let _ctx_guard = JitCtxGuard::install(&ctx);
     // ADR 0012 D-2 (iter BN) — register this closure's stack-map
     // registry on the per-thread active-frames list so the GC can
     // see its Gc<Value> roots if `collect()` fires during the
     // native call. Pop happens on Drop (RAII), so panics inside
     // the JIT body don't leave a stale entry.
     let _frame_guard = JitFrameGuard::install(closure.jit_stack_maps());
-    // ADR 0012 D-1 (iter BU) — install the caller's symbol table on
-    // the JIT TLS so `vm_call_general` slow-path calls can re-enter
-    // `vm_call_sync`. Guard restores the previous value on drop.
-    let _syms_guard = JitSymsGuard::install(syms as *mut SymbolTable);
     let r: i64 = match args.len() {
         0 => {
             let f: extern "C" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
