@@ -7887,18 +7887,17 @@ pub unsafe extern "C" fn vm_call_general(
     // ADR 0012 D-1 (iter JG) — bump miss_count atomic + thread-
     // local total so callers can observe IC fire rates.
     //
-    // ADR 0012 D-1 (iter JH) — IC soundness gate. The CallGeneral
-    // site always passes Any-boxed args (the JIT translator boxes
-    // every arg before CallGeneral). The IC hot path's
-    // `call_indirect` passes those Any handles straight through to
-    // `cached_jit_ptr` *without* the Any→typed unboxing that
-    // `try_dispatch_jit` does on the miss path. So we may only
-    // cache a `jit_ptr` whose body was compiled for *all-Any*
-    // params — otherwise the body reinterprets a Gc pointer as a
-    // raw Fixnum/Flonum and silently miscompiles (observed:
-    // unbounded self-recursion → stack overflow). Callees compiled
-    // for typed params simply never populate the slot; every call
-    // from this site stays on the (correct) `vm_call_sync` path.
+    // ADR 0012 D-1 (iter BY) — populate the IC slot for any
+    // JIT-compiled callee, not just all-Any param shapes. Stage 2c
+    // relaxed the previous `jit_param_types_all_any` gate:
+    // `vm_ic_dispatch` now unboxes each Any-handle arg into the
+    // typed lane the cached body expects, reading the (atomic-
+    // snapshotted) cached_param_types from the slot. So a body
+    // compiled with hints like (Fixnum, Fixnum, Any) — n-queens'
+    // `safe?`, `place`, the various named-let `loop` lambdas — can
+    // also live on the IC fast path, bypassing the
+    // `vm_call_general` → `vm_call_sync` re-entry that previously
+    // dominated the JIT-to-JIT crossing cost.
     if !slot_ptr.is_null() {
         bump_jit_ic_miss_count();
         // SAFETY: slot_ptr was Box::leak'd by the lowering site for
@@ -7913,7 +7912,7 @@ pub unsafe extern "C" fn vm_call_general(
                 let jit_ptr = vmc.jit_ptr();
                 let param_types = vmc.jit_param_types();
                 let arity = vmc.jit_arity();
-                if id != 0 && !jit_ptr.is_null() && jit_param_types_all_any(param_types, arity) {
+                if id != 0 && !jit_ptr.is_null() {
                     slot.cached_closure_id
                         .store(id, std::sync::atomic::Ordering::Relaxed);
                     slot.cached_jit_ptr
@@ -7978,6 +7977,7 @@ pub unsafe extern "C" fn vm_ic_dispatch(
     args_ptr: *const i64,
     n_args: usize,
     jit_ptr: *const u8,
+    slot_ptr: *const std::ffi::c_void,
 ) -> i64 {
     let callee_v = unsafe { gc_i64_to_value(callee) };
     let closure = match &callee_v {
@@ -7987,9 +7987,34 @@ pub unsafe extern "C" fn vm_ic_dispatch(
         },
         _ => panic!("vm_ic_dispatch: callee is not a procedure"),
     };
+    // Read the slot's snapshot of the callee's param types. We use the
+    // SLOT's snapshot (not `closure.jit_param_types()` from the
+    // VmClosure) because the slot's `cached_param_types` is paired
+    // atomically with `cached_jit_ptr`: if the callee was recompiled
+    // since this slot was populated, the slot's pair (jit_ptr,
+    // param_types) is self-consistent — both pre-recompile — while
+    // the closure's current jit_param_types would mismatch the
+    // pre-recompile jit_ptr we just dispatched to. Post-Stage-2c
+    // (relaxed soundness gate): the cached jit_ptr can be a typed-
+    // param body, not just all-Any, so we unbox each arg to the
+    // expected lane before the call.
+    let cached_param_types: u32 = if !slot_ptr.is_null() {
+        let slot = unsafe { &*(slot_ptr as *const crate::ic_compat::IcSlotShim) };
+        slot.cached_param_types
+            .load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        // Defensive — pre-Stage-2c callers without the slot arg get
+        // the previous (all-Any) shape.
+        let mut v: u32 = 0;
+        for i in 0..n_args.min(8) {
+            v |= (JIT_RT_ANY as u32) << (i * 4);
+        }
+        v
+    };
     // Decode each arg handle once. `value_args` keeps owned clones
-    // for the deopt fallback; `jit_args` are fresh handles the JIT
-    // body consumes linearly.
+    // for the deopt fallback; `jit_args` are the per-arg slots fed
+    // to the cached JIT body — typed inline for non-Any params,
+    // freshly-cloned Gc handles for Any params.
     let mut value_args: Vec<Value> = Vec::with_capacity(n_args);
     let mut jit_args: [i64; 6] = [0; 6];
     if n_args > jit_args.len() {
@@ -8011,14 +8036,88 @@ pub unsafe extern "C" fn vm_ic_dispatch(
             Err(e) => panic!("vm_ic_dispatch: {}", e.message),
         };
     }
+    // Per-arg lane decode: for each arg, look at the nibble in
+    // `cached_param_types` and re-encode the materialized `Value` to
+    // match the cached body's signature. Any → fresh Gc handle (the
+    // body owns one strong count). Immediate types (Fixnum / Boolean
+    // / Character / Flonum) → raw inline i64. Type mismatch → deopt
+    // and fall through to the slow path. (Stage 2c: enables the IC
+    // for typed-param callees, not just all-Any.)
+    let mut type_miss = false;
     for i in 0..n_args {
         let v = unsafe { gc_i64_to_value(*args_ptr.add(i)) };
-        value_args.push(v.clone());
-        jit_args[i] = value_to_gc_i64(v);
+        let nibble = ((cached_param_types >> (i as u32 * 4)) & 0xF) as u8;
+        let slot_val: i64 = match (nibble, &v) {
+            (JIT_RT_FIXNUM, Value::Number(cs_core::Number::Fixnum(n))) => *n,
+            (JIT_RT_BOOLEAN, Value::Boolean(b)) => {
+                if *b {
+                    1
+                } else {
+                    0
+                }
+            }
+            (JIT_RT_CHARACTER, Value::Character(c)) => *c as u32 as i64,
+            (JIT_RT_FLONUM, Value::Number(cs_core::Number::Flonum(f))) => f.to_bits() as i64,
+            (JIT_RT_ANY, _) => value_to_gc_i64(v.clone()),
+            // Type mismatch — or heap-typed param (JIT_RT_PAIR etc.)
+            // not yet supported on the IC fast path. Mark a deopt
+            // and fall through to `vm_call_sync`, which handles all
+            // value shapes uniformly.
+            _ => {
+                type_miss = true;
+                0
+            }
+        };
+        jit_args[i] = slot_val;
+        value_args.push(v);
+    }
+    if type_miss {
+        // Drop the typed slots we encoded (only the JIT_RT_ANY ones
+        // own Gc handles; immediate slots own nothing). The Any-slot
+        // handles are captured in jit_args[i] and need to be released.
+        for i in 0..n_args {
+            let nibble = ((cached_param_types >> (i as u32 * 4)) & 0xF) as u8;
+            if nibble == JIT_RT_ANY {
+                unsafe { vm_value_drop_gc(jit_args[i]) };
+            }
+        }
+        let syms_ptr = jit_active_syms();
+        if syms_ptr.is_null() {
+            panic!("vm_ic_dispatch: JIT_ACTIVE_SYMS is null");
+        }
+        let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
+        return match vm_call_sync(&callee_v, &value_args, syms) {
+            Ok(v) => value_to_gc_i64(v),
+            Err(e) => panic!("vm_ic_dispatch: {}", e.message),
+        };
     }
     bump_jit_call_count();
     bump_jit_ic_hit_count();
     closure.bump_jit_call_count_self();
+    // ADR 0012 D-1 (closure-env capture fix, mirror of `try_dispatch_jit`):
+    // a body that contains `MakeClosure` captures `JIT_CALLER_ENV` when
+    // it builds a nested closure, and that capture must include *this*
+    // invocation's params (otherwise the nested closure's body can't
+    // resolve the JIT function's args as free vars later). Bodies
+    // without MakeClosure leave `jit_needs_frame_env` false and keep
+    // the zero-alloc fast path (env = bare definition env). Pre-Stage-2c
+    // the soundness gate happened to filter such callees out of the IC;
+    // post-Stage-2c they enter the IC, so we must reproduce the frame
+    // env build here (n-queens' `place` is the motivating case).
+    let frame_env_holder: Option<Rc<Env>> = if closure.jit_needs_frame_env() {
+        let env = Env::child(closure.env.clone());
+        let lam = &closure.bc.lambdas[closure.lambda_idx];
+        for (name, v) in lam.params.iter().zip(value_args.iter()) {
+            env.define(*name, v.clone());
+        }
+        Some(env)
+    } else {
+        None
+    };
+    let env_ref: &Rc<Env> = match &frame_env_holder {
+        Some(e) => e,
+        None => &closure.env,
+    };
     let raw: i64 = {
         // Same TLS context try_dispatch_jit installs, in one shot
         // via the consolidated JitCallContext (Stage 1). vm_ic_dispatch
@@ -8028,7 +8127,7 @@ pub unsafe extern "C" fn vm_ic_dispatch(
         // `closure.env` / `closure.bc` are held alive by `callee_v` at
         // the outer scope.
         let ctx = JitCallContext {
-            env: Rc::as_ptr(&closure.env),
+            env: Rc::as_ptr(env_ref),
             bc: Rc::as_ptr(&closure.bc),
             syms: jit_active_syms(),
         };

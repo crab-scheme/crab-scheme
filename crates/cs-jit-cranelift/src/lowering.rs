@@ -1972,6 +1972,7 @@ impl Lowerer {
         ic_dispatch_sig.params.push(AbiParam::new(I64)); // args buffer pointer
         ic_dispatch_sig.params.push(AbiParam::new(I64)); // n_args
         ic_dispatch_sig.params.push(AbiParam::new(I64)); // cached jit_ptr
+        ic_dispatch_sig.params.push(AbiParam::new(I64)); // slot_ptr (for cached_param_types read)
         ic_dispatch_sig.returns.push(AbiParam::new(I64));
         let ic_dispatch_func = module
             .declare_function(
@@ -7885,9 +7886,16 @@ fn lower_inst(
             let cached_jit_ptr_v =
                 b.ins()
                     .load(I64, cranelift_codegen::ir::MemFlags::new(), slot_addr_v, 8);
+            // Pass slot_addr too so `vm_ic_dispatch` can read the
+            // slot's `cached_param_types` to unbox each Any-handle arg
+            // into the typed lane the cached body expects. Without
+            // this, the IC could only cache all-Any callees (the
+            // jit_param_types_all_any gate in vm_call_general); now
+            // typed-param callees (n-queens' `safe?`, with hints like
+            // (Fixnum, Fixnum, Any)) hit the IC fast path too.
             let hit_inst = b.ins().call(
                 ic_dispatch_fnref,
-                &[callee_v, buf_addr, n_args_v, cached_jit_ptr_v],
+                &[callee_v, buf_addr, n_args_v, cached_jit_ptr_v, slot_addr_v],
             );
             let hit_result = {
                 let rs = b.inst_results(hit_inst);
