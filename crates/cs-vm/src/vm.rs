@@ -10256,8 +10256,11 @@ fn run_dispatch(
                 // Capture the call-site span up front so error paths can
                 // attach it cheaply (one Rc deref + indexed read per Call).
                 let call_span = frame.spans.get(inst_ip).copied().unwrap_or(Span::DUMMY);
-                let func_val = stack.at_as_value(func_idx);
-                let func_proc = match &func_val {
+                // Zero-cost borrow into the slot — only clone the
+                // `Rc<dyn Procedure>` we actually need. Pre-step-3a
+                // this was `&stack[func_idx]`; the `.at()` method
+                // gives the same shape via the wrapper.
+                let func_proc = match stack.at(func_idx) {
                     Value::Procedure(p) => p.clone(),
                     other => {
                         return Err(VmError::new(format!(
