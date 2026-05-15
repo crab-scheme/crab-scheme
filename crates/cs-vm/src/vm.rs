@@ -966,6 +966,437 @@ impl PartialEq for TaggedValue {
 }
 impl Eq for TaggedValue {}
 
+// ===== NanboxValue (Stage 2 K1 step 2 — NaN-box encoding) =====
+//
+// A second `#[repr(transparent)]` newtype over `i64` carrying the
+// NaN-box encoding chosen for the eventual bytecode-VM stack
+// migration. Separate from `TaggedValue` (which wraps the existing
+// 3-bit-low-tag JIT Any-lane encoding) until K1 step 2 wires the
+// two encodings together — at which point `TaggedValue` likely gets
+// retired or aliased to `NanboxValue`.
+//
+// **Encoding shape (sign-bit-set quiet NaN):**
+//
+// ```
+// bit:  63    62..52   51    50..47   46..0
+//      sign   exp=0x7FF quiet  tag(4)   payload(47)
+//      1      all 1s    1
+// ```
+//
+// - Tagged values: high 13 bits = `0xFFF8` (sign=1 + quiet NaN
+//   signature). 16 tag values × 47-bit payload.
+// - Real Flonums: any other f64 bit pattern. Sign=0 quiet NaNs
+//   (the `0x7FF8…` range) stay distinct, so naturally-arising f64
+//   NaN results from arithmetic do not collide with the tagged
+//   range. Sign=1 NaNs are canonicalized at f64-producer sites.
+//
+// **47-bit pointer payloads** fit x86-64 user-space (canonical
+// addresses are 47–48 bits, upper bits zero). This means heap
+// values store their `Gc<T>` / `Rc<dyn …>` raw pointer **directly**
+// with a per-variant tag — no `Gc<Value>` wrap, no allocation
+// regression on the stack migration (which is the whole point of
+// going with NaN-boxing over high-byte-only tagging).
+//
+// **47-bit Fixnum** range is ±2^46 = ±70 trillion. Practical Scheme
+// programs never trip this; oversized values fall through to the
+// BigInt path (which is heap-allocated regardless).
+
+/// High 13-bit signature for our tagged-NaN range. A bit-pattern
+/// `b` is in the tagged range iff `(b as u64) & SIGNATURE_MASK ==
+/// SIGNATURE_BITS`.
+pub const NB_SIGNATURE_MASK: u64 = 0xFFF8_0000_0000_0000;
+pub const NB_SIGNATURE_BITS: u64 = 0xFFF8_0000_0000_0000;
+pub const NB_TAG_SHIFT: u32 = 47;
+pub const NB_TAG_MASK: u64 = 0xF << NB_TAG_SHIFT;
+pub const NB_PAYLOAD_MASK: u64 = (1u64 << 47) - 1;
+
+/// Variant tags. 16 values, one per top-level `Value` shape. Order
+/// chosen so immediate-typed tags (the hot cases) cluster low.
+pub const NB_TAG_FIXNUM: u64 = 0;
+pub const NB_TAG_BOOLEAN: u64 = 1;
+pub const NB_TAG_CHARACTER: u64 = 2;
+pub const NB_TAG_SYMBOL: u64 = 3;
+pub const NB_TAG_NULL: u64 = 4;
+pub const NB_TAG_UNSPECIFIED: u64 = 5;
+pub const NB_TAG_EOF: u64 = 6;
+pub const NB_TAG_PAIR: u64 = 7;
+pub const NB_TAG_VECTOR: u64 = 8;
+pub const NB_TAG_STRING: u64 = 9;
+pub const NB_TAG_BYTEVECTOR: u64 = 10;
+pub const NB_TAG_PROCEDURE: u64 = 11;
+pub const NB_TAG_HASHTABLE: u64 = 12;
+pub const NB_TAG_PORT: u64 = 13;
+pub const NB_TAG_PROMISE: u64 = 14;
+/// Catchall for `Value` variants that don't have a dedicated NaN-
+/// box tag — currently the wider Number forms (Flonum is *not*
+/// here; it rides the raw-f64 path. The catchall is for
+/// `Number::BigInt`, `Number::Rational`, `Number::Complex`). The
+/// i64 payload is a `Gc<Value>` raw pointer wrapping the full
+/// Value enum, mirroring the existing TaggedValue PTR encoding.
+pub const NB_TAG_GC_VALUE: u64 = 15;
+
+/// Inclusive max Fixnum that fits the 47-bit signed payload.
+pub const NB_FIXNUM_MAX: i64 = (1i64 << 46) - 1;
+pub const NB_FIXNUM_MIN: i64 = -(1i64 << 46);
+
+/// Canonical f64 NaN bit pattern — sign=0 quiet NaN, mantissa
+/// payload zero. Outside our tagged range (sign=0, not sign=1).
+/// Arithmetic that produces NaN should normalize to this pattern
+/// at encode time so the same Scheme-level NaN compares bit-equal.
+pub const NB_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
+
+/// True iff `bits` falls in the tagged NaN range (not a regular
+/// f64). One mask + compare; suitable for the hot path.
+#[inline]
+pub fn nb_is_tagged(bits: u64) -> bool {
+    (bits & NB_SIGNATURE_MASK) == NB_SIGNATURE_BITS
+}
+
+#[inline]
+pub fn nb_tag_of(bits: u64) -> u64 {
+    (bits & NB_TAG_MASK) >> NB_TAG_SHIFT
+}
+
+#[inline]
+pub fn nb_payload_of(bits: u64) -> u64 {
+    bits & NB_PAYLOAD_MASK
+}
+
+#[inline]
+pub fn nb_make(tag: u64, payload: u64) -> u64 {
+    NB_SIGNATURE_BITS | ((tag & 0xF) << NB_TAG_SHIFT) | (payload & NB_PAYLOAD_MASK)
+}
+
+/// Sign-extend the low 47 bits of `payload` to a full i64. Used to
+/// decode the Fixnum tag (47-bit signed → i64).
+#[inline]
+pub fn nb_sign_extend_47(payload: u64) -> i64 {
+    let shifted = (payload as i64) << 17;
+    shifted >> 17
+}
+
+/// Encode an `f64` as a NaN-boxed `i64`. Real flonums map to their
+/// `to_bits()` directly; bit patterns that would collide with the
+/// tagged range (sign=1 quiet NaN) are canonicalized to the
+/// reserved [`NB_NAN_BITS`] sign=0 NaN.
+#[inline]
+pub fn nb_encode_flonum(f: f64) -> i64 {
+    let bits = f.to_bits();
+    if nb_is_tagged(bits) {
+        NB_NAN_BITS as i64
+    } else {
+        bits as i64
+    }
+}
+
+/// NaN-boxed value carrier — the migration target for the bytecode
+/// VM dispatch stack (K1 step 3). Layout-identical to `i64`. See
+/// the module-level NanboxValue encoding documentation above.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct NanboxValue(pub i64);
+
+impl NanboxValue {
+    /// The bit pattern for `Value::Null`. `const fn`-friendly.
+    pub const NULL: NanboxValue =
+        NanboxValue((NB_SIGNATURE_BITS | (NB_TAG_NULL << NB_TAG_SHIFT)) as i64);
+    /// The bit pattern for `Value::Unspecified`.
+    pub const UNSPECIFIED: NanboxValue =
+        NanboxValue((NB_SIGNATURE_BITS | (NB_TAG_UNSPECIFIED << NB_TAG_SHIFT)) as i64);
+    /// The bit pattern for `Value::Eof`.
+    pub const EOF: NanboxValue =
+        NanboxValue((NB_SIGNATURE_BITS | (NB_TAG_EOF << NB_TAG_SHIFT)) as i64);
+    /// `Value::Boolean(false)`.
+    pub const FALSE: NanboxValue =
+        NanboxValue((NB_SIGNATURE_BITS | (NB_TAG_BOOLEAN << NB_TAG_SHIFT)) as i64);
+    /// `Value::Boolean(true)`.
+    pub const TRUE: NanboxValue =
+        NanboxValue((NB_SIGNATURE_BITS | (NB_TAG_BOOLEAN << NB_TAG_SHIFT) | 1) as i64);
+
+    #[inline]
+    pub fn fixnum(n: i64) -> Self {
+        if n >= NB_FIXNUM_MIN && n <= NB_FIXNUM_MAX {
+            NanboxValue(nb_make(NB_TAG_FIXNUM, (n as u64) & NB_PAYLOAD_MASK) as i64)
+        } else {
+            // Oversized: wrap in Gc<Value> with NB_TAG_GC_VALUE.
+            // (Allocation. Same fallback as TaggedValue.)
+            Self::from_value(Value::Number(cs_core::Number::Fixnum(n)))
+        }
+    }
+
+    #[inline]
+    pub fn boolean(b: bool) -> Self {
+        if b {
+            Self::TRUE
+        } else {
+            Self::FALSE
+        }
+    }
+
+    #[inline]
+    pub fn character(c: char) -> Self {
+        NanboxValue(nb_make(NB_TAG_CHARACTER, c as u32 as u64) as i64)
+    }
+
+    #[inline]
+    pub fn symbol(s: cs_core::Symbol) -> Self {
+        NanboxValue(nb_make(NB_TAG_SYMBOL, s.0 as u64) as i64)
+    }
+
+    #[inline]
+    pub fn flonum(f: f64) -> Self {
+        NanboxValue(nb_encode_flonum(f))
+    }
+
+    /// Encode a `Value` into the NaN-box. Pointer variants store
+    /// their raw `Gc<T>` / `Rc<dyn …>` handle directly in the
+    /// 47-bit payload with the matching variant tag — no extra
+    /// `Gc<Value>` wrap. Non-Fixnum Number variants (BigInt /
+    /// Rational / Complex) take the `NB_TAG_GC_VALUE` catchall
+    /// path which DOES wrap, mirroring the existing TaggedValue
+    /// path for these rare cases.
+    pub fn from_value(v: Value) -> Self {
+        match v {
+            Value::Null => Self::NULL,
+            Value::Unspecified => Self::UNSPECIFIED,
+            Value::Eof => Self::EOF,
+            Value::Boolean(b) => Self::boolean(b),
+            Value::Character(c) => Self::character(c),
+            Value::Symbol(s) => Self::symbol(s),
+            Value::Number(cs_core::Number::Fixnum(n)) => Self::fixnum(n),
+            Value::Number(cs_core::Number::Flonum(f)) => Self::flonum(f),
+            // For pointer variants, take the Gc/Rc raw pointer
+            // directly. Pointers must have low bits zero (8-byte
+            // align) and upper 16 bits zero (x86-64 user-space),
+            // so they fit in 47-bit signed canonical addresses
+            // (and our 47-bit payload).
+            Value::Pair(g) => {
+                let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+                debug_assert!(
+                    ptr & !NB_PAYLOAD_MASK == 0,
+                    "Pair ptr exceeds 47-bit payload"
+                );
+                NanboxValue(nb_make(NB_TAG_PAIR, ptr) as i64)
+            }
+            Value::Vector(g) => {
+                let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+                debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
+                NanboxValue(nb_make(NB_TAG_VECTOR, ptr) as i64)
+            }
+            Value::String(g) => {
+                let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+                debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
+                NanboxValue(nb_make(NB_TAG_STRING, ptr) as i64)
+            }
+            Value::ByteVector(g) => {
+                let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+                debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
+                NanboxValue(nb_make(NB_TAG_BYTEVECTOR, ptr) as i64)
+            }
+            // `Rc<dyn Procedure>` is a fat pointer (data ptr +
+            // vtable ptr, 16 bytes) — doesn't fit in the 47-bit
+            // payload. Route through the `NB_TAG_GC_VALUE` Gc<Value>
+            // wrap fallback for now (same cost as the existing
+            // TaggedValue path). NB_TAG_PROCEDURE = 11 stays
+            // reserved for a future thin-procedure encoding (e.g.,
+            // an enum that lifts the vtable into a small index).
+            Value::Procedure(p) => {
+                let v = Value::Procedure(p);
+                let g = cs_gc::Gc::new(v);
+                let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+                debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
+                NanboxValue(nb_make(NB_TAG_GC_VALUE, ptr) as i64)
+            }
+            Value::Hashtable(g) => {
+                let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+                debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
+                NanboxValue(nb_make(NB_TAG_HASHTABLE, ptr) as i64)
+            }
+            Value::Port(g) => {
+                let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+                debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
+                NanboxValue(nb_make(NB_TAG_PORT, ptr) as i64)
+            }
+            Value::Promise(g) => {
+                let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+                debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
+                NanboxValue(nb_make(NB_TAG_PROMISE, ptr) as i64)
+            }
+            // Number variants outside Fixnum/Flonum (BigInt,
+            // Rational, Complex). Wrap in Gc<Value> for now —
+            // these are rare in performance-sensitive code.
+            other @ Value::Number(_) => {
+                let g = cs_gc::Gc::new(other);
+                let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+                debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
+                NanboxValue(nb_make(NB_TAG_GC_VALUE, ptr) as i64)
+            }
+        }
+    }
+
+    /// Decode this NaN-box back into a `Value`. Pointer-typed tags
+    /// consume one strong refcount (`Rc::from_raw` semantics) and
+    /// clone the inner value out. Inline immediates are pure value
+    /// extractions.
+    ///
+    /// # Safety
+    ///
+    /// `self.0` must be a live, owned encoding from `from_value`
+    /// or the equivalent. Passing the same `NanboxValue` to
+    /// `to_value` twice is a double-free for the pointer tags.
+    pub unsafe fn to_value(self) -> Value {
+        let bits = self.0 as u64;
+        if !nb_is_tagged(bits) {
+            // Not in the tagged range — it's a raw f64.
+            return Value::Number(cs_core::Number::Flonum(f64::from_bits(bits)));
+        }
+        let tag = nb_tag_of(bits);
+        let payload = nb_payload_of(bits);
+        match tag {
+            t if t == NB_TAG_FIXNUM => {
+                Value::Number(cs_core::Number::Fixnum(nb_sign_extend_47(payload)))
+            }
+            t if t == NB_TAG_BOOLEAN => Value::Boolean(payload != 0),
+            t if t == NB_TAG_CHARACTER => {
+                let cp = (payload as u32) & 0x1F_FFFF;
+                Value::Character(char::from_u32(cp).unwrap_or('\u{FFFD}'))
+            }
+            t if t == NB_TAG_SYMBOL => Value::Symbol(cs_core::Symbol(payload as u32)),
+            t if t == NB_TAG_NULL => Value::Null,
+            t if t == NB_TAG_UNSPECIFIED => Value::Unspecified,
+            t if t == NB_TAG_EOF => Value::Eof,
+            // Each pointer-typed decode reconstitutes the typed
+            // `Gc<T>` from the raw pointer payload via
+            // `from_raw_jit` (which takes over one strong refcount).
+            // We then wrap it in the matching `Value::T(Gc<T>)`
+            // variant, **preserving that single strong ref** —
+            // no deep clone, no extra `Gc::new` allocation. The
+            // returned `Value` owns the same allocation the input
+            // `NanboxValue` did; consumer can clone or drop as
+            // usual.
+            //
+            // (`Value::clone` for these variants is an Rc-clone, so
+            // even if the caller clones the resulting Value, no deep
+            // copy happens.)
+            t if t == NB_TAG_PAIR => {
+                let g: cs_gc::Gc<cs_core::Pair> =
+                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                Value::Pair(g)
+            }
+            t if t == NB_TAG_VECTOR => {
+                let g: cs_gc::Gc<std::cell::RefCell<Vec<Value>>> =
+                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                Value::Vector(g)
+            }
+            t if t == NB_TAG_STRING => {
+                let g: cs_gc::Gc<std::cell::RefCell<String>> =
+                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                Value::String(g)
+            }
+            t if t == NB_TAG_BYTEVECTOR => {
+                let g: cs_gc::Gc<std::cell::RefCell<Vec<u8>>> =
+                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                Value::ByteVector(g)
+            }
+            // NB_TAG_PROCEDURE is reserved but not currently
+            // produced — `from_value` routes `Value::Procedure`
+            // through `NB_TAG_GC_VALUE` because `Rc<dyn Procedure>`
+            // is a fat pointer that doesn't fit the 47-bit payload.
+            // If we ever observe this tag at decode it's a bug
+            // (encode/decode mismatch); panic-free fallback via
+            // `_t` arm below treats it as `NB_TAG_GC_VALUE`.
+            t if t == NB_TAG_HASHTABLE => {
+                let g: cs_gc::Gc<cs_core::Hashtable> =
+                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                Value::Hashtable(g)
+            }
+            t if t == NB_TAG_PORT => {
+                let g: cs_gc::Gc<cs_core::Port> =
+                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                Value::Port(g)
+            }
+            t if t == NB_TAG_PROMISE => {
+                let g: cs_gc::Gc<cs_core::Promise> =
+                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                Value::Promise(g)
+            }
+            _t /* NB_TAG_GC_VALUE or unknown */ => {
+                let g: cs_gc::Gc<Value> =
+                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                (*g).clone()
+            }
+        }
+    }
+
+    /// Raw i64 carrier.
+    #[inline]
+    pub fn into_raw(self) -> i64 {
+        self.0
+    }
+
+    /// True iff this is a tagged value (not a raw f64).
+    #[inline]
+    pub fn is_tagged(self) -> bool {
+        nb_is_tagged(self.0 as u64)
+    }
+
+    /// True iff this is a Flonum (carries an f64 bit pattern).
+    #[inline]
+    pub fn is_flonum(self) -> bool {
+        !self.is_tagged()
+    }
+
+    /// Variant tag (only meaningful when `is_tagged()` is true).
+    #[inline]
+    pub fn tag(self) -> u64 {
+        nb_tag_of(self.0 as u64)
+    }
+
+    /// Truthiness for `if` — false iff this is `Value::Boolean(false)`.
+    #[inline]
+    pub fn is_truthy(self) -> bool {
+        self.0 != Self::FALSE.0
+    }
+
+    /// Extract a Fixnum payload if applicable.
+    #[inline]
+    pub fn as_fixnum(self) -> Option<i64> {
+        if self.is_tagged() && self.tag() == NB_TAG_FIXNUM {
+            Some(nb_sign_extend_47(nb_payload_of(self.0 as u64)))
+        } else {
+            None
+        }
+    }
+
+    /// Extract a Boolean payload if applicable.
+    #[inline]
+    pub fn as_boolean(self) -> Option<bool> {
+        if self.is_tagged() && self.tag() == NB_TAG_BOOLEAN {
+            Some(nb_payload_of(self.0 as u64) != 0)
+        } else {
+            None
+        }
+    }
+
+    /// Extract an f64 if this is a Flonum.
+    #[inline]
+    pub fn as_flonum(self) -> Option<f64> {
+        if self.is_flonum() {
+            Some(f64::from_bits(self.0 as u64))
+        } else {
+            None
+        }
+    }
+}
+
+impl PartialEq for NanboxValue {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for NanboxValue {}
+
 /// `(cons car cdr)` — heap-allocate a fresh pair. Operands are i64
 /// carriers tagged per the wider ABI; the helper decodes both into
 /// `Value`s, allocates a `Pair`, and returns an `Any`-tagged i64
@@ -14457,6 +14888,261 @@ mod gc_helper_tests_extra {
         assert_ne!(TaggedValue::null(), TaggedValue::unspecified());
         assert_ne!(TaggedValue::null(), TaggedValue::eof());
         assert_ne!(TaggedValue::null(), TaggedValue::fixnum(0));
+    }
+
+    // ===== NanboxValue (K1 step 2) — NaN-box encoding tests =====
+
+    #[test]
+    fn nanbox_layout_matches_i64() {
+        assert_eq!(std::mem::size_of::<NanboxValue>(), 8);
+        assert_eq!(std::mem::align_of::<NanboxValue>(), 8);
+    }
+
+    #[test]
+    fn nanbox_signature_separates_tagged_from_flonum() {
+        // The signature mask `0xFFF8_0000_0000_0000` distinguishes
+        // our tagged NaN range from real f64s. Sign=1 quiet NaNs
+        // are ours; sign=0 quiet NaNs (the natural NaN result of
+        // arithmetic) are not.
+        let ours: u64 = NB_SIGNATURE_BITS | (NB_TAG_NULL << NB_TAG_SHIFT);
+        assert!(nb_is_tagged(ours));
+
+        let real_finite = 3.14_f64.to_bits();
+        assert!(!nb_is_tagged(real_finite));
+
+        let real_zero = 0.0_f64.to_bits();
+        assert!(!nb_is_tagged(real_zero));
+
+        let real_inf = f64::INFINITY.to_bits();
+        assert!(!nb_is_tagged(real_inf));
+
+        let real_neg_inf = f64::NEG_INFINITY.to_bits();
+        assert!(!nb_is_tagged(real_neg_inf));
+
+        // Sign=0 quiet NaN — NOT in our tagged range.
+        let natural_nan = f64::NAN.to_bits();
+        assert!(
+            !nb_is_tagged(natural_nan),
+            "natural f64 NaN must not collide with the tagged range (got {:#x})",
+            natural_nan
+        );
+
+        // Sign=1 quiet NaN — IS in our tagged range. (Real f64
+        // arithmetic rarely produces these, and `nb_encode_flonum`
+        // canonicalizes any that do.)
+        let sign1_nan: u64 = 0xFFF8_0000_0000_0001;
+        assert!(nb_is_tagged(sign1_nan));
+    }
+
+    #[test]
+    fn nanbox_round_trips_immediate_values() {
+        for v in [
+            Value::Null,
+            Value::Unspecified,
+            Value::Eof,
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Character('a'),
+            Value::Character('\u{1F4A9}'),
+            Value::Symbol(cs_core::Symbol(0)),
+            Value::Symbol(cs_core::Symbol(42)),
+            Value::Symbol(cs_core::Symbol(u32::MAX)),
+            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(-1)),
+            Value::Number(cs_core::Number::Fixnum(NB_FIXNUM_MAX)),
+            Value::Number(cs_core::Number::Fixnum(NB_FIXNUM_MIN)),
+        ] {
+            let label = format!("{:?}", v);
+            let nb = NanboxValue::from_value(v.clone());
+            let back = unsafe { nb.to_value() };
+            let matches = match (&v, &back) {
+                (Value::Null, Value::Null) => true,
+                (Value::Unspecified, Value::Unspecified) => true,
+                (Value::Eof, Value::Eof) => true,
+                (Value::Boolean(a), Value::Boolean(b)) => a == b,
+                (Value::Character(a), Value::Character(b)) => a == b,
+                (Value::Symbol(a), Value::Symbol(b)) => a.0 == b.0,
+                (
+                    Value::Number(cs_core::Number::Fixnum(a)),
+                    Value::Number(cs_core::Number::Fixnum(b)),
+                ) => a == b,
+                _ => false,
+            };
+            assert!(matches, "{}: round-trip mismatch: {:?}", label, back);
+        }
+    }
+
+    #[test]
+    fn nanbox_round_trips_flonum_inline() {
+        // Flonums travel as raw f64 bits. No allocation, no
+        // signature collision (verified by encode).
+        let h = cs_gc::Heap::new();
+        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
+        let before = h.alloc_count();
+
+        for f in [0.0_f64, 1.0, -1.0, 3.14, 1e100, -1e-100, f64::EPSILON] {
+            let nb = NanboxValue::flonum(f);
+            assert!(nb.is_flonum(), "Flonum({}) should encode as f64 lane", f);
+            assert_eq!(nb.as_flonum(), Some(f));
+            let back = unsafe { nb.to_value() };
+            match back {
+                Value::Number(cs_core::Number::Flonum(g)) => assert_eq!(f.to_bits(), g.to_bits()),
+                other => panic!("expected Flonum({}), got {:?}", f, other),
+            }
+        }
+
+        // Special f64s: infinities round-trip, NaN canonicalizes.
+        let pos_inf = NanboxValue::flonum(f64::INFINITY);
+        assert_eq!(pos_inf.as_flonum(), Some(f64::INFINITY));
+        let neg_inf = NanboxValue::flonum(f64::NEG_INFINITY);
+        assert_eq!(neg_inf.as_flonum(), Some(f64::NEG_INFINITY));
+
+        // A sign=1 NaN bit pattern would collide with the tagged
+        // range; `nb_encode_flonum` canonicalizes it. Use a sign=0
+        // NaN to test the non-collision path.
+        let nan = NanboxValue::flonum(f64::NAN);
+        assert!(nan.is_flonum());
+        let nan_back = unsafe { nan.to_value() };
+        match nan_back {
+            Value::Number(cs_core::Number::Flonum(g)) => assert!(g.is_nan()),
+            other => panic!("expected NaN, got {:?}", other),
+        }
+
+        clear_jit_active_heap();
+        assert_eq!(
+            h.alloc_count(),
+            before,
+            "inline Flonum encoding must not touch the Heap"
+        );
+    }
+
+    #[test]
+    fn nanbox_round_trips_heap_pair_without_extra_wrap() {
+        // The whole point of NaN-boxing: a heap-typed Value (here
+        // a Pair) encodes by stashing its `Gc<Pair>` raw pointer
+        // **directly** in the 47-bit payload — no extra
+        // `Gc<Value>` wrap. Round-trip must preserve the Pair's
+        // identity and contents.
+        let h = cs_gc::Heap::new();
+        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
+        let before = h.alloc_count();
+
+        // `Pair::new` already returns a `Gc<Pair>` (matches the
+        // construction sites elsewhere in vm.rs).
+        let v = Value::Pair(cs_core::Pair::new(
+            Value::Number(cs_core::Number::Fixnum(1)),
+            Value::Number(cs_core::Number::Fixnum(2)),
+        ));
+        // alloc_count: 0 here (Gc::new is unregistered when no
+        // heap is set yet… but I set the heap above. Let me
+        // recount.) Actually the Pair allocation here used
+        // unregistered Gc::new, not the heap. So heap count
+        // didn't move.
+        let after_construct = h.alloc_count();
+
+        let nb = NanboxValue::from_value(v);
+        // The encoding should NOT trigger an additional heap
+        // allocation — the `Gc<Pair>` ptr is stored directly.
+        assert_eq!(
+            h.alloc_count(),
+            after_construct,
+            "NaN-box encode of Pair must not allocate a Gc<Value> wrap"
+        );
+        assert!(nb.is_tagged());
+        assert_eq!(nb.tag(), NB_TAG_PAIR);
+
+        let back = unsafe { nb.to_value() };
+        match back {
+            Value::Pair(g) => {
+                let car = g.car.borrow().clone();
+                let cdr = g.cdr.borrow().clone();
+                match (&car, &cdr) {
+                    (
+                        Value::Number(cs_core::Number::Fixnum(a)),
+                        Value::Number(cs_core::Number::Fixnum(b)),
+                    ) => {
+                        assert_eq!(*a, 1);
+                        assert_eq!(*b, 2);
+                    }
+                    _ => panic!("Pair contents wrong: car={:?}, cdr={:?}", car, cdr),
+                }
+            }
+            other => panic!("expected Pair, got {:?}", other),
+        }
+
+        clear_jit_active_heap();
+    }
+
+    #[test]
+    fn nanbox_singleton_constructors_match_from_value() {
+        // The const-fn singletons produce bit-identical encodings
+        // to `from_value` of the matching Value variant.
+        assert_eq!(
+            NanboxValue::NULL.into_raw(),
+            NanboxValue::from_value(Value::Null).into_raw()
+        );
+        assert_eq!(
+            NanboxValue::UNSPECIFIED.into_raw(),
+            NanboxValue::from_value(Value::Unspecified).into_raw()
+        );
+        assert_eq!(
+            NanboxValue::EOF.into_raw(),
+            NanboxValue::from_value(Value::Eof).into_raw()
+        );
+        assert_eq!(
+            NanboxValue::TRUE.into_raw(),
+            NanboxValue::from_value(Value::Boolean(true)).into_raw()
+        );
+        assert_eq!(
+            NanboxValue::FALSE.into_raw(),
+            NanboxValue::from_value(Value::Boolean(false)).into_raw()
+        );
+    }
+
+    #[test]
+    fn nanbox_is_truthy_matches_scheme_semantics() {
+        assert!(!NanboxValue::boolean(false).is_truthy());
+        assert!(NanboxValue::boolean(true).is_truthy());
+        assert!(NanboxValue::NULL.is_truthy());
+        assert!(NanboxValue::UNSPECIFIED.is_truthy());
+        assert!(NanboxValue::EOF.is_truthy());
+        assert!(NanboxValue::fixnum(0).is_truthy());
+        assert!(NanboxValue::fixnum(-1).is_truthy());
+        assert!(NanboxValue::flonum(0.0).is_truthy());
+    }
+
+    #[test]
+    fn nanbox_fixnum_sign_extension() {
+        // 47-bit signed Fixnum must sign-extend correctly. The
+        // encoding truncates to 47 bits at encode; decode must
+        // reproduce the negative.
+        for n in [-1i64, -42, NB_FIXNUM_MIN, NB_FIXNUM_MIN + 1, -(1i64 << 30)] {
+            let nb = NanboxValue::fixnum(n);
+            assert_eq!(nb.as_fixnum(), Some(n), "Fixnum({}) sign-extension", n);
+        }
+    }
+
+    #[test]
+    fn nanbox_predicates_and_accessors() {
+        let fx = NanboxValue::fixnum(7);
+        assert!(fx.is_tagged());
+        assert!(!fx.is_flonum());
+        assert_eq!(fx.tag(), NB_TAG_FIXNUM);
+        assert_eq!(fx.as_fixnum(), Some(7));
+        assert_eq!(fx.as_boolean(), None);
+        assert_eq!(fx.as_flonum(), None);
+
+        let bt = NanboxValue::boolean(true);
+        assert_eq!(bt.tag(), NB_TAG_BOOLEAN);
+        assert_eq!(bt.as_fixnum(), None);
+        assert_eq!(bt.as_boolean(), Some(true));
+
+        let fl = NanboxValue::flonum(2.5);
+        assert!(!fl.is_tagged());
+        assert!(fl.is_flonum());
+        assert_eq!(fl.as_flonum(), Some(2.5));
+        assert_eq!(fl.as_fixnum(), None);
     }
 
     #[test]
