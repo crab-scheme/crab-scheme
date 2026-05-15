@@ -581,6 +581,12 @@ pub const DEOPT_REASON_FLONUM_MISS: u8 = 3;
 pub const DEOPT_REASON_PAIR_MISS: u8 = 4;
 #[allow(dead_code)]
 pub const DEOPT_REASON_NULL_MISS: u8 = 5;
+/// Stage 3 baseline JIT arithmetic / comparison slow path errored.
+/// Fired by `vm_value_{add,sub,mul,lt,eq}_nb` when `generic_arith2`
+/// or `generic_cmp2` returned an error (e.g. non-number operand);
+/// the dispatch boundary catches it and retries through bytecode
+/// so the error is raised with the correct span.
+pub const DEOPT_REASON_ARITH_MISS: u8 = 6;
 
 /// Set the deopt sentinel. Called by JIT runtime helpers on a
 /// type miss before they return a placeholder value.
@@ -5777,6 +5783,190 @@ pub unsafe extern "C" fn vm_value_drop_gc(r: i64) {
     }
 }
 
+// ====================================================================
+// Stage 3 baseline JIT — NB-typed arithmetic / comparison helpers.
+//
+// Each `vm_value_{add,sub,mul,lt,eq}_nb` takes two NanboxValue carriers
+// (i64) and produces one. The fast path (both operands `NB_TAG_FIXNUM`)
+// does the i64 op inline and encodes a fresh Fixnum NB. The slow path
+// decodes the operands to `Value`, runs `generic_arith2` /
+// `generic_cmp2` (same code the bytecode VM uses), and re-encodes the
+// result.
+//
+// Ownership: each helper consumes one strong ref per operand and
+// transfers one strong ref out via the return. Fixnum operands have no
+// refs so the fast path is a no-op for refcount. The slow path
+// consumes refs via `NanboxValue::to_value`.
+//
+// On `generic_*` error the helper sets `DEOPT_REASON_ARITH_MISS` and
+// returns the `Value::Boolean(false)` NB as a sentinel. The dispatch
+// boundary (`try_dispatch_jit_nb`) detects the deopt and retries
+// through bytecode, which raises the underlying error with the
+// correct span.
+
+/// Run `generic_arith2(a, b, op)`, encoding the result as NB. On
+/// error sets the deopt sentinel and returns `NanboxValue::FALSE`.
+/// Consumes one strong ref each on `a_nb` and `b_nb`.
+fn run_generic_arith_nb(a_nb: i64, b_nb: i64, op: GenericArith) -> i64 {
+    let a = unsafe { NanboxValue(a_nb).to_value() };
+    let b = unsafe { NanboxValue(b_nb).to_value() };
+    let spans = [Span::DUMMY];
+    let syms_ptr = jit_active_syms();
+    let result = if syms_ptr.is_null() {
+        // Direct-call test harness: no installed SymbolTable. Construct
+        // a throw-away one for the slow-path call.
+        let mut local_syms = SymbolTable::new();
+        generic_arith2((a, b), op, 0, &spans, &mut local_syms)
+    } else {
+        let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
+        generic_arith2((a, b), op, 0, &spans, syms)
+    };
+    match result {
+        Ok(v) => NanboxValue::from_value(v).into_raw(),
+        Err(_) => {
+            jit_request_deopt(DEOPT_REASON_ARITH_MISS);
+            NanboxValue::FALSE.into_raw()
+        }
+    }
+}
+
+/// Same shape as `run_generic_arith_nb` but for comparisons. Returns
+/// an NB-encoded `Boolean` on success.
+fn run_generic_cmp_nb(a_nb: i64, b_nb: i64, op: GenericCmp) -> i64 {
+    let a = unsafe { NanboxValue(a_nb).to_value() };
+    let b = unsafe { NanboxValue(b_nb).to_value() };
+    let spans = [Span::DUMMY];
+    let syms_ptr = jit_active_syms();
+    let result = if syms_ptr.is_null() {
+        let mut local_syms = SymbolTable::new();
+        generic_cmp2((a, b), op, 0, &spans, &mut local_syms)
+    } else {
+        let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
+        generic_cmp2((a, b), op, 0, &spans, syms)
+    };
+    match result {
+        Ok(v) => NanboxValue::from_value(v).into_raw(),
+        Err(_) => {
+            jit_request_deopt(DEOPT_REASON_ARITH_MISS);
+            NanboxValue::FALSE.into_raw()
+        }
+    }
+}
+
+/// `(+ a b)` — NB-typed. Fast path: both Fixnum, checked_add, encode
+/// result as Fixnum NB. Slow path: delegate to `generic_arith2`.
+///
+/// # Safety
+///
+/// `a` and `b` must each be a valid `NanboxValue` bit pattern with one
+/// owned strong refcount on their respective payload. The return
+/// carries one owned strong refcount.
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_add_nb(a: i64, b: i64) -> i64 {
+    let ab = a as u64;
+    let bb = b as u64;
+    if nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM
+    {
+        let av = nb_sign_extend_47(nb_payload_of(ab));
+        let bv = nb_sign_extend_47(nb_payload_of(bb));
+        if let Some(r) = av.checked_add(bv) {
+            return NanboxValue::fixnum(r).into_raw();
+        }
+    }
+    run_generic_arith_nb(a, b, GenericArith::Add)
+}
+
+/// `(- a b)` — NB-typed. See [`vm_value_add_nb`].
+///
+/// # Safety
+///
+/// Same as [`vm_value_add_nb`].
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_sub_nb(a: i64, b: i64) -> i64 {
+    let ab = a as u64;
+    let bb = b as u64;
+    if nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM
+    {
+        let av = nb_sign_extend_47(nb_payload_of(ab));
+        let bv = nb_sign_extend_47(nb_payload_of(bb));
+        if let Some(r) = av.checked_sub(bv) {
+            return NanboxValue::fixnum(r).into_raw();
+        }
+    }
+    run_generic_arith_nb(a, b, GenericArith::Sub)
+}
+
+/// `(* a b)` — NB-typed. See [`vm_value_add_nb`].
+///
+/// # Safety
+///
+/// Same as [`vm_value_add_nb`].
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_mul_nb(a: i64, b: i64) -> i64 {
+    let ab = a as u64;
+    let bb = b as u64;
+    if nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM
+    {
+        let av = nb_sign_extend_47(nb_payload_of(ab));
+        let bv = nb_sign_extend_47(nb_payload_of(bb));
+        if let Some(r) = av.checked_mul(bv) {
+            return NanboxValue::fixnum(r).into_raw();
+        }
+    }
+    run_generic_arith_nb(a, b, GenericArith::Mul)
+}
+
+/// `(< a b)` — NB-typed. Result is `Value::Boolean` NB.
+///
+/// # Safety
+///
+/// Same as [`vm_value_add_nb`].
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_lt_nb(a: i64, b: i64) -> i64 {
+    let ab = a as u64;
+    let bb = b as u64;
+    if nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM
+    {
+        let av = nb_sign_extend_47(nb_payload_of(ab));
+        let bv = nb_sign_extend_47(nb_payload_of(bb));
+        return NanboxValue::boolean(av < bv).into_raw();
+    }
+    run_generic_cmp_nb(a, b, GenericCmp::Lt)
+}
+
+/// `(= a b)` — NB-typed. Result is `Value::Boolean` NB.
+///
+/// # Safety
+///
+/// Same as [`vm_value_add_nb`].
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_eq_nb(a: i64, b: i64) -> i64 {
+    let ab = a as u64;
+    let bb = b as u64;
+    if nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM
+    {
+        let av = nb_sign_extend_47(nb_payload_of(ab));
+        let bv = nb_sign_extend_47(nb_payload_of(bb));
+        return NanboxValue::boolean(av == bv).into_raw();
+    }
+    run_generic_cmp_nb(a, b, GenericCmp::Eq)
+}
+
 /// `(make-vector n fill)` — allocate a fresh vector of length `n`
 /// whose slots are all cloned copies of `fill`. ADR 0012 D-2
 /// Gc-backed counterpart to a future `vm_alloc_vector` (no Box
@@ -9698,6 +9888,15 @@ pub const JIT_RT_ANY: u8 = 15;
 /// Iter BG repurposes nibble 15 (`JIT_RT_ANY` → `JIT_RT_GC`) once
 /// every helper is converted.
 pub const JIT_RT_GC: u8 = 16;
+
+/// Stage 3 uniform-NB ABI tag — i64 carries a raw `NanboxValue` bit
+/// pattern. Used both as a per-arg tag and as a closure-level marker:
+/// when `VmClosure::jit_return_type == JIT_RT_NB`, every param is
+/// NB-typed and the body emits NB tag-check + payload-extract per
+/// arithmetic op (delegating slow paths to `vm_value_*_nb`). The
+/// boundary (`try_dispatch_jit_nb`) passes NB i64s through unchanged
+/// for NB params and decodes NB returns directly.
+pub const JIT_RT_NB: u8 = 17;
 
 /// Default `jit_param_types` value: every nibble = JIT_RT_FIXNUM (0).
 pub const JIT_PARAM_TYPES_ALL_FIXNUM: u32 = 0;
@@ -15248,5 +15447,132 @@ mod gc_helper_tests_extra {
         let p1 = unsafe { vm_alloc_pair_gc(1, JIT_RT_FIXNUM, 2, JIT_RT_FIXNUM) };
         let p2 = unsafe { vm_alloc_pair_gc(1, JIT_RT_FIXNUM, 2, JIT_RT_FIXNUM) };
         assert_eq!(unsafe { vm_eq_any_gc(p1, p2) }, 0);
+    }
+}
+
+// ====================================================================
+// Stage 3 iter 3.0 — NB-native arithmetic / comparison helper tests.
+
+#[cfg(test)]
+mod nb_arith_tests {
+    use super::*;
+
+    fn nb_fixnum(n: i64) -> i64 {
+        NanboxValue::fixnum(n).into_raw()
+    }
+    fn nb_bool(b: bool) -> i64 {
+        NanboxValue::boolean(b).into_raw()
+    }
+    fn assert_fixnum(nb: i64, expected: i64) {
+        let v = unsafe { NanboxValue(nb).to_value() };
+        match v {
+            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, expected),
+            other => panic!("expected Fixnum({}), got {:?}", expected, other),
+        }
+    }
+    fn assert_bool(nb: i64, expected: bool) {
+        let v = unsafe { NanboxValue(nb).to_value() };
+        match v {
+            Value::Boolean(b) => assert_eq!(b, expected),
+            other => panic!("expected Boolean({}), got {:?}", expected, other),
+        }
+    }
+
+    #[test]
+    fn add_fast_path_fixnums() {
+        let _ = jit_take_deopt(); // clear any leftover sentinel
+        let r = unsafe { vm_value_add_nb(nb_fixnum(40), nb_fixnum(2)) };
+        assert_fixnum(r, 42);
+        assert_eq!(jit_take_deopt(), 0, "fast path must not request deopt");
+    }
+
+    #[test]
+    fn sub_fast_path_fixnums() {
+        let _ = jit_take_deopt();
+        let r = unsafe { vm_value_sub_nb(nb_fixnum(100), nb_fixnum(58)) };
+        assert_fixnum(r, 42);
+        assert_eq!(jit_take_deopt(), 0);
+    }
+
+    #[test]
+    fn mul_fast_path_fixnums() {
+        let _ = jit_take_deopt();
+        let r = unsafe { vm_value_mul_nb(nb_fixnum(6), nb_fixnum(7)) };
+        assert_fixnum(r, 42);
+        assert_eq!(jit_take_deopt(), 0);
+    }
+
+    #[test]
+    fn lt_fast_path_fixnums() {
+        let _ = jit_take_deopt();
+        assert_bool(unsafe { vm_value_lt_nb(nb_fixnum(1), nb_fixnum(2)) }, true);
+        assert_bool(unsafe { vm_value_lt_nb(nb_fixnum(2), nb_fixnum(2)) }, false);
+        assert_bool(unsafe { vm_value_lt_nb(nb_fixnum(3), nb_fixnum(2)) }, false);
+        assert_eq!(jit_take_deopt(), 0);
+    }
+
+    #[test]
+    fn eq_fast_path_fixnums() {
+        let _ = jit_take_deopt();
+        assert_bool(unsafe { vm_value_eq_nb(nb_fixnum(7), nb_fixnum(7)) }, true);
+        assert_bool(unsafe { vm_value_eq_nb(nb_fixnum(7), nb_fixnum(8)) }, false);
+        assert_eq!(jit_take_deopt(), 0);
+    }
+
+    #[test]
+    fn add_overflow_falls_to_slow_path() {
+        // i64::MAX + 1 — fixnum check passes (both NB-tagged Fixnum)
+        // but `checked_add` returns None, so we go via generic_arith2.
+        // generic_arith2 promotes through Number::add, which for two
+        // fixnums uses i128 overflow semantics; the result is encoded
+        // back as either an oversized Fixnum (wraps via Gc<Value>) or
+        // a BigInt. Either way, no deopt should fire — slow path is a
+        // legitimate code path, not an error.
+        let _ = jit_take_deopt();
+        let r = unsafe { vm_value_add_nb(nb_fixnum(NB_FIXNUM_MAX), nb_fixnum(1)) };
+        // Decode and verify it represents NB_FIXNUM_MAX + 1.
+        let v = unsafe { NanboxValue(r).to_value() };
+        match v {
+            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, NB_FIXNUM_MAX + 1),
+            Value::Number(cs_core::Number::Big(_)) => { /* acceptable */ }
+            other => panic!("expected Fixnum(NB_FIXNUM_MAX+1) or Big, got {:?}", other),
+        }
+        assert_eq!(jit_take_deopt(), 0);
+    }
+
+    #[test]
+    fn add_mixed_fixnum_flonum_falls_to_slow_path() {
+        let _ = jit_take_deopt();
+        let r = unsafe { vm_value_add_nb(nb_fixnum(1), NanboxValue::flonum(2.5).into_raw()) };
+        let v = unsafe { NanboxValue(r).to_value() };
+        match v {
+            Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 3.5).abs() < 1e-9),
+            other => panic!("expected Flonum(3.5), got {:?}", other),
+        }
+        assert_eq!(
+            jit_take_deopt(),
+            0,
+            "mixed fixnum/flonum add is valid Number arith, no deopt"
+        );
+    }
+
+    #[test]
+    fn add_non_number_operand_requests_deopt() {
+        let _ = jit_take_deopt();
+        // Adding a Boolean to a Fixnum is a type error.
+        let r = unsafe { vm_value_add_nb(nb_fixnum(1), nb_bool(true)) };
+        // Result is the sentinel `Boolean(false)` NB; deopt was set.
+        assert_eq!(jit_take_deopt(), DEOPT_REASON_ARITH_MISS);
+        // The sentinel itself is `Boolean(false)` — verify it decodes
+        // sanely so callers don't panic on it.
+        assert_bool(r, false);
+    }
+
+    #[test]
+    fn lt_non_number_operand_requests_deopt() {
+        let _ = jit_take_deopt();
+        let r = unsafe { vm_value_lt_nb(nb_bool(true), nb_fixnum(1)) };
+        assert_eq!(jit_take_deopt(), DEOPT_REASON_ARITH_MISS);
+        assert_bool(r, false);
     }
 }
