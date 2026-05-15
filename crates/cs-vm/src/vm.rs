@@ -9052,193 +9052,42 @@ fn bump_jit_call_count() {
     VM_JIT_CALL_COUNT.with(|c| c.set(c.get() + 1));
 }
 
-/// Try to dispatch a JIT-compiled closure call. Returns
-/// `Some(result)` if the closure has a JIT pointer installed and
-/// every arg is a Fixnum; otherwise `None` (caller falls back to
-/// bytecode dispatch).
+/// `Value`-shaped JIT dispatch entry — for callers that still hold
+/// `&[Value]` (HO bridge `vm_call_sync`, the apply/special-form
+/// dispatch arm). Encodes each `Value` to a `NanboxValue` and routes
+/// through [`try_dispatch_jit_nb`]; decodes the result back to
+/// `Value`. The NB slots own strong refs from the encoding step and
+/// must be released after the body call regardless of outcome.
 ///
-/// Iter-6 ABI: `extern "C" fn(i64, ..., i64) -> i64`. Args are
-/// unboxed Fixnums; the result is wrapped as `Value::Number(Fixnum)`.
-///
-/// `syms` is the caller's symbol table; installed in
-/// `JIT_ACTIVE_SYMS` for the duration of the JIT call so the
-/// `vm_call_general` slow-path helper (iter BU) can re-enter
-/// `vm_call_sync` with the same table when the JIT body invokes
-/// a non-self, non-builtin closure.
+/// Hot callers that already have `NanboxValue` (the main `Inst::Call`
+/// dispatch) should call [`try_dispatch_jit_nb`] directly to skip
+/// the per-arg `Value` round-trip.
 fn try_dispatch_jit(closure: &VmClosure, args: &[Value], syms: &mut SymbolTable) -> Option<Value> {
-    let ptr = closure.jit_ptr();
-    if ptr.is_null() {
+    if args.len() > 6 {
         return None;
     }
-    if closure.jit_arity() as usize != args.len() {
-        return None;
+    let mut nb_args = [NanboxValue(0); 6];
+    for (i, v) in args.iter().enumerate() {
+        nb_args[i] = NanboxValue::from_value(v.clone());
     }
-    let mut argv = [0i64; 6];
-    if args.len() > argv.len() {
-        return None;
+    let result = try_dispatch_jit_nb(closure, &nb_args[..args.len()], syms);
+    // `nb_args` slots own one strong ref each (transferred from the
+    // cloned `Value`s). Release them regardless of dispatch outcome —
+    // the JIT body's ABI took independent ownership of its own
+    // wraps for `JIT_RT_ANY` slots.
+    for nb in nb_args.iter().take(args.len()) {
+        unsafe { vm_value_drop_gc(nb.into_raw()) };
     }
-    let param_types = closure.jit_param_types();
-    for (i, a) in args.iter().enumerate() {
-        let expected = ((param_types >> (i * 4)) & 0xF) as u8;
-        match (expected, a) {
-            (JIT_RT_FIXNUM, Value::Number(cs_core::Number::Fixnum(n))) => argv[i] = *n,
-            (JIT_RT_FLONUM, Value::Number(cs_core::Number::Flonum(f))) => {
-                argv[i] = f.to_bits() as i64
-            }
-            (JIT_RT_BOOLEAN, Value::Boolean(b)) => argv[i] = if *b { 1 } else { 0 },
-            (JIT_RT_CHARACTER, Value::Character(c)) => argv[i] = *c as u32 as i64,
-            // Any-tagged param: clone the Value into a fresh
-            // `Gc<Value>` handle and pass its raw pointer as the i64.
-            // The JIT body owns one strong refcount; consumption is
-            // linear (car / cdr / pair? / null? / return). ADR 0012
-            // D-2 (iter BJ) — switched from `value_to_any_i64`
-            // (Box::into_raw) to `value_to_gc_i64`. The Box-flavored
-            // helpers remain defined but the dispatcher and Cranelift
-            // both wire through the `*_gc` family now.
-            (JIT_RT_ANY, v) => argv[i] = value_to_gc_i64(v.clone()),
-            _ => {
-                // Type-guard miss: the JIT body's signature doesn't
-                // match this call's arg shapes. Bump the per-closure
-                // deopt counter; if it crosses the recompile
-                // threshold, drop the JIT pointer so the next
-                // call's tier-up hook recompiles with fresh type
-                // feedback. (Iter AH — feedback-driven recompile.)
-                let n = closure.bump_jit_deopt();
-                if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
-                    closure.clear_jit_for_recompile();
-                }
-                return None;
-            }
-        }
-    }
-    bump_jit_call_count();
-    closure.bump_jit_call_count_self();
-    // Install the closure's env in the JIT thread-local so any
-    // Inst::EnvLookup the body emits can read free vars. The
-    // guard restores the previous value (or null) on drop, even
-    // on panic from inside the JIT body.
-    //
-    // ADR 0012 D-1 (closure-env capture fix): the bare definition-
-    // time `closure.env` is wrong when the body builds a nested
-    // closure. `vm_make_closure` captures whatever `JIT_CALLER_ENV`
-    // points at; a nested lambda's free vars include *this*
-    // invocation's parameters, which are otherwise passed only as
-    // native registers and live in no env. So when the body has a
-    // `MakeClosure` (flag set by the tier-up hook), build a real
-    // invocation-frame env — params bound, parented to the
-    // definition env — exactly as the bytecode VM's closure-call
-    // path does. Pure-arithmetic bodies (no `MakeClosure`) keep the
-    // zero-alloc fast path: `closure.env` directly.
-    let frame_env_holder: Option<Rc<Env>> = if closure.jit_needs_frame_env() {
-        let env = Env::child(closure.env.clone());
-        let lam = &closure.bc.lambdas[closure.lambda_idx];
-        for (name, v) in lam.params.iter().zip(args.iter()) {
-            env.define(*name, v.clone());
-        }
-        Some(env)
-    } else {
-        None
-    };
-    // Stage 1: consolidate the three per-crossing TLS installs (env,
-    // bc, syms) into one. The frame-stack-map list stays separate —
-    // it's a stack (push/pop on nested JIT calls), not a scalar
-    // replace. The env we point at depends on jit_needs_frame_env:
-    // a body with a `MakeClosure` needs the invocation-frame env
-    // (params bound, see ADR 0012 D-1); pure-arithmetic bodies use
-    // the bare definition-time env. Both Rc<Env>s outlive `ctx_guard`:
-    // `frame_env_holder` is owned by this stack frame, and
-    // `closure.env` is held alive by `closure: &VmClosure` here.
-    let env_ref: &Rc<Env> = match &frame_env_holder {
-        Some(e) => e,
-        None => &closure.env,
-    };
-    let ctx = JitCallContext {
-        env: Rc::as_ptr(env_ref),
-        bc: Rc::as_ptr(&closure.bc),
-        syms: syms as *mut SymbolTable,
-    };
-    let _ctx_guard = JitCtxGuard::install(&ctx);
-    // ADR 0012 D-2 (iter BN) — register this closure's stack-map
-    // registry on the per-thread active-frames list so the GC can
-    // see its Gc<Value> roots if `collect()` fires during the
-    // native call. Pop happens on Drop (RAII), so panics inside
-    // the JIT body don't leave a stale entry.
-    let _frame_guard = JitFrameGuard::install(closure.jit_stack_maps());
-    let r: i64 = match args.len() {
-        0 => {
-            let f: extern "C" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
-            f()
-        }
-        1 => {
-            let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };
-            f(argv[0])
-        }
-        2 => {
-            let f: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
-            f(argv[0], argv[1])
-        }
-        3 => {
-            let f: extern "C" fn(i64, i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
-            f(argv[0], argv[1], argv[2])
-        }
-        4 => {
-            let f: extern "C" fn(i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
-            f(argv[0], argv[1], argv[2], argv[3])
-        }
-        _ => return None,
-    };
-    // Iter BW — check if a runtime helper requested deopt during
-    // the native call. Non-zero means some helper (vm_unbox_*,
-    // vm_pair_car_gc, etc.) hit a type miss; the JIT body's return
-    // value is a placeholder. Bump the closure's deopt counter;
-    // past threshold, clear the JIT pointer so the next call hits
-    // bytecode. Either way, we return None so the caller retries
-    // through the bytecode VM with the original args (it has them
-    // — `args: &[Value]` is owned by the dispatch caller).
-    let deopt_reason = jit_take_deopt();
-    if deopt_reason != 0 {
-        let n = closure.bump_jit_deopt();
-        if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
-            closure.clear_jit_for_recompile();
-        }
-        return None;
-    }
-    Some(decode_jit_return(closure.jit_return_type(), r))
+    result.map(|nb| unsafe { nb.to_value() })
 }
 
-/// Wrap a raw i64 from a JIT'd body into the matching `Value` form
-/// based on the closure's stored return-type tag. Boolean uses 0/1
-/// from Lt/Eq; Character carries the codepoint in the low 32 bits;
-/// Flonum reads the i64 as the bit pattern of an f64. Any reads
-/// the i64 as `Box::into_raw(Box<Value>)` and reconstitutes the
-/// owned Value (dropping the Box on the way out).
+/// `Value`-shaped JIT return decoder — thin wrapper around
+/// [`decode_jit_return_nb`] for the IC dispatch helper that still
+/// needs to construct a `Value`. New code should use the NB version
+/// directly.
 fn decode_jit_return(rt: u8, r: i64) -> Value {
-    match rt {
-        JIT_RT_BOOLEAN => Value::Boolean(r != 0),
-        JIT_RT_CHARACTER => {
-            // Truncate to u32; `char::from_u32` rejects surrogates and
-            // out-of-range codepoints. If the JIT body produced an
-            // invalid codepoint we fall back to U+FFFD rather than
-            // panicking — this lines up with `decode_bytes` in the
-            // codec layer.
-            Value::Character(char::from_u32(r as u32).unwrap_or('\u{FFFD}'))
-        }
-        JIT_RT_FLONUM => {
-            let f = f64::from_bits(r as u64);
-            Value::Number(cs_core::Number::Flonum(f))
-        }
-        JIT_RT_NULL => Value::Null,
-        JIT_RT_SYMBOL => Value::Symbol(cs_core::Symbol(r as u32)),
-        JIT_RT_ANY => {
-            // ADR 0012 D-2 (iter BJ) — the JIT body produces this
-            // i64 via `value_to_gc_i64` (`Gc::into_raw_jit`). We own
-            // one strong refcount; `gc_i64_to_value` consumes it and
-            // returns the inner Value (cloned, so the Gc allocation
-            // is freed if this was the last reference).
-            unsafe { gc_i64_to_value(r) }
-        }
-        _ => Value::Number(cs_core::Number::Fixnum(r)),
-    }
+    let nb = decode_jit_return_nb(rt, r);
+    unsafe { nb.to_value() }
 }
 
 /// Stage 3 NB-native JIT dispatch entry. Mirrors [`try_dispatch_jit`] but
