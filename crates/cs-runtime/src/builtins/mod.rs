@@ -11576,9 +11576,15 @@ fn b_jit_status(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String>
         let nibble = ((packed >> (i as u32 * 4)) & 0xF) as u8;
         params.push(tag_to_sym(nibble, syms));
     }
+    // Prefer the *semantic* return tag (what the body conceptually
+    // returns) over the ABI tag (`JIT_RT_NB` for uniform-NB carriers).
+    // Both agree for specialized-tier bodies; they diverge for
+    // uniform-NB bodies, where the ABI carrier alone would render a
+    // flonum-returning body as `fixnum` (the default fallback for
+    // unknown tags in `tag_to_sym`).
     let out = vec![
         Value::Symbol(syms.intern("jit-on")),
-        tag_to_sym(closure.jit_return_type(), syms),
+        tag_to_sym(closure.jit_semantic_return_type(), syms),
         Value::list(params),
         Value::Symbol(syms.intern("calls")),
         Value::fixnum(closure.jit_call_count() as i64),

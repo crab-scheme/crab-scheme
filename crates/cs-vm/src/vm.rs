@@ -8993,48 +8993,77 @@ pub unsafe extern "C" fn vm_ic_dispatch(
             Err(e) => panic!("vm_ic_dispatch: {}", e.message),
         };
     }
-    // Per-arg lane decode: for each arg, look at the nibble in
-    // `cached_param_types` and re-encode the materialized `Value` to
-    // match the cached body's signature. Any → fresh Gc handle (the
-    // body owns one strong count). Immediate types (Fixnum / Boolean
-    // / Character / Flonum) → raw inline i64. Type mismatch → deopt
-    // and fall through to the slow path. (Stage 2c: enables the IC
-    // for typed-param callees, not just all-Any.)
+    // The cached body's calling convention depends on its return-type
+    // ABI tag: uniform-NB bodies (`JIT_RT_NB`) take NB-encoded i64s
+    // for *every* param; specialized bodies take typed raw-i64 lanes
+    // (Fixnum / Boolean / Character / Flonum / Any) per the per-nibble
+    // `cached_param_types` packing.
+    //
+    // For uniform-NB we still enforce the hinted type guard up front
+    // (mirroring `try_dispatch_jit_nb`'s guard) — bodies lowered for
+    // `[Flonum]` hint emit `FlonumMul` etc. which silently miscompiles
+    // when called with a Fixnum (NaN * NaN preserves operand bits).
+    let body_is_uniform_nb = closure.jit_return_type() == JIT_RT_NB;
     let mut type_miss = false;
     for i in 0..n_args {
-        let v = unsafe { gc_i64_to_value(*args_ptr.add(i)) };
+        let raw = unsafe { *args_ptr.add(i) };
+        let v = unsafe { gc_i64_to_value(raw) };
         let nibble = ((cached_param_types >> (i as u32 * 4)) & 0xF) as u8;
-        let slot_val: i64 = match (nibble, &v) {
-            (JIT_RT_FIXNUM, Value::Number(cs_core::Number::Fixnum(n))) => *n,
-            (JIT_RT_BOOLEAN, Value::Boolean(b)) => {
-                if *b {
-                    1
-                } else {
-                    0
-                }
-            }
-            (JIT_RT_CHARACTER, Value::Character(c)) => *c as u32 as i64,
-            (JIT_RT_FLONUM, Value::Number(cs_core::Number::Flonum(f))) => f.to_bits() as i64,
-            (JIT_RT_ANY, _) => value_to_gc_i64(v.clone()),
-            // Type mismatch — or heap-typed param (JIT_RT_PAIR etc.)
-            // not yet supported on the IC fast path. Mark a deopt
-            // and fall through to `vm_call_sync`, which handles all
-            // value shapes uniformly.
-            _ => {
+        let slot_val: i64 = if body_is_uniform_nb {
+            // NB ABI: enforce hint match then pass the NB carrier
+            // through with a refcount bump (so the body owns its
+            // independent ref). `value_to_gc_i64` round-trips the
+            // already-decoded `v` back to NB encoding.
+            let bits = raw as u64;
+            let tagged = nb_is_tagged(bits);
+            let tag = if tagged { nb_tag_of(bits) } else { u64::MAX };
+            let matched = match nibble {
+                JIT_RT_ANY => true,
+                JIT_RT_FIXNUM => tagged && tag == NB_TAG_FIXNUM,
+                JIT_RT_BOOLEAN => tagged && tag == NB_TAG_BOOLEAN,
+                JIT_RT_CHARACTER => tagged && tag == NB_TAG_CHARACTER,
+                JIT_RT_FLONUM => !tagged,
+                _ => true,
+            };
+            if !matched {
                 type_miss = true;
                 0
+            } else {
+                value_to_gc_i64(v.clone())
+            }
+        } else {
+            match (nibble, &v) {
+                (JIT_RT_FIXNUM, Value::Number(cs_core::Number::Fixnum(n))) => *n,
+                (JIT_RT_BOOLEAN, Value::Boolean(b)) => {
+                    if *b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                (JIT_RT_CHARACTER, Value::Character(c)) => *c as u32 as i64,
+                (JIT_RT_FLONUM, Value::Number(cs_core::Number::Flonum(f))) => f.to_bits() as i64,
+                (JIT_RT_ANY, _) => value_to_gc_i64(v.clone()),
+                // Type mismatch — or heap-typed param (JIT_RT_PAIR etc.)
+                // not yet supported on the IC fast path. Mark a deopt
+                // and fall through to `vm_call_sync`, which handles all
+                // value shapes uniformly.
+                _ => {
+                    type_miss = true;
+                    0
+                }
             }
         };
         jit_args[i] = slot_val;
         value_args.push(v);
     }
     if type_miss {
-        // Drop the typed slots we encoded (only the JIT_RT_ANY ones
-        // own Gc handles; immediate slots own nothing). The Any-slot
-        // handles are captured in jit_args[i] and need to be released.
+        // Drop the typed slots we encoded. For uniform-NB every
+        // populated slot is an NB carrier with a strong ref bump;
+        // for specialized only the `JIT_RT_ANY` slots own Gc handles.
         for i in 0..n_args {
             let nibble = ((cached_param_types >> (i as u32 * 4)) & 0xF) as u8;
-            if nibble == JIT_RT_ANY {
+            if body_is_uniform_nb || nibble == JIT_RT_ANY {
                 unsafe { vm_value_drop_gc(jit_args[i]) };
             }
         }
@@ -9406,8 +9435,44 @@ fn try_dispatch_jit_nb(
     // every param is NB-shaped. Pass the NB i64s through unchanged
     // and incref any pointer-typed payloads so the body owns its
     // refs independently of the caller's stack slots.
+    //
+    // Type guard: the uniform-NB translator emits *typed* primops
+    // (FlonumMul, FlonumAdd, etc.) and even const-folds predicates
+    // like `(char? v)` based on the per-param type hints fed to
+    // `bytecode_to_rir_with_hints`. A body lowered for `[Flonum]`
+    // miscompiles silently when called with a Fixnum (FlonumMul
+    // bitcasts NB-Fixnum bits to f64 → NaN, then NaN*NaN preserves
+    // the operand bit pattern, returning the input as if it were
+    // unchanged). To preserve correctness without inserting a guard
+    // into every body, the dispatcher checks each NB arg against
+    // the cached `jit_param_types` nibble *before* running the
+    // body; a mismatch falls back to bytecode, which evaluates the
+    // generic semantics correctly. `JIT_RT_ANY` is the "generic"
+    // sentinel — it matches every shape.
     let body_is_uniform_nb = closure.jit_return_type() == JIT_RT_NB;
     if body_is_uniform_nb {
+        let param_types = closure.jit_param_types();
+        for (i, nb) in args.iter().enumerate() {
+            let expected = ((param_types >> (i * 4)) & 0xF) as u8;
+            let bits = nb.into_raw() as u64;
+            let tagged = nb_is_tagged(bits);
+            let tag = if tagged { nb_tag_of(bits) } else { u64::MAX };
+            let matched = match expected {
+                JIT_RT_ANY => true,
+                JIT_RT_FIXNUM => tagged && tag == NB_TAG_FIXNUM,
+                JIT_RT_BOOLEAN => tagged && tag == NB_TAG_BOOLEAN,
+                JIT_RT_CHARACTER => tagged && tag == NB_TAG_CHARACTER,
+                JIT_RT_FLONUM => !tagged,
+                _ => true,
+            };
+            if !matched {
+                let n = closure.bump_jit_deopt();
+                if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
+                    closure.clear_jit_for_recompile();
+                }
+                return None;
+            }
+        }
         for (i, nb) in args.iter().enumerate() {
             argv[i] = unsafe { vm_value_clone_gc(nb.into_raw()) };
         }
@@ -9745,6 +9810,16 @@ pub struct LambdaProfile {
     /// translated body contains a `MakeClosure`. ADR 0012 D-1
     /// (closure-env capture fix).
     jit_needs_frame_env: Cell<bool>,
+    /// Semantic return type tag — what the body *logically* returns
+    /// (Fixnum / Flonum / Pair / Any / ...). For specialized-tier
+    /// bodies this is identical to [`jit_return_type`] (the ABI tag
+    /// is the semantic tag). For uniform-NB bodies the ABI tag is
+    /// always `JIT_RT_NB` (i64 carrier holds an NB encoding); the
+    /// semantic tag is the RIR `return_type` recorded at compile
+    /// time so observability (`jit-status`) can still report what
+    /// the body conceptually returns. Defaults to `JIT_RT_FIXNUM`
+    /// until the tier-up hook stamps it.
+    jit_semantic_return_type: Cell<u8>,
     /// Stable, process-wide unique identifier for this lambda.
     /// Stamped at construction from [`NEXT_LAMBDA_ID`]; never mutates.
     /// Used as the inline-cache identity key (Stage 2d): the IC slot
@@ -9780,6 +9855,7 @@ impl Default for LambdaProfile {
             jit_call_count: Cell::new(0),
             jit_stack_maps: std::cell::RefCell::new(None),
             jit_needs_frame_env: Cell::new(false),
+            jit_semantic_return_type: Cell::new(JIT_RT_FIXNUM),
             lambda_id: alloc_lambda_id(),
         }
     }
@@ -9816,6 +9892,20 @@ impl LambdaProfile {
 
     pub fn jit_return_type(&self) -> u8 {
         self.jit_return_type.get()
+    }
+
+    /// Set the *semantic* return type tag (what the body conceptually
+    /// returns). Distinct from the ABI tag for uniform-NB bodies
+    /// (whose ABI tag is `JIT_RT_NB` regardless of the body's logical
+    /// return type). Observed by `jit-status` so flonum-returning
+    /// bodies don't appear as `fixnum` just because their ABI carrier
+    /// is the NB i64.
+    pub fn set_jit_semantic_return_type(&self, rt: u8) {
+        self.jit_semantic_return_type.set(rt);
+    }
+
+    pub fn jit_semantic_return_type(&self) -> u8 {
+        self.jit_semantic_return_type.get()
     }
 
     /// Bake per-param type tags from a slice (low nibble = arg 0).
@@ -10066,6 +10156,20 @@ impl VmClosure {
 
     pub fn jit_return_type(&self) -> u8 {
         self.profile.jit_return_type()
+    }
+
+    /// Tell `jit-status` (and other observability surfaces) the
+    /// body's *semantic* return type — the user-visible type the
+    /// body conceptually returns. For specialized-tier bodies this
+    /// equals [`jit_return_type`]. For uniform-NB bodies the ABI
+    /// carrier is always `JIT_RT_NB`, but the semantic tag records
+    /// the RIR `return_type` recorded at compile time.
+    pub fn set_jit_semantic_return_type(&self, rt: u8) {
+        self.profile.set_jit_semantic_return_type(rt);
+    }
+
+    pub fn jit_semantic_return_type(&self) -> u8 {
+        self.profile.jit_semantic_return_type()
     }
 
     /// Install the stack-map registry harvested when this lambda

@@ -185,20 +185,24 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
         }
         closure.set_jit_stack_maps(std::rc::Rc::new(maps));
     }
-    // For the uniform-NB tier the return type tag is `JIT_RT_NB`
-    // (the boundary passes the i64 through unchanged). For the
-    // specialized tier, decode per `rir.return_type` as before.
-    let rt_tag = match return_tag_override {
-        Some(t) => t,
-        None => match rir.return_type {
-            RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
-            RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,
-            RirType::Flonum => cs_vm::vm::JIT_RT_FLONUM,
-            RirType::Null => cs_vm::vm::JIT_RT_NULL,
-            RirType::Symbol => cs_vm::vm::JIT_RT_SYMBOL,
-            RirType::Any => cs_vm::vm::JIT_RT_ANY,
-            _ => cs_vm::vm::JIT_RT_FIXNUM,
-        },
+    // Always compute the semantic return tag from `rir.return_type`
+    // (what the body conceptually returns). For the specialized tier
+    // this is also the ABI tag — the body emits raw i64 of that
+    // shape. For uniform-NB the ABI tag is `JIT_RT_NB` (the body
+    // emits a uniform NB i64 carrier) while the semantic tag still
+    // describes what the body conceptually returns, so observability
+    // surfaces like `jit-status` and `jit-introspection` can report
+    // the user-visible type rather than the ABI carrier.
+    let semantic_tag = match rir.return_type {
+        RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
+        RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,
+        RirType::Flonum => cs_vm::vm::JIT_RT_FLONUM,
+        RirType::Null => cs_vm::vm::JIT_RT_NULL,
+        RirType::Symbol => cs_vm::vm::JIT_RT_SYMBOL,
+        RirType::Any => cs_vm::vm::JIT_RT_ANY,
+        _ => cs_vm::vm::JIT_RT_FIXNUM,
     };
+    let rt_tag = return_tag_override.unwrap_or(semantic_tag);
     closure.set_jit_return_type(rt_tag);
+    closure.set_jit_semantic_return_type(semantic_tag);
 }

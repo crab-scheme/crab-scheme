@@ -5064,6 +5064,12 @@ impl Lowerer {
                 make_closure: self
                     .module
                     .declare_func_in_func(self.make_closure_func, builder.func),
+                closure_id_peek: self
+                    .module
+                    .declare_func_in_func(self.closure_id_peek_func, builder.func),
+                ic_dispatch: self
+                    .module
+                    .declare_func_in_func(self.ic_dispatch_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -6604,6 +6610,15 @@ struct NbHelpers {
     env_lookup_any: cranelift_codegen::ir::FuncRef,
     env_set_nb: cranelift_codegen::ir::FuncRef,
     make_closure: cranelift_codegen::ir::FuncRef,
+    // IC hot path (CallGeneral): `vm_closure_id_peek(callee) -> u32`
+    // reads the callee's lambda id without consuming the handle;
+    // `vm_ic_dispatch(callee, args_ptr, n_args, jit_ptr, slot_ptr)`
+    // runs the cached native body with the same env / bytecode /
+    // stack-map TLS guards `try_dispatch_jit_nb` installs. Mirrors
+    // the specialized tier's CallGeneral plumbing so uniform-NB
+    // sites also get IC speedups when the callee tiers up.
+    closure_id_peek: cranelift_codegen::ir::FuncRef,
+    ic_dispatch: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -6901,11 +6916,11 @@ fn lower_inst_uniform_nb(
                 b.ins().call(helpers.env_set_nb, &[sym_v, val]);
             }
             // `Inst::Call` is the translator's "I have feedback about
-            // this callee" form — specialized tier emits an inline-
-            // cache hot path. Uniform-NB has no IC; treat it
-            // identically to `CallGeneral` (route through
-            // `vm_call_general`). The translator's feedback hint is
-            // lost, but correctness is preserved.
+            // this callee" form. Mirror the specialized tier's
+            // inline-cache hot path: per-site `IcSlot` with hit/miss
+            // branches. Hit dispatches through `vm_ic_dispatch` (NB-
+            // aware after Phase 4 keystone follow-up); miss falls
+            // through to `vm_call_general`, which populates the slot.
             Inst::Call(dst, callee, args) | Inst::CallGeneral(dst, callee, args) => {
                 let callee_v = lookup(map, *callee)?;
                 let n = args.len();
@@ -6914,9 +6929,9 @@ fn lower_inst_uniform_nb(
                     .map(|a| lookup(map, *a))
                     .collect::<Result<_, _>>()?;
 
-                // Stack-allocate the args buffer (`vm_call_general`
-                // takes `*const i64` + count). At least 8 bytes so
-                // `stack_addr` is valid even at n == 0.
+                // Stack-allocate the args buffer (`vm_call_general` /
+                // `vm_ic_dispatch` both take `*const i64` + count). At
+                // least 8 bytes so `stack_addr` is valid for n == 0.
                 let buf_bytes = std::cmp::max(8u32, (n as u32) * 8);
                 let buf_slot = b.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
@@ -6928,12 +6943,77 @@ fn lower_inst_uniform_nb(
                 }
                 let buf_addr = b.ins().stack_addr(I64, buf_slot, 0);
                 let n_args_v = b.ins().iconst(I64, n as i64);
-                let null_slot = b.ins().iconst(I64, 0);
-                let call = b.ins().call(
-                    helpers.call_general,
-                    &[callee_v, buf_addr, n_args_v, null_slot],
+
+                // Per-site IC slot. Box::leak gives a stable
+                // process-lifetime address; the i64 constant baked
+                // into the body's pool is that address.
+                let ic_slot: &'static crate::ic::IcSlot =
+                    Box::leak(Box::new(crate::ic::IcSlot::new()));
+                let slot_ptr_const = ic_slot as *const crate::ic::IcSlot as i64;
+                let slot_addr_v = b.ins().iconst(I64, slot_ptr_const);
+
+                // Peek callee's lambda id (doesn't consume the handle).
+                let peek_inst = b.ins().call(helpers.closure_id_peek, &[callee_v]);
+                let peeked_id_i32 = b.inst_results(peek_inst)[0];
+                // Cached id is u32 at offset 0 of IcSlot (#[repr(C)]).
+                let cached_id_i32 = b.ins().load(
+                    cranelift_codegen::ir::types::I32,
+                    cranelift_codegen::ir::MemFlags::new(),
+                    slot_addr_v,
+                    0,
                 );
-                let result = b.inst_results(call)[0];
+                let id_match = b.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    peeked_id_i32,
+                    cached_id_i32,
+                );
+                let zero32 = b.ins().iconst(cranelift_codegen::ir::types::I32, 0);
+                let cached_nonzero = b.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::NotEqual,
+                    cached_id_i32,
+                    zero32,
+                );
+                let take_hit = b.ins().band(id_match, cached_nonzero);
+
+                let hit_block = b.create_block();
+                let miss_block = b.create_block();
+                let join_block = b.create_block();
+                b.append_block_param(join_block, I64);
+                b.ins().brif(take_hit, hit_block, &[], miss_block, &[]);
+
+                // ===== Hit =====
+                b.switch_to_block(hit_block);
+                b.seal_block(hit_block);
+                let cached_jit_ptr_v =
+                    b.ins()
+                        .load(I64, cranelift_codegen::ir::MemFlags::new(), slot_addr_v, 8);
+                let hit_inst = b.ins().call(
+                    helpers.ic_dispatch,
+                    &[callee_v, buf_addr, n_args_v, cached_jit_ptr_v, slot_addr_v],
+                );
+                let hit_result = b.inst_results(hit_inst)[0];
+                b.ins().jump(
+                    join_block,
+                    &[cranelift_codegen::ir::BlockArg::Value(hit_result)],
+                );
+
+                // ===== Miss =====
+                b.switch_to_block(miss_block);
+                b.seal_block(miss_block);
+                let miss_inst = b.ins().call(
+                    helpers.call_general,
+                    &[callee_v, buf_addr, n_args_v, slot_addr_v],
+                );
+                let miss_result = b.inst_results(miss_inst)[0];
+                b.ins().jump(
+                    join_block,
+                    &[cranelift_codegen::ir::BlockArg::Value(miss_result)],
+                );
+
+                // ===== Join =====
+                b.switch_to_block(join_block);
+                b.seal_block(join_block);
+                let result = b.block_params(join_block)[0];
                 b.declare_value_needs_stack_map(result);
                 map.insert(*dst, result);
             }
