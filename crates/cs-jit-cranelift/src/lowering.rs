@@ -149,6 +149,12 @@ pub struct Lowerer {
     /// FuncId of `vm_value_eq_nb(a, b) -> i64` (Stage 3 baseline). See
     /// [`Self::value_add_nb_func`].
     value_eq_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_value_le_nb(a, b) -> i64` (Stage 3 baseline).
+    value_le_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_value_gt_nb(a, b) -> i64` (Stage 3 baseline).
+    value_gt_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_value_ge_nb(a, b) -> i64` (Stage 3 baseline).
+    value_ge_nb_func: cranelift_module::FuncId,
     /// FuncId of `vm_eq_any(a, b) -> i64`. `Inst::EqAny` lowers
     /// to this. Consumes both boxes; returns 0/1.
     eq_any_func: cranelift_module::FuncId,
@@ -878,6 +884,9 @@ impl Lowerer {
         builder.symbol("vm_value_mul_nb", cs_vm::vm::vm_value_mul_nb as *const u8);
         builder.symbol("vm_value_lt_nb", cs_vm::vm::vm_value_lt_nb as *const u8);
         builder.symbol("vm_value_eq_nb", cs_vm::vm::vm_value_eq_nb as *const u8);
+        builder.symbol("vm_value_le_nb", cs_vm::vm::vm_value_le_nb as *const u8);
+        builder.symbol("vm_value_gt_nb", cs_vm::vm::vm_value_gt_nb as *const u8);
+        builder.symbol("vm_value_ge_nb", cs_vm::vm::vm_value_ge_nb as *const u8);
         builder.symbol("vm_eq_any", cs_vm::vm::vm_eq_any_gc as *const u8);
         // ADR 0012 D-2 (iter DZ) — equal? deep structural equality.
         builder.symbol("vm_equal_gc", cs_vm::vm::vm_equal_gc as *const u8);
@@ -1994,6 +2003,27 @@ impl Lowerer {
                 &nb_arith_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_value_eq_nb: {e}")))?;
+        let value_le_nb_func = module
+            .declare_function(
+                "vm_value_le_nb",
+                cranelift_module::Linkage::Import,
+                &nb_arith_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_value_le_nb: {e}")))?;
+        let value_gt_nb_func = module
+            .declare_function(
+                "vm_value_gt_nb",
+                cranelift_module::Linkage::Import,
+                &nb_arith_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_value_gt_nb: {e}")))?;
+        let value_ge_nb_func = module
+            .declare_function(
+                "vm_value_ge_nb",
+                cranelift_module::Linkage::Import,
+                &nb_arith_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_value_ge_nb: {e}")))?;
 
         // vm_eq_any(a, b) -> i64. Same shape as the existing
         // `box_typed_sig` (i64, i64) -> i64.
@@ -4428,6 +4458,9 @@ impl Lowerer {
             value_mul_nb_func,
             value_lt_nb_func,
             value_eq_nb_func,
+            value_le_nb_func,
+            value_gt_nb_func,
+            value_ge_nb_func,
             eq_any_func,
             equal_func,
             any_truthy_func,
@@ -4834,17 +4867,37 @@ impl Lowerer {
                     | Inst::Mul(_, _, _)
                     | Inst::Lt(_, _, _)
                     | Inst::Eq(_, _, _)
+                    | Inst::FlonumAdd(_, _, _)
+                    | Inst::FlonumSub(_, _, _)
+                    | Inst::FlonumMul(_, _, _)
+                    | Inst::FlonumDiv(_, _, _)
+                    | Inst::FlonumLt(_, _, _)
+                    | Inst::FlonumEq(_, _, _)
+                    | Inst::FlonumMax(_, _, _)
+                    | Inst::FlonumMin(_, _, _)
+                    | Inst::FlonumSqrt(_, _)
+                    | Inst::FlonumAbs(_, _)
+                    | Inst::FlonumFloor(_, _)
+                    | Inst::FlonumCeil(_, _)
+                    | Inst::FlonumTrunc(_, _)
+                    | Inst::FlonumRound(_, _)
                     | Inst::Cons(_, _, _, _, _)
                     | Inst::Car(_, _)
                     | Inst::Cdr(_, _)
                     | Inst::PairP(_, _)
                     | Inst::NullP(_, _)
+                    | Inst::VecAlloc(_, _, _)
+                    | Inst::VecRef(_, _, _)
+                    | Inst::VecSet(_, _, _, _)
+                    | Inst::VecLength(_, _)
+                    | Inst::VecP(_, _)
                     | Inst::AnyClone(_, _)
                     | Inst::AnyDrop(_)
                     | Inst::MakeClosure(_, _)
                     | Inst::EnvLookup(_, _)
                     | Inst::EnvLookupAny(_, _)
                     | Inst::EnvSet(_, _)
+                    | Inst::Call(_, _, _)
                     | Inst::CallGeneral(_, _, _) => {}
                     Inst::CallSelf(_, _) => {
                         let is_tail = i == last_idx && detect_tail_call_self(rir, blk).is_some();
@@ -4953,6 +5006,15 @@ impl Lowerer {
                 eq: self
                     .module
                     .declare_func_in_func(self.value_eq_nb_func, builder.func),
+                le: self
+                    .module
+                    .declare_func_in_func(self.value_le_nb_func, builder.func),
+                gt: self
+                    .module
+                    .declare_func_in_func(self.value_gt_nb_func, builder.func),
+                ge: self
+                    .module
+                    .declare_func_in_func(self.value_ge_nb_func, builder.func),
                 alloc_pair: self
                     .module
                     .declare_func_in_func(self.alloc_pair_func, builder.func),
@@ -4968,6 +5030,21 @@ impl Lowerer {
                 null_p: self
                     .module
                     .declare_func_in_func(self.null_p_func, builder.func),
+                alloc_vector: self
+                    .module
+                    .declare_func_in_func(self.alloc_vector_func, builder.func),
+                vector_ref: self
+                    .module
+                    .declare_func_in_func(self.vector_ref_func, builder.func),
+                vector_set: self
+                    .module
+                    .declare_func_in_func(self.vector_set_func, builder.func),
+                vector_length: self
+                    .module
+                    .declare_func_in_func(self.vector_length_func, builder.func),
+                vector_p: self
+                    .module
+                    .declare_func_in_func(self.vector_p_func, builder.func),
                 value_clone: self
                     .module
                     .declare_func_in_func(self.value_clone_func, builder.func),
@@ -6497,12 +6574,21 @@ struct NbHelpers {
     mul: cranelift_codegen::ir::FuncRef,
     lt: cranelift_codegen::ir::FuncRef,
     eq: cranelift_codegen::ir::FuncRef,
+    le: cranelift_codegen::ir::FuncRef,
+    gt: cranelift_codegen::ir::FuncRef,
+    ge: cranelift_codegen::ir::FuncRef,
     // Pair primitives.
     alloc_pair: cranelift_codegen::ir::FuncRef,
     pair_car: cranelift_codegen::ir::FuncRef,
     pair_cdr: cranelift_codegen::ir::FuncRef,
     pair_p: cranelift_codegen::ir::FuncRef,
     null_p: cranelift_codegen::ir::FuncRef,
+    // Vector primitives.
+    alloc_vector: cranelift_codegen::ir::FuncRef,
+    vector_ref: cranelift_codegen::ir::FuncRef,
+    vector_set: cranelift_codegen::ir::FuncRef,
+    vector_length: cranelift_codegen::ir::FuncRef,
+    vector_p: cranelift_codegen::ir::FuncRef,
     // Refcount management for Any-shape values.
     value_clone: cranelift_codegen::ir::FuncRef,
     value_drop: cranelift_codegen::ir::FuncRef,
@@ -6575,6 +6661,69 @@ fn lower_inst_uniform_nb(
                 });
                 map.insert(dst, r);
             }
+            // (RIR has no Le/Gt/Ge variants — the translator rewrites
+            // those to `Lt` with swapped args plus `not`. Helpers
+            // `vm_value_le_nb`/`_gt_nb`/`_ge_nb` are exposed for future
+            // use but currently unreferenced from this lowering.)
+            // ─── Flonum primitives ─────────────────────────────────────
+            // NB Flonum encoding IS raw `f64::to_bits` (sign-bit-clear
+            // qNaN canonicalized), bit-identical to `JIT_RT_FLONUM`. So
+            // these lower exactly like the specialized tier: bitcast i64
+            // operand to f64, op, bitcast result to i64.
+            &Inst::FlonumAdd(dst, lhs, rhs) => {
+                fbinop(b, map, dst, lhs, rhs, |b, l, r| b.ins().fadd(l, r))?
+            }
+            &Inst::FlonumSub(dst, lhs, rhs) => {
+                fbinop(b, map, dst, lhs, rhs, |b, l, r| b.ins().fsub(l, r))?
+            }
+            &Inst::FlonumMul(dst, lhs, rhs) => {
+                fbinop(b, map, dst, lhs, rhs, |b, l, r| b.ins().fmul(l, r))?
+            }
+            &Inst::FlonumDiv(dst, lhs, rhs) => {
+                fbinop(b, map, dst, lhs, rhs, |b, l, r| b.ins().fdiv(l, r))?
+            }
+            &Inst::FlonumMax(dst, lhs, rhs) => {
+                fbinop(b, map, dst, lhs, rhs, |b, l, r| b.ins().fmax(l, r))?
+            }
+            &Inst::FlonumMin(dst, lhs, rhs) => {
+                fbinop(b, map, dst, lhs, rhs, |b, l, r| b.ins().fmin(l, r))?
+            }
+            &Inst::FlonumSqrt(dst, src) => funary(b, map, dst, src, |b, x| b.ins().sqrt(x))?,
+            &Inst::FlonumAbs(dst, src) => funary(b, map, dst, src, |b, x| b.ins().fabs(x))?,
+            &Inst::FlonumFloor(dst, src) => funary(b, map, dst, src, |b, x| b.ins().floor(x))?,
+            &Inst::FlonumCeil(dst, src) => funary(b, map, dst, src, |b, x| b.ins().ceil(x))?,
+            &Inst::FlonumTrunc(dst, src) => funary(b, map, dst, src, |b, x| b.ins().trunc(x))?,
+            &Inst::FlonumRound(dst, src) => funary(b, map, dst, src, |b, x| b.ins().nearest(x))?,
+            &Inst::FlonumLt(dst, lhs, rhs) => {
+                let l_i = lookup(map, lhs)?;
+                let r_i = lookup(map, rhs)?;
+                let mf = cranelift_codegen::ir::MemFlags::new();
+                let l_f = b.ins().bitcast(F64, mf, l_i);
+                let r_f = b.ins().bitcast(F64, mf, r_i);
+                let cmp = b.ins().fcmp(
+                    cranelift_codegen::ir::condcodes::FloatCC::LessThan,
+                    l_f,
+                    r_f,
+                );
+                let widened = b.ins().uextend(I64, cmp);
+                let nb_false = cs_vm::vm::NanboxValue::FALSE.into_raw();
+                let result = b.ins().bor_imm(widened, nb_false);
+                map.insert(dst, result);
+            }
+            &Inst::FlonumEq(dst, lhs, rhs) => {
+                let l_i = lookup(map, lhs)?;
+                let r_i = lookup(map, rhs)?;
+                let mf = cranelift_codegen::ir::MemFlags::new();
+                let l_f = b.ins().bitcast(F64, mf, l_i);
+                let r_f = b.ins().bitcast(F64, mf, r_i);
+                let cmp = b
+                    .ins()
+                    .fcmp(cranelift_codegen::ir::condcodes::FloatCC::Equal, l_f, r_f);
+                let widened = b.ins().uextend(I64, cmp);
+                let nb_false = cs_vm::vm::NanboxValue::FALSE.into_raw();
+                let result = b.ins().bor_imm(widened, nb_false);
+                map.insert(dst, result);
+            }
             &Inst::Cons(dst, car, _car_tag, cdr, _cdr_tag) => {
                 // Uniform-NB ignores the per-operand tags emitted by the
                 // specialized-tier translator: both operands are NB i64,
@@ -6620,6 +6769,71 @@ fn lower_inst_uniform_nb(
             &Inst::NullP(dst, src) => {
                 let v = lookup(map, src)?;
                 let call = b.ins().call(helpers.null_p, &[v]);
+                let raw = b.inst_results(call)[0];
+                let nb_false = cs_vm::vm::NanboxValue::FALSE.into_raw();
+                let result = b.ins().bor_imm(raw, nb_false);
+                map.insert(dst, result);
+            }
+            // ─── Vector primitives ─────────────────────────────────────
+            // The Vector helpers take their `idx`/`n` as RAW fixnum
+            // i64s (the specialized tier's RIR Type::Fixnum encoding),
+            // not NanboxValue. Uniform-NB has to decode the NB Fixnum
+            // payload (sign-extend the 47-bit) on the way in. Same
+            // for the output of `VecLength` — re-encode raw → NB.
+            //
+            // The Gc-tagged operands (`vec`, `fill`, `x`) flow through
+            // unchanged: `vm_alloc_vector_gc`, `vm_vector_ref_gc`,
+            // `vm_vector_set_gc` all decode their Gc<Value> args via
+            // `gc_i64_to_value` (= `NanboxValue::to_value`), so an NB
+            // i64 is accepted natively.
+            &Inst::VecAlloc(dst, n_op, fill) => {
+                let n_nb = lookup(map, n_op)?;
+                let payload = b.ins().band_imm(n_nb, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let shl = b.ins().ishl_imm(payload, 17);
+                let n_raw = b.ins().sshr_imm(shl, 17);
+                let f_v = lookup(map, fill)?;
+                let call = b.ins().call(helpers.alloc_vector, &[n_raw, f_v]);
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(dst, result);
+            }
+            &Inst::VecRef(dst, vec, idx) => {
+                let v_v = lookup(map, vec)?;
+                let i_nb = lookup(map, idx)?;
+                let payload = b.ins().band_imm(i_nb, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let shl = b.ins().ishl_imm(payload, 17);
+                let i_raw = b.ins().sshr_imm(shl, 17);
+                let call = b.ins().call(helpers.vector_ref, &[v_v, i_raw]);
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(dst, result);
+            }
+            &Inst::VecSet(dst, vec, idx, x) => {
+                let v_v = lookup(map, vec)?;
+                let i_nb = lookup(map, idx)?;
+                let payload = b.ins().band_imm(i_nb, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let shl = b.ins().ishl_imm(payload, 17);
+                let i_raw = b.ins().sshr_imm(shl, 17);
+                let x_v = lookup(map, x)?;
+                let call = b.ins().call(helpers.vector_set, &[v_v, i_raw, x_v]);
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(dst, result);
+            }
+            &Inst::VecLength(dst, vec) => {
+                let v_v = lookup(map, vec)?;
+                let call = b.ins().call(helpers.vector_length, &[v_v]);
+                let raw = b.inst_results(call)[0];
+                // Re-encode raw length → NB Fixnum.
+                let payload = b.ins().band_imm(raw, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let result = b
+                    .ins()
+                    .bor_imm(payload, cs_vm::vm::NB_SIGNATURE_BITS as i64);
+                map.insert(dst, result);
+            }
+            &Inst::VecP(dst, src) => {
+                let v_v = lookup(map, src)?;
+                let call = b.ins().call(helpers.vector_p, &[v_v]);
                 let raw = b.inst_results(call)[0];
                 let nb_false = cs_vm::vm::NanboxValue::FALSE.into_raw();
                 let result = b.ins().bor_imm(raw, nb_false);
@@ -6686,12 +6900,13 @@ fn lower_inst_uniform_nb(
                 let sym_v = b.ins().iconst(I64, sym as i64);
                 b.ins().call(helpers.env_set_nb, &[sym_v, val]);
             }
-            Inst::CallGeneral(dst, callee, args) => {
-                // Slow-path general call via `vm_call_general`. The
-                // baseline tier skips the inline-cache hot path the
-                // specialized tier emits — uniform-NB just funnels
-                // every call through the helper. Hot bodies can tier
-                // up to specialized to recover IC perf.
+            // `Inst::Call` is the translator's "I have feedback about
+            // this callee" form — specialized tier emits an inline-
+            // cache hot path. Uniform-NB has no IC; treat it
+            // identically to `CallGeneral` (route through
+            // `vm_call_general`). The translator's feedback hint is
+            // lost, but correctness is preserved.
+            Inst::Call(dst, callee, args) | Inst::CallGeneral(dst, callee, args) => {
                 let callee_v = lookup(map, *callee)?;
                 let n = args.len();
                 let arg_vs: Vec<cranelift_codegen::ir::Value> = args

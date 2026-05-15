@@ -5980,6 +5980,69 @@ pub unsafe extern "C" fn vm_value_lt_nb(a: i64, b: i64) -> i64 {
     run_generic_cmp_nb(a, b, GenericCmp::Lt)
 }
 
+/// `(<= a b)` — NB-typed.
+///
+/// # Safety
+///
+/// Same as [`vm_value_add_nb`].
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_le_nb(a: i64, b: i64) -> i64 {
+    let ab = a as u64;
+    let bb = b as u64;
+    if nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM
+    {
+        let av = nb_sign_extend_47(nb_payload_of(ab));
+        let bv = nb_sign_extend_47(nb_payload_of(bb));
+        return NanboxValue::boolean(av <= bv).into_raw();
+    }
+    run_generic_cmp_nb(a, b, GenericCmp::Le)
+}
+
+/// `(> a b)` — NB-typed.
+///
+/// # Safety
+///
+/// Same as [`vm_value_add_nb`].
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_gt_nb(a: i64, b: i64) -> i64 {
+    let ab = a as u64;
+    let bb = b as u64;
+    if nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM
+    {
+        let av = nb_sign_extend_47(nb_payload_of(ab));
+        let bv = nb_sign_extend_47(nb_payload_of(bb));
+        return NanboxValue::boolean(av > bv).into_raw();
+    }
+    run_generic_cmp_nb(a, b, GenericCmp::Gt)
+}
+
+/// `(>= a b)` — NB-typed.
+///
+/// # Safety
+///
+/// Same as [`vm_value_add_nb`].
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_ge_nb(a: i64, b: i64) -> i64 {
+    let ab = a as u64;
+    let bb = b as u64;
+    if nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM
+    {
+        let av = nb_sign_extend_47(nb_payload_of(ab));
+        let bv = nb_sign_extend_47(nb_payload_of(bb));
+        return NanboxValue::boolean(av >= bv).into_raw();
+    }
+    run_generic_cmp_nb(a, b, GenericCmp::Ge)
+}
+
 /// `(= a b)` — NB-typed. Result is `Value::Boolean` NB.
 ///
 /// # Safety
