@@ -57,6 +57,20 @@ fi
 if command -v gsi >/dev/null 2>&1; then
   IMPLS+=("gambit|gsi $SCM")
 fi
+# Gambit AOT path: `gsc -dynamic` produces a native `.o1` next to the
+# source; loading the `.o1` directly via `gsi` runs the AOT-compiled
+# native module. We build into a sibling dir to avoid touching the
+# source tree, then point gsi at the absolute `.o1` path.
+if command -v gsc >/dev/null 2>&1 && command -v gsi >/dev/null 2>&1; then
+  GAMBIT_BUILD="$OUT_DIR/gambit-aot-build"
+  mkdir -p "$GAMBIT_BUILD"
+  cp "$SCM" "$GAMBIT_BUILD/nbody.scm"
+  if gsc -dynamic "$GAMBIT_BUILD/nbody.scm" >/dev/null 2>&1 && [ -f "$GAMBIT_BUILD/nbody.o1" ]; then
+    IMPLS+=("gambit-aot|gsi $GAMBIT_BUILD/nbody.o1")
+  else
+    echo "    (gambit AOT compile failed — skipping)"
+  fi
+fi
 
 # Run each impl, capture lines like `nbody-round N SECONDS`, store as
 # (round, seconds) TSV in $OUT_DIR/<name>.tsv.
