@@ -96,3 +96,119 @@ fn add_one_bytecode_translates_and_jits() {
     assert_eq!(func(41), 42);
     assert_eq!(func(-1), 0);
 }
+
+// ====================================================================
+// Stage 3 iter 3.1 — uniform-NB skeleton tests.
+//
+// The body's ABI is i64 NanboxValue bits in / i64 NanboxValue bits out.
+// These tests hand the JIT a hand-rolled RIR Function (skipping the
+// translator, which only emits typed RIR for the specialized tier) and
+// invoke the resulting function pointer with raw NB bits.
+
+#[test]
+fn uniform_nb_add_two_fixnums() {
+    use cs_rir::{Block, BlockId, Const as RirConst, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    // Function: (fn (a b) (+ a b)) — all NB-typed.
+    let mut f = Function::new("add_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.params.push((cs_rir::Value(1), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![RirInst::Add(
+            cs_rir::Value(2),
+            cs_rir::Value(0),
+            cs_rir::Value(1),
+        )],
+        terminator: Term::Return(cs_rir::Value(2)),
+    });
+    // Suppress unused warning on the imported variants we don't use here.
+    let _ = RirConst::Fixnum(0);
+
+    let mut lowerer = Lowerer::new().expect("Lowerer::new");
+    let ptr = lowerer.compile_uniform_nb(&f).expect("compile_uniform_nb");
+    let func: extern "C" fn(i64, i64) -> i64 = unsafe { transmute(ptr) };
+
+    // Fast path: both Fixnum NBs.
+    let a = NanboxValue::fixnum(40).into_raw();
+    let b = NanboxValue::fixnum(2).into_raw();
+    let r = func(a, b);
+    let v = unsafe { NanboxValue(r).to_value() };
+    match v {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 42),
+        other => panic!("expected Fixnum(42), got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_loadconst_plus_param() {
+    use cs_rir::{Block, BlockId, Const as RirConst, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    // Function: (fn (x) (+ x 1)) — LoadConst Fixnum + Add via NB.
+    let mut f = Function::new("plus_one_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            RirInst::LoadConst(cs_rir::Value(1), RirConst::Fixnum(1)),
+            RirInst::Add(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
+        ],
+        terminator: Term::Return(cs_rir::Value(2)),
+    });
+
+    let mut lowerer = Lowerer::new().expect("Lowerer::new");
+    let ptr = lowerer.compile_uniform_nb(&f).expect("compile_uniform_nb");
+    let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
+
+    let x = NanboxValue::fixnum(41).into_raw();
+    let r = func(x);
+    let v = unsafe { NanboxValue(r).to_value() };
+    match v {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 42),
+        other => panic!("expected Fixnum(42), got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_add_mixed_fixnum_flonum_slow_path() {
+    use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    // (fn (a b) (+ a b)) — call with Fixnum + Flonum. Should go via
+    // the runtime helper's slow path and return a Flonum.
+    let mut f = Function::new("add_mixed");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.params.push((cs_rir::Value(1), Type::Any));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![RirInst::Add(
+            cs_rir::Value(2),
+            cs_rir::Value(0),
+            cs_rir::Value(1),
+        )],
+        terminator: Term::Return(cs_rir::Value(2)),
+    });
+
+    let mut lowerer = Lowerer::new().expect("Lowerer::new");
+    let ptr = lowerer.compile_uniform_nb(&f).expect("compile_uniform_nb");
+    let func: extern "C" fn(i64, i64) -> i64 = unsafe { transmute(ptr) };
+
+    let a = NanboxValue::fixnum(1).into_raw();
+    let b = NanboxValue::flonum(2.5).into_raw();
+    let r = func(a, b);
+    let v = unsafe { NanboxValue(r).to_value() };
+    match v {
+        cs_core::Value::Number(cs_core::Number::Flonum(f)) => {
+            assert!((f - 3.5).abs() < 1e-9);
+        }
+        other => panic!("expected Flonum(3.5), got {:?}", other),
+    }
+}

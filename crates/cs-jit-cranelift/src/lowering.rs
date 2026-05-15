@@ -128,6 +128,22 @@ pub struct Lowerer {
     /// lowers to this. Consumes the box; returns the f64 bit
     /// pattern.
     unbox_flonum_func: cranelift_module::FuncId,
+    /// FuncId of `vm_value_add_nb(a: i64, b: i64) -> i64` (Stage 3 baseline).
+    /// `Inst::Add` in the uniform-NB body lowers to a Cranelift call
+    /// against this on a Fixnum tag-check miss.
+    value_add_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_value_sub_nb(a, b) -> i64` (Stage 3 baseline). See
+    /// [`Self::value_add_nb_func`].
+    value_sub_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_value_mul_nb(a, b) -> i64` (Stage 3 baseline). See
+    /// [`Self::value_add_nb_func`].
+    value_mul_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_value_lt_nb(a, b) -> i64` (Stage 3 baseline). See
+    /// [`Self::value_add_nb_func`].
+    value_lt_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_value_eq_nb(a, b) -> i64` (Stage 3 baseline). See
+    /// [`Self::value_add_nb_func`].
+    value_eq_nb_func: cranelift_module::FuncId,
     /// FuncId of `vm_eq_any(a, b) -> i64`. `Inst::EqAny` lowers
     /// to this. Consumes both boxes; returns 0/1.
     eq_any_func: cranelift_module::FuncId,
@@ -848,6 +864,12 @@ impl Lowerer {
             "vm_unbox_flonum",
             cs_vm::vm::vm_unbox_flonum_gc as *const u8,
         );
+        // Stage 3 baseline-JIT NB-typed arithmetic helpers (iter 3.0).
+        builder.symbol("vm_value_add_nb", cs_vm::vm::vm_value_add_nb as *const u8);
+        builder.symbol("vm_value_sub_nb", cs_vm::vm::vm_value_sub_nb as *const u8);
+        builder.symbol("vm_value_mul_nb", cs_vm::vm::vm_value_mul_nb as *const u8);
+        builder.symbol("vm_value_lt_nb", cs_vm::vm::vm_value_lt_nb as *const u8);
+        builder.symbol("vm_value_eq_nb", cs_vm::vm::vm_value_eq_nb as *const u8);
         builder.symbol("vm_eq_any", cs_vm::vm::vm_eq_any_gc as *const u8);
         // ADR 0012 D-2 (iter DZ) — equal? deep structural equality.
         builder.symbol("vm_equal_gc", cs_vm::vm::vm_equal_gc as *const u8);
@@ -1913,6 +1935,50 @@ impl Lowerer {
                 &pair_accessor_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_unbox_flonum: {e}")))?;
+
+        // Stage 3 baseline-JIT NB-typed arith / cmp helpers (iter 3.0).
+        // All share the (i64, i64) -> i64 signature `box_typed_sig` was
+        // built for; lazily declared here so the JIT module can call
+        // them once the iter-3.1 lowering wires them in.
+        let mut nb_arith_sig = module.make_signature();
+        nb_arith_sig.params.push(AbiParam::new(I64));
+        nb_arith_sig.params.push(AbiParam::new(I64));
+        nb_arith_sig.returns.push(AbiParam::new(I64));
+        let value_add_nb_func = module
+            .declare_function(
+                "vm_value_add_nb",
+                cranelift_module::Linkage::Import,
+                &nb_arith_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_value_add_nb: {e}")))?;
+        let value_sub_nb_func = module
+            .declare_function(
+                "vm_value_sub_nb",
+                cranelift_module::Linkage::Import,
+                &nb_arith_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_value_sub_nb: {e}")))?;
+        let value_mul_nb_func = module
+            .declare_function(
+                "vm_value_mul_nb",
+                cranelift_module::Linkage::Import,
+                &nb_arith_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_value_mul_nb: {e}")))?;
+        let value_lt_nb_func = module
+            .declare_function(
+                "vm_value_lt_nb",
+                cranelift_module::Linkage::Import,
+                &nb_arith_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_value_lt_nb: {e}")))?;
+        let value_eq_nb_func = module
+            .declare_function(
+                "vm_value_eq_nb",
+                cranelift_module::Linkage::Import,
+                &nb_arith_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_value_eq_nb: {e}")))?;
 
         // vm_eq_any(a, b) -> i64. Same shape as the existing
         // `box_typed_sig` (i64, i64) -> i64.
@@ -4341,6 +4407,11 @@ impl Lowerer {
             unbox_fixnum_func,
             unbox_boolean_func,
             unbox_flonum_func,
+            value_add_nb_func,
+            value_sub_nb_func,
+            value_mul_nb_func,
+            value_lt_nb_func,
+            value_eq_nb_func,
             eq_any_func,
             equal_func,
             any_truthy_func,
@@ -4705,6 +4776,152 @@ impl Lowerer {
         // `JitStackMaps` keyed by the inner base for the closure.
         self.last_inner_base = self.module.get_finalized_function(inner_id);
         Ok(self.module.get_finalized_function(outer_id))
+    }
+
+    /// Stage 3 baseline tier entry. Compiles `rir` under the uniform
+    /// `NanboxValue` ABI: every param and the return is an i64 NB bit
+    /// pattern, with type checks emitted inline per arithmetic op (Iter
+    /// 3.2+) or delegated to NB-typed runtime helpers (`vm_value_*_nb`,
+    /// added in Iter 3.0).
+    ///
+    /// **Iter 3.1 — skeleton scope**: only `Inst::LoadConst`, `Inst::Add`,
+    /// and `Term::Return` are lowered. Add always delegates to
+    /// `vm_value_add_nb` (no inline Fixnum fast path yet — that's
+    /// Iter 3.2). LoadConst encodes the const as an NB i64 at compile
+    /// time. Other RIR variants return `JitError::Unsupported` so the
+    /// translator's coverage analysis can mark functions as
+    /// baseline-eligible vs not.
+    pub fn compile_uniform_nb(&mut self, rir: &RirFunction) -> Result<*const u8, JitError> {
+        if rir.blocks.is_empty() {
+            return Err(JitError::Codegen("function has no blocks".into()));
+        }
+
+        let outer_sig = {
+            let mut sig = Signature::new(CallConv::SystemV);
+            for _ in &rir.params {
+                sig.params.push(AbiParam::new(I64));
+            }
+            sig.returns.push(AbiParam::new(I64));
+            sig
+        };
+        let inner_sig = {
+            let mut sig = Signature::new(CallConv::Tail);
+            for _ in &rir.params {
+                sig.params.push(AbiParam::new(I64));
+            }
+            sig.returns.push(AbiParam::new(I64));
+            sig
+        };
+
+        let outer_seq = self.fresh_id();
+        let inner_seq = self.fresh_id();
+        let outer_module_name = format!("{}#{}.nb_outer", rir.name, outer_seq);
+        let inner_module_name = format!("{}#{}.nb_inner", rir.name, inner_seq);
+        let outer_id = self
+            .module
+            .declare_function(&outer_module_name, Linkage::Local, &outer_sig)
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function {}: {e}", outer_module_name))
+            })?;
+        let inner_id = self
+            .module
+            .declare_function(&inner_module_name, Linkage::Local, &inner_sig)
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function {}: {e}", inner_module_name))
+            })?;
+
+        self.compile_inner_body_uniform_nb(rir, inner_id, inner_seq, &inner_sig)?;
+        // Re-use the existing trampoline: it's tier-agnostic — just
+        // forwards i64 args to inner. Same shape works for NB-typed
+        // bodies.
+        self.compile_outer_trampoline(rir, outer_id, outer_seq, &outer_sig, inner_id)?;
+        self.module
+            .finalize_definitions()
+            .map_err(|e| JitError::Codegen(format!("finalize_definitions: {e}")))?;
+        self.last_inner_base = self.module.get_finalized_function(inner_id);
+        Ok(self.module.get_finalized_function(outer_id))
+    }
+
+    /// Iter 3.1 body lowering — minimal `LoadConst` / `Add` / `Return`.
+    /// All values flow as raw NanboxValue i64s; `Add` delegates to
+    /// `vm_value_add_nb` (which does its own Fixnum fast path). Future
+    /// iters inline the tag check and add more ops.
+    fn compile_inner_body_uniform_nb(
+        &mut self,
+        rir: &RirFunction,
+        inner_id: cranelift_module::FuncId,
+        inner_seq: u64,
+        inner_sig: &Signature,
+    ) -> Result<(), JitError> {
+        let func_name = UserFuncName::user(0, inner_seq as u32);
+        let mut clif = ClifFunction::with_name_signature(func_name, inner_sig.clone());
+        let mut value_map: HashMap<RirValue, cranelift_codegen::ir::Value> = HashMap::new();
+        {
+            let mut builder = FunctionBuilder::new(&mut clif, &mut self.func_ctx);
+            let value_add_nb_fnref = self
+                .module
+                .declare_func_in_func(self.value_add_nb_func, builder.func);
+
+            // Block-id map: RIR BlockId -> Cranelift Block.
+            let mut block_map: HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block> =
+                HashMap::new();
+            for blk in &rir.blocks {
+                let cb = builder.create_block();
+                // Block params get appended in lower_block below. The
+                // entry block also gets the function's actual params
+                // (one slot per `rir.params`).
+                block_map.insert(blk.id, cb);
+            }
+            let entry_block = *block_map
+                .get(&rir.entry)
+                .ok_or_else(|| JitError::Codegen("entry block missing".into()))?;
+            // Wire function params into the entry block's signature.
+            for _ in &rir.params {
+                builder.append_block_param(entry_block, I64);
+            }
+            builder.switch_to_block(entry_block);
+            builder.seal_block(entry_block);
+            // Bind RIR Value(i) for params to the entry block params.
+            for (i, (rv, _ty)) in rir.params.iter().enumerate() {
+                let p = builder.block_params(entry_block)[i];
+                value_map.insert(*rv, p);
+            }
+
+            // Append per-block params for non-entry blocks.
+            for blk in &rir.blocks {
+                if blk.id == rir.entry {
+                    continue;
+                }
+                let cb = block_map[&blk.id];
+                for _ in &blk.params {
+                    builder.append_block_param(cb, I64);
+                }
+            }
+
+            // Lower each block.
+            for blk in &rir.blocks {
+                let cb = block_map[&blk.id];
+                if blk.id != rir.entry {
+                    builder.switch_to_block(cb);
+                    // Bind RIR block params to the Cranelift block params.
+                    for (i, (rv, _ty)) in blk.params.iter().enumerate() {
+                        let p = builder.block_params(cb)[i];
+                        value_map.insert(*rv, p);
+                    }
+                    builder.seal_block(cb);
+                }
+                lower_inst_uniform_nb(&mut builder, &mut value_map, value_add_nb_fnref, blk)?;
+                lower_terminator_uniform_nb(&mut builder, &value_map, &block_map, &blk.terminator)?;
+            }
+
+            builder.finalize();
+        }
+
+        let mut ctx = cranelift_codegen::Context::for_function(clif);
+        self.module
+            .define_function(inner_id, &mut ctx)
+            .map_err(|e| JitError::Codegen(format!("define_function inner uniform_nb: {e}")))?;
+        Ok(())
     }
 
     fn compile_inner_body(
@@ -6119,6 +6336,101 @@ fn detect_tail_call_self<'a>(
             }
         }
         _ => None,
+    }
+}
+
+/// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
+/// instructions and emits Cranelift IR for the supported subset.
+/// Returns `JitError::Unsupported(...)` on RIR variants the iter
+/// hasn't covered yet — the translator's coverage analysis will
+/// route those bodies to the specialized tier or bytecode.
+fn lower_inst_uniform_nb(
+    b: &mut FunctionBuilder,
+    map: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
+    value_add_nb_fnref: cranelift_codegen::ir::FuncRef,
+    blk: &cs_rir::Block,
+) -> Result<(), JitError> {
+    for inst in &blk.insts {
+        match inst {
+            Inst::LoadConst(dst, c) => {
+                let nb = encode_const_as_nb(c);
+                let v = b.ins().iconst(I64, nb);
+                map.insert(*dst, v);
+            }
+            &Inst::Add(dst, lhs, rhs) => {
+                let a = *map.get(&lhs).ok_or_else(|| {
+                    JitError::Codegen(format!("Add: lhs SSA value {:?} unbound", lhs))
+                })?;
+                let bv = *map.get(&rhs).ok_or_else(|| {
+                    JitError::Codegen(format!("Add: rhs SSA value {:?} unbound", rhs))
+                })?;
+                let call = b.ins().call(value_add_nb_fnref, &[a, bv]);
+                let r = b.inst_results(call)[0];
+                map.insert(dst, r);
+            }
+            other => {
+                return Err(JitError::Unsupported(format!(
+                    "uniform-nb skeleton: Inst {:?} not yet supported",
+                    other
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stage 3 baseline-tier terminator lowering. Returns
+/// `JitError::Unsupported` on variants the iter hasn't covered.
+fn lower_terminator_uniform_nb(
+    b: &mut FunctionBuilder,
+    map: &HashMap<RirValue, cranelift_codegen::ir::Value>,
+    _block_map: &HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block>,
+    term: &Term,
+) -> Result<(), JitError> {
+    match term {
+        Term::Return(v) => {
+            let val = *map
+                .get(v)
+                .ok_or_else(|| JitError::Codegen(format!("Return: SSA value {:?} unbound", v)))?;
+            b.ins().return_(&[val]);
+            Ok(())
+        }
+        other => Err(JitError::Unsupported(format!(
+            "uniform-nb skeleton: Term {:?} not yet supported",
+            other
+        ))),
+    }
+}
+
+/// Encode an RIR `Const` to its `NanboxValue` bit pattern as an i64
+/// at compile time. The lowering emits a single `iconst` of this
+/// value, so non-Fixnum constants don't pay an encode cost at run
+/// time. Returns `None` (TODO) for variants that require heap
+/// allocation; the skeleton handles inline-encodable kinds only.
+fn encode_const_as_nb(c: &Const) -> i64 {
+    use cs_vm::vm::NanboxValue;
+    match c {
+        Const::Fixnum(n) => NanboxValue::fixnum(*n).into_raw(),
+        Const::Flonum(f) => NanboxValue::flonum(*f).into_raw(),
+        Const::Boolean(b) => NanboxValue::boolean(*b).into_raw(),
+        Const::Character(ch) => NanboxValue::character(*ch).into_raw(),
+        Const::Null => NanboxValue::NULL.into_raw(),
+        Const::Unspecified => NanboxValue::UNSPECIFIED.into_raw(),
+        Const::Eof => NanboxValue::EOF.into_raw(),
+        Const::Symbol(id) => NanboxValue::symbol(cs_core::Symbol(*id)).into_raw(),
+        // String constants would need a static-table lookup that
+        // materializes a `Gc<String>` on first access. Skeleton
+        // doesn't support these yet — the translator will route any
+        // function containing `Const::StringRef` to the specialized
+        // tier (or bytecode).
+        Const::StringRef(_) => {
+            // Sentinel: the caller in `lower_inst_uniform_nb` won't
+            // reach this branch because the Inst::LoadConst arm would
+            // need to fail-out before invoking us. Defensive: return
+            // `Value::Unspecified` NB to keep the lowering honest if
+            // a translator bug routes us here.
+            NanboxValue::UNSPECIFIED.into_raw()
+        }
     }
 }
 
