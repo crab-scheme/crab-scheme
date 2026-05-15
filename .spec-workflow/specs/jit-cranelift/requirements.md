@@ -1,6 +1,12 @@
 # M6 JIT (Cranelift) — Requirements
 
-> Status: **Draft** — initial scaffolding lands as part of this spec.
+> Status: **Phase 1+2+3+4 shipped** — see exit reports:
+>   - Phase 1: `docs/milestones/m6-exit.md` (tag `m6-complete`) — Cranelift JIT shipped with i64-only ABI
+>   - Phase 2: `docs/milestones/m6-phase2-exit.md` (tag `m6-phase2-complete`) — four-tag immediate-value pipeline (Fixnum/Boolean/Character/Flonum)
+>   - Phase 3: `docs/milestones/m6-phase3-exit.md` (tag `m6-phase3-complete`) — tail calls + mixed-tower arithmetic correctness
+>   - Phase 4: `docs/milestones/m6-phase4-exit.md` (tag pending) — uniform NanboxValue across tiers + baseline NB JIT tier
+>
+> The Phase 1 requirements / design docs below are retained as historical scaffolding; subsequent phases were tracked through their exit reports. Gabriel-benchmark geomean and gcc-O2 perf gates remain ungated.
 > Spec slug: `jit-cranelift`
 > Roadmap slot: M6
 > Predecessor: M5 (`docs/milestones/m5-exit.md`, conformance 2150)
