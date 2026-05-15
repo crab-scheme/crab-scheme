@@ -88,6 +88,10 @@ pub struct Lowerer {
     /// FuncId of the imported `vm_env_set_fixnum` helper.
     /// `Inst::EnvSet` lowers to a Cranelift call against this.
     env_set_func: cranelift_module::FuncId,
+    /// FuncId of `vm_env_set_nb(sym, value) -> ()` (Stage 3 baseline).
+    /// Same shape as `vm_env_set_fixnum` but accepts a raw
+    /// `NanboxValue` and decodes internally.
+    env_set_nb_func: cranelift_module::FuncId,
     /// FuncId of `vm_alloc_pair(car, car_tag, cdr, cdr_tag) -> i64`.
     /// `Inst::Cons` lowers to a Cranelift call against this.
     alloc_pair_func: cranelift_module::FuncId,
@@ -834,6 +838,9 @@ impl Lowerer {
             "vm_env_set_fixnum",
             cs_vm::vm::vm_env_set_fixnum as *const u8,
         );
+        // Stage 3 baseline-JIT env-set helper (iter 3.5): accepts a
+        // raw NanboxValue, decodes internally.
+        builder.symbol("vm_env_set_nb", cs_vm::vm::vm_env_set_nb as *const u8);
         // ADR 0011 D-5 — heap-pointer ABI helpers. Pure-additive
         // imports today (no translator path uses them yet); subsequent
         // iters wire `cons` / `car` / `cdr` lowering through these
@@ -1818,6 +1825,13 @@ impl Lowerer {
                 &env_set_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function env_set: {e}")))?;
+        let env_set_nb_func = module
+            .declare_function(
+                "vm_env_set_nb",
+                cranelift_module::Linkage::Import,
+                &env_set_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function env_set_nb: {e}")))?;
 
         // Heap-pointer ABI helpers (ADR 0011 D-5). Imported so the
         // module knows about them; no JIT body calls them yet.
@@ -4397,6 +4411,7 @@ impl Lowerer {
             env_lookup_func,
             env_lookup_any_func,
             env_set_func,
+            env_set_nb_func,
             alloc_pair_func,
             pair_car_func,
             pair_cdr_func,
@@ -4902,6 +4917,15 @@ impl Lowerer {
                 call_general: self
                     .module
                     .declare_func_in_func(self.call_general_func, builder.func),
+                env_lookup_any: self
+                    .module
+                    .declare_func_in_func(self.env_lookup_any_func, builder.func),
+                env_set_nb: self
+                    .module
+                    .declare_func_in_func(self.env_set_nb_func, builder.func),
+                make_closure: self
+                    .module
+                    .declare_func_in_func(self.make_closure_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -6398,6 +6422,14 @@ struct NbHelpers {
     // path. `vm_call_general(callee, args_ptr, n_args, slot_ptr)`.
     self_fn: cranelift_codegen::ir::FuncRef,
     call_general: cranelift_codegen::ir::FuncRef,
+    // Env access. EnvLookup variants share `vm_env_lookup_any` for
+    // uniform-NB (it returns an NB-shaped Gc<Value> wrap); EnvSet
+    // uses the new `vm_env_set_nb`. `MakeClosure` invokes
+    // `vm_make_closure` which reads the enclosing env from the
+    // thread-local installed by `try_dispatch_jit_nb`.
+    env_lookup_any: cranelift_codegen::ir::FuncRef,
+    env_set_nb: cranelift_codegen::ir::FuncRef,
+    make_closure: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -6531,6 +6563,40 @@ fn lower_inst_uniform_nb(
                 let call = b.ins().call(helpers.self_fn, &cargs);
                 let result = b.inst_results(call)[0];
                 map.insert(*dst, result);
+            }
+            &Inst::MakeClosure(dst, lambda_idx) => {
+                // Builds a fresh `VmClosure` capturing the enclosing
+                // env (read from the thread-local by `vm_make_closure`).
+                // Result is an NB-shaped Gc<Value> wrap.
+                let idx_v = b.ins().iconst(I64, lambda_idx as i64);
+                let call = b.ins().call(helpers.make_closure, &[idx_v]);
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(dst, result);
+            }
+            &Inst::EnvLookup(dst, sym) => {
+                // The specialized translator emits `EnvLookup` only for
+                // Fixnum-typed bindings. Uniform-NB doesn't have that
+                // type narrowing — route through `vm_env_lookup_any`
+                // which returns an NB-shaped Gc<Value> wrap that works
+                // for every type.
+                let sym_v = b.ins().iconst(I64, sym as i64);
+                let call = b.ins().call(helpers.env_lookup_any, &[sym_v]);
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(dst, result);
+            }
+            &Inst::EnvLookupAny(dst, sym) => {
+                let sym_v = b.ins().iconst(I64, sym as i64);
+                let call = b.ins().call(helpers.env_lookup_any, &[sym_v]);
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(dst, result);
+            }
+            &Inst::EnvSet(sym, value) => {
+                let val = lookup(map, value)?;
+                let sym_v = b.ins().iconst(I64, sym as i64);
+                b.ins().call(helpers.env_set_nb, &[sym_v, val]);
             }
             Inst::CallGeneral(dst, callee, args) => {
                 // Slow-path general call via `vm_call_general`. The

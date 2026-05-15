@@ -376,6 +376,40 @@ pub extern "C" fn vm_env_set_fixnum(sym: i64, value: i64) {
     }
 }
 
+/// Stage 3 baseline-JIT `set!` helper — accepts a raw NanboxValue
+/// `i64` and writes it to the named binding. Consumes one strong
+/// refcount on `value` (via the eventual `Env::define`'s
+/// `from_value` re-encode chain).
+///
+/// # Safety
+///
+/// `JIT_CALLER_ENV` must be set (same contract as the typed
+/// variants). `value` must be a live, owned `NanboxValue` bit
+/// pattern with one strong refcount on its payload (if pointer-
+/// typed); ownership is transferred to the env binding.
+#[no_mangle]
+pub unsafe extern "C" fn vm_env_set_nb(sym: i64, value: i64) {
+    let env_ptr = jit_caller_env();
+    if env_ptr.is_null() {
+        panic!("vm_env_set_nb: JIT_CALLER_ENV is null");
+    }
+    let env = unsafe { &*env_ptr };
+    let sym = Symbol(sym as u32);
+    let v = unsafe { NanboxValue(value).to_value() };
+    if !env.set_existing(sym, v.clone()) {
+        let mut root: Rc<Env> = unsafe {
+            let raw_rc = Rc::from_raw(env_ptr);
+            let cloned = raw_rc.clone();
+            std::mem::forget(raw_rc);
+            cloned
+        };
+        while let Some(p) = root.parent.clone() {
+            root = p;
+        }
+        root.define(sym, v);
+    }
+}
+
 /// Helper called by JIT-compiled code to look up a free variable's
 /// fixnum value in the closure's captured env. The env pointer is
 /// pulled from `JIT_CALLER_ENV` (set by `try_dispatch_jit`).
