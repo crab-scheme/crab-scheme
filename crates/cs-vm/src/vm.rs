@@ -1170,6 +1170,152 @@ impl PartialEq for NanboxValue {
 }
 impl Eq for NanboxValue {}
 
+// ===== ValueStack (Stage 2 K1 step 3 — VM dispatch stack wrapper) =====
+//
+// Wrapper around the VM dispatch stack. Currently storage is
+// `Vec<Value>` (24-byte enum slots, unchanged from pre-K1) — the
+// **storage migration to `Vec<NanboxValue>` did not land** in this
+// iteration. Bench showed the per-push/pop NaN-box encode/decode
+// cost regressed VM-tier perf by 1.3×–2.0× on every benchmark
+// because Inst handlers still operate on `Value`, so every dispatch
+// would pay the conversion. The storage migration must happen *with*
+// hot-Inst-handler migration (each handler operating directly on
+// NanboxValue via `push_nb` / `pop_nb`) in the same iteration to
+// avoid the regression — that's the work-unit for a future step.
+//
+// What this wrapper provides today:
+// - The Vec<Value>-shaped API the call sites already use (push, pop,
+//   truncate, len, is_empty).
+// - Explicit method-call shape for the formerly-indexed sites
+//   (`at_as_value(i)` instead of `stack[i].clone()`,
+//   `slice_as_values(range)` instead of `&stack[range]`,
+//   `drain_to_values(start)` instead of
+//   `stack.drain(start..).collect()`).
+// - `restore_from_value_slice` for call/cc snapshot restore.
+// - `push_nb` / `pop_nb` for future hot-handler migration.
+//
+// The shape is unchanged from the (reverted) NanboxValue storage
+// version. When the migration lands, the only change is the
+// internal `raw` type — all call sites stay as-is.
+pub struct ValueStack {
+    raw: Vec<Value>,
+}
+
+impl ValueStack {
+    #[inline]
+    pub fn new() -> Self {
+        Self { raw: Vec::new() }
+    }
+
+    /// Push a `Value` onto the stack.
+    #[inline]
+    pub fn push(&mut self, v: Value) {
+        self.raw.push(v);
+    }
+
+    /// Pop the top slot as a `Value`.
+    #[inline]
+    pub fn pop(&mut self) -> Option<Value> {
+        self.raw.pop()
+    }
+
+    /// Drop the top slots, shrinking to `new_len`.
+    #[inline]
+    pub fn truncate(&mut self, new_len: usize) {
+        self.raw.truncate(new_len);
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.raw.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
+    /// Read slot `idx` as a `Value`, with clone semantics — the
+    /// original slot stays intact.
+    #[inline]
+    pub fn at_as_value(&self, idx: usize) -> Value {
+        self.raw[idx].clone()
+    }
+
+    /// Borrow slot `idx` as `&Value`. Zero-cost while the storage
+    /// stays `Vec<Value>`; the NanboxValue migration will replace
+    /// this with a different mechanism.
+    #[inline]
+    pub fn at(&self, idx: usize) -> &Value {
+        &self.raw[idx]
+    }
+
+    /// Zero-cost slice borrow over a range. Today's storage is
+    /// `Vec<Value>` so this is a direct subslice. The NanboxValue
+    /// storage migration will replace this with a closure-style
+    /// `with_slice<R>(&self, range, f: FnOnce(&[Value]) -> R)`
+    /// that buffers into a thread-local — at which point call
+    /// sites switch shape.
+    #[inline]
+    pub fn slice(&self, range: std::ops::Range<usize>) -> &[Value] {
+        &self.raw[range]
+    }
+
+    /// Snapshot a contiguous range of slots as an owned `Vec<Value>`.
+    /// Each slot is cloned, leaving the stack unchanged. Used where
+    /// the consumer needs ownership (e.g. `call/cc` snapshot).
+    pub fn slice_as_values(&self, range: std::ops::Range<usize>) -> Vec<Value> {
+        self.raw[range].to_vec()
+    }
+
+    /// Drain slots from `start` to the end, transferring slot
+    /// ownership into a `Vec<Value>`. The stack shrinks to `start`.
+    /// Mirrors `Vec<Value>::drain(start..).collect()`.
+    pub fn drain_to_values(&mut self, start: usize) -> Vec<Value> {
+        self.raw.drain(start..).collect()
+    }
+
+    /// Clear the stack and push each value from `values`. Used by
+    /// call/cc snapshot restore — the snapshot's `Rc<Vec<Value>>`
+    /// stays intact (re-invocable).
+    pub fn restore_from_value_slice(&mut self, values: &[Value]) {
+        self.raw.clear();
+        self.raw.extend(values.iter().cloned());
+    }
+
+    /// Direct push of a `NanboxValue` for the future migration —
+    /// today this decodes via the same path as `push(Value)`.
+    /// Hot Inst handlers in a future step will use this to skip the
+    /// Value round-trip once the underlying storage is `Vec<NanboxValue>`.
+    #[inline]
+    pub fn push_nb(&mut self, nb: NanboxValue) {
+        // SAFETY: caller produced `nb` via a valid encoding; pushing
+        // through the decode preserves the strong-ref ownership
+        // contract (the slot now owns what the NanboxValue did).
+        self.raw.push(unsafe { nb.to_value() });
+    }
+
+    /// Direct pop returning a `NanboxValue`. Today's body encodes
+    /// the popped Value; future storage migration makes this a
+    /// pure memcpy.
+    #[inline]
+    pub fn pop_nb(&mut self) -> Option<NanboxValue> {
+        self.raw.pop().map(NanboxValue::from_value)
+    }
+}
+
+// `Vec<Value>` already drops its slots correctly; the explicit
+// `Drop` impl was only needed when the storage was `Vec<NanboxValue>`
+// (which is `Copy` and has no destructor). Re-add when the storage
+// migration lands.
+
+impl Default for ValueStack {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// `(cons car cdr)` — heap-allocate a fresh pair. Operands are i64
 /// carriers tagged per the wider ABI; the helper decodes both into
 /// `Value`s, allocates a `Pair`, and returns an `Any`-tagged i64
@@ -9958,7 +10104,7 @@ pub fn run_with_entry(
 ) -> Result<Value, VmError> {
     let insts = entry_insts.unwrap_or_else(|| bc.insts.clone());
     let spans = entry_spans.unwrap_or_else(|| bc.spans.clone());
-    let mut stack: Vec<Value> = Vec::new();
+    let mut stack: ValueStack = ValueStack::new();
     let mut frames: Vec<Frame> = vec![Frame {
         insts,
         spans,
@@ -9986,7 +10132,7 @@ pub fn run_with_entry(
 /// The actual dispatch loop, factored out so `run_with_entry` can wrap
 /// its result with a frame-walking backtrace builder before returning.
 fn run_dispatch(
-    stack: &mut Vec<Value>,
+    stack: &mut ValueStack,
     frames: &mut Vec<Frame>,
     syms: &mut SymbolTable,
 ) -> Result<Value, VmError> {
@@ -10110,7 +10256,8 @@ fn run_dispatch(
                 // Capture the call-site span up front so error paths can
                 // attach it cheaply (one Rc deref + indexed read per Call).
                 let call_span = frame.spans.get(inst_ip).copied().unwrap_or(Span::DUMMY);
-                let func_proc = match &stack[func_idx] {
+                let func_val = stack.at_as_value(func_idx);
+                let func_proc = match &func_val {
                     Value::Procedure(p) => p.clone(),
                     other => {
                         return Err(VmError::new(format!(
@@ -10124,14 +10271,14 @@ fn run_dispatch(
                     let any = func_proc.as_any();
                     if let Some(closure) = any.downcast_ref::<VmClosure>() {
                         if closure.profile.tier.bump() {
-                            fire_tier_up_hook(closure, &stack[args_start..stack_len]);
+                            fire_tier_up_hook(closure, stack.slice(args_start..stack_len));
                         }
                         // JIT fast path: if a native pointer is
                         // installed and every arg is a Fixnum, run
                         // the JIT body. Falls through to bytecode on
                         // ABI mismatch or non-Fixnum args.
                         if !closure.jit_ptr().is_null() {
-                            let arg_slice = &stack[args_start..stack_len];
+                            let arg_slice = stack.slice(args_start..stack_len);
                             if let Some(result) = try_dispatch_jit(closure, arg_slice, syms) {
                                 stack.truncate(func_idx);
                                 stack.push(result);
@@ -10161,8 +10308,9 @@ fn run_dispatch(
                         // params/consts. Skip Env+Frame allocation; just run
                         // the primop directly on the args sitting on the stack.
                         if let Some(fp) = &lam.fast {
-                            let result = apply_fast_primop(fp, &stack[args_start..stack_len], syms)
-                                .map_err(|e| e.with_span(call_span))?;
+                            let result =
+                                apply_fast_primop(fp, stack.slice(args_start..stack_len), syms)
+                                    .map_err(|e| e.with_span(call_span))?;
                             stack.truncate(func_idx);
                             stack.push(result);
                             if is_tail {
@@ -10180,10 +10328,10 @@ fn run_dispatch(
                         }
                         let new_env = Env::child(closure.env.clone());
                         for (i, name) in lam.params.iter().enumerate() {
-                            new_env.define(*name, stack[args_start + i].clone());
+                            new_env.define(*name, stack.at_as_value(args_start + i));
                         }
                         if let Some(rest_name) = lam.rest {
-                            let rest = &stack[args_start + lam.params.len()..stack_len];
+                            let rest = stack.slice(args_start + lam.params.len()..stack_len);
                             new_env.define(rest_name, Value::list(rest.iter().cloned()));
                         }
                         stack.truncate(func_idx);
@@ -10207,7 +10355,7 @@ fn run_dispatch(
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltin>() {
                         let name = b.name;
-                        let raw = (b.f)(&stack[args_start..stack_len]);
+                        let raw = (b.f)(stack.slice(args_start..stack_len));
                         let r = match raw {
                             Ok(v) => v,
                             Err(e) => {
@@ -10228,7 +10376,7 @@ fn run_dispatch(
                     }
                     if let Some(h) = any.downcast_ref::<VmHostBuiltin>() {
                         let name = h.name;
-                        let raw = (h.f)(&stack[args_start..stack_len]);
+                        let raw = (h.f)(stack.slice(args_start..stack_len));
                         let r = match raw {
                             Ok(v) => v,
                             Err(e) => {
@@ -10249,7 +10397,7 @@ fn run_dispatch(
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltinSyms>() {
                         let name = b.name;
-                        let raw = (b.f)(&stack[args_start..stack_len], syms);
+                        let raw = (b.f)(stack.slice(args_start..stack_len), syms);
                         let r = match raw {
                             Ok(v) => v,
                             Err(e) => {
@@ -10272,7 +10420,7 @@ fn run_dispatch(
                         let r = if n == 0 {
                             param.cell.borrow().clone()
                         } else if n == 1 {
-                            let v = stack[args_start].clone();
+                            let v = stack.at_as_value(args_start);
                             *param.cell.borrow_mut() = v;
                             Value::Unspecified
                         } else {
@@ -10302,7 +10450,7 @@ fn run_dispatch(
                         let v = if n == 0 {
                             Value::Unspecified
                         } else {
-                            stack[args_start].clone()
+                            stack.at_as_value(args_start)
                         };
                         // Snapshot-restore only fires once the
                         // originating call/cc has returned (in_flight
@@ -10315,7 +10463,7 @@ fn run_dispatch(
                         if !k.in_flight.get() {
                             if let Some(snap) = &k.snapshot {
                                 *frames = (*snap.frames).clone();
-                                *stack = (*snap.stack).clone();
+                                stack.restore_from_value_slice(&snap.stack);
                                 stack.push(v);
                                 continue;
                             }
@@ -10326,7 +10474,7 @@ fn run_dispatch(
                 }
                 // SLOW PATH: drain into Vec<Value> and pop func for HO marker
                 // dispatch. (map/fold/filter/raise/with-exception-handler/...)
-                let mut args: Vec<Value> = stack.drain(args_start..).collect();
+                let mut args: Vec<Value> = stack.drain_to_values(args_start);
                 let mut func = stack
                     .pop()
                     .ok_or_else(|| VmError::new("missing function on Call"))?;
@@ -11346,7 +11494,7 @@ fn run_dispatch(
                         // continuation invocation. (M8 iter 3.)
                         let snapshot = Rc::new(VmContSnapshot {
                             frames: Rc::new(frames.clone()),
-                            stack: Rc::new(stack.clone()),
+                            stack: Rc::new(stack.slice_as_values(0..stack.len())),
                         });
                         let (k, k_handle) = make_vm_continuation_with_snapshot(id, snapshot);
                         let res = vm_call_sync(&proc_val, &[k], syms);
@@ -11819,7 +11967,7 @@ fn run_dispatch(
 /// target if `op(a, b)` and return true. Returns false if either arg
 /// wasn't a fixnum — caller falls back to generic_cmp2.
 fn fxbranch(
-    stack: &mut Vec<Value>,
+    stack: &mut ValueStack,
     op: impl Fn(i64, i64) -> bool,
     target: usize,
     ip: &mut usize,
@@ -11848,7 +11996,7 @@ fn fxbranch(
 /// not the negated branch trigger — matches the un-fused
 /// `generic_cmp2 + JumpIfFalse` semantics.)
 fn fallback_branch(
-    stack: &mut Vec<Value>,
+    stack: &mut ValueStack,
     op: GenericCmp,
     target: usize,
     inst_ip: usize,
@@ -11937,7 +12085,7 @@ fn apply_fast_primop(
 }
 
 fn fixnum_binop2(
-    stack: &mut Vec<Value>,
+    stack: &mut ValueStack,
     op: &mut dyn FnMut(i64, i64) -> Option<i64>,
 ) -> Result<(), (Value, Value)> {
     let b = stack.pop().expect("stack underflow on fxop");
@@ -11956,7 +12104,7 @@ fn fixnum_binop2(
 }
 
 fn fixnum_cmp2(
-    stack: &mut Vec<Value>,
+    stack: &mut ValueStack,
     op: &mut dyn FnMut(i64, i64) -> bool,
 ) -> Result<(), (Value, Value)> {
     let b = stack.pop().expect("stack underflow on fxcmp");
