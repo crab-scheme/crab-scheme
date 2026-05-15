@@ -606,14 +606,14 @@ pub fn jit_peek_deopt() -> u8 {
     JIT_DEOPT_REQUESTED.with(|c| c.get())
 }
 
-// ===== Any-lane i64 encoding (Stage 2, inline-Fixnum) =====
+// ===== Any-lane i64 encoding (Stage 2, inline immediates) =====
 //
 // The JIT's "Any" ABI carries a `Value` as a single i64 word.
 // Historically this was always a `Gc<Value>` raw handle, requiring a
 // heap allocation for every value crossing the boundary — even tiny
-// Fixnums. Stage 2 introduces an inline encoding for the dominant
-// case: a Fixnum whose magnitude fits 61 bits travels in the i64
-// itself, with a tag in the low 3 bits, skipping allocation entirely.
+// Fixnums and #f / #t. Stage 2 introduces inline encodings for the
+// immediate cases: the value rides in the i64 itself with a tag in
+// the low 3 bits, skipping allocation entirely.
 //
 // Layout (low 3 bits = tag):
 //   `000` — `Gc<Value>` raw handle. Low 3 bits are zero because
@@ -621,16 +621,27 @@ pub fn jit_peek_deopt() -> u8 {
 //           `RcInner` carries two `usize` refcounts).
 //   `001` — Inline Fixnum. `i >> 3` recovers the signed 61-bit value
 //           (arithmetic shift preserves sign).
-//   `010`–`111` — reserved for later immediate lanes (Boolean,
-//           Character, Null, Unspecified, ...).
+//   `010` — Inline Boolean. Bit 3 = 0/1.
+//   `011` — Inline Character. Bits 3..34 = u32 codepoint.
+//   `100` — Inline Null (singleton; payload bits unused).
+//   `101` — Inline Unspecified (singleton; payload bits unused).
+//   `110` — Inline Eof (singleton; payload bits unused).
+//   `111` — Reserved (likely Symbol u32 in a later iteration).
 //
-// Range cutoff: 61-bit signed = ±2^60 (~±1.15×10^18). Larger Fixnums
-// fall back to Gc allocation (same shape as today). Practical Scheme
+// Range cutoff for Fixnum: 61-bit signed = ±2^60 (~±1.15×10^18).
+// Larger Fixnums fall back to Gc allocation. Practical Scheme
 // programs never see this cutoff; the JIT-allocation-heavy ones (n-
-// queens, ack, ...) trip well below it.
+// queens, ack, ...) trip well below it. Flonums need 64 bits to
+// carry the f64 bit pattern and so cannot inline under this scheme;
+// they remain on the Gc path until a Stage 2 NaN-box variant.
 pub const ANY_INLINE_TAG_MASK: i64 = 0b111;
 pub const ANY_INLINE_TAG_PTR: i64 = 0b000;
 pub const ANY_INLINE_TAG_FIXNUM: i64 = 0b001;
+pub const ANY_INLINE_TAG_BOOLEAN: i64 = 0b010;
+pub const ANY_INLINE_TAG_CHARACTER: i64 = 0b011;
+pub const ANY_INLINE_TAG_NULL: i64 = 0b100;
+pub const ANY_INLINE_TAG_UNSPECIFIED: i64 = 0b101;
+pub const ANY_INLINE_TAG_EOF: i64 = 0b110;
 pub const ANY_INLINE_TAG_SHIFT: u32 = 3;
 /// Inclusive max Fixnum value that fits the inline encoding's 61
 /// signed bits. Beyond this, encoding falls back to Gc allocation.
@@ -657,13 +668,28 @@ pub fn any_i64_is_inline(i: i64) -> bool {
 /// sees the slot. Otherwise falls back to unregistered `Gc::new`
 /// (refcount-only — cycles can leak but values stay alive).
 fn value_to_gc_i64(v: Value) -> i64 {
-    // Inline-Fixnum fast path: the dominant per-crossing allocation
-    // observed at the CallGeneral boundary is `BoxTyped(Fixnum, …)`
-    // wrapping a small integer; this branch eliminates that alloc.
-    if let Value::Number(cs_core::Number::Fixnum(n)) = &v {
-        if *n >= ANY_INLINE_FIXNUM_MIN && *n <= ANY_INLINE_FIXNUM_MAX {
+    // Inline-immediate fast paths: each branch eliminates a per-
+    // crossing heap allocation that previously wrapped a small
+    // immediate. Fixnum is the dominant case (see Stage 2 part A);
+    // Boolean/Character/Null/Unspecified/Eof follow the same shape
+    // (each saves an alloc per crossing for their respective
+    // values).
+    match &v {
+        Value::Number(cs_core::Number::Fixnum(n))
+            if *n >= ANY_INLINE_FIXNUM_MIN && *n <= ANY_INLINE_FIXNUM_MAX =>
+        {
             return (*n << ANY_INLINE_TAG_SHIFT) | ANY_INLINE_TAG_FIXNUM;
         }
+        Value::Boolean(b) => {
+            return ((*b as i64) << ANY_INLINE_TAG_SHIFT) | ANY_INLINE_TAG_BOOLEAN;
+        }
+        Value::Character(c) => {
+            return ((*c as u32 as i64) << ANY_INLINE_TAG_SHIFT) | ANY_INLINE_TAG_CHARACTER;
+        }
+        Value::Null => return ANY_INLINE_TAG_NULL,
+        Value::Unspecified => return ANY_INLINE_TAG_UNSPECIFIED,
+        Value::Eof => return ANY_INLINE_TAG_EOF,
+        _ => {}
     }
     let g = JIT_ACTIVE_HEAP.with(|c| {
         let ptr = c.get();
@@ -693,16 +719,27 @@ fn value_to_gc_i64(v: Value) -> i64 {
 unsafe fn gc_i64_to_value(i: i64) -> Value {
     match i & ANY_INLINE_TAG_MASK {
         ANY_INLINE_TAG_FIXNUM => Value::Number(cs_core::Number::Fixnum(i >> ANY_INLINE_TAG_SHIFT)),
+        ANY_INLINE_TAG_BOOLEAN => Value::Boolean((i >> ANY_INLINE_TAG_SHIFT) != 0),
+        ANY_INLINE_TAG_CHARACTER => {
+            // Codepoint was written as `(c as u32) << SHIFT`; logical
+            // shift right (after masking off the tag) recovers it.
+            // `char::from_u32` rejects surrogates / out-of-range; on
+            // an invalid bit pattern we fall back to U+FFFD rather
+            // than panicking through `extern "C"`.
+            let cp = ((i >> ANY_INLINE_TAG_SHIFT) as u32) & 0x1F_FFFF;
+            Value::Character(char::from_u32(cp).unwrap_or('\u{FFFD}'))
+        }
+        ANY_INLINE_TAG_NULL => Value::Null,
+        ANY_INLINE_TAG_UNSPECIFIED => Value::Unspecified,
+        ANY_INLINE_TAG_EOF => Value::Eof,
         ANY_INLINE_TAG_PTR => {
             let g: cs_gc::Gc<Value> = unsafe { cs_gc::Gc::from_raw_jit(i as *const ()) };
             (*g).clone()
         }
-        // Tag `010`..`111` are reserved for future immediate lanes
-        // (Boolean, Character, Null, Unspecified). Until those tags
-        // start being produced, treat anything other than the two
-        // defined tags as a programming bug rather than silently
-        // mis-decoding — but stay panic-free so we don't blow up
-        // through `extern "C"`. Deopt + return Fixnum(0).
+        // Tag `111` (and any other unrecognized pattern) — reserved
+        // for a future inline lane (e.g. Symbol). Until that lands,
+        // treat as a programming bug; stay panic-free across `extern
+        // "C"` by deopting + returning a placeholder.
         _ => {
             jit_request_deopt(DEOPT_REASON_FIXNUM_MISS);
             Value::Number(cs_core::Number::Fixnum(0))
@@ -13781,6 +13818,48 @@ mod gc_helper_tests_extra {
             h.alloc_count(),
             before,
             "inline encoding must not touch the Heap"
+        );
+    }
+
+    #[test]
+    fn value_to_gc_i64_inline_immediates_round_trip() {
+        // Boolean, Character, Null, Unspecified, Eof all encode
+        // inline (no Gc allocation) and round-trip through
+        // `gc_i64_to_value` without touching the Heap.
+        let h = cs_gc::Heap::new();
+        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
+        let before = h.alloc_count();
+
+        let cases: Vec<(Value, &str)> = vec![
+            (Value::Boolean(false), "Boolean(false)"),
+            (Value::Boolean(true), "Boolean(true)"),
+            (Value::Character('a'), "Character('a')"),
+            (Value::Character('\u{1F4A9}'), "Character('💩')"),
+            (Value::Character('\0'), "Character('\\0')"),
+            (Value::Null, "Null"),
+            (Value::Unspecified, "Unspecified"),
+            (Value::Eof, "Eof"),
+        ];
+        for (v, label) in cases {
+            let i = value_to_gc_i64(v.clone());
+            assert!(any_i64_is_inline(i), "{} should encode inline", label);
+            let back = unsafe { gc_i64_to_value(i) };
+            let same = match (&v, &back) {
+                (Value::Boolean(a), Value::Boolean(b)) => a == b,
+                (Value::Character(a), Value::Character(b)) => a == b,
+                (Value::Null, Value::Null) => true,
+                (Value::Unspecified, Value::Unspecified) => true,
+                (Value::Eof, Value::Eof) => true,
+                _ => false,
+            };
+            assert!(same, "{} round-trip mismatch: {:?} -> {:?}", label, v, back);
+        }
+
+        clear_jit_active_heap();
+        assert_eq!(
+            h.alloc_count(),
+            before,
+            "inline immediates must not touch the Heap"
         );
     }
 
