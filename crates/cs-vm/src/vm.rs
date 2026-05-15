@@ -10287,9 +10287,17 @@ impl cs_gc::Trace for Bindings {
         let trace_nb = |nb: &NanboxValue, marker: &mut cs_gc::Marker| {
             let bits = nb.into_raw() as u64;
             if !nb_is_tagged(bits) {
-                return; // Flonum — leaf.
+                return; // Flonum — leaf (raw f64 bit pattern, no payload to trace).
             }
             let tag = nb_tag_of(bits);
+            // Inline immediates (Fixnum / Boolean / Character / Symbol /
+            // Null / Unspecified / Eof) carry no GC payload — skip.
+            // Without this guard, tracing a Fixnum-bound `p` after
+            // `(set! p 0)` would reinterpret the payload as a
+            // `Gc<Value>` raw pointer and segfault.
+            if tag < NB_TAG_PAIR {
+                return;
+            }
             let payload = nb_payload_of(bits);
             let ptr = payload as *const ();
             match tag {
@@ -15684,5 +15692,35 @@ mod nb_arith_tests {
         let r = unsafe { vm_value_lt_nb(nb_bool(true), nb_fixnum(1)) };
         assert_eq!(jit_take_deopt(), DEOPT_REASON_ARITH_MISS);
         assert_bool(r, false);
+    }
+
+    #[test]
+    fn bindings_trace_skips_inline_immediates() {
+        // Regression test for the Phase 4 keystone SIGSEGV in
+        // diff_jit_pair_alloc_then_collect_reclaims_when_unreachable.
+        // Bindings::trace's trace_nb only skipped Flonum (untagged); inline
+        // TAGGED immediates (Fixnum/Boolean/Character/Symbol/Null/
+        // Unspecified/Eof) fell into the Gc<Value> default arm and
+        // dereferenced the payload as a heap pointer, crashing for any
+        // non-pointer-typed binding (e.g., `(set! p 0)` then `collect()`).
+        use cs_gc::Trace;
+        let mut syms = SymbolTable::new();
+        let mut b = Bindings::default();
+        // One entry per inline-immediate tag.
+        b.insert_nb(syms.intern("fx"), NanboxValue::fixnum(0));
+        b.insert_nb(syms.intern("bt"), NanboxValue::boolean(true));
+        b.insert_nb(syms.intern("bf"), NanboxValue::boolean(false));
+        b.insert_nb(syms.intern("ch"), NanboxValue::character('x'));
+        b.insert_nb(syms.intern("sy"), NanboxValue::symbol(syms.intern("hi")));
+        b.insert_nb(syms.intern("nl"), NanboxValue::NULL);
+        b.insert_nb(syms.intern("us"), NanboxValue::UNSPECIFIED);
+        b.insert_nb(syms.intern("eo"), NanboxValue::EOF);
+        b.insert_nb(syms.intern("fl"), NanboxValue::flonum(3.14));
+        // Tracing must complete without segfault. The trace is a no-op
+        // for these (no GC payload), but the dispatch must not deref
+        // the payload as a pointer.
+        let heap = cs_gc::Heap::new();
+        heap.add_root(move |marker| b.trace(marker));
+        heap.collect();
     }
 }
