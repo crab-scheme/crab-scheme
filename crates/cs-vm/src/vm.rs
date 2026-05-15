@@ -606,15 +606,65 @@ pub fn jit_peek_deopt() -> u8 {
     JIT_DEOPT_REQUESTED.with(|c| c.get())
 }
 
-/// Encode a `Value` into a Gc-backed raw handle carried as a single
-/// i64 word. Companion to `value_to_any_i64` for the JIT_RT_GC ABI
-/// per ADR 0012 D-2.
+// ===== Any-lane i64 encoding (Stage 2, inline-Fixnum) =====
+//
+// The JIT's "Any" ABI carries a `Value` as a single i64 word.
+// Historically this was always a `Gc<Value>` raw handle, requiring a
+// heap allocation for every value crossing the boundary — even tiny
+// Fixnums. Stage 2 introduces an inline encoding for the dominant
+// case: a Fixnum whose magnitude fits 61 bits travels in the i64
+// itself, with a tag in the low 3 bits, skipping allocation entirely.
+//
+// Layout (low 3 bits = tag):
+//   `000` — `Gc<Value>` raw handle. Low 3 bits are zero because
+//           `Gc<Value>`'s inner is at least 8-byte aligned (its
+//           `RcInner` carries two `usize` refcounts).
+//   `001` — Inline Fixnum. `i >> 3` recovers the signed 61-bit value
+//           (arithmetic shift preserves sign).
+//   `010`–`111` — reserved for later immediate lanes (Boolean,
+//           Character, Null, Unspecified, ...).
+//
+// Range cutoff: 61-bit signed = ±2^60 (~±1.15×10^18). Larger Fixnums
+// fall back to Gc allocation (same shape as today). Practical Scheme
+// programs never see this cutoff; the JIT-allocation-heavy ones (n-
+// queens, ack, ...) trip well below it.
+pub const ANY_INLINE_TAG_MASK: i64 = 0b111;
+pub const ANY_INLINE_TAG_PTR: i64 = 0b000;
+pub const ANY_INLINE_TAG_FIXNUM: i64 = 0b001;
+pub const ANY_INLINE_TAG_SHIFT: u32 = 3;
+/// Inclusive max Fixnum value that fits the inline encoding's 61
+/// signed bits. Beyond this, encoding falls back to Gc allocation.
+pub const ANY_INLINE_FIXNUM_MAX: i64 = (1i64 << 60) - 1;
+/// Inclusive min Fixnum value that fits the inline encoding.
+pub const ANY_INLINE_FIXNUM_MIN: i64 = -(1i64 << 60);
+
+/// True when `i` carries an inline-tagged immediate rather than a
+/// `Gc<Value>` raw handle. Refcount-touching helpers
+/// (`vm_value_clone_gc`, `vm_value_drop_gc`) use this to skip the
+/// `raw_incref` / `from_raw_jit` dance for inline values.
+#[inline]
+pub fn any_i64_is_inline(i: i64) -> bool {
+    (i & ANY_INLINE_TAG_MASK) != ANY_INLINE_TAG_PTR
+}
+
+/// Encode a `Value` into the JIT Any-lane i64. Returns an inline
+/// tagged i64 when `v` is a small Fixnum; otherwise allocates a
+/// `Gc<Value>` via the active heap (or unregistered `Gc::new` as
+/// fallback) and returns the raw handle.
 ///
 /// If a `Heap` is installed on this thread via `set_jit_active_heap`,
 /// the allocation routes through `Heap::alloc` so the tracing GC
 /// sees the slot. Otherwise falls back to unregistered `Gc::new`
 /// (refcount-only — cycles can leak but values stay alive).
 fn value_to_gc_i64(v: Value) -> i64 {
+    // Inline-Fixnum fast path: the dominant per-crossing allocation
+    // observed at the CallGeneral boundary is `BoxTyped(Fixnum, …)`
+    // wrapping a small integer; this branch eliminates that alloc.
+    if let Value::Number(cs_core::Number::Fixnum(n)) = &v {
+        if *n >= ANY_INLINE_FIXNUM_MIN && *n <= ANY_INLINE_FIXNUM_MAX {
+            return (*n << ANY_INLINE_TAG_SHIFT) | ANY_INLINE_TAG_FIXNUM;
+        }
+    }
     let g = JIT_ACTIVE_HEAP.with(|c| {
         let ptr = c.get();
         if ptr.is_null() {
@@ -628,17 +678,36 @@ fn value_to_gc_i64(v: Value) -> i64 {
     cs_gc::Gc::into_raw_jit(g) as i64
 }
 
-/// Decode a Gc-backed raw handle from an i64. Consumes one strong
-/// count (Rc::from_raw semantics). Use `Gc::raw_incref(ptr)` first
-/// if you want to borrow without consuming.
+/// Decode an Any-lane i64. For an inline tagged immediate, returns
+/// the corresponding `Value` directly (no refcount work). For a
+/// `Gc<Value>` raw handle, consumes one strong count (`Rc::from_raw`
+/// semantics) and returns a clone of the inner Value. Use
+/// `Gc::raw_incref(ptr)` first if you want to borrow without
+/// consuming.
 ///
 /// # Safety
 ///
-/// `i` must be a live, owned handle from `value_to_gc_i64` (or
-/// `Gc::into_raw_jit`) for `Value`.
+/// `i` must be either an inline tagged immediate from
+/// `value_to_gc_i64` or a live, owned handle from `value_to_gc_i64` /
+/// `Gc::into_raw_jit` for `Value`.
 unsafe fn gc_i64_to_value(i: i64) -> Value {
-    let g: cs_gc::Gc<Value> = unsafe { cs_gc::Gc::from_raw_jit(i as *const ()) };
-    (*g).clone()
+    match i & ANY_INLINE_TAG_MASK {
+        ANY_INLINE_TAG_FIXNUM => Value::Number(cs_core::Number::Fixnum(i >> ANY_INLINE_TAG_SHIFT)),
+        ANY_INLINE_TAG_PTR => {
+            let g: cs_gc::Gc<Value> = unsafe { cs_gc::Gc::from_raw_jit(i as *const ()) };
+            (*g).clone()
+        }
+        // Tag `010`..`111` are reserved for future immediate lanes
+        // (Boolean, Character, Null, Unspecified). Until those tags
+        // start being produced, treat anything other than the two
+        // defined tags as a programming bug rather than silently
+        // mis-decoding — but stay panic-free so we don't blow up
+        // through `extern "C"`. Deopt + return Fixnum(0).
+        _ => {
+            jit_request_deopt(DEOPT_REASON_FIXNUM_MISS);
+            Value::Number(cs_core::Number::Fixnum(0))
+        }
+    }
 }
 
 /// `(cons car cdr)` — heap-allocate a fresh pair. Operands are i64
@@ -4979,16 +5048,30 @@ pub unsafe extern "C" fn vm_reverse_gc(r: i64) -> i64 {
 /// version: bumps the strong refcount on the existing allocation
 /// and returns the same raw handle, so the caller has two
 /// independent owners of the same slot. No new heap allocation.
+///
+/// Inline-immediate aware (Stage 2): an inline-tagged i64 has no
+/// refcount to bump — cloning is the identity. The tag check is one
+/// `and`+`cmp` and keeps the heap path's hot single-helper-call
+/// shape unchanged.
 #[no_mangle]
 pub unsafe extern "C" fn vm_value_clone_gc(r: i64) -> i64 {
+    if any_i64_is_inline(r) {
+        return r;
+    }
     unsafe { cs_gc::Gc::<Value>::raw_incref(r as *const ()) };
     r
 }
 
 /// Gc-backed counterpart to `vm_value_drop`. Decrements the strong
 /// refcount; frees the slot if it was the last reference.
+///
+/// Inline-immediate aware (Stage 2): an inline-tagged i64 owns no
+/// allocation — drop is a no-op.
 #[no_mangle]
 pub unsafe extern "C" fn vm_value_drop_gc(r: i64) {
+    if any_i64_is_inline(r) {
+        return;
+    }
     drop(unsafe { cs_gc::Gc::<Value>::from_raw_jit(r as *const ()) });
 }
 
@@ -7996,6 +8079,13 @@ pub unsafe extern "C" fn vm_ic_dispatch(
 /// ManuallyDrop to peek).
 #[no_mangle]
 pub unsafe extern "C" fn vm_closure_id_peek(callee: i64) -> u32 {
+    // Inline-tagged immediates (Fixnum, etc.) are never procedures —
+    // signal IC miss so the slow path runs and the call-site error
+    // (calling a non-procedure) flows through `vm_call_sync`'s
+    // normal error reporting rather than UB-ing on a bogus pointer.
+    if any_i64_is_inline(callee) {
+        return 0;
+    }
     // Bump count so the reconstituted Gc doesn't decrement when it
     // drops; the caller still owns its strong ref via the raw i64.
     unsafe { cs_gc::Gc::<Value>::raw_incref(callee as *const ()) };
@@ -13630,11 +13720,14 @@ mod gc_helper_tests_extra {
 
     #[test]
     fn value_to_gc_i64_uses_active_heap_when_set() {
-        // With no Heap installed, the allocation is via Gc::new
-        // (unregistered). The Heap's alloc_count stays at 0.
+        // Stage 2 inline-Fixnum: small Fixnums no longer allocate —
+        // they ride in the i64 itself with a low-bit tag. Use Pairs
+        // (which genuinely heap-allocate regardless of value size)
+        // to exercise the Heap path.
         let h = cs_gc::Heap::new();
         let before = h.alloc_count();
-        let _ = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(1)));
+        let mk_pair = || Value::Pair(cs_core::Pair::new(Value::Null, Value::Null));
+        let _ = value_to_gc_i64(mk_pair());
         assert_eq!(
             h.alloc_count(),
             before,
@@ -13643,14 +13736,75 @@ mod gc_helper_tests_extra {
 
         // Install the Heap; subsequent allocations are tracked.
         unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let _ = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(2)));
-        let _ = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(3)));
+        let _ = value_to_gc_i64(mk_pair());
+        let _ = value_to_gc_i64(mk_pair());
         clear_jit_active_heap();
         assert_eq!(
             h.alloc_count(),
             before + 2,
             "two allocations through the Heap should bump alloc_count by 2"
         );
+    }
+
+    #[test]
+    fn value_to_gc_i64_inline_fixnum_skips_allocation() {
+        // Small Fixnums encode inline (low-bit tag) — no Gc allocation
+        // is made at all, even with an active Heap. Round-trip
+        // through `gc_i64_to_value` recovers the original value.
+        let h = cs_gc::Heap::new();
+        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
+        let before = h.alloc_count();
+        for n in [
+            0i64,
+            1,
+            -1,
+            42,
+            -42,
+            ANY_INLINE_FIXNUM_MAX,
+            ANY_INLINE_FIXNUM_MIN,
+        ] {
+            let i = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(n)));
+            assert!(
+                any_i64_is_inline(i),
+                "Fixnum({}) should encode inline (tag != 0), got i64={:#x}",
+                n,
+                i
+            );
+            let back = unsafe { gc_i64_to_value(i) };
+            match back {
+                Value::Number(cs_core::Number::Fixnum(m)) => assert_eq!(m, n),
+                other => panic!("expected Fixnum({}), got {:?}", n, other),
+            }
+        }
+        clear_jit_active_heap();
+        assert_eq!(
+            h.alloc_count(),
+            before,
+            "inline encoding must not touch the Heap"
+        );
+    }
+
+    #[test]
+    fn value_to_gc_i64_oversized_fixnum_falls_back_to_heap() {
+        // A Fixnum just past the 61-bit inline range falls through
+        // to the Gc allocation path. Encode + decode still round-
+        // trips — only the carrier changes.
+        let h = cs_gc::Heap::new();
+        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
+        let before = h.alloc_count();
+        let big = ANY_INLINE_FIXNUM_MAX + 1;
+        let i = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(big)));
+        assert!(
+            !any_i64_is_inline(i),
+            "Fixnum past inline range should fall back to Gc handle"
+        );
+        let back = unsafe { gc_i64_to_value(i) };
+        clear_jit_active_heap();
+        match back {
+            Value::Number(cs_core::Number::Fixnum(m)) => assert_eq!(m, big),
+            other => panic!("expected Fixnum({}), got {:?}", big, other),
+        }
+        assert_eq!(h.alloc_count(), before + 1);
     }
 
     #[test]
