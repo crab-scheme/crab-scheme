@@ -752,6 +752,220 @@ unsafe fn gc_i64_to_value(i: i64) -> Value {
     }
 }
 
+// ===== TaggedValue (Stage 2 K1, step 1 — type-level infrastructure) =====
+//
+// A typed wrapper over the `i64` Any-lane encoding. Same in-memory
+// layout (`#[repr(transparent)]`) as `i64`, so `Vec<TaggedValue>`
+// is laid out identically to `Vec<i64>` — the migration to a tagged
+// bytecode-VM stack (K1 step 2+) can swap storage without touching
+// the encoding.
+//
+// **Why a newtype.** The existing free functions `value_to_gc_i64`
+// and `gc_i64_to_value` already implement the encoding, but their
+// signatures lose type information: a raw `i64` on the stack could
+// be anything — a Cranelift constant, a tag-stripped pointer, an
+// arithmetic intermediate, or an Any-lane value handle. The
+// newtype lets the type system distinguish "this i64 is an Any-lane
+// encoded value" from arbitrary i64s, catching misuse at compile
+// time.
+//
+// **Encoding (unchanged).** Inherits the existing layout: low 3
+// bits are the tag (`ANY_INLINE_TAG_*`), upper 61 bits are the
+// payload (inline immediate, or `Gc<Value>` raw pointer when the
+// tag is `ANY_INLINE_TAG_PTR`). The 3-bit tag space is currently
+// full; extending to NaN-boxing or high-byte heap-variant tags is
+// K1 step 2 work.
+//
+// **Ownership.** Like the underlying i64, a `TaggedValue` carrying
+// a `Gc<Value>` pointer (tag = PTR) is **one owned strong
+// reference**. The encode/decode helpers consume / produce that
+// reference exactly once — call them with care across `extern "C"`
+// boundaries (see `vm_value_clone_gc` / `vm_value_drop_gc` for the
+// inline-aware refcount helpers).
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct TaggedValue(pub i64);
+
+impl TaggedValue {
+    /// Encode a `Value` into the Any-lane representation. Small
+    /// immediates (Fixnum in the 61-bit range, Boolean, Character,
+    /// Null, Unspecified, Eof) ride inline; everything else
+    /// allocates a `Gc<Value>` through the active heap (or
+    /// unregistered `Gc::new` as fallback) and stores its raw
+    /// handle.
+    ///
+    /// Consumes one strong reference's worth of ownership in the
+    /// returned i64 for heap values. Mirrors the existing
+    /// `value_to_gc_i64` (which now delegates here).
+    pub fn from_value(v: Value) -> Self {
+        TaggedValue(value_to_gc_i64(v))
+    }
+
+    /// Decode this tagged value back to a `Value`. For inline
+    /// immediates: a pure value conversion (no allocation, no
+    /// refcount touch). For a `Gc<Value>` pointer (tag = PTR):
+    /// consumes one strong count (`Rc::from_raw` semantics) and
+    /// clones the inner Value out.
+    ///
+    /// # Safety
+    ///
+    /// `self.0` must be a live, owned encoding from `from_value`
+    /// (or the equivalent `value_to_gc_i64`). Passing the same
+    /// TaggedValue to `to_value` twice is a double-free.
+    pub unsafe fn to_value(self) -> Value {
+        unsafe { gc_i64_to_value(self.0) }
+    }
+
+    /// Reconstruct from a raw i64 known to follow the Any-lane
+    /// encoding. Useful at FFI boundaries where we have an i64
+    /// from JIT-emitted code and need to bring it into typed land.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must follow the encoding contract — either an inline
+    /// tagged immediate or a live `Gc<Value>` pointer with low 3
+    /// bits zero. Construction is unsafe because there's no way to
+    /// validate the encoding from the i64 alone.
+    #[inline]
+    pub unsafe fn from_raw(raw: i64) -> Self {
+        TaggedValue(raw)
+    }
+
+    /// Strip back to the raw i64 carrier. Useful when handing off
+    /// to JIT-emitted code or `extern "C"` helpers that take i64.
+    /// Caller is responsible for tracking ownership.
+    #[inline]
+    pub fn into_raw(self) -> i64 {
+        self.0
+    }
+
+    /// Read the low 3 tag bits without consuming.
+    #[inline]
+    pub fn tag(self) -> i64 {
+        self.0 & ANY_INLINE_TAG_MASK
+    }
+
+    /// True iff this is an inline-tagged immediate (not a heap
+    /// pointer). Cheap (one mask + compare); useful for fast paths
+    /// that can skip Gc handling when both operands are inline.
+    #[inline]
+    pub fn is_inline(self) -> bool {
+        self.tag() != ANY_INLINE_TAG_PTR
+    }
+
+    /// True iff this carries an inline Fixnum.
+    #[inline]
+    pub fn is_fixnum(self) -> bool {
+        self.tag() == ANY_INLINE_TAG_FIXNUM
+    }
+
+    /// True iff this carries an inline Boolean.
+    #[inline]
+    pub fn is_boolean(self) -> bool {
+        self.tag() == ANY_INLINE_TAG_BOOLEAN
+    }
+
+    /// Extract the inline-Fixnum payload. `None` if this is not a
+    /// Fixnum-encoded value. Single shift + tag compare, no
+    /// allocation.
+    #[inline]
+    pub fn as_fixnum(self) -> Option<i64> {
+        if self.is_fixnum() {
+            Some(self.0 >> ANY_INLINE_TAG_SHIFT)
+        } else {
+            None
+        }
+    }
+
+    /// Extract the inline-Boolean payload. `None` if this is not a
+    /// Boolean-encoded value.
+    #[inline]
+    pub fn as_boolean(self) -> Option<bool> {
+        if self.is_boolean() {
+            Some((self.0 >> ANY_INLINE_TAG_SHIFT) != 0)
+        } else {
+            None
+        }
+    }
+
+    /// Truthiness for Scheme `if` — every value is true except
+    /// `#f`. Fast path when the value is inline: avoid the decode
+    /// and the Gc refcount touch.
+    #[inline]
+    pub fn is_truthy(self) -> bool {
+        // The only falsy Scheme value is `#f`, which encodes as
+        // `(0 << 3) | TAG_BOOLEAN` = 0b010. Any other inline tag
+        // (including `#t` = `(1 << 3) | TAG_BOOLEAN` = 0b1010) is
+        // truthy. For heap pointers (tag = PTR = 000), we'd need
+        // to decode to check — but in practice no heap-valued
+        // VmClosure return is `Value::Boolean`, so the only way to
+        // get a heap-pointed false would be via `value_to_gc_i64`
+        // hitting the non-inline-Fixnum/Boolean/etc. branch on a
+        // `Value::Boolean(false)`, which it doesn't (Boolean
+        // always inlines). So this conservative shortcut is
+        // correct under the current encoding.
+        self.0 != ((0i64) << ANY_INLINE_TAG_SHIFT | ANY_INLINE_TAG_BOOLEAN)
+    }
+
+    /// The encoded form of `Value::Boolean(false)` — the unique
+    /// falsy bit pattern under the inline encoding. Exposed so
+    /// hot-path consumers can do a single `i64 == FALSE_RAW` test.
+    pub const FALSE_RAW: i64 = ANY_INLINE_TAG_BOOLEAN;
+    /// The encoded form of `Value::Boolean(true)`.
+    pub const TRUE_RAW: i64 = (1 << ANY_INLINE_TAG_SHIFT) | ANY_INLINE_TAG_BOOLEAN;
+    /// The encoded form of `Value::Null`.
+    pub const NULL_RAW: i64 = ANY_INLINE_TAG_NULL;
+    /// The encoded form of `Value::Unspecified`.
+    pub const UNSPECIFIED_RAW: i64 = ANY_INLINE_TAG_UNSPECIFIED;
+    /// The encoded form of `Value::Eof`.
+    pub const EOF_RAW: i64 = ANY_INLINE_TAG_EOF;
+
+    /// Cheap singleton constructors that skip the
+    /// `value_to_gc_i64` match.
+    #[inline]
+    pub const fn null() -> Self {
+        TaggedValue(Self::NULL_RAW)
+    }
+    #[inline]
+    pub const fn unspecified() -> Self {
+        TaggedValue(Self::UNSPECIFIED_RAW)
+    }
+    #[inline]
+    pub const fn eof() -> Self {
+        TaggedValue(Self::EOF_RAW)
+    }
+    #[inline]
+    pub const fn boolean(b: bool) -> Self {
+        TaggedValue(if b { Self::TRUE_RAW } else { Self::FALSE_RAW })
+    }
+    /// Construct a Fixnum tagged value if `n` fits the inline
+    /// range; falls back to `from_value` for oversized Fixnums
+    /// (which allocates a `Gc<Value>` — practically never tripped
+    /// in normal Scheme code).
+    #[inline]
+    pub fn fixnum(n: i64) -> Self {
+        if n >= ANY_INLINE_FIXNUM_MIN && n <= ANY_INLINE_FIXNUM_MAX {
+            TaggedValue((n << ANY_INLINE_TAG_SHIFT) | ANY_INLINE_TAG_FIXNUM)
+        } else {
+            Self::from_value(Value::Number(cs_core::Number::Fixnum(n)))
+        }
+    }
+}
+
+impl PartialEq for TaggedValue {
+    /// Equality on the raw bit pattern. For inline immediates this
+    /// is the same as `eqv?` semantics: two `Fixnum(5)`s have the
+    /// same bit pattern. For heap pointers it's pointer identity
+    /// (same `Gc<Value>` allocation) — which matches Scheme `eq?`
+    /// on heap-allocated objects. Use `to_value` + `==` for full
+    /// structural `equal?` semantics.
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for TaggedValue {}
+
 /// `(cons car cdr)` — heap-allocate a fresh pair. Operands are i64
 /// carriers tagged per the wider ABI; the helper decodes both into
 /// `Value`s, allocates a `Pair`, and returns an `Any`-tagged i64
@@ -14066,6 +14280,183 @@ mod gc_helper_tests_extra {
             other => panic!("expected Fixnum({}), got {:?}", big, other),
         }
         assert_eq!(h.alloc_count(), before + 1);
+    }
+
+    // ===== TaggedValue (K1 step 1) — type-level wrapper tests =====
+    //
+    // These exercise the newtype API directly, separate from the
+    // free-function `value_to_gc_i64` / `gc_i64_to_value` tests
+    // above. The newtype is a thin wrapper, so round-trip
+    // correctness reduces to the same encoding tests — but the API
+    // surface (predicates, accessors, singleton constants) needs
+    // its own coverage so the migration in K1 step 2+ can rely on
+    // it.
+
+    #[test]
+    fn tagged_value_round_trips_via_from_and_to_value() {
+        let h = cs_gc::Heap::new();
+        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
+        let cases: Vec<(Value, &str)> = vec![
+            (Value::Null, "Null"),
+            (Value::Unspecified, "Unspecified"),
+            (Value::Eof, "Eof"),
+            (Value::Boolean(true), "Boolean(true)"),
+            (Value::Boolean(false), "Boolean(false)"),
+            (Value::Character('x'), "Character"),
+            (Value::Number(cs_core::Number::Fixnum(42)), "Fixnum(42)"),
+            (Value::Number(cs_core::Number::Fixnum(-1)), "Fixnum(-1)"),
+        ];
+        for (v, label) in cases {
+            let tv = TaggedValue::from_value(v.clone());
+            let back = unsafe { tv.to_value() };
+            let same = matches!(
+                (&v, &back),
+                (Value::Null, Value::Null)
+                    | (Value::Unspecified, Value::Unspecified)
+                    | (Value::Eof, Value::Eof)
+            ) || matches!((&v, &back), (Value::Boolean(a), Value::Boolean(b)) if a == b)
+                || matches!((&v, &back), (Value::Character(a), Value::Character(b)) if a == b)
+                || matches!(
+                    (&v, &back),
+                    (
+                        Value::Number(cs_core::Number::Fixnum(a)),
+                        Value::Number(cs_core::Number::Fixnum(b))
+                    ) if a == b
+                );
+            assert!(same, "{} round-trip failed: {:?} -> {:?}", label, v, back);
+        }
+        clear_jit_active_heap();
+    }
+
+    #[test]
+    fn tagged_value_singleton_constructors_match_from_value() {
+        // The `const fn` constructors must produce bit-identical
+        // encodings to `from_value` on the equivalent Value variants.
+        // Migrations that swap one for the other don't change
+        // observable behavior.
+        let null_a = TaggedValue::null();
+        let null_b = TaggedValue::from_value(Value::Null);
+        assert_eq!(null_a.into_raw(), null_b.into_raw());
+
+        let unspec_a = TaggedValue::unspecified();
+        let unspec_b = TaggedValue::from_value(Value::Unspecified);
+        assert_eq!(unspec_a.into_raw(), unspec_b.into_raw());
+
+        let eof_a = TaggedValue::eof();
+        let eof_b = TaggedValue::from_value(Value::Eof);
+        assert_eq!(eof_a.into_raw(), eof_b.into_raw());
+
+        let true_a = TaggedValue::boolean(true);
+        let true_b = TaggedValue::from_value(Value::Boolean(true));
+        assert_eq!(true_a.into_raw(), true_b.into_raw());
+
+        let false_a = TaggedValue::boolean(false);
+        let false_b = TaggedValue::from_value(Value::Boolean(false));
+        assert_eq!(false_a.into_raw(), false_b.into_raw());
+
+        for n in [
+            0,
+            1,
+            -1,
+            42,
+            -42,
+            ANY_INLINE_FIXNUM_MAX,
+            ANY_INLINE_FIXNUM_MIN,
+        ] {
+            let a = TaggedValue::fixnum(n);
+            let b = TaggedValue::from_value(Value::Number(cs_core::Number::Fixnum(n)));
+            assert_eq!(
+                a.into_raw(),
+                b.into_raw(),
+                "Fixnum({}) bit-pattern mismatch",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_value_predicates_and_accessors() {
+        // is_inline / is_fixnum / is_boolean: tag-only checks, no
+        // decode. as_fixnum / as_boolean: payload extraction.
+        let fx = TaggedValue::fixnum(7);
+        assert!(fx.is_inline());
+        assert!(fx.is_fixnum());
+        assert!(!fx.is_boolean());
+        assert_eq!(fx.as_fixnum(), Some(7));
+        assert_eq!(fx.as_boolean(), None);
+
+        let bt = TaggedValue::boolean(true);
+        assert!(bt.is_inline());
+        assert!(!bt.is_fixnum());
+        assert!(bt.is_boolean());
+        assert_eq!(bt.as_fixnum(), None);
+        assert_eq!(bt.as_boolean(), Some(true));
+
+        let bf = TaggedValue::boolean(false);
+        assert!(bf.is_boolean());
+        assert_eq!(bf.as_boolean(), Some(false));
+
+        let nl = TaggedValue::null();
+        assert!(nl.is_inline());
+        assert!(!nl.is_fixnum());
+        assert!(!nl.is_boolean());
+
+        // Heap-pointed value: NOT inline.
+        let pair =
+            TaggedValue::from_value(Value::Pair(cs_core::Pair::new(Value::Null, Value::Null)));
+        assert!(!pair.is_inline(), "Pair should encode as a heap pointer");
+        assert!(!pair.is_fixnum());
+        assert!(!pair.is_boolean());
+        assert_eq!(pair.as_fixnum(), None);
+        // Consume the handle so the test doesn't leak the Gc<Value>.
+        let _ = unsafe { pair.to_value() };
+    }
+
+    #[test]
+    fn tagged_value_is_truthy_matches_scheme_semantics() {
+        // Every Scheme value is truthy except #f.
+        assert!(!TaggedValue::boolean(false).is_truthy());
+        assert!(TaggedValue::boolean(true).is_truthy());
+        assert!(TaggedValue::null().is_truthy());
+        assert!(TaggedValue::unspecified().is_truthy());
+        assert!(TaggedValue::eof().is_truthy());
+        assert!(TaggedValue::fixnum(0).is_truthy());
+        assert!(TaggedValue::fixnum(-1).is_truthy());
+        assert!(TaggedValue::fixnum(42).is_truthy());
+    }
+
+    #[test]
+    fn tagged_value_layout_matches_i64() {
+        // The `#[repr(transparent)]` contract: TaggedValue and i64
+        // have identical layout. K1 step 2 relies on this — the
+        // bytecode VM stack will switch from `Vec<Value>` (24 B
+        // slots) to `Vec<TaggedValue>` (8 B slots) without changing
+        // any allocator semantics.
+        assert_eq!(
+            std::mem::size_of::<TaggedValue>(),
+            std::mem::size_of::<i64>()
+        );
+        assert_eq!(
+            std::mem::align_of::<TaggedValue>(),
+            std::mem::align_of::<i64>()
+        );
+    }
+
+    #[test]
+    fn tagged_value_eq_is_bitwise() {
+        // PartialEq is bitwise — useful for IC-style "same value?"
+        // checks on the hot path. For inline immediates this is
+        // eqv? semantics; for heap pointers it's eq? (pointer
+        // identity).
+        assert_eq!(TaggedValue::fixnum(5), TaggedValue::fixnum(5));
+        assert_ne!(TaggedValue::fixnum(5), TaggedValue::fixnum(6));
+        assert_eq!(TaggedValue::boolean(true), TaggedValue::boolean(true));
+        assert_ne!(TaggedValue::boolean(true), TaggedValue::boolean(false));
+        assert_eq!(TaggedValue::null(), TaggedValue::null());
+        // Different singletons distinguish.
+        assert_ne!(TaggedValue::null(), TaggedValue::unspecified());
+        assert_ne!(TaggedValue::null(), TaggedValue::eof());
+        assert_ne!(TaggedValue::null(), TaggedValue::fixnum(0));
     }
 
     #[test]
