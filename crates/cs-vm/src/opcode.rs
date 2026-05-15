@@ -35,6 +35,21 @@ pub enum Inst {
     MakeClosure(usize),
     /// Return from current call frame; top of stack is the return value.
     Return,
+    /// Push a new lexical sub-scope onto the current call frame's env
+    /// (an `Env::child` layer parented to the current env). Locals
+    /// `DefineLocal`'d after this land in the new layer and shadow
+    /// outer bindings; `LeaveScope` pops the layer.
+    ///
+    /// Used by `letrec` / named-`let` so they don't need a wrapper
+    /// closure just to scope their bindings — the bindings live in
+    /// a stack-discipline env layer instead. (Post-M8 contification
+    /// pass.)
+    EnterScope,
+    /// Pop the lexical sub-scope pushed by the most recent
+    /// `EnterScope`. Restores the parent env on the current frame.
+    /// Does not touch the value stack — the body's result on top of
+    /// stack passes through unchanged.
+    LeaveScope,
 
     // ---- 2-arg fixnum primops (specialized fast paths for common
     // arithmetic). The compiler emits these when the App's function is

@@ -454,36 +454,42 @@ fn compile_expr(
             body,
             span: s,
         } => {
+            // Inline `letrec` compilation (post-M8 contification): the
+            // bindings live in an `Env::child` layer pushed onto the
+            // *current* call frame's env via `Inst::EnterScope` rather
+            // than a wrapper closure. Previously every `letrec` /
+            // named-`let` compiled to a 0-arg `CompiledLambda` +
+            // `MakeClosure` + `Call(0)`, allocating a fresh `VmClosure`
+            // (and its `Gc<Value::Procedure>` heap wrapper) every time
+            // control entered the form — a hot allocation site on
+            // closure-heavy code (n-queens' `count-from-1-to-n` does it
+            // once per call, ~2057 times for `(nqueens 8)`). The
+            // wrapper closure carries no information the surrounding
+            // frame doesn't already have; the only thing it provided
+            // was scope isolation, which an env-layer push/pop
+            // captures more cheaply.
+            //
+            // Tail-position handling: if the surrounding context is
+            // tail, the body's tail expression can `TailCall` directly,
+            // discarding the current frame (and the env layer with
+            // it). Control never reaches the trailing `LeaveScope`.
+            // For non-tail context, the body leaves a value on the
+            // stack and control flows to `LeaveScope`, which pops the
+            // env layer while the value-stack top passes through.
             let frame: HashSet<Symbol> = bindings.iter().map(|(s, _)| *s).collect();
             scope.push(frame);
-            let mut body_buf = InstBuf::new();
+            out.push(Inst::EnterScope, *s);
             for (name, _) in bindings {
-                body_buf.push(Inst::Const(Value::Unspecified), *s);
-                body_buf.push(Inst::DefineLocal(*name), *s);
+                out.push(Inst::Const(Value::Unspecified), *s);
+                out.push(Inst::DefineLocal(*name), *s);
             }
             for (name, expr) in bindings {
-                compile_expr(expr, &mut body_buf, lambdas, false, globals, primops, scope)?;
-                body_buf.push(Inst::DefineLocal(*name), expr.span());
+                compile_expr(expr, out, lambdas, false, globals, primops, scope)?;
+                out.push(Inst::DefineLocal(*name), expr.span());
             }
-            compile_expr(body, &mut body_buf, lambdas, true, globals, primops, scope)?;
-            body_buf.push(Inst::Return, body.span());
+            compile_expr(body, out, lambdas, is_tail, globals, primops, scope)?;
+            out.push(Inst::LeaveScope, body.span());
             scope.pop();
-            let (body_insts, body_spans) = body_buf.finish();
-            let lambda_idx = lambdas.len();
-            lambdas.push(CompiledLambda {
-                params: Vec::new(),
-                rest: None,
-                body: Rc::new(body_insts),
-                spans: Rc::new(body_spans),
-                fast: None,
-                profile: Default::default(),
-            });
-            out.push(Inst::MakeClosure(lambda_idx), *s);
-            if is_tail {
-                out.push(Inst::TailCall(0), *s);
-            } else {
-                out.push(Inst::Call(0), *s);
-            }
             Ok(())
         }
     }

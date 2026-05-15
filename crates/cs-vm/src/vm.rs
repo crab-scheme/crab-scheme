@@ -626,7 +626,11 @@ pub fn jit_peek_deopt() -> u8 {
 //   `100` — Inline Null (singleton; payload bits unused).
 //   `101` — Inline Unspecified (singleton; payload bits unused).
 //   `110` — Inline Eof (singleton; payload bits unused).
-//   `111` — Reserved (likely Symbol u32 in a later iteration).
+//   `111` — Inline Symbol; `(i >> 3) as u32` recovers the Symbol id.
+//
+// All 8 tag slots are now used. Adding new inline types requires
+// either reclaiming a slot, widening the tag (which trades Fixnum
+// range), or layering NaN-boxing on top.
 //
 // Range cutoff for Fixnum: 61-bit signed = ±2^60 (~±1.15×10^18).
 // Larger Fixnums fall back to Gc allocation. Practical Scheme
@@ -642,6 +646,7 @@ pub const ANY_INLINE_TAG_CHARACTER: i64 = 0b011;
 pub const ANY_INLINE_TAG_NULL: i64 = 0b100;
 pub const ANY_INLINE_TAG_UNSPECIFIED: i64 = 0b101;
 pub const ANY_INLINE_TAG_EOF: i64 = 0b110;
+pub const ANY_INLINE_TAG_SYMBOL: i64 = 0b111;
 pub const ANY_INLINE_TAG_SHIFT: u32 = 3;
 /// Inclusive max Fixnum value that fits the inline encoding's 61
 /// signed bits. Beyond this, encoding falls back to Gc allocation.
@@ -9555,6 +9560,29 @@ fn run_dispatch(
                     .ok_or_else(|| VmError::new("stack underflow on DefineLocal"))?;
                 stamp_self_name_if_closure(&v, s);
                 frame.env.define(s, v);
+            }
+            Inst::EnterScope => {
+                // Push a fresh child env layer onto the current frame's
+                // env. `letrec` / named-`let` use this to scope their
+                // bindings without allocating a wrapper closure (which
+                // was the pre-contification pattern). DefineLocals that
+                // follow land in the child layer; LeaveScope pops it.
+                let parent = frame.env.clone();
+                frame.env = Env::child(parent);
+            }
+            Inst::LeaveScope => {
+                // Pop the env layer pushed by the matching EnterScope.
+                // The value-stack top (the scope's body's result, if
+                // any) is preserved — this op touches only the env.
+                let parent = match &frame.env.parent {
+                    Some(p) => p.clone(),
+                    None => {
+                        return Err(VmError::new(
+                            "LeaveScope with no parent env (mismatched EnterScope/LeaveScope?)",
+                        ));
+                    }
+                };
+                frame.env = parent;
             }
             Inst::Pop => {
                 stack
