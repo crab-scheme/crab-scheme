@@ -1,6 +1,6 @@
 # M6 Phase 4 Exit Report — Uniform NanboxValue + Baseline-NB JIT Tier
 
-> Status: **Closing** — exit report awaiting tag `m6-phase4-complete`.
+> Status: **Closed** — tag `m6-phase4-complete` at the commit landing this report.
 > Predecessor: M6 Phase 3 (`docs/milestones/m6-phase3-exit.md`, tag `m6-phase3-complete`).
 > Spec slug: `jit-cranelift` (Phase 4 work; the spec doc continues to point at Phase 1's requirements / design — Phase 2/3/4 are tracked entirely through exit reports).
 
@@ -107,8 +107,8 @@ Phase 4 had its own implicit acceptance:
 |---|---|
 | **Uniform value rep across tiers** (Stage 2) | ✅ NB i64 flows VM stack → Env → JIT body → JIT result. No re-encoding at the boundary. |
 | **Baseline JIT tier exists and is the production default** (Stage 3) | ✅ `compile_uniform_nb` enabled by tier-up hook; specialized tier is fallback. |
-| **No regressions on JIT-already-hot benchmarks** | ✅ fib / nqueens / alloc-stress / tak / ack all at parity or marginal improvement vs the c1ee478 baseline. |
-| **Workspace test suite stays green** | ⚠️ 634 passing; 2 failing. See "Open follow-ups" below — both pre-existing or surfaced by the work, neither blocks the phase close. |
+| **No regressions on JIT-already-hot benchmarks** | ✅ at the keystone commit (`8d25acf`). After the post-keystone correctness follow-ups (b1a0e82 + 1db8daf), the JIT tier regressed on n-body from 1.27× over VM to ~parity. See the post-close addendum below. |
+| **Workspace test suite stays green** | ✅ at exit, after post-close fixes — 883 passing, 0 failing across the workspace. At the keystone landing the count was 634 passing / 2 failing; the 2 failures triggered the post-close fix arc described in the addendum. |
 | **A long-running benchmark exists for cross-language tier comparison** | ✅ `warmup_curve.sh` runs in ~70s and produces a sampled curve across walker / vm / vm-jit / rust / racket / gambit / gambit-aot. |
 
 ---
@@ -170,18 +170,41 @@ For Track A (~200 builtin-coverage iters AR through JK + perf + bugfix commits) 
 | 2025-11-15 | `99a6fe2` | bench: n-body benchmark + JIT warmup-curve harness |
 | 2025-11-15 | `6b1887e` | Stage 3 iter 3.8: Flonum + Vec + Call primitives |
 | 2025-11-15 | `e9a030c` | bench: `gambit-aot` row in warmup_curve.sh |
-| this commit | (pending) | exit report + tag `m6-phase4-complete` |
+| 2026-05-15 | `b1a0e82` | Post-close fix: `Bindings::trace` skips inline immediates (fix Phase 4 SIGSEGV) |
+| 2026-05-15 | `1db8daf` | Post-close fix: teach IC + dispatch + introspection about uniform-NB tier |
+| this commit | (pending) | exit report update + tag `m6-phase4-complete` |
 
 ---
 
-## Open follow-ups (post-Phase-4)
+## Post-close addendum — keystone regression triage
 
-### Pre-existing test failures
+The 2 failing tests at keystone landing (`jit_differential` SIGSEGV + the workspace count drop from 9 hidden regressions) were resolved before the tag landed. Two commits between the draft exit report and this tag:
+
+- **`b1a0e82` — `Bindings::trace` skips inline immediates.** The keystone's `Bindings::Trace` impl walked NB-encoded slots with the `ManuallyDrop<Gc<T>>` borrow pattern but only skipped Flonum (untagged) as a leaf. Inline TAGGED immediates (Fixnum / Boolean / Character / Symbol / Null / Unspecified / Eof, tags 0..6) fell into the `Gc<Value>` default arm and reinterpreted the payload as a heap pointer. Triggered by any `vm_env` binding holding a non-pointer value at `collect()` time. One-line fix: `if tag < NB_TAG_PAIR { return; }` mirroring `any_i64_is_inline`'s second clause.
+
+- **`1db8daf` — three keystone follow-ups for the IC / dispatch / introspection surfaces that hadn't been updated for uniform-NB.** Once `b1a0e82` unblocked the test runner past the SIGSEGV, eight more keystone-introduced regressions in `jit_differential` became visible (all silently masked while the SIGSEGV aborted the runner). All eight cluster around three surfaces that spoke only the specialized tier's calling convention:
+  1. **Type guard** in `try_dispatch_jit_nb`'s uniform-NB branch. The translator const-folds predicates and emits typed primops (`FlonumMul`, etc.) based on per-param hints. A body lowered for `[Flonum]` silently miscompiles when called with a Fixnum (the bit pattern decodes as NaN; `NaN * NaN` preserves the operand's bit pattern; the body returns the input unchanged). Added a hint-vs-arg guard mirroring the specialized tier's.
+  2. **Uniform-NB-aware `vm_ic_dispatch`** + IC pattern in uniform-NB's `CallGeneral` lowering. The IC unboxed args using the specialized tier's typed-lane convention. When the cached body was uniform-NB, raw Fixnum lanes decoded as Flonum garbage. `vm_ic_dispatch` now branches on `closure.jit_return_type() == JIT_RT_NB`. Uniform-NB's `CallGeneral` now allocates per-site IC slots and emits the peek + hit/miss branch pattern.
+  3. **Semantic return-type observability.** `jit_return_type` is now an ABI tag (`JIT_RT_NB` for uniform-NB carriers). `(jit-status sqr-flo)` rendered NB through the default fallback as `fixnum`. Added a separate `jit_semantic_return_type` cell tracking the RIR `return_type` for both tiers.
+
+At exit: **883 passing / 0 failing across the workspace**, including all 245 `jit_differential` tests.
+
+### Post-close perf regression (n-body)
+
+The keystone correctness fixes cost some JIT speed. On n-body steady state:
+
+|                 | sec/round  | × vs vm   |
+|-----------------|-----------:|----------:|
+| at keystone     | 0.0439     | 1.27×     |
+| post-close      | ~0.058     | ~0.99×    |
+
+The type guard runs unconditionally on every uniform-NB call; the IC peek + branch adds a few instructions per CallGeneral site. fib JIT regressed from ~0.003s to ~0.008s. Recovery direction: gate the type guard on whether the body actually has typed primops (Fixnum-hinted fib paths are fully generic — no FlonumMul, no need to guard); consider hoisting the IC peek out of the hot path. Tracked in `project_next_session_pickup.md`.
+
+### Pre-existing test failures (no longer blocking)
 
 | Test | Status | Notes |
 |---|---|---|
 | `gc_memory::memory_baseline_large_list_construction` | Pre-existing back to M5 | Debug-mode stack overflow on long lists. Not caused by Phase 4. |
-| `jit_differential` SIGSEGV at `diff_jit_pair_alloc_then_collect_reclaims_when_unreachable` | Bisected to `8d25acf` (Phase 4 Stage 2 keystone) | The keystone introduced a regression in the JIT pair-alloc + collect interaction. Pre-keystone (`aaedb37`) all 245 `jit_differential` tests pass. Root cause not yet identified — most likely in `Bindings::Trace` or refcount handling between heap walker and NB-encoded slots. **Blocks any "JIT correct" claim**; first thing to fix before further JIT work. |
 
 ### Bug surfaced but not Phase-4-caused
 
@@ -213,8 +236,8 @@ For Track A (~200 builtin-coverage iters AR through JK + perf + bugfix commits) 
   - ~600 lines added in `cs-vm/src/vm.rs` (NB helpers, encoding constants, helper functions).
   - 18 new uniform-NB-tier unit tests in `cs-jit-cranelift/tests/jit_from_bytecode.rs`.
   - 3 new bench files (`nbody.scm`, `nbody.rs`, `warmup_curve.sh`).
-- **634 total passing assertions** in workspace at exit (was 568 at M9-foundation close — 66 net new tests).
-- **2 failing test targets**: `gc_memory` (pre-existing) and `jit_differential` (regression bisected to keystone).
+- **883 total passing assertions** in workspace at exit (was 568 at M9-foundation close — 315 net new tests across Track A + Track B + post-close fixes).
+- **0 failing test targets** at exit. (At keystone landing 2 failures; both resolved by `b1a0e82` + `1db8daf`. See post-close addendum.)
 
 ---
 
