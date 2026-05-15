@@ -4898,6 +4898,10 @@ impl Lowerer {
                 value_drop: self
                     .module
                     .declare_func_in_func(self.value_drop_func, builder.func),
+                self_fn: self.module.declare_func_in_func(inner_id, builder.func),
+                call_general: self
+                    .module
+                    .declare_func_in_func(self.call_general_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -6390,6 +6394,10 @@ struct NbHelpers {
     // Refcount management for Any-shape values.
     value_clone: cranelift_codegen::ir::FuncRef,
     value_drop: cranelift_codegen::ir::FuncRef,
+    // Self-recursion (the inner func) and the general-call slow
+    // path. `vm_call_general(callee, args_ptr, n_args, slot_ptr)`.
+    self_fn: cranelift_codegen::ir::FuncRef,
+    call_general: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -6509,6 +6517,56 @@ fn lower_inst_uniform_nb(
             &Inst::AnyDrop(src) => {
                 let v = lookup(map, src)?;
                 b.ins().call(helpers.value_drop, &[v]);
+            }
+            Inst::CallSelf(dst, args) => {
+                // Recursive self-call. The inner Cranelift func uses
+                // `CallConv::Tail`; future iters can promote this to
+                // `return_call` for tail-recursion ergonomics. For now
+                // a plain call is correct (just consumes host stack
+                // per level — same as the bytecode VM's frames).
+                let cargs: Vec<cranelift_codegen::ir::Value> = args
+                    .iter()
+                    .map(|a| lookup(map, *a))
+                    .collect::<Result<_, _>>()?;
+                let call = b.ins().call(helpers.self_fn, &cargs);
+                let result = b.inst_results(call)[0];
+                map.insert(*dst, result);
+            }
+            Inst::CallGeneral(dst, callee, args) => {
+                // Slow-path general call via `vm_call_general`. The
+                // baseline tier skips the inline-cache hot path the
+                // specialized tier emits — uniform-NB just funnels
+                // every call through the helper. Hot bodies can tier
+                // up to specialized to recover IC perf.
+                let callee_v = lookup(map, *callee)?;
+                let n = args.len();
+                let arg_vs: Vec<cranelift_codegen::ir::Value> = args
+                    .iter()
+                    .map(|a| lookup(map, *a))
+                    .collect::<Result<_, _>>()?;
+
+                // Stack-allocate the args buffer (`vm_call_general`
+                // takes `*const i64` + count). At least 8 bytes so
+                // `stack_addr` is valid even at n == 0.
+                let buf_bytes = std::cmp::max(8u32, (n as u32) * 8);
+                let buf_slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    buf_bytes,
+                    3,
+                ));
+                for (i, av) in arg_vs.iter().enumerate() {
+                    let _ = b.ins().stack_store(*av, buf_slot, (i as i32) * 8);
+                }
+                let buf_addr = b.ins().stack_addr(I64, buf_slot, 0);
+                let n_args_v = b.ins().iconst(I64, n as i64);
+                let null_slot = b.ins().iconst(I64, 0);
+                let call = b.ins().call(
+                    helpers.call_general,
+                    &[callee_v, buf_addr, n_args_v, null_slot],
+                );
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(*dst, result);
             }
             other => {
                 return Err(JitError::Unsupported(format!(

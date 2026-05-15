@@ -636,6 +636,121 @@ fn uniform_nb_any_clone_preserves_pair() {
 }
 
 #[test]
+fn uniform_nb_call_self_countdown() {
+    // (define (count-down n) (if (< n 1) n (count-down (- n 1))))
+    // For n >= 0, recurses until n=0, returns 0.
+    use cs_rir::{Block, BlockId, Const as RirConst, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("count_down_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.entry = BlockId(0);
+    // Block 0: compute (n < 1), branch.
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            RirInst::LoadConst(cs_rir::Value(1), RirConst::Fixnum(1)),
+            RirInst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
+        ],
+        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2)),
+    });
+    // Block 1: base case, return n.
+    f.blocks.push(Block {
+        id: BlockId(1),
+        params: vec![],
+        insts: vec![],
+        terminator: Term::Return(cs_rir::Value(0)),
+    });
+    // Block 2: recurse with n - 1.
+    f.blocks.push(Block {
+        id: BlockId(2),
+        params: vec![],
+        insts: vec![
+            RirInst::LoadConst(cs_rir::Value(3), RirConst::Fixnum(1)),
+            RirInst::Sub(cs_rir::Value(4), cs_rir::Value(0), cs_rir::Value(3)),
+            RirInst::CallSelf(cs_rir::Value(5), vec![cs_rir::Value(4)]),
+        ],
+        terminator: Term::Return(cs_rir::Value(5)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
+
+    // n = 0 returns 0 (base case immediately).
+    let r0 = func(NanboxValue::fixnum(0).into_raw());
+    match unsafe { NanboxValue(r0).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 0),
+        other => panic!("expected Fixnum(0), got {:?}", other),
+    }
+    // n = 10 recurses 10× and returns 0.
+    let r10 = func(NanboxValue::fixnum(10).into_raw());
+    match unsafe { NanboxValue(r10).to_value() } {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 0),
+        other => panic!("expected Fixnum(0), got {:?}", other),
+    }
+}
+
+#[test]
+fn uniform_nb_call_self_fib() {
+    // (define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+    use cs_rir::{Block, BlockId, Const as RirConst, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
+
+    let mut f = Function::new("fib_nb");
+    f.params.push((cs_rir::Value(0), Type::Any));
+    f.entry = BlockId(0);
+    // Block 0: (< n 2)?
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            RirInst::LoadConst(cs_rir::Value(1), RirConst::Fixnum(2)),
+            RirInst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
+        ],
+        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2)),
+    });
+    // Block 1: base, return n.
+    f.blocks.push(Block {
+        id: BlockId(1),
+        params: vec![],
+        insts: vec![],
+        terminator: Term::Return(cs_rir::Value(0)),
+    });
+    // Block 2: (+ (fib (- n 1)) (fib (- n 2))).
+    f.blocks.push(Block {
+        id: BlockId(2),
+        params: vec![],
+        insts: vec![
+            RirInst::LoadConst(cs_rir::Value(3), RirConst::Fixnum(1)),
+            RirInst::Sub(cs_rir::Value(4), cs_rir::Value(0), cs_rir::Value(3)),
+            RirInst::CallSelf(cs_rir::Value(5), vec![cs_rir::Value(4)]),
+            RirInst::LoadConst(cs_rir::Value(6), RirConst::Fixnum(2)),
+            RirInst::Sub(cs_rir::Value(7), cs_rir::Value(0), cs_rir::Value(6)),
+            RirInst::CallSelf(cs_rir::Value(8), vec![cs_rir::Value(7)]),
+            RirInst::Add(cs_rir::Value(9), cs_rir::Value(5), cs_rir::Value(8)),
+        ],
+        terminator: Term::Return(cs_rir::Value(9)),
+    });
+
+    let mut lowerer = Lowerer::new().unwrap();
+    let ptr = lowerer.compile_uniform_nb(&f).unwrap();
+    let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
+
+    let expect = [(0i64, 0i64), (1, 1), (2, 1), (5, 5), (10, 55), (15, 610)];
+    for (n, want) in expect {
+        let r = func(NanboxValue::fixnum(n).into_raw());
+        match unsafe { NanboxValue(r).to_value() } {
+            cs_core::Value::Number(cs_core::Number::Fixnum(got)) => {
+                assert_eq!(got, want, "fib({}) want {} got {}", n, want, got);
+            }
+            other => panic!("fib({}): expected Fixnum, got {:?}", n, other),
+        }
+    }
+}
+
+#[test]
 fn uniform_nb_add_mixed_fixnum_flonum_slow_path() {
     use cs_rir::{Block, BlockId, Function, Inst as RirInst, Term, Type};
     use cs_vm::vm::NanboxValue;
