@@ -9241,6 +9241,155 @@ fn decode_jit_return(rt: u8, r: i64) -> Value {
     }
 }
 
+/// Stage 3 NB-native JIT dispatch entry. Mirrors [`try_dispatch_jit`] but
+/// takes `&[NanboxValue]` and returns `NanboxValue` — no `Value` enum
+/// materialization at the boundary. The JIT body itself still uses the
+/// specialized i64 ABI (per-arg `JIT_RT_*` tags); this function unboxes
+/// directly from NB into those slots.
+///
+/// Hot path: the main VM `Inst::Call` arm hands a `[NanboxValue; 6]`
+/// stack-local array into this without allocating a `Vec<Value>`.
+fn try_dispatch_jit_nb(
+    closure: &VmClosure,
+    args: &[NanboxValue],
+    syms: &mut SymbolTable,
+) -> Option<NanboxValue> {
+    let ptr = closure.jit_ptr();
+    if ptr.is_null() {
+        return None;
+    }
+    if closure.jit_arity() as usize != args.len() {
+        return None;
+    }
+    let mut argv = [0i64; 6];
+    if args.len() > argv.len() {
+        return None;
+    }
+    let param_types = closure.jit_param_types();
+    for (i, nb) in args.iter().enumerate() {
+        let expected = ((param_types >> (i * 4)) & 0xF) as u8;
+        let bits = nb.into_raw() as u64;
+        let tagged = nb_is_tagged(bits);
+        let tag = if tagged { nb_tag_of(bits) } else { u64::MAX };
+        let payload = nb_payload_of(bits);
+        match expected {
+            JIT_RT_FIXNUM if tagged && tag == NB_TAG_FIXNUM => {
+                argv[i] = nb_sign_extend_47(payload);
+            }
+            JIT_RT_FLONUM if !tagged => {
+                argv[i] = bits as i64;
+            }
+            JIT_RT_BOOLEAN if tagged && tag == NB_TAG_BOOLEAN => {
+                argv[i] = if payload != 0 { 1 } else { 0 };
+            }
+            JIT_RT_CHARACTER if tagged && tag == NB_TAG_CHARACTER => {
+                argv[i] = payload as i64;
+            }
+            JIT_RT_ANY => {
+                // Body's ABI expects a `Gc<Value>` raw handle (one
+                // owned strong refcount) in the i64 slot. The slot
+                // we're reading still owns its NB ref, so we must
+                // produce a fresh strong ref on a `Gc<Value>` wrap
+                // containing the decoded `Value`.
+                let cloned_bits = unsafe { vm_value_clone_gc(nb.into_raw()) };
+                let v = unsafe { NanboxValue(cloned_bits).to_value() };
+                argv[i] = value_to_gc_i64(v);
+            }
+            _ => {
+                let n = closure.bump_jit_deopt();
+                if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
+                    closure.clear_jit_for_recompile();
+                }
+                return None;
+            }
+        }
+    }
+    bump_jit_call_count();
+    closure.bump_jit_call_count_self();
+    // Frame-env construction (ADR 0012 D-1) — only when the body has a
+    // `MakeClosure` that captures invocation params. Bind params as
+    // NanboxValue directly via `define_nb`, mirroring the `LoadVar`
+    // fast path that lives in K2.
+    let frame_env_holder: Option<Rc<Env>> = if closure.jit_needs_frame_env() {
+        let env = Env::child(closure.env.clone());
+        let lam = &closure.bc.lambdas[closure.lambda_idx];
+        for (name, nb) in lam.params.iter().zip(args.iter()) {
+            let cloned = unsafe { vm_value_clone_gc(nb.into_raw()) };
+            env.define_nb(*name, NanboxValue(cloned));
+        }
+        Some(env)
+    } else {
+        None
+    };
+    let env_ref: &Rc<Env> = match &frame_env_holder {
+        Some(e) => e,
+        None => &closure.env,
+    };
+    let ctx = JitCallContext {
+        env: Rc::as_ptr(env_ref),
+        bc: Rc::as_ptr(&closure.bc),
+        syms: syms as *mut SymbolTable,
+    };
+    let _ctx_guard = JitCtxGuard::install(&ctx);
+    let _frame_guard = JitFrameGuard::install(closure.jit_stack_maps());
+    let r: i64 = match args.len() {
+        0 => {
+            let f: extern "C" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
+            f()
+        }
+        1 => {
+            let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+            f(argv[0])
+        }
+        2 => {
+            let f: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+            f(argv[0], argv[1])
+        }
+        3 => {
+            let f: extern "C" fn(i64, i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+            f(argv[0], argv[1], argv[2])
+        }
+        4 => {
+            let f: extern "C" fn(i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+            f(argv[0], argv[1], argv[2], argv[3])
+        }
+        _ => return None,
+    };
+    let deopt_reason = jit_take_deopt();
+    if deopt_reason != 0 {
+        let n = closure.bump_jit_deopt();
+        if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
+            closure.clear_jit_for_recompile();
+        }
+        return None;
+    }
+    Some(decode_jit_return_nb(closure.jit_return_type(), r))
+}
+
+/// NB-native counterpart to [`decode_jit_return`]. Wraps the JIT body's
+/// raw i64 return into a `NanboxValue` directly — no intermediate
+/// `Value`. For `JIT_RT_ANY` the body produced a `Gc<Value>` raw handle;
+/// we still have to decode it to read the inner Value (the wrap allocation
+/// itself is held until we encode back into NB). A future iter can
+/// shortcut this by emitting NB-native bodies and removing the wrap.
+fn decode_jit_return_nb(rt: u8, r: i64) -> NanboxValue {
+    match rt {
+        JIT_RT_BOOLEAN => NanboxValue::boolean(r != 0),
+        JIT_RT_CHARACTER => NanboxValue::character(char::from_u32(r as u32).unwrap_or('\u{FFFD}')),
+        JIT_RT_FLONUM => NanboxValue::flonum(f64::from_bits(r as u64)),
+        JIT_RT_NULL => NanboxValue::NULL,
+        JIT_RT_SYMBOL => NanboxValue::symbol(cs_core::Symbol(r as u32)),
+        JIT_RT_ANY => {
+            // The body produced `Gc::into_raw_jit(Gc<Value>)` carrying
+            // one owned strong ref. Decode into Value (consuming the
+            // wrap), re-encode as NB.
+            let v = unsafe { gc_i64_to_value(r) };
+            NanboxValue::from_value(v)
+        }
+        _ => NanboxValue::fixnum(r),
+    }
+}
+
 /// Install the `eval` hook for the current thread. Returns the previous hook
 /// so callers can restore it after the VM run completes.
 pub fn install_eval_hook(hook: Option<VmEvalHook>) -> Option<VmEvalHook> {
@@ -10480,19 +10629,32 @@ fn run_dispatch(
                             fire_tier_up_hook(closure, &args);
                         }
                         if !closure.jit_ptr().is_null() {
-                            let args = stack.slice_as_values(args_start..stack_len);
-                            if let Some(result) = try_dispatch_jit(closure, &args, syms) {
-                                stack.truncate(func_idx);
-                                stack.push(result);
-                                if is_tail {
-                                    frames.pop();
-                                    if frames.is_empty() {
-                                        return stack
-                                            .pop()
-                                            .ok_or_else(|| VmError::new("empty stack at exit"));
-                                    }
+                            // Stage 3: pull NB args via zero-cost copies
+                            // into a stack-local array. No `Vec<Value>`
+                            // materialization on the JIT dispatch boundary.
+                            // Bodies with > 6 args fall through to bytecode
+                            // (same ceiling as the old path).
+                            let nargs = stack_len - args_start;
+                            if nargs <= 6 {
+                                let mut nb_args = [NanboxValue(0); 6];
+                                for i in 0..nargs {
+                                    nb_args[i] = stack.at_nb(args_start + i);
                                 }
-                                continue;
+                                if let Some(result) =
+                                    try_dispatch_jit_nb(closure, &nb_args[..nargs], syms)
+                                {
+                                    stack.truncate(func_idx);
+                                    stack.push_nb(result);
+                                    if is_tail {
+                                        frames.pop();
+                                        if frames.is_empty() {
+                                            return stack.pop().ok_or_else(|| {
+                                                VmError::new("empty stack at exit")
+                                            });
+                                        }
+                                    }
+                                    continue;
+                                }
                             }
                         }
                         let lam = &closure.bc.lambdas[closure.lambda_idx];
