@@ -1390,6 +1390,22 @@ pub struct Function {
     /// against this list to compute the capture-slice index. See
     /// `docs/milestones/aot-iter-24-design.md`.
     pub captures: Vec<u32>,
+    /// RC3 iter 2.7 — top-level binding sym id, if this function is
+    /// bound at top level via `(define (name args) body)`. Empty
+    /// for anonymous lambdas or internal `define`s. cs-aot uses this
+    /// to build a `sym → fn` resolver so cross-procedure references
+    /// (e.g. `(mandelbrot-pixel cr ci)` called from inside
+    /// `mandelbrot`) can be lowered as direct
+    /// `vm_alloc_aot_procedure` calls instead of failing on a
+    /// surviving `EnvLookup`.
+    pub name_sym: Option<u32>,
+    /// RC3 iter 2.7 — sym IDs for positional params, in the same
+    /// order as `params`. Empty by default; the translator
+    /// populates this for AOT-targeted lambdas so cs-aot can map
+    /// `EnvLookup(sym)` to the right param Value (e.g., a nested
+    /// closure inside `(define (f x) ...)` captures `x` which is
+    /// a *param* of `f`, not a local define).
+    pub param_syms: Vec<u32>,
 }
 
 impl Function {
@@ -1403,6 +1419,8 @@ impl Function {
             return_type: Type::Fixnum,
             lambda_index: None,
             captures: Vec::new(),
+            name_sym: None,
+            param_syms: Vec::new(),
         }
     }
 

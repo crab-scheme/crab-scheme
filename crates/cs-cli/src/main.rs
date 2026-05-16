@@ -978,8 +978,8 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
     use cs_core::SymbolTable;
     use cs_expand::Expander;
     use cs_parse::read_all;
+    use cs_vm::compile_with_globals_and_primops;
     use cs_vm::compiler::PrimOp;
-    use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir_aot};
 
     let src = match fs::read_to_string(file) {
         Ok(s) => s,
@@ -1045,13 +1045,22 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
     // stable Rust identifier for emission.
     let mut name_by_idx: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
+    let mut sym_by_idx: std::collections::HashMap<usize, cs_core::Symbol> =
+        std::collections::HashMap::new();
     for window in bc.insts.windows(2) {
         if let (cs_vm::opcode::Inst::MakeClosure(idx), cs_vm::opcode::Inst::SetVar(sym)) =
             (&window[0], &window[1])
         {
             name_by_idx.insert(*idx, syms.name(*sym).to_string());
+            sym_by_idx.insert(*idx, *sym);
         }
     }
+    // RC3 iter 2.7 — known-globals set so the translator excludes
+    // top-level AOT'd function names from the captures list.
+    // Surviving EnvLookups of these syms then resolve through the
+    // emitter's by_name_sym table to direct
+    // `vm_alloc_aot_procedure` calls (cross-procedure references).
+    let known_globals: std::collections::HashSet<u32> = sym_by_idx.values().map(|s| s.0).collect();
     let mut compatible_funcs: Vec<cs_rir::Function> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     for (idx, lam) in bc.lambdas.iter().enumerate() {
@@ -1059,12 +1068,21 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
             Some(n) => (n.clone(), Some(syms.intern(n))),
             None => (format!("__aot_lambda_{idx}"), None),
         };
-        match bytecode_to_rir_aot(lam, name.as_str(), self_sym) {
+        match cs_vm::jit_translate::bytecode_to_rir_aot_with_globals(
+            lam,
+            name.as_str(),
+            self_sym,
+            Some(&known_globals),
+        ) {
             Ok(mut rir) => {
                 // RC3 iter 2.2 Step 1 — annotate the RIR with its
                 // source lambda index so cs-aot's MakeClosure
                 // resolver can find this function by index.
                 rir.lambda_index = Some(idx);
+                // RC3 iter 2.7 — top-level binding sym (if any) so
+                // cross-procedure references through the resolver's
+                // by_name_sym table can find this function.
+                rir.name_sym = sym_by_idx.get(&idx).map(|s| s.0);
                 compatible_funcs.push(rir);
             }
             Err(e) => skipped.push((name, format!("{e:?}"))),

@@ -551,14 +551,73 @@ pub fn for_each_value_in_inst<F: FnMut(&mut Value)>(inst: &mut Inst, mut f: F) {
         // 1 source + Type — DeoptCheck has no dst, just a guard on src.
         Inst::DeoptCheck(s, _t) => f(s),
 
-        // Any other Inst variant landing here means `analyze_for_inline`
-        // accepted a callee whose body the walker doesn't actually
-        // cover — a discipline mismatch between the analyzer's
-        // `is_inline_supported` set and this walker. The two must stay
-        // in lockstep; if you add a variant to one, add it to the other.
-        // Reaching this arm is a programmer error, not a runtime error.
+        // RC3 iter 2.7 — the demote-pass now walks every surviving
+        // Inst (not just is_inline_supported ones) to rewrite operands
+        // via the alias map. The inliner's analyzer still uses
+        // is_inline_supported as its gate; the walker covers a strict
+        // superset so the demote pass doesn't crash on supported-by-
+        // cs-aot-but-not-the-inliner variants. Each arm below covers
+        // the Value operands of one such variant.
+        //
+        // ---- closure / call / env (post-demote survivors) ----
+        Inst::MakeClosure(d, _idx) => f(d),
+        Inst::Call(d, callee, args) | Inst::CallGeneral(d, callee, args) => {
+            f(d);
+            f(callee);
+            for a in args {
+                f(a);
+            }
+        }
+        Inst::CallSelf(d, args) => {
+            f(d);
+            for a in args {
+                f(a);
+            }
+        }
+        Inst::EnvLookup(d, _sym) | Inst::EnvLookupAny(d, _sym) => f(d),
+        Inst::EnvSet(_sym, v) => f(v),
+        Inst::EnvDefineLocal(_sym, v) => f(v),
+
+        // ---- vector / pair / type-predicate operands ----
+        Inst::VecAlloc(d, n, fill) => {
+            f(d);
+            f(n);
+            f(fill);
+        }
+        Inst::VecSet(d, v, idx, val) => {
+            f(d);
+            f(v);
+            f(idx);
+            f(val);
+        }
+        Inst::Cons(d, car_v, _car_tag, cdr_v, _cdr_tag) => {
+            f(d);
+            f(car_v);
+            f(cdr_v);
+        }
+        Inst::Car(d, p) | Inst::Cdr(d, p) => {
+            f(d);
+            f(p);
+        }
+        Inst::AnyClone(d, s)
+        | Inst::PairP(d, s)
+        | Inst::NullP(d, s)
+        | Inst::ProcedureP(d, s)
+        | Inst::SymbolP(d, s)
+        | Inst::FixnumP(d, s)
+        | Inst::FlonumP(d, s) => {
+            f(d);
+            f(s);
+        }
+
+        // Any other Inst variant landing here means a NEW Inst variant
+        // was added without extending this walker. The analyzer's
+        // `is_inline_supported` set was historically the discipline
+        // gate; today the demote pass relies on this walker covering
+        // all surviving Inst variants. If you add an Inst, add a match
+        // arm here that calls `f` on each Value operand.
         _ => unreachable!(
-            "for_each_value_in_inst: variant {} not in walker but accepted by analyzer",
+            "for_each_value_in_inst: variant {} not in walker — add an arm covering its Value operands",
             inst_variant_name(inst)
         ),
     }

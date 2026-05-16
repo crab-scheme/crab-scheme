@@ -32,7 +32,7 @@ use cs_expand::Expander;
 use cs_parse::read_all;
 use cs_vm::compile_with_globals_and_primops;
 use cs_vm::compiler::PrimOp;
-use cs_vm::jit_translate::bytecode_to_rir_aot;
+use cs_vm::jit_translate::{bytecode_to_rir_aot, bytecode_to_rir_aot_with_globals};
 
 /// Mirrors cs_runtime's private primop_table. The compiler uses
 /// this to emit AddFx2/SubFx2/etc. specialized opcodes instead of
@@ -348,22 +348,27 @@ fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> P
 
     // Mirror cs-cli's --multi name scan so the test path matches.
     let mut name_by_idx: HashMap<usize, String> = HashMap::new();
+    let mut sym_by_idx: HashMap<usize, cs_core::Symbol> = HashMap::new();
     for window in bc.insts.windows(2) {
         if let (cs_vm::opcode::Inst::MakeClosure(idx), cs_vm::opcode::Inst::SetVar(sym)) =
             (&window[0], &window[1])
         {
             name_by_idx.insert(*idx, syms.name(*sym).to_string());
+            sym_by_idx.insert(*idx, *sym);
         }
     }
+    let known_globals: std::collections::HashSet<u32> = sym_by_idx.values().map(|s| s.0).collect();
     let mut compatible: Vec<cs_rir::Function> = Vec::new();
     for (idx, lam) in bc.lambdas.iter().enumerate() {
         let (name, self_sym) = match name_by_idx.get(&idx) {
             Some(n) => (n.clone(), Some(syms.intern(n))),
             None => (format!("__aot_lambda_{idx}"), None),
         };
-        let mut rir = bytecode_to_rir_aot(lam, name.as_str(), self_sym)
-            .unwrap_or_else(|e| panic!("bytecode_to_rir_aot failed on lambda {idx}: {e:?}"));
+        let mut rir =
+            bytecode_to_rir_aot_with_globals(lam, name.as_str(), self_sym, Some(&known_globals))
+                .unwrap_or_else(|e| panic!("bytecode_to_rir_aot failed on lambda {idx}: {e:?}"));
         rir.lambda_index = Some(idx);
+        rir.name_sym = sym_by_idx.get(&idx).map(|s| s.0);
         compatible.push(rir);
     }
     assert!(
@@ -425,6 +430,33 @@ fn run_multi_with_args(bin: &PathBuf, entry: &str, args: &[i64]) -> i64 {
         .trim()
         .parse::<i64>()
         .expect("i64 parse")
+}
+
+#[test]
+fn source_to_aot_cross_procedure_reference() {
+    // RC3 iter 2.7 — top-level cross-procedure references. `apply-
+    // double` calls `double` by name; the bytecode emits
+    // `EnvLookupAny(double_sym) + CallGeneral`. With the iter-2.7
+    // resolver, the demote-surviving EnvLookup resolves through
+    // `LambdaResolver::by_name_sym` to a direct
+    // `vm_alloc_aot_procedure(double_aot_dispatch, 1)` call instead
+    // of failing on a missing capture.
+    //
+    // Exercises:
+    //   1. translator's known_globals excludes `double` from
+    //      `apply-double`'s captures list
+    //   2. cs-aot's EnvLookup arm emits the vm_alloc call directly
+    //   3. CallGeneral routes through vm_call_aot_procedure to the
+    //      other AOT'd fn's dispatch wrapper
+    let bin = aot_compile_multi_and_run(
+        "(define (double x) (* x 2)) (define (apply-double n) (double n))",
+        "apply-double",
+        "cross_proc",
+    );
+    assert_eq!(run_multi_with_args(&bin, "double", &[3]), 6);
+    assert_eq!(run_multi_with_args(&bin, "apply-double", &[5]), 10);
+    assert_eq!(run_multi_with_args(&bin, "apply-double", &[100]), 200);
+    assert_eq!(run_multi_with_args(&bin, "apply-double", &[-7]), -14);
 }
 
 #[test]

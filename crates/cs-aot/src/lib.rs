@@ -396,6 +396,12 @@ pub fn emit_with(mode: EmitMode, func: &Function) -> Result<String, AotError> {
 #[derive(Debug, Clone, Default)]
 pub struct LambdaResolver {
     pub by_idx: std::collections::HashMap<usize, LambdaInfo>,
+    /// RC3 iter 2.7 — sym → lambda-index lookup so a surviving
+    /// `EnvLookup`/`EnvLookupAny` of a top-level name resolves to
+    /// the corresponding AOT'd function (emitted as a direct
+    /// `vm_alloc_aot_procedure` call) rather than failing with
+    /// an unresolved-capture error.
+    pub by_name_sym: std::collections::HashMap<u32, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -418,6 +424,7 @@ impl LambdaResolver {
     }
     pub fn from_funcs(funcs: &[Function]) -> Self {
         let mut by_idx = std::collections::HashMap::new();
+        let mut by_name_sym = std::collections::HashMap::new();
         for f in funcs {
             if let Some(idx) = f.lambda_index {
                 by_idx.insert(
@@ -428,9 +435,15 @@ impl LambdaResolver {
                         captures: f.captures.clone(),
                     },
                 );
+                if let Some(sym) = f.name_sym {
+                    by_name_sym.insert(sym, idx);
+                }
             }
         }
-        Self { by_idx }
+        Self {
+            by_idx,
+            by_name_sym,
+        }
     }
 }
 
@@ -653,12 +666,22 @@ fn emit_loop_match(
 /// Emit an Inst as `let v_N: i64 = expr;` (straight-line shape).
 /// Used only by `emit_straight_line`; the loop+match shape uses
 /// `emit_inst_assign` instead (assignment to pre-declared mut).
-/// RC3 iter 2.4 — scan a function for `EnvDefineLocal(sym, value)`
-/// insts and build a `sym → Value` map. `MakeClosure` lowering uses
-/// this to resolve callee-capture-syms that refer to local defines
-/// (the other source is the caller's own captures list).
+/// RC3 iter 2.4 + 2.7 — scan a function and build a `sym → Value`
+/// map covering both:
+///   1. Positional param syms (`func.param_syms[i] → func.params[i].0`)
+///   2. `EnvDefineLocal(sym, value)` insts (let / internal-define
+///      bindings).
+///
+/// `MakeClosure` lowering uses this to resolve callee-capture-syms
+/// to the right Value in the caller's scope. Params come first so a
+/// shadowing local define wins (later inserts overwrite).
 fn collect_local_defines(func: &Function) -> std::collections::HashMap<u32, Value> {
     let mut map = std::collections::HashMap::new();
+    for (i, sym) in func.param_syms.iter().enumerate() {
+        if let Some((v, _)) = func.params.get(i) {
+            map.insert(*sym, *v);
+        }
+    }
     for block in &func.blocks {
         for inst in &block.insts {
             if let Inst::EnvDefineLocal(sym, val) = inst {
@@ -1285,18 +1308,51 @@ fn inst_rhs(
             (*dst, call)
         }
 
-        // ---- EnvLookup / EnvLookupAny (RC3 iter 2.4) ----
+        // ---- EnvLookup / EnvLookupAny (RC3 iter 2.4 + 2.7) ----
         //
-        // After the demote pass, surviving EnvLookups reference
-        // captured free variables. The translator's `record_captures`
-        // post-pass populated `func.captures` in declaration order;
-        // each EnvLookup's sym maps to a `__cap<sym>` param the
-        // dispatch wrapper unpacked from the captures slice. Identity
-        // copy in NB mode (the capture is already an NB carrier).
+        // After the demote pass, surviving EnvLookups reference one
+        // of three things, in lookup-priority order:
+        //
+        //   1. (iter 2.4) A captured free variable — the sym is in
+        //      this function's captures list, so we read the
+        //      `__cap<sym>` prefix param the dispatch wrapper
+        //      unpacked.
+        //   2. (iter 2.7) A top-level AOT'd function — the sym
+        //      resolves through the resolver's by_name_sym table;
+        //      we emit a `vm_alloc_aot_procedure` call to build a
+        //      fresh Procedure NB value pointing at the other AOT'd
+        //      fn's dispatch wrapper.
+        //   3. (iter 2.4) An `EnvDefineLocal(sym, v)` already in
+        //      scope — for top-level scripts that hoist things via
+        //      define before MakeClosure. Emit a direct `v<v.0>`
+        //      copy.
+        //
+        // None of the three → falls through to the unsupported-Inst
+        // catch-all at the bottom of the match.
         (Inst::EnvLookup(dst, sym), _) | (Inst::EnvLookupAny(dst, sym), _)
             if captures.contains(sym) =>
         {
             (*dst, format!("__cap{sym}"))
+        }
+        (Inst::EnvLookup(dst, sym), EmitMode::Nb)
+        | (Inst::EnvLookupAny(dst, sym), EmitMode::Nb)
+            if resolver.by_name_sym.contains_key(sym) =>
+        {
+            let idx = resolver.by_name_sym[sym];
+            let info = &resolver.by_idx[&idx];
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_alloc_aot_procedure({}_aot_dispatch as usize, {}u32) }}",
+                    info.fn_name, info.arity
+                ),
+            )
+        }
+        (Inst::EnvLookup(dst, sym), _) | (Inst::EnvLookupAny(dst, sym), _)
+            if local_defs.contains_key(sym) =>
+        {
+            let v = local_defs[sym];
+            (*dst, format!("v{}", v.0))
         }
 
         // ---- MakeClosure (RC3 iter 2.2 Step 3 + 2.4) ----
@@ -1342,9 +1398,20 @@ fn inst_rhs(
                         cap_exprs.push(format!("__cap{sym}"));
                     } else if let Some(v) = local_defs.get(sym) {
                         cap_exprs.push(format!("v{}", v.0));
+                    } else if let Some(other_idx) = resolver.by_name_sym.get(sym) {
+                        // RC3 iter 2.7 — capture is a top-level AOT'd
+                        // function. Allocate a fresh Procedure NB
+                        // value pointing at the other fn's dispatch
+                        // wrapper.
+                        let other = &resolver.by_idx[other_idx];
+                        cap_exprs.push(format!(
+                            "unsafe {{ cs_vm::vm::vm_alloc_aot_procedure({}_aot_dispatch as usize, {}u32) }}",
+                            other.fn_name, other.arity
+                        ));
                     } else {
                         // Sym is neither in our captures nor locally
-                        // defined via EnvDefineLocal. The bytecode
+                        // defined via EnvDefineLocal nor a known
+                        // top-level AOT'd function. The bytecode
                         // likely binds it via a path we don't yet
                         // model (e.g., direct env install from a
                         // letrec frame outside our scan).

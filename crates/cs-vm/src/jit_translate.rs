@@ -96,6 +96,22 @@ pub fn bytecode_to_rir_aot(
     name: impl Into<String>,
     self_name: Option<Symbol>,
 ) -> Result<Function, TranslateError> {
+    bytecode_to_rir_aot_with_globals(lambda, name, self_name, None)
+}
+
+/// RC3 iter 2.7 — same as `bytecode_to_rir_aot` but accepts a set of
+/// top-level sym IDs that are known to be AOT'd as separate
+/// functions. Such syms are EXCLUDED from `func.captures` so the
+/// emitter can resolve them as direct cross-procedure references via
+/// the resolver's by-name-sym table rather than expecting them to be
+/// passed in as closure captures. Pass `None` (or an empty set) for
+/// the legacy single-procedure path.
+pub fn bytecode_to_rir_aot_with_globals(
+    lambda: &CompiledLambda,
+    name: impl Into<String>,
+    self_name: Option<Symbol>,
+    known_globals: Option<&std::collections::HashSet<u32>>,
+) -> Result<Function, TranslateError> {
     let mut func = bytecode_to_rir(lambda, name, self_name)?;
     // RC3 Phase 2 iter 2.5: demote runs for any function shape,
     // single- or multi-block. Pre-scan inside the helper bails
@@ -105,33 +121,42 @@ pub fn bytecode_to_rir_aot(
     // On bail, downstream sees the original RIR + a clean
     // UnsupportedInst diagnostic from cs-aot.
     let _ = demote_env_to_ssa_all_blocks(&mut func);
-    // RC3 iter 2.4 Step 1: capture analysis post-pass. The demote
-    // dropped EnvLookup/EnvLookupAny for locally-defined syms; any
-    // surviving env op references a free variable that must be
-    // captured at MakeClosure time. Collect those syms in
-    // first-seen order into func.captures; cs-aot uses this list
-    // to emit the dispatch wrapper's capture-slice unpacking +
-    // MakeClosure's capture-gathering.
-    record_captures(&mut func);
+    // RC3 iter 2.4 Step 1 + iter 2.7: capture analysis post-pass.
+    // The demote dropped EnvLookup/EnvLookupAny for locally-defined
+    // syms; any surviving env op references either (a) a free
+    // variable that must be captured at MakeClosure time, or (b) a
+    // top-level global known to be AOT'd separately. Record (a) in
+    // first-seen order into func.captures; cs-aot resolves (b)
+    // through the LambdaResolver's by_name_sym table at emit time.
+    record_captures(&mut func, known_globals);
     Ok(func)
 }
 
-/// RC3 iter 2.4 Step 1 — walk a translated Function looking for
-/// `EnvLookup` / `EnvLookupAny` insts referring to syms NOT locally
-/// defined. Each such sym is a captured free variable; we record
-/// them on `func.captures` in first-seen order.
+/// RC3 iter 2.4 Step 1 + iter 2.7 — walk a translated Function
+/// looking for `EnvLookup` / `EnvLookupAny` insts referring to syms
+/// NOT locally defined AND NOT in `known_globals`. Each such sym is
+/// a captured free variable; we record them on `func.captures` in
+/// first-seen order. Syms that ARE in `known_globals` are
+/// cross-procedure references that cs-aot resolves at emit time
+/// via the LambdaResolver.
 ///
 /// Run AFTER `demote_env_to_ssa_all_blocks` so the demote-able
 /// lookups (those paired with EnvDefineLocal in the same function)
-/// are already gone. Surviving lookups are the captures by
-/// definition.
-fn record_captures(func: &mut cs_rir::Function) {
+/// are already gone. Surviving lookups are captures or globals
+/// by definition.
+fn record_captures(
+    func: &mut cs_rir::Function,
+    known_globals: Option<&std::collections::HashSet<u32>>,
+) {
     use std::collections::HashSet;
     let mut seen: HashSet<u32> = HashSet::new();
     let mut order: Vec<u32> = Vec::new();
     for block in &func.blocks {
         for inst in &block.insts {
             if let RirInst::EnvLookup(_, sym) | RirInst::EnvLookupAny(_, sym) = inst {
+                if known_globals.is_some_and(|g| g.contains(sym)) {
+                    continue;
+                }
                 if seen.insert(*sym) {
                     order.push(*sym);
                 }
@@ -167,7 +192,7 @@ fn record_captures(func: &mut cs_rir::Function) {
 /// references a sym not defined locally — the free-var case
 /// signals the AOT path should leave func untouched.
 fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
-    use cs_rir::inline::{for_each_value_in_inst, for_each_value_in_term, is_inline_supported};
+    use cs_rir::inline::{for_each_value_in_inst, for_each_value_in_term};
 
     if func.blocks.is_empty() {
         return true;
@@ -249,12 +274,22 @@ fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
                     alias.insert(*d, src);
                 }
                 other => {
+                    // RC3 iter 2.7 — apply the alias map to operand
+                    // Values in EVERY surviving inst, not just
+                    // is_inline_supported ones. The former check was
+                    // a leftover from when the demote pass piggybacked
+                    // on the JIT inliner's eligibility predicate;
+                    // CallGeneral / MakeClosure / Cons / etc. all need
+                    // their operands rewritten so a callee read of a
+                    // demoted let-binding resolves to the right SSA
+                    // Value. Without this, a named-let lambda
+                    // reference (`(let loop ...) (loop i acc)`) ends
+                    // up with an unresolved Value(N) in CallGeneral's
+                    // callee slot.
                     let mut cloned = other.clone();
-                    if is_inline_supported(&cloned) {
-                        for_each_value_in_inst(&mut cloned, |v| {
-                            *v = resolve(*v, &alias);
-                        });
-                    }
+                    for_each_value_in_inst(&mut cloned, |v| {
+                        *v = resolve(*v, &alias);
+                    });
                     rewritten.push(cloned);
                 }
             }
@@ -376,11 +411,15 @@ pub fn bytecode_to_rir_full(
     // When the caller supplied per-param type hints (arg-side
     // feedback), use them; else default to Fixnum.
     let mut func = Function::new(name);
-    for (i, _sym) in lambda.params.iter().enumerate() {
+    for (i, sym) in lambda.params.iter().enumerate() {
         let t = param_type_hints
             .and_then(|h| h.get(i).copied())
             .unwrap_or(Type::Fixnum);
         func.params.push((RirValue(i as u32), t));
+        // RC3 iter 2.7 — record the param's sym ID so cs-aot can
+        // map EnvLookup(sym) of a param to the right Value when
+        // resolving an inner closure's captures.
+        func.param_syms.push(sym.0);
     }
     func.entry = BlockId(0);
 
