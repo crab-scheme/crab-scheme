@@ -410,6 +410,30 @@ pub unsafe extern "C" fn vm_env_set_nb(sym: i64, value: i64) {
     }
 }
 
+/// Phase 5b iter8 — `define-local` semantics: install a binding
+/// directly into the current `JIT_CALLER_ENV` layer.
+///
+/// EXPERIMENTAL — see iter8 investigation. Stamping of `self_name`
+/// happens conditionally via the `STAMP_SELF_NAME` flag for
+/// bisection diagnostics.
+///
+/// # Safety
+///
+/// `JIT_CALLER_ENV` must be set. `value` must be a live, owned
+/// `NanboxValue` bit pattern.
+#[no_mangle]
+pub unsafe extern "C" fn vm_env_define_local_nb(sym: i64, value: i64) {
+    let env_ptr = jit_caller_env();
+    if env_ptr.is_null() {
+        panic!("vm_env_define_local_nb: JIT_CALLER_ENV is null");
+    }
+    let env = unsafe { &*env_ptr };
+    let sym = Symbol(sym as u32);
+    let v = unsafe { NanboxValue(value).to_value() };
+    stamp_self_name_if_closure(&v, sym);
+    env.define(sym, v);
+}
+
 /// Helper called by JIT-compiled code to look up a free variable's
 /// fixnum value in the closure's captured env. The env pointer is
 /// pulled from `JIT_CALLER_ENV` (set by `try_dispatch_jit`).

@@ -153,6 +153,10 @@ pub fn bytecode_to_rir_with_hints(
         param_map.insert(*sym, RirValue(i as u32));
     }
 
+    // Phase 5b iter8 — local lexical bindings tracked alongside the
+    // runtime env. Stack of frames so LeaveScope can pop.
+    let mut local_scopes: Vec<HashMap<Symbol, RirValue>> = Vec::new();
+
     // Per-Value type table populated as the translator emits
     // instructions. Lets arithmetic emission pick FlonumAdd vs
     // Add based on operand types, and the return-type post-pass
@@ -253,7 +257,21 @@ pub fn bytecode_to_rir_with_hints(
                     sim_stack.push(StackEntry::Value(dst));
                 }
                 Inst::LoadVar(sym) => {
-                    if let Some(v) = param_map.get(sym).copied() {
+                    // iter8b — for symbols in local_scopes (letrec-
+                    // bound), emit an Any-typed env lookup directly.
+                    // RirInst::EnvDefineLocal stored the value into
+                    // the env; we read it back via EnvLookupAny so
+                    // we always get a fresh ref (no SSA staleness).
+                    let local_known = local_scopes
+                        .iter()
+                        .rev()
+                        .any(|frame| frame.contains_key(sym));
+                    if local_known {
+                        let dst = alloc();
+                        insts.push(RirInst::EnvLookupAny(dst, sym.0));
+                        value_types.insert(dst, Type::Any);
+                        sim_stack.push(StackEntry::Value(dst));
+                    } else if let Some(v) = param_map.get(sym).copied() {
                         // Any-typed params live in linear-typed land:
                         // each "use" must own a fresh box. We clone
                         // on every load and drop the original at
@@ -301,27 +319,46 @@ pub fn bytecode_to_rir_with_hints(
                     sim_stack.push(StackEntry::Value(dst));
                 }
                 Inst::SetVar(sym) => {
-                    // SetVar pops one value and stores it into the
-                    // binding for `sym`. After SetVar, the cs-vm
-                    // compiler emits Const(Unspecified) so the
-                    // result of `(set! x v)` is well-defined; we
-                    // honor that by also pushing a placeholder
-                    // value here. (Const(Unspecified) appears in
-                    // the bytecode as the next instruction, which
-                    // we'll see and emit as LoadConst.)
-                    //
-                    // For free-var SetVar, lower to Inst::EnvSet.
-                    // Local-var SetVar isn't yet supported; we
-                    // never bind locals via DefineLocal in the
-                    // current translator scope, so any SetVar is a
-                    // free-var update.
                     let val = pop_value(&mut sim_stack)?;
                     if param_map.contains_key(sym) {
                         return Err(TranslateError::Unsupported(
                             "set! of a parameter (mutable params not yet supported)".into(),
                         ));
                     }
+                    // Update local SSA if sym is locally bound; always
+                    // emit EnvSet so any captured closure sees the
+                    // new value via env lookup.
+                    for frame in local_scopes.iter_mut().rev() {
+                        if frame.contains_key(sym) {
+                            frame.insert(*sym, val);
+                            break;
+                        }
+                    }
                     insts.push(RirInst::EnvSet(sym.0, val));
+                }
+                // Phase 5b iter8 — EnterScope pushes a local frame.
+                // No RIR emission: the bytecode VM's EnterScope creates
+                // an env LAYER, but try_dispatch_jit_nb already
+                // installs a fresh child env when jit_needs_frame_env
+                // is true (which the rir.builds_closures() check sets
+                // for bodies with MakeClosure). DefineLocal calls go
+                // into that frame env via vm_env_define_local_nb.
+                Inst::EnterScope => {
+                    local_scopes.push(HashMap::new());
+                }
+                Inst::LeaveScope => {
+                    if local_scopes.pop().is_none() {
+                        return Err(TranslateError::Invalid(
+                            "LeaveScope without matching EnterScope".into(),
+                        ));
+                    }
+                }
+                Inst::DefineLocal(sym) => {
+                    let val = pop_value(&mut sim_stack)?;
+                    if let Some(frame) = local_scopes.last_mut() {
+                        frame.insert(*sym, val);
+                    }
+                    insts.push(RirInst::EnvDefineLocal(sym.0, val));
                 }
                 Inst::AddFx2 => emit_arith_binop(
                     &mut insts,

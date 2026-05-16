@@ -302,6 +302,13 @@ pub enum Inst {
     /// just `()` (void) — no SSA result.
     EnvSet(u32, Value),
 
+    /// Define a binding directly in the current `JIT_CALLER_ENV`
+    /// layer. Phase 5b iter8 — installs bindings for letrec /
+    /// internal-define / named-let that need to be visible to
+    /// closures captured by subsequent `MakeClosure` in the same
+    /// body. Lowers to `vm_env_define_local_nb(sym, value)`.
+    EnvDefineLocal(u32, Value),
+
     /// `dst = make-vector(n, fill)`. Lowers to `vm_alloc_vector_gc`.
     /// `n` is Fixnum-shape; `fill` is Any (Gc handle, consumed).
     /// `dst` is Any (fresh Gc handle to a Vector slot).

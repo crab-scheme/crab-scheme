@@ -92,6 +92,8 @@ pub struct Lowerer {
     /// Same shape as `vm_env_set_fixnum` but accepts a raw
     /// `NanboxValue` and decodes internally.
     env_set_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_env_define_local_nb(sym, value) -> ()` (iter8).
+    env_define_local_nb_func: cranelift_module::FuncId,
     /// FuncId of `vm_alloc_pair(car, car_tag, cdr, cdr_tag) -> i64`.
     /// `Inst::Cons` lowers to a Cranelift call against this.
     alloc_pair_func: cranelift_module::FuncId,
@@ -851,6 +853,10 @@ impl Lowerer {
         // Stage 3 baseline-JIT env-set helper (iter 3.5): accepts a
         // raw NanboxValue, decodes internally.
         builder.symbol("vm_env_set_nb", cs_vm::vm::vm_env_set_nb as *const u8);
+        builder.symbol(
+            "vm_env_define_local_nb",
+            cs_vm::vm::vm_env_define_local_nb as *const u8,
+        );
         // ADR 0011 D-5 — heap-pointer ABI helpers. Pure-additive
         // imports today (no translator path uses them yet); subsequent
         // iters wire `cons` / `car` / `cdr` lowering through these
@@ -1849,6 +1855,13 @@ impl Lowerer {
                 &env_set_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function env_set_nb: {e}")))?;
+        let env_define_local_nb_func = module
+            .declare_function(
+                "vm_env_define_local_nb",
+                cranelift_module::Linkage::Import,
+                &env_set_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function env_define_local_nb: {e}")))?;
 
         // Heap-pointer ABI helpers (ADR 0011 D-5). Imported so the
         // module knows about them; no JIT body calls them yet.
@@ -4457,6 +4470,7 @@ impl Lowerer {
             env_lookup_any_func,
             env_set_func,
             env_set_nb_func,
+            env_define_local_nb_func,
             alloc_pair_func,
             pair_car_func,
             pair_cdr_func,
@@ -4914,6 +4928,7 @@ impl Lowerer {
                     | Inst::EnvLookup(_, _)
                     | Inst::EnvLookupAny(_, _)
                     | Inst::EnvSet(_, _)
+                    | Inst::EnvDefineLocal(_, _)
                     | Inst::Call(_, _, _)
                     | Inst::CallGeneral(_, _, _)
                     | Inst::BoxTyped(_, _, _)
@@ -5122,6 +5137,9 @@ impl Lowerer {
                 env_set_nb: self
                     .module
                     .declare_func_in_func(self.env_set_nb_func, builder.func),
+                env_define_local_nb: self
+                    .module
+                    .declare_func_in_func(self.env_define_local_nb_func, builder.func),
                 make_closure: self
                     .module
                     .declare_func_in_func(self.make_closure_func, builder.func),
@@ -6730,6 +6748,7 @@ struct NbHelpers {
     // thread-local installed by `try_dispatch_jit_nb`.
     env_lookup_any: cranelift_codegen::ir::FuncRef,
     env_set_nb: cranelift_codegen::ir::FuncRef,
+    env_define_local_nb: cranelift_codegen::ir::FuncRef,
     make_closure: cranelift_codegen::ir::FuncRef,
     // IC hot path (CallGeneral): `vm_closure_id_peek(callee) -> u32`
     // reads the callee's lambda id without consuming the handle;
@@ -7046,6 +7065,11 @@ fn lower_inst_uniform_nb(
                 let val = lookup(map, value)?;
                 let sym_v = b.ins().iconst(I64, sym as i64);
                 b.ins().call(helpers.env_set_nb, &[sym_v, val]);
+            }
+            &Inst::EnvDefineLocal(sym, value) => {
+                let val = lookup(map, value)?;
+                let sym_v = b.ins().iconst(I64, sym as i64);
+                b.ins().call(helpers.env_define_local_nb, &[sym_v, val]);
             }
             // `Inst::Call` is the translator's "I have feedback about
             // this callee" form. Mirror the specialized tier's
@@ -7813,6 +7837,11 @@ fn lower_inst(
         Inst::Div(_, _, _) => {
             return Err(JitError::Unsupported(
                 "specialized: Inst::Div not supported (use uniform-NB tier)".into(),
+            ));
+        }
+        Inst::EnvDefineLocal(_, _) => {
+            return Err(JitError::Unsupported(
+                "specialized: Inst::EnvDefineLocal not supported (use uniform-NB tier)".into(),
             ));
         }
         Inst::Quotient(dst, lhs, rhs) => {
