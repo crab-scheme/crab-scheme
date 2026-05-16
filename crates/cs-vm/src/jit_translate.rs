@@ -145,6 +145,41 @@ fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
         return true;
     }
 
+    // RC3 Phase 2 iter 2.6 — atomicity fix. Previously this fn
+    // `drain`'d block 0's Insts and bailed mid-iteration on the
+    // first free-var EnvLookup. The bailed-out `false` return left
+    // block 0 with an empty inst list (the drain already emptied it,
+    // and we never reassigned `rewritten` back). `func` was thus
+    // corrupted — surfaced as cs-aot's "v17 used before defined"
+    // error on spectral-norm where the very first inst is a
+    // MakeClosure followed by an EnvLookupAny on a free-var binding.
+    //
+    // Two-pass fix: PRE-SCAN to verify every EnvLookup's sym was
+    // EnvDefineLocal'd somewhere in block 0. If any miss, bail
+    // BEFORE touching `func` so the original RIR survives intact
+    // and downstream gets a clean UnsupportedInst error from
+    // cs-aot rather than a corrupted function.
+    {
+        let mut defined_syms: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for inst in &func.blocks[0].insts {
+            match inst {
+                RirInst::EnvDefineLocal(sym, _) => {
+                    defined_syms.insert(*sym);
+                }
+                RirInst::EnvLookupAny(_, sym) | RirInst::EnvLookup(_, sym) => {
+                    if !defined_syms.contains(sym) {
+                        // Free-var binding. Demote can't rewrite this
+                        // to an SSA alias because there's no local
+                        // source — abort cleanly without mutating
+                        // anything.
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     let mut sym_to_src: HashMap<u32, RirValue> = HashMap::new();
     let mut alias: HashMap<RirValue, RirValue> = HashMap::new();
     let resolve = |v: RirValue, alias: &HashMap<RirValue, RirValue>| -> RirValue {
@@ -160,6 +195,8 @@ fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
 
     // Step 1+2: process block 0 — collect alias + drop env insts +
     // rewrite block-0 operands. Mirrors the single-block helper.
+    // Safe to drain now: pre-scan proved every EnvLookup is paired
+    // with a corresponding EnvDefineLocal.
     let block0_insts: Vec<_> = func.blocks[0].insts.drain(..).collect();
     let mut rewritten: Vec<RirInst> = Vec::with_capacity(block0_insts.len());
     for inst in block0_insts {
@@ -168,6 +205,12 @@ fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
                 sym_to_src.insert(sym, resolve(src, &alias));
             }
             RirInst::EnvLookupAny(d, sym) | RirInst::EnvLookup(d, sym) => {
+                // Pre-scan guarantees sym is in sym_to_src by the
+                // time we reach the EnvLookup (modulo lexical-order
+                // hazards — see RC3 iter 2.5 multi-block work). If
+                // a lookup appears before its define in the same
+                // block, demote still bails here but the pre-scan
+                // would have already caught it as undefined.
                 let src = match sym_to_src.get(&sym) {
                     Some(&s) => s,
                     None => return false,
