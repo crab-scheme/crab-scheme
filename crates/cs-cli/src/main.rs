@@ -87,6 +87,19 @@ enum Cmd {
         /// On success, prints the resulting native binary's path.
         #[arg(long = "build")]
         build: bool,
+        /// RC2 iter R debug aid: print the entry function's RIR
+        /// (post-`bytecode_to_rir_aot`) to stdout in a human-
+        /// readable form. Useful when an `UnsupportedInst` error
+        /// surfaces — shows which Insts the translator emitted.
+        #[arg(long = "emit-rir")]
+        emit_rir: bool,
+        /// RC2 iter R debug aid: dump the AOT-emitted Rust source
+        /// (the `src/main.rs` content) to stdout instead of (or
+        /// after) writing to the output directory. Useful for
+        /// inspecting what cs-aot would compile when debugging
+        /// codegen issues.
+        #[arg(long = "emit-rust-source")]
+        emit_rust_source: bool,
     },
 }
 
@@ -109,12 +122,28 @@ fn main() -> ExitCode {
             output,
             entry,
             build,
-        }) => run_aot(&file, output.as_deref(), entry.as_deref(), build),
+            emit_rir,
+            emit_rust_source,
+        }) => run_aot(
+            &file,
+            output.as_deref(),
+            entry.as_deref(),
+            build,
+            emit_rir,
+            emit_rust_source,
+        ),
     }
 }
 
 #[cfg(feature = "aot")]
-fn run_aot(file: &str, output: Option<&str>, entry: Option<&str>, build: bool) -> ExitCode {
+fn run_aot(
+    file: &str,
+    output: Option<&str>,
+    entry: Option<&str>,
+    build: bool,
+    emit_rir: bool,
+    emit_rust_source: bool,
+) -> ExitCode {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::process::Command;
@@ -265,6 +294,27 @@ fn run_aot(file: &str, output: Option<&str>, entry: Option<&str>, build: bool) -
         }
     };
 
+    // RC2 iter R: --emit-rir dumps the post-translate RIR to stdout
+    // before emission. Useful when an UnsupportedInst surfaces:
+    // shows exactly which Insts the translator emitted.
+    if emit_rir {
+        println!("// --- cs-aot RIR for `{entry_name}` ---");
+        println!("// params: {:?}", rir.params);
+        println!("// return_type: {:?}", rir.return_type);
+        println!("// entry: {:?}", rir.entry);
+        for block in &rir.blocks {
+            println!("\n// {:?}:", block.id);
+            if !block.params.is_empty() {
+                println!("//   params: {:?}", block.params);
+            }
+            for inst in &block.insts {
+                println!("//   {inst:?}");
+            }
+            println!("//   TERM: {:?}", block.terminator);
+        }
+        println!("// --- end RIR ---");
+    }
+
     // --- Output dir + package name ----
     let out_dir = output
         .map(PathBuf::from)
@@ -314,6 +364,26 @@ fn run_aot(file: &str, output: Option<&str>, entry: Option<&str>, build: bool) -
     );
     println!("  entry: {entry_name}");
     println!("  package: {pkg_name}");
+
+    // RC2 iter R: --emit-rust-source prints the generated src/main.rs
+    // after emit. Useful when the resulting cargo build fails — lets
+    // the user see exactly what got compiled.
+    if emit_rust_source {
+        let src_path = emitted.project_dir.join("src/main.rs");
+        match fs::read_to_string(&src_path) {
+            Ok(s) => {
+                println!("// --- cs-aot src/main.rs ({}) ---", src_path.display());
+                println!("{s}");
+                println!("// --- end main.rs ---");
+            }
+            Err(e) => {
+                eprintln!(
+                    "crabscheme aot: --emit-rust-source: cannot read {}: {e}",
+                    src_path.display()
+                );
+            }
+        }
+    }
 
     if !build {
         println!("  (re-run with --build to invoke `cargo build --release`)");
