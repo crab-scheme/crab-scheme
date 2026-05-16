@@ -1,0 +1,203 @@
+name: release
+
+# Builds and publishes pre-built `crabscheme` binaries when a version
+# tag is pushed. Triggers on tags matching `1.*` (1.0-rc1, 1.0,
+# 1.0.1, 1.1-rc1, etc.) — the leading version digit gates against
+# accidental pushes of milestone tags like `m10-complete`.
+#
+# Per-target output: a `crabscheme-<version>-<target>.tar.gz`
+# containing the native binary + LICENSE-MIT + LICENSE-APACHE +
+# README.md, with a `.sha256` checksum sidecar.
+#
+# Targets (RC1 scope):
+#   - darwin-aarch64   (macOS Apple Silicon)
+#   - darwin-x86_64    (macOS Intel)
+#   - linux-x86_64     (Ubuntu glibc)
+#   - linux-aarch64    (Ubuntu glibc on ARM)
+#   - wasm32-wasip1    (WASI bytecode-VM-only; --no-default-features)
+#
+# Native builds use the full default feature set (jit + ffi-dynamic).
+# The WASM build drops both per the M10 Track W design.
+#
+# The final `publish` job creates / updates the GitHub Release and
+# attaches every artifact. Re-running the workflow against an
+# existing release is safe (artifacts overwrite by name).
+
+on:
+  push:
+    tags:
+      - "1.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build + release (must already exist)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            asset: darwin-aarch64
+            cargo_args: "--release -p cs-cli"
+            bin_path: "target/release/crabscheme"
+          - target: x86_64-apple-darwin
+            os: macos-13
+            asset: darwin-x86_64
+            cargo_args: "--release -p cs-cli"
+            bin_path: "target/release/crabscheme"
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            asset: linux-x86_64
+            cargo_args: "--release -p cs-cli"
+            bin_path: "target/release/crabscheme"
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            asset: linux-aarch64
+            cargo_args: "--release -p cs-cli"
+            bin_path: "target/release/crabscheme"
+          - target: wasm32-wasip1
+            os: ubuntu-24.04
+            asset: wasm32-wasip1
+            cargo_args: "--release -p cs-cli --no-default-features --target wasm32-wasip1"
+            bin_path: "target/wasm32-wasip1/release/crabscheme.wasm"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml. Override the channel
+        # explicitly here because the runner image may have a
+        # different default. WASM job needs the wasm32-wasip1 target.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          targets: ${{ matrix.target == 'wasm32-wasip1' && 'wasm32-wasip1' || '' }}
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          # On a tag push, GITHUB_REF_NAME is the tag; on
+          # workflow_dispatch, take the input.
+          if [ -n "${{ inputs.tag }}" ]; then
+            v="${{ inputs.tag }}"
+          else
+            v="${GITHUB_REF_NAME}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Building for version: $v"
+
+      - name: cargo build
+        run: cargo build ${{ matrix.cargo_args }}
+
+      - name: Package artifact
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ steps.version.outputs.version }}"
+          asset="crabscheme-${v}-${{ matrix.asset }}"
+          stage="$RUNNER_TEMP/${asset}"
+          mkdir -p "$stage"
+
+          # Native targets ship `crabscheme`; WASM ships
+          # `crabscheme.wasm` (kept as a .wasm next to the binary
+          # name for clarity that this isn't a host binary).
+          cp "${{ matrix.bin_path }}" "$stage/"
+          cp README.md "$stage/"
+          cp LICENSE-MIT "$stage/"
+          cp LICENSE-APACHE "$stage/"
+
+          # tar.gz with stable name + sha256 sidecar. Use BSD-tar on
+          # macOS and GNU-tar on Linux — both produce a portable
+          # ustar/gzip archive, so cross-platform consumers can untar
+          # with any common tool.
+          tarball="${asset}.tar.gz"
+          ( cd "$RUNNER_TEMP" && tar -czf "$tarball" "$asset" )
+          ( cd "$RUNNER_TEMP" && shasum -a 256 "$tarball" > "${tarball}.sha256" )
+
+          echo "tarball_path=$RUNNER_TEMP/$tarball" >> "$GITHUB_OUTPUT"
+          echo "checksum_path=$RUNNER_TEMP/${tarball}.sha256" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Names need to be unique across matrix entries; using the
+          # `asset` slug (e.g. `linux-x86_64`) keeps the publish
+          # job's download path predictable.
+          name: ${{ steps.package.outputs.asset_name }}
+          path: |
+            ${{ steps.package.outputs.tarball_path }}
+            ${{ steps.package.outputs.checksum_path }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            v="${{ inputs.tag }}"
+          else
+            v="${GITHUB_REF_NAME}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # Each matrix entry uploaded under its asset slug; this
+          # downloads everything into dist/<slug>/<files...>.
+          merge-multiple: true
+
+      - name: List artifacts
+        shell: bash
+        run: |
+          echo "Artifacts to attach:"
+          find dist -type f | sort
+          echo
+          echo "SHA256 manifest:"
+          cat dist/*.sha256 | sort
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          # `prerelease: true` for any tag containing `rc`, `alpha`,
+          # `beta`, or `pre` so GitHub shows the appropriate badge.
+          prerelease: ${{ contains(steps.version.outputs.version, 'rc') || contains(steps.version.outputs.version, 'alpha') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'pre') }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          fail_on_unmatched_files: true
