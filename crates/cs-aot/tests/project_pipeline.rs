@@ -44,7 +44,7 @@ fn factorial_function() -> Function {
             Inst::LoadConst(Value(1), Const::Fixnum(0)),
             Inst::Eq(Value(2), Value(0), Value(1)),
         ],
-        terminator: Term::Branch(Value(2), BlockId(1), BlockId(2)),
+        terminator: Term::Branch(Value(2), BlockId(1), BlockId(2), Vec::new()),
     });
     f.blocks.push(Block {
         id: BlockId(1),
@@ -210,7 +210,7 @@ fn fib_function() -> Function {
             Inst::LoadConst(Value(1), Const::Fixnum(2)),
             Inst::Lt(Value(2), Value(0), Value(1)),
         ],
-        terminator: Term::Branch(Value(2), BlockId(1), BlockId(2)),
+        terminator: Term::Branch(Value(2), BlockId(1), BlockId(2), Vec::new()),
     });
     // base: return n
     f.blocks.push(Block {

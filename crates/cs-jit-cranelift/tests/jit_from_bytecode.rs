@@ -301,7 +301,7 @@ fn uniform_nb_branch_clamp() {
             RirInst::LoadConst(cs_rir::Value(1), RirConst::Fixnum(10)),
             RirInst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
         ],
-        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2)),
+        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2), Vec::new()),
     });
     f.blocks.push(Block {
         id: BlockId(1),
@@ -353,7 +353,7 @@ fn uniform_nb_jump_with_block_param() {
             RirInst::LoadConst(cs_rir::Value(1), RirConst::Fixnum(0)),
             RirInst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
         ],
-        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2)),
+        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2), Vec::new()),
     });
     // Negative branch: 0 - x.
     f.blocks.push(Block {
@@ -653,7 +653,7 @@ fn uniform_nb_call_self_countdown() {
             RirInst::LoadConst(cs_rir::Value(1), RirConst::Fixnum(1)),
             RirInst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
         ],
-        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2)),
+        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2), Vec::new()),
     });
     // Block 1: base case, return n.
     f.blocks.push(Block {
@@ -714,7 +714,7 @@ fn uniform_nb_rejects_non_tail_callself() {
             RirInst::LoadConst(cs_rir::Value(1), RirConst::Fixnum(2)),
             RirInst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
         ],
-        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2)),
+        terminator: Term::Branch(cs_rir::Value(2), BlockId(1), BlockId(2), Vec::new()),
     });
     f.blocks.push(Block {
         id: BlockId(1),

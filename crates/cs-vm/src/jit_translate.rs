@@ -113,6 +113,14 @@ pub fn bytecode_to_rir_aot_with_globals(
     known_globals: Option<&std::collections::HashSet<u32>>,
 ) -> Result<Function, TranslateError> {
     let mut func = bytecode_to_rir(lambda, name, self_name)?;
+    // RC3 iter 2.13 — seed self_binding_sym from self_name so
+    // record_captures (which runs below) can exclude self-EnvLookups
+    // from the captures list (they resolve to __self_handle instead).
+    // cs-cli also sets this field after translation, but record_captures
+    // needs it FIRST.
+    if let Some(sym) = self_name {
+        func.self_binding_sym = Some(sym.0);
+    }
     // RC3 Phase 2 iter 2.5: demote runs for any function shape,
     // single- or multi-block. Pre-scan inside the helper bails
     // cleanly without mutating `func` on free-vars / duplicate
@@ -151,10 +159,20 @@ fn record_captures(
     use std::collections::HashSet;
     let mut seen: HashSet<u32> = HashSet::new();
     let mut order: Vec<u32> = Vec::new();
+    // RC3 iter 2.13 — exclude the function's own self-binding-sym
+    // from captures. EnvLookups of THIS sym resolve to __self_handle
+    // (iter 2.12 + iter 2.13's EnvLookup arm), not a capture slot.
+    // Including it as a capture would force the caller to provide a
+    // value it can't have: at MakeClosure time, the closure is being
+    // CREATED — its handle doesn't exist yet.
+    let self_sym = func.self_binding_sym;
     for block in &func.blocks {
         for inst in &block.insts {
             if let RirInst::EnvLookup(_, sym) | RirInst::EnvLookupAny(_, sym) = inst {
                 if known_globals.is_some_and(|g| g.contains(sym)) {
+                    continue;
+                }
+                if self_sym == Some(*sym) {
                     continue;
                 }
                 if seen.insert(*sym) {
@@ -826,6 +844,20 @@ pub fn bytecode_to_rir_full(
                     };
                     let target_block = lookup_block(&offset_to_block, *target, "JumpIfFalse")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "JumpIfFalse fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -843,7 +875,12 @@ pub fn bytecode_to_rir_full(
                         &sim_stack_values(&sim_stack),
                     )?;
                     // JumpIfFalse jumps when cond is falsy. brif: cond truthy -> first, else second.
-                    term = Some(Term::Branch(cond, fall_block, target_block));
+                    // RC3 iter 2.13 — Term::Branch now carries args
+                    // for the target blocks' params, same shape as
+                    // Term::Jump. Both successors get the same args
+                    // (the pre-branch sim_stack values).
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, fall_block, target_block, branch_args));
                     break;
                 }
                 Inst::BranchOnGeFx2(target) => {
@@ -851,6 +888,20 @@ pub fn bytecode_to_rir_full(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnGeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGeFx2 fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -867,7 +918,12 @@ pub fn bytecode_to_rir_full(
                         fall_block,
                         &sim_stack_values(&sim_stack),
                     )?;
-                    term = Some(Term::Branch(cond, fall_block, target_block));
+                    // RC3 iter 2.13 — Term::Branch now carries args
+                    // for the target blocks' params, same shape as
+                    // Term::Jump. Both successors get the same args
+                    // (the pre-branch sim_stack values).
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, fall_block, target_block, branch_args));
                     break;
                 }
                 Inst::BranchOnGtFx2(target) => {
@@ -875,6 +931,20 @@ pub fn bytecode_to_rir_full(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, b, a);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnGtFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGtFx2 fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -891,7 +961,8 @@ pub fn bytecode_to_rir_full(
                         fall_block,
                         &sim_stack_values(&sim_stack),
                     )?;
-                    term = Some(Term::Branch(cond, target_block, fall_block));
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, target_block, fall_block, branch_args));
                     break;
                 }
                 Inst::BranchOnLeFx2(target) => {
@@ -899,6 +970,20 @@ pub fn bytecode_to_rir_full(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, b, a);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnLeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLeFx2 fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -915,7 +1000,12 @@ pub fn bytecode_to_rir_full(
                         fall_block,
                         &sim_stack_values(&sim_stack),
                     )?;
-                    term = Some(Term::Branch(cond, fall_block, target_block));
+                    // RC3 iter 2.13 — Term::Branch now carries args
+                    // for the target blocks' params, same shape as
+                    // Term::Jump. Both successors get the same args
+                    // (the pre-branch sim_stack values).
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, fall_block, target_block, branch_args));
                     break;
                 }
                 Inst::BranchOnLtFx2(target) => {
@@ -923,6 +1013,20 @@ pub fn bytecode_to_rir_full(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnLtFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLtFx2 fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -939,7 +1043,8 @@ pub fn bytecode_to_rir_full(
                         fall_block,
                         &sim_stack_values(&sim_stack),
                     )?;
-                    term = Some(Term::Branch(cond, target_block, fall_block));
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, target_block, fall_block, branch_args));
                     break;
                 }
                 Inst::BranchOnNeFx2(target) => {
@@ -947,6 +1052,20 @@ pub fn bytecode_to_rir_full(
                     let cond = emit_typed_eq(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnNeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnNeFx2 fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -963,11 +1082,25 @@ pub fn bytecode_to_rir_full(
                         fall_block,
                         &sim_stack_values(&sim_stack),
                     )?;
-                    term = Some(Term::Branch(cond, fall_block, target_block));
+                    // RC3 iter 2.13 — Term::Branch now carries args
+                    // for the target blocks' params, same shape as
+                    // Term::Jump. Both successors get the same args
+                    // (the pre-branch sim_stack values).
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, fall_block, target_block, branch_args));
                     break;
                 }
                 Inst::Jump(target) => {
                     let target_block = lookup_block(&offset_to_block, *target, "Jump")?;
+                    // RC3 iter 2.13 — same marker-materialization as
+                    // JumpIfFalse so the markers flow as Values.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     // Pull the current stack out as the jump-args.
                     // The first jump to a target seeds its block
                     // params; subsequent jumps must match the count
@@ -7732,6 +7865,51 @@ fn sim_stack_values(sim_stack: &[StackEntry]) -> Vec<RirValue> {
         .collect()
 }
 
+/// RC3 iter 2.13 — at a branch point, any non-Value entries on the
+/// stack (SelfRef, BuiltinRef) would be silently DROPPED by the
+/// previous `sim_stack_values` filter, causing the merge-block
+/// successor to see a smaller stack than the predecessor pushed. The
+/// downstream `Call(n)` then trips its "stack has only K entries"
+/// invariant.
+///
+/// Fix: materialize each marker as a concrete RIR Value before the
+/// branch. SelfRef becomes an `EnvLookup(self_name)` (which lowers to
+/// `__self_handle` via iter 2.12's resolver path). BuiltinRef is
+/// rejected — the AOT pipeline can't materialize a builtin
+/// procedure handle (would need runtime allocation + a name → handle
+/// registry); programs that branch with a builtin on the stack stay
+/// blocked and surface a clean UnsupportedInst at lower time.
+fn materialize_markers_at_branch(
+    sim_stack: &mut [StackEntry],
+    insts: &mut Vec<RirInst>,
+    value_types: &mut HashMap<RirValue, Type>,
+    alloc: &mut impl FnMut() -> RirValue,
+    self_name: Option<Symbol>,
+) -> Result<(), TranslateError> {
+    for entry in sim_stack.iter_mut() {
+        match entry {
+            StackEntry::Value(_) => {}
+            StackEntry::SelfRef => {
+                let sym = self_name.ok_or_else(|| {
+                    TranslateError::Invalid("SelfRef on stack at branch but no self_name".into())
+                })?;
+                let dst = alloc();
+                insts.push(RirInst::EnvLookupAny(dst, sym.0));
+                value_types.insert(dst, Type::Any);
+                *entry = StackEntry::Value(dst);
+            }
+            StackEntry::BuiltinRef(name) => {
+                return Err(TranslateError::Unsupported(format!(
+                    "builtin-ref `{name}` on stack at branch (RC3 iter 2.13: \
+                     materialization across blocks needs a builtin → AOT-handle \
+                     registry that doesn't exist yet)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn seed_block_entry(
     entry_stack: &mut HashMap<BlockId, Vec<RirValue>>,
     block_params: &mut HashMap<BlockId, Vec<(RirValue, Type)>>,
@@ -8071,7 +8249,7 @@ mod tests {
         assert_eq!(f.blocks.len(), 3);
         // Entry ends in Branch.
         match &f.blocks[0].terminator {
-            Term::Branch(_, _, _) => {}
+            Term::Branch(_, _, _, _) => {}
             other => panic!("entry terminator: {:?}", other),
         }
         // The else arm body should contain at least 2 CallSelf insts.

@@ -4995,7 +4995,7 @@ impl Lowerer {
             // a defensive `other =>` arm here, but rustc flagged it
             // unreachable since the explicit arm matches everything.)
             match &blk.terminator {
-                Term::Return(_) | Term::Jump(_, _) | Term::Branch(_, _, _) => {}
+                Term::Return(_) | Term::Jump(_, _) | Term::Branch(_, _, _, _) => {}
             }
         }
 
@@ -7318,7 +7318,7 @@ fn lower_terminator_uniform_nb(
             b.ins().jump(tb, &cargs);
             Ok(())
         }
-        Term::Branch(cond, then_b, else_b) => {
+        Term::Branch(cond, then_b, else_b, args) => {
             let cv = lookup(map, *cond)?;
             let tb = *block_map
                 .get(then_b)
@@ -7330,7 +7330,13 @@ fn lower_terminator_uniform_nb(
             // (Value::Boolean(false) NB). Anything else is truthy.
             let nb_false_bits = cs_vm::vm::NanboxValue::FALSE.into_raw();
             let truthy = b.ins().icmp_imm(IntCC::NotEqual, cv, nb_false_bits);
-            b.ins().brif(truthy, tb, &[], eb, &[]);
+            // RC3 iter 2.13 — pass block args to both successors so
+            // their params get their incoming values.
+            let cargs: Vec<cranelift_codegen::ir::BlockArg> = args
+                .iter()
+                .map(|a| lookup(map, *a).map(cranelift_codegen::ir::BlockArg::Value))
+                .collect::<Result<_, _>>()?;
+            b.ins().brif(truthy, tb, &cargs, eb, &cargs);
             Ok(())
         }
     }
@@ -7631,7 +7637,7 @@ fn lower_terminator(
                 .collect::<Result<_, _>>()?;
             b.ins().jump(tb, &cargs);
         }
-        Term::Branch(cond, then_b, else_b) => {
+        Term::Branch(cond, then_b, else_b, args) => {
             let cv = lookup(map, *cond)?;
             let tb = *block_map
                 .get(then_b)
@@ -7639,7 +7645,11 @@ fn lower_terminator(
             let eb = *block_map
                 .get(else_b)
                 .ok_or_else(|| JitError::Codegen(format!("unknown else target {:?}", else_b)))?;
-            b.ins().brif(cv, tb, &[], eb, &[]);
+            let cargs: Vec<cranelift_codegen::ir::BlockArg> = args
+                .iter()
+                .map(|a| lookup(map, *a).map(cranelift_codegen::ir::BlockArg::Value))
+                .collect::<Result<_, _>>()?;
+            b.ins().brif(cv, tb, &cargs, eb, &cargs);
         }
     }
     Ok(())
@@ -12195,7 +12205,12 @@ mod tests {
                 Inst::LoadConst(cs_rir::Value(1), Const::Fixnum(10)),
                 Inst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
             ],
-            terminator: Term::Branch(cs_rir::Value(2), cs_rir::BlockId(1), cs_rir::BlockId(2)),
+            terminator: Term::Branch(
+                cs_rir::Value(2),
+                cs_rir::BlockId(1),
+                cs_rir::BlockId(2),
+                Vec::new(),
+            ),
         });
         f.blocks.push(Block {
             id: cs_rir::BlockId(1),
@@ -12238,7 +12253,12 @@ mod tests {
                 Inst::LoadConst(cs_rir::Value(1), Const::Fixnum(0)),
                 Inst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
             ],
-            terminator: Term::Branch(cs_rir::Value(2), cs_rir::BlockId(1), cs_rir::BlockId(2)),
+            terminator: Term::Branch(
+                cs_rir::Value(2),
+                cs_rir::BlockId(1),
+                cs_rir::BlockId(2),
+                Vec::new(),
+            ),
         });
         f.blocks.push(Block {
             id: cs_rir::BlockId(1),
@@ -12294,7 +12314,12 @@ mod tests {
                 Inst::LoadConst(cs_rir::Value(1), Const::Fixnum(2)),
                 Inst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
             ],
-            terminator: Term::Branch(cs_rir::Value(2), cs_rir::BlockId(1), cs_rir::BlockId(2)),
+            terminator: Term::Branch(
+                cs_rir::Value(2),
+                cs_rir::BlockId(1),
+                cs_rir::BlockId(2),
+                Vec::new(),
+            ),
         });
         f.blocks.push(Block {
             id: cs_rir::BlockId(1),

@@ -1341,7 +1341,16 @@ pub enum Term {
 
     /// Branch on `cond`. If `cond` is truthy go to `then_target`, else
     /// `else_target`. cs-vm: `Inst::JumpIf` / `JumpIfNot`.
-    Branch(Value, BlockId, BlockId),
+    ///
+    /// RC3 iter 2.13 — extended with `args: Vec<Value>` passed to BOTH
+    /// target blocks (same as Jump's args). The previous shape passed
+    /// no args, which meant block params on either successor went
+    /// uninitialized when the predecessor had a non-empty stack at the
+    /// branch point. The (lp (if cond then else)) pattern hit this:
+    /// SelfRef materialized to a Value flows from the pre-if block
+    /// into both arms, but `Term::Branch` with no args left it
+    /// dangling.
+    Branch(Value, BlockId, BlockId, Vec<Value>),
 }
 
 /// One basic block: a list of straight-line instructions plus a

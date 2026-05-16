@@ -66,7 +66,7 @@
 use std::collections::HashSet;
 use std::fmt::Write;
 
-use cs_rir::{Const, Function, Inst, Term, Type, Value};
+use cs_rir::{BlockId, Const, Function, Inst, Term, Type, Value};
 
 pub mod project;
 
@@ -1353,6 +1353,20 @@ fn inst_rhs(
         {
             (*dst, format!("__cap{sym}"))
         }
+        (Inst::EnvLookup(dst, sym), _) | (Inst::EnvLookupAny(dst, sym), _)
+            if self_binding_sym == Some(*sym) =>
+        {
+            // RC3 iter 2.13 — the iter 2.13 marker-materialization
+            // turns SelfRef on the stack at a branch point into an
+            // EnvLookup of the function's own self-name. The lookup
+            // value at runtime IS this closure's own Procedure
+            // handle — exactly what __self_handle holds (iter 2.12).
+            // Without this arm we'd treat the lookup as a capture
+            // and fail at the caller's MakeClosure (the caller would
+            // need to provide this closure's handle, but the closure
+            // doesn't exist yet at MakeClosure time).
+            (*dst, "__self_handle".to_string())
+        }
         (Inst::EnvLookup(dst, sym), EmitMode::Nb)
         | (Inst::EnvLookupAny(dst, sym), EmitMode::Nb)
             if resolver.by_name_sym.contains_key(sym) =>
@@ -1533,25 +1547,37 @@ fn emit_terminator(
             writeln!(out, "                block = {};", target.0).unwrap();
             writeln!(out, "                continue;").unwrap();
         }
-        Term::Branch(cond, then_target, else_target) => {
-            // Truthiness predicate depends on ABI:
-            //   - RawI64 mode: Lt/Eq emit `1` for true, `0` for false,
-            //     so plain `cond != 0` works.
-            //   - Nb mode: Lt/Eq delegate to `vm_value_*_nb` which
-            //     return NB-encoded Booleans. NB false has a specific
-            //     bit pattern (0xFFF8_8000_0000_0000); EVERY other
-            //     value — including NB Fixnum 0 and NB true — is
-            //     truthy, matching Scheme's `#f`-is-the-only-false
-            //     semantics. We compare against the NB false literal
-            //     so `(if 0 a b)` correctly takes the `a` branch.
+        Term::Branch(cond, then_target, else_target, args) => {
             let truthy_pred = match mode {
                 EmitMode::RawI64 => format!("v{} != 0", cond.0),
                 EmitMode::Nb => format!("v{} != {}", cond.0, nb_false_literal()),
             };
+            // RC3 iter 2.13 — emit per-target block-arg assignments
+            // before jumping. Same shape as Term::Jump: each arg
+            // copies into the target's params. Both then- and else-
+            // targets receive the same args (both successors of a
+            // brif inherit the predecessor's stack).
+            let emit_args_for = |out: &mut String, target: BlockId| {
+                if args.is_empty() {
+                    return;
+                }
+                let target_block = match func.blocks.iter().find(|b| b.id == target) {
+                    Some(b) => b,
+                    None => return,
+                };
+                if args.len() != target_block.params.len() {
+                    return;
+                }
+                for (arg_v, (param_v, _ty)) in args.iter().zip(target_block.params.iter()) {
+                    writeln!(out, "                    v{} = v{};", param_v.0, arg_v.0).unwrap();
+                }
+            };
             writeln!(out, "                if {truthy_pred} {{").unwrap();
+            emit_args_for(out, *then_target);
             writeln!(out, "                    block = {};", then_target.0).unwrap();
             writeln!(out, "                    continue;").unwrap();
             writeln!(out, "                }} else {{").unwrap();
+            emit_args_for(out, *else_target);
             writeln!(out, "                    block = {};", else_target.0).unwrap();
             writeln!(out, "                    continue;").unwrap();
             writeln!(out, "                }}").unwrap();
@@ -1741,7 +1767,7 @@ fn term_variant_name(term: &Term) -> &'static str {
     match term {
         Term::Return(_) => "Return",
         Term::Jump(_, _) => "Jump",
-        Term::Branch(_, _, _) => "Branch",
+        Term::Branch(_, _, _, _) => "Branch",
     }
 }
 
@@ -2058,7 +2084,7 @@ mod tests {
                 Inst::LoadConst(Value(1), Const::Fixnum(0)),
                 Inst::Lt(Value(2), Value(0), Value(1)),
             ],
-            terminator: Term::Branch(Value(2), BlockId(1), BlockId(2)),
+            terminator: Term::Branch(Value(2), BlockId(1), BlockId(2), Vec::new()),
         });
         f.blocks.push(Block {
             id: BlockId(1),

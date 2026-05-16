@@ -163,7 +163,7 @@ fn aot_abs_via_branch_runs_correctly() {
             Inst::LoadConst(Value(1), Const::Fixnum(0)),
             Inst::Lt(Value(2), Value(0), Value(1)),
         ],
-        terminator: Term::Branch(Value(2), BlockId(1), BlockId(2)),
+        terminator: Term::Branch(Value(2), BlockId(1), BlockId(2), Vec::new()),
     });
     f.blocks.push(Block {
         id: BlockId(1),
@@ -232,7 +232,7 @@ fn aot_iterative_sum_loop_via_jump() {
         id: BlockId(1),
         params: vec![(Value(3), Type::Fixnum), (Value(4), Type::Fixnum)],
         insts: vec![Inst::Lt(Value(5), Value(0), Value(3))],
-        terminator: Term::Branch(Value(5), BlockId(2), BlockId(3)),
+        terminator: Term::Branch(Value(5), BlockId(2), BlockId(3), Vec::new()),
     });
     f.blocks.push(Block {
         id: BlockId(2),
@@ -600,7 +600,7 @@ fn aot_iterative_sum_nb_via_jump() {
         id: BlockId(1),
         params: vec![(Value(3), Type::Fixnum), (Value(4), Type::Fixnum)],
         insts: vec![Inst::Lt(Value(5), Value(0), Value(3))],
-        terminator: Term::Branch(Value(5), BlockId(2), BlockId(3)),
+        terminator: Term::Branch(Value(5), BlockId(2), BlockId(3), Vec::new()),
     });
     f.blocks.push(Block {
         id: BlockId(2),
