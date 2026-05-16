@@ -347,6 +347,7 @@ fn run_aot(
         mode: EmitMode::Nb,
         package_name: pkg_name.clone(),
         entry_fn_name: entry_name.clone(),
+        cs_vm_dep: None, // fall through to legacy cs_vm_path
         cs_vm_path: Some(cs_vm_path),
     };
 

@@ -160,6 +160,7 @@ fn aot_compile_and_run(
         mode: EmitMode::Nb,
         package_name: format!("aot_src_{pkg_suffix}"),
         entry_fn_name: fn_name.to_string(),
+        cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_workspace_path()),
     };
 

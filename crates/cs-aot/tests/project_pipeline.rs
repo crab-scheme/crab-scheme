@@ -137,6 +137,7 @@ fn factorial_nb_compiles_and_runs() {
         mode: EmitMode::Nb,
         package_name: "aot_factorial_nb".to_string(),
         entry_fn_name: "factorial".to_string(),
+        cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_workspace_path()),
     };
 
@@ -174,6 +175,7 @@ fn factorial_rawi64_compiles_and_runs() {
         mode: EmitMode::RawI64,
         package_name: "aot_factorial_raw".to_string(),
         entry_fn_name: "factorial".to_string(),
+        cs_vm_dep: None,
         cs_vm_path: None,
     };
 
@@ -246,6 +248,7 @@ fn fib_rawi64_compiles_and_runs() {
         mode: EmitMode::RawI64,
         package_name: "aot_fib_raw".to_string(),
         entry_fn_name: "fib".to_string(),
+        cs_vm_dep: None,
         cs_vm_path: None,
     };
 
@@ -272,6 +275,7 @@ fn fib_nb_compiles_and_runs() {
         mode: EmitMode::Nb,
         package_name: "aot_fib_nb".to_string(),
         entry_fn_name: "fib".to_string(),
+        cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_workspace_path()),
     };
 

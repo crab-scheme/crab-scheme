@@ -72,6 +72,39 @@ impl From<io::Error> for ProjectError {
     }
 }
 
+/// How the emitted Cargo.toml refers to cs-vm.
+///
+/// RC3 Phase 1 iter 1.5: introduced ahead of the cs-vm crates.io
+/// publish (iter 1.3). Path-based emission stays the default for
+/// dev-tree usage; the Version variant flips on once cs-vm is
+/// published, eliminating the "release-installed crabscheme can't
+/// AOT because cs-vm isn't at the resolved path" gap documented
+/// in `docs/milestones/aot-hardening-plan.md` Phase 1.
+#[derive(Debug, Clone)]
+pub enum CsVmDep {
+    /// `cs-vm = { path = "<absolute path>" }`. Resolves to the
+    /// in-workspace cs-vm at build time. Required pre-Phase-1.3;
+    /// dev-tree builds always use this.
+    Path(PathBuf),
+    /// `cs-vm = "<version>"`. Resolves via crates.io. Use once
+    /// cs-vm is published. The string is passed verbatim to cargo
+    /// — supports caret (`"0.1"`), exact (`"=0.1.2"`), or any
+    /// other valid cargo version requirement spec.
+    Version(String),
+}
+
+impl CsVmDep {
+    /// Render as the right-hand-side of `cs-vm = ` in TOML form.
+    /// Returns the value sans the `cs-vm = ` prefix so the caller
+    /// can compose it into the deps table cleanly.
+    pub(crate) fn to_toml(&self) -> String {
+        match self {
+            CsVmDep::Path(p) => format!("{{ path = \"{}\" }}", p.display()),
+            CsVmDep::Version(v) => format!("\"{v}\""),
+        }
+    }
+}
+
 /// Options controlling the emitted cargo project.
 #[derive(Debug, Clone)]
 pub struct ProjectOptions {
@@ -85,10 +118,33 @@ pub struct ProjectOptions {
     /// args. The entry's arity determines how many CLI args main
     /// requires.
     pub entry_fn_name: String,
-    /// Absolute path to the cs-vm crate. Required for Nb mode (the
-    /// emitted main.rs references `cs_vm::vm::NanboxValue` to encode
-    /// args + decode the result). Ignored in RawI64 mode.
+    /// Where the emitted Cargo.toml gets cs-vm from. See
+    /// [`CsVmDep`]. When `None`, falls back to the legacy
+    /// [`cs_vm_path`](Self::cs_vm_path) field for backward
+    /// compatibility with rc2-era callers; new code should prefer
+    /// this field over `cs_vm_path`.
+    ///
+    /// Required for Nb mode (the emitted main.rs references
+    /// `cs_vm::vm::NanboxValue` to encode args + decode the
+    /// result). Ignored in RawI64 mode.
+    pub cs_vm_dep: Option<CsVmDep>,
+    /// **Deprecated** in favor of [`cs_vm_dep`](Self::cs_vm_dep).
+    /// Kept for backward compatibility with rc2 callers that
+    /// constructed `ProjectOptions` literally. When `cs_vm_dep`
+    /// is `None` and this is `Some(path)`, behaves identically to
+    /// `cs_vm_dep = Some(CsVmDep::Path(path))`.
     pub cs_vm_path: Option<PathBuf>,
+}
+
+impl ProjectOptions {
+    /// Resolve the effective cs-vm dependency: prefer `cs_vm_dep`
+    /// if set, fall back to wrapping `cs_vm_path` as
+    /// `CsVmDep::Path`.
+    pub(crate) fn effective_cs_vm_dep(&self) -> Option<CsVmDep> {
+        self.cs_vm_dep
+            .clone()
+            .or_else(|| self.cs_vm_path.clone().map(CsVmDep::Path))
+    }
 }
 
 /// Result of a successful project emission. Caller passes
@@ -150,17 +206,16 @@ fn render_cargo_toml(opts: &ProjectOptions) -> String {
     s.push_str("[dependencies]\n");
     if opts.mode == EmitMode::Nb {
         // Nb mode requires cs-vm in scope for the runtime helpers +
-        // NanboxValue encode/decode in the main shim. The path is
-        // emitted with absolute resolution so the project compiles
-        // wherever it's dropped (no relative-path fragility).
-        let cs_vm_path = opts.cs_vm_path.as_ref().expect(
-            "ProjectOptions::cs_vm_path must be set when mode == Nb \
-             (caller should resolve cs-vm's location before emitting)",
+        // NanboxValue encode/decode in the main shim. The dep can be
+        // either a path (in-workspace dev usage) or a crates.io
+        // version (RC3 Phase 1 iter 1.5 — once iter 1.3 publishes
+        // cs-vm). `effective_cs_vm_dep` prefers the new `cs_vm_dep`
+        // field, falling back to the rc2-era `cs_vm_path`.
+        let dep = opts.effective_cs_vm_dep().expect(
+            "ProjectOptions::cs_vm_dep (or legacy cs_vm_path) must be set when mode == Nb \
+             (caller should resolve cs-vm's location/version before emitting)",
         );
-        s.push_str(&format!(
-            "cs-vm = {{ path = \"{}\" }}\n",
-            cs_vm_path.display()
-        ));
+        s.push_str(&format!("cs-vm = {}\n", dep.to_toml()));
     }
     s.push('\n');
 
@@ -268,4 +323,65 @@ fn render_main_rs(
     src.push_str("}\n");
 
     Ok(src)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cs_vm_dep_path_emits_path_form() {
+        let dep = CsVmDep::Path(PathBuf::from("/abs/path/to/cs-vm"));
+        assert_eq!(dep.to_toml(), "{ path = \"/abs/path/to/cs-vm\" }");
+    }
+
+    #[test]
+    fn cs_vm_dep_version_emits_version_form() {
+        let dep = CsVmDep::Version("0.1".to_string());
+        assert_eq!(dep.to_toml(), "\"0.1\"");
+    }
+
+    #[test]
+    fn effective_cs_vm_dep_prefers_new_field() {
+        // RC3 Phase 1 iter 1.5: when both fields are set, cs_vm_dep
+        // wins (it's the new explicit field; cs_vm_path is the
+        // backward-compat fallback).
+        let opts = ProjectOptions {
+            mode: EmitMode::Nb,
+            package_name: "test".into(),
+            entry_fn_name: "f".into(),
+            cs_vm_dep: Some(CsVmDep::Version("0.2".into())),
+            cs_vm_path: Some(PathBuf::from("/should/be/ignored")),
+        };
+        let dep = opts.effective_cs_vm_dep().unwrap();
+        assert!(matches!(dep, CsVmDep::Version(v) if v == "0.2"));
+    }
+
+    #[test]
+    fn effective_cs_vm_dep_falls_back_to_legacy_path() {
+        // The rc2-era pattern: only cs_vm_path set, cs_vm_dep None.
+        // Must still work — that's the back-compat contract.
+        let opts = ProjectOptions {
+            mode: EmitMode::Nb,
+            package_name: "test".into(),
+            entry_fn_name: "f".into(),
+            cs_vm_dep: None,
+            cs_vm_path: Some(PathBuf::from("/legacy/path")),
+        };
+        let dep = opts.effective_cs_vm_dep().unwrap();
+        assert!(matches!(dep, CsVmDep::Path(p) if p == PathBuf::from("/legacy/path")));
+    }
+
+    #[test]
+    fn effective_cs_vm_dep_none_when_neither_set() {
+        // RawI64 mode use case — no cs-vm needed.
+        let opts = ProjectOptions {
+            mode: EmitMode::RawI64,
+            package_name: "test".into(),
+            entry_fn_name: "f".into(),
+            cs_vm_dep: None,
+            cs_vm_path: None,
+        };
+        assert!(opts.effective_cs_vm_dep().is_none());
+    }
 }

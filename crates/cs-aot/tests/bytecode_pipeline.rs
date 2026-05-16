@@ -158,6 +158,7 @@ fn bytecode_to_rir_to_aot_compiles_fib_end_to_end() {
         mode: EmitMode::Nb,
         package_name: "aot_fib_bytecode".to_string(),
         entry_fn_name: "fib".to_string(),
+        cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_workspace_path()),
     };
 
@@ -231,6 +232,7 @@ fn bytecode_to_rir_to_aot_compiles_fact_end_to_end() {
         mode: EmitMode::Nb,
         package_name: "aot_fact_bytecode".to_string(),
         entry_fn_name: "fact".to_string(),
+        cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_workspace_path()),
     };
 
