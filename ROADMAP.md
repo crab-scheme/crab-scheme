@@ -15,10 +15,10 @@ spec, in which order, with what exit criteria*.
 | M3        | Hygienic macro expander              | `expander`             | Larceny macro tests ≥ 80% pass; bootstrap stdlib in Scheme | ✅ done |
 | M4        | Bytecode VM (warm tier)              | `vm`                   | differential tests pass tree-walker vs VM on ≥ 1k corpus   | ✅ tagged `m4-complete` (1460 tests) |
 | M5        | Precise tracing GC                   | `gc`                   | 24-hour fuzz no leaks; sub-1ms GC pause p99 on stdlib load | ✅ tagged `m5-complete` |
-| M6        | JIT abstraction + Cranelift backend  | `jit-cranelift`        | JIT speedup ≥ 5× over interpreter on Gabriel benchmarks    | ✅ Phase 1+2+3+4 done (Gabriel ungated; Phase 4 = uniform NB + baseline tier) |
+| M6        | JIT abstraction + Cranelift backend  | `jit-cranelift`        | JIT speedup ≥ 5× over interpreter on Gabriel benchmarks    | ✅ Phase 1–4 done (`m6-phase4-complete`); Gabriel geomean **1.74×** as of 2026-05-15 — perf-eng work remains (see `docs/measurements/`) |
 | M7        | HolyJIT backend (primary)            | `jit-holy`             | JIT differential parity with Cranelift backend             | ⏸ parked (ADR 0009 — upstream stale) |
 | M8        | First-class continuations + CWCC     | `continuations`        | Larceny cont tests ≥ 95% pass                              | ✅ VM-tier done (`m8-vm-complete`); walker-tier + Larceny suite deferred |
-| M9        | R6RS standard library completion     | `stdlib`               | R6RS conformance ≥ 99%; Larceny suite ≥ 95%                | ✅ foundation done (`m9-foundation-complete`); conformance measurement deferred |
+| M9        | R6RS standard library completion     | `stdlib`               | R6RS conformance ≥ 99%; Larceny suite ≥ 95%                | ✅ foundation done (`m9-foundation-complete`); R6RS conformance **99.96%** on our corpus / **100%** Racket-cross-validated subset (2026-05-15) — Larceny @ 94% on parsable slice, reader shims would expand sample |
 | M10       | AOT compiler + WASM target           | `aot`, `wasm`          | Static binaries from Scheme; WASM bytecode tier shipping   | — |
 | M11       | Verified core (stretch)              | `verification`         | Mechanized eval semantics with extracted reference         | — |
 
