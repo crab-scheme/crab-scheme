@@ -754,6 +754,57 @@ fn inst_rhs(
             )
         }
 
+        // ---- Equality predicates (RC2 iter S) ----
+        //
+        // EqAny / EqualAny both call cs-vm runtime helpers and
+        // return 0/1 i64. Same NB-Boolean wrap pattern as iter L's
+        // type predicates.
+        (Inst::EqAny(dst, lhs, rhs), m) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            let call = format!(
+                "unsafe {{ cs_vm::vm::vm_eq_any_gc(v{}, v{}) }}",
+                lhs.0, rhs.0
+            );
+            let expr = match m {
+                EmitMode::RawI64 => call,
+                EmitMode::Nb => {
+                    format!("(({call} as u64) | 0xfff8_8000_0000_0000u64) as i64")
+                }
+            };
+            (*dst, expr)
+        }
+        (Inst::EqualAny(dst, lhs, rhs), m) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            let call = format!(
+                "unsafe {{ cs_vm::vm::vm_equal_gc(v{}, v{}) }}",
+                lhs.0, rhs.0
+            );
+            let expr = match m {
+                EmitMode::RawI64 => call,
+                EmitMode::Nb => {
+                    format!("(({call} as u64) | 0xfff8_8000_0000_0000u64) as i64")
+                }
+            };
+            (*dst, expr)
+        }
+
+        // ---- AnyClone (RC2 iter T) ----
+        //
+        // Bumps the refcount on an Any-tagged box. Lowers to
+        // `vm_value_clone_gc(r)` which returns a fresh handle with
+        // an incremented refcount on the same payload. Used when a
+        // value needs to be consumed twice (e.g., passed to two
+        // different runtime helpers).
+        (Inst::AnyClone(dst, src), _) => {
+            check(*src)?;
+            (
+                *dst,
+                format!("unsafe {{ cs_vm::vm::vm_value_clone_gc(v{}) }}", src.0),
+            )
+        }
+
         // ---- Division ----
         //
         // RawI64 mode: integer division via `wrapping_div`. Panics on
@@ -1205,6 +1256,10 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         | Inst::VecLength(v, _) => Some(*v),
         // RC2 iter N — pair primitives.
         Inst::Cons(v, _, _, _, _) | Inst::Car(v, _) | Inst::Cdr(v, _) => Some(*v),
+        // RC2 iter S — equality predicates on Any values.
+        Inst::EqAny(v, _, _) | Inst::EqualAny(v, _, _) => Some(*v),
+        // RC2 iter T — Any-handle refcount clone.
+        Inst::AnyClone(v, _) => Some(*v),
         // RC2 iter D — Flonum unary / binary / predicate Insts.
         Inst::FlonumSqrt(v, _)
         | Inst::FlonumAbs(v, _)
