@@ -124,3 +124,14 @@ fn jit_conformance_call_cc() {
     // up using call/cc semantics; pass count must still match.
     assert_three_tier_pass_count("call_cc.scm");
 }
+
+#[test]
+fn jit_conformance_cross_lambda_loop() {
+    // Regression test for the cross-lambda Fixnum-return loop bug.
+    // Pre-iter3 this produced garbage on --tier vm-jit. Iter3
+    // (53207f2) inadvertently fixed it by adding BoxTyped support
+    // in the uniform-NB tier so the loop body no longer falls back
+    // to specialized with broken return-type inference. See
+    // docs/research/jit_loop_cross_lambda_bug.md.
+    assert_three_tier_pass_count("jit_cross_lambda_loop.scm");
+}
