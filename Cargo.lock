@@ -389,6 +389,7 @@ name = "cs-aot"
 version = "0.0.1"
 dependencies = [
  "cs-rir",
+ "cs-vm",
  "syn",
 ]
 

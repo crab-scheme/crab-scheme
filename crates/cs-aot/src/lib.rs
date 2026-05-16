@@ -5,7 +5,7 @@
 //! the same `cs-rir` IR feeds both the JIT (Cranelift → native
 //! bytes) and the AOT (cs-aot → Rust source → rustc → native bytes).
 //!
-//! ## Status: M10 Track A iter 2a (multi-block + comparisons)
+//! ## Status: M10 Track A iter 2b (NanboxValue ABI)
 //!
 //! - **Multi-block**: functions with branching / loops now compile.
 //!   The emitter falls into one of two shapes:
@@ -23,15 +23,31 @@
 //!   - `Lt`, `Eq` — comparisons return 0/1 as i64, matching the
 //!     JIT's `emit_nb_cmp_fixnum_fast` shape.
 //!   - `Move` — SSA alias copy.
-//! - **All-i64 ABI** remains. NanboxValue carriers + non-Fixnum
-//!   types still arrive in A2b.
+//! - **Two ABI modes** via [`EmitMode`]:
+//!   - [`EmitMode::RawI64`] (iter-1/2a default) — each SSA value is
+//!     a raw `i64`; arithmetic is `wrapping_*`; comparisons return
+//!     0/1. Self-contained: no runtime dependency. Use this for
+//!     functions that operate on pre-decoded fixnums (e.g. tight
+//!     numeric kernels called from a Rust embedder that owns the
+//!     NB encoding boundary).
+//!   - [`EmitMode::Nb`] (iter 2b, new) — each SSA value is an i64
+//!     carrying a [`NanboxValue`] bit pattern. Constants emit as
+//!     NB-encoded literals computed at emit time. Arithmetic and
+//!     comparisons call the runtime's `vm_value_*_nb` helpers
+//!     (which handle Fixnum + Flonum + Rational uniformly).
+//!     Matches the JIT's outer-trampoline ABI so AOT'd functions
+//!     are call-compatible with the runtime's dispatch path.
+//!     Requires `cs-vm` to be in scope at compile time.
 //! - The emitter does not invoke `rustc`; it returns the source as a
 //!   `String`. Callers feed that to their build system.
 //!
 //! ## Invariants & contracts
 //!
-//! - Output is `#![deny(unsafe_code)]` clean — no unsafe blocks in
-//!   emitted code (AOT is meant to be auditable).
+//! - RawI64 output is `#![deny(unsafe_code)]` clean. Nb output uses
+//!   `unsafe { cs_vm::vm::vm_value_*_nb(...) }` blocks — they call
+//!   `extern "C"` runtime helpers, the same shape the JIT emits as
+//!   direct calls. Callers that need unsafe-free output should pick
+//!   RawI64; callers that need NB-compat interop accept the unsafe.
 //! - Output parses as a valid `syn::File`; the AOT tests assert this
 //!   for every emitted snippet, separately from semantic tests that
 //!   actually `rustc` the source.
@@ -106,23 +122,51 @@ impl std::fmt::Display for AotError {
 
 impl std::error::Error for AotError {}
 
-/// Emit Rust source for `func`. The result is a complete
-/// definition: one `pub extern "C" fn` matching the JIT's outer-
-/// trampoline signature.
-///
-/// See the module doc for supported variants and the two output
-/// shapes (straight-line vs loop+match).
+/// Output ABI for the emitted function. See the module doc for the
+/// trade-offs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmitMode {
+    /// Raw `i64` carriers; arithmetic is `wrapping_*`; comparisons
+    /// emit `if v_l <op> v_r { 1 } else { 0 }`. Self-contained:
+    /// emitted source has no runtime dependency. Limited to Fixnum
+    /// inputs (Flonum / other Number types panic-flow through
+    /// undefined behavior — caller's responsibility to gate).
+    RawI64,
+    /// `i64` carriers holding [`cs_vm::vm::NanboxValue`] bit patterns.
+    /// Arithmetic + comparisons delegate to `cs_vm::vm::vm_value_*_nb`
+    /// runtime helpers which handle Fixnum + Flonum + Rational
+    /// uniformly. Emitted source requires `cs-vm` in scope.
+    Nb,
+}
+
+/// Emit Rust source for `func` using the iter-1/2a [`EmitMode::RawI64`]
+/// ABI. Preserved for backward compatibility with iter-1 tests +
+/// embedders that want self-contained fixnum-only emission. New code
+/// should prefer [`emit_with`] with [`EmitMode::Nb`] for runtime
+/// interop.
 pub fn emit(func: &Function) -> Result<String, AotError> {
+    emit_with(EmitMode::RawI64, func)
+}
+
+/// Emit Rust source for `func` under the specified [`EmitMode`].
+/// The result is a complete definition: one `pub extern "C" fn`
+/// matching the JIT's outer-trampoline signature.
+pub fn emit_with(mode: EmitMode, func: &Function) -> Result<String, AotError> {
     // ---- Function-level validation -------------------------------
     if func.blocks.is_empty() {
         return Err(AotError::EmptyFunction);
     }
-    if func.return_type != Type::Fixnum {
-        return Err(AotError::UnsupportedReturnType);
-    }
-    for (_, ty) in &func.params {
-        if *ty != Type::Fixnum {
-            return Err(AotError::UnsupportedParamType);
+    // RawI64 mode only handles Fixnum-typed params/return. Nb mode
+    // accepts any param/return type because the i64 NB carrier is
+    // uniform across all Scheme value variants.
+    if mode == EmitMode::RawI64 {
+        if func.return_type != Type::Fixnum {
+            return Err(AotError::UnsupportedReturnType);
+        }
+        for (_, ty) in &func.params {
+            if *ty != Type::Fixnum {
+                return Err(AotError::UnsupportedParamType);
+            }
         }
     }
 
@@ -143,7 +187,7 @@ pub fn emit(func: &Function) -> Result<String, AotError> {
     writeln!(out, "///").unwrap();
     writeln!(
         out,
-        "/// {} param(s) · {} block(s) · {} inst(s) · {} · all-i64 ABI",
+        "/// {} param(s) · {} block(s) · {} inst(s) · {} · {} ABI",
         func.params.len(),
         func.blocks.len(),
         func.blocks.iter().map(|b| b.insts.len()).sum::<usize>(),
@@ -151,6 +195,10 @@ pub fn emit(func: &Function) -> Result<String, AotError> {
             "straight-line"
         } else {
             "loop+match"
+        },
+        match mode {
+            EmitMode::RawI64 => "raw-i64",
+            EmitMode::Nb => "NB-i64",
         }
     )
     .unwrap();
@@ -168,9 +216,9 @@ pub fn emit(func: &Function) -> Result<String, AotError> {
     out.push_str(") -> i64 {\n");
 
     if straight_line {
-        emit_straight_line(&mut out, func)?;
+        emit_straight_line(&mut out, func, mode)?;
     } else {
-        emit_loop_match(&mut out, func)?;
+        emit_loop_match(&mut out, func, mode)?;
     }
 
     out.push_str("}\n");
@@ -181,12 +229,12 @@ pub fn emit(func: &Function) -> Result<String, AotError> {
 /// Return value as a trailing tail expression. Preserves snapshot-
 /// test output for simple functions and is more readable when the
 /// CFG is degenerate.
-fn emit_straight_line(out: &mut String, func: &Function) -> Result<(), AotError> {
+fn emit_straight_line(out: &mut String, func: &Function, mode: EmitMode) -> Result<(), AotError> {
     let block = &func.blocks[0];
     let mut defined: HashSet<Value> = func.params.iter().map(|(v, _)| *v).collect();
 
     for inst in &block.insts {
-        emit_inst_let(out, inst, &defined)?;
+        emit_inst_let(out, inst, &defined, mode)?;
         if let Some(dst) = inst_dst(inst) {
             defined.insert(dst);
         }
@@ -210,7 +258,7 @@ fn emit_straight_line(out: &mut String, func: &Function) -> Result<(), AotError>
 /// `loop { match block { ... } }` state machine for block dispatch.
 /// Verbose but always correct for arbitrary CFGs without needing
 /// liveness analysis.
-fn emit_loop_match(out: &mut String, func: &Function) -> Result<(), AotError> {
+fn emit_loop_match(out: &mut String, func: &Function, mode: EmitMode) -> Result<(), AotError> {
     // Pre-declare every Value that ISN'T already a function
     // parameter. Block params and Inst destinations all go here.
     // Using `let mut` + assignment (not `let`) means a Value defined
@@ -248,9 +296,9 @@ fn emit_loop_match(out: &mut String, func: &Function) -> Result<(), AotError> {
     for block in &func.blocks {
         writeln!(out, "            {} => {{", block.id.0).unwrap();
         for inst in &block.insts {
-            emit_inst_assign(out, inst)?;
+            emit_inst_assign(out, inst, mode)?;
         }
-        emit_terminator(out, &block.terminator, func)?;
+        emit_terminator(out, &block.terminator, func, mode)?;
         writeln!(out, "            }}").unwrap();
     }
 
@@ -266,20 +314,25 @@ fn emit_loop_match(out: &mut String, func: &Function) -> Result<(), AotError> {
 /// Emit an Inst as `let v_N: i64 = expr;` (straight-line shape).
 /// Used only by `emit_straight_line`; the loop+match shape uses
 /// `emit_inst_assign` instead (assignment to pre-declared mut).
-fn emit_inst_let(out: &mut String, inst: &Inst, defined: &HashSet<Value>) -> Result<(), AotError> {
-    let (dst, expr) = inst_rhs(inst, Some(defined))?;
+fn emit_inst_let(
+    out: &mut String,
+    inst: &Inst,
+    defined: &HashSet<Value>,
+    mode: EmitMode,
+) -> Result<(), AotError> {
+    let (dst, expr) = inst_rhs(inst, Some(defined), mode)?;
     writeln!(out, "    let v{}: i64 = {};", dst.0, expr).unwrap();
     Ok(())
 }
 
 /// Emit an Inst as `v_N = expr;` (loop+match shape). The Value is
 /// pre-declared as `let mut` at function top.
-fn emit_inst_assign(out: &mut String, inst: &Inst) -> Result<(), AotError> {
+fn emit_inst_assign(out: &mut String, inst: &Inst, mode: EmitMode) -> Result<(), AotError> {
     // The loop+match shape pre-declares all values; SSA validity is
     // a property of well-formed RIR, not something we re-check here
     // (the check requires cross-block dataflow analysis we don't yet
     // do in the emitter). Pass `None` to skip.
-    let (dst, expr) = inst_rhs(inst, None)?;
+    let (dst, expr) = inst_rhs(inst, None, mode)?;
     writeln!(out, "                v{} = {};", dst.0, expr).unwrap();
     Ok(())
 }
@@ -288,7 +341,11 @@ fn emit_inst_assign(out: &mut String, inst: &Inst) -> Result<(), AotError> {
 /// is in Rust source form ready to be assigned. When `defined` is
 /// `Some(set)`, perform use-before-def detection against it; when
 /// `None`, skip (the loop+match shape uses this).
-fn inst_rhs(inst: &Inst, defined: Option<&HashSet<Value>>) -> Result<(Value, String), AotError> {
+fn inst_rhs(
+    inst: &Inst,
+    defined: Option<&HashSet<Value>>,
+    mode: EmitMode,
+) -> Result<(Value, String), AotError> {
     let check = |v: Value| -> Result<(), AotError> {
         match defined {
             Some(set) if !set.contains(&v) => Err(AotError::UndefinedValue(v)),
@@ -296,27 +353,71 @@ fn inst_rhs(inst: &Inst, defined: Option<&HashSet<Value>>) -> Result<(Value, Str
         }
     };
 
-    Ok(match inst {
-        Inst::LoadConst(dst, c) => (*dst, const_to_rust_i64(c)?),
-        Inst::Add(dst, lhs, rhs) => {
+    Ok(match (inst, mode) {
+        // ---- LoadConst ----
+        (Inst::LoadConst(dst, c), EmitMode::RawI64) => (*dst, const_to_rust_i64(c)?),
+        (Inst::LoadConst(dst, c), EmitMode::Nb) => (*dst, const_to_rust_nb(c)?),
+
+        // ---- Arithmetic ----
+        //
+        // RawI64: `wrapping_*` ops, self-contained.
+        // Nb: delegate to runtime helpers (matches JIT slow path;
+        //     A2c-ish optimization can add inline fast paths).
+        (Inst::Add(dst, lhs, rhs), EmitMode::RawI64) => {
             check(*lhs)?;
             check(*rhs)?;
             (*dst, format!("v{}.wrapping_add(v{})", lhs.0, rhs.0))
         }
-        Inst::Sub(dst, lhs, rhs) => {
+        (Inst::Sub(dst, lhs, rhs), EmitMode::RawI64) => {
             check(*lhs)?;
             check(*rhs)?;
             (*dst, format!("v{}.wrapping_sub(v{})", lhs.0, rhs.0))
         }
-        Inst::Mul(dst, lhs, rhs) => {
+        (Inst::Mul(dst, lhs, rhs), EmitMode::RawI64) => {
             check(*lhs)?;
             check(*rhs)?;
             (*dst, format!("v{}.wrapping_mul(v{})", lhs.0, rhs.0))
         }
-        Inst::Lt(dst, lhs, rhs) => {
-            // Match the JIT's `emit_nb_cmp_fixnum_fast` shape:
-            // comparison returns 0/1 as an i64 (the bare integer,
-            // pre-NB-tag — A2b adds the NB Boolean tag).
+        (Inst::Add(dst, lhs, rhs), EmitMode::Nb) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_value_add_nb(v{}, v{}) }}",
+                    lhs.0, rhs.0
+                ),
+            )
+        }
+        (Inst::Sub(dst, lhs, rhs), EmitMode::Nb) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_value_sub_nb(v{}, v{}) }}",
+                    lhs.0, rhs.0
+                ),
+            )
+        }
+        (Inst::Mul(dst, lhs, rhs), EmitMode::Nb) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_value_mul_nb(v{}, v{}) }}",
+                    lhs.0, rhs.0
+                ),
+            )
+        }
+
+        // ---- Comparisons ----
+        //
+        // RawI64: produce 0/1 i64, matching the JIT's `emit_nb_cmp_
+        // fixnum_fast` pre-tag shape.
+        // Nb: delegate to vm_value_*_nb which returns an NB Boolean.
+        (Inst::Lt(dst, lhs, rhs), EmitMode::RawI64) => {
             check(*lhs)?;
             check(*rhs)?;
             (
@@ -324,7 +425,7 @@ fn inst_rhs(inst: &Inst, defined: Option<&HashSet<Value>>) -> Result<(Value, Str
                 format!("if v{} < v{} {{ 1 }} else {{ 0 }}", lhs.0, rhs.0),
             )
         }
-        Inst::Eq(dst, lhs, rhs) => {
+        (Inst::Eq(dst, lhs, rhs), EmitMode::RawI64) => {
             check(*lhs)?;
             check(*rhs)?;
             (
@@ -332,16 +433,48 @@ fn inst_rhs(inst: &Inst, defined: Option<&HashSet<Value>>) -> Result<(Value, Str
                 format!("if v{} == v{} {{ 1 }} else {{ 0 }}", lhs.0, rhs.0),
             )
         }
-        Inst::Move(dst, src) => {
+        (Inst::Lt(dst, lhs, rhs), EmitMode::Nb) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_value_lt_nb(v{}, v{}) }}",
+                    lhs.0, rhs.0
+                ),
+            )
+        }
+        (Inst::Eq(dst, lhs, rhs), EmitMode::Nb) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_value_eq_nb(v{}, v{}) }}",
+                    lhs.0, rhs.0
+                ),
+            )
+        }
+
+        // ---- Move (alias) ----
+        // Identical across modes: i64 → i64 copy.
+        (Inst::Move(dst, src), _) => {
             check(*src)?;
             (*dst, format!("v{}", src.0))
         }
-        other => return Err(AotError::UnsupportedInst(inst_variant_name(other))),
+
+        // ---- Unsupported ----
+        (other, _) => return Err(AotError::UnsupportedInst(inst_variant_name(other))),
     })
 }
 
 /// Emit the terminator for a block in the loop+match shape.
-fn emit_terminator(out: &mut String, term: &Term, func: &Function) -> Result<(), AotError> {
+fn emit_terminator(
+    out: &mut String,
+    term: &Term,
+    func: &Function,
+    mode: EmitMode,
+) -> Result<(), AotError> {
     match term {
         Term::Return(v) => {
             writeln!(out, "                return v{};", v.0).unwrap();
@@ -367,10 +500,21 @@ fn emit_terminator(out: &mut String, term: &Term, func: &Function) -> Result<(),
             writeln!(out, "                continue;").unwrap();
         }
         Term::Branch(cond, then_target, else_target) => {
-            // The JIT (and our Lt/Eq emission) produces 0/1 as i64;
-            // any non-zero value is truthy, matching cs-vm's NB
-            // brif semantics (NB Boolean payload's low bit).
-            writeln!(out, "                if v{} != 0 {{", cond.0).unwrap();
+            // Truthiness predicate depends on ABI:
+            //   - RawI64 mode: Lt/Eq emit `1` for true, `0` for false,
+            //     so plain `cond != 0` works.
+            //   - Nb mode: Lt/Eq delegate to `vm_value_*_nb` which
+            //     return NB-encoded Booleans. NB false has a specific
+            //     bit pattern (0xFFF8_8000_0000_0000); EVERY other
+            //     value — including NB Fixnum 0 and NB true — is
+            //     truthy, matching Scheme's `#f`-is-the-only-false
+            //     semantics. We compare against the NB false literal
+            //     so `(if 0 a b)` correctly takes the `a` branch.
+            let truthy_pred = match mode {
+                EmitMode::RawI64 => format!("v{} != 0", cond.0),
+                EmitMode::Nb => format!("v{} != {}", cond.0, nb_false_literal()),
+            };
+            writeln!(out, "                if {truthy_pred} {{").unwrap();
             writeln!(out, "                    block = {};", then_target.0).unwrap();
             writeln!(out, "                    continue;").unwrap();
             writeln!(out, "                }} else {{").unwrap();
@@ -380,6 +524,15 @@ fn emit_terminator(out: &mut String, term: &Term, func: &Function) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// The NB-encoded `#f` literal as a Rust source expression. Used by
+/// NB-mode Branch terminators for the truthiness test.
+fn nb_false_literal() -> &'static str {
+    // NB_SIGNATURE_BITS | (NB_TAG_BOOLEAN << NB_TAG_SHIFT) | 0
+    //   = 0xFFF8_0000_0000_0000 | (1 << 47)
+    //   = 0xFFF8_8000_0000_0000
+    "0xfff8_8000_0000_0000u64 as i64"
 }
 
 /// Return the destination Value an Inst writes, if any. Used for
@@ -450,6 +603,49 @@ fn const_to_rust_i64(c: &Const) -> Result<String, AotError> {
         Const::Symbol(_) => Err(AotError::UnsupportedConst("Symbol")),
         Const::StringRef(_) => Err(AotError::UnsupportedConst("StringRef")),
     }
+}
+
+/// Compute the NB-encoded i64 literal for a Const at emit time.
+/// The bit pattern is computed using the same formulas as
+/// `cs_vm::vm::NanboxValue::{fixnum, boolean, ...}`, so emitted
+/// code carries the literal bits directly instead of calling into
+/// the runtime for the encoding.
+///
+/// This keeps the emitter standalone (no cs-vm at emit time) and
+/// lets `rustc -O` constant-fold the literal at compile time.
+fn const_to_rust_nb(c: &Const) -> Result<String, AotError> {
+    // NB layout (mirroring cs_vm::vm::NB_*):
+    //   bits 63..51:  signature 0xFFF8 (12 bits set + sign bit)
+    //   bits 50..47:  tag (4 bits)
+    //   bits 46..0:   payload (47 bits)
+    const NB_SIGNATURE_BITS: u64 = 0xFFF8_0000_0000_0000;
+    const NB_TAG_SHIFT: u32 = 47;
+    const NB_PAYLOAD_MASK: u64 = (1u64 << 47) - 1;
+    // Tag values from cs_vm::vm.
+    const NB_TAG_FIXNUM: u64 = 0;
+    const NB_TAG_BOOLEAN: u64 = 1;
+    const NB_TAG_CHARACTER: u64 = 2;
+    const NB_TAG_NULL: u64 = 4;
+    const NB_TAG_UNSPECIFIED: u64 = 5;
+    const NB_TAG_EOF: u64 = 6;
+    let nb_make = |tag: u64, payload: u64| -> u64 {
+        NB_SIGNATURE_BITS | ((tag & 0xF) << NB_TAG_SHIFT) | (payload & NB_PAYLOAD_MASK)
+    };
+    let bits: u64 = match c {
+        Const::Fixnum(n) => nb_make(NB_TAG_FIXNUM, (*n as u64) & NB_PAYLOAD_MASK),
+        Const::Boolean(false) => nb_make(NB_TAG_BOOLEAN, 0),
+        Const::Boolean(true) => nb_make(NB_TAG_BOOLEAN, 1),
+        Const::Character(c) => nb_make(NB_TAG_CHARACTER, *c as u64),
+        Const::Null => nb_make(NB_TAG_NULL, 0),
+        Const::Unspecified => nb_make(NB_TAG_UNSPECIFIED, 0),
+        Const::Eof => nb_make(NB_TAG_EOF, 0),
+        Const::Flonum(f) => f.to_bits(), // NB Flonum = raw f64 bits
+        Const::Symbol(_) => return Err(AotError::UnsupportedConst("Symbol")),
+        Const::StringRef(_) => return Err(AotError::UnsupportedConst("StringRef")),
+    };
+    // Render as a hex literal with the i64 suffix. Using hex makes
+    // the high bits readable (NB carriers all start with 0xFFF8...).
+    Ok(format!("0x{:016x}u64 as i64", bits))
 }
 
 fn require_defined(defined: &HashSet<Value>, v: Value) -> Result<(), AotError> {

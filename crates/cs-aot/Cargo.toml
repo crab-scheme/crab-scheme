@@ -10,6 +10,11 @@ description = "Ahead-of-time compiler for CrabScheme: consumes cs-rir Function v
 cs-rir = { workspace = true }
 
 [dev-dependencies]
+# A2b NB-mode tests link the emitted source against cs-vm to use
+# its `vm_value_*_nb` runtime helpers + `NanboxValue` encode/decode.
+# Dev-only because cs-aot itself doesn't depend on the runtime —
+# it just emits source that references the runtime's public API.
+cs-vm = { workspace = true }
 # `syn` parses the emitted Rust source as a sanity check that we
 # produce well-formed code, separate from compilation tests that
 # actually invoke rustc on the output.

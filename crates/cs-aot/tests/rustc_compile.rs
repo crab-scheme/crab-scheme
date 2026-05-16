@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use cs_aot::emit;
+use cs_aot::{emit, emit_with, EmitMode};
 use cs_rir::{Block, BlockId, Const, Function, Inst, Term, Type, Value};
 
 /// Build a runnable test binary from the emitted source.
@@ -257,6 +257,202 @@ fn aot_iterative_sum_loop_via_jump() {
     assert_eq!(run_aot_binary(&bin, &[10]), 55);
     assert_eq!(run_aot_binary(&bin, &[100]), 5050);
     assert_eq!(run_aot_binary(&bin, &[1000]), 500500);
+}
+
+// ---------------------------------------------------------------------
+// NB-mode end-to-end tests (iter 2b)
+//
+// NB mode's emitted source references `cs_vm::vm::vm_value_*_nb`.
+// We can't link cs-vm with bare `rustc` (it has external crate deps:
+// num-bigint, num-rational, etc.), so we build via cargo with a
+// tmp project that declares cs-vm as a path dependency. Slower than
+// the RawI64 tests but proves the end-to-end NB ABI pipeline.
+// ---------------------------------------------------------------------
+
+/// Compile an NB-mode emitted snippet into a runnable binary by
+/// spawning a tmp cargo project that links cs-vm.
+///
+/// The wrapper main encodes each argv arg as an NB Fixnum, calls the
+/// AOT'd function (which now operates in NB), decodes the result as
+/// a fixnum, and prints it. Round-tripping through cs-vm's actual
+/// NanboxValue encode/decode is intentional — it's what catches ABI
+/// mismatches between the emitter's `const_to_rust_nb` bit-layout
+/// and the runtime's actual NB shape.
+fn build_aot_binary_nb(emitted: &str, fn_name: &str, n_params: usize) -> PathBuf {
+    let pid = std::process::id();
+    let tmpdir = std::env::temp_dir().join(format!("cs-aot-nb-{fn_name}-{pid}"));
+    let _ = fs::remove_dir_all(&tmpdir); // start clean to avoid stale artifacts
+    fs::create_dir_all(tmpdir.join("src")).expect("create src");
+
+    // Resolve cs-vm's absolute path relative to cs-aot's manifest.
+    // CARGO_MANIFEST_DIR is the cs-aot crate root at test compile time.
+    let cs_aot_manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cs_vm_path = cs_aot_manifest_dir
+        .parent()
+        .expect("cs-aot has parent dir (crates/)")
+        .join("cs-vm");
+    assert!(
+        cs_vm_path.exists(),
+        "expected cs-vm at {}",
+        cs_vm_path.display()
+    );
+
+    // Package + bin name must be unique per test, otherwise tests
+    // sharing CARGO_TARGET_DIR overwrite each other's `aot_bin` and
+    // we end up reading the wrong binary (race + stale-artifact bug
+    // that produced silent test failures in the iter-2b NB tests).
+    let pkg_name = format!("aot_nb_test_{fn_name}");
+    let bin_name = format!("aot_bin_{fn_name}");
+    let cargo_toml = format!(
+        r#"[package]
+name = "{pkg_name}"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+cs-vm = {{ path = "{cs_vm_path}" }}
+
+[[bin]]
+name = "{bin_name}"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+"#,
+        cs_vm_path = cs_vm_path.display(),
+    );
+    fs::write(tmpdir.join("Cargo.toml"), cargo_toml).expect("write Cargo.toml");
+
+    let mut src = String::from("#![allow(unused, unused_unsafe)]\n");
+    src.push_str(emitted);
+    src.push('\n');
+    src.push_str("use cs_vm::vm::NanboxValue;\n");
+    src.push_str("fn main() {\n");
+    src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
+    let mut call_args = String::new();
+    for i in 0..n_params {
+        if i > 0 {
+            call_args.push_str(", ");
+        }
+        call_args.push_str(&format!(
+            "NanboxValue::fixnum(args[{}].parse::<i64>().unwrap()).into_raw()",
+            i + 1
+        ));
+    }
+    src.push_str(&format!(
+        "    let result_nb: i64 = {fn_name}({call_args});\n"
+    ));
+    src.push_str("    let nb = NanboxValue(result_nb);\n");
+    src.push_str("    let n = nb.as_fixnum().expect(\"NB result is a fixnum\");\n");
+    src.push_str("    println!(\"{}\", n);\n");
+    src.push_str("}\n");
+    fs::write(tmpdir.join("src/main.rs"), &src).expect("write main.rs");
+
+    // Share the workspace target dir so cs-vm + deps don't get
+    // rebuilt for every NB test. We construct the target path
+    // relative to cs-aot's manifest, pointing at the workspace root.
+    let workspace_root = cs_aot_manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("cs-aot is two levels below workspace root");
+    let target_dir = workspace_root.join("target/aot-nb-tests");
+
+    let output = Command::new("cargo")
+        .current_dir(&tmpdir)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .arg("build")
+        .arg("--release")
+        .arg("--bin")
+        .arg(&bin_name)
+        .arg("--offline")
+        .output()
+        .expect("cargo executes");
+    assert!(
+        output.status.success(),
+        "cargo build failed on NB AOT'd source:\n--- src ---\n{}\n--- stderr ---\n{}\n--- stdout ---\n{}",
+        src,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+
+    target_dir.join(format!("release/{bin_name}"))
+}
+
+#[test]
+fn aot_sq_nb_runs_correctly() {
+    // Same RIR as aot_sq_runs_correctly, but emitted under NB ABI.
+    // (* x x) → vm_value_mul_nb(v0, v0), result is an NB Fixnum.
+    let mut f = Function::new("sq_nb");
+    f.params.push((Value(0), Type::Fixnum));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![Inst::Mul(Value(1), Value(0), Value(0))],
+        terminator: Term::Return(Value(1)),
+    });
+
+    let src = emit_with(EmitMode::Nb, &f).unwrap();
+    assert!(
+        src.contains("vm_value_mul_nb"),
+        "NB emit should reference vm_value_mul_nb: {src}"
+    );
+    let bin = build_aot_binary_nb(&src, "sq_nb", 1);
+
+    assert_eq!(run_aot_binary(&bin, &[0]), 0);
+    assert_eq!(run_aot_binary(&bin, &[7]), 49);
+    assert_eq!(run_aot_binary(&bin, &[-3]), 9);
+    assert_eq!(run_aot_binary(&bin, &[12345]), 152399025);
+}
+
+#[test]
+fn aot_iterative_sum_nb_via_jump() {
+    // Same iterative sum as the RawI64 variant — but emitted under
+    // NB ABI. This proves loop+match + Jump-with-args + NB
+    // arithmetic helpers all compose correctly. Catches any tag
+    // smearing that would corrupt the back-edge param assignment.
+    let mut f = Function::new("sum_nb");
+    f.params.push((Value(0), Type::Fixnum));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            Inst::LoadConst(Value(1), Const::Fixnum(1)),
+            Inst::LoadConst(Value(2), Const::Fixnum(0)),
+        ],
+        terminator: Term::Jump(BlockId(1), vec![Value(1), Value(2)]),
+    });
+    f.blocks.push(Block {
+        id: BlockId(1),
+        params: vec![(Value(3), Type::Fixnum), (Value(4), Type::Fixnum)],
+        insts: vec![Inst::Lt(Value(5), Value(0), Value(3))],
+        terminator: Term::Branch(Value(5), BlockId(2), BlockId(3)),
+    });
+    f.blocks.push(Block {
+        id: BlockId(2),
+        params: vec![],
+        insts: vec![],
+        terminator: Term::Return(Value(4)),
+    });
+    f.blocks.push(Block {
+        id: BlockId(3),
+        params: vec![],
+        insts: vec![
+            Inst::LoadConst(Value(6), Const::Fixnum(1)),
+            Inst::Add(Value(7), Value(3), Value(6)),
+            Inst::Add(Value(8), Value(4), Value(3)),
+        ],
+        terminator: Term::Jump(BlockId(1), vec![Value(7), Value(8)]),
+    });
+
+    let src = emit_with(EmitMode::Nb, &f).unwrap();
+    let bin = build_aot_binary_nb(&src, "sum_nb", 1);
+
+    assert_eq!(run_aot_binary(&bin, &[0]), 0);
+    assert_eq!(run_aot_binary(&bin, &[1]), 1);
+    assert_eq!(run_aot_binary(&bin, &[10]), 55);
+    assert_eq!(run_aot_binary(&bin, &[100]), 5050);
 }
 
 #[test]
