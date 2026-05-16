@@ -406,6 +406,45 @@ fn compile_expr(
                     }
                 }
             }
+            // Phase 5b iter9 — let* inlining at compile time.
+            // Pattern: `((lambda (x) body) arg)` — produced by the
+            // expander for `let*` (which rewrites to a nested chain
+            // of single-binding lambda-apps).
+            //
+            // The default path emits MakeClosure + Call which spawns
+            // a fresh closure and dispatches through CallGeneral.
+            // For non-escaping single-binding lets (the common case),
+            // we compile as EnterScope + DefineLocal + body + LeaveScope.
+            //
+            // Gate: ONLY single-binding (1 arg). Multi-binding lets
+            // (e.g. `(let ((r ...) (c ...)) body)` from safe?-style
+            // helpers) trade one Gc-alloc + IC-cached dispatch for
+            // multiple per-binding EnvDefineLocal helper calls per
+            // iteration — net regression in tight loops where the IC
+            // already caches the closure call. Single-binding wins
+            // because the body still has one EnvDefineLocal but
+            // saves the closure allocation entirely.
+            if let CoreExpr::Lambda {
+                params,
+                body,
+                span: lam_s,
+                ..
+            } = &**func
+            {
+                if params.rest.is_none() && params.fixed.len() == 1 && args.len() == 1 {
+                    let frame: std::collections::HashSet<Symbol> =
+                        params.fixed.iter().copied().collect();
+                    scope.push(frame);
+                    out.push(Inst::EnterScope, *lam_s);
+                    let name = params.fixed[0];
+                    compile_expr(&args[0], out, lambdas, false, globals, primops, scope)?;
+                    out.push(Inst::DefineLocal(name), args[0].span());
+                    compile_expr(body, out, lambdas, is_tail, globals, primops, scope)?;
+                    out.push(Inst::LeaveScope, body.span());
+                    scope.pop();
+                    return Ok(());
+                }
+            }
             compile_expr(func, out, lambdas, false, globals, primops, scope)?;
             for a in args {
                 compile_expr(a, out, lambdas, false, globals, primops, scope)?;
