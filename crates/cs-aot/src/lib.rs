@@ -1015,14 +1015,26 @@ fn inst_rhs(
         // embedded at translate time) that vm_alloc_pair_gc passes
         // to the underlying allocator. car/cdr are simple slot
         // accessors via the *_gc helpers.
-        (Inst::Cons(dst, car_v, car_tag, cdr_v, cdr_tag), _) => {
+        (Inst::Cons(dst, car_v, car_tag, cdr_v, cdr_tag), mode) => {
             check(*car_v)?;
             check(*cdr_v)?;
+            // RC3 iter 2.16 — in NB mode, operands are NB-encoded i64
+            // carriers. vm_alloc_pair_gc routes the tag byte through
+            // i64_to_value, which only knows how to decode NB via the
+            // JIT_RT_ANY arm (other tags treat the i64 as a raw
+            // value and produce garbage). Force JIT_RT_ANY in NB
+            // mode regardless of what the translator inferred. The
+            // RawI64 mode keeps the original tag (operands are raw
+            // i64 there).
+            let (car_t, cdr_t) = match mode {
+                EmitMode::RawI64 => (*car_tag, *cdr_tag),
+                EmitMode::Nb => (15u8, 15u8), // JIT_RT_ANY
+            };
             (
                 *dst,
                 format!(
                     "unsafe {{ cs_vm::vm::vm_alloc_pair_gc(v{}, {}u8, v{}, {}u8) }}",
-                    car_v.0, car_tag, cdr_v.0, cdr_tag
+                    car_v.0, car_t, cdr_v.0, cdr_t
                 ),
             )
         }
