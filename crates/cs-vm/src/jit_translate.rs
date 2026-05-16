@@ -70,6 +70,56 @@ pub fn bytecode_to_rir(
     bytecode_to_rir_with_hints(lambda, name, self_name, None)
 }
 
+/// RC2 iter J — `bytecode_to_rir` plus a post-translation pass that
+/// demotes non-escaping `EnvDefineLocal`/`EnvLookup*` pairs to SSA
+/// aliases in the entry block. The transformation is the same one
+/// the JIT already runs on inlined leaf-callees (see
+/// `demote_env_to_ssa_in_first_block`'s doc) — it eliminates env
+/// round-trips that arise from `(let ((x ...)) body)` desugaring
+/// when `x` doesn't escape the body.
+///
+/// **Why expose this as a separate entry point:** the JIT only
+/// applies the demote during inlining because for top-level JIT
+/// bodies the env round-trip is harmless (the helpers exist
+/// because JIT bodies run with `JIT_CALLER_ENV` installed). cs-aot
+/// has no equivalent install API, so `EnvDefineLocal`/`EnvLookup*`
+/// don't lower — programs that use `let` fail today. Demoting at
+/// the top level makes `let`-using programs AOT-able without
+/// adding Env-Inst support to cs-aot.
+///
+/// On failure (env op references a symbol not defined in this body
+/// — i.e. a free variable from an enclosing closure): falls back
+/// to the un-demoted RIR. cs-aot will then surface the specific
+/// unhandled Inst in its `UnsupportedInst` error, same as today.
+pub fn bytecode_to_rir_aot(
+    lambda: &CompiledLambda,
+    name: impl Into<String>,
+    self_name: Option<Symbol>,
+) -> Result<Function, TranslateError> {
+    let mut func = bytecode_to_rir(lambda, name, self_name)?;
+    // Gate the demote to single-block functions. The underlying
+    // `demote_env_to_ssa_in_first_block` only rewrites operands in
+    // the first block + its terminator (matching the JIT-inliner
+    // use case where the inlined callee is already known to be
+    // single-block). For multi-block functions, later blocks'
+    // Insts/Terms keep references to the alias destinations the
+    // demote dropped — producing cargo-build-time "value not found
+    // in scope" errors instead of a clean AotError diagnostic.
+    //
+    // Without the demote, multi-block let-using functions fall
+    // through to cs-aot's existing UnsupportedInst path with a
+    // clean error naming the specific Env Inst. Future iters can
+    // extend the demote to walk all blocks; for RC2 single-block
+    // covers the most common case (`(define (f x) (let ...) body)`
+    // with no internal branching).
+    if func.blocks.len() == 1 {
+        // Best-effort: on bail (free-var EnvLookup) we leave `func`
+        // untouched and downstream sees the original Env Insts.
+        let _ = demote_env_to_ssa_in_first_block(&mut func);
+    }
+    Ok(func)
+}
+
 /// Phase 6 Stage A iter 2 — maximum inline-recursion depth. Caps
 /// nested leaf-callee inlining so a body that calls another body
 /// that calls another body doesn't blow up code size or recurse

@@ -32,7 +32,7 @@ use cs_expand::Expander;
 use cs_parse::read_all;
 use cs_vm::compile_with_globals_and_primops;
 use cs_vm::compiler::PrimOp;
-use cs_vm::jit_translate::bytecode_to_rir;
+use cs_vm::jit_translate::bytecode_to_rir_aot;
 
 /// Mirrors cs_runtime's private primop_table. The compiler uses
 /// this to emit AddFx2/SubFx2/etc. specialized opcodes instead of
@@ -149,7 +149,7 @@ fn aot_compile_and_run(
     fn_name: &str,
     pkg_suffix: &str,
 ) -> PathBuf {
-    let rir = bytecode_to_rir(&lam, fn_name, Some(entry_sym))
+    let rir = bytecode_to_rir_aot(&lam, fn_name, Some(entry_sym))
         .expect("bytecode_to_rir succeeds on source-derived lambda");
 
     let pid = std::process::id();
@@ -251,6 +251,50 @@ fn source_to_aot_picks_entry_by_name_in_multi_define() {
     assert_eq!(run_with_arg(&bin, 3), 27);
     assert_eq!(run_with_arg(&bin, 5), 125);
     assert_eq!(run_with_arg(&bin, 10), 1000);
+}
+
+#[test]
+fn source_to_aot_function_with_let_binding() {
+    // RC2 iter J — `let` inside a function body. Pre-iter-J, the
+    // bytecode→RIR translator emitted `EnvDefineLocal +
+    // EnvLookupAny + AnyToFix` for the binding, which surfaced
+    // as `UnsupportedInst` in cs-aot. Post-iter-J, `bytecode_to_
+    // rir_aot` demotes the env round-trip to SSA aliases and the
+    // identity-in-NB ops (AnyToFix etc.) lower to Move.
+    //
+    // `(define (f n) (let ((doubled (* n 2))) (+ doubled 1)))`
+    // is the smallest test of this — exercises both
+    // EnvDefineLocal + EnvLookupAny in one let-binding.
+    let (lam, sym) = compile_source_to_lambda(
+        "(define (f n) (let ((doubled (* n 2))) (+ doubled 1)))",
+        "f",
+    );
+    let bin = aot_compile_and_run(lam, sym, "f", "let_doubled");
+    assert_eq!(run_with_arg(&bin, 0), 1);
+    assert_eq!(run_with_arg(&bin, 5), 11);
+    assert_eq!(run_with_arg(&bin, 10), 21);
+}
+
+#[test]
+fn source_to_aot_function_with_nested_lets() {
+    // Two let bindings in sequence — iter J's demote pass needs
+    // to handle a chain of EnvDefineLocal+EnvLookupAny round-trips,
+    // not just one. Both bindings live as SSA aliases after
+    // demotion.
+    //
+    // `(define (g n)
+    //    (let ((a (* n n)))
+    //      (let ((b (+ a 1)))
+    //        (- b 1))))`
+    // → g(n) = n*n. Verifies the chained-let path lands clean.
+    let (lam, sym) = compile_source_to_lambda(
+        "(define (g n) (let ((a (* n n))) (let ((b (+ a 1))) (- b 1))))",
+        "g",
+    );
+    let bin = aot_compile_and_run(lam, sym, "g", "nested_let");
+    assert_eq!(run_with_arg(&bin, 0), 0);
+    assert_eq!(run_with_arg(&bin, 3), 9);
+    assert_eq!(run_with_arg(&bin, 7), 49);
 }
 
 #[test]

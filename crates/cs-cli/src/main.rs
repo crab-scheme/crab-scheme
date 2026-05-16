@@ -125,7 +125,7 @@ fn run_aot(file: &str, output: Option<&str>, entry: Option<&str>, build: bool) -
     use cs_expand::Expander;
     use cs_parse::read_all;
     use cs_vm::compiler::PrimOp;
-    use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir};
+    use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir_aot};
 
     // --- Read source ----
     let src = match fs::read_to_string(file) {
@@ -252,7 +252,7 @@ fn run_aot(file: &str, output: Option<&str>, entry: Option<&str>, build: bool) -
     };
 
     // --- Translate to RIR ----
-    let rir = match bytecode_to_rir(&lam, &entry_name, Some(entry_sym)) {
+    let rir = match bytecode_to_rir_aot(&lam, &entry_name, Some(entry_sym)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("crabscheme aot: bytecode→RIR error: {e:?}");

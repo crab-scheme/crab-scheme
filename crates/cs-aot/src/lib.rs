@@ -604,6 +604,34 @@ fn inst_rhs(
             (*dst, format!("v{}", src.0))
         }
 
+        // ---- Identity-in-NB ops (RC2 iter J) ----
+        //
+        // In the uniform-NB ABI cs-aot's Nb mode shares with the JIT,
+        // these box/unbox/bitcast Insts are all no-ops because every
+        // typed-lane value is already an NB carrier with its proper
+        // tag. The JIT's lowering at cs-jit-cranelift/src/lowering.rs
+        // explicitly comments "BoxTyped is an identity in uniform-NB"
+        // and groups the rest of this set under the same identity arm.
+        // cs-aot mirrors that — emit as Move.
+        //
+        // In RawI64 mode these don't have a defined meaning (RawI64
+        // doesn't track NB tags), so we accept the identity emission
+        // as the natural fallback; callers using RawI64 shouldn't be
+        // feeding it programs that rely on Any/Fixnum unboxing.
+        (Inst::AnyToFix(dst, src), _)
+        | (Inst::AnyToBool(dst, src), _)
+        | (Inst::AnyToFlo(dst, src), _)
+        | (Inst::AnyTruthy(dst, src), _)
+        | (Inst::FixToFlo(dst, src), _)
+        | (Inst::IntCharBitcast(dst, src), _) => {
+            check(*src)?;
+            (*dst, format!("v{}", src.0))
+        }
+        (Inst::BoxTyped(dst, src, _tag), _) => {
+            check(*src)?;
+            (*dst, format!("v{}", src.0))
+        }
+
         // ---- Division ----
         //
         // RawI64 mode: integer division via `wrapping_div`. Panics on
@@ -1017,6 +1045,16 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         | Inst::FlonumMul(v, _, _)
         | Inst::FlonumDiv(v, _, _) => Some(*v),
         Inst::FlonumLt(v, _, _) | Inst::FlonumEq(v, _, _) => Some(*v),
+        // RC2 iter J — identity-in-NB ops (BoxTyped, AnyTo*, FixToFlo,
+        // IntCharBitcast). All emit to a Move-style alias; their dst
+        // must be pre-declared for loop+match emission.
+        Inst::BoxTyped(v, _, _) => Some(*v),
+        Inst::AnyToFix(v, _)
+        | Inst::AnyToBool(v, _)
+        | Inst::AnyToFlo(v, _)
+        | Inst::AnyTruthy(v, _)
+        | Inst::FixToFlo(v, _)
+        | Inst::IntCharBitcast(v, _) => Some(*v),
         // RC2 iter D — Flonum unary / binary / predicate Insts.
         Inst::FlonumSqrt(v, _)
         | Inst::FlonumAbs(v, _)
