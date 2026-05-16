@@ -6,21 +6,34 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-# M10 Track W iter 1 — feature-flag JIT + FFI so the runtime can build
-# for targets that don't support runtime native codegen (WASM) or
-# dynamic library loading (WASM, sandboxed embeds).
+# M10 Track W iter 1 + closeout — feature flags so the runtime can
+# build for targets that don't support runtime native codegen (WASM)
+# or dynamic library loading (WASM, sandboxed embeds).
 #
 # `default` keeps the native build's surface identical to pre-M10.
 # `--no-default-features` produces a minimal runtime suitable for
-# wasm32-wasip1 (track W iter 2+).
-default = ["jit", "ffi"]
+# wasm32-wasip1.
+default = ["jit", "ffi-dynamic"]
 # Enables `cs-jit*` deps and `Runtime::install_jit` / `jit_lowerer`.
 # Disabled in WASM and AOT-binary builds (which inline their codegen
 # at build time instead of at runtime).
 jit = ["dep:cs-jit", "dep:cs-jit-cranelift"]
-# Enables `cs-ffi*` deps and `Runtime::load_shared_library` /
-# `register_host_procedure`. Disabled in WASM (no `dlopen`).
-ffi = ["dep:cs-ffi", "dep:libloading"]
+# Enables the `cs-ffi` trait surface (HostProcedure, RuntimeFfi ABI
+# types) and `Runtime::register_host_procedure`. Pure Rust; portable
+# to WASM. A WASM embedder that wants custom Scheme builtins
+# implemented in Rust enables `ffi-trait` but skips `ffi-dynamic`.
+ffi-trait = ["dep:cs-ffi"]
+# Enables dynamic shared-library loading: `(load-shared-library)`,
+# `RuntimeFfiContext` (the dlopen-time C-ABI context), the `CAbiProc`
+# wrapper adapting C-ABI plugins to the HostProcedure trait. Requires
+# `libloading::Library::new` which is unavailable on WASM (no
+# `dlopen`). Implies `ffi-trait`.
+ffi-dynamic = ["ffi-trait", "dep:libloading"]
+# Convenience alias preserving the pre-closeout name. Equivalent to
+# enabling both `ffi-trait` and `ffi-dynamic`. Kept so external Rust
+# embedders that wrote `features = ["ffi"]` against the W1 API stay
+# building.
+ffi = ["ffi-dynamic"]
 
 [dependencies]
 cs-core = { workspace = true }

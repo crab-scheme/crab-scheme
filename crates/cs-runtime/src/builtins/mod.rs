@@ -9702,13 +9702,15 @@ fn b_eval(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
 
 // ---- load-shared-library ----
 //
-// M10 W1: gated on the `ffi` feature. With the feature disabled
-// (e.g. WASM builds) the builtin reports an error explaining the
-// missing capability rather than silently being absent — keeps the
-// builtin name available so Scheme code's existence check remains
-// well-defined.
+// M10 W1 + closeout: gated on `ffi-dynamic`. The builtin name stays
+// defined in all builds so Scheme-side existence checks remain
+// well-formed; the disabled-feature stub reports the missing
+// capability instead of being absent. A WASM build that wants
+// custom Rust-implemented Scheme builtins compiles them in directly
+// via the `ffi-trait` feature + `Runtime::register_host_procedure`
+// at embedder-startup time, rather than via dlopen.
 
-#[cfg(feature = "ffi")]
+#[cfg(feature = "ffi-dynamic")]
 fn b_load_shared_library(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("load-shared-library", "1", args.len()));
@@ -9727,10 +9729,10 @@ fn b_load_shared_library(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, St
     Ok(Value::Unspecified)
 }
 
-#[cfg(not(feature = "ffi"))]
+#[cfg(not(feature = "ffi-dynamic"))]
 fn b_load_shared_library(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> {
     let _ = args;
-    Err("load-shared-library: FFI not available in this build (built --no-default-features without `ffi`)".to_string())
+    Err("load-shared-library: dynamic library loading not available in this build (no `ffi-dynamic` feature, e.g. WASM target). Use `Runtime::register_host_procedure` from the embedder instead.".to_string())
 }
 
 // ---- error-object accessors ----

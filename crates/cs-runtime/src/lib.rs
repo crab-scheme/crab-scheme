@@ -4,7 +4,12 @@ pub mod active;
 pub mod builtins;
 pub mod env;
 pub mod eval;
-#[cfg(feature = "ffi")]
+// The `ffi` module contains only the libloading-using dlopen path
+// (`load_shared_library`, `RuntimeFfiContext`, `CAbiProc`) — gated
+// on `ffi-dynamic`. The pure-Rust trait surface (HostProcedure,
+// register_host_procedure) lives in `lib.rs` under `ffi-trait` so
+// it remains available in WASM builds.
+#[cfg(feature = "ffi-dynamic")]
 pub mod ffi;
 #[cfg(feature = "jit")]
 pub mod jit;
@@ -48,16 +53,18 @@ pub struct Runtime {
     /// Shared libraries loaded via [`Runtime::load_shared_library`].
     /// Held here only so the plugin's text segment stays mapped for
     /// the runtime's lifetime; we never inspect them after register.
-    /// (M10 W1: gated on the `ffi` feature — WASM doesn't have
-    /// `dlopen`.)
-    #[cfg(feature = "ffi")]
+    /// (M10 W1: gated on `ffi-dynamic` — WASM has no `dlopen`.
+    /// Plugins compiled-in via the `ffi-trait` API don't need this.)
+    #[cfg(feature = "ffi-dynamic")]
     loaded_libs: Vec<libloading::Library>,
-    /// Cached C-ABI context. Lazily initialized on first FFI use;
+    /// Cached C-ABI context. Lazily initialized on first dlopen use;
     /// kept alive for the runtime's lifetime so registered host
     /// procedures' captured back-pointers stay valid. Boxed so the
     /// runtime back-pointer (which equals `self`) stays valid even
-    /// if Runtime fields are reordered.
-    #[cfg(feature = "ffi")]
+    /// if Runtime fields are reordered. Only the dlopen path
+    /// constructs this — `ffi-trait`-only embedders register their
+    /// procedures via `register_host_procedure` directly.
+    #[cfg(feature = "ffi-dynamic")]
     ffi_ctx: Option<Box<crate::ffi::RuntimeFfiContext>>,
     /// JIT lowerer; populated by [`Runtime::install_jit`]. None
     /// means the runtime hasn't opted into JIT (closures stay on
@@ -1644,9 +1651,9 @@ impl Runtime {
             // "null" ValueRef. Internal Pinned guards never use 0
             // either, so the convention is consistent across users.
             next_pin_id: Rc::new(Cell::new(1)),
-            #[cfg(feature = "ffi")]
+            #[cfg(feature = "ffi-dynamic")]
             loaded_libs: Vec::new(),
-            #[cfg(feature = "ffi")]
+            #[cfg(feature = "ffi-dynamic")]
             ffi_ctx: None,
             #[cfg(feature = "jit")]
             jit_lowerer: None,
@@ -1764,9 +1771,12 @@ impl Runtime {
     /// See `.spec-workflow/specs/ffi/{requirements,design}.md` and
     /// `docs/adr/0008-ffi-design.md`.
     ///
-    /// (M10 W1: gated on the `ffi` feature — WASM doesn't have
-    /// `dlopen`, and the HostProcedure trait lives in `cs-ffi`.)
-    #[cfg(feature = "ffi")]
+    /// (M10 W1 + closeout: gated on `ffi-trait`. The trait itself is
+    /// pure Rust and portable to WASM, so a WASM embedder that wants
+    /// custom Rust-implemented Scheme builtins enables `ffi-trait`
+    /// and calls this method directly — without needing `ffi-dynamic`
+    /// (which adds the dlopen path that WASM can't support).)
+    #[cfg(feature = "ffi-trait")]
     pub fn register_host_procedure(&mut self, proc: std::sync::Arc<dyn cs_ffi::HostProcedure>) {
         let name_owned: String = proc.name().to_string();
         let name_static: &'static str = Box::leak(name_owned.into_boxed_str());

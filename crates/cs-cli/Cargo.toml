@@ -10,11 +10,16 @@ name = "crabscheme"
 path = "src/main.rs"
 
 [features]
-# M10 Track W iter 1 — mirror cs-runtime's feature flags. The CLI's
-# default keeps the full native build (jit + ffi). --no-default-
-# features produces a minimal build suitable for WASM (W2+).
-default = ["jit", "ffi"]
+# M10 Track W iter 1 + closeout — mirror cs-runtime's feature flags.
+# `default` keeps the full native build (jit + ffi-dynamic). A WASM
+# build uses `--no-default-features`; an in-process Rust embedder
+# that wants custom builtins without dlopen uses `--features
+# ffi-trait` (e.g. for compile-into-WASM plugins).
+default = ["jit", "ffi-dynamic"]
 jit = ["cs-runtime/jit"]
+ffi-trait = ["cs-runtime/ffi-trait"]
+ffi-dynamic = ["cs-runtime/ffi-dynamic"]
+# Backward-compat alias matching the W1 feature name.
 ffi = ["cs-runtime/ffi"]
 
 [dependencies]
