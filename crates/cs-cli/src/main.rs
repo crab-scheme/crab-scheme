@@ -119,6 +119,17 @@ enum Cmd {
         /// AOT together.
         #[arg(long = "multi")]
         multi: bool,
+        /// RC3 Phase 6 iter 6.6: after `--build`, also run the
+        /// AOT'd binary AND the JIT tier on the given sample arg
+        /// list, and warn if the two outputs disagree. Cheap
+        /// insurance against silent codegen regressions; use when
+        /// shipping a binary you can't independently verify.
+        ///
+        /// Format: `--verify "1 2 3"` (space-separated args, same
+        /// shape the AOT'd binary would receive). Exit code 0 on
+        /// match, non-zero with diagnostic on mismatch.
+        #[arg(long = "verify", value_name = "ARGS")]
+        verify: Option<String>,
     },
     /// RC3 Phase 4 iter 4.5: self-test the AOT installation. Runs
     /// a baked-in `(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))`
@@ -155,20 +166,36 @@ fn main() -> ExitCode {
             emit_rust_source,
             explain,
             multi,
+            verify,
         }) => {
             if explain {
                 run_aot_explain(&file)
             } else if multi {
                 run_aot_multi(&file, output.as_deref(), build)
             } else {
-                run_aot(
+                let code = run_aot(
                     &file,
                     output.as_deref(),
                     entry.as_deref(),
                     build,
                     emit_rir,
                     emit_rust_source,
-                )
+                );
+                // RC3 iter 6.6: --verify is a post-step on top of
+                // --build. Only runs if the AOT build succeeded.
+                if let Some(args) = verify {
+                    if matches!(code, ExitCode::SUCCESS) && build {
+                        let sample_args: Vec<&str> = args.split_whitespace().collect();
+                        run_aot_verify(&file, entry.as_deref(), output.as_deref(), &sample_args)
+                    } else {
+                        eprintln!(
+                            "crabscheme aot --verify requires --build (and a successful AOT build); skipping verify"
+                        );
+                        code
+                    }
+                } else {
+                    code
+                }
             }
         }
         #[cfg(feature = "aot")]
@@ -1052,6 +1079,119 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
             eprintln!("crabscheme aot --multi: cargo not found / failed to spawn: {e}");
             ExitCode::from(5)
         }
+    }
+}
+
+/// RC3 Phase 6 iter 6.6: AOT-vs-JIT cross-check.
+///
+/// After a successful `crabscheme aot ... --build`, this helper
+/// runs both the AOT'd binary AND the JIT tier on the same sample
+/// args and asserts the outputs match. Mismatch = silent codegen
+/// regression; the diff harness in `tests/diff_aot_vs_jit.rs` uses
+/// the same pattern as test coverage.
+///
+/// The caller has already AOT-built the project at `<basename>-aot/`
+/// (or the user's `-o` dir). We re-derive the binary path, run it,
+/// then re-run via cs_runtime + JIT for the same `(entry args)`
+/// invocation. On mismatch, print both outputs + exit non-zero.
+#[cfg(feature = "aot")]
+fn run_aot_verify(
+    file: &str,
+    entry: Option<&str>,
+    output: Option<&str>,
+    sample_args: &[&str],
+) -> ExitCode {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    // 1. Resolve the entry name + binary path the same way run_aot did.
+    let entry_name = entry.unwrap_or_else(|| basename_no_ext(file)).to_string();
+    let pkg_name = sanitize_pkg_name(&entry_name);
+    let out_dir = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{}-aot", basename_no_ext(file))));
+    let bin_path = out_dir.join("target/release").join(&pkg_name);
+    if !bin_path.exists() {
+        eprintln!(
+            "crabscheme aot --verify: AOT binary not found at {} (did --build succeed?)",
+            bin_path.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    // 2. Run AOT binary with sample args.
+    let aot_out = Command::new(&bin_path)
+        .args(sample_args)
+        .output()
+        .expect("AOT binary executes");
+    if !aot_out.status.success() {
+        eprintln!(
+            "crabscheme aot --verify: AOT binary exited non-zero ({})",
+            aot_out.status
+        );
+        return ExitCode::from(2);
+    }
+    let aot_stdout = String::from_utf8_lossy(&aot_out.stdout).trim().to_string();
+
+    // 3. Run the same call through cs_runtime + JIT.
+    let src = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("crabscheme aot --verify: cannot re-read {file}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut rt = Runtime::new();
+    #[cfg(feature = "jit")]
+    if let Err(e) = rt.install_jit() {
+        eprintln!("crabscheme aot --verify: failed to install JIT: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(diag) = rt.eval_str_via_vm(file, &src) {
+        eprintln!(
+            "crabscheme aot --verify: JIT-tier eval failed on source: {}",
+            diag.message
+        );
+        return ExitCode::from(1);
+    }
+    let call_expr = format!("({entry_name} {})", sample_args.join(" "));
+    let v = match rt.eval_str_via_vm("<verify-call>", &call_expr) {
+        Ok(v) => v,
+        Err(diag) => {
+            eprintln!(
+                "crabscheme aot --verify: JIT-tier call `{call_expr}` failed: {}",
+                diag.message
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let jit_stdout = match &v {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => n.to_string(),
+        // AOT today only returns Fixnums via the Nb shim; other Value
+        // variants would indicate a contract mismatch with AOT's
+        // emitted main shim.
+        other => {
+            eprintln!(
+                "crabscheme aot --verify: JIT-tier returned non-Fixnum Value: {other:?} \
+                 (AOT can only verify Fixnum-returning entries today)"
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    // 4. Compare.
+    if aot_stdout == jit_stdout {
+        println!(
+            "crabscheme aot --verify: OK — AOT and JIT agree on `({entry_name} {}): {jit_stdout}`",
+            sample_args.join(" ")
+        );
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "crabscheme aot --verify: MISMATCH on `({entry_name} {})`:\n  AOT: {aot_stdout:?}\n  JIT: {jit_stdout:?}\n\nThis indicates a codegen bug; please file an issue with the source + sample args.",
+            sample_args.join(" ")
+        );
+        ExitCode::from(6)
     }
 }
 
