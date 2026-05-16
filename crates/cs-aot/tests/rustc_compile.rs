@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use cs_aot::{emit, emit_with, EmitMode};
+use cs_aot::{emit, emit_with, nb_helpers_source, EmitMode};
 use cs_rir::{Block, BlockId, Const, Function, Inst, Term, Type, Value};
 
 /// Build a runnable test binary from the emitted source.
@@ -324,6 +324,10 @@ opt-level = 3
     fs::write(tmpdir.join("Cargo.toml"), cargo_toml).expect("write Cargo.toml");
 
     let mut src = String::from("#![allow(unused, unused_unsafe)]\n");
+    // NB-mode emitted source references `nb_*_inline` helpers; the
+    // caller (this test scaffold, and project.rs for project builds)
+    // is required to inject them once per translation unit.
+    src.push_str(nb_helpers_source());
     src.push_str(emitted);
     src.push('\n');
     src.push_str("use cs_vm::vm::NanboxValue;\n");
@@ -381,7 +385,9 @@ opt-level = 3
 #[test]
 fn aot_sq_nb_runs_correctly() {
     // Same RIR as aot_sq_runs_correctly, but emitted under NB ABI.
-    // (* x x) → vm_value_mul_nb(v0, v0), result is an NB Fixnum.
+    // (* x x) lowers to nb_mul_inline(v0, v0); the helper inlines
+    // the Fixnum fast path and falls back to vm_value_mul_nb on a
+    // tag miss. Result is an NB Fixnum.
     let mut f = Function::new("sq_nb");
     f.params.push((Value(0), Type::Fixnum));
     f.entry = BlockId(0);
@@ -394,8 +400,8 @@ fn aot_sq_nb_runs_correctly() {
 
     let src = emit_with(EmitMode::Nb, &f).unwrap();
     assert!(
-        src.contains("vm_value_mul_nb"),
-        "NB emit should reference vm_value_mul_nb: {src}"
+        src.contains("nb_mul_inline"),
+        "NB emit should call nb_mul_inline helper: {src}"
     );
     let bin = build_aot_binary_nb(&src, "sq_nb", 1);
 

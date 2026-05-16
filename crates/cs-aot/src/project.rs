@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use cs_rir::Function;
 
-use crate::{emit_with, sanitize_ident_for_project, AotError, EmitMode};
+use crate::{emit_with, nb_helpers_source, sanitize_ident_for_project, AotError, EmitMode};
 
 /// Errors specific to project emission (separate from per-function
 /// emit errors; those bubble through `Aot`).
@@ -189,6 +189,14 @@ fn render_main_rs(
          //! Do not edit by hand — re-run cs-aot::project::emit_project to refresh.\n",
     );
     src.push_str("#![allow(unused, unused_unsafe)]\n\n");
+
+    // Nb mode: prepend the inline NB fast-path helpers once at the
+    // top of the translation unit. Each emitted function's
+    // arith/cmp ops are calls into these helpers (nb_add_inline,
+    // etc.) — see `nb_helpers_source` for the contract.
+    if opts.mode == EmitMode::Nb {
+        src.push_str(nb_helpers_source());
+    }
 
     // Emit every Function in declaration order. Self-recursion (via
     // `CallSelf`) works because each function refers to itself by

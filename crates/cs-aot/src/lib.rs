@@ -78,6 +78,149 @@ pub(crate) fn sanitize_ident_for_project(name: &str) -> String {
     sanitize_ident(name)
 }
 
+/// Rust source for the NB-mode inline fast-path helpers.
+///
+/// Emitted-source contract (RC2 iter A): in [`EmitMode::Nb`] every
+/// `Inst::{Add,Sub,Mul,Lt,Eq}` lowers to a call like
+/// `nb_add_inline(va, vb)`. The helper does the JIT's inline NB
+/// Fixnum fast path open-coded — tag check → sign-extend → checked
+/// arith → range check → re-encode — and only falls back to the
+/// `vm_value_*_nb` runtime helper on a tag miss or overflow.
+/// `#[inline(always)]` lets `rustc -O` constant-fold the tag check
+/// away when type-feedback eventually proves both operands are
+/// always Fixnum (the AOT analog of the JIT's type guards).
+///
+/// Callers must inject this source ONCE into the same translation
+/// unit as the emitted functions:
+/// - Single-function callers (test harnesses) prepend it before
+///   the [`emit_with`] output in their main shim.
+/// - [`project::emit_project`] prepends it inside `src/main.rs`
+///   before any function bodies.
+///
+/// Mirrors the bit layout in `cs_vm::vm`: NB_SIGNATURE_BITS =
+/// 0xFFF8_0000_0000_0000, tag occupies bits 47-50 (FIXNUM tag is
+/// 0), payload is the low 47 bits sign-extended. The constants
+/// here are duplicated literals (not `cs_vm` re-exports) so the
+/// AOT source can stay self-contained at emit time — the runtime
+/// `unsafe` calls are the only `cs_vm` references.
+pub fn nb_helpers_source() -> &'static str {
+    NB_HELPERS_SOURCE
+}
+
+const NB_HELPERS_SOURCE: &str = r##"// --- NB inline fast-path helpers (cs-aot RC2 iter A) -------------
+//
+// Tag check, sign-extend payload, checked arith, range check, encode.
+// On any miss (non-Fixnum operand or 47-bit overflow), delegate to
+// the cs_vm runtime helper which handles Flonum/Rational/etc.
+
+#[allow(dead_code)]
+const NB_FIX_SIG_MASK: u64 = 0xFFFF_8000_0000_0000; // SIGNATURE | TAG bits
+#[allow(dead_code)]
+const NB_FIX_SIG_PAT:  u64 = 0xFFF8_0000_0000_0000; // SIG | (FIXNUM_TAG<<47)
+#[allow(dead_code)]
+const NB_PAYLOAD_MASK: u64 = (1u64 << 47) - 1;
+#[allow(dead_code)]
+const NB_TRUE_BITS:    i64 = 0xFFF8_8000_0000_0001u64 as i64;
+#[allow(dead_code)]
+const NB_FALSE_BITS:   i64 = 0xFFF8_8000_0000_0000u64 as i64;
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_extract_fixnum(payload: u64) -> i64 {
+    // Sign-extend the low 47 bits: shl 17, then arithmetic shr 17.
+    (((payload & NB_PAYLOAD_MASK) as i64) << 17) >> 17
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_encode_fixnum_if_fits(r: i64) -> Option<i64> {
+    // 47-bit Fixnum range check: round-trip through sign-extend.
+    let r_ext = (r << 17) >> 17;
+    if r == r_ext {
+        Some(((r as u64 & NB_PAYLOAD_MASK) | NB_FIX_SIG_PAT) as i64)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_both_fixnum(a: i64, b: i64) -> bool {
+    let (au, bu) = (a as u64, b as u64);
+    (au & NB_FIX_SIG_MASK) == NB_FIX_SIG_PAT
+        && (bu & NB_FIX_SIG_MASK) == NB_FIX_SIG_PAT
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_add_inline(a: i64, b: i64) -> i64 {
+    if nb_both_fixnum(a, b) {
+        let pa = nb_extract_fixnum(a as u64);
+        let pb = nb_extract_fixnum(b as u64);
+        if let Some(r) = pa.checked_add(pb) {
+            if let Some(enc) = nb_encode_fixnum_if_fits(r) {
+                return enc;
+            }
+        }
+    }
+    unsafe { cs_vm::vm::vm_value_add_nb(a, b) }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_sub_inline(a: i64, b: i64) -> i64 {
+    if nb_both_fixnum(a, b) {
+        let pa = nb_extract_fixnum(a as u64);
+        let pb = nb_extract_fixnum(b as u64);
+        if let Some(r) = pa.checked_sub(pb) {
+            if let Some(enc) = nb_encode_fixnum_if_fits(r) {
+                return enc;
+            }
+        }
+    }
+    unsafe { cs_vm::vm::vm_value_sub_nb(a, b) }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_mul_inline(a: i64, b: i64) -> i64 {
+    if nb_both_fixnum(a, b) {
+        let pa = nb_extract_fixnum(a as u64);
+        let pb = nb_extract_fixnum(b as u64);
+        if let Some(r) = pa.checked_mul(pb) {
+            if let Some(enc) = nb_encode_fixnum_if_fits(r) {
+                return enc;
+            }
+        }
+    }
+    unsafe { cs_vm::vm::vm_value_mul_nb(a, b) }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_lt_inline(a: i64, b: i64) -> i64 {
+    if nb_both_fixnum(a, b) {
+        let pa = nb_extract_fixnum(a as u64);
+        let pb = nb_extract_fixnum(b as u64);
+        return if pa < pb { NB_TRUE_BITS } else { NB_FALSE_BITS };
+    }
+    unsafe { cs_vm::vm::vm_value_lt_nb(a, b) }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_eq_inline(a: i64, b: i64) -> i64 {
+    if nb_both_fixnum(a, b) {
+        let pa = nb_extract_fixnum(a as u64);
+        let pb = nb_extract_fixnum(b as u64);
+        return if pa == pb { NB_TRUE_BITS } else { NB_FALSE_BITS };
+    }
+    unsafe { cs_vm::vm::vm_value_eq_nb(a, b) }
+}
+// --- end NB inline fast-path helpers ----------------------------
+
+"##;
+
 /// Errors the AOT emitter can return.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AotError {
@@ -402,38 +545,24 @@ fn inst_rhs(
             check(*rhs)?;
             (*dst, format!("v{}.wrapping_mul(v{})", lhs.0, rhs.0))
         }
+        // Nb mode: call into the prologue helpers (nb_*_inline) the
+        // caller is expected to inject — open-coded tag check +
+        // checked arith + encode, with fallback to vm_value_*_nb on
+        // miss. See `nb_helpers_source()` for the helper definitions.
         (Inst::Add(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (
-                *dst,
-                format!(
-                    "unsafe {{ cs_vm::vm::vm_value_add_nb(v{}, v{}) }}",
-                    lhs.0, rhs.0
-                ),
-            )
+            (*dst, format!("nb_add_inline(v{}, v{})", lhs.0, rhs.0))
         }
         (Inst::Sub(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (
-                *dst,
-                format!(
-                    "unsafe {{ cs_vm::vm::vm_value_sub_nb(v{}, v{}) }}",
-                    lhs.0, rhs.0
-                ),
-            )
+            (*dst, format!("nb_sub_inline(v{}, v{})", lhs.0, rhs.0))
         }
         (Inst::Mul(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (
-                *dst,
-                format!(
-                    "unsafe {{ cs_vm::vm::vm_value_mul_nb(v{}, v{}) }}",
-                    lhs.0, rhs.0
-                ),
-            )
+            (*dst, format!("nb_mul_inline(v{}, v{})", lhs.0, rhs.0))
         }
 
         // ---- Comparisons ----
@@ -460,24 +589,12 @@ fn inst_rhs(
         (Inst::Lt(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (
-                *dst,
-                format!(
-                    "unsafe {{ cs_vm::vm::vm_value_lt_nb(v{}, v{}) }}",
-                    lhs.0, rhs.0
-                ),
-            )
+            (*dst, format!("nb_lt_inline(v{}, v{})", lhs.0, rhs.0))
         }
         (Inst::Eq(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (
-                *dst,
-                format!(
-                    "unsafe {{ cs_vm::vm::vm_value_eq_nb(v{}, v{}) }}",
-                    lhs.0, rhs.0
-                ),
-            )
+            (*dst, format!("nb_eq_inline(v{}, v{})", lhs.0, rhs.0))
         }
 
         // ---- Move (alias) ----
