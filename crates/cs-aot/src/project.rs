@@ -172,7 +172,18 @@ fn render_cargo_toml(opts: &ProjectOptions) -> String {
     // opt-level=3 + no LTO: matches workspace defaults for
     // dev-cycle predictability. iter-4 bench harness can override
     // by editing the emitted Cargo.toml directly.
-    s.push_str("[profile.release]\nopt-level = 3\n");
+    s.push_str("[profile.release]\nopt-level = 3\n\n");
+
+    // Empty `[workspace]` table: opt this project OUT of any
+    // enclosing cargo workspace. Without it, AOT'ing into a
+    // directory that lives below an existing workspace's root
+    // (e.g. emitting into `target/aot-comparison/<name>/` inside
+    // crabscheme's own checkout) fails with "current package
+    // believes it's in a workspace when it's not". Standalone
+    // emission with no enclosing workspace is unaffected — an
+    // empty `[workspace]` table on a single-package manifest is a
+    // no-op there.
+    s.push_str("[workspace]\n");
 
     s
 }
