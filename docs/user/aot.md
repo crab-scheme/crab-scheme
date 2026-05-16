@@ -66,7 +66,63 @@ crabscheme aot <file> [flags]
       --build             Also invoke `cargo build --release` and print binary path
       --emit-rir          Print the post-translate RIR to stdout (debug aid)
       --emit-rust-source  Print the emitted src/main.rs to stdout (debug aid)
+      --explain           Survey lambdas + report AOT compatibility per entry
+                          (RC3 Phase 4). Doesn't emit a project; exits 0 if
+                          ≥1 entry is compatible, 3 if none.
+
+crabscheme aot-doctor                    (RC3 Phase 4)
+
+  Self-test the AOT installation. Runs a baked-in fact program
+  through the full pipeline + asserts the binary returns 120 for
+  fact(5). Useful for verifying a release-installed binary works
+  on the user's platform.
 ```
+
+### Typical user flow
+
+```bash
+1. crabscheme aot-doctor                          # verify install
+2. crabscheme aot prog.scm --explain              # survey what compiles
+3. crabscheme aot prog.scm --entry <name> --build # ship it
+4. ./prog-aot/target/release/<name> <args>        # run
+5. ./prog-aot/target/release/<name> --version     # check provenance
+```
+
+### AOT'd binary flags
+
+Every AOT-compiled binary (the output of `crabscheme aot ... --build`)
+intercepts `--version` / `-V` before the entry call:
+
+```
+$ ./fact-aot/target/release/fact --version
+compiled by crabscheme (cs-aot 0.0.1) from entry `fact` (NB ABI)
+```
+
+Bug reports should include this line so the maintainers know which
+crabscheme produced the binary.
+
+### Diagnostics
+
+When the AOT pipeline rejects a program, the error includes a
+user-meaningful description + suggested workaround:
+
+```
+$ crabscheme aot multi-fn.scm --entry main
+crabscheme aot: project emit error: cs-aot project: emit error in function `main`:
+  cs-aot: Inst::EnvLookupAny not yet supported — your program references a
+  variable that isn't an argument or a let-binding within the AOT'd function
+  — typically a free variable captured from an enclosing scope, or a global
+  that AOT can't yet reach without runtime env support
+    suggestion: if the variable is a top-level define, inline the value or
+    pass it as an argument. For deeper fixes, this needs Phase 2.4 (env
+    install API) so AOT'd code can read from the runtime env.
+    reference: docs/user/aot.md (Supported/Unsupported tables)
+```
+
+The 7 most-likely-to-be-hit Inst names (MakeClosure, Call, CallGeneral,
+EnvLookupAny, EnvLookup, EnvDefineLocal, EnvSet, Div) each have their
+own description + actionable workaround. See
+`crates/cs-aot/src/lib.rs` `inst_user_hint(...)`.
 
 ## What works
 

@@ -11,9 +11,12 @@ $ crabscheme -e '(letrec ((fib (lambda (n) (if (< n 2) n (+ (fib (- n 1)) (fib (
 
 ## Status
 
-**1.0 Release Candidate 2** in progress on the `rc2` branch.
-**1.0-rc1** tagged at commit `17632e7` with native +
-`wasm32-wasip1` release binaries at
+**1.0 Release Candidate 3** in progress on the `rc3` branch
+(AOT hardening per
+[`docs/milestones/aot-hardening-plan.md`](docs/milestones/aot-hardening-plan.md)).
+**1.0-rc2** tagged with native + WASM release binaries at
+[github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc2](https://github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc2);
+**1.0-rc1** at
 [github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc1](https://github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc1).
 All ROADMAP milestones M0–M10 are complete and tagged. See
 [`docs/measurements/2026-05-16-1.0-rc-readiness.md`](docs/measurements/2026-05-16-1.0-rc-readiness.md)
