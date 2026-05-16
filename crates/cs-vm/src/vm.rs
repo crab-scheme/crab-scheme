@@ -14888,6 +14888,198 @@ trace_leaf_proc!(
     VmContinuation,
 );
 
+// =========================================================================
+// RC3 Phase 2 iter 2.1 — AOT-procedure public API surface
+// =========================================================================
+//
+// The cs-aot project emitter needs to wrap a Rust `extern "C" fn`
+// (an AOT-compiled lambda) as a Scheme `Procedure` value so that
+// `MakeClosure` + general `Call` can flow through it. This module
+// adds the minimum public surface for that:
+//
+//   - `VmAotClosure` — Procedure-impl that stores a fn pointer + arity.
+//   - `vm_alloc_aot_procedure` — allocates one, returns an NB carrier.
+//   - `vm_call_aot_procedure`  — invokes one, given NB-encoded args.
+//
+// The AOT-emitted dispatch signature is `extern "C" fn(*const i64,
+// usize) -> i64` — takes a slice of NB-encoded args + count, returns
+// an NB-encoded result. cs-aot generates one of these wrappers per
+// AOT'd lambda (iter 2.2's scope; this iter only provides the
+// runtime surface).
+//
+// Capture semantics intentionally NOT included in 2.1 — see iter
+// 2.4 plan in aot-hardening-plan.md. This API is sufficient for
+// non-capturing nested lambdas and direct general-Call dispatch
+// (iter 2.2 + 2.3).
+
+/// AOT-procedure dispatch signature: takes an args slice (NB-encoded
+/// i64s) + length, returns an NB-encoded i64. cs-aot emits one of
+/// these wrappers per AOT'd top-level lambda.
+pub type AotDispatchFn = unsafe extern "C" fn(*const i64, usize) -> i64;
+
+/// Procedure-impl wrapping an AOT-emitted dispatch fn pointer +
+/// declared arity.
+///
+/// Lives behind `Rc<dyn Procedure>` in the proc_table. The fn pointer
+/// must stay live for the duration the procedure is reachable —
+/// AOT'd binaries embed the dispatch fn as a static symbol, so this
+/// is trivially satisfied (the pointer is just an address in the
+/// binary's `.text` section).
+#[derive(Debug)]
+pub struct VmAotClosure {
+    /// Function pointer to the AOT-emitted dispatch wrapper. Stored
+    /// as `usize` so the struct is `Trace`-friendly (no Gc-tracked
+    /// pointer to worry about) and stays Send-able if we ever need
+    /// cross-thread Procedure handles.
+    fn_ptr: usize,
+    /// Declared arity (number of positional args). `vm_call_aot_
+    /// procedure` validates the caller's arg count against this
+    /// before invoking — catches obvious shape mismatches before
+    /// the dispatch fn would.
+    arity: u32,
+    /// Optional name used for diagnostics (Procedure trait method).
+    /// AOT emitter passes the original Scheme name (post-sanitize).
+    name: Option<String>,
+}
+
+impl VmAotClosure {
+    /// Construct an AOT-procedure wrapper. The `fn_ptr` must be a
+    /// valid `AotDispatchFn` address; the caller is responsible
+    /// for that invariant. `arity` is the number of positional args
+    /// the underlying AOT'd lambda expects.
+    ///
+    /// # Safety
+    ///
+    /// Passing an `fn_ptr` that isn't a valid `AotDispatchFn` is UB
+    /// (it'll be transmuted + called when the procedure is invoked).
+    /// AOT-emitted code always passes a `&fn_name as *const _ as
+    /// usize` where `fn_name`'s declared signature matches, so the
+    /// invariant holds for AOT call sites.
+    pub unsafe fn new(fn_ptr: usize, arity: u32, name: Option<String>) -> Self {
+        Self {
+            fn_ptr,
+            arity,
+            name,
+        }
+    }
+}
+
+impl cs_core::Procedure for VmAotClosure {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+}
+
+impl cs_gc::Trace for VmAotClosure {
+    fn trace(&self, _marker: &mut cs_gc::Marker) {
+        // No Gc-tracked fields; the fn pointer is a static address.
+    }
+}
+
+/// RC3 iter 2.1 — allocate an AOT procedure and return its NB carrier.
+///
+/// `disp_fn` is the AOT-emitted dispatch wrapper's function-pointer
+/// cast to `usize`. `arity` is the underlying lambda's positional
+/// arg count. The returned i64 is an NB-encoded `Procedure` value
+/// the caller can pass around like any other Scheme value.
+///
+/// # Safety
+///
+/// `disp_fn` must be a valid `AotDispatchFn` address. Caller takes
+/// ownership of one strong refcount on the resulting NB carrier
+/// (consume-on-use; pass to `vm_value_drop_gc` to release).
+#[no_mangle]
+pub unsafe extern "C" fn vm_alloc_aot_procedure(disp_fn: usize, arity: u32) -> i64 {
+    let closure = VmAotClosure {
+        fn_ptr: disp_fn,
+        arity,
+        name: None,
+    };
+    let proc_rc: std::rc::Rc<dyn cs_core::Procedure> = std::rc::Rc::new(closure);
+    let idx = proc_table::alloc(proc_rc);
+    nb_make(NB_TAG_PROCEDURE, idx as u64) as i64
+}
+
+/// RC3 iter 2.1 — invoke an AOT procedure with the given NB-encoded
+/// args. Returns the dispatch fn's result NB-encoded.
+///
+/// # Safety
+///
+/// - `proc_nb` must be a valid NB carrier with `NB_TAG_PROCEDURE`
+///   referring to a `VmAotClosure` in the proc_table.
+/// - `args_ptr` must point at `n_args` valid NB-encoded i64 values.
+/// - The dispatch fn the procedure wraps is invoked with these
+///   args; it must satisfy the `AotDispatchFn` contract.
+///
+/// Panics:
+/// - The NB carrier's tag isn't NB_TAG_PROCEDURE.
+/// - The Procedure isn't a VmAotClosure (e.g., it was a Scheme
+///   built-in or a VM-tier VmClosure).
+/// - The arg count doesn't match the procedure's declared arity.
+#[no_mangle]
+pub unsafe extern "C" fn vm_call_aot_procedure(
+    proc_nb: i64,
+    args_ptr: *const i64,
+    n_args: usize,
+) -> i64 {
+    let bits = proc_nb as u64;
+    assert!(
+        nb_is_tagged(bits) && nb_tag_of(bits) == NB_TAG_PROCEDURE,
+        "vm_call_aot_procedure: NB carrier 0x{bits:016x} is not NB_TAG_PROCEDURE"
+    );
+    let idx = nb_payload_of(bits) as u32;
+    let p = proc_table::peek(idx);
+    let aot = p
+        .as_any()
+        .downcast_ref::<VmAotClosure>()
+        .expect("vm_call_aot_procedure: procedure is not a VmAotClosure");
+    assert_eq!(
+        aot.arity as usize, n_args,
+        "vm_call_aot_procedure: arity mismatch — procedure expects {}, got {}",
+        aot.arity, n_args
+    );
+    let f: AotDispatchFn = std::mem::transmute(aot.fn_ptr);
+    f(args_ptr, n_args)
+}
+
+#[cfg(test)]
+mod aot_proc_tests {
+    use super::*;
+
+    /// Minimal extern "C" dispatch fn: returns args[0] + args[1]
+    /// as NB Fixnums.
+    unsafe extern "C" fn add_dispatch(args: *const i64, n: usize) -> i64 {
+        assert_eq!(n, 2);
+        let a = *args;
+        let b = *args.add(1);
+        vm_value_add_nb(a, b)
+    }
+
+    #[test]
+    fn alloc_then_call_aot_procedure_roundtrip() {
+        let proc_nb = unsafe { vm_alloc_aot_procedure(add_dispatch as usize, 2) };
+        // Encode two Fixnum args + dispatch.
+        let args = [
+            NanboxValue::fixnum(40).into_raw(),
+            NanboxValue::fixnum(2).into_raw(),
+        ];
+        let result = unsafe { vm_call_aot_procedure(proc_nb, args.as_ptr(), args.len()) };
+        let result_nb = NanboxValue(result);
+        assert_eq!(result_nb.as_fixnum(), Some(42));
+    }
+
+    // Note: a `#[should_panic(expected = "arity mismatch")]` test
+    // for `vm_call_aot_procedure(_, _, wrong_n_args)` was tried but
+    // doesn't work — `vm_call_aot_procedure` is `extern "C"`, and
+    // panicking across that boundary is undefined behavior in Rust
+    // (manifests as a non-unwinding abort here). The arity check is
+    // exercised end-to-end via the integration tests once iter 2.3
+    // wires it through cs-aot's general-Call emission.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
