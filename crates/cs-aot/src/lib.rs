@@ -1427,7 +1427,7 @@ fn inst_rhs(
                     format!(
                         "{{ let __aot_caps: [i64; {n_caps}] = [{cap_csv}]; \
                          unsafe {{ cs_vm::vm::vm_alloc_aot_procedure_with_captures(\
-                         {}_aot_dispatch as usize, {}u32, __aot_caps.to_vec()) }} }}",
+                         {}_aot_dispatch as usize, {}u32, __aot_caps.as_ptr(), {n_caps}) }} }}",
                         info.fn_name, info.arity
                     ),
                 )
@@ -1735,6 +1735,21 @@ fn sanitize_ident(name: &str) -> String {
         }
     }
     if s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        s = format!("proc_{s}");
+    }
+    // RC3 iter 2.9 — guard against Scheme names that happen to be
+    // Rust keywords (`loop`, `if`, `match`, `fn`, `let`, etc.) by
+    // prefixing with `proc_` if the candidate ident is reserved.
+    // The Scheme→Rust ident remapping is sticky for downstream
+    // resolver lookups since by_name_sym is keyed by sym not name.
+    const RUST_KEYWORDS: &[&str] = &[
+        "as", "async", "await", "break", "const", "continue", "crate", "do", "dyn", "else", "enum",
+        "extern", "false", "final", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "macro",
+        "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
+        "super", "trait", "true", "try", "type", "union", "unsafe", "unsized", "use", "virtual",
+        "where", "while", "yield",
+    ];
+    if RUST_KEYWORDS.contains(&s.as_str()) {
         s = format!("proc_{s}");
     }
     s

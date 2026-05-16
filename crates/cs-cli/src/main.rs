@@ -1047,12 +1047,39 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
         std::collections::HashMap::new();
     let mut sym_by_idx: std::collections::HashMap<usize, cs_core::Symbol> =
         std::collections::HashMap::new();
-    for window in bc.insts.windows(2) {
-        if let (cs_vm::opcode::Inst::MakeClosure(idx), cs_vm::opcode::Inst::SetVar(sym)) =
-            (&window[0], &window[1])
-        {
-            name_by_idx.insert(*idx, syms.name(*sym).to_string());
-            sym_by_idx.insert(*idx, *sym);
+    // RC3 iter 2.9 — self-name detection for letrec / named-let-
+    // bound inner lambdas. Scan EVERY lambda's body (not just the
+    // top-level insts) for MakeClosure(idx)+SetVar(sym) and
+    // MakeClosure(idx)+DefineLocal(sym) patterns. The first gives
+    // top-level (define) names; the second gives letrec / named-let
+    // (DefineLocal) names. Passing the right self_sym to the
+    // translator lets CallSelf detection kick in on the inner
+    // lambda's recursive calls, avoiding the chicken-and-egg
+    // "lambda captures itself" problem in MakeClosure.
+    let scan_pairs = |insts: &[cs_vm::opcode::Inst]| -> Vec<(usize, cs_core::Symbol)> {
+        let mut pairs = Vec::new();
+        for window in insts.windows(2) {
+            if let cs_vm::opcode::Inst::MakeClosure(idx) = &window[0] {
+                if let cs_vm::opcode::Inst::SetVar(sym)
+                | cs_vm::opcode::Inst::DefineGlobal(sym)
+                | cs_vm::opcode::Inst::DefineLocal(sym) = &window[1]
+                {
+                    pairs.push((*idx, *sym));
+                }
+            }
+        }
+        pairs
+    };
+    for (idx, sym) in scan_pairs(&bc.insts) {
+        name_by_idx.insert(idx, syms.name(sym).to_string());
+        sym_by_idx.insert(idx, sym);
+    }
+    for lam in bc.lambdas.iter() {
+        for (idx, sym) in scan_pairs(&lam.body) {
+            name_by_idx
+                .entry(idx)
+                .or_insert_with(|| syms.name(sym).to_string());
+            sym_by_idx.entry(idx).or_insert(sym);
         }
     }
     // RC3 iter 2.7 — known-globals set so the translator excludes
@@ -1060,7 +1087,19 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
     // Surviving EnvLookups of these syms then resolve through the
     // emitter's by_name_sym table to direct
     // `vm_alloc_aot_procedure` calls (cross-procedure references).
-    let known_globals: std::collections::HashSet<u32> = sym_by_idx.values().map(|s| s.0).collect();
+    //
+    // RC3 iter 2.9: only TOP-LEVEL syms (those from bc.insts) belong
+    // here — letrec/named-let bindings are local and need their
+    // EnvDefineLocal-driven Value resolution, not a top-level lookup.
+    let top_level_syms: std::collections::HashSet<u32> = {
+        let mut s = std::collections::HashSet::new();
+        for (idx, sym) in scan_pairs(&bc.insts) {
+            let _ = idx;
+            s.insert(sym.0);
+        }
+        s
+    };
+    let known_globals: std::collections::HashSet<u32> = top_level_syms;
     let mut compatible_funcs: Vec<cs_rir::Function> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     for (idx, lam) in bc.lambdas.iter().enumerate() {
@@ -1079,10 +1118,16 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
                 // source lambda index so cs-aot's MakeClosure
                 // resolver can find this function by index.
                 rir.lambda_index = Some(idx);
-                // RC3 iter 2.7 — top-level binding sym (if any) so
+                // RC3 iter 2.7 — TOP-LEVEL binding sym so
                 // cross-procedure references through the resolver's
-                // by_name_sym table can find this function.
-                rir.name_sym = sym_by_idx.get(&idx).map(|s| s.0);
+                // by_name_sym table can find this function. Letrec /
+                // named-let inner-lambda bindings are intentionally
+                // excluded (they shouldn't be resolvable cross-fn).
+                rir.name_sym = if known_globals.contains(&sym_by_idx.get(&idx).map_or(0, |s| s.0)) {
+                    sym_by_idx.get(&idx).map(|s| s.0)
+                } else {
+                    None
+                };
                 compatible_funcs.push(rir);
             }
             Err(e) => skipped.push((name, format!("{e:?}"))),

@@ -452,10 +452,18 @@ fn write_multi_procedure_main(
     mode: EmitMode,
     aot_version: &str,
 ) -> Result<(), ProjectError> {
-    let entry_names: Vec<String> = funcs
+    // RC3 iter 2.9 — only emit CLI dispatch arms for funcs that have
+    // zero captures. Letrec / named-let inner lambdas have at least
+    // one capture (their own self-reference, or an outer-scope
+    // binding) — the CLI can't synthesize those values, so they're
+    // unreachable from `<bin> <fn> <args>`. They still emit as
+    // helpers callable from other AOT'd funcs via the resolver.
+    let dispatchable: Vec<(&Function, String)> = funcs
         .iter()
-        .map(|f| sanitize_ident_for_project(&f.name))
+        .filter(|f| f.captures.is_empty())
+        .map(|f| (f, sanitize_ident_for_project(&f.name)))
         .collect();
+    let entry_names: Vec<String> = dispatchable.iter().map(|(_, n)| n.clone()).collect();
 
     src.push_str(&format!(
         "const AOT_PROVENANCE: &str = \"compiled by crabscheme (cs-aot {aot_version}) \
@@ -483,7 +491,7 @@ fn write_multi_procedure_main(
     src.push_str("    let fn_name = args[1].as_str();\n");
     src.push_str("    match fn_name {\n");
 
-    for (func, name) in funcs.iter().zip(entry_names.iter()) {
+    for (func, name) in dispatchable.iter() {
         let n_params = func.params.len();
         // Use the ORIGINAL Scheme name (pre-sanitization) as the
         // dispatch key — that's what the user typed. sanitize_ident_

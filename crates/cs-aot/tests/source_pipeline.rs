@@ -346,18 +346,40 @@ fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> P
     let primops = build_primops(&mut syms);
     let bc = compile_with_globals_and_primops(&core, &globals, &primops).expect("compile");
 
-    // Mirror cs-cli's --multi name scan so the test path matches.
+    // Mirror cs-cli's --multi scans (top-level + per-lambda) so
+    // letrec / named-let inner-lambda self-name detection works.
+    let scan_pairs = |insts: &[cs_vm::opcode::Inst]| -> Vec<(usize, cs_core::Symbol)> {
+        let mut pairs = Vec::new();
+        for window in insts.windows(2) {
+            if let cs_vm::opcode::Inst::MakeClosure(idx) = &window[0] {
+                if let cs_vm::opcode::Inst::SetVar(sym)
+                | cs_vm::opcode::Inst::DefineGlobal(sym)
+                | cs_vm::opcode::Inst::DefineLocal(sym) = &window[1]
+                {
+                    pairs.push((*idx, *sym));
+                }
+            }
+        }
+        pairs
+    };
     let mut name_by_idx: HashMap<usize, String> = HashMap::new();
     let mut sym_by_idx: HashMap<usize, cs_core::Symbol> = HashMap::new();
-    for window in bc.insts.windows(2) {
-        if let (cs_vm::opcode::Inst::MakeClosure(idx), cs_vm::opcode::Inst::SetVar(sym)) =
-            (&window[0], &window[1])
-        {
-            name_by_idx.insert(*idx, syms.name(*sym).to_string());
-            sym_by_idx.insert(*idx, *sym);
+    for (idx, sym) in scan_pairs(&bc.insts) {
+        name_by_idx.insert(idx, syms.name(sym).to_string());
+        sym_by_idx.insert(idx, sym);
+    }
+    for lam in bc.lambdas.iter() {
+        for (idx, sym) in scan_pairs(&lam.body) {
+            name_by_idx
+                .entry(idx)
+                .or_insert_with(|| syms.name(sym).to_string());
+            sym_by_idx.entry(idx).or_insert(sym);
         }
     }
-    let known_globals: std::collections::HashSet<u32> = sym_by_idx.values().map(|s| s.0).collect();
+    let known_globals: std::collections::HashSet<u32> = scan_pairs(&bc.insts)
+        .into_iter()
+        .map(|(_, s)| s.0)
+        .collect();
     let mut compatible: Vec<cs_rir::Function> = Vec::new();
     for (idx, lam) in bc.lambdas.iter().enumerate() {
         let (name, self_sym) = match name_by_idx.get(&idx) {
@@ -368,7 +390,11 @@ fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> P
             bytecode_to_rir_aot_with_globals(lam, name.as_str(), self_sym, Some(&known_globals))
                 .unwrap_or_else(|e| panic!("bytecode_to_rir_aot failed on lambda {idx}: {e:?}"));
         rir.lambda_index = Some(idx);
-        rir.name_sym = sym_by_idx.get(&idx).map(|s| s.0);
+        rir.name_sym = if known_globals.contains(&sym_by_idx.get(&idx).map_or(0, |s| s.0)) {
+            sym_by_idx.get(&idx).map(|s| s.0)
+        } else {
+            None
+        };
         compatible.push(rir);
     }
     assert!(
@@ -430,6 +456,30 @@ fn run_multi_with_args(bin: &PathBuf, entry: &str, args: &[i64]) -> i64 {
         .trim()
         .parse::<i64>()
         .expect("i64 parse")
+}
+
+#[test]
+fn source_to_aot_named_let_self_recursion() {
+    // RC3 iter 2.9 — named-let with an internally-recursive inner
+    // lambda. The named-let desugars to a letrec; the translator's
+    // self-name detection (extended in 2.9 to scan ALL lambdas'
+    // bodies for MakeClosure+DefineLocal pairs) passes `loop_sym`
+    // as the inner lambda's self_name. CallSelf detection then
+    // covers the recursive `(loop ...)` calls, so the inner lambda
+    // doesn't need to capture itself.
+    //
+    // Also exercises the proc_loop ident remapping (since `loop` is
+    // a Rust keyword) — sanitize_ident now guards against keywords.
+    let bin = aot_compile_multi_and_run(
+        "(define (sum-to n) (let loop ((i 0) (acc 0)) \
+           (if (> i n) acc (loop (+ i 1) (+ acc i)))))",
+        "sum-to",
+        "named_let",
+    );
+    assert_eq!(run_multi_with_args(&bin, "sum-to", &[0]), 0);
+    assert_eq!(run_multi_with_args(&bin, "sum-to", &[5]), 15);
+    assert_eq!(run_multi_with_args(&bin, "sum-to", &[10]), 55);
+    assert_eq!(run_multi_with_args(&bin, "sum-to", &[100]), 5050);
 }
 
 #[test]
