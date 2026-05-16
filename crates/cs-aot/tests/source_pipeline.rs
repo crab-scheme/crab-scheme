@@ -52,9 +52,11 @@ fn build_primops(syms: &mut SymbolTable) -> HashMap<Symbol, PrimOp> {
 }
 
 /// Compile a literal Scheme source through the full pipeline and
-/// return (the first compiled lambda, the symbol for its name if
-/// `entry_name` matches a top-level define). Panics with a useful
-/// message on any pipeline failure.
+/// return the CompiledLambda matching `entry_name` (defined as
+/// `(define (<entry_name> args...) body)` at the top level). Uses
+/// the iter-H MakeClosure+SetVar scan to map names to lambda
+/// indices. Panics with a useful diagnostic if the source fails
+/// to parse/expand/compile, or if the entry isn't found.
 fn compile_source_to_lambda(
     src: &str,
     entry_name: &str,
@@ -76,17 +78,55 @@ fn compile_source_to_lambda(
     let primops = build_primops(&mut syms);
     let bc = compile_with_globals_and_primops(&core, &globals, &primops).expect("compile succeeds");
 
-    // For a single `(define (fname args) body)`, the compiler emits
-    // exactly one CompiledLambda in `bc.lambdas` — that's our entry.
-    // More elaborate programs (multiple defines, internal lambdas)
-    // would need a name-keyed lookup; iter F's scope is one lambda.
     assert!(
         !bc.lambdas.is_empty(),
         "expected at least one CompiledLambda in bytecode for `{src}`, got 0"
     );
-    let lam = bc.lambdas[0].clone();
+
     let entry_sym = syms.intern(entry_name);
-    (lam, entry_sym)
+    let idx = lambda_index_by_name(&bc, entry_sym).unwrap_or_else(|| {
+        let available = lambda_names_in_bytecode(&bc, &syms);
+        panic!("entry `{entry_name}` not found among top-level defines; available: {available:?}")
+    });
+    (bc.lambdas[idx].clone(), entry_sym)
+}
+
+/// Walk top-level bytecode looking for the iter-H define pattern:
+///   ... Inst::MakeClosure(i) | Inst::SetVar(sym) ...
+/// Returns the lambda index that gets bound to `target_sym`, if any.
+///
+/// The compiler emits `(define (f args) body)` as the sequence
+/// `MakeClosure(i)` followed directly by `SetVar(sym)` where `sym`
+/// is the global name. There may be no intervening Insts in the
+/// common case; we look for an adjacent SetVar to keep the matcher
+/// tight (false positives would be confusing if a user picked a
+/// name that happens to be reused as a SetVar target after some
+/// unrelated MakeClosure).
+fn lambda_index_by_name(bc: &cs_vm::opcode::Bytecode, target_sym: Symbol) -> Option<usize> {
+    for window in bc.insts.windows(2) {
+        if let (cs_vm::opcode::Inst::MakeClosure(idx), cs_vm::opcode::Inst::SetVar(sym)) =
+            (&window[0], &window[1])
+        {
+            if *sym == target_sym {
+                return Some(*idx);
+            }
+        }
+    }
+    None
+}
+
+/// Enumerate all top-level-bound lambda names for diagnostic
+/// purposes. Same scan as `lambda_index_by_name` but accumulates.
+fn lambda_names_in_bytecode(bc: &cs_vm::opcode::Bytecode, syms: &SymbolTable) -> Vec<String> {
+    let mut names = Vec::new();
+    for window in bc.insts.windows(2) {
+        if let (cs_vm::opcode::Inst::MakeClosure(_), cs_vm::opcode::Inst::SetVar(sym)) =
+            (&window[0], &window[1])
+        {
+            names.push(syms.name(*sym).to_string());
+        }
+    }
+    names
 }
 
 fn cs_vm_workspace_path() -> PathBuf {
@@ -186,4 +226,55 @@ fn source_to_aot_fib() {
     assert_eq!(run_with_arg(&bin, 1), 1);
     assert_eq!(run_with_arg(&bin, 10), 55);
     assert_eq!(run_with_arg(&bin, 25), 75025);
+}
+
+#[test]
+fn source_to_aot_picks_entry_by_name_in_multi_define() {
+    // RC2 iter H — multi-define source. Two top-level defines
+    // (`square` and `cube`); --entry-equivalent selects `cube`
+    // which only self-references (the `(* n (* n n))` body
+    // doesn't call square — that would surface as an unsupported
+    // EnvLookup or general Call since AOT can't yet do cross-
+    // procedure references).
+    //
+    // The lambda_index_by_name scanner finds cube's lambda index
+    // by walking MakeClosure(i)+SetVar(sym) pairs in the top-level
+    // bytecode. Without the iter-H lookup we'd default to lambdas[0]
+    // (square) and the assertion would fail because square(3)=9 not 27.
+    let src = "
+        (define (square n) (* n n))
+        (define (cube n) (* n (* n n)))
+    ";
+    let (lam, sym) = compile_source_to_lambda(src, "cube");
+    let bin = aot_compile_and_run(lam, sym, "cube", "cube_multi");
+    assert_eq!(run_with_arg(&bin, 0), 0);
+    assert_eq!(run_with_arg(&bin, 3), 27);
+    assert_eq!(run_with_arg(&bin, 5), 125);
+    assert_eq!(run_with_arg(&bin, 10), 1000);
+}
+
+#[test]
+fn compile_source_diagnostics_list_available_entries_on_typo() {
+    // Negative-path coverage: if --entry NAME doesn't match any
+    // top-level define, the helper panics with the available names
+    // for friendly error reporting. Exercises the
+    // lambda_names_in_bytecode helper end-to-end.
+    let src = "
+        (define (sq n) (* n n))
+        (define (cb n) (* n (* n n)))
+    ";
+    let result = std::panic::catch_unwind(|| compile_source_to_lambda(src, "nonexistent"));
+    let msg = result
+        .err()
+        .and_then(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        })
+        .expect("expected a panic with a message");
+    assert!(
+        msg.contains("nonexistent") && msg.contains("sq") && msg.contains("cb"),
+        "expected diagnostic to mention the requested + available entries, got: {msg}"
+    );
 }

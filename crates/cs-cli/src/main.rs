@@ -198,15 +198,61 @@ fn run_aot(file: &str, output: Option<&str>, entry: Option<&str>, build: bool) -
         return ExitCode::from(2);
     }
 
-    // --- Pick the entry lambda. RC2 iter G default = first define;
-    // future iters that handle multi-define programs can match
-    // `entry` against per-lambda names recovered from the bytecode.
-    let lam = &bc.lambdas[0];
-    let entry_name = entry.unwrap_or_else(|| basename_no_ext(file)).to_string();
-    let entry_sym = syms.intern(&entry_name);
+    // --- Pick the entry lambda.
+    //
+    // iter G default: `bc.lambdas[0]`. iter H: walk the top-level
+    // bytecode for `MakeClosure(i) + SetVar(sym)` pairs and build a
+    // name → lambda-index map so `--entry NAME` picks the right
+    // function in multi-define files. When `--entry` isn't given we
+    // try the file's basename first (matching the common convention
+    // of `foo.scm` defining `(define (foo ...) ...)`); on miss we
+    // fall back to the first defined lambda and warn that we
+    // re-resolved.
+    let available = lambda_names_in_top_level(&bc, &syms);
+    let (entry_name, entry_sym, lam) = match entry {
+        Some(want) => match lambda_index_for(&bc, syms.intern(want)) {
+            Some(idx) => (want.to_string(), syms.intern(want), bc.lambdas[idx].clone()),
+            None => {
+                eprintln!(
+                    "crabscheme aot: entry `{want}` not found; available: {available:?}\n\
+                     hint: pick one with `--entry NAME`"
+                );
+                return ExitCode::from(2);
+            }
+        },
+        None => {
+            let basename = basename_no_ext(file).to_string();
+            match lambda_index_for(&bc, syms.intern(&basename)) {
+                Some(idx) => (
+                    basename.clone(),
+                    syms.intern(&basename),
+                    bc.lambdas[idx].clone(),
+                ),
+                None if !available.is_empty() => {
+                    // Fall back to the first defined lambda. Use
+                    // its actual name so CallSelf inside the body
+                    // resolves correctly.
+                    let actual = available[0].clone();
+                    if actual != basename {
+                        eprintln!(
+                            "crabscheme aot: file basename `{basename}` doesn't match \
+                             any top-level define; defaulting to `{actual}` \
+                             (available: {available:?})"
+                        );
+                    }
+                    let actual_sym = syms.intern(&actual);
+                    (actual, actual_sym, bc.lambdas[0].clone())
+                }
+                None => {
+                    eprintln!("crabscheme aot: no top-level (define (NAME ...) ...) found");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    };
 
     // --- Translate to RIR ----
-    let rir = match bytecode_to_rir(lam, &entry_name, Some(entry_sym)) {
+    let rir = match bytecode_to_rir(&lam, &entry_name, Some(entry_sym)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("crabscheme aot: bytecode→RIR error: {e:?}");
@@ -303,6 +349,43 @@ fn basename_no_ext(path: &str) -> &str {
         .and_then(|s| s.to_str())
         .unwrap_or("aot");
     stem
+}
+
+/// Walk top-level bytecode for `MakeClosure(i) + SetVar(sym)` pairs
+/// and return the lambda index bound to `target_sym`, if any. The
+/// adjacency check keeps the matcher tight — see the matching
+/// helper in `crates/cs-aot/tests/source_pipeline.rs` for rationale.
+#[cfg(feature = "aot")]
+fn lambda_index_for(bc: &cs_vm::opcode::Bytecode, target_sym: cs_core::Symbol) -> Option<usize> {
+    for window in bc.insts.windows(2) {
+        if let (cs_vm::opcode::Inst::MakeClosure(idx), cs_vm::opcode::Inst::SetVar(sym)) =
+            (&window[0], &window[1])
+        {
+            if *sym == target_sym {
+                return Some(*idx);
+            }
+        }
+    }
+    None
+}
+
+/// Enumerate all top-level-bound lambda names — used to render
+/// useful diagnostics ("available: [...]") when `--entry NAME`
+/// doesn't match anything.
+#[cfg(feature = "aot")]
+fn lambda_names_in_top_level(
+    bc: &cs_vm::opcode::Bytecode,
+    syms: &cs_core::SymbolTable,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for window in bc.insts.windows(2) {
+        if let (cs_vm::opcode::Inst::MakeClosure(_), cs_vm::opcode::Inst::SetVar(sym)) =
+            (&window[0], &window[1])
+        {
+            names.push(syms.name(*sym).to_string());
+        }
+    }
+    names
 }
 
 #[cfg(feature = "aot")]
