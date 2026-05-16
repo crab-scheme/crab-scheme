@@ -101,6 +101,16 @@ enum Cmd {
         #[arg(long = "emit-rust-source")]
         emit_rust_source: bool,
     },
+    /// RC3 Phase 4 iter 4.5: self-test the AOT installation. Runs
+    /// a baked-in `(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))`
+    /// through the full pipeline (parse → expand → compile → RIR →
+    /// emit project → cargo build → run) and asserts the resulting
+    /// binary returns `120` for `fact(5)`. Exit code 0 on success;
+    /// non-zero (with diagnostic) on any pipeline stage failure.
+    /// Useful for verifying a release-installed binary works on
+    /// the user's platform before pointing it at real source files.
+    #[cfg(feature = "aot")]
+    AotDoctor,
 }
 
 fn main() -> ExitCode {
@@ -132,7 +142,237 @@ fn main() -> ExitCode {
             emit_rir,
             emit_rust_source,
         ),
+        #[cfg(feature = "aot")]
+        Some(Cmd::AotDoctor) => run_aot_doctor(),
     }
+}
+
+/// RC3 Phase 4 iter 4.5: AOT installation self-test.
+///
+/// Pipeline check matrix:
+///
+/// | Step                    | What goes wrong if this fails       |
+/// |-------------------------|-------------------------------------|
+/// | 1. parse                | cs-parse not in cs-cli's deps       |
+/// | 2. expand               | cs-expand not in cs-cli's deps      |
+/// | 3. compile              | cs-vm not in cs-cli's deps          |
+/// | 4. bytecode_to_rir_aot  | translator bug or RIR variant gap   |
+/// | 5. emit_project         | cs-aot Inst-coverage gap            |
+/// | 6. resolve cs-vm dep    | path = unreachable from this binary |
+/// | 7. cargo build          | rust toolchain / cargo install      |
+/// | 8. run + verify         | NB ABI / runtime helper mismatch    |
+///
+/// Prints each step's result; exits 0 if all pass.
+#[cfg(feature = "aot")]
+fn run_aot_doctor() -> ExitCode {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use cs_aot::project::{emit_project, ProjectOptions};
+    use cs_aot::EmitMode;
+    use cs_core::SymbolTable;
+    use cs_expand::Expander;
+    use cs_parse::read_all;
+    use cs_vm::compiler::PrimOp;
+    use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir_aot};
+
+    println!("crabscheme aot-doctor: self-test");
+    println!();
+
+    let src = "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))";
+    let mut step = 0;
+    let mut report = |label: &str, ok: bool, detail: &str| {
+        step += 1;
+        let badge = if ok { "  OK  " } else { " FAIL " };
+        println!(
+            "[{badge}] step {step}: {label}{}",
+            if detail.is_empty() {
+                "".to_string()
+            } else {
+                format!(" — {detail}")
+            }
+        );
+    };
+    let bail = |msg: &str| -> ExitCode {
+        eprintln!("\ncrabscheme aot-doctor: failed: {msg}");
+        ExitCode::from(1)
+    };
+
+    // ---- Steps 1-3: source → bytecode -----
+    let mut sources = SourceMap::new();
+    let file_id = sources.add("<doctor>", src);
+    let mut syms = SymbolTable::new();
+    let data = match read_all(file_id, src, &mut syms) {
+        Ok(d) => {
+            report("parse", true, &format!("{} datum(s)", d.len()));
+            d
+        }
+        Err(e) => {
+            report("parse", false, &e[0].message());
+            return bail("parse failed");
+        }
+    };
+
+    let mut macros = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = match expander.expand_program(&data) {
+        Ok(c) => {
+            report("expand", true, "");
+            c
+        }
+        Err(e) => {
+            let m = e.message().to_string();
+            report("expand", false, &m);
+            return bail("expand failed");
+        }
+    };
+    drop(expander);
+
+    let globals = HashMap::new();
+    let primops = {
+        let mut m = HashMap::new();
+        for (op, kind) in &[
+            ("+", PrimOp::Add),
+            ("-", PrimOp::Sub),
+            ("*", PrimOp::Mul),
+            ("=", PrimOp::Eq),
+            ("<", PrimOp::Lt),
+        ] {
+            m.insert(syms.intern(op), *kind);
+        }
+        m
+    };
+    let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
+        Ok(b) => {
+            report(
+                "compile",
+                true,
+                &format!(
+                    "{} top-level inst(s), {} lambda(s)",
+                    bc_inst_count(&b),
+                    b.lambdas.len()
+                ),
+            );
+            b
+        }
+        Err(e) => {
+            report("compile", false, &e.message);
+            return bail("compile failed");
+        }
+    };
+
+    // ---- Step 4: bytecode → RIR -----
+    let fact_sym = syms.intern("fact");
+    let lam = match bc.lambdas.first() {
+        Some(l) => l,
+        None => {
+            report("bytecode_to_rir", false, "no lambdas in bytecode");
+            return bail("no lambdas — compile may have folded fact away");
+        }
+    };
+    let rir = match bytecode_to_rir_aot(lam, "fact", Some(fact_sym)) {
+        Ok(r) => {
+            report(
+                "bytecode_to_rir_aot",
+                true,
+                &format!("{} block(s)", r.blocks.len()),
+            );
+            r
+        }
+        Err(e) => {
+            report("bytecode_to_rir_aot", false, &format!("{e:?}"));
+            return bail("bytecode→RIR failed");
+        }
+    };
+
+    // ---- Step 5: emit_project -----
+    let cs_vm_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .join("cs-vm");
+    let cs_vm_present = cs_vm_path.exists();
+    report(
+        "resolve cs-vm dep",
+        cs_vm_present,
+        &cs_vm_path.display().to_string(),
+    );
+    if !cs_vm_present {
+        return bail(
+            "cs-vm not at the expected dev-tree path — release-installed binaries can't AOT yet (Phase 1.3 crates.io publish addresses this)",
+        );
+    }
+
+    let tmpdir = std::env::temp_dir().join(format!("crabscheme-aot-doctor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmpdir);
+    let opts = ProjectOptions {
+        mode: EmitMode::Nb,
+        package_name: "doctor_fact".to_string(),
+        entry_fn_name: "fact".to_string(),
+        cs_vm_dep: None,
+        cs_vm_path: Some(cs_vm_path),
+    };
+    let emitted = match emit_project(&[rir], &tmpdir, &opts) {
+        Ok(e) => {
+            report("emit_project", true, &e.project_dir.display().to_string());
+            e
+        }
+        Err(e) => {
+            report("emit_project", false, &format!("{e}"));
+            return bail("project emit failed");
+        }
+    };
+
+    // ---- Step 7: cargo build ------
+    println!("  ...running cargo build --release (may take ~10s on a cold cache)...");
+    let build_status = Command::new("cargo")
+        .current_dir(&emitted.project_dir)
+        .arg("build")
+        .arg("--release")
+        .status();
+    match build_status {
+        Ok(s) if s.success() => report("cargo build --release", true, ""),
+        Ok(s) => {
+            report("cargo build --release", false, &format!("exit {s}"));
+            return bail("cargo build failed — is the rust toolchain installed?");
+        }
+        Err(e) => {
+            report("cargo build --release", false, &format!("spawn: {e}"));
+            return bail("cargo not on PATH");
+        }
+    }
+
+    // ---- Step 8: run + verify ------
+    let bin = &emitted.built_binary_path;
+    let out = match Command::new(bin).arg("5").output() {
+        Ok(o) => o,
+        Err(e) => {
+            report("run AOT binary", false, &format!("spawn: {e}"));
+            return bail("binary couldn't be spawned");
+        }
+    };
+    if !out.status.success() {
+        report("run AOT binary", false, &format!("exit {}", out.status));
+        return bail("binary exited non-zero");
+    }
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let want = "120";
+    if got == want {
+        report("verify fact(5) = 120", true, "");
+    } else {
+        report("verify fact(5) = 120", false, &format!("got {got:?}"));
+        return bail("AOT binary returned wrong result — silent codegen bug");
+    }
+
+    println!();
+    println!("crabscheme aot-doctor: all checks passed.");
+    println!("  AOT-compiled binary at: {}", bin.display());
+    ExitCode::SUCCESS
+}
+
+#[cfg(feature = "aot")]
+fn bc_inst_count(bc: &cs_vm::opcode::Bytecode) -> usize {
+    bc.insts.len()
 }
 
 #[cfg(feature = "aot")]
