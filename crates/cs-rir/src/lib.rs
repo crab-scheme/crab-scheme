@@ -1367,6 +1367,16 @@ pub struct Function {
     /// dispatcher how to *decode* the i64 back into a `Value`. Defaults
     /// to `Type::Fixnum` for back-compat with iter-6's i64-only ABI.
     pub return_type: Type,
+    /// RC3 iter 2.2 — the bytecode `lambdas` index this Function was
+    /// translated from, if known. The bytecode→RIR translator sets it
+    /// so cs-aot's `MakeClosure(_, idx)` lowering can resolve which
+    /// fn name to wrap. `None` for functions hand-built outside the
+    /// translator (e.g., tests).
+    ///
+    /// Stays as `Option<usize>` instead of `usize` so existing
+    /// `Function::new(...)` constructions stay valid without the
+    /// caller needing a sentinel value.
+    pub lambda_index: Option<usize>,
 }
 
 impl Function {
@@ -1378,6 +1388,7 @@ impl Function {
             entry: BlockId(0),
             blocks: Vec::new(),
             return_type: Type::Fixnum,
+            lambda_index: None,
         }
     }
 

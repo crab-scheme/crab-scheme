@@ -292,6 +292,17 @@ fn render_main_rs(
         let body = emit_with(opts.mode, f).map_err(|e| ProjectError::Emit(f.name.clone(), e))?;
         src.push_str(&body);
         src.push('\n');
+
+        // RC3 iter 2.2 Step 2: per-Function dispatch wrapper. A
+        // uniform-arity `extern "C" fn(*const i64, usize) -> i64`
+        // that vm_alloc_aot_procedure can wrap. The wrapper unpacks
+        // the args slice + calls the actual typed fn. Only emitted
+        // in Nb mode (RawI64 doesn't interop with cs-vm's Procedure
+        // table) and only when the Function has a non-zero arity
+        // that the wrapper can statically validate.
+        if opts.mode == EmitMode::Nb {
+            write_aot_dispatch_wrapper(&mut src, f);
+        }
     }
 
     // Main shim. Two shapes:
@@ -306,6 +317,36 @@ fn render_main_rs(
     }
 
     Ok(src)
+}
+
+/// RC3 iter 2.2 Step 2 — emit a uniform-arity dispatch wrapper
+/// for an AOT'd Function. The wrapper has signature
+/// `extern "C" fn(*const i64, usize) -> i64` (matching cs-vm's
+/// `AotDispatchFn` type), unpacks the args slice, and calls the
+/// typed AOT fn.
+///
+/// `cs_vm::vm::vm_alloc_aot_procedure(<name>_aot_dispatch as usize,
+/// arity)` then wraps it as a Procedure value usable from Scheme
+/// code (via MakeClosure + general Call, iter 2.3+).
+fn write_aot_dispatch_wrapper(src: &mut String, f: &Function) {
+    let fn_name = sanitize_ident_for_project(&f.name);
+    let arity = f.params.len();
+
+    src.push_str(&format!(
+        "/// RC3 iter 2.2: dispatch wrapper for `{fn_name}` (arity {arity}).\n\
+         /// Called via cs_vm::vm::vm_call_aot_procedure when the\n\
+         /// procedure value is invoked from Scheme code.\n"
+    ));
+    src.push_str(&format!(
+        "#[no_mangle]\npub unsafe extern \"C\" fn {fn_name}_aot_dispatch(args: *const i64, n: usize) -> i64 {{\n"
+    ));
+    src.push_str(&format!(
+        "    debug_assert_eq!(n, {arity}, \"{fn_name}_aot_dispatch: arity\");\n"
+    ));
+
+    // Unpack args + invoke.
+    let arg_loads: Vec<String> = (0..arity).map(|i| format!("*args.add({i})")).collect();
+    src.push_str(&format!("    {fn_name}({})\n}}\n\n", arg_loads.join(", ")));
 }
 
 /// Single-entry main shim (RC2 baseline; default).
