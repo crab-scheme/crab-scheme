@@ -1698,15 +1698,20 @@ pub fn bytecode_to_rir_full(
                                         insts.push(RirInst::Eq(dst, bit, zero));
                                     }
                                     // ADR 0012 D-2 (iter EQ) — type-aware (not x).
-                                    // Boolean operand: Eq(x, 0) flips the
-                                    // 0/1 carrier (existing fast path).
+                                    // Boolean operand: lower to the dedicated
+                                    // `Inst::NotBoolean` so AOT and JIT can
+                                    // emit a specialized bit-flip rather
+                                    // than re-using numeric Eq (which calls
+                                    // generic_cmp2 and FAILS on boolean
+                                    // operands, making the previous (not x)
+                                    // path return #f for every boolean — the
+                                    // bug tak hit on `(not (< y x))`).
                                     ("not", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Boolean) =>
                                     {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Eq(dst, args[0], zero));
+                                        insts.push(RirInst::NotBoolean(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
                                     }
                                     // Any operand: route through AnyTruthy
                                     // (returns 0 iff inner is #f) and Eq

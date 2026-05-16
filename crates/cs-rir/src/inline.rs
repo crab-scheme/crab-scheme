@@ -551,6 +551,26 @@ pub fn for_each_value_in_inst<F: FnMut(&mut Value)>(inst: &mut Inst, mut f: F) {
         // 1 source + Type — DeoptCheck has no dst, just a guard on src.
         Inst::DeoptCheck(s, _t) => f(s),
 
+        // RC3 iter 2.14 — boolean negation, dst + 1 source.
+        Inst::NotBoolean(d, s) => {
+            f(d);
+            f(s);
+        }
+
+        // RC3 iter 2.14 — additional dst + 2 source arith / bit
+        // ops that surface from R6RS numeric tower programs (binary-
+        // trees, alloc-stress hit these). dst + 2 src shape.
+        Inst::ArithShift(d, a, b) | Inst::Expt(d, a, b) => {
+            f(d);
+            f(a);
+            f(b);
+        }
+        // dst + 1 source. Length is `(length pair)` — list length.
+        Inst::Length(d, s) => {
+            f(d);
+            f(s);
+        }
+
         // RC3 iter 2.7 — the demote-pass now walks every surviving
         // Inst (not just is_inline_supported ones) to rewrite operands
         // via the alias map. The inliner's analyzer still uses
@@ -617,8 +637,9 @@ pub fn for_each_value_in_inst<F: FnMut(&mut Value)>(inst: &mut Inst, mut f: F) {
         // all surviving Inst variants. If you add an Inst, add a match
         // arm here that calls `f` on each Value operand.
         _ => unreachable!(
-            "for_each_value_in_inst: variant {} not in walker — add an arm covering its Value operands",
-            inst_variant_name(inst)
+            "for_each_value_in_inst: variant {} not in walker — add an arm covering its Value operands. Full inst: {:?}",
+            inst_variant_name(inst),
+            inst
         ),
     }
 }

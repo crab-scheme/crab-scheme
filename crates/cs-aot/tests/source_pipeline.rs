@@ -342,7 +342,25 @@ fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> P
     let mut expander = Expander::new(&mut syms, &mut macros);
     let core = expander.expand_program(&data).expect("expand");
     drop(expander);
-    let globals = HashMap::new();
+    // RC3 iter 2.14 — populate globals with stub builtins for names
+    // the compiler folds (`not`, `display`, `newline`, `/`, etc.).
+    // Stubs are never CALLED here (the AOT-emitted code routes to
+    // its own builtin lowerings); they exist so the compiler's
+    // global-fold optimization fires and emits Const(Procedure)
+    // → BuiltinRef → specialized RIR Inst. Without this, every
+    // LoadVar of a builtin becomes an EnvLookup → unresolved
+    // capture in AOT.
+    let mut globals: HashMap<cs_core::Symbol, cs_core::Value> = HashMap::new();
+    fn stub(_args: &[cs_core::Value]) -> Result<cs_core::Value, String> {
+        Err("stub builtin called from AOT test driver".into())
+    }
+    for name in &[
+        "not", "display", "newline", "/", "quotient", "modulo", "abs",
+    ] {
+        let sym = syms.intern(name);
+        let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+        globals.insert(sym, cs_vm::vm::make_vm_builtin(leaked, stub));
+    }
     let primops = build_primops(&mut syms);
     let bc = compile_with_globals_and_primops(&core, &globals, &primops).expect("compile");
 
@@ -487,6 +505,32 @@ fn source_to_aot_forward_self_ref_capture() {
     assert_eq!(run_multi_with_args(&bin, "f", &[3]), 4);
     assert_eq!(run_multi_with_args(&bin, "f", &[5]), 6);
     assert_eq!(run_multi_with_args(&bin, "f", &[10]), 11);
+}
+
+#[test]
+fn source_to_aot_not_boolean_lowering() {
+    // RC3 iter 2.14 — (not boolean) lowering. Previously the
+    // type-aware fast-path emitted `Eq(x, Fixnum(0))` which works
+    // in the JIT's i64 0/1 boolean representation but FAILS in
+    // NB mode (numeric Eq's generic_cmp2 rejects boolean
+    // operands, so the result is always #f and every if-with-not
+    // condition takes the else branch unconditionally).
+    //
+    // Tak hit this on `(not (< y x))` and infinite-recursed.
+    // The fix introduces a dedicated `Inst::NotBoolean` that
+    // lowers to xor-with-1 (NB_TRUE and NB_FALSE differ only in
+    // bit 0, so xor flips them correctly). Same lowering works
+    // for JIT i64 0/1 booleans.
+    let bin = aot_compile_multi_and_run(
+        "(define (test n) (if (not (= n 0)) 999 111))",
+        "test",
+        "not_boolean",
+    );
+    // test(0): (= 0 0) = #t, (not #t) = #f → else → 111
+    assert_eq!(run_multi_with_args(&bin, "test", &[0]), 111);
+    // test(5): (= 5 0) = #f, (not #f) = #t → then → 999
+    assert_eq!(run_multi_with_args(&bin, "test", &[5]), 999);
+    assert_eq!(run_multi_with_args(&bin, "test", &[-7]), 999);
 }
 
 #[test]

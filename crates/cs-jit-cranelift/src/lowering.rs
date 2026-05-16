@@ -8077,6 +8077,15 @@ fn lower_inst(
             let widened = b.ins().uextend(I64, cmp);
             map.insert(*dst, widened);
         }
+        // RC3 iter 2.14 — boolean negation. JIT booleans are i64 0/1;
+        // xor with 1 flips. The AOT path emits the same `v ^ 1`
+        // (which also flips NB_TRUE ↔ NB_FALSE since they differ
+        // only in bit 0).
+        Inst::NotBoolean(dst, src) => {
+            let v = lookup(map, *src)?;
+            let flipped = b.ins().bxor_imm(v, 1);
+            map.insert(*dst, flipped);
+        }
         Inst::Move(dst, src) => {
             let v = lookup(map, *src)?;
             map.insert(*dst, v);

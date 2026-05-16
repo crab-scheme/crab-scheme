@@ -892,6 +892,14 @@ fn inst_rhs(
             check(*src)?;
             (*dst, format!("v{}", src.0))
         }
+        // RC3 iter 2.14 — boolean negation. NB_TRUE / NB_FALSE differ
+        // only in bit 0 (NB_TRUE = NB_FALSE | 1); xor with 1 flips
+        // it. RawI64 mode treats the operand as 0/1 i64 so xor-with-1
+        // also flips it. The dst type stays Boolean.
+        (Inst::NotBoolean(dst, src), _) => {
+            check(*src)?;
+            (*dst, format!("(v{} ^ 1)", src.0))
+        }
         (Inst::BoxTyped(dst, src, _tag), _) => {
             check(*src)?;
             (*dst, format!("v{}", src.0))
@@ -1717,6 +1725,8 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         | Inst::AnyTruthy(v, _)
         | Inst::FixToFlo(v, _)
         | Inst::IntCharBitcast(v, _) => Some(*v),
+        // RC3 iter 2.14 — boolean negation.
+        Inst::NotBoolean(v, _) => Some(*v),
         // RC2 iter L — type predicates.
         Inst::PairP(v, _)
         | Inst::NullP(v, _)

@@ -1328,6 +1328,17 @@ pub enum Inst {
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
     /// always dispatches dynamically).
     DeoptCheck(Value, Type),
+
+    /// RC3 iter 2.14 — `dst = not(src)` where `src` is known to be a
+    /// Boolean (NB-encoded #t or #f). Specialized lowering: AOT
+    /// emits `if v == NB_FALSE { NB_TRUE } else { NB_FALSE }`; JIT
+    /// emits a single bxor with the low bit (NB_TRUE and NB_FALSE
+    /// differ only in bit 0). Avoids routing through `Inst::Eq`,
+    /// which means "numeric `=`" and FAILS on boolean operands
+    /// (generic_cmp2 only accepts numbers). Bytecode source:
+    /// `LoadVar(not) + LoadVar(boolean) + Call(1)` where the
+    /// `LoadVar(boolean)` produces a `Type::Boolean`-tracked value.
+    NotBoolean(Value, Value),
 }
 
 /// Block terminator. Every basic block ends in exactly one of these.

@@ -1009,7 +1009,16 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
         }
     };
     drop(expander);
-    let globals = HashMap::new();
+    // RC3 iter 2.14 — populate globals from the runtime's builtins so
+    // the compiler folds (/ a b), (display x), (not p), etc. to
+    // Const(Procedure). Without this they'd compile to LoadVar which
+    // becomes an EnvLookup → unresolved capture in AOT.
+    let rt_globals = cs_runtime::Runtime::new().builtin_procs_by_name();
+    let mut globals: HashMap<cs_core::Symbol, cs_core::Value> = HashMap::new();
+    for (name, val) in rt_globals {
+        let sym = syms.intern(&name);
+        globals.insert(sym, val);
+    }
     let primops = {
         let mut m = HashMap::new();
         for (op, kind) in &[
@@ -1155,7 +1164,7 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
     // the resolver-miss case) can be traced back to their cause.
     if !skipped.is_empty() {
         eprintln!(
-            "crabscheme aot --multi: {} lambda(s) skipped during translation:",
+            "crabscheme aot --multi: {} lambda(s) skipped during translation; downstream MakeClosure of these will fail:",
             skipped.len()
         );
         for (n, r) in &skipped {

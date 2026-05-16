@@ -1743,6 +1743,23 @@ impl Runtime {
         &self.syms
     }
 
+    /// RC3 iter 2.14 — snapshot the runtime's vm-env builtin
+    /// procedure bindings, re-keyed by NAME. cs-cli's aot pipeline
+    /// uses this to pass a globals snapshot to the compiler so that
+    /// `(/ a b)`, `(display x)`, `(not p)`, etc. fold to
+    /// `Const(Procedure)` (which the translator converts to a
+    /// BuiltinRef → specialized RIR Inst) instead of `LoadVar` (which
+    /// becomes an EnvLookup → unresolved capture in AOT).
+    pub fn builtin_procs_by_name(&self) -> std::collections::HashMap<String, Value> {
+        let mut m = std::collections::HashMap::new();
+        for (sym, val) in self.vm_env.snapshot_bindings() {
+            if matches!(val, Value::Procedure(_)) {
+                m.insert(self.syms.name(sym).to_string(), val);
+            }
+        }
+        m
+    }
+
     pub fn source_map(&self) -> &SourceMap {
         &self.sources
     }
