@@ -1376,7 +1376,13 @@ fn inst_rhs(
         // The emitted call boxes args into a stack-allocated array
         // + passes a pointer + len. arity validation happens inside
         // vm_call_aot_procedure.
-        (Inst::Call(dst, callee, args), EmitMode::Nb) => {
+        (Inst::Call(dst, callee, args), EmitMode::Nb)
+        | (Inst::CallGeneral(dst, callee, args), EmitMode::Nb) => {
+            // RC3 iter 2.4 follow-up: Call and CallGeneral lower
+            // identically in AOT. The JIT distinguishes them for
+            // the IC fast-path-vs-slow-path split; AOT doesn't have
+            // ICs so both take the same `vm_call_aot_procedure`
+            // dispatch.
             check(*callee)?;
             for arg in args {
                 check(*arg)?;
@@ -1572,6 +1578,7 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         // RC3 iter 2.2 Steps 3-4 — MakeClosure + general Call.
         Inst::MakeClosure(v, _) => Some(*v),
         Inst::Call(v, _, _) => Some(*v),
+        Inst::CallGeneral(v, _, _) => Some(*v),
         // RC3 iter 2.4 — EnvLookup post-demote (captures).
         Inst::EnvLookup(v, _) | Inst::EnvLookupAny(v, _) => Some(*v),
         // RC2 iter C — Flonum arith/cmp Insts.
@@ -2150,28 +2157,28 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_inst() {
-        // `CallGeneral` (the slow-path general procedure call into
-        // closures the JIT couldn't resolve to Self/Builtin) isn't
-        // yet handled — needs iter 2.4's closure-capture story.
-        // Used here as the canary that the unsupported-Inst error
-        // path still fires; the list of supported Insts grew in
-        // RC3 iter 2.2 (MakeClosure + Call now lower).
-        let mut f = Function::new("callgen_unsup");
-        f.params.push((Value(0), Type::Procedure));
-        f.params.push((Value(1), Type::Fixnum));
+        // `EnvSet` (Set! to a closure-captured or top-level var) isn't
+        // yet handled — needs a mutable-binding story for AOT'd code
+        // (the demote pass treats syms as immutable). Used here as
+        // the canary that the unsupported-Inst error path still
+        // fires; the list of supported Insts grew significantly
+        // across RC3 Phase 2 (MakeClosure, Call, CallGeneral, and
+        // capturing-closure EnvLookup all now lower).
+        let mut f = Function::new("envset_unsup");
+        f.params.push((Value(0), Type::Fixnum));
         f.entry = BlockId(0);
         f.blocks.push(Block {
             id: BlockId(0),
             params: vec![],
-            insts: vec![Inst::CallGeneral(Value(2), Value(0), vec![Value(1)])],
-            terminator: Term::Return(Value(2)),
+            insts: vec![Inst::EnvSet(42, Value(0))],
+            terminator: Term::Return(Value(0)),
         });
         f.return_type = Type::Fixnum;
         // Nb mode accepts any param/return type; that's the easier
         // path to exercise the unsupported-Inst rejection.
         assert_eq!(
             emit_with(EmitMode::Nb, &f),
-            Err(AotError::UnsupportedInst("CallGeneral"))
+            Err(AotError::UnsupportedInst("EnvSet"))
         );
     }
 
