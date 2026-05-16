@@ -119,6 +119,10 @@ binaries built with `opt-level = 3`, no LTO override.
 | cs-aot **RawI64** mode        |       0.14 s | 447 KB| Self-contained, no runtime dep             |
 | cs-aot **Nb** mode (NB ABI)   |       0.80 s | 633 KB| Each arith calls into `vm_value_*_nb`      |
 
+**Post-RC2 update (commit `9643067`, 2026-05-16):** Nb mode now
+0.29 s (1.93× rustc -O) after the inline fast-path helpers landed.
+See `docs/measurements/2026-05-16-rc2-aot-nb-inline.md`.
+
 RawI64 mode **matches reference Rust to the centisecond** —
 expected, since the emitted source compiles down to the same x86_64
 add/sub/mul/cmp instructions a hand-written Rust fib would produce.
