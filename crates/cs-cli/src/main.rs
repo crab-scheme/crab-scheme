@@ -967,6 +967,101 @@ fn run_aot_explain(file: &str) -> ExitCode {
 ///   25
 ///   $ ./mylib-aot/target/release/mylib cube 5
 ///   125
+/// RC3 iter 2.16 — transitive capture propagation for AOT.
+///
+/// For each function F: if F's body contains `MakeClosure(I)` for
+/// inner lambda I, and I captures sym S, then F must ALSO capture
+/// S unless S is already in F's locals (params, EnvDefineLocal,
+/// self_binding_sym, or top-level globals). Iterates to a fixed
+/// point so multi-level lifting (nqueens's anon → place → nqueens)
+/// resolves correctly in one pass.
+///
+/// Mutates each function's `captures` field in place; the cs-aot
+/// emitter then picks up the new captures via its existing arms:
+/// the function header gets `__cap<sym>` for the new entry, the
+/// dispatch wrapper unpacks one more capture slot, and the parent's
+/// MakeClosure capture-gather provides a value.
+#[cfg(feature = "aot")]
+fn propagate_transitive_captures(
+    funcs: &mut [cs_rir::Function],
+    known_globals: &std::collections::HashSet<u32>,
+) {
+    use std::collections::{HashMap, HashSet};
+
+    // Build idx → position in funcs slice for fast lookup. funcs
+    // were translated in bytecode-lambda-index order so position ==
+    // lambda_index, but be defensive.
+    let mut by_idx: HashMap<usize, usize> = HashMap::new();
+    for (pos, f) in funcs.iter().enumerate() {
+        if let Some(idx) = f.lambda_index {
+            by_idx.insert(idx, pos);
+        }
+    }
+
+    // Snapshot each function's "locals" (the syms a capture-need
+    // can be satisfied by without becoming a transitive capture):
+    // - param_syms (function's positional args)
+    // - EnvDefineLocal syms (let-binding scans inside the body)
+    // - self_binding_sym (the function's own letrec/top-level name)
+    // - known_globals (top-level fns resolvable via by_name_sym)
+    let locals: Vec<HashSet<u32>> = funcs
+        .iter()
+        .map(|f| {
+            let mut set: HashSet<u32> = HashSet::new();
+            set.extend(f.param_syms.iter().copied());
+            if let Some(s) = f.self_binding_sym {
+                set.insert(s);
+            }
+            set.extend(known_globals.iter().copied());
+            for block in &f.blocks {
+                for inst in &block.insts {
+                    if let cs_rir::Inst::EnvDefineLocal(sym, _) = inst {
+                        set.insert(*sym);
+                    }
+                }
+            }
+            set
+        })
+        .collect();
+
+    // Fixed-point: propagate inner-lambda captures upward.
+    loop {
+        let mut changed = false;
+        // Collect all MakeClosure edges before mutating funcs (so
+        // we can read inner.captures without holding two borrows).
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for (parent_pos, f) in funcs.iter().enumerate() {
+            for block in &f.blocks {
+                for inst in &block.insts {
+                    if let cs_rir::Inst::MakeClosure(_, inner_idx) = inst {
+                        if let Some(&inner_pos) = by_idx.get(&(*inner_idx as usize)) {
+                            edges.push((parent_pos, inner_pos));
+                        }
+                    }
+                }
+            }
+        }
+        for (parent_pos, inner_pos) in edges {
+            // Snapshot the inner's captures so we don't hold a
+            // borrow across the mutating parent update.
+            let inner_caps: Vec<u32> = funcs[inner_pos].captures.clone();
+            for sym in inner_caps {
+                if locals[parent_pos].contains(&sym) {
+                    continue;
+                }
+                let parent = &mut funcs[parent_pos];
+                if !parent.captures.contains(&sym) {
+                    parent.captures.push(sym);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 #[cfg(feature = "aot")]
 fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
     use std::collections::HashMap;
@@ -1207,6 +1302,22 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
         }
         return ExitCode::from(3);
     }
+    // RC3 iter 2.16 — transitive capture propagation. If function F
+    // contains MakeClosure(I) for inner lambda I, and I captures sym
+    // S, then F must ALSO capture S (so F can pass S as a value to
+    // I's vm_alloc_aot_procedure_with_captures call). Without this,
+    // the cs-aot capture-gather hits an "unresolved capture" error
+    // when S isn't in F's own scope.
+    //
+    // Example: nqueens's `(let loop ((p placed)) ...)` lambda. Inner
+    // let-body lambda captures col, row from safe?'s scope. loop
+    // MakeClosures the inner-let-body but doesn't itself reference
+    // col/row directly — so record_captures missed them for loop.
+    // Iter 2.16 closes this with a fixed-point analysis: for each
+    // lambda, walk its body for MakeClosure(I); for each capture
+    // sym of I that isn't in F's locals/params/self/by_name_sym/
+    // top-level globals, add it to F's captures.
+    propagate_transitive_captures(&mut compatible_funcs, &known_globals);
     // Always report what got skipped so downstream MakeClosure
     // failures (which surface as "MakeClosure not yet supported" in
     // the resolver-miss case) can be traced back to their cause.
