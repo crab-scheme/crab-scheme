@@ -407,6 +407,7 @@ dependencies = [
  "cs-diag",
  "cs-expand",
  "cs-parse",
+ "cs-rir",
  "cs-runtime",
  "cs-vm",
 ]

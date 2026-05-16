@@ -139,6 +139,7 @@ fn factorial_nb_compiles_and_runs() {
         entry_fn_name: "factorial".to_string(),
         cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_workspace_path()),
+        multi_procedure: false,
     };
 
     let emitted =
@@ -177,6 +178,7 @@ fn factorial_rawi64_compiles_and_runs() {
         entry_fn_name: "factorial".to_string(),
         cs_vm_dep: None,
         cs_vm_path: None,
+        multi_procedure: false,
     };
 
     let emitted =
@@ -250,6 +252,7 @@ fn fib_rawi64_compiles_and_runs() {
         entry_fn_name: "fib".to_string(),
         cs_vm_dep: None,
         cs_vm_path: None,
+        multi_procedure: false,
     };
 
     let emitted = emit_project(&[fib_function()], &tmpdir, &opts).expect("emit_project succeeds");
@@ -277,6 +280,7 @@ fn fib_nb_compiles_and_runs() {
         entry_fn_name: "fib".to_string(),
         cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_workspace_path()),
+        multi_procedure: false,
     };
 
     let emitted = emit_project(&[fib_function()], &tmpdir, &opts).expect("emit_project succeeds");

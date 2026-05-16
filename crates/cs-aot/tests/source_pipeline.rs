@@ -162,6 +162,7 @@ fn aot_compile_and_run(
         entry_fn_name: fn_name.to_string(),
         cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_workspace_path()),
+        multi_procedure: false,
     };
 
     let emitted = emit_project(&[rir], &tmpdir, &opts)

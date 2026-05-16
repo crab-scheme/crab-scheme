@@ -108,6 +108,17 @@ enum Cmd {
         /// Useful for surveying coverage before picking `--entry`.
         #[arg(long = "explain")]
         explain: bool,
+        /// RC3 Phase 6 iter 6.3: emit a multi-procedure binary
+        /// instead of a single-entry one. The resulting binary
+        /// takes `<fn-name> <args...>` on the CLI and dispatches
+        /// to whichever AOT-compatible top-level lambda matches.
+        /// Incompatible lambdas (e.g., MakeClosure-blocked) are
+        /// skipped with a warning printed at emit time, not
+        /// included in the binary. Useful when a single source
+        /// file defines several utility functions you want to
+        /// AOT together.
+        #[arg(long = "multi")]
+        multi: bool,
     },
     /// RC3 Phase 4 iter 4.5: self-test the AOT installation. Runs
     /// a baked-in `(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))`
@@ -143,9 +154,12 @@ fn main() -> ExitCode {
             emit_rir,
             emit_rust_source,
             explain,
+            multi,
         }) => {
             if explain {
                 run_aot_explain(&file)
+            } else if multi {
+                run_aot_multi(&file, output.as_deref(), build)
             } else {
                 run_aot(
                     &file,
@@ -326,6 +340,7 @@ fn run_aot_doctor() -> ExitCode {
         entry_fn_name: "fact".to_string(),
         cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_path),
+        multi_procedure: false,
     };
     let emitted = match emit_project(&[rir], &tmpdir, &opts) {
         Ok(e) => {
@@ -604,6 +619,7 @@ fn run_aot(
         entry_fn_name: entry_name.clone(),
         cs_vm_dep: None, // fall through to legacy cs_vm_path
         cs_vm_path: Some(cs_vm_path),
+        multi_procedure: false,
     };
 
     let emitted = match emit_project(&[rir], &out_dir, &opts) {
@@ -839,6 +855,203 @@ fn run_aot_explain(file: &str) -> ExitCode {
         ExitCode::from(3)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// RC3 Phase 6 iter 6.3: emit a multi-procedure AOT'd binary.
+///
+/// Reads the source, enumerates every top-level `(define (NAME args) body)`,
+/// tries `bytecode_to_rir_aot` + emit on each. Compatible entries become
+/// match arms in the emitted binary's dispatch shim; incompatible ones
+/// are warned at emit time and skipped.
+///
+/// Resulting binary takes `<fn> <args...>`:
+///
+///   $ ./mylib-aot/target/release/mylib square 5
+///   25
+///   $ ./mylib-aot/target/release/mylib cube 5
+///   125
+#[cfg(feature = "aot")]
+fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use cs_aot::project::{emit_project, ProjectOptions};
+    use cs_aot::EmitMode;
+    use cs_core::SymbolTable;
+    use cs_expand::Expander;
+    use cs_parse::read_all;
+    use cs_vm::compiler::PrimOp;
+    use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir_aot};
+
+    let src = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("crabscheme aot --multi: cannot read {file}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut sources = SourceMap::new();
+    let file_id = sources.add(file, &src);
+    let mut syms = SymbolTable::new();
+    let data = match read_all(file_id, &src, &mut syms) {
+        Ok(d) => d,
+        Err(errs) => {
+            eprintln!("crabscheme aot --multi: parse error: {}", errs[0].message());
+            return ExitCode::from(2);
+        }
+    };
+    let mut macros = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = match expander.expand_program(&data) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("crabscheme aot --multi: expand error: {}", e.message());
+            return ExitCode::from(2);
+        }
+    };
+    drop(expander);
+    let globals = HashMap::new();
+    let primops = {
+        let mut m = HashMap::new();
+        for (op, kind) in &[
+            ("+", PrimOp::Add),
+            ("-", PrimOp::Sub),
+            ("*", PrimOp::Mul),
+            ("<", PrimOp::Lt),
+            ("<=", PrimOp::Le),
+            (">", PrimOp::Gt),
+            (">=", PrimOp::Ge),
+            ("=", PrimOp::Eq),
+        ] {
+            m.insert(syms.intern(op), *kind);
+        }
+        m
+    };
+    let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("crabscheme aot --multi: compile error: {}", e.message);
+            return ExitCode::from(2);
+        }
+    };
+
+    // Enumerate top-level lambdas + filter to AOT-compatible ones.
+    let mut compatible_funcs: Vec<cs_rir::Function> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    for window in bc.insts.windows(2) {
+        if let (cs_vm::opcode::Inst::MakeClosure(idx), cs_vm::opcode::Inst::SetVar(sym)) =
+            (&window[0], &window[1])
+        {
+            let name = syms.name(*sym).to_string();
+            let lam = &bc.lambdas[*idx];
+            match bytecode_to_rir_aot(lam, name.as_str(), Some(*sym)) {
+                Ok(rir) => compatible_funcs.push(rir),
+                Err(e) => skipped.push((name.clone(), format!("{e:?}"))),
+            }
+        }
+    }
+
+    if compatible_funcs.is_empty() {
+        eprintln!("crabscheme aot --multi: no AOT-compatible top-level lambdas in {file}");
+        if !skipped.is_empty() {
+            eprintln!("  skipped entries:");
+            for (n, r) in &skipped {
+                eprintln!("    {n}: {r}");
+            }
+        }
+        return ExitCode::from(3);
+    }
+
+    let basename = basename_no_ext(file).to_string();
+    let out_dir = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{basename}-aot")));
+    let cs_vm_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .join("cs-vm");
+    let pkg_name = sanitize_pkg_name(&basename);
+
+    let opts = ProjectOptions {
+        mode: EmitMode::Nb,
+        package_name: pkg_name.clone(),
+        // entry_fn_name is unused in multi mode but still required.
+        entry_fn_name: compatible_funcs[0].name.clone(),
+        cs_vm_dep: None,
+        cs_vm_path: Some(cs_vm_path),
+        multi_procedure: true,
+    };
+
+    let emitted = match emit_project(&compatible_funcs, &out_dir, &opts) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("crabscheme aot --multi: project emit error: {e}");
+            return ExitCode::from(4);
+        }
+    };
+
+    println!(
+        "crabscheme aot --multi: emitted project at {} with {} entr{}",
+        emitted.project_dir.display(),
+        compatible_funcs.len(),
+        if compatible_funcs.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+    );
+    println!(
+        "  entries: {}",
+        compatible_funcs
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if !skipped.is_empty() {
+        println!(
+            "  skipped {} incompatible entr{}:",
+            skipped.len(),
+            if skipped.len() == 1 { "y" } else { "ies" }
+        );
+        for (n, r) in &skipped {
+            // First line of the diagnostic only — keeps the CLI output tidy.
+            let summary = r.lines().next().unwrap_or(r);
+            println!("    {n}: {summary}");
+        }
+    }
+
+    if !build {
+        println!("  (re-run with --build to invoke `cargo build --release`)");
+        return ExitCode::SUCCESS;
+    }
+
+    println!("  building (cargo build --release)...");
+    let status = Command::new("cargo")
+        .current_dir(&emitted.project_dir)
+        .arg("build")
+        .arg("--release")
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("  built: {}", emitted.built_binary_path.display());
+            println!(
+                "  usage: {} <fn> <args...>",
+                emitted.built_binary_path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(s) => {
+            eprintln!("crabscheme aot --multi: cargo build failed (exit {s})");
+            ExitCode::from(5)
+        }
+        Err(e) => {
+            eprintln!("crabscheme aot --multi: cargo not found / failed to spawn: {e}");
+            ExitCode::from(5)
+        }
     }
 }
 

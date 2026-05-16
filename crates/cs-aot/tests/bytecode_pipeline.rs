@@ -160,6 +160,7 @@ fn bytecode_to_rir_to_aot_compiles_fib_end_to_end() {
         entry_fn_name: "fib".to_string(),
         cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_workspace_path()),
+        multi_procedure: false,
     };
 
     let emitted = emit_project(&[rir], &tmpdir, &opts)
@@ -234,6 +235,7 @@ fn bytecode_to_rir_to_aot_compiles_fact_end_to_end() {
         entry_fn_name: "fact".to_string(),
         cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_workspace_path()),
+        multi_procedure: false,
     };
 
     let emitted = match emit_project(&[rir.clone()], &tmpdir, &opts) {

@@ -134,6 +134,14 @@ pub struct ProjectOptions {
     /// is `None` and this is `Some(path)`, behaves identically to
     /// `cs_vm_dep = Some(CsVmDep::Path(path))`.
     pub cs_vm_path: Option<PathBuf>,
+    /// RC3 Phase 6 iter 6.3: when true, the emitted binary takes
+    /// `<fn-name> <args...>` and dispatches to one of the input
+    /// `Function`s by name. When false (default), the binary
+    /// calls the single `entry_fn_name` directly with its CLI
+    /// args. Multi-procedure mode is the natural fit for users
+    /// who want to AOT a whole utility library; single-entry mode
+    /// is what RC2's CLI shipped with.
+    pub multi_procedure: bool,
 }
 
 impl ProjectOptions {
@@ -286,19 +294,25 @@ fn render_main_rs(
         src.push('\n');
     }
 
-    // Main shim. The shape depends on EmitMode:
-    //   RawI64: parse args as i64, pass directly, print i64 result.
-    //   Nb:     parse args as i64, NB-encode as Fixnum, call entry,
-    //           decode NB result, print as i64.
+    // Main shim. Two shapes:
+    //   single-entry (default): call `entry_fn_name` directly
+    //   multi-procedure (iter 6.3): dispatch on args[1] (fn name)
+    let aot_version = env!("CARGO_PKG_VERSION");
+
+    if opts.multi_procedure {
+        write_multi_procedure_main(&mut src, funcs, opts.mode, aot_version)?;
+    } else {
+        write_single_entry_main(&mut src, entry, opts.mode, aot_version);
+    }
+
+    Ok(src)
+}
+
+/// Single-entry main shim (RC2 baseline; default).
+fn write_single_entry_main(src: &mut String, entry: &Function, mode: EmitMode, aot_version: &str) {
     let entry_name = sanitize_ident_for_project(&entry.name);
     let n_params = entry.params.len();
 
-    // RC3 Phase 6 iter 6.5 — embed the crabscheme version that
-    // produced this binary. `--version` on the AOT'd binary prints
-    // the provenance line; bug reports can pin which crabscheme
-    // emitted broken code. CARGO_PKG_VERSION at emit time captures
-    // cs-aot's version (workspace-shared, matches crabscheme).
-    let aot_version = env!("CARGO_PKG_VERSION");
     src.push_str(&format!(
         "const AOT_PROVENANCE: &str = \"compiled by crabscheme (cs-aot {aot_version}) \
          from entry `{entry_name}` (NB ABI)\";\n\n"
@@ -306,8 +320,6 @@ fn render_main_rs(
 
     src.push_str("fn main() {\n");
     src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
-    // RC3 Phase 6 iter 6.5: --version intercept before the arg-arity
-    // check — print the embedded provenance + exit 0.
     src.push_str(
         "    if args.iter().any(|a| a == \"--version\" || a == \"-V\") {\n\
          \x20       println!(\"{}\", AOT_PROVENANCE);\n\
@@ -326,7 +338,7 @@ fn render_main_rs(
     src.push_str("    }\n");
 
     let arg_exprs: Vec<String> = (0..n_params)
-        .map(|i| match opts.mode {
+        .map(|i| match mode {
             EmitMode::RawI64 => format!("args[{}].parse::<i64>().unwrap()", i + 1),
             EmitMode::Nb => format!(
                 "cs_vm::vm::NanboxValue::fixnum(args[{}].parse::<i64>().unwrap()).into_raw()",
@@ -339,7 +351,7 @@ fn render_main_rs(
         "    let raw_result: i64 = {entry_name}({});\n",
         arg_exprs.join(", ")
     ));
-    match opts.mode {
+    match mode {
         EmitMode::RawI64 => {
             src.push_str("    println!(\"{}\", raw_result);\n");
         }
@@ -352,8 +364,114 @@ fn render_main_rs(
         }
     }
     src.push_str("}\n");
+}
 
-    Ok(src)
+/// Multi-procedure main shim (RC3 Phase 6 iter 6.3).
+///
+/// Generates a `main()` that takes `<fn-name> <args...>` and
+/// dispatches to one of the input funcs. Each func gets a match
+/// arm with per-arity validation + arg parsing + result decoding.
+///
+/// Provenance line lists all included entries.
+fn write_multi_procedure_main(
+    src: &mut String,
+    funcs: &[Function],
+    mode: EmitMode,
+    aot_version: &str,
+) -> Result<(), ProjectError> {
+    let entry_names: Vec<String> = funcs
+        .iter()
+        .map(|f| sanitize_ident_for_project(&f.name))
+        .collect();
+
+    src.push_str(&format!(
+        "const AOT_PROVENANCE: &str = \"compiled by crabscheme (cs-aot {aot_version}) \
+         from {n} entr{plural}: [{entries}] (NB ABI)\";\n\n",
+        n = entry_names.len(),
+        plural = if entry_names.len() == 1 { "y" } else { "ies" },
+        entries = entry_names.join(", "),
+    ));
+
+    src.push_str("fn main() {\n");
+    src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
+    src.push_str(
+        "    if args.iter().any(|a| a == \"--version\" || a == \"-V\") {\n\
+         \x20       println!(\"{}\", AOT_PROVENANCE);\n\
+         \x20       std::process::exit(0);\n\
+         \x20   }\n",
+    );
+    src.push_str("    if args.len() < 2 {\n");
+    src.push_str(&format!(
+        "        eprintln!(\"usage: {{}} <fn> <args...>\\navailable: {}\", args[0]);\n",
+        entry_names.join(", "),
+    ));
+    src.push_str("        std::process::exit(2);\n");
+    src.push_str("    }\n");
+    src.push_str("    let fn_name = args[1].as_str();\n");
+    src.push_str("    match fn_name {\n");
+
+    for (func, name) in funcs.iter().zip(entry_names.iter()) {
+        let n_params = func.params.len();
+        // Use the ORIGINAL Scheme name (pre-sanitization) as the
+        // dispatch key — that's what the user typed. sanitize_ident_
+        // for_project may rewrite `+` → `_` etc., which the user
+        // wouldn't think to type.
+        let scheme_name = &func.name;
+        src.push_str(&format!("        \"{scheme_name}\" => {{\n"));
+        src.push_str(&format!(
+            "            if args.len() != {} {{\n",
+            n_params + 2
+        ));
+        src.push_str(&format!(
+            "                eprintln!(\"usage: {{}} {scheme_name} {}\", args[0]);\n",
+            (0..n_params)
+                .map(|i| format!("<arg{i}>"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
+        src.push_str("                std::process::exit(2);\n");
+        src.push_str("            }\n");
+
+        let arg_exprs: Vec<String> = (0..n_params)
+            .map(|i| match mode {
+                EmitMode::RawI64 => format!("args[{}].parse::<i64>().unwrap()", i + 2),
+                EmitMode::Nb => format!(
+                    "cs_vm::vm::NanboxValue::fixnum(args[{}].parse::<i64>().unwrap()).into_raw()",
+                    i + 2
+                ),
+            })
+            .collect();
+
+        src.push_str(&format!(
+            "            let raw_result: i64 = {name}({});\n",
+            arg_exprs.join(", ")
+        ));
+        match mode {
+            EmitMode::RawI64 => {
+                src.push_str("            println!(\"{}\", raw_result);\n");
+            }
+            EmitMode::Nb => {
+                src.push_str("            let nb = cs_vm::vm::NanboxValue(raw_result);\n");
+                src.push_str(&format!(
+                    "            let decoded = nb.as_fixnum().expect(\"entry `{scheme_name}` returned a non-Fixnum NB value\");\n"
+                ));
+                src.push_str("            println!(\"{}\", decoded);\n");
+            }
+        }
+        src.push_str("        }\n");
+    }
+
+    src.push_str("        other => {\n");
+    src.push_str(&format!(
+        "            eprintln!(\"unknown fn `{{}}`; available: {}\", other);\n",
+        entry_names.join(", "),
+    ));
+    src.push_str("            std::process::exit(2);\n");
+    src.push_str("        }\n");
+    src.push_str("    }\n");
+    src.push_str("}\n");
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -383,6 +501,7 @@ mod tests {
             entry_fn_name: "f".into(),
             cs_vm_dep: Some(CsVmDep::Version("0.2".into())),
             cs_vm_path: Some(PathBuf::from("/should/be/ignored")),
+            multi_procedure: false,
         };
         let dep = opts.effective_cs_vm_dep().unwrap();
         assert!(matches!(dep, CsVmDep::Version(v) if v == "0.2"));
@@ -398,6 +517,7 @@ mod tests {
             entry_fn_name: "f".into(),
             cs_vm_dep: None,
             cs_vm_path: Some(PathBuf::from("/legacy/path")),
+            multi_procedure: false,
         };
         let dep = opts.effective_cs_vm_dep().unwrap();
         assert!(matches!(dep, CsVmDep::Path(p) if p == PathBuf::from("/legacy/path")));
@@ -412,6 +532,7 @@ mod tests {
             entry_fn_name: "f".into(),
             cs_vm_dep: None,
             cs_vm_path: None,
+            multi_procedure: false,
         };
         assert!(opts.effective_cs_vm_dep().is_none());
     }
