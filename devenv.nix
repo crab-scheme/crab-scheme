@@ -27,14 +27,10 @@
 
     # Other Scheme implementations for microbench cross-comparison.
     # Each enables a row in `bench/microbench/run.sh`'s table.
-    #
-    # racket is intentionally NOT here — racket-minimal fails to build
-    # from source on aarch64-darwin in the rolling nixpkgs we pin.
-    # Install it via the official Racket installer if you want a
-    # racket column in the bench table.
     chez # Chez Scheme — fast batch interpreter
     guile_3_0 # GNU Guile (R7RS-ish via #!r7rs)
     gambit # gsi for Gambit Scheme
+    racket # Racket — needed for R6RS conformance suite measurement
   ];
 
   # ---- scripts ------------------------------------------------------------
