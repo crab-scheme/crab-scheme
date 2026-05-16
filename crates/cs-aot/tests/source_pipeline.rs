@@ -433,6 +433,28 @@ fn run_multi_with_args(bin: &PathBuf, entry: &str, args: &[i64]) -> i64 {
 }
 
 #[test]
+fn source_to_aot_mutual_recursion() {
+    // RC3 iter 2.8 (free-rides on iter 2.7) — mutual recursion
+    // between two top-level fns. `even?` calls `odd?` calls `even?`.
+    // The cross-procedure-reference mechanism resolves each call
+    // through the LambdaResolver's by_name_sym table; mutual
+    // recursion just works because both fns are emitted into the
+    // same project with the same resolver.
+    let bin = aot_compile_multi_and_run(
+        "(define (even? n) (if (= n 0) 1 (odd? (- n 1)))) \
+         (define (odd? n) (if (= n 0) 0 (even? (- n 1))))",
+        "even?",
+        "mutual_rec",
+    );
+    assert_eq!(run_multi_with_args(&bin, "even?", &[0]), 1);
+    assert_eq!(run_multi_with_args(&bin, "even?", &[4]), 1);
+    assert_eq!(run_multi_with_args(&bin, "even?", &[7]), 0);
+    assert_eq!(run_multi_with_args(&bin, "odd?", &[1]), 1);
+    assert_eq!(run_multi_with_args(&bin, "odd?", &[5]), 1);
+    assert_eq!(run_multi_with_args(&bin, "odd?", &[8]), 0);
+}
+
+#[test]
 fn source_to_aot_cross_procedure_reference() {
     // RC3 iter 2.7 — top-level cross-procedure references. `apply-
     // double` calls `double` by name; the bytecode emits
