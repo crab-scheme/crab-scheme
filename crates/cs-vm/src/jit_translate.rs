@@ -191,6 +191,26 @@ fn record_captures(
 /// Returns false (same contract as the original) if any EnvLookup
 /// references a sym not defined locally — the free-var case
 /// signals the AOT path should leave func untouched.
+/// RC3 iter 2.11 — clone an Inst and rewrite its operand Values
+/// through the alias map. Used by demote when we choose to KEEP an
+/// Inst (rather than dropping it as an alias-target) but still want
+/// operand rewrites — same machinery as the catch-all arm.
+fn other_with_alias(inst: &RirInst, alias: &HashMap<RirValue, RirValue>) -> RirInst {
+    use cs_rir::inline::for_each_value_in_inst;
+    let mut cloned = inst.clone();
+    for_each_value_in_inst(&mut cloned, |v| {
+        let mut cur = *v;
+        for _ in 0..=alias.len() {
+            match alias.get(&cur) {
+                Some(&next) if next != cur => cur = next,
+                _ => break,
+            }
+        }
+        *v = cur;
+    });
+    cloned
+}
+
 fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
     use cs_rir::inline::{for_each_value_in_inst, for_each_value_in_term};
 
@@ -214,13 +234,20 @@ fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
     //   cleanly without mutating `func` on either constraint
     //   miss (free var, duplicate define, forward cross-block ref).
     let single_block = func.blocks.len() == 1;
-    let mut defined_count: HashMap<u32, usize> = HashMap::new();
+    // RC3 iter 2.11 — track defines per-block + the lookups. A sym
+    // with multiple defines all in the SAME block is a re-binding
+    // (letrec/named-let emits a placeholder Unspecified-define then
+    // overwrites after MakeClosure); the alias safely tracks the
+    // LAST define in textual order, even in multi-block functions.
+    // The strict bail only applies when defines span multiple blocks
+    // (which truly needs φ-merge).
+    let mut defined_blocks: HashMap<u32, std::collections::HashSet<usize>> = HashMap::new();
     let mut all_lookup_syms: Vec<u32> = Vec::new();
-    for block in &func.blocks {
+    for (bidx, block) in func.blocks.iter().enumerate() {
         for inst in &block.insts {
             match inst {
                 RirInst::EnvDefineLocal(sym, _) => {
-                    *defined_count.entry(*sym).or_insert(0) += 1;
+                    defined_blocks.entry(*sym).or_default().insert(bidx);
                 }
                 RirInst::EnvLookupAny(_, sym) | RirInst::EnvLookup(_, sym) => {
                     all_lookup_syms.push(*sym);
@@ -229,12 +256,24 @@ fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
             }
         }
     }
+    // demote_eligible: syms whose lookups we CAN safely alias to a
+    // single source Value. Free vars / captures / globals NOT
+    // eligible — they survive as EnvLookups for the AOT resolver to
+    // handle. Multi-block + cross-block multi-define also NOT
+    // eligible — needs φ-merge.
+    let mut demote_eligible: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for sym in &all_lookup_syms {
-        match defined_count.get(sym) {
-            None => return false,         // free-var binding — can't alias
-            Some(&1) => {}                // exactly one define — safe in both modes
-            Some(_) if single_block => {} // multi-define re-binding — iter J path
-            Some(_) => return false,      // multi-block + multi-define — would need φ-merge
+        match defined_blocks.get(sym) {
+            None => {} // free var — skip
+            Some(blocks) if blocks.len() == 1 => {
+                // All defines in one block — safe re-binding (last
+                // define wins in textual order).
+                demote_eligible.insert(*sym);
+            }
+            Some(_) if single_block => {
+                demote_eligible.insert(*sym);
+            }
+            Some(_) => {} // defines span multiple blocks — needs φ-merge
         }
     }
 
@@ -261,17 +300,36 @@ fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
         for inst in &block.insts {
             match inst {
                 RirInst::EnvDefineLocal(sym, src) => {
-                    sym_to_src.insert(*sym, resolve(*src, &alias));
+                    if demote_eligible.contains(sym) {
+                        sym_to_src.insert(*sym, resolve(*src, &alias));
+                    } else {
+                        // Non-eligible sym (multi-define in multi-
+                        // block) — keep the define so subsequent
+                        // operations against this sym still work.
+                        rewritten.push(other_with_alias(inst, &alias));
+                    }
                 }
                 RirInst::EnvLookupAny(d, sym) | RirInst::EnvLookup(d, sym) => {
-                    // Forward cross-block lookup → bail (pre-scan
-                    // approved this sym, but its define hasn't been
-                    // walked yet in dominator order).
-                    let src = match sym_to_src.get(sym) {
-                        Some(&s) => s,
-                        None => return false,
-                    };
-                    alias.insert(*d, src);
+                    // RC3 iter 2.11 — three-way dispatch:
+                    //   1. Sym is demote-eligible AND we have a
+                    //      sym_to_src entry → add to alias map, drop
+                    //      this EnvLookup.
+                    //   2. Sym is demote-eligible but no sym_to_src
+                    //      yet (forward cross-block ref) → keep the
+                    //      EnvLookup; downstream cs-aot uses its
+                    //      captures / local_defs / by_name_sym
+                    //      resolver. The d Value still gets defined
+                    //      by the surviving EnvLookup.
+                    //   3. Sym is not eligible → same as (2).
+                    if demote_eligible.contains(sym) {
+                        if let Some(&src) = sym_to_src.get(sym) {
+                            alias.insert(*d, src);
+                        } else {
+                            rewritten.push(other_with_alias(inst, &alias));
+                        }
+                    } else {
+                        rewritten.push(other_with_alias(inst, &alias));
+                    }
                 }
                 other => {
                     // RC3 iter 2.7 — apply the alias map to operand

@@ -702,6 +702,16 @@ fn emit_inst_let(
     captures: &[u32],
     local_defs: &std::collections::HashMap<u32, Value>,
 ) -> Result<(), AotError> {
+    // RC3 iter 2.11 — EnvDefineLocal that survived demote (the
+    // multi-block + multi-define case) lowers to a no-op: the
+    // `collect_local_defines` pre-scan already records sym → Value,
+    // so subsequent EnvLookups read directly from the source Value
+    // via the `local_defs.contains_key(sym)` arm in inst_rhs. The
+    // define itself produces no SSA result, so there's nothing to
+    // emit.
+    if matches!(inst, Inst::EnvDefineLocal(..)) {
+        return Ok(());
+    }
     let (dst, expr) = inst_rhs(
         inst,
         Some(defined),
@@ -726,6 +736,10 @@ fn emit_inst_assign(
     captures: &[u32],
     local_defs: &std::collections::HashMap<u32, Value>,
 ) -> Result<(), AotError> {
+    // Same no-op as emit_inst_let for surviving EnvDefineLocal.
+    if matches!(inst, Inst::EnvDefineLocal(..)) {
+        return Ok(());
+    }
     // The loop+match shape pre-declares all values; SSA validity is
     // a property of well-formed RIR, not something we re-check here
     // (the check requires cross-block dataflow analysis we don't yet

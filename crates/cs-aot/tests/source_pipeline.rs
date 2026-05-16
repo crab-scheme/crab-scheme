@@ -459,6 +459,37 @@ fn run_multi_with_args(bin: &PathBuf, entry: &str, args: &[i64]) -> i64 {
 }
 
 #[test]
+fn source_to_aot_nested_named_lets_independent() {
+    // RC3 iter 2.11 — two nested named-lets where the inner one
+    // doesn't call out to the outer. Pre-iter-2.11 this failed
+    // because the demote pass's strict rule bailed on multi-block
+    // multi-define (letrec emits placeholder + post-MakeClosure
+    // overwrite for each binding sym). Iter 2.11 relaxes the rule:
+    // multiple defines of a sym in the SAME block are safe
+    // (re-binding; last define wins in textual order), even in
+    // multi-block functions.
+    //
+    // `(define (f n) (let loop1 ...) ...)` — outer loop1 has if;
+    // its else branch contains a let loop2 with its own body. loop2
+    // doesn't reference loop1, just sums j up to a limit.
+    let bin = aot_compile_multi_and_run(
+        "(define (f n) (let loop1 ((i 0)) \
+           (let loop2 ((j 0)) \
+             (if (> j 5) i (loop2 (+ j 1))))))",
+        "f",
+        "nested_named_lets",
+    );
+    // loop1's body has no if so it doesn't even iterate — just
+    // immediately enters loop2, sums j 0..6, returns i=0.
+    // (The point of the test is the demote pass survives + a
+    // binary builds + runs; numeric result is whatever loop2's
+    // result with the boxed i carries through. With our minimal
+    // emission, loop1's body returns loop2's result. loop2 returns
+    // i which is the closure's captured copy of loop1's i=0.)
+    assert_eq!(run_multi_with_args(&bin, "f", &[0]), 0);
+}
+
+#[test]
 fn source_to_aot_named_let_self_recursion() {
     // RC3 iter 2.9 — named-let with an internally-recursive inner
     // lambda. The named-let desugars to a letrec; the translator's
