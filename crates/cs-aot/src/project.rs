@@ -224,10 +224,22 @@ fn render_cargo_toml(opts: &ProjectOptions) -> String {
         opts.package_name
     ));
 
-    // opt-level=3 + no LTO: matches workspace defaults for
-    // dev-cycle predictability. iter-4 bench harness can override
-    // by editing the emitted Cargo.toml directly.
-    s.push_str("[profile.release]\nopt-level = 3\n\n");
+    // RC3 Phase 5 iter 5.6 — flip on LTO + codegen-units=1 in the
+    // emitted release profile. The workspace default keeps these
+    // off for dev-loop predictability, but AOT-emitted projects
+    // are one-off binaries that benefit from cross-crate inlining
+    // (cs-vm's `vm_value_*_nb` runtime helpers in particular can
+    // get inlined into the emitted source under thin LTO when the
+    // call site's tag-check predicate is monomorphic). Adds 10-30%
+    // to cold-cache build time; eliminates a comparable fraction
+    // of runtime overhead on the hot path.
+    s.push_str(
+        "[profile.release]\n\
+         opt-level = 3\n\
+         lto = \"thin\"\n\
+         codegen-units = 1\n\
+         \n",
+    );
 
     // Empty `[workspace]` table: opt this project OUT of any
     // enclosing cargo workspace. Without it, AOT'ing into a
@@ -281,8 +293,27 @@ fn render_main_rs(
     let entry_name = sanitize_ident_for_project(&entry.name);
     let n_params = entry.params.len();
 
+    // RC3 Phase 6 iter 6.5 — embed the crabscheme version that
+    // produced this binary. `--version` on the AOT'd binary prints
+    // the provenance line; bug reports can pin which crabscheme
+    // emitted broken code. CARGO_PKG_VERSION at emit time captures
+    // cs-aot's version (workspace-shared, matches crabscheme).
+    let aot_version = env!("CARGO_PKG_VERSION");
+    src.push_str(&format!(
+        "const AOT_PROVENANCE: &str = \"compiled by crabscheme (cs-aot {aot_version}) \
+         from entry `{entry_name}` (NB ABI)\";\n\n"
+    ));
+
     src.push_str("fn main() {\n");
     src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
+    // RC3 Phase 6 iter 6.5: --version intercept before the arg-arity
+    // check — print the embedded provenance + exit 0.
+    src.push_str(
+        "    if args.iter().any(|a| a == \"--version\" || a == \"-V\") {\n\
+         \x20       println!(\"{}\", AOT_PROVENANCE);\n\
+         \x20       std::process::exit(0);\n\
+         \x20   }\n",
+    );
     src.push_str(&format!("    if args.len() < {} {{\n", n_params + 1));
     src.push_str(&format!(
         "        eprintln!(\"usage: {{}} {}\", args[0]);\n",
