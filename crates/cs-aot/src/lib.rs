@@ -5,7 +5,7 @@
 //! the same `cs-rir` IR feeds both the JIT (Cranelift → native
 //! bytes) and the AOT (cs-aot → Rust source → rustc → native bytes).
 //!
-//! ## Status: M10 Track A iter 2b (NanboxValue ABI)
+//! ## Status: M10 Track A iter 3 (whole-program glue)
 //!
 //! - **Multi-block**: functions with branching / loops now compile.
 //!   The emitter falls into one of two shapes:
@@ -18,11 +18,16 @@
 //!     state machine. `Jump(target, args)` assigns block params and
 //!     `continue`s; `Branch(cond, t, e)` reads `cond != 0` and
 //!     dispatches; `Return(v)` exits the loop via `return v_N;`.
-//! - **Supported Inst variants** (added in iter 2a):
-//!   - `LoadConst(Fixnum)`, `Add`, `Sub`, `Mul` (iter 1)
-//!   - `Lt`, `Eq` — comparisons return 0/1 as i64, matching the
-//!     JIT's `emit_nb_cmp_fixnum_fast` shape.
-//!   - `Move` — SSA alias copy.
+//! - **Supported Inst variants**:
+//!   - `LoadConst(Fixnum)` (iter 1) + `LoadConst(Boolean/Char/Null/
+//!     Unspecified/Eof/Flonum)` in Nb mode (iter 2b)
+//!   - `Add`, `Sub`, `Mul` (iter 1)
+//!   - `Lt`, `Eq` — comparisons return 0/1 as i64 in RawI64, or an
+//!     NB Boolean in Nb mode (iter 2a/2b).
+//!   - `Move` — SSA alias copy (iter 2a).
+//!   - `CallSelf` — recursive call to the function being emitted;
+//!     compiles to a direct Rust call (iter 3). Enables AOT of
+//!     fact, fib, and other self-recursive numeric kernels.
 //! - **Two ABI modes** via [`EmitMode`]:
 //!   - [`EmitMode::RawI64`] (iter-1/2a default) — each SSA value is
 //!     a raw `i64`; arithmetic is `wrapping_*`; comparisons return
@@ -62,6 +67,16 @@ use std::collections::HashSet;
 use std::fmt::Write;
 
 use cs_rir::{Const, Function, Inst, Term, Type, Value};
+
+pub mod project;
+
+/// Re-export of [`sanitize_ident`] for use by the project emitter.
+/// The two callers need byte-for-byte identical name mangling (the
+/// emitted function definition must match the call site in `main()`),
+/// so the helper is shared rather than duplicated.
+pub(crate) fn sanitize_ident_for_project(name: &str) -> String {
+    sanitize_ident(name)
+}
 
 /// Errors the AOT emitter can return.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,8 +248,9 @@ fn emit_straight_line(out: &mut String, func: &Function, mode: EmitMode) -> Resu
     let block = &func.blocks[0];
     let mut defined: HashSet<Value> = func.params.iter().map(|(v, _)| *v).collect();
 
+    let fn_name = sanitize_ident(&func.name);
     for inst in &block.insts {
-        emit_inst_let(out, inst, &defined, mode)?;
+        emit_inst_let(out, inst, &defined, mode, &fn_name)?;
         if let Some(dst) = inst_dst(inst) {
             defined.insert(dst);
         }
@@ -293,10 +309,11 @@ fn emit_loop_match(out: &mut String, func: &Function, mode: EmitMode) -> Result<
     writeln!(out, "    loop {{").unwrap();
     writeln!(out, "        match block {{").unwrap();
 
+    let fn_name = sanitize_ident(&func.name);
     for block in &func.blocks {
         writeln!(out, "            {} => {{", block.id.0).unwrap();
         for inst in &block.insts {
-            emit_inst_assign(out, inst, mode)?;
+            emit_inst_assign(out, inst, mode, &fn_name)?;
         }
         emit_terminator(out, &block.terminator, func, mode)?;
         writeln!(out, "            }}").unwrap();
@@ -319,20 +336,26 @@ fn emit_inst_let(
     inst: &Inst,
     defined: &HashSet<Value>,
     mode: EmitMode,
+    self_fn_name: &str,
 ) -> Result<(), AotError> {
-    let (dst, expr) = inst_rhs(inst, Some(defined), mode)?;
+    let (dst, expr) = inst_rhs(inst, Some(defined), mode, self_fn_name)?;
     writeln!(out, "    let v{}: i64 = {};", dst.0, expr).unwrap();
     Ok(())
 }
 
 /// Emit an Inst as `v_N = expr;` (loop+match shape). The Value is
 /// pre-declared as `let mut` at function top.
-fn emit_inst_assign(out: &mut String, inst: &Inst, mode: EmitMode) -> Result<(), AotError> {
+fn emit_inst_assign(
+    out: &mut String,
+    inst: &Inst,
+    mode: EmitMode,
+    self_fn_name: &str,
+) -> Result<(), AotError> {
     // The loop+match shape pre-declares all values; SSA validity is
     // a property of well-formed RIR, not something we re-check here
     // (the check requires cross-block dataflow analysis we don't yet
     // do in the emitter). Pass `None` to skip.
-    let (dst, expr) = inst_rhs(inst, None, mode)?;
+    let (dst, expr) = inst_rhs(inst, None, mode, self_fn_name)?;
     writeln!(out, "                v{} = {};", dst.0, expr).unwrap();
     Ok(())
 }
@@ -345,6 +368,7 @@ fn inst_rhs(
     inst: &Inst,
     defined: Option<&HashSet<Value>>,
     mode: EmitMode,
+    self_fn_name: &str,
 ) -> Result<(Value, String), AotError> {
     let check = |v: Value| -> Result<(), AotError> {
         match defined {
@@ -463,6 +487,38 @@ fn inst_rhs(
             (*dst, format!("v{}", src.0))
         }
 
+        // ---- CallSelf (recursive call) ----
+        //
+        // Both modes lower identically: a direct Rust call to the
+        // function being emitted. The AOT'd function is
+        // `pub extern "C" fn {self_fn_name}(args...) -> i64`, so a
+        // direct call uses the C ABI and threads i64 carriers
+        // through registers — the same shape every operand already
+        // uses. Recursion bottoms out naturally because the IR is
+        // already in self-recursive form.
+        //
+        // RawI64 mode: each arg is a raw i64; recursion semantics
+        //              are whatever the caller defines (unchecked
+        //              arithmetic, etc.).
+        // Nb mode: each arg is an NB carrier; the recursive call
+        //          returns an NB carrier. Same contract as the
+        //          inline arith helpers.
+        (Inst::CallSelf(dst, args), _) => {
+            for arg in args {
+                check(*arg)?;
+            }
+            let mut call = String::from(self_fn_name);
+            call.push('(');
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    call.push_str(", ");
+                }
+                call.push_str(&format!("v{}", arg.0));
+            }
+            call.push(')');
+            (*dst, call)
+        }
+
         // ---- Unsupported ----
         (other, _) => return Err(AotError::UnsupportedInst(inst_variant_name(other))),
     })
@@ -543,6 +599,7 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         Inst::Add(v, _, _) | Inst::Sub(v, _, _) | Inst::Mul(v, _, _) => Some(*v),
         Inst::Lt(v, _, _) | Inst::Eq(v, _, _) => Some(*v),
         Inst::Move(v, _) => Some(*v),
+        Inst::CallSelf(v, _) => Some(*v),
         // Any inst not in the supported set: returning None is fine
         // because the emitter rejects unsupported variants before
         // pre-declaration anyway. Keeps this helper lean.
