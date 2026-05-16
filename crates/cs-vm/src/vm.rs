@@ -8968,17 +8968,25 @@ pub unsafe extern "C" fn vm_ic_dispatch(
         }
         v
     };
-    // Decode each arg handle once. `value_args` keeps owned clones
-    // for the deopt fallback; `jit_args` are the per-arg slots fed
-    // to the cached JIT body — typed inline for non-Any params,
-    // freshly-cloned Gc handles for Any params.
-    let mut value_args: Vec<Value> = Vec::with_capacity(n_args);
+    // The cached body's calling convention depends on its return-type
+    // ABI tag: uniform-NB bodies (`JIT_RT_NB`) take NB-encoded i64s
+    // for *every* param; specialized bodies take typed raw-i64 lanes
+    // (Fixnum / Boolean / Character / Flonum / Any) per the per-nibble
+    // `cached_param_types` packing.
+    //
+    // For uniform-NB we still enforce the hinted type guard up front
+    // (mirroring `try_dispatch_jit_nb`'s guard) — bodies lowered for
+    // `[Flonum]` hint emit `FlonumMul` etc. which silently miscompiles
+    // when called with a Fixnum (NaN * NaN preserves operand bits).
+    let body_is_uniform_nb = closure.jit_return_type() == JIT_RT_NB;
+    let needs_frame_env = closure.jit_needs_frame_env();
     let mut jit_args: [i64; 6] = [0; 6];
     if n_args > jit_args.len() {
-        // Beyond the fast-path arity window — re-decode and route
+        // Beyond the fast-path arity window — decode args and route
         // through the general path. (try_dispatch_jit caps at 6
         // too, so the IC slot is never filled for wider arities;
         // this branch is defensive.)
+        let mut value_args: Vec<Value> = Vec::with_capacity(n_args);
         for i in 0..n_args {
             let v = unsafe { gc_i64_to_value(*args_ptr.add(i)) };
             value_args.push(v);
@@ -8993,27 +9001,16 @@ pub unsafe extern "C" fn vm_ic_dispatch(
             Err(e) => panic!("vm_ic_dispatch: {}", e.message),
         };
     }
-    // The cached body's calling convention depends on its return-type
-    // ABI tag: uniform-NB bodies (`JIT_RT_NB`) take NB-encoded i64s
-    // for *every* param; specialized bodies take typed raw-i64 lanes
-    // (Fixnum / Boolean / Character / Flonum / Any) per the per-nibble
-    // `cached_param_types` packing.
-    //
-    // For uniform-NB we still enforce the hinted type guard up front
-    // (mirroring `try_dispatch_jit_nb`'s guard) — bodies lowered for
-    // `[Flonum]` hint emit `FlonumMul` etc. which silently miscompiles
-    // when called with a Fixnum (NaN * NaN preserves operand bits).
-    let body_is_uniform_nb = closure.jit_return_type() == JIT_RT_NB;
     let mut type_miss = false;
-    for i in 0..n_args {
-        let raw = unsafe { *args_ptr.add(i) };
-        let v = unsafe { gc_i64_to_value(raw) };
-        let nibble = ((cached_param_types >> (i as u32 * 4)) & 0xF) as u8;
-        let slot_val: i64 = if body_is_uniform_nb {
-            // NB ABI: enforce hint match then pass the NB carrier
-            // through with a refcount bump (so the body owns its
-            // independent ref). `value_to_gc_i64` round-trips the
-            // already-decoded `v` back to NB encoding.
+    let mut filled: usize = 0;
+    // `value_args` is only built when needed (deopt fallback, frame
+    // env construction, type-miss). On the common hot path neither
+    // is needed and we skip the allocation entirely.
+    let mut value_args_opt: Option<Vec<Value>> = None;
+    if body_is_uniform_nb {
+        for i in 0..n_args {
+            let raw = unsafe { *args_ptr.add(i) };
+            let nibble = ((cached_param_types >> (i as u32 * 4)) & 0xF) as u8;
             let bits = raw as u64;
             let tagged = nb_is_tagged(bits);
             let tag = if tagged { nb_tag_of(bits) } else { u64::MAX };
@@ -9027,12 +9024,25 @@ pub unsafe extern "C" fn vm_ic_dispatch(
             };
             if !matched {
                 type_miss = true;
-                0
-            } else {
-                value_to_gc_i64(v.clone())
+                break;
             }
-        } else {
-            match (nibble, &v) {
+            // For inline immediates this is a no-op; for heap-typed
+            // it bumps the strong refcount so the body owns its ref
+            // independently of the caller's slot.
+            jit_args[i] = unsafe { vm_value_clone_gc(raw) };
+            filled += 1;
+        }
+    } else {
+        // Specialized typed-lane: decode each arg to Value, then
+        // extract the typed payload into the matching jit_args slot.
+        // value_args is built here because we need the decoded Value
+        // for both the typed unbox and for fallback.
+        let mut value_args: Vec<Value> = Vec::with_capacity(n_args);
+        for i in 0..n_args {
+            let raw = unsafe { *args_ptr.add(i) };
+            let v = unsafe { gc_i64_to_value(raw) };
+            let nibble = ((cached_param_types >> (i as u32 * 4)) & 0xF) as u8;
+            let slot_val: i64 = match (nibble, &v) {
                 (JIT_RT_FIXNUM, Value::Number(cs_core::Number::Fixnum(n))) => *n,
                 (JIT_RT_BOOLEAN, Value::Boolean(b)) => {
                     if *b {
@@ -9044,28 +9054,41 @@ pub unsafe extern "C" fn vm_ic_dispatch(
                 (JIT_RT_CHARACTER, Value::Character(c)) => *c as u32 as i64,
                 (JIT_RT_FLONUM, Value::Number(cs_core::Number::Flonum(f))) => f.to_bits() as i64,
                 (JIT_RT_ANY, _) => value_to_gc_i64(v.clone()),
-                // Type mismatch — or heap-typed param (JIT_RT_PAIR etc.)
-                // not yet supported on the IC fast path. Mark a deopt
-                // and fall through to `vm_call_sync`, which handles all
-                // value shapes uniformly.
                 _ => {
                     type_miss = true;
                     0
                 }
+            };
+            if type_miss {
+                value_args.push(v);
+                break;
             }
-        };
-        jit_args[i] = slot_val;
-        value_args.push(v);
+            jit_args[i] = slot_val;
+            filled += 1;
+            value_args.push(v);
+        }
+        value_args_opt = Some(value_args);
     }
     if type_miss {
-        // Drop the typed slots we encoded. For uniform-NB every
-        // populated slot is an NB carrier with a strong ref bump;
-        // for specialized only the `JIT_RT_ANY` slots own Gc handles.
-        for i in 0..n_args {
+        // Drop the typed slots we encoded successfully. For
+        // uniform-NB every populated slot is an NB carrier with a
+        // strong ref bump; for specialized only the `JIT_RT_ANY`
+        // slots own Gc handles.
+        for i in 0..filled {
             let nibble = ((cached_param_types >> (i as u32 * 4)) & 0xF) as u8;
             if body_is_uniform_nb || nibble == JIT_RT_ANY {
                 unsafe { vm_value_drop_gc(jit_args[i]) };
             }
+        }
+        // Build (or finish building) value_args by decoding any
+        // remaining raw_args.
+        let mut value_args = value_args_opt
+            .take()
+            .unwrap_or_else(|| Vec::with_capacity(n_args));
+        while value_args.len() < n_args {
+            let i = value_args.len();
+            let raw = unsafe { *args_ptr.add(i) };
+            value_args.push(unsafe { gc_i64_to_value(raw) });
         }
         let syms_ptr = jit_active_syms();
         if syms_ptr.is_null() {
@@ -9090,7 +9113,22 @@ pub unsafe extern "C" fn vm_ic_dispatch(
     // the soundness gate happened to filter such callees out of the IC;
     // post-Stage-2c they enter the IC, so we must reproduce the frame
     // env build here (n-queens' `place` is the motivating case).
-    let frame_env_holder: Option<Rc<Env>> = if closure.jit_needs_frame_env() {
+    let frame_env_holder: Option<Rc<Env>> = if needs_frame_env {
+        // Materialize value_args on demand. The uniform-NB hot path
+        // skipped this step; specialized already has the Vec built.
+        if value_args_opt.is_none() {
+            let mut va: Vec<Value> = Vec::with_capacity(n_args);
+            for i in 0..n_args {
+                let raw = unsafe { *args_ptr.add(i) };
+                // raw is a borrowed view; bump the refcount via the
+                // NB-aware clone helper before decoding so we don't
+                // steal the slot's strong ref.
+                let cloned = unsafe { vm_value_clone_gc(raw) };
+                va.push(unsafe { gc_i64_to_value(cloned) });
+            }
+            value_args_opt = Some(va);
+        }
+        let value_args = value_args_opt.as_ref().expect("just populated");
         let env = Env::child(closure.env.clone());
         let lam = &closure.bc.lambdas[closure.lambda_idx];
         for (name, v) in lam.params.iter().zip(value_args.iter()) {
@@ -9169,8 +9207,8 @@ pub unsafe extern "C" fn vm_ic_dispatch(
         }
     };
     // Iter BW deopt sentinel: if the JIT body bailed, `jit_args`
-    // were consumed by it — re-dispatch from the `value_args`
-    // clones via the bytecode VM.
+    // were consumed by it — re-dispatch from freshly-decoded args
+    // via the bytecode VM.
     if jit_take_deopt() != 0 {
         let n = closure.bump_jit_deopt();
         if n >= JIT_DEOPT_RECOMPILE_THRESHOLD {
@@ -9181,6 +9219,18 @@ pub unsafe extern "C" fn vm_ic_dispatch(
             panic!("vm_ic_dispatch: JIT_ACTIVE_SYMS is null");
         }
         let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
+        let value_args = match value_args_opt {
+            Some(va) => va,
+            None => {
+                let mut va: Vec<Value> = Vec::with_capacity(n_args);
+                for i in 0..n_args {
+                    let raw = unsafe { *args_ptr.add(i) };
+                    let cloned = unsafe { vm_value_clone_gc(raw) };
+                    va.push(unsafe { gc_i64_to_value(cloned) });
+                }
+                va
+            }
+        };
         return match vm_call_sync(&callee_v, &value_args, syms) {
             Ok(v) => value_to_gc_i64(v),
             Err(e) => panic!("vm_ic_dispatch: {}", e.message),
