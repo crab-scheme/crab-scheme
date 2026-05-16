@@ -902,6 +902,150 @@ pub fn nb_encode_flonum(f: f64) -> i64 {
 
 /// Allocate a `Gc<Value>` through the active heap if one is
 /// installed on this thread, falling back to unregistered
+/// Phase 6 Stage B2 — thread-local registry of `Rc<dyn Procedure>`
+/// values for the thin-procedure NB encoding. Each Procedure
+/// passed through the NB lane gets a u32 slot index encoded in
+/// the NB_TAG_PROCEDURE payload, replacing the previous
+/// `nb_alloc_gc_value(Value::Procedure(p))` heap allocation per
+/// encoding.
+///
+/// Lifetime semantics mirror the Gc<Value> handle:
+/// - `alloc(p)` registers `p` with refcount 1, returns slot idx.
+/// - `incref(idx)` bumps refcount (called by `vm_value_clone_gc`).
+/// - `decref(idx)` decrements; frees slot at 0 (called by
+///   `vm_value_drop_gc`, and by `to_value` when it consumes the NB).
+/// - `peek(idx)` clones the Rc without changing refcount (used by
+///   helpers that need to inspect without consuming).
+///
+/// **GC tracing posture:** matches the pre-B2 encoding exactly.
+/// `Value::Procedure(_)`'s `Trace` impl is a no-op (line ~321 of
+/// cs-core/src/value.rs); captures are rooted via the VM stack /
+/// caller env path, not through the NB carrier. Switching to
+/// ProcTable doesn't change which Gc handles get traced.
+///
+/// **Slot reuse:** free list keeps the table compact under
+/// steady-state encode/decode churn (nbody-style ~70k encodings/ms
+/// settles to a small in-flight count).
+mod proc_table {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct ProcSlot {
+        // Some when the slot is live; None when freed and on the free list.
+        proc: Option<Rc<dyn cs_core::Procedure>>,
+        // Live NB carriers pointing at this slot. Slot freed at 0.
+        refcount: u32,
+        // Free-list link (u32::MAX = tail).
+        next_free: u32,
+    }
+
+    pub(super) struct ProcTable {
+        slots: Vec<ProcSlot>,
+        free_head: u32,
+    }
+
+    impl ProcTable {
+        const NIL: u32 = u32::MAX;
+
+        const fn new() -> Self {
+            Self {
+                slots: Vec::new(),
+                free_head: Self::NIL,
+            }
+        }
+
+        pub(super) fn alloc(&mut self, p: Rc<dyn cs_core::Procedure>) -> u32 {
+            if self.free_head != Self::NIL {
+                let idx = self.free_head;
+                let slot = &mut self.slots[idx as usize];
+                self.free_head = slot.next_free;
+                slot.proc = Some(p);
+                slot.refcount = 1;
+                slot.next_free = Self::NIL;
+                idx
+            } else {
+                let idx = self.slots.len() as u32;
+                self.slots.push(ProcSlot {
+                    proc: Some(p),
+                    refcount: 1,
+                    next_free: Self::NIL,
+                });
+                idx
+            }
+        }
+
+        pub(super) fn incref(&mut self, idx: u32) {
+            let slot = &mut self.slots[idx as usize];
+            debug_assert!(slot.proc.is_some(), "incref on freed slot");
+            slot.refcount = slot
+                .refcount
+                .checked_add(1)
+                .expect("proc_table refcount overflow");
+        }
+
+        /// Decrement refcount; free slot if it hits 0.
+        pub(super) fn decref(&mut self, idx: u32) {
+            let slot = &mut self.slots[idx as usize];
+            debug_assert!(slot.proc.is_some(), "decref on freed slot");
+            slot.refcount -= 1;
+            if slot.refcount == 0 {
+                slot.proc = None;
+                slot.next_free = self.free_head;
+                self.free_head = idx;
+            }
+        }
+
+        /// Borrow without consuming. The returned Rc is a fresh clone;
+        /// the slot's refcount is unchanged.
+        pub(super) fn peek(&self, idx: u32) -> Rc<dyn cs_core::Procedure> {
+            self.slots[idx as usize]
+                .proc
+                .as_ref()
+                .expect("peek on freed slot")
+                .clone()
+        }
+    }
+
+    thread_local! {
+        static PROC_TABLE: RefCell<ProcTable> = const { RefCell::new(ProcTable::new()) };
+    }
+
+    /// Register `p` and return the new slot index (refcount = 1).
+    pub(super) fn alloc(p: Rc<dyn cs_core::Procedure>) -> u32 {
+        PROC_TABLE.with(|t| t.borrow_mut().alloc(p))
+    }
+
+    pub(super) fn incref(idx: u32) {
+        // `try_with` tolerates TLS-destruction during process exit:
+        // if `PROC_TABLE` has already been destroyed (Bindings drops
+        // running after PROC_TABLE's drop) we silently skip — the
+        // slot's Rc is leaked but the process is exiting anyway.
+        // Without this guard, `vm_value_drop_gc` during the
+        // shutdown path panics on `cannot access TLS during
+        // destruction`.
+        let _ = PROC_TABLE.try_with(|t| t.borrow_mut().incref(idx));
+    }
+
+    pub(super) fn decref(idx: u32) {
+        let _ = PROC_TABLE.try_with(|t| t.borrow_mut().decref(idx));
+    }
+
+    pub(super) fn peek(idx: u32) -> Rc<dyn cs_core::Procedure> {
+        PROC_TABLE.with(|t| t.borrow().peek(idx))
+    }
+
+    /// Consume the NB encoding: clone the Rc out + decrement refcount
+    /// (freeing the slot when it was the last NB owner).
+    pub(super) fn take(idx: u32) -> Rc<dyn cs_core::Procedure> {
+        PROC_TABLE.with(|t| {
+            let mut t = t.borrow_mut();
+            let p = t.peek(idx);
+            t.decref(idx);
+            p
+        })
+    }
+}
+
 /// `Gc::new` otherwise. Used by the `NB_TAG_GC_VALUE` wrap paths
 /// in `NanboxValue::from_value` (Procedure + non-Fixnum/Flonum
 /// Number variants) to preserve the heap-tracking semantics the
@@ -1026,22 +1170,28 @@ impl NanboxValue {
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
                 NanboxValue(nb_make(NB_TAG_BYTEVECTOR, ptr) as i64)
             }
-            // `Rc<dyn Procedure>` is a fat pointer (data ptr +
-            // vtable ptr, 16 bytes) — doesn't fit in the 47-bit
-            // payload. Route through the `NB_TAG_GC_VALUE` Gc<Value>
-            // wrap fallback for now (same cost as the pre-NaN-box
-            // path). NB_TAG_PROCEDURE = 11 stays
-            // reserved for a future thin-procedure encoding (e.g.,
-            // an enum that lifts the vtable into a small index).
+            // Phase 6 Stage B2 — thin-procedure NB encoding.
+            // `Rc<dyn Procedure>` is a fat pointer (data + vtable,
+            // 16 bytes) that doesn't fit the 47-bit payload, so the
+            // pre-B2 path wrapped it in `Gc<Value>` (one heap alloc
+            // per encoding — nbody's measured ~250M alloc storm).
             //
-            // The Gc<Value> wrap allocation routes through the
-            // active Heap when one is installed, matching the
-            // pre-NaN-box `value_to_gc_i64` behavior.
+            // B2 registers `p` in a thread-local `proc_table` and
+            // encodes the returned u32 slot index with
+            // `NB_TAG_PROCEDURE`. Decoding (`to_value` /
+            // `vm_value_clone_gc` / `vm_value_drop_gc`) special-
+            // cases this tag against the table. Net effect: no heap
+            // alloc per Procedure encoding; ~1 Vec push (or free-
+            // list pop) instead.
+            //
+            // GC tracing: unchanged from the pre-B2 path. The
+            // `Value::Procedure(_)` `Trace` impl in cs-core/value.rs
+            // is intentionally a no-op (line ~321); captures are
+            // already rooted through the VM stack / caller env,
+            // never reached via this NB carrier.
             Value::Procedure(p) => {
-                let g = nb_alloc_gc_value(Value::Procedure(p));
-                let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
-                debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_GC_VALUE, ptr) as i64)
+                let idx = proc_table::alloc(p);
+                NanboxValue(nb_make(NB_TAG_PROCEDURE, idx as u64) as i64)
             }
             Value::Hashtable(g) => {
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
@@ -1135,13 +1285,17 @@ impl NanboxValue {
                     unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
                 Value::ByteVector(g)
             }
-            // NB_TAG_PROCEDURE is reserved but not currently
-            // produced — `from_value` routes `Value::Procedure`
-            // through `NB_TAG_GC_VALUE` because `Rc<dyn Procedure>`
-            // is a fat pointer that doesn't fit the 47-bit payload.
-            // If we ever observe this tag at decode it's a bug
-            // (encode/decode mismatch); panic-free fallback via
-            // `_t` arm below treats it as `NB_TAG_GC_VALUE`.
+            // Phase 6 Stage B2 — thin-procedure decode. Symmetric
+            // to `from_value`'s `Value::Procedure(p)` arm: the
+            // payload is the u32 ProcTable slot index. `take`
+            // clones the Rc out and decrements the slot's refcount
+            // (freeing the slot when this was the last NB pointing
+            // at it), matching `to_value`'s consuming-the-NB
+            // semantics shared with the other pointer-tag arms.
+            t if t == NB_TAG_PROCEDURE => {
+                let idx = payload as u32;
+                Value::Procedure(proc_table::take(idx))
+            }
             t if t == NB_TAG_HASHTABLE => {
                 let g: cs_gc::Gc<cs_core::Hashtable> =
                     unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
@@ -5788,13 +5942,23 @@ pub unsafe extern "C" fn vm_value_clone_gc(r: i64) -> i64 {
     if any_i64_is_inline(r) {
         return r;
     }
+    let bits = r as u64;
+    let tag = nb_tag_of(bits);
+    let payload = nb_payload_of(bits);
+    // Phase 6 Stage B2 — NB_TAG_PROCEDURE's payload is a u32
+    // ProcTable slot index, NOT a Gc pointer. Bump the slot's
+    // refcount via the table instead of `Gc::raw_incref` (which
+    // would interpret the index as a pointer and corrupt memory).
+    if tag == NB_TAG_PROCEDURE {
+        proc_table::incref(payload as u32);
+        return r;
+    }
     // Pointer-typed (NB_TAG_PAIR..NB_TAG_GC_VALUE): bump the
     // strong refcount on the underlying `Gc<T>` allocation.
     // `Gc::<_>::raw_incref` is T-agnostic — it only touches the
     // strong-count header which lives at a fixed offset in the
     // `RcInner` regardless of T — so passing `Gc::<Value>` works
     // even when the actual T is `Pair` / `Vector` / etc.
-    let payload = nb_payload_of(r as u64);
     unsafe { cs_gc::Gc::<Value>::raw_incref(payload as *const ()) };
     r
 }
@@ -5815,6 +5979,14 @@ pub unsafe extern "C" fn vm_value_drop_gc(r: i64) {
     let bits = r as u64;
     let tag = nb_tag_of(bits);
     let payload = nb_payload_of(bits);
+    // Phase 6 Stage B2 — NB_TAG_PROCEDURE owns a slot in the thread-
+    // local ProcTable, not a Gc allocation. Decrement the slot's
+    // refcount; the table frees the slot (dropping the contained Rc)
+    // when refcount hits 0.
+    if tag == NB_TAG_PROCEDURE {
+        proc_table::decref(payload as u32);
+        return;
+    }
     let ptr = payload as *const ();
     match tag {
         t if t == NB_TAG_PAIR => drop(unsafe { cs_gc::Gc::<cs_core::Pair>::from_raw_jit(ptr) }),
@@ -9315,12 +9487,20 @@ pub unsafe extern "C" fn vm_closure_id_peek(callee: i64) -> u32 {
     }
     let bits = callee as u64;
     let tag = nb_tag_of(bits);
-    // Under NaN-box encoding (K1 step 2b) the callee handle is
-    // either NB_TAG_GC_VALUE (Procedure currently routes here —
-    // see `NanboxValue::from_value`) or one of the dedicated heap
-    // tags. Only NB_TAG_GC_VALUE wraps a `Gc<Value::Procedure>`;
-    // a Pair / Vector / etc. tag means the callee is not a
-    // procedure at all.
+    // Phase 6 Stage B2 — Procedures now encode via NB_TAG_PROCEDURE
+    // (u32 ProcTable slot index). Pre-B2 they routed through
+    // NB_TAG_GC_VALUE (Gc<Value> wrap); the GC_VALUE arm stays for
+    // backward-compat with non-Procedure values wrapped via that
+    // tag (BigInt / Rational / etc.).
+    if tag == NB_TAG_PROCEDURE {
+        let idx = nb_payload_of(bits) as u32;
+        let p = proc_table::peek(idx);
+        return p
+            .as_any()
+            .downcast_ref::<VmClosure>()
+            .map(|c| c.lambda_id())
+            .unwrap_or(0);
+    }
     if tag != NB_TAG_GC_VALUE {
         return 0;
     }
@@ -10536,6 +10716,15 @@ impl cs_gc::Trace for Bindings {
                     });
                     (*g).trace(marker);
                 }
+                // Phase 6 Stage B2 — NB_TAG_PROCEDURE payload is a
+                // u32 ProcTable slot index, NOT a Gc pointer.
+                // Reinterpreting it as a pointer (via the catch-all
+                // arm) would segfault. The trace is a no-op:
+                // `Value::Procedure`'s `Trace` impl is also no-op
+                // (cs-core/value.rs ~line 321) — captures are rooted
+                // through the VM stack / caller env, not via this
+                // carrier.
+                t if t == NB_TAG_PROCEDURE => {}
                 _ => {
                     // NB_TAG_GC_VALUE (or any other pointer tag routed
                     // through the Gc<Value> wrap fallback). Trace the
@@ -10955,8 +11144,7 @@ fn run_dispatch(
                 let func_proc: Rc<dyn cs_core::Procedure> = {
                     let nb = stack.at_nb(func_idx);
                     let bits = nb.into_raw() as u64;
-                    if !nb_is_tagged(bits) || nb_tag_of(bits) != NB_TAG_GC_VALUE {
-                        // Decode for the error message — cold path.
+                    if !nb_is_tagged(bits) {
                         let v = stack.at_as_value(func_idx);
                         return Err(VmError::new(format!(
                             "call to non-procedure ({})",
@@ -10965,18 +11153,42 @@ fn run_dispatch(
                         .with_span(call_span));
                     }
                     let payload = nb_payload_of(bits);
-                    // ManuallyDrop: borrow the wrap allocation, do NOT
-                    // decref it. The slot still owns the strong ref.
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<Value>::from_raw_jit(payload as *const ())
-                    });
-                    match &**g {
-                        Value::Procedure(p) => p.clone(),
-                        other => {
-                            let tn = other.type_name();
-                            return Err(VmError::new(format!("call to non-procedure ({})", tn))
+                    let tag = nb_tag_of(bits);
+                    // Phase 6 Stage B2 — Procedures encode via
+                    // NB_TAG_PROCEDURE (thin u32 index into the
+                    // per-thread ProcTable). Peek borrows the slot
+                    // without changing the table's per-slot refcount,
+                    // matching the prior NB_TAG_GC_VALUE
+                    // `ManuallyDrop` borrow shape.
+                    if tag == NB_TAG_PROCEDURE {
+                        proc_table::peek(payload as u32)
+                    } else if tag == NB_TAG_GC_VALUE {
+                        // ManuallyDrop: borrow the wrap allocation,
+                        // do NOT decref it. The slot still owns the
+                        // strong ref. Kept for non-Procedure values
+                        // wrapped via `nb_alloc_gc_value` (BigInt /
+                        // Rational / etc.).
+                        let g = std::mem::ManuallyDrop::new(unsafe {
+                            cs_gc::Gc::<Value>::from_raw_jit(payload as *const ())
+                        });
+                        match &**g {
+                            Value::Procedure(p) => p.clone(),
+                            other => {
+                                let tn = other.type_name();
+                                return Err(VmError::new(format!(
+                                    "call to non-procedure ({})",
+                                    tn
+                                ))
                                 .with_span(call_span));
+                            }
                         }
+                    } else {
+                        let v = stack.at_as_value(func_idx);
+                        return Err(VmError::new(format!(
+                            "call to non-procedure ({})",
+                            v.type_name()
+                        ))
+                        .with_span(call_span));
                     }
                 };
                 {
