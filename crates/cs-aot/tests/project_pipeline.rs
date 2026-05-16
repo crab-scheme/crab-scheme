@@ -185,3 +185,106 @@ fn factorial_rawi64_compiles_and_runs() {
     assert_eq!(run_with_arg(&bin, 5), 120);
     assert_eq!(run_with_arg(&bin, 10), 3628800);
 }
+
+/// (define (fib n)
+///   (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+///
+/// Track A iter-4 closeout canary: the canonical recursion benchmark
+/// from bench/microbench/scheme/fib.scm. Two `CallSelf` ops per
+/// recursive case make this a tighter call-overhead exercise than
+/// factorial.
+fn fib_function() -> Function {
+    let mut f = Function::new("fib");
+    f.params.push((Value(0), Type::Fixnum));
+    f.return_type = Type::Fixnum;
+    f.entry = BlockId(0);
+    // entry: v1=2; v2 = n < 2; Branch
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            Inst::LoadConst(Value(1), Const::Fixnum(2)),
+            Inst::Lt(Value(2), Value(0), Value(1)),
+        ],
+        terminator: Term::Branch(Value(2), BlockId(1), BlockId(2)),
+    });
+    // base: return n
+    f.blocks.push(Block {
+        id: BlockId(1),
+        params: vec![],
+        insts: vec![],
+        terminator: Term::Return(Value(0)),
+    });
+    // recurse: fib(n-1) + fib(n-2)
+    f.blocks.push(Block {
+        id: BlockId(2),
+        params: vec![],
+        insts: vec![
+            Inst::LoadConst(Value(3), Const::Fixnum(1)),
+            Inst::Sub(Value(4), Value(0), Value(3)),
+            Inst::CallSelf(Value(5), vec![Value(4)]),
+            Inst::LoadConst(Value(6), Const::Fixnum(2)),
+            Inst::Sub(Value(7), Value(0), Value(6)),
+            Inst::CallSelf(Value(8), vec![Value(7)]),
+            Inst::Add(Value(9), Value(5), Value(8)),
+        ],
+        terminator: Term::Return(Value(9)),
+    });
+    f
+}
+
+#[test]
+fn fib_rawi64_compiles_and_runs() {
+    // RawI64 variant — fib with no runtime dep. Confirms the AOT
+    // path can produce a fully self-contained binary that matches
+    // the reference Rust fib semantics.
+    let pid = std::process::id();
+    let tmpdir = std::env::temp_dir().join(format!("cs-aot-project-fib-raw-{pid}"));
+    let _ = std::fs::remove_dir_all(&tmpdir);
+
+    let opts = ProjectOptions {
+        mode: EmitMode::RawI64,
+        package_name: "aot_fib_raw".to_string(),
+        entry_fn_name: "fib".to_string(),
+        cs_vm_path: None,
+    };
+
+    let emitted = emit_project(&[fib_function()], &tmpdir, &opts).expect("emit_project succeeds");
+    let bin = cargo_build(&emitted.project_dir, &opts.package_name);
+
+    assert_eq!(run_with_arg(&bin, 0), 0);
+    assert_eq!(run_with_arg(&bin, 10), 55);
+    assert_eq!(run_with_arg(&bin, 25), 75025);
+}
+
+#[test]
+fn fib_nb_compiles_and_runs() {
+    // Mirrors bench/microbench/scheme/fib.scm — the canonical
+    // recursion benchmark across all CrabScheme tiers. If this
+    // passes, the AOT pipeline is good enough for iter-5/post-1.0
+    // bench-integration work to compare AOT-built fib timings
+    // against walker/VM/JIT/Gambit/Chez.
+    let pid = std::process::id();
+    let tmpdir = std::env::temp_dir().join(format!("cs-aot-project-fib-nb-{pid}"));
+    let _ = std::fs::remove_dir_all(&tmpdir);
+
+    let opts = ProjectOptions {
+        mode: EmitMode::Nb,
+        package_name: "aot_fib_nb".to_string(),
+        entry_fn_name: "fib".to_string(),
+        cs_vm_path: Some(cs_vm_workspace_path()),
+    };
+
+    let emitted = emit_project(&[fib_function()], &tmpdir, &opts).expect("emit_project succeeds");
+    let bin = cargo_build(&emitted.project_dir, &opts.package_name);
+
+    // Small fibs: catch base-case + first-recurse correctness.
+    assert_eq!(run_with_arg(&bin, 0), 0);
+    assert_eq!(run_with_arg(&bin, 1), 1);
+    assert_eq!(run_with_arg(&bin, 2), 1);
+    assert_eq!(run_with_arg(&bin, 10), 55);
+    // fib(25) — same N used by the comparative microbench harness.
+    // The reference Rust fib in bench/microbench/rust/fib.rs hits
+    // the same expected result.
+    assert_eq!(run_with_arg(&bin, 25), 75025);
+}

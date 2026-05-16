@@ -1,8 +1,12 @@
 # M10 Plan — AOT Compiler + WASM Target
 
-> Status: **Open** as of 2026-05-16. Predecessor: M6 Phase 6 (`m6-phase6-complete`).
-> Spec slugs: `aot`, `wasm` (two parallel tracks per the ROADMAP).
-> Estimated duration: 3-6 months across both tracks.
+> Status: **Both tracks closed (Track W: `m10-wasm-complete`; Track A:
+> `m10-aot-complete` at this commit).** Both reports landed:
+> [Track W exit](m10-trackW-exit.md), [Track A exit](m10-trackA-exit.md).
+> Predecessor: M6 Phase 6 (`m6-phase6-complete`).
+> Spec slugs: `aot`, `wasm`. Original estimate 3-6 months across both;
+> actual elapsed was substantially shorter — Track W shipped clean on
+> first attempt, and Track A scope-narrowed to a numeric-kernel pipeline.
 
 ## Why M10 exists
 
@@ -54,6 +58,16 @@ Both tracks expand the runtime's reach beyond "tool you run on a Unix-style mach
 | A4   | Closeout — a non-trivial Scheme program (e.g. the `fib` or `nqueens` benchmark) compiles to a static binary, runs identically, with bench numbers comparable to JIT. | Low — measurement | 1 iter |
 
 **Exit criteria:** A non-trivial Scheme program compiles to a static binary that runs correctly. Bench numbers should be within 2× of JIT (likely faster post-rustc LTO).
+
+**Actual outcome (see [Track A exit](m10-trackA-exit.md)):** scope
+narrowed to a numeric-kernel AOT pipeline (Fixnum arith + branching +
+self-recursion). fib(40) RawI64 ABI matches reference `rustc -O` to
+the centisecond (0.14s, 447KB binary); Nb ABI runs 5.7× slower due
+to per-op runtime helper calls (inline NB fast paths are a
+post-1.0 optimization). The long tail of Inst variants (closures,
+heap, env ops, FlonumArith, generic Call, bytecode-to-RIR glue) is
+mechanical follow-up work, not a redesign — Track A demonstrated
+the pipeline.
 
 ## Recommended ordering — WASM first, then AOT
 
