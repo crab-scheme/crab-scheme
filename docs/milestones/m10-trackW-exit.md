@@ -94,7 +94,29 @@ This validates the M6 Phase 4 decision to unify on `NanboxValue` across tiers (c
 - Workspace tests on native: 911 / 0.
 - WASM build: clean.
 - WASM smoke tests: 8 / 8 microbench cases correct.
-- WASM conformance corpus: 2,438 / 1 / 2-skipped (matching native behavior exactly modulo sandbox).
+- WASM conformance corpus: 2,438 / 1 / 2-skipped at W4 close.
+
+### Post-closeout addendum (2026-05-16, pre-1.0 cleanup)
+
+The W4 sweep was run ad-hoc by hand. `bench/wasm-conformance.sh`
+is the committed reproducible harness; it builds the WASM binary
+if needed, iterates the corpus, wires the `--dir`/`--env` flags
+the file-I/O fixtures need, and tallies pass/fail/error counts.
+
+With the harness in place + the cond_expand_assert fix already
+landed in `58864ad`:
+
+| Stat          | W4 ad-hoc | Committed harness |
+|---------------|----------:|------------------:|
+| Pass          |     2,438 |             2,464 |
+| Fail          |         1 |                 0 |
+| Errored files |         2 |                 0 |
+| Files run     |       115 |               117 |
+
+Both file-I/O fixtures (`r7rs_load.scm` reads/writes `$TMPDIR`;
+`sorting_files.scm` reads `/etc/hosts` to exercise `file-exists?`
++ `open-input-file` on a real path) now pass under wasmtime with
+the harness's per-fixture flag mappings. Full sweep ≈ 4.8s.
 
 ## What this unblocks
 
