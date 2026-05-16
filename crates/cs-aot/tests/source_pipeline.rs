@@ -546,6 +546,37 @@ fn source_to_aot_forward_self_ref_capture() {
 }
 
 #[test]
+fn source_to_aot_mixed_fixnum_flonum_arith() {
+    // RC3 iter 2.17 — Flonum ops must handle NB-Fixnum operands
+    // correctly. Previous fbinop_rust / fcmp_*_rust / funary_rust_method
+    // assumed both operands are raw f64 bit patterns (NB Flonum's
+    // representation). When the translator fed a Flonum op an NB
+    // Fixnum (e.g., from a Fixnum-typed param flowing into mixed
+    // arith), `f64::from_bits(NB_Fixnum_bits)` interpreted the
+    // tagged-NaN range as a NaN, all subsequent f64 ops propagated
+    // NaN, and results were garbage.
+    //
+    // Mandelbrot returned 3 for any input vs the JIT's correct
+    // 27/45/157. With iter 2.17's NB-Fixnum-aware operand decode
+    // in each Flonum lowering helper, mandelbrot matches the JIT.
+    //
+    // This test exercises the specific bug shape with a smaller
+    // repro: (* x x) on Fixnum x mixed with (* 1.5 1.5) on Flonum.
+    let bin = aot_compile_multi_and_run(
+        "(define (test x) (let ((sum (+ (* x x) (* 1.5 1.5)))) \
+           (if (> sum 4.0) 1 0)))",
+        "test",
+        "mixed_fixnum_flonum",
+    );
+    // test(1): (* 1 1) = 1, (+ 1 2.25) = 3.25. 3.25 > 4.0 = #f → 0
+    assert_eq!(run_multi_with_args(&bin, "test", &[1]), 0);
+    // test(2): (* 2 2) = 4, (+ 4 2.25) = 6.25. 6.25 > 4.0 = #t → 1
+    assert_eq!(run_multi_with_args(&bin, "test", &[2]), 1);
+    // test(3): (* 3 3) = 9, (+ 9 2.25) = 11.25. > 4.0 → 1
+    assert_eq!(run_multi_with_args(&bin, "test", &[3]), 1);
+}
+
+#[test]
 fn source_to_aot_transitive_capture_propagation() {
     // RC3 iter 2.16 — transitive capture propagation. The inner
     // anonymous lambda `(lambda (x) (+ outer-y x))` is passed to a

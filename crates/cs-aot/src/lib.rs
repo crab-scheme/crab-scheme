@@ -1694,25 +1694,56 @@ fn emit_terminator(
     Ok(())
 }
 
-/// Emit a Flonum binary op as a Rust expression. The two operands
-/// are i64 carriers of f64 bit patterns; emit
-/// `(f64::from_bits(va as u64) <op> f64::from_bits(vb as u64))
-/// .to_bits() as i64`. Identical in both EmitModes.
+/// Emit a Flonum binary op as a Rust expression.
+///
+/// RC3 iter 2.17 — operand-shape NB-aware. Previous version
+/// assumed both operands are RAW f64 bit patterns (NB Flonum's
+/// representation). When mixed-type arith feeds a Flonum op an
+/// NB Fixnum (e.g., `(+ (* x x) (* 1.5 1.5))` where x = NB Fix(2)),
+/// `f64::from_bits(NB_Fixnum_bits)` interprets the tagged-NaN
+/// range as a NaN, all subsequent f64 ops propagate NaN, and the
+/// result is garbage. Mandelbrot hit this in
+/// `(> (+ (* zr zr) (* zi zi)) 4.0)` where zr/zi were typed Any
+/// but flowed as NB Fixnums initially (because loop's params
+/// defaulted to Any, losing the Flonum specialization at the call
+/// site).
+///
+/// Fix: extract a f64 from each operand. If NB Fixnum, convert
+/// payload to f64; if NB Flonum (or RawI64 mode with raw f64
+/// bits), use bit pattern directly. NanboxValue::as_fixnum
+/// handles the discrimination.
 fn fbinop_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
+    // Helper that yields a Rust expression converting an NB carrier
+    // (Fixnum-or-Flonum) to f64.
+    let to_f64 = |v: &Value| -> String {
+        format!(
+            "(if let Some(__nb_n) = cs_vm::vm::NanboxValue(v{v}).as_fixnum() {{ \
+             __nb_n as f64 }} else {{ f64::from_bits(v{v} as u64) }})",
+            v = v.0
+        )
+    };
     format!(
-        "(f64::from_bits(v{l} as u64) {op} f64::from_bits(v{r} as u64)).to_bits() as i64",
-        l = lhs.0,
-        r = rhs.0,
+        "({lhs_f} {op} {rhs_f}).to_bits() as i64",
+        lhs_f = to_f64(lhs),
+        rhs_f = to_f64(rhs),
         op = op,
     )
 }
 
 /// RawI64-mode Flonum comparison: result is 0/1 i64.
+/// RC3 iter 2.17 — see fbinop_rust for NB-Fixnum handling rationale.
 fn fcmp_raw_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
+    let to_f64 = |v: &Value| -> String {
+        format!(
+            "(if let Some(__nb_n) = cs_vm::vm::NanboxValue(v{v}).as_fixnum() {{ \
+             __nb_n as f64 }} else {{ f64::from_bits(v{v} as u64) }})",
+            v = v.0
+        )
+    };
     format!(
-        "if f64::from_bits(v{l} as u64) {op} f64::from_bits(v{r} as u64) {{ 1 }} else {{ 0 }}",
-        l = lhs.0,
-        r = rhs.0,
+        "if {lhs_f} {op} {rhs_f} {{ 1 }} else {{ 0 }}",
+        lhs_f = to_f64(lhs),
+        rhs_f = to_f64(rhs),
         op = op,
     )
 }
@@ -1720,11 +1751,19 @@ fn fcmp_raw_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
 /// Nb-mode Flonum comparison: result is an NB Boolean encoded by
 /// OR'ing the (0|1) compare with `NB_FALSE_BITS` — so 0→NB_FALSE,
 /// 1→NB_TRUE. Mirrors the JIT's FlonumLt lowering shape.
+/// RC3 iter 2.17 — NB-Fixnum-aware operand conversion.
 fn fcmp_nb_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
+    let to_f64 = |v: &Value| -> String {
+        format!(
+            "(if let Some(__nb_n) = cs_vm::vm::NanboxValue(v{v}).as_fixnum() {{ \
+             __nb_n as f64 }} else {{ f64::from_bits(v{v} as u64) }})",
+            v = v.0
+        )
+    };
     format!(
-        "((if f64::from_bits(v{l} as u64) {op} f64::from_bits(v{r} as u64) {{ 1u64 }} else {{ 0u64 }}) | 0xfff8_8000_0000_0000u64) as i64",
-        l = lhs.0,
-        r = rhs.0,
+        "((if {lhs_f} {op} {rhs_f} {{ 1u64 }} else {{ 0u64 }}) | 0xfff8_8000_0000_0000u64) as i64",
+        lhs_f = to_f64(lhs),
+        rhs_f = to_f64(rhs),
         op = op,
     )
 }
@@ -1732,9 +1771,11 @@ fn fcmp_nb_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
 /// Flonum unary method call: `f64::from_bits(v0 as u64).METHOD()
 /// .to_bits() as i64`. Used for sqrt/abs/floor/ceil/trunc/round/sin/
 /// cos/tan/ln/exp/asin/acos/atan.
+/// RC3 iter 2.17 — NB-Fixnum-aware via NanboxValue::as_fixnum.
 fn funary_rust_method(method: &str, src: &Value) -> String {
     format!(
-        "f64::from_bits(v{s} as u64).{method}().to_bits() as i64",
+        "(if let Some(__nb_n) = cs_vm::vm::NanboxValue(v{s}).as_fixnum() {{ \
+         (__nb_n as f64).{method}() }} else {{ f64::from_bits(v{s} as u64).{method}() }}).to_bits() as i64",
         s = src.0,
         method = method,
     )
@@ -1742,11 +1783,19 @@ fn funary_rust_method(method: &str, src: &Value) -> String {
 
 /// Flonum binary method call: `lhs.METHOD(rhs)` shape. Used for
 /// max/min/log (base)/atan2/powf.
+/// RC3 iter 2.17 — NB-Fixnum-aware operand conversion.
 fn fbinop_method_rust(method: &str, lhs: &Value, rhs: &Value) -> String {
+    let to_f64 = |v: &Value| -> String {
+        format!(
+            "(if let Some(__nb_n) = cs_vm::vm::NanboxValue(v{v}).as_fixnum() {{ \
+             __nb_n as f64 }} else {{ f64::from_bits(v{v} as u64) }})",
+            v = v.0
+        )
+    };
     format!(
-        "f64::from_bits(v{l} as u64).{method}(f64::from_bits(v{r} as u64)).to_bits() as i64",
-        l = lhs.0,
-        r = rhs.0,
+        "{lhs_f}.{method}({rhs_f}).to_bits() as i64",
+        lhs_f = to_f64(lhs),
+        rhs_f = to_f64(rhs),
         method = method,
     )
 }
@@ -2348,7 +2397,13 @@ mod tests {
             terminator: Term::Return(Value(1)),
         });
         let src = emit_with(EmitMode::Nb, &f).unwrap();
-        assert!(src.contains("f64::from_bits(v0 as u64).sqrt().to_bits() as i64"));
+        // RC3 iter 2.17 — operand decode is NB-Fixnum-aware: each
+        // operand goes through `as_fixnum() → __nb_n as f64` else
+        // `f64::from_bits(...)`. The post-decode shape stays
+        // `.sqrt().to_bits() as i64`.
+        assert!(src.contains(".sqrt()"));
+        assert!(src.contains(".to_bits() as i64"));
+        assert!(src.contains("NanboxValue(v0).as_fixnum()"));
     }
 
     #[test]
@@ -2367,7 +2422,10 @@ mod tests {
             terminator: Term::Return(Value(2)),
         });
         let src = emit_with(EmitMode::Nb, &f).unwrap();
-        assert!(src.contains(".powf(f64::from_bits(v1 as u64))"));
+        // RC3 iter 2.17 — operand decode is NB-Fixnum-aware.
+        assert!(src.contains(".powf("));
+        assert!(src.contains("NanboxValue(v0).as_fixnum()"));
+        assert!(src.contains("NanboxValue(v1).as_fixnum()"));
     }
 
     #[test]
