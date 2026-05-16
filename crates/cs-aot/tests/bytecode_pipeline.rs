@@ -101,6 +101,109 @@ fn workspace_target_dir() -> PathBuf {
         .join("target/aot-bytecode-pipeline-tests")
 }
 
+/// Hand-built bytecode for fib, identical shape to the
+/// `cs-jit-cranelift/tests/jit_from_bytecode.rs` template:
+///   (define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+fn fib_lambda(syms: &mut SymbolTable) -> (CompiledLambda, cs_core::Symbol) {
+    let n = syms.intern("n");
+    let fib = syms.intern("fib");
+    let body = vec![
+        VmInst::LoadVar(n),
+        VmInst::Const(Value::Number(Number::Fixnum(2))),
+        VmInst::LtFx2,
+        VmInst::JumpIfFalse(6),
+        VmInst::LoadVar(n),
+        VmInst::Return,
+        VmInst::LoadVar(fib),
+        VmInst::LoadVar(n),
+        VmInst::Const(Value::Number(Number::Fixnum(1))),
+        VmInst::SubFx2,
+        VmInst::Call(1),
+        VmInst::LoadVar(fib),
+        VmInst::LoadVar(n),
+        VmInst::Const(Value::Number(Number::Fixnum(2))),
+        VmInst::SubFx2,
+        VmInst::Call(1),
+        VmInst::AddFx2,
+        VmInst::Return,
+    ];
+    let len = body.len();
+    let lam = CompiledLambda {
+        params: vec![n],
+        rest: None,
+        body: Rc::new(body),
+        spans: Rc::new(vec![Span::DUMMY; len]),
+        fast: None,
+        profile: Default::default(),
+    };
+    (lam, fib)
+}
+
+#[test]
+fn bytecode_to_rir_to_aot_compiles_fib_end_to_end() {
+    // Same pipeline as the fact test, different kernel. fib's
+    // double self-recursion + Lt-comparison exercise more of the
+    // bytecode→RIR→AOT surface (two CallSelfs per recursive case,
+    // Branch on Lt-result NB Boolean).
+    let mut syms = SymbolTable::new();
+    let (lam, fib_sym) = fib_lambda(&mut syms);
+    let rir = bytecode_to_rir(&lam, "fib", Some(fib_sym))
+        .expect("bytecode_to_rir should accept fib's lambda");
+
+    let pid = std::process::id();
+    let tmpdir = std::env::temp_dir().join(format!("cs-aot-bytecode-fib-{pid}"));
+    let _ = std::fs::remove_dir_all(&tmpdir);
+
+    let opts = ProjectOptions {
+        mode: EmitMode::Nb,
+        package_name: "aot_fib_bytecode".to_string(),
+        entry_fn_name: "fib".to_string(),
+        cs_vm_path: Some(cs_vm_workspace_path()),
+    };
+
+    let emitted = emit_project(&[rir], &tmpdir, &opts)
+        .expect("emit_project should accept fib's bytecode-translated RIR");
+
+    let target_dir = workspace_target_dir();
+    let bin_name = &opts.package_name;
+    let output = Command::new("cargo")
+        .current_dir(&emitted.project_dir)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .arg("build")
+        .arg("--release")
+        .arg("--bin")
+        .arg(bin_name)
+        .arg("--offline")
+        .output()
+        .expect("cargo executes");
+    assert!(
+        output.status.success(),
+        "cargo build failed for fib:\n--- stderr ---\n{}\n",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let bin = target_dir.join(format!("release/{bin_name}"));
+
+    let run = |n: i64| -> i64 {
+        let out = Command::new(&bin)
+            .arg(n.to_string())
+            .output()
+            .expect("binary executes");
+        assert!(out.status.success());
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .parse::<i64>()
+            .expect("i64 parse")
+    };
+
+    assert_eq!(run(0), 0);
+    assert_eq!(run(1), 1);
+    assert_eq!(run(2), 1);
+    assert_eq!(run(10), 55);
+    assert_eq!(run(20), 6765);
+    assert_eq!(run(25), 75025);
+}
+
 #[test]
 fn bytecode_to_rir_to_aot_compiles_fact_end_to_end() {
     // Translate fact bytecode → RIR.
