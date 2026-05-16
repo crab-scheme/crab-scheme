@@ -3237,17 +3237,55 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::VecAlloc(dst, args[0], fill));
                                         value_types.insert(dst, Type::Any);
                                     }
-                                    ("vector-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
+                                    ("vector-ref", 2) => {
+                                        // Phase 5 iter3 — try promoting
+                                        // a free-var EnvLookup arg0 to
+                                        // Any before requiring it. This
+                                        // lets `(vector-ref v i)` where
+                                        // `v` is a captured vector work
+                                        // (previously rejected when v
+                                        // defaulted to Fixnum).
+                                        let arg0_ty = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        if arg0_ty != Type::Any {
+                                            promote_envlookup_to_any(
+                                                &mut insts,
+                                                &mut value_types,
+                                                args[0],
+                                            );
+                                        }
+                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
+                                            return Err(TranslateError::Unsupported(format!(
+                                                "vector-ref on non-Any operand (type={:?})",
+                                                arg0_ty
+                                            )));
+                                        }
                                         insts.push(RirInst::VecRef(dst, args[0], args[1]));
                                         value_types.insert(dst, Type::Any);
                                     }
-                                    ("vector-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
+                                    ("vector-set!", 3) => {
+                                        // Phase 5 iter3 — promote arg0
+                                        // from EnvLookup Fixnum default
+                                        // to Any if needed.
+                                        let arg0_ty = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        if arg0_ty != Type::Any {
+                                            promote_envlookup_to_any(
+                                                &mut insts,
+                                                &mut value_types,
+                                                args[0],
+                                            );
+                                        }
+                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
+                                            return Err(TranslateError::Unsupported(format!(
+                                                "vector-set! on non-Any operand (type={:?})",
+                                                arg0_ty
+                                            )));
+                                        }
                                         // Box the value-to-store if it's
                                         // a typed immediate.
                                         let v_t = value_types
@@ -3269,19 +3307,53 @@ pub fn bytecode_to_rir_with_hints(
                                         insts.push(RirInst::VecSet(dst, args[0], args[1], val));
                                         value_types.insert(dst, Type::Any);
                                     }
-                                    ("vector-length", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
+                                    ("vector-length", 1) => {
+                                        let arg0_ty = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        if arg0_ty != Type::Any {
+                                            promote_envlookup_to_any(
+                                                &mut insts,
+                                                &mut value_types,
+                                                args[0],
+                                            );
+                                        }
+                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
+                                            return Err(TranslateError::Unsupported(format!(
+                                                "vector-length on non-Any operand (type={:?})",
+                                                arg0_ty
+                                            )));
+                                        }
                                         insts.push(RirInst::VecLength(dst, args[0]));
                                         value_types.insert(dst, Type::Fixnum);
                                     }
-                                    ("vector?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::VecP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
+                                    ("vector?", 1) => {
+                                        let arg0_ty = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        if arg0_ty != Type::Any {
+                                            promote_envlookup_to_any(
+                                                &mut insts,
+                                                &mut value_types,
+                                                args[0],
+                                            );
+                                        }
+                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
+                                            // For non-Any non-promoted
+                                            // operands the type is statically
+                                            // known and the answer is false
+                                            // (except for Any, handled above).
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Boolean(false),
+                                            ));
+                                            value_types.insert(dst, Type::Boolean);
+                                        } else {
+                                            insts.push(RirInst::VecP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
                                     }
                                     // ADR 0012 D-2 (iter BX) — string ops.
                                     // make-string requires the fill argument

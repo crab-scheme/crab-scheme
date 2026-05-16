@@ -695,10 +695,12 @@ fn uniform_nb_call_self_countdown() {
 #[test]
 fn uniform_nb_rejects_non_tail_callself() {
     // (define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
-    // — has two non-tail CallSelfs in the same block. The baseline
-    // tier rejects this so the closure falls back to bytecode rather
-    // than risking host stack overflow. (Specialized tier handles
-    // it via different recursion plumbing — different problem.)
+    // — has two non-tail CallSelfs in the same block. The uniform-NB
+    // inner uses CallConv::Tail which costs more host stack per non-
+    // tail frame than SystemV; deeper nestings like tak's triple
+    // CallSelf overflow at benchmark sizes. Rejecting forces the
+    // closure to the specialized tier (SystemV) where these compile
+    // safely.
     use cs_jit::JitError;
     use cs_rir::{Block, BlockId, Const as RirConst, Function, Inst as RirInst, Term, Type};
 

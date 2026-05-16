@@ -4898,9 +4898,50 @@ impl Lowerer {
                     | Inst::EnvLookupAny(_, _)
                     | Inst::EnvSet(_, _)
                     | Inst::Call(_, _, _)
-                    | Inst::CallGeneral(_, _, _) => {}
+                    | Inst::CallGeneral(_, _, _)
+                    | Inst::BoxTyped(_, _, _)
+                    | Inst::AnyToFix(_, _)
+                    | Inst::AnyToBool(_, _)
+                    | Inst::AnyToFlo(_, _)
+                    | Inst::AnyTruthy(_, _)
+                    | Inst::FixToFlo(_, _)
+                    | Inst::IntCharBitcast(_, _) => {
+                        // Phase 5 iter3 — BoxTyped is an identity in
+                        // uniform-NB: the typed-lane src is already an
+                        // NB carrier with its proper tag, and any
+                        // consumer decoding via gc_i64_to_value handles
+                        // every NB tag uniformly.
+                    }
                     Inst::CallSelf(_, _) => {
-                        let is_tail = i == last_idx && detect_tail_call_self(rir, blk).is_some();
+                        // Non-tail CallSelf still rejected here — the
+                        // uniform-NB inner uses CallConv::Tail which
+                        // burns more host stack per non-tail frame than
+                        // CallConv::SystemV. tak's 3× nested CallSelf
+                        // overflows on benchmark-scale recursion.
+                        // Specialized tier (SystemV) handles non-tail
+                        // CallSelf without overflow; falling back keeps
+                        // tak working.
+                        //
+                        // Pattern (a)/(b): plain tail-call (CallSelf
+                        // is last inst). Pattern (c): CallSelf at n-2
+                        // followed by a no-op BoxTyped on its dst.
+                        let last_check_ab = i == last_idx;
+                        let pattern_c = if i + 1 == last_idx {
+                            if let (
+                                Some(Inst::CallSelf(call_dst, _)),
+                                Some(Inst::BoxTyped(_, box_src, _)),
+                            ) = (blk.insts.get(i), blk.insts.get(last_idx))
+                            {
+                                box_src == call_dst
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        let last_check = last_check_ab || pattern_c;
+                        let tail_check = detect_tail_call_self(rir, blk).is_some() || pattern_c;
+                        let is_tail = last_check && tail_check;
                         if !is_tail {
                             return Err(JitError::Unsupported(
                                 "uniform-nb: non-tail CallSelf would burn host stack".into(),
@@ -5116,17 +5157,74 @@ impl Lowerer {
                 // compile_inner_body. Emits `return_call` instead of a
                 // regular `call` so deeply recursive bodies (tak, etc.)
                 // don't burn host stack.
-                let tail = detect_tail_call_self(rir, blk);
-                if tail.is_some() {
-                    // Lower all but the last inst (the CallSelf).
+                //
+                // Uniform-NB also recognizes the CallSelf-then-
+                // BoxTyped pattern: when the recursive arm's value
+                // must widen to Any to merge with a sibling typed
+                // branch, the translator emits BoxTyped(_, callself,
+                // _) before the trivial Jump-to-Return. BoxTyped is a
+                // no-op in uniform-NB (all values are NB), so we can
+                // treat the pair as tail-position together.
+                let (tail_args, trim_extra): (Option<&[RirValue]>, usize) = {
+                    let n = blk.insts.len();
+                    if n >= 2 {
+                        if let (
+                            Some(Inst::CallSelf(call_dst, call_args)),
+                            Some(Inst::BoxTyped(box_dst, box_src, _)),
+                        ) = (blk.insts.get(n - 2), blk.insts.get(n - 1))
+                        {
+                            if box_src == call_dst {
+                                // Pattern (c) — extend the trivial-
+                                // join/return check using box_dst as
+                                // the value being passed forward.
+                                let ok = match &blk.terminator {
+                                    Term::Return(ret_v) => ret_v == box_dst,
+                                    Term::Jump(target, jump_args)
+                                        if jump_args.len() == 1 && jump_args[0] == *box_dst =>
+                                    {
+                                        rir.blocks.iter().find(|b| b.id == *target).map_or(
+                                            false,
+                                            |tb| {
+                                                tb.insts.is_empty()
+                                                    && matches!(
+                                                        &tb.terminator,
+                                                        Term::Return(rv)
+                                                            if tb.params.first()
+                                                                .map_or(false, |(p, _)| rv == p)
+                                                    )
+                                            },
+                                        )
+                                    }
+                                    _ => false,
+                                };
+                                if ok {
+                                    (Some(call_args.as_slice()), 1)
+                                } else {
+                                    (detect_tail_call_self(rir, blk), 0)
+                                }
+                            } else {
+                                (detect_tail_call_self(rir, blk), 0)
+                            }
+                        } else {
+                            (detect_tail_call_self(rir, blk), 0)
+                        }
+                    } else {
+                        (detect_tail_call_self(rir, blk), 0)
+                    }
+                };
+                if tail_args.is_some() {
+                    // Drop the CallSelf and (if pattern (c)) the
+                    // trailing BoxTyped.
+                    let n = blk.insts.len();
+                    let trim = 1 + trim_extra;
                     let truncated = cs_rir::Block {
                         id: blk.id,
                         params: blk.params.clone(),
-                        insts: blk.insts[..blk.insts.len() - 1].to_vec(),
+                        insts: blk.insts[..n - trim].to_vec(),
                         terminator: blk.terminator.clone(),
                     };
                     lower_inst_uniform_nb(&mut builder, &mut value_map, &nb_helpers, &truncated)?;
-                    let args = tail.unwrap();
+                    let args = tail_args.unwrap();
                     let cargs: Vec<cranelift_codegen::ir::Value> = args
                         .iter()
                         .map(|a| lookup(&value_map, *a))
@@ -7016,6 +7114,103 @@ fn lower_inst_uniform_nb(
                 let result = b.block_params(join_block)[0];
                 b.declare_value_needs_stack_map(result);
                 map.insert(*dst, result);
+            }
+            // Phase 5 iter3 — BoxTyped(dst, src, _tag) in uniform-NB
+            // is a coordinate-system identity: `src` is already an NB
+            // carrier holding the value with its proper NB tag (Fixnum
+            // NB / Boolean NB / Character NB / Flonum bits / etc.). Any
+            // recipient that decodes via `gc_i64_to_value` handles
+            // every NB tag uniformly, so no wrap is needed. The `_tag`
+            // arg becomes irrelevant in NB land.
+            //
+            // In specialized this op allocates a Gc<Value> wrap; here
+            // it's free. The dst still needs a stack-map declaration so
+            // GC can walk it (in case the value was actually a pointer-
+            // tagged NB carrying a Gc handle).
+            &Inst::BoxTyped(dst, src, _tag) => {
+                let v = lookup(map, src)?;
+                b.declare_value_needs_stack_map(v);
+                map.insert(dst, v);
+            }
+            // Phase 5 iter3 — Any→typed conversions in uniform-NB are
+            // also identities. The NB-aware downstream ops (Add/Sub/Mul/
+            // Lt/Eq via emit_nb_arith_fixnum_fast / emit_nb_cmp_fixnum_
+            // fast) check tags at runtime and dispatch fast-or-slow, so
+            // no unboxing is needed. In specialized these ops would call
+            // vm_unbox_* helpers; here they're free.
+            &Inst::AnyToFix(dst, src) | &Inst::AnyToBool(dst, src) | &Inst::AnyToFlo(dst, src) => {
+                let v = lookup(map, src)?;
+                map.insert(dst, v);
+            }
+            // AnyTruthy: NB Branch terminator already compares against
+            // NB_FALSE bit pattern (see `lower_terminator_uniform_nb`),
+            // so any NB carrier works as a branch condition. Identity.
+            &Inst::AnyTruthy(dst, src) => {
+                let v = lookup(map, src)?;
+                map.insert(dst, v);
+            }
+            // FixToFlo: convert NB Fixnum to NB Flonum (= f64 bits).
+            // The translator's static value_types is best-effort —
+            // EnvLookup values default to Fixnum but may be any NB
+            // shape at runtime. So we dispatch on the tag: NB Fixnum
+            // gets the integer→float conversion; anything else (real
+            // Flonum f64 bits, Gc<Value> wrap, etc.) passes through
+            // unchanged so downstream FlonumXxx ops bitcast it as the
+            // f64 it already is. This is safe because NB Flonums ARE
+            // f64 bit patterns and the only legitimate non-Fixnum
+            // input here is a Flonum that the translator mis-tagged.
+            &Inst::FixToFlo(dst, src) => {
+                let v = lookup(map, src)?;
+                let sig_masked = b.ins().band_imm(v, cs_vm::vm::NB_SIGNATURE_MASK as i64);
+                let tag_masked = b.ins().band_imm(v, cs_vm::vm::NB_TAG_MASK as i64);
+                let is_nb_sig = b.ins().icmp_imm(
+                    IntCC::Equal,
+                    sig_masked,
+                    cs_vm::vm::NB_SIGNATURE_BITS as i64,
+                );
+                let is_fixnum_tag = b.ins().icmp_imm(IntCC::Equal, tag_masked, 0);
+                let needs_conv = b.ins().band(is_nb_sig, is_fixnum_tag);
+
+                let conv_block = b.create_block();
+                let passthrough_block = b.create_block();
+                let join_block = b.create_block();
+                b.append_block_param(join_block, I64);
+                b.ins()
+                    .brif(needs_conv, conv_block, &[], passthrough_block, &[]);
+
+                b.switch_to_block(conv_block);
+                b.seal_block(conv_block);
+                let payload = b.ins().band_imm(v, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let shifted = b.ins().ishl_imm(payload, 17);
+                let signed = b.ins().sshr_imm(shifted, 17);
+                let f = b.ins().fcvt_from_sint(F64, signed);
+                let mf = cranelift_codegen::ir::MemFlags::new();
+                let bits = b.ins().bitcast(I64, mf, f);
+                b.ins()
+                    .jump(join_block, &[cranelift_codegen::ir::BlockArg::Value(bits)]);
+
+                b.switch_to_block(passthrough_block);
+                b.seal_block(passthrough_block);
+                b.ins()
+                    .jump(join_block, &[cranelift_codegen::ir::BlockArg::Value(v)]);
+
+                b.switch_to_block(join_block);
+                b.seal_block(join_block);
+                let result = b.block_params(join_block)[0];
+                map.insert(dst, result);
+            }
+            // IntCharBitcast: same bit pattern, just retag the SSA value.
+            // In NB land both Fixnum and Character carry the codepoint
+            // in low bits — but tag differs. We need to re-tag: strip
+            // the FIXNUM header, OR in the CHARACTER header.
+            &Inst::IntCharBitcast(dst, src) => {
+                let v = lookup(map, src)?;
+                let payload = b.ins().band_imm(v, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let char_tag_bits = (cs_vm::vm::NB_SIGNATURE_BITS
+                    | ((cs_vm::vm::NB_TAG_CHARACTER as u64) << 47))
+                    as i64;
+                let retagged = b.ins().bor_imm(payload, char_tag_bits);
+                map.insert(dst, retagged);
             }
             other => {
                 return Err(JitError::Unsupported(format!(
