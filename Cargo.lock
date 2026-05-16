@@ -385,6 +385,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-aot"
+version = "0.0.1"
+dependencies = [
+ "cs-rir",
+ "syn",
+]
+
+[[package]]
 name = "cs-cli"
 version = "0.0.1"
 dependencies = [

@@ -18,6 +18,7 @@ members = [
     "crates/cs-ffi-example",
     "crates/cs-ffi-sha2",
     "crates/cs-ffi-http",
+    "crates/cs-aot",
     "crates/cs-cli",
     "crates/cs-cli-sha2",
 ]

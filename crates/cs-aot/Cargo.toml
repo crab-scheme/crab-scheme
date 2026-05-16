@@ -1,0 +1,16 @@
+[package]
+name = "cs-aot"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+description = "Ahead-of-time compiler for CrabScheme: consumes cs-rir Function values and emits Rust source. The Rust source compiles to native code via the standard cargo toolchain; the same `cs-rir` IR feeds both the JIT (Cranelift -> native bytes) and the AOT (cs-aot -> Rust source -> rustc -> native bytes)."
+
+[dependencies]
+cs-rir = { workspace = true }
+
+[dev-dependencies]
+# `syn` parses the emitted Rust source as a sanity check that we
+# produce well-formed code, separate from compilation tests that
+# actually invoke rustc on the output.
+syn = { version = "2", features = ["full", "parsing"] }
