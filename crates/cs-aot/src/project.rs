@@ -345,18 +345,24 @@ fn write_aot_dispatch_wrapper(src: &mut String, f: &Function) {
     let arity = f.params.len();
 
     src.push_str(&format!(
-        "/// RC3 iter 2.2: dispatch wrapper for `{fn_name}` (arity {arity}).\n\
+        "/// RC3 iter 2.2 + 2.4: dispatch wrapper for `{fn_name}` (arity {arity}).\n\
          /// Called via cs_vm::vm::vm_call_aot_procedure when the\n\
-         /// procedure value is invoked from Scheme code.\n"
+         /// procedure value is invoked from Scheme code. Signature\n\
+         /// matches cs_vm::vm::AotDispatchFn (captures + args).\n\
+         /// Non-capturing wrappers ignore the captures slice.\n"
     ));
     src.push_str(&format!(
-        "#[no_mangle]\npub unsafe extern \"C\" fn {fn_name}_aot_dispatch(args: *const i64, n: usize) -> i64 {{\n"
+        "#[no_mangle]\npub unsafe extern \"C\" fn {fn_name}_aot_dispatch(\
+         _captures: *const i64, _n_captures: usize, \
+         args: *const i64, n_args: usize) -> i64 {{\n"
     ));
     src.push_str(&format!(
-        "    debug_assert_eq!(n, {arity}, \"{fn_name}_aot_dispatch: arity\");\n"
+        "    debug_assert_eq!(n_args, {arity}, \"{fn_name}_aot_dispatch: arity\");\n"
     ));
 
-    // Unpack args + invoke.
+    // Unpack args + invoke. Non-capturing today; iter 2.4's cs-aot
+    // side will extend the unpack to also load captures and pass
+    // them as extra params to the typed fn.
     let arg_loads: Vec<String> = (0..arity).map(|i| format!("*args.add({i})")).collect();
     src.push_str(&format!("    {fn_name}({})\n}}\n\n", arg_loads.join(", ")));
 }

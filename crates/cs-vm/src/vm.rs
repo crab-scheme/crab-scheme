@@ -14912,19 +14912,37 @@ trace_leaf_proc!(
 // non-capturing nested lambdas and direct general-Call dispatch
 // (iter 2.2 + 2.3).
 
-/// AOT-procedure dispatch signature: takes an args slice (NB-encoded
-/// i64s) + length, returns an NB-encoded i64. cs-aot emits one of
-/// these wrappers per AOT'd top-level lambda.
-pub type AotDispatchFn = unsafe extern "C" fn(*const i64, usize) -> i64;
+/// AOT-procedure dispatch signature (iter 2.4): captures + args.
+///
+/// - `captures` points at `n_captures` NB-encoded i64s holding the
+///   lambda's captured free variables (in declaration order; the
+///   translator records that order at MakeClosure time).
+/// - `args` points at `n_args` NB-encoded i64s holding the
+///   positional arguments passed by the caller.
+///
+/// Non-capturing lambdas pass `n_captures = 0` and `captures =
+/// null_ptr`. The dispatch wrapper is responsible for arity
+/// validation on `n_args`.
+pub type AotDispatchFn = unsafe extern "C" fn(
+    captures: *const i64,
+    n_captures: usize,
+    args: *const i64,
+    n_args: usize,
+) -> i64;
 
 /// Procedure-impl wrapping an AOT-emitted dispatch fn pointer +
-/// declared arity.
+/// declared arity + captured free-var values.
 ///
 /// Lives behind `Rc<dyn Procedure>` in the proc_table. The fn pointer
 /// must stay live for the duration the procedure is reachable —
 /// AOT'd binaries embed the dispatch fn as a static symbol, so this
 /// is trivially satisfied (the pointer is just an address in the
 /// binary's `.text` section).
+///
+/// Captures are owned by the closure: incref'd on alloc, decref'd
+/// when the closure is dropped (via the proc_table's existing
+/// drop path). The captures `Vec<i64>` carries NB carriers, each
+/// with one strong refcount per the consume-on-use ABI.
 #[derive(Debug)]
 pub struct VmAotClosure {
     /// Function pointer to the AOT-emitted dispatch wrapper. Stored
@@ -14940,6 +14958,11 @@ pub struct VmAotClosure {
     /// Optional name used for diagnostics (Procedure trait method).
     /// AOT emitter passes the original Scheme name (post-sanitize).
     name: Option<String>,
+    /// RC3 iter 2.4 — captured free-var values (NB-encoded). Each
+    /// is one strong ref on its payload; the proc_table's drop
+    /// path will refcount them down when the closure is freed.
+    /// Empty for non-capturing closures.
+    captures: Vec<i64>,
 }
 
 impl VmAotClosure {
@@ -14960,7 +14983,41 @@ impl VmAotClosure {
             fn_ptr,
             arity,
             name,
+            captures: Vec::new(),
         }
+    }
+
+    /// RC3 iter 2.4 — construct an AOT closure that carries captured
+    /// free-var values. Each capture is an NB carrier with one
+    /// strong refcount (consume-on-use); ownership transfers to the
+    /// closure, dropped via the proc_table's drop path when the
+    /// closure is freed.
+    ///
+    /// # Safety
+    ///
+    /// Same as `new`, plus: each `captures` entry must be a live,
+    /// owned NB carrier. Pointer-typed payloads (Pair / Vector /
+    /// String / Procedure) are not refcount-traced by VmAotClosure's
+    /// `Trace` impl — they're held by Rc count alone. iter 2.4 ships
+    /// with this conservative posture; broader GC integration is
+    /// post-RC3 work.
+    pub unsafe fn new_with_captures(
+        fn_ptr: usize,
+        arity: u32,
+        name: Option<String>,
+        captures: Vec<i64>,
+    ) -> Self {
+        Self {
+            fn_ptr,
+            arity,
+            name,
+            captures,
+        }
+    }
+
+    /// Number of captured free-var values. 0 for non-capturing.
+    pub fn n_captures(&self) -> usize {
+        self.captures.len()
     }
 }
 
@@ -14997,6 +15054,40 @@ pub unsafe extern "C" fn vm_alloc_aot_procedure(disp_fn: usize, arity: u32) -> i
         fn_ptr: disp_fn,
         arity,
         name: None,
+        captures: Vec::new(),
+    };
+    let proc_rc: std::rc::Rc<dyn cs_core::Procedure> = std::rc::Rc::new(closure);
+    let idx = proc_table::alloc(proc_rc);
+    nb_make(NB_TAG_PROCEDURE, idx as u64) as i64
+}
+
+/// RC3 iter 2.4 — allocate an AOT procedure with captured free-var
+/// values. Like [`vm_alloc_aot_procedure`] but the closure carries
+/// `n_captures` NB-encoded values that get passed to the dispatch
+/// fn as a separate slice at invoke time.
+///
+/// # Safety
+///
+/// - `disp_fn` must be a valid `AotDispatchFn` (iter 2.4 signature).
+/// - `captures_ptr` must point at `n_captures` valid NB carriers,
+///   each with one strong refcount the closure takes ownership of.
+#[no_mangle]
+pub unsafe extern "C" fn vm_alloc_aot_procedure_with_captures(
+    disp_fn: usize,
+    arity: u32,
+    captures_ptr: *const i64,
+    n_captures: usize,
+) -> i64 {
+    let captures = if n_captures == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(captures_ptr, n_captures).to_vec()
+    };
+    let closure = VmAotClosure {
+        fn_ptr: disp_fn,
+        arity,
+        name: None,
+        captures,
     };
     let proc_rc: std::rc::Rc<dyn cs_core::Procedure> = std::rc::Rc::new(closure);
     let idx = proc_table::alloc(proc_rc);
@@ -15042,33 +15133,76 @@ pub unsafe extern "C" fn vm_call_aot_procedure(
         aot.arity, n_args
     );
     let f: AotDispatchFn = std::mem::transmute(aot.fn_ptr);
-    f(args_ptr, n_args)
+    // RC3 iter 2.4 — pass captures alongside args. Non-capturing
+    // closures have an empty captures Vec; we still pass a valid
+    // (possibly empty) slice + count.
+    let (captures_ptr, n_captures) = if aot.captures.is_empty() {
+        (std::ptr::null::<i64>(), 0usize)
+    } else {
+        (aot.captures.as_ptr(), aot.captures.len())
+    };
+    f(captures_ptr, n_captures, args_ptr, n_args)
 }
 
 #[cfg(test)]
 mod aot_proc_tests {
     use super::*;
 
-    /// Minimal extern "C" dispatch fn: returns args[0] + args[1]
-    /// as NB Fixnums.
-    unsafe extern "C" fn add_dispatch(args: *const i64, n: usize) -> i64 {
-        assert_eq!(n, 2);
+    /// Minimal extern "C" dispatch fn (iter 2.4 signature):
+    /// returns args[0] + args[1] as NB Fixnums. Ignores captures.
+    unsafe extern "C" fn add_dispatch(
+        _captures: *const i64,
+        _n_captures: usize,
+        args: *const i64,
+        n_args: usize,
+    ) -> i64 {
+        assert_eq!(n_args, 2);
         let a = *args;
         let b = *args.add(1);
         vm_value_add_nb(a, b)
     }
 
+    /// Dispatch fn that uses a captured value: returns captures[0] + args[0].
+    /// Simulates a `(lambda (x) (+ captured x))` style closure body.
+    unsafe extern "C" fn capture_then_add_dispatch(
+        captures: *const i64,
+        n_captures: usize,
+        args: *const i64,
+        n_args: usize,
+    ) -> i64 {
+        assert_eq!(n_captures, 1);
+        assert_eq!(n_args, 1);
+        vm_value_add_nb(*captures, *args)
+    }
+
     #[test]
     fn alloc_then_call_aot_procedure_roundtrip() {
         let proc_nb = unsafe { vm_alloc_aot_procedure(add_dispatch as usize, 2) };
-        // Encode two Fixnum args + dispatch.
         let args = [
             NanboxValue::fixnum(40).into_raw(),
             NanboxValue::fixnum(2).into_raw(),
         ];
         let result = unsafe { vm_call_aot_procedure(proc_nb, args.as_ptr(), args.len()) };
-        let result_nb = NanboxValue(result);
-        assert_eq!(result_nb.as_fixnum(), Some(42));
+        assert_eq!(NanboxValue(result).as_fixnum(), Some(42));
+    }
+
+    #[test]
+    fn aot_procedure_with_captures_roundtrip() {
+        // RC3 iter 2.4 — closure captures a Fixnum, applies it
+        // additively to the arg. `(let ((x 100)) (lambda (y) (+ x y)))`
+        // then invoked with `y = 23` should yield 123.
+        let captures = [NanboxValue::fixnum(100).into_raw()];
+        let proc_nb = unsafe {
+            vm_alloc_aot_procedure_with_captures(
+                capture_then_add_dispatch as usize,
+                1,
+                captures.as_ptr(),
+                captures.len(),
+            )
+        };
+        let args = [NanboxValue::fixnum(23).into_raw()];
+        let result = unsafe { vm_call_aot_procedure(proc_nb, args.as_ptr(), args.len()) };
+        assert_eq!(NanboxValue(result).as_fixnum(), Some(123));
     }
 
     // Note: a `#[should_panic(expected = "arity mismatch")]` test
