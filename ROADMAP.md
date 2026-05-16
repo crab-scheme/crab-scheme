@@ -19,7 +19,7 @@ spec, in which order, with what exit criteria*.
 | M7        | HolyJIT backend (primary)            | `jit-holy`             | JIT differential parity with Cranelift backend             | ⏸ parked (ADR 0009 — upstream stale) |
 | M8        | First-class continuations + CWCC     | `continuations`        | Larceny cont tests ≥ 95% pass                              | ✅ VM-tier done (`m8-vm-complete`); walker-tier + Larceny suite deferred |
 | M9        | R6RS standard library completion     | `stdlib`               | R6RS conformance ≥ 99%; Larceny suite ≥ 95%                | ✅ foundation done (`m9-foundation-complete`); R6RS conformance **99.96%** on our corpus / **100%** Racket-cross-validated subset (2026-05-15) — Larceny @ 94% on parsable slice, reader shims would expand sample |
-| M10       | AOT compiler + WASM target           | `aot`, `wasm`          | Static binaries from Scheme; WASM bytecode tier shipping   | — |
+| M10       | AOT compiler + WASM target           | `aot`, `wasm`          | Static binaries from Scheme; WASM bytecode tier shipping   | 🚧 OPEN as of 2026-05-16 — Track W (WASM) starting first per `docs/milestones/m10-plan.md` |
 | M11       | Verified core (stretch)              | `verification`         | Mechanized eval semantics with extracted reference         | — |
 
 Each milestone produces a tagged release (`milestone-N-complete`) and a written
