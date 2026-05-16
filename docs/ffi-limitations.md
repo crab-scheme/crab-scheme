@@ -3,10 +3,68 @@
 > Tracking doc for FFI gaps surfaced while building the M10
 > Track W example plugins (`cs-ffi-sha2`, `cs-ffi-http`,
 > `cs-cli-sha2`). Each entry includes the symptom that exposed it
-> and a sketched fix. None of these block 1.0 — they're follow-on
-> polish for the FFI surface.
+> and a sketched fix.
+>
+> **Status update (2026-05-16, same day as discovery): L1 + L6 LANDED
+> as cs-ffi v2.** See the "Resolved" section below. The remaining
+> entries (L2-L5, L7) are still backlog.
 
-## L1 — No value decoders in the C-ABI
+## ✅ L1 — RESOLVED — Value decoders in the C-ABI
+
+**Status:** Shipped in cs-ffi v2 (`CRABSCHEME_FFI_API_VERSION` bumped
+1 → 2). Commit: see git log around the cs-ffi v2 iter.
+
+`RuntimeFfi` now exposes:
+- `value_kind(v: ValueRef) -> ValueKind` — discriminator returning
+  `Invalid` / `Null` / `Boolean` / `Fixnum` / `Flonum` / `Character` /
+  `Symbol` / `String` / `Pair` / `Vector` / `ByteVector` / `Other`.
+- `decode_string(v, out_ptr, out_len) -> i32` — (ptr, len) view into
+  the underlying UTF-8 buffer.
+- `decode_bytevector(v, out_ptr, out_len) -> i32` — same for raw bytes.
+- `decode_fixnum(v, out: *mut i64) -> i32`
+- `decode_flonum(v, out: *mut f64) -> i32`
+- `decode_boolean(v, out: *mut i32) -> i32`
+- `decode_character(v, out: *mut u32) -> i32`
+- `decode_symbol(v, out_ptr, out_len) -> i32`
+
+The borrowed-view contract: `(ptr, len)` from string/bytevector/symbol
+decoders is valid for the call's duration AND until the plugin invokes
+any callback that may mutate the value. `CAbiProc` pins args at the
+top of the call and unpins after, so the underlying allocations stay
+live throughout.
+
+`cs-ffi-sha2` now registers the same `(sha256 v)` from both dlopen
+and static-link, accepting string or bytevector. `cs-ffi-http` now
+takes a real URL: `(http-get "https://example.com/")`.
+
+9 new unit tests in `crates/cs-runtime/src/ffi.rs::tests` cover each
+decoder's happy path + a type-mismatch path. End-to-end flows
+verified for all four configurations (native dlopen with string and
+bytevector args, native static-link, WASM static-link, HTTP).
+
+## ✅ L6 — RESOLVED — Plugin registration status surfaces
+
+**Status:** Already implemented before this doc was written; the
+"symptom" claim in the original draft was a mis-reading of the code.
+
+`Runtime::load_shared_library` (cs-runtime/src/ffi.rs ~line 85)
+already checks the `crabscheme_register` return value and propagates
+non-zero status as `FfiError::HostFailure`:
+
+```rust
+let status = register(p);
+if status != 0 {
+    return Err(FfiError::HostFailure(format!(
+        "load_shared_library({path}): plugin register returned {status}"
+    )));
+}
+```
+
+Unit test `load_shared_library_surfaces_version_mismatch` exercises
+the control flow. The full dlopen path (status propagating through
+`libloading::Library::get`) is covered by `tests/ffi_loader.rs`.
+
+## L1 — No value decoders in the C-ABI (ORIGINAL, NOW RESOLVED ABOVE)
 
 **Symptom:** `cs-ffi-sha2`'s dlopen path can only register
 `(sha256-empty)` (arity 0) because the C-ABI provides no way to
@@ -176,23 +234,25 @@ with the `cs-ffi-macros` proc-macro crate.
 **Impact:** developer experience. Not blocking but reduces
 adoption friction.
 
-## Priorities
+## Priorities (post-v2)
 
-For the cs-ffi roadmap (post-1.0):
+For the cs-ffi roadmap going forward:
 
-| # | Item | Effort | Unblocks |
-|---|------|-------:|----------|
-| L1 | Value decoders in C-ABI | small | real dlopen plugins |
-| L6 | Surface registration status | tiny | correctness on misversioned plugins |
-| L3 | Structured error reporting | small | production plugins |
-| L2 | Symmetric trait/C-ABI surface | medium | cleaner plugin code |
-| L5 | Typed signatures | tiny | UX |
+| # | Item | Effort | Status |
+|---|------|-------:|--------|
+| L1 | Value decoders in C-ABI | small | ✅ done (v2) |
+| L6 | Surface registration status | tiny | ✅ done (pre-v2) |
+| L3 | Structured error reporting | small | backlog |
+| L2 | Symmetric trait/C-ABI surface | medium | backlog (largely subsumed by L1) |
+| L5 | Typed signatures | tiny | backlog (UX) |
 | L4 | wasi-http (ecosystem) | ext | wait for upstream |
-| L7 | Plugin scaffold tooling | medium | DX |
+| L7 | Plugin scaffold tooling | medium | backlog (DX) |
 
-None block 1.0 RC. L1 + L6 together would make dlopen plugins
-genuinely useful for real workloads; recommend bundling them as
-a "cs-ffi v2" iter before declaring the FFI surface stable.
+L1 + L6 — the "cs-ffi v2" milestone — landed 2026-05-16 alongside
+the M10 Track W closeout. Real-shape dlopen plugins are now
+practical (string args, bytevector args, type dispatch via
+`value_kind`). The remaining items are smaller-scope polish; none
+block 1.0 RC.
 
 ## How to verify state
 

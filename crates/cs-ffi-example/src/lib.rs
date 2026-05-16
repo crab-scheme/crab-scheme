@@ -148,6 +148,10 @@ mod tests {
     fn build_version_stamp_includes_api_version() {
         let s = build_version_stamp();
         let s = s.into_string().unwrap();
-        assert!(s.contains("api=1"), "{s}");
+        // Bumped to api=2 in cs-ffi L1 (decoder callbacks added to
+        // RuntimeFfi). The constant lives in cs-ffi::abi; this test
+        // tracks whatever CRABSCHEME_FFI_API_VERSION is.
+        let expected = format!("api={}", CRABSCHEME_FFI_API_VERSION);
+        assert!(s.contains(&expected), "{s}");
     }
 }

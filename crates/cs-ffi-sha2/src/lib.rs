@@ -6,35 +6,25 @@
 //! `make_sha256_proc()` factory function (for static registration
 //! into a custom embedder binary — the WASM-compatible path).
 //!
-//! ## Why two paths?
+//! ## Both paths register `(sha256 v)`
 //!
-//! The dlopen C-ABI exposes argument *encoders* (`alloc_string`,
-//! `alloc_fixnum`, etc.) but not decoders for arbitrary values
-//! into Rust types — that's the cs-ffi-trait surface, accessed via
-//! `&[Value]` directly. So the two paths have different
-//! capabilities:
+//! Post cs-ffi v2 (L1: value decoders), the dlopen path can decode
+//! plugin arguments via the `decode_string` / `decode_bytevector`
+//! callbacks the runtime exposes. The static-link and dlopen paths
+//! now register the SAME `(sha256 v)` procedure name and accept
+//! string-or-bytevector inputs.
 //!
-//! | Path        | Args accepted     | Surface                 | WASM-OK? |
-//! |-------------|-------------------|-------------------------|----------|
-//! | dlopen      | none (this iter)  | extern "C" + RuntimeFfi | ✗        |
-//! | static-link | full `&[Value]`   | impl HostProcedure      | ✓        |
-//!
-//! Real-world dlopen plugins would either extend the C-ABI with
-//! per-type decoders or use the static-link path when arg shape
-//! matters. This crate ships:
-//!
-//! - dlopen `(sha256-empty)` → constant `"e3b0c4..."` (the known
-//!   SHA-256 of the empty input). Demonstrates the registration
-//!   mechanism end-to-end without needing arg decoders.
-//! - static-link `(sha256 v)` → full-featured. `v` may be a string
-//!   or a bytevector; returns lowercase hex.
+//! | Path        | Surface                 | WASM-OK? |
+//! |-------------|-------------------------|----------|
+//! | dlopen      | extern "C" + RuntimeFfi | ✗        |
+//! | static-link | impl HostProcedure      | ✓        |
 //!
 //! ## Usage — native dlopen
 //!
 //! ```sh
 //! cargo build --release -p cs-ffi-sha2
-//! crabscheme -e '(load-shared-library "target/release/libcs_ffi_sha2.dylib") (display (sha256-empty))'
-//! # prints: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+//! crabscheme -e '(load-shared-library "target/release/libcs_ffi_sha2.dylib") (display (sha256 "hello"))'
+//! # prints: 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
 //! ```
 //!
 //! ## Usage — static linking (WASM-compatible)
@@ -118,7 +108,7 @@ mod dlopen {
     use std::os::raw::c_char;
 
     use cs_ffi::abi::{
-        EvalOutput, EvalStatus, HostProcDecl, RegHandle, RuntimeFfi, ValueRef,
+        EvalOutput, EvalStatus, HostProcDecl, RegHandle, RuntimeFfi, ValueKind, ValueRef,
         CRABSCHEME_FFI_API_VERSION,
     };
 
@@ -150,16 +140,15 @@ mod dlopen {
             return RegisterStatus::VersionMismatch as i32;
         }
 
-        // Register (sha256-empty) — takes 0 args, returns the SHA-256
-        // hex of the empty input (a known constant). The name
-        // intentionally signals the limited-API state so users don't
-        // confuse this with the static-link `(sha256 v)`.
-        let name = b"sha256-empty";
+        // Register (sha256 v) — 1 arg, accepts string-or-bytevector,
+        // returns hex. Same Scheme surface as the static-link path
+        // post cs-ffi v2 (L1: decoder callbacks).
+        let name = b"sha256";
         let decl = HostProcDecl {
             name_ptr: name.as_ptr() as *const c_char,
             name_len: name.len(),
-            call: sha256_empty_call,
-            arity: 0,
+            call: sha256_call_cabi,
+            arity: 1,
         };
         // SAFETY: rt is valid for the call; decl is valid for the
         // call (the runtime copies whatever it needs to retain).
@@ -168,17 +157,16 @@ mod dlopen {
         RegisterStatus::Ok as i32
     }
 
-    /// C-ABI thunk for `(sha256-empty)`. Computes SHA-256 of an
-    /// empty input and returns the digest as a Scheme string via
-    /// the runtime's `alloc_string` callback. No argument decoding
-    /// needed (arity = 0).
-    extern "C" fn sha256_empty_call(
+    /// C-ABI thunk for `(sha256 v)`. Decodes the arg via the v2
+    /// decoder callbacks (string OR bytevector), computes SHA-256,
+    /// returns the digest as a Scheme string.
+    extern "C" fn sha256_call_cabi(
         rt: *mut RuntimeFfi,
-        _args: *const ValueRef,
+        args: *const ValueRef,
         argc: usize,
         out: *mut EvalOutput,
     ) {
-        if rt.is_null() || out.is_null() || argc != 0 {
+        let write_err = |out: *mut EvalOutput| {
             if !out.is_null() {
                 unsafe {
                     *out = EvalOutput {
@@ -188,12 +176,54 @@ mod dlopen {
                     };
                 }
             }
+        };
+
+        if rt.is_null() || out.is_null() || argc != 1 || args.is_null() {
+            write_err(out);
             return;
         }
+        let arg0 = unsafe { *args };
+
+        // Use `value_kind` to discriminate before decoding. Slightly
+        // verbose vs trying both decoders, but communicates intent
+        // and avoids relying on decoder-returns-0 as type-check.
+        let kind = unsafe { ((*rt).value_kind)(rt, arg0) };
 
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(b"");
+
+        match kind {
+            ValueKind::String => {
+                let mut s_ptr: *const c_char = std::ptr::null();
+                let mut s_len: usize = 0;
+                // SAFETY: rt non-null; decode_string writes
+                // (ptr, len) view valid for the call duration.
+                let ok = unsafe { ((*rt).decode_string)(rt, arg0, &mut s_ptr, &mut s_len) };
+                if ok == 0 || s_ptr.is_null() {
+                    write_err(out);
+                    return;
+                }
+                let bytes = unsafe { std::slice::from_raw_parts(s_ptr as *const u8, s_len) };
+                hasher.update(bytes);
+            }
+            ValueKind::ByteVector => {
+                let mut b_ptr: *const u8 = std::ptr::null();
+                let mut b_len: usize = 0;
+                let ok = unsafe { ((*rt).decode_bytevector)(rt, arg0, &mut b_ptr, &mut b_len) };
+                if ok == 0 || b_ptr.is_null() {
+                    write_err(out);
+                    return;
+                }
+                let bytes = unsafe { std::slice::from_raw_parts(b_ptr, b_len) };
+                hasher.update(bytes);
+            }
+            _ => {
+                // Type mismatch: not a string or bytevector.
+                write_err(out);
+                return;
+            }
+        }
+
         let digest = hasher.finalize();
         let hex_str = hex::encode(digest);
         let hex_bytes = hex_str.as_bytes();

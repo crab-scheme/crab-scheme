@@ -35,7 +35,53 @@ use std::os::raw::c_char;
 /// compatibility check this on entry to their `crabscheme_register`
 /// hook and refuse to register if their compiled-in version does
 /// not match what the host runtime exports.
-pub const CRABSCHEME_FFI_API_VERSION: u32 = 1;
+///
+/// ## Version history
+///
+/// - **v1** (M5b): initial ABI. Encoders (`alloc_pair`,
+///   `alloc_fixnum`, `alloc_string`), `eval_str`, `release_value`,
+///   `raise`, `register_proc`. No value decoders — plugins could
+///   only register constructor-style procedures (no introspection
+///   of arguments).
+/// - **v2** (M10 follow-on, see `docs/ffi-limitations.md` L1+L6):
+///   adds per-type decoders (`decode_string`, `decode_bytevector`,
+///   `decode_fixnum`, `decode_flonum`, `decode_boolean`,
+///   `decode_character`, `decode_symbol`) plus `value_kind` for
+///   type discrimination. Unblocks real-shape plugins that take
+///   typed arguments via dlopen. Also surfaces
+///   `crabscheme_register`'s status code through
+///   `Runtime::load_shared_library` (was silently discarded in v1).
+pub const CRABSCHEME_FFI_API_VERSION: u32 = 2;
+
+/// Discriminant tag for [`RuntimeFfi::value_kind`] — lets plugins
+/// inspect a [`ValueRef`]'s type before attempting a typed decode.
+///
+/// The tag space mirrors the variants of `cs_core::Value` that the
+/// v2 decoders support. Variants not yet decodable (Promise, Port,
+/// Hashtable, Procedure) map to [`ValueKind::Other`] so plugins
+/// can gracefully reject what they can't handle.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    /// Returned when the [`ValueRef`] handle is invalid (released
+    /// or never minted). Decoders that see this should treat it as
+    /// a runtime error.
+    Invalid = 0,
+    Null = 1,
+    Boolean = 2,
+    Fixnum = 3,
+    Flonum = 4,
+    Character = 5,
+    Symbol = 6,
+    String = 7,
+    Pair = 8,
+    Vector = 9,
+    ByteVector = 10,
+    /// Catch-all for variants the v2 decoders don't cover
+    /// (Procedure, Port, Hashtable, Promise, BigInt/Rational, Eof,
+    /// Unspecified).
+    Other = 255,
+}
 
 /// Opaque handle to a Scheme value held by the runtime.
 ///
@@ -165,6 +211,65 @@ pub struct RuntimeFfi {
     /// returns to the caller; the runtime unwinds back to the
     /// nearest exception handler.
     pub raise: extern "C" fn(rt: *mut RuntimeFfi, condition: ValueRef) -> !,
+
+    // ----- v2 additions (M10 follow-on) ---------------------------
+    //
+    // Decoder callbacks. Each returns 1 on type match (out-params
+    // written), 0 on type mismatch (out-params untouched). For
+    // string/bytevector/symbol the returned `(ptr, len)` view borrows
+    // a buffer owned by the runtime: it is valid until the plugin's
+    // host-proc call returns OR the plugin invokes any callback that
+    // may mutate the value (e.g. `eval_str`). Plugins that need to
+    // retain the bytes past those points must copy.
+    //
+    // For Fixnum/Flonum/Boolean/Character/Null the out-param is a
+    // plain value with no lifetime concerns.
+    /// Discriminate a value by kind. Useful for variant-dispatching
+    /// plugins that want one branch per Scheme type.
+    pub value_kind: extern "C" fn(rt: *mut RuntimeFfi, v: ValueRef) -> ValueKind,
+
+    /// Decode a `ValueRef` as a string. Writes `(*out_ptr, *out_len)`
+    /// on success (1 returned). The borrow lifetime contract is
+    /// documented in the module above.
+    pub decode_string: extern "C" fn(
+        rt: *mut RuntimeFfi,
+        v: ValueRef,
+        out_ptr: *mut *const c_char,
+        out_len: *mut usize,
+    ) -> i32,
+
+    /// Decode a `ValueRef` as a bytevector. Same `(ptr, len)`
+    /// semantics as `decode_string` but the bytes are raw (not
+    /// required to be UTF-8).
+    pub decode_bytevector: extern "C" fn(
+        rt: *mut RuntimeFfi,
+        v: ValueRef,
+        out_ptr: *mut *const u8,
+        out_len: *mut usize,
+    ) -> i32,
+
+    /// Decode a `ValueRef` as a fixnum. Writes `*out` on success.
+    pub decode_fixnum: extern "C" fn(rt: *mut RuntimeFfi, v: ValueRef, out: *mut i64) -> i32,
+
+    /// Decode a `ValueRef` as a flonum. Writes `*out` on success.
+    pub decode_flonum: extern "C" fn(rt: *mut RuntimeFfi, v: ValueRef, out: *mut f64) -> i32,
+
+    /// Decode a `ValueRef` as a boolean. Writes `*out` as 0 or 1.
+    pub decode_boolean: extern "C" fn(rt: *mut RuntimeFfi, v: ValueRef, out: *mut i32) -> i32,
+
+    /// Decode a `ValueRef` as a character. Writes `*out` as the
+    /// Unicode codepoint (u32).
+    pub decode_character: extern "C" fn(rt: *mut RuntimeFfi, v: ValueRef, out: *mut u32) -> i32,
+
+    /// Decode a `ValueRef` as a symbol. Writes `(*out_ptr, *out_len)`
+    /// pointing at the symbol's name (UTF-8). Same borrow lifetime
+    /// rules as `decode_string`.
+    pub decode_symbol: extern "C" fn(
+        rt: *mut RuntimeFfi,
+        v: ValueRef,
+        out_ptr: *mut *const c_char,
+        out_len: *mut usize,
+    ) -> i32,
 }
 
 // --- Stub implementations (iter 5 placeholder) ---------------------
@@ -213,6 +318,48 @@ extern "C" fn stub_raise(_rt: *mut RuntimeFfi, _condition: ValueRef) -> ! {
     panic!("RuntimeFfi::raise stub called before iter 6 wired the runtime side")
 }
 
+// v2 decoder stubs. Same abort-on-call shape.
+
+extern "C" fn stub_value_kind(_rt: *mut RuntimeFfi, _v: ValueRef) -> ValueKind {
+    panic!("RuntimeFfi::value_kind stub called")
+}
+extern "C" fn stub_decode_string(
+    _rt: *mut RuntimeFfi,
+    _v: ValueRef,
+    _out_ptr: *mut *const c_char,
+    _out_len: *mut usize,
+) -> i32 {
+    panic!("RuntimeFfi::decode_string stub called")
+}
+extern "C" fn stub_decode_bytevector(
+    _rt: *mut RuntimeFfi,
+    _v: ValueRef,
+    _out_ptr: *mut *const u8,
+    _out_len: *mut usize,
+) -> i32 {
+    panic!("RuntimeFfi::decode_bytevector stub called")
+}
+extern "C" fn stub_decode_fixnum(_rt: *mut RuntimeFfi, _v: ValueRef, _out: *mut i64) -> i32 {
+    panic!("RuntimeFfi::decode_fixnum stub called")
+}
+extern "C" fn stub_decode_flonum(_rt: *mut RuntimeFfi, _v: ValueRef, _out: *mut f64) -> i32 {
+    panic!("RuntimeFfi::decode_flonum stub called")
+}
+extern "C" fn stub_decode_boolean(_rt: *mut RuntimeFfi, _v: ValueRef, _out: *mut i32) -> i32 {
+    panic!("RuntimeFfi::decode_boolean stub called")
+}
+extern "C" fn stub_decode_character(_rt: *mut RuntimeFfi, _v: ValueRef, _out: *mut u32) -> i32 {
+    panic!("RuntimeFfi::decode_character stub called")
+}
+extern "C" fn stub_decode_symbol(
+    _rt: *mut RuntimeFfi,
+    _v: ValueRef,
+    _out_ptr: *mut *const c_char,
+    _out_len: *mut usize,
+) -> i32 {
+    panic!("RuntimeFfi::decode_symbol stub called")
+}
+
 impl RuntimeFfi {
     /// Construct a `RuntimeFfi` whose function pointers are
     /// abort-on-call stubs.
@@ -231,6 +378,15 @@ impl RuntimeFfi {
             alloc_string: stub_alloc_string,
             release_value: stub_release_value,
             raise: stub_raise,
+            // v2 decoders.
+            value_kind: stub_value_kind,
+            decode_string: stub_decode_string,
+            decode_bytevector: stub_decode_bytevector,
+            decode_fixnum: stub_decode_fixnum,
+            decode_flonum: stub_decode_flonum,
+            decode_boolean: stub_decode_boolean,
+            decode_character: stub_decode_character,
+            decode_symbol: stub_decode_symbol,
         }
     }
 }
@@ -241,8 +397,10 @@ mod tests {
     use std::mem::size_of;
 
     #[test]
-    fn api_version_is_one() {
-        assert_eq!(CRABSCHEME_FFI_API_VERSION, 1);
+    fn api_version_is_two() {
+        // v2 (M10 follow-on) — added decoders + value_kind. See
+        // `docs/ffi-limitations.md` L1.
+        assert_eq!(CRABSCHEME_FFI_API_VERSION, 2);
     }
 
     #[test]
