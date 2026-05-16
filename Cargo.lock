@@ -402,9 +402,13 @@ name = "cs-cli"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "cs-aot",
  "cs-core",
  "cs-diag",
+ "cs-expand",
+ "cs-parse",
  "cs-runtime",
+ "cs-vm",
 ]
 
 [[package]]

@@ -62,6 +62,32 @@ enum Cmd {
     },
     /// Start an interactive REPL.
     Repl,
+    /// Ahead-of-time compile a Scheme source file to a cargo project
+    /// (and optionally a native binary). RC2 iter G — accepts the
+    /// subset of Scheme that lowers to cs-aot's supported RIR Insts
+    /// (self-recursive numeric kernels: LoadConst/Add/Sub/Mul/Div +
+    /// Lt/Eq + CallSelf + Flonum surface). Single-define-per-file
+    /// programs at this iter; multi-define + top-level entry-point
+    /// synthesis is post-RC2 work.
+    #[cfg(feature = "aot")]
+    Aot {
+        /// Path to the .scm source file.
+        file: String,
+        /// Output directory for the emitted cargo project. Defaults
+        /// to `<file-basename>-aot/` in the current directory.
+        #[arg(short = 'o', long = "output", value_name = "DIR")]
+        output: Option<String>,
+        /// Name of the top-level (define (<entry> ...) ...) to use as
+        /// the binary's entry. Defaults to the first lambda the
+        /// bytecode compiler emits (typically the first top-level
+        /// define).
+        #[arg(long = "entry", value_name = "NAME")]
+        entry: Option<String>,
+        /// Also invoke `cargo build --release` on the emitted project.
+        /// On success, prints the resulting native binary's path.
+        #[arg(long = "build")]
+        build: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -77,6 +103,226 @@ fn main() -> ExitCode {
     match cli.cmd {
         Some(Cmd::Run { file, args }) => run_file(&file, &args, via_vm, with_jit, color),
         Some(Cmd::Repl) | None => run_repl(via_vm, color),
+        #[cfg(feature = "aot")]
+        Some(Cmd::Aot {
+            file,
+            output,
+            entry,
+            build,
+        }) => run_aot(&file, output.as_deref(), entry.as_deref(), build),
+    }
+}
+
+#[cfg(feature = "aot")]
+fn run_aot(file: &str, output: Option<&str>, entry: Option<&str>, build: bool) -> ExitCode {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use cs_aot::project::{emit_project, ProjectOptions};
+    use cs_aot::EmitMode;
+    use cs_core::SymbolTable;
+    use cs_expand::Expander;
+    use cs_parse::read_all;
+    use cs_vm::compiler::PrimOp;
+    use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir};
+
+    // --- Read source ----
+    let src = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("crabscheme aot: cannot read {file}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // --- Lex + parse + expand + compile ----
+    //
+    // Mirrors the same pipeline as cs-runtime's eval_str_via_vm but
+    // stops at Bytecode rather than executing. We can't reuse
+    // Runtime::eval_str_via_vm directly because it runs the bytecode;
+    // the AOT path keeps the bytecode as data to translate.
+    let mut sources = SourceMap::new();
+    let file_id = sources.add(file, &src);
+    let mut syms = SymbolTable::new();
+
+    let data = match read_all(file_id, &src, &mut syms) {
+        Ok(d) => d,
+        Err(errs) => {
+            let e = &errs[0];
+            eprintln!("crabscheme aot: parse error: {}", e.message());
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut macros = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = match expander.expand_program(&data) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("crabscheme aot: expand error: {}", e.message());
+            return ExitCode::from(2);
+        }
+    };
+    drop(expander);
+
+    let globals = HashMap::new();
+    // Primop table mirrors cs-runtime's; without it `(+ a b)` compiles
+    // to a generic Call and the bytecode→RIR translator emits Insts
+    // cs-aot doesn't yet handle.
+    let primops = {
+        let mut m = HashMap::new();
+        m.insert(syms.intern("+"), PrimOp::Add);
+        m.insert(syms.intern("-"), PrimOp::Sub);
+        m.insert(syms.intern("*"), PrimOp::Mul);
+        m.insert(syms.intern("<"), PrimOp::Lt);
+        m.insert(syms.intern("<="), PrimOp::Le);
+        m.insert(syms.intern(">"), PrimOp::Gt);
+        m.insert(syms.intern(">="), PrimOp::Ge);
+        m.insert(syms.intern("="), PrimOp::Eq);
+        m
+    };
+    let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("crabscheme aot: compile error: {}", e.message);
+            return ExitCode::from(2);
+        }
+    };
+
+    if bc.lambdas.is_empty() {
+        eprintln!(
+            "crabscheme aot: no top-level lambdas in {file} — AOT requires \
+             at least one (define (name args...) body) form"
+        );
+        return ExitCode::from(2);
+    }
+
+    // --- Pick the entry lambda. RC2 iter G default = first define;
+    // future iters that handle multi-define programs can match
+    // `entry` against per-lambda names recovered from the bytecode.
+    let lam = &bc.lambdas[0];
+    let entry_name = entry.unwrap_or_else(|| basename_no_ext(file)).to_string();
+    let entry_sym = syms.intern(&entry_name);
+
+    // --- Translate to RIR ----
+    let rir = match bytecode_to_rir(lam, &entry_name, Some(entry_sym)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("crabscheme aot: bytecode→RIR error: {e:?}");
+            eprintln!(
+                "  (the translator emits Insts cs-aot doesn't yet handle for \
+                 some Scheme constructs — see docs/milestones/m10-trackA-exit.md \
+                 for the supported-Inst list)"
+            );
+            return ExitCode::from(3);
+        }
+    };
+
+    // --- Output dir + package name ----
+    let out_dir = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{}-aot", basename_no_ext(file))));
+
+    // Resolve cs-vm path relative to this binary's manifest — at
+    // CARGO_MANIFEST_DIR build time, cs-vm sits at ../cs-vm in the
+    // workspace. For end-user binaries shipped via the release
+    // workflow, this path won't resolve at runtime; the emitted
+    // Cargo.toml then needs cs-vm published to crates.io, which is
+    // post-RC2 packaging work. For dev-loop usage from a built-from-
+    // source binary the path is correct.
+    let cs_vm_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .join("cs-vm");
+    if !cs_vm_path.exists() {
+        eprintln!(
+            "crabscheme aot: expected cs-vm at {} — \
+             this binary's emitted project depends on cs-vm at that path. \
+             AOT from a release-installed binary needs cs-vm published to \
+             crates.io (post-RC2 packaging work).",
+            cs_vm_path.display()
+        );
+        return ExitCode::from(4);
+    }
+
+    let pkg_name = sanitize_pkg_name(&entry_name);
+    let opts = ProjectOptions {
+        mode: EmitMode::Nb,
+        package_name: pkg_name.clone(),
+        entry_fn_name: entry_name.clone(),
+        cs_vm_path: Some(cs_vm_path),
+    };
+
+    let emitted = match emit_project(&[rir], &out_dir, &opts) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("crabscheme aot: project emit error: {e}");
+            return ExitCode::from(4);
+        }
+    };
+
+    println!(
+        "crabscheme aot: emitted project at {}",
+        emitted.project_dir.display()
+    );
+    println!("  entry: {entry_name}");
+    println!("  package: {pkg_name}");
+
+    if !build {
+        println!("  (re-run with --build to invoke `cargo build --release`)");
+        return ExitCode::SUCCESS;
+    }
+
+    println!("  building (cargo build --release)...");
+    let status = Command::new("cargo")
+        .current_dir(&emitted.project_dir)
+        .arg("build")
+        .arg("--release")
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("  built: {}", emitted.built_binary_path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(s) => {
+            eprintln!("crabscheme aot: cargo build failed (exit {})", s);
+            ExitCode::from(5)
+        }
+        Err(e) => {
+            eprintln!("crabscheme aot: cargo not found / failed to spawn: {e}");
+            ExitCode::from(5)
+        }
+    }
+}
+
+#[cfg(feature = "aot")]
+fn basename_no_ext(path: &str) -> &str {
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("aot");
+    stem
+}
+
+#[cfg(feature = "aot")]
+fn sanitize_pkg_name(s: &str) -> String {
+    // Cargo package names: lowercase letters, digits, underscores,
+    // hyphens. Replace anything else with underscore; collapse
+    // double-underscores; prefix with `aot_` if empty / starts with
+    // digit.
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() || out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        format!("aot_{out}")
+    } else {
+        out
     }
 }
 

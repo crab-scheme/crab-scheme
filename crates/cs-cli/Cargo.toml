@@ -11,16 +11,19 @@ path = "src/main.rs"
 
 [features]
 # M10 Track W iter 1 + closeout — mirror cs-runtime's feature flags.
-# `default` keeps the full native build (jit + ffi-dynamic). A WASM
-# build uses `--no-default-features`; an in-process Rust embedder
-# that wants custom builtins without dlopen uses `--features
-# ffi-trait` (e.g. for compile-into-WASM plugins).
-default = ["jit", "ffi-dynamic"]
+# `default` keeps the full native build (jit + ffi-dynamic + aot).
+# A WASM build uses `--no-default-features`; an in-process Rust
+# embedder that wants custom builtins without dlopen uses
+# `--features ffi-trait` (e.g. for compile-into-WASM plugins).
+default = ["jit", "ffi-dynamic", "aot"]
 jit = ["cs-runtime/jit"]
 ffi-trait = ["cs-runtime/ffi-trait"]
 ffi-dynamic = ["cs-runtime/ffi-dynamic"]
 # Backward-compat alias matching the W1 feature name.
 ffi = ["cs-runtime/ffi"]
+# RC2 iter G — wire the AOT subcommand. Default-on for native; the
+# WASM build drops it (can't spawn cargo at WASI runtime).
+aot = ["dep:cs-aot", "dep:cs-vm", "dep:cs-parse", "dep:cs-expand"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -30,4 +33,10 @@ cs-diag = { workspace = true }
 # when requested. --no-default-features on cs-cli produces a
 # minimal runtime (target for W2's wasm32-wasip1 build).
 cs-runtime = { workspace = true }
+# Optional — only pulled in when the `aot` feature is on. Keeps the
+# WASM/no-default-features minimal build slim.
+cs-aot = { workspace = true, optional = true }
+cs-vm = { workspace = true, optional = true }
+cs-parse = { workspace = true, optional = true }
+cs-expand = { workspace = true, optional = true }
 clap = { workspace = true }
