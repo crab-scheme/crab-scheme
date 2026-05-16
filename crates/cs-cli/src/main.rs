@@ -100,6 +100,14 @@ enum Cmd {
         /// codegen issues.
         #[arg(long = "emit-rust-source")]
         emit_rust_source: bool,
+        /// RC3 Phase 4 iter 4.3: print a per-lambda AOT-compatibility
+        /// report and exit. Doesn't emit a cargo project or build
+        /// anything. For each top-level `(define (name args) body)`
+        /// in the source, tries `bytecode_to_rir_aot` and reports
+        /// whether the resulting RIR is in cs-aot's supported set.
+        /// Useful for surveying coverage before picking `--entry`.
+        #[arg(long = "explain")]
+        explain: bool,
     },
     /// RC3 Phase 4 iter 4.5: self-test the AOT installation. Runs
     /// a baked-in `(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))`
@@ -134,14 +142,21 @@ fn main() -> ExitCode {
             build,
             emit_rir,
             emit_rust_source,
-        }) => run_aot(
-            &file,
-            output.as_deref(),
-            entry.as_deref(),
-            build,
-            emit_rir,
-            emit_rust_source,
-        ),
+            explain,
+        }) => {
+            if explain {
+                run_aot_explain(&file)
+            } else {
+                run_aot(
+                    &file,
+                    output.as_deref(),
+                    entry.as_deref(),
+                    build,
+                    emit_rir,
+                    emit_rust_source,
+                )
+            }
+        }
         #[cfg(feature = "aot")]
         Some(Cmd::AotDoctor) => run_aot_doctor(),
     }
@@ -660,6 +675,171 @@ fn basename_no_ext(path: &str) -> &str {
         .and_then(|s| s.to_str())
         .unwrap_or("aot");
     stem
+}
+
+/// RC3 Phase 4 iter 4.3: AOT compatibility survey for a Scheme
+/// source file. Lists every top-level `(define (name args) body)`
+/// the bytecode compiler emits and reports whether each one passes
+/// `bytecode_to_rir_aot` + `emit_with(Nb)` cleanly.
+///
+/// Doesn't emit a cargo project or build anything — just enumerates
+/// + probes. Useful for users debugging "why doesn't my program
+/// AOT" who want to know which entries are compatible before
+/// picking `--entry` and trying `--build`.
+#[cfg(feature = "aot")]
+fn run_aot_explain(file: &str) -> ExitCode {
+    use std::collections::HashMap;
+
+    use cs_aot::{emit_with, EmitMode};
+    use cs_core::SymbolTable;
+    use cs_expand::Expander;
+    use cs_parse::read_all;
+    use cs_vm::compiler::PrimOp;
+    use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir_aot};
+
+    let src = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("crabscheme aot --explain: cannot read {file}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut sources = SourceMap::new();
+    let file_id = sources.add(file, &src);
+    let mut syms = SymbolTable::new();
+    let data = match read_all(file_id, &src, &mut syms) {
+        Ok(d) => d,
+        Err(errs) => {
+            eprintln!(
+                "crabscheme aot --explain: parse error: {}",
+                errs[0].message()
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let mut macros = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = match expander.expand_program(&data) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("crabscheme aot --explain: expand error: {}", e.message());
+            return ExitCode::from(2);
+        }
+    };
+    drop(expander);
+    let globals = HashMap::new();
+    let primops = {
+        let mut m = HashMap::new();
+        for (op, kind) in &[
+            ("+", PrimOp::Add),
+            ("-", PrimOp::Sub),
+            ("*", PrimOp::Mul),
+            ("<", PrimOp::Lt),
+            ("<=", PrimOp::Le),
+            (">", PrimOp::Gt),
+            (">=", PrimOp::Ge),
+            ("=", PrimOp::Eq),
+        ] {
+            m.insert(syms.intern(op), *kind);
+        }
+        m
+    };
+    let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("crabscheme aot --explain: compile error: {}", e.message);
+            return ExitCode::from(2);
+        }
+    };
+
+    // Build the name → lambda-index map via MakeClosure+SetVar
+    // pairs (same scanner the run_aot uses for --entry resolution).
+    let mut entries: Vec<(String, usize)> = Vec::new();
+    for window in bc.insts.windows(2) {
+        if let (cs_vm::opcode::Inst::MakeClosure(idx), cs_vm::opcode::Inst::SetVar(sym)) =
+            (&window[0], &window[1])
+        {
+            entries.push((syms.name(*sym).to_string(), *idx));
+        }
+    }
+
+    println!("crabscheme aot --explain: {}", file);
+    println!("  {} top-level lambda(s)", entries.len());
+    println!();
+
+    if entries.is_empty() {
+        println!(
+            "  no top-level defines found — AOT requires at least one\n  \
+             (define (name args...) body) form in the source."
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let mut compatible: Vec<String> = Vec::new();
+    let mut incompatible: Vec<(String, String)> = Vec::new();
+
+    for (name, idx) in &entries {
+        let entry_sym = syms.intern(name);
+        let lam = &bc.lambdas[*idx];
+        let arity = lam.params.len();
+        match bytecode_to_rir_aot(lam, name.as_str(), Some(entry_sym)) {
+            Ok(rir) => match emit_with(EmitMode::Nb, &rir) {
+                Ok(_) => {
+                    println!(
+                        "  ✓ {name}  ({arity} param{}, RIR: {} block(s), {} inst(s))",
+                        if arity == 1 { "" } else { "s" },
+                        rir.blocks.len(),
+                        rir.blocks.iter().map(|b| b.insts.len()).sum::<usize>(),
+                    );
+                    compatible.push(name.clone());
+                }
+                Err(e) => {
+                    // Just the first line of the diagnostic — full
+                    // user-hint output would be too verbose for a
+                    // survey table.
+                    let summary = format!("{e}")
+                        .lines()
+                        .next()
+                        .unwrap_or("emit error")
+                        .to_string();
+                    println!("  ✗ {name}  ({arity} param) — {summary}");
+                    incompatible.push((name.clone(), summary));
+                }
+            },
+            Err(e) => {
+                let summary = format!("bytecode→RIR error: {e:?}");
+                println!("  ✗ {name}  ({arity} param) — {summary}");
+                incompatible.push((name.clone(), summary));
+            }
+        }
+    }
+
+    println!();
+    if !compatible.is_empty() {
+        println!("AOT-compatible entries ({}):", compatible.len());
+        for n in &compatible {
+            println!("  crabscheme aot {file} --entry {n} --build");
+        }
+    }
+    if !incompatible.is_empty() {
+        println!();
+        println!("Incompatible entries ({}):", incompatible.len());
+        for (n, reason) in &incompatible {
+            println!("  {n}: {reason}");
+        }
+        println!();
+        println!(
+            "See `docs/user/aot.md` for the supported-Inst table and rewrite\n\
+             suggestions per blocker."
+        );
+    }
+
+    if compatible.is_empty() {
+        ExitCode::from(3)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// Walk top-level bytecode for `MakeClosure(i) + SetVar(sym)` pairs
