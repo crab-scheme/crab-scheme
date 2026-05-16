@@ -277,6 +277,35 @@ fn source_to_aot_function_with_let_binding() {
 }
 
 #[test]
+fn source_to_aot_function_with_let_then_branch() {
+    // RC3 Phase 2 iter 2.5 — multi-block demote. The `if`
+    // introduces multiple blocks; the `let` binding in the entry
+    // block needs to flow as an SSA alias into BOTH the then-
+    // and else- arms via the cross-block alias map.
+    //
+    // (define (h n)
+    //   (let ((doubled (* n 2)))
+    //     (if (< doubled 100)
+    //         doubled
+    //         (* doubled 2))))
+    //
+    // → h(n) = min(2n, 4n). Catches the multi-block alias
+    // propagation: the EnvLookupAny(doubled) reference inside
+    // each branch must resolve to the entry-block Mul's result.
+    let (lam, sym) = compile_source_to_lambda(
+        "(define (h n) (let ((doubled (* n 2))) (if (< doubled 100) doubled (* doubled 2))))",
+        "h",
+    );
+    let bin = aot_compile_and_run(lam, sym, "h", "let_then_branch");
+    // (< doubled 100) is strict less-than, so doubled == 100 → else branch.
+    assert_eq!(run_with_arg(&bin, 0), 0); // doubled=0; 0<100 → 0
+    assert_eq!(run_with_arg(&bin, 10), 20); // doubled=20; 20<100 → 20
+    assert_eq!(run_with_arg(&bin, 49), 98); // doubled=98; 98<100 → 98
+    assert_eq!(run_with_arg(&bin, 50), 200); // doubled=100; !<100 → 200
+    assert_eq!(run_with_arg(&bin, 100), 400); // doubled=200; !<100 → 400
+}
+
+#[test]
 fn source_to_aot_function_with_nested_lets() {
     // Two let bindings in sequence — iter J's demote pass needs
     // to handle a chain of EnvDefineLocal+EnvLookupAny round-trips,

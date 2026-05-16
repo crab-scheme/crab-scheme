@@ -97,19 +97,14 @@ pub fn bytecode_to_rir_aot(
     self_name: Option<Symbol>,
 ) -> Result<Function, TranslateError> {
     let mut func = bytecode_to_rir(lambda, name, self_name)?;
-    // RC2 iter J: single-block demote.
-    // RC2 iter O attempted multi-block demote but regressed tak —
-    // blocks 1+ have their own EnvDefineLocal/EnvLookup ops the
-    // simple "alias-rewrite blocks 1+" extension didn't handle.
-    // Properly demoting multi-block functions needs per-block
-    // alias maps OR a join lattice across blocks; deferred to
-    // post-RC2 work. Reverted to the single-block gate so
-    // multi-block let-using programs surface clean
-    // `UnsupportedInst("EnvLookupAny")` diagnostics rather than
-    // post-build cargo errors.
-    if func.blocks.len() == 1 {
-        let _ = demote_env_to_ssa_all_blocks(&mut func);
-    }
+    // RC3 Phase 2 iter 2.5: demote runs for any function shape,
+    // single- or multi-block. Pre-scan inside the helper bails
+    // cleanly without mutating `func` on free-vars / duplicate
+    // defines / forward cross-block lookups (the iter-2.6 atomicity
+    // fix combined with iter-2.5's no-duplicate-define invariant).
+    // On bail, downstream sees the original RIR + a clean
+    // UnsupportedInst diagnostic from cs-aot.
+    let _ = demote_env_to_ssa_all_blocks(&mut func);
     Ok(func)
 }
 
@@ -145,38 +140,43 @@ fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
         return true;
     }
 
-    // RC3 Phase 2 iter 2.6 — atomicity fix. Previously this fn
-    // `drain`'d block 0's Insts and bailed mid-iteration on the
-    // first free-var EnvLookup. The bailed-out `false` return left
-    // block 0 with an empty inst list (the drain already emptied it,
-    // and we never reassigned `rewritten` back). `func` was thus
-    // corrupted — surfaced as cs-aot's "v17 used before defined"
-    // error on spectral-norm where the very first inst is a
-    // MakeClosure followed by an EnvLookupAny on a free-var binding.
+    // RC3 Phase 2 iter 2.5 — proper multi-block demote via the
+    // pre-scan pattern from iter 2.6.
     //
-    // Two-pass fix: PRE-SCAN to verify every EnvLookup's sym was
-    // EnvDefineLocal'd somewhere in block 0. If any miss, bail
-    // BEFORE touching `func` so the original RIR survives intact
-    // and downstream gets a clean UnsupportedInst error from
-    // cs-aot rather than a corrupted function.
-    {
-        let mut defined_syms: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for inst in &func.blocks[0].insts {
+    // Two-tier strictness:
+    // - **Single-block functions**: same posture as iter J — pre-
+    //   scan just verifies every lookup's sym is defined somewhere
+    //   in block 0. Multiple defines of the same sym are fine
+    //   (re-bindings; last define wins in textual order, matching
+    //   the iter-J behavior the scorecard already validated).
+    // - **Multi-block functions**: stricter. Pre-scan requires
+    //   every looked-up sym to be defined EXACTLY ONCE across the
+    //   whole function — multiple defines would need φ-merge at
+    //   branch points, which iter 2.5 doesn't implement. Bails
+    //   cleanly without mutating `func` on either constraint
+    //   miss (free var, duplicate define, forward cross-block ref).
+    let single_block = func.blocks.len() == 1;
+    let mut defined_count: HashMap<u32, usize> = HashMap::new();
+    let mut all_lookup_syms: Vec<u32> = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
             match inst {
                 RirInst::EnvDefineLocal(sym, _) => {
-                    defined_syms.insert(*sym);
+                    *defined_count.entry(*sym).or_insert(0) += 1;
                 }
                 RirInst::EnvLookupAny(_, sym) | RirInst::EnvLookup(_, sym) => {
-                    if !defined_syms.contains(sym) {
-                        // Free-var binding. Demote can't rewrite this
-                        // to an SSA alias because there's no local
-                        // source — abort cleanly without mutating
-                        // anything.
-                        return false;
-                    }
+                    all_lookup_syms.push(*sym);
                 }
                 _ => {}
             }
+        }
+    }
+    for sym in &all_lookup_syms {
+        match defined_count.get(sym) {
+            None => return false,         // free-var binding — can't alias
+            Some(&1) => {}                // exactly one define — safe in both modes
+            Some(_) if single_block => {} // multi-define re-binding — iter J path
+            Some(_) => return false,      // multi-block + multi-define — would need φ-merge
         }
     }
 
@@ -193,60 +193,46 @@ fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
         cur
     };
 
-    // Step 1+2: process block 0 — collect alias + drop env insts +
-    // rewrite block-0 operands. Mirrors the single-block helper.
-    // Safe to drain now: pre-scan proved every EnvLookup is paired
-    // with a corresponding EnvDefineLocal.
-    let block0_insts: Vec<_> = func.blocks[0].insts.drain(..).collect();
-    let mut rewritten: Vec<RirInst> = Vec::with_capacity(block0_insts.len());
-    for inst in block0_insts {
-        match inst {
-            RirInst::EnvDefineLocal(sym, src) => {
-                sym_to_src.insert(sym, resolve(src, &alias));
-            }
-            RirInst::EnvLookupAny(d, sym) | RirInst::EnvLookup(d, sym) => {
-                // Pre-scan guarantees sym is in sym_to_src by the
-                // time we reach the EnvLookup (modulo lexical-order
-                // hazards — see RC3 iter 2.5 multi-block work). If
-                // a lookup appears before its define in the same
-                // block, demote still bails here but the pre-scan
-                // would have already caught it as undefined.
-                let src = match sym_to_src.get(&sym) {
-                    Some(&s) => s,
-                    None => return false,
-                };
-                alias.insert(d, src);
-            }
-            mut other => {
-                if is_inline_supported(&other) {
-                    for_each_value_in_inst(&mut other, |v| {
-                        *v = resolve(*v, &alias);
-                    });
+    // Per-block rewritten buffer + alias-build walk. Done in dominator
+    // order (block 0 first) so EnvLookupAny in block N can resolve
+    // through the alias map built from block M's EnvDefineLocal for
+    // M < N.
+    let mut per_block_rewritten: Vec<Vec<RirInst>> = Vec::with_capacity(func.blocks.len());
+    for block in &func.blocks {
+        let mut rewritten = Vec::with_capacity(block.insts.len());
+        for inst in &block.insts {
+            match inst {
+                RirInst::EnvDefineLocal(sym, src) => {
+                    sym_to_src.insert(*sym, resolve(*src, &alias));
                 }
-                rewritten.push(other);
+                RirInst::EnvLookupAny(d, sym) | RirInst::EnvLookup(d, sym) => {
+                    // Forward cross-block lookup → bail (pre-scan
+                    // approved this sym, but its define hasn't been
+                    // walked yet in dominator order).
+                    let src = match sym_to_src.get(sym) {
+                        Some(&s) => s,
+                        None => return false,
+                    };
+                    alias.insert(*d, src);
+                }
+                other => {
+                    let mut cloned = other.clone();
+                    if is_inline_supported(&cloned) {
+                        for_each_value_in_inst(&mut cloned, |v| {
+                            *v = resolve(*v, &alias);
+                        });
+                    }
+                    rewritten.push(cloned);
+                }
             }
         }
+        per_block_rewritten.push(rewritten);
     }
-    func.blocks[0].insts = rewritten;
-    for_each_value_in_term(&mut func.blocks[0].terminator, |v| {
-        *v = resolve(*v, &alias);
-    });
 
-    // Step 3 (iter O): walk blocks 1+ applying the alias rewrite.
-    // Don't try to drop EnvDefineLocal/Lookup in later blocks; the
-    // simple "lets at function top" pattern is what we target. Any
-    // env op in block 1+ that references our alias map gets its
-    // operand rewritten; env ops with their own non-block-0 sym
-    // bindings pass through (Type::Any source-of-truth left to the
-    // emitter).
-    for block in func.blocks.iter_mut().skip(1) {
-        for inst in block.insts.iter_mut() {
-            if is_inline_supported(inst) {
-                for_each_value_in_inst(inst, |v| {
-                    *v = resolve(*v, &alias);
-                });
-            }
-        }
+    // Commit: assign the per-block rewritten Insts back + rewrite
+    // each block's terminator via the now-complete alias map.
+    for (block, rewritten) in func.blocks.iter_mut().zip(per_block_rewritten) {
+        block.insts = rewritten;
         for_each_value_in_term(&mut block.terminator, |v| {
             *v = resolve(*v, &alias);
         });
