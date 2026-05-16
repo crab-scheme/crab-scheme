@@ -19,7 +19,7 @@ spec, in which order, with what exit criteria*.
 | M7        | HolyJIT backend (primary)            | `jit-holy`             | JIT differential parity with Cranelift backend             | ⏸ parked (ADR 0009 — upstream stale) |
 | M8        | First-class continuations + CWCC     | `continuations`        | Larceny cont tests ≥ 95% pass                              | ✅ VM-tier done (`m8-vm-complete`); walker-tier + Larceny suite deferred |
 | M9        | R6RS standard library completion     | `stdlib`               | R6RS conformance ≥ 99%; Larceny suite ≥ 95%                | ✅ foundation done (`m9-foundation-complete`); R6RS conformance **99.96%** on our corpus / **100%** Racket-cross-validated subset (2026-05-15) — Larceny @ 94% on parsable slice, reader shims would expand sample |
-| M10       | AOT compiler + WASM target           | `aot`, `wasm`          | Static binaries from Scheme; WASM bytecode tier shipping   | 🚧 OPEN as of 2026-05-16 — **Track W (WASM) COMPLETE** (`m10-wasm-complete`, conformance 2438/1 matches native), Track A (AOT) queued |
+| M10       | AOT compiler + WASM target           | `aot`, `wasm`          | Static binaries from Scheme; WASM bytecode tier shipping   | ✅ tagged `m10-complete` (2026-05-16) — Track W done (`m10-wasm-complete`, WASM conformance matches native); Track A done (`m10-aot-complete`, numeric-kernel AOT pipeline; fib(40) RawI64 ABI matches `rustc -O` to the centisecond). AOT long-tail (inline NB fast paths, closures, bytecode→RIR glue, CLI integration) is post-1.0 work. See `docs/milestones/m10-trackA-exit.md`. |
 | M11       | Verified core (stretch)              | `verification`         | Mechanized eval semantics with extracted reference         | — |
 
 Each milestone produces a tagged release (`milestone-N-complete`) and a written
@@ -345,6 +345,19 @@ Two stretch deliverables in parallel:
   identically to the JIT version.
 - WASM: CrabScheme runs in `wasmtime` and in a browser; bytecode VM
   conformance pass rate within 2 percentage points of native.
+
+**Actual outcome (tagged 2026-05-16):** AOT shipped at narrower scope
+than originally envisioned — a numeric-kernel pipeline (Fixnum
+arith + branching + self-recursion) compiles end-to-end to a static
+binary. fib(40) under the RawI64 ABI matches reference `rustc -O`
+to the centisecond; the NB ABI runs ~5.7× slower due to per-op
+runtime-helper calls (inline NB fast paths are post-1.0). WASM
+shipped clean on first attempt: 2.2 MB `wasm32-wasip1` binary,
+conformance matches native (modulo two file-I/O tests that need
+`--dir` mappings to satisfy the WASI sandbox). The browser
+`wasm32-unknown-unknown` target is deferred to a future
+post-1.0 iter when motivated. See `docs/milestones/m10-trackA-exit.md`
+and `docs/milestones/m10-trackW-exit.md`.
 
 ---
 
