@@ -1128,6 +1128,12 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
                 } else {
                     None
                 };
+                // RC3 iter 2.12 — ALL binding syms (top-level OR
+                // letrec / named-let). When this fn's body emits a
+                // MakeClosure for an inner lambda whose captures
+                // include THIS fn's own binding sym, the capture-
+                // gather emits `__self_handle` (forward self-ref).
+                rir.self_binding_sym = sym_by_idx.get(&idx).map(|s| s.0);
                 compatible_funcs.push(rir);
             }
             Err(e) => skipped.push((name, format!("{e:?}"))),
@@ -1143,6 +1149,18 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
             }
         }
         return ExitCode::from(3);
+    }
+    // Always report what got skipped so downstream MakeClosure
+    // failures (which surface as "MakeClosure not yet supported" in
+    // the resolver-miss case) can be traced back to their cause.
+    if !skipped.is_empty() {
+        eprintln!(
+            "crabscheme aot --multi: {} lambda(s) skipped during translation:",
+            skipped.len()
+        );
+        for (n, r) in &skipped {
+            eprintln!("    {n}: {r}");
+        }
     }
 
     let basename = basename_no_ext(file).to_string();

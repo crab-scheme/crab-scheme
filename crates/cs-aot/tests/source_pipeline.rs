@@ -395,6 +395,8 @@ fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> P
         } else {
             None
         };
+        // RC3 iter 2.12 — self_binding_sym covers letrec bindings too.
+        rir.self_binding_sym = sym_by_idx.get(&idx).map(|s| s.0);
         compatible.push(rir);
     }
     assert!(
@@ -456,6 +458,35 @@ fn run_multi_with_args(bin: &PathBuf, entry: &str, args: &[i64]) -> i64 {
         .trim()
         .parse::<i64>()
         .expect("i64 parse")
+}
+
+#[test]
+fn source_to_aot_forward_self_ref_capture() {
+    // RC3 iter 2.12 — forward self-reference capture. The inner
+    // loop2 calls back into loop1 (its lexical parent's letrec
+    // binding), but loop1's VmAotClosure handle doesn't exist as
+    // an SSA Value at MakeClosure-of-loop2 time (loop1's body is
+    // running INSIDE loop1's own dispatch). The iter-2.12 fix
+    // threads `__self_handle` (the closure's own NB Procedure
+    // handle) through the AotDispatchFn ABI; the capture-gather
+    // emits `__self_handle` when an inner-lambda capture-sym
+    // matches the caller's `self_binding_sym`.
+    //
+    // f(3) = 4: loop1 iterates i=0..3 (each iteration runs loop2
+    // for j=0..5 then bumps i), and on i=4 the (> i n) check fires
+    // and returns i=4.
+    let bin = aot_compile_multi_and_run(
+        "(define (f n) (let loop1 ((i 0)) \
+           (if (> i n) i \
+             (let loop2 ((j 0)) \
+               (if (> j 5) (loop1 (+ i 1)) (loop2 (+ j 1)))))))",
+        "f",
+        "forward_self_ref",
+    );
+    assert_eq!(run_multi_with_args(&bin, "f", &[0]), 1);
+    assert_eq!(run_multi_with_args(&bin, "f", &[3]), 4);
+    assert_eq!(run_multi_with_args(&bin, "f", &[5]), 6);
+    assert_eq!(run_multi_with_args(&bin, "f", &[10]), 11);
 }
 
 #[test]

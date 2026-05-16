@@ -518,23 +518,24 @@ pub fn emit_with_resolver(
     // params. The dispatch wrapper unpacks captures + args and
     // passes both. EnvLookup(_, sym) in the body resolves to
     // `__cap<sym>` via the captures-index lookup.
-    write!(out, "pub extern \"C\" fn {fn_name}(").unwrap();
-    let mut first_param = true;
+    // RC3 iter 2.12 — `__self_handle: i64` is always the first param,
+    // threaded by the dispatch wrapper. Holds the closure's own NB
+    // Procedure handle. The body re-passes it as a capture value
+    // when MakeClosure'ing an inner lambda that needs a forward
+    // self-reference back to this closure. Even non-capturing fns
+    // get this param (the dispatch ABI is uniform).
+    write!(out, "pub extern \"C\" fn {fn_name}(__self_handle: i64").unwrap();
     for sym in &func.captures {
-        if !first_param {
-            out.push_str(", ");
-        }
-        first_param = false;
+        out.push_str(", ");
         write!(out, "__cap{sym}: i64").unwrap();
     }
     for (v, _ty) in func.params.iter() {
-        if !first_param {
-            out.push_str(", ");
-        }
-        first_param = false;
+        out.push_str(", ");
         write!(out, "v{}: i64", v.0).unwrap();
     }
     out.push_str(") -> i64 {\n");
+    // Suppress unused warning when the body doesn't need self_handle.
+    out.push_str("    let _ = __self_handle;\n");
 
     if straight_line {
         emit_straight_line(&mut out, func, mode, resolver)?;
@@ -571,6 +572,7 @@ fn emit_straight_line(
             resolver,
             &func.captures,
             &local_defs,
+            func.self_binding_sym,
         )?;
         if let Some(dst) = inst_dst(inst) {
             defined.insert(dst);
@@ -648,6 +650,7 @@ fn emit_loop_match(
                 resolver,
                 &func.captures,
                 &local_defs,
+                func.self_binding_sym,
             )?;
         }
         emit_terminator(out, &block.terminator, func, mode)?;
@@ -701,6 +704,7 @@ fn emit_inst_let(
     resolver: &LambdaResolver,
     captures: &[u32],
     local_defs: &std::collections::HashMap<u32, Value>,
+    self_binding_sym: Option<u32>,
 ) -> Result<(), AotError> {
     // RC3 iter 2.11 — EnvDefineLocal that survived demote (the
     // multi-block + multi-define case) lowers to a no-op: the
@@ -720,6 +724,7 @@ fn emit_inst_let(
         resolver,
         captures,
         local_defs,
+        self_binding_sym,
     )?;
     writeln!(out, "    let v{}: i64 = {};", dst.0, expr).unwrap();
     Ok(())
@@ -735,6 +740,7 @@ fn emit_inst_assign(
     resolver: &LambdaResolver,
     captures: &[u32],
     local_defs: &std::collections::HashMap<u32, Value>,
+    self_binding_sym: Option<u32>,
 ) -> Result<(), AotError> {
     // Same no-op as emit_inst_let for surviving EnvDefineLocal.
     if matches!(inst, Inst::EnvDefineLocal(..)) {
@@ -752,6 +758,7 @@ fn emit_inst_assign(
         resolver,
         captures,
         local_defs,
+        self_binding_sym,
     )?;
     writeln!(out, "                v{} = {};", dst.0, expr).unwrap();
     Ok(())
@@ -769,6 +776,7 @@ fn inst_rhs(
     resolver: &LambdaResolver,
     captures: &[u32],
     local_defs: &std::collections::HashMap<u32, Value>,
+    self_binding_sym: Option<u32>,
 ) -> Result<(Value, String), AotError> {
     let check = |v: Value| -> Result<(), AotError> {
         match defined {
@@ -1298,24 +1306,21 @@ fn inst_rhs(
             for arg in args {
                 check(*arg)?;
             }
-            // RC3 iter 2.4: CallSelf in a capturing function passes
-            // through the same captures (recursive calls are within
-            // the same closure, so captures don't change).
+            // RC3 iter 2.4 + 2.12: CallSelf in a capturing function
+            // passes through the same captures (recursive calls are
+            // within the same closure, so captures don't change).
+            // Also threads __self_handle (iter 2.12) — the recursive
+            // call lives in the same closure, so the same handle
+            // applies.
             let mut call = String::from(self_fn_name);
             call.push('(');
-            let mut first = true;
+            call.push_str("__self_handle");
             for sym in captures {
-                if !first {
-                    call.push_str(", ");
-                }
-                first = false;
+                call.push_str(", ");
                 call.push_str(&format!("__cap{sym}"));
             }
             for arg in args {
-                if !first {
-                    call.push_str(", ");
-                }
-                first = false;
+                call.push_str(", ");
                 call.push_str(&format!("v{}", arg.0));
             }
             call.push(')');
@@ -1412,6 +1417,15 @@ fn inst_rhs(
                         cap_exprs.push(format!("__cap{sym}"));
                     } else if let Some(v) = local_defs.get(sym) {
                         cap_exprs.push(format!("v{}", v.0));
+                    } else if self_binding_sym == Some(*sym) {
+                        // RC3 iter 2.12 — forward self-reference
+                        // capture. The inner lambda's capture-sym is
+                        // the CALLER's own letrec binding name. The
+                        // caller's __self_handle (threaded by the
+                        // dispatch ABI) is the NB Procedure handle
+                        // for this very closure — exactly what the
+                        // inner lambda needs to call back into us.
+                        cap_exprs.push("__self_handle".to_string());
                     } else if let Some(other_idx) = resolver.by_name_sym.get(sym) {
                         // RC3 iter 2.7 — capture is a top-level AOT'd
                         // function. Allocate a fresh Procedure NB
@@ -1425,10 +1439,9 @@ fn inst_rhs(
                     } else {
                         // Sym is neither in our captures nor locally
                         // defined via EnvDefineLocal nor a known
-                        // top-level AOT'd function. The bytecode
-                        // likely binds it via a path we don't yet
-                        // model (e.g., direct env install from a
-                        // letrec frame outside our scan).
+                        // top-level AOT'd function nor our own
+                        // letrec binding. The bytecode likely binds
+                        // it via a path we don't yet model.
                         return Err(AotError::UnsupportedInst(
                             "MakeClosure with unresolved capture",
                         ));
@@ -1919,8 +1932,8 @@ mod tests {
     #[test]
     fn emits_sq() {
         let src = emit(&sq_function()).unwrap();
-        // Smoke: contains the expected pieces.
-        assert!(src.contains("pub extern \"C\" fn sq(v0: i64) -> i64"));
+        // RC3 iter 2.12 — every fn gets `__self_handle: i64` first.
+        assert!(src.contains("pub extern \"C\" fn sq(__self_handle: i64, v0: i64) -> i64"));
         assert!(src.contains("let v1: i64 = v0.wrapping_mul(v0);"));
         assert!(src.contains("    v1\n"));
     }
@@ -1928,7 +1941,9 @@ mod tests {
     #[test]
     fn emits_add3() {
         let src = emit(&add3_function()).unwrap();
-        assert!(src.contains("pub extern \"C\" fn add3(v0: i64, v1: i64, v2: i64) -> i64"));
+        assert!(src.contains(
+            "pub extern \"C\" fn add3(__self_handle: i64, v0: i64, v1: i64, v2: i64) -> i64"
+        ));
         assert!(src.contains("let v3: i64 = v0.wrapping_add(v1);"));
         assert!(src.contains("let v4: i64 = v3.wrapping_add(v2);"));
         assert!(src.contains("    v4\n"));
@@ -1945,7 +1960,7 @@ mod tests {
             terminator: Term::Return(Value(0)),
         });
         let src = emit(&f).unwrap();
-        assert!(src.contains("pub extern \"C\" fn answer() -> i64"));
+        assert!(src.contains("pub extern \"C\" fn answer(__self_handle: i64) -> i64"));
         assert!(src.contains("let v0: i64 = 42i64;"));
     }
 

@@ -14923,7 +14923,15 @@ trace_leaf_proc!(
 /// Non-capturing lambdas pass `n_captures = 0` and `captures =
 /// null_ptr`. The dispatch wrapper is responsible for arity
 /// validation on `n_args`.
+/// RC3 iter 2.12 — `self_handle: i64` is the closure's own NB
+/// Procedure handle, threaded by `vm_call_aot_procedure`. The typed
+/// fn body can pass it as a capture value when allocating an inner
+/// closure that needs a forward self-reference (e.g., named-let /
+/// letrec where the inner lambda calls back into its lexical parent).
+/// Without this, the inner lambda's "capture loop1" sym would have
+/// no resolvable value at MakeClosure time.
 pub type AotDispatchFn = unsafe extern "C" fn(
+    self_handle: i64,
     captures: *const i64,
     n_captures: usize,
     args: *const i64,
@@ -15141,16 +15149,21 @@ pub unsafe extern "C" fn vm_call_aot_procedure(
     } else {
         (aot.captures.as_ptr(), aot.captures.len())
     };
-    f(captures_ptr, n_captures, args_ptr, n_args)
+    // RC3 iter 2.12 — pass the closure's own NB Procedure handle as
+    // self_handle. The typed fn can re-pass this as a capture value
+    // when allocating an inner closure that needs a forward
+    // self-reference back to this closure.
+    f(proc_nb, captures_ptr, n_captures, args_ptr, n_args)
 }
 
 #[cfg(test)]
 mod aot_proc_tests {
     use super::*;
 
-    /// Minimal extern "C" dispatch fn (iter 2.4 signature):
-    /// returns args[0] + args[1] as NB Fixnums. Ignores captures.
+    /// Minimal extern "C" dispatch fn (iter 2.12 signature):
+    /// returns args[0] + args[1] as NB Fixnums. Ignores self_handle + captures.
     unsafe extern "C" fn add_dispatch(
+        _self_handle: i64,
         _captures: *const i64,
         _n_captures: usize,
         args: *const i64,
@@ -15165,6 +15178,7 @@ mod aot_proc_tests {
     /// Dispatch fn that uses a captured value: returns captures[0] + args[0].
     /// Simulates a `(lambda (x) (+ captured x))` style closure body.
     unsafe extern "C" fn capture_then_add_dispatch(
+        _self_handle: i64,
         captures: *const i64,
         n_captures: usize,
         args: *const i64,

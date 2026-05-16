@@ -1406,6 +1406,20 @@ pub struct Function {
     /// closure inside `(define (f x) ...)` captures `x` which is
     /// a *param* of `f`, not a local define).
     pub param_syms: Vec<u32>,
+    /// RC3 iter 2.12 — sym this function is bound to in its IMMEDIATE
+    /// lexical parent. For top-level fns, equals `name_sym`. For
+    /// letrec / named-let inner lambdas, equals the letrec binding
+    /// sym (which differs from `name_sym` since iter 2.7 reserves
+    /// `name_sym` for top-level-only).
+    ///
+    /// cs-aot uses this for forward self-reference capture: when an
+    /// inner lambda's capture list contains the CALLER's
+    /// `self_binding_sym`, the caller emits `__self_handle` (its own
+    /// NB Procedure handle, threaded by the dispatch ABI) as the
+    /// capture value — solving the chicken-and-egg where a letrec
+    /// binding's value doesn't exist at MakeClosure time but is
+    /// needed by an inner lambda calling back into the parent.
+    pub self_binding_sym: Option<u32>,
 }
 
 impl Function {
@@ -1421,6 +1435,7 @@ impl Function {
             captures: Vec::new(),
             name_sym: None,
             param_syms: Vec::new(),
+            self_binding_sym: None,
         }
     }
 

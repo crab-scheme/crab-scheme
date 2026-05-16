@@ -346,10 +346,10 @@ fn write_aot_dispatch_wrapper(src: &mut String, f: &Function) {
 
     let n_captures = f.captures.len();
     src.push_str(&format!(
-        "/// RC3 iter 2.2 + 2.4: dispatch wrapper for `{fn_name}` (arity {arity}, captures {n_captures}).\n\
+        "/// RC3 iter 2.2 + 2.4 + 2.12: dispatch wrapper for `{fn_name}` (arity {arity}, captures {n_captures}).\n\
          /// Called via cs_vm::vm::vm_call_aot_procedure when the\n\
          /// procedure value is invoked from Scheme code. Signature\n\
-         /// matches cs_vm::vm::AotDispatchFn (captures + args).\n"
+         /// matches cs_vm::vm::AotDispatchFn (self_handle + captures + args).\n"
     ));
     let captures_binding = if n_captures == 0 {
         "_captures"
@@ -358,6 +358,7 @@ fn write_aot_dispatch_wrapper(src: &mut String, f: &Function) {
     };
     src.push_str(&format!(
         "#[no_mangle]\npub unsafe extern \"C\" fn {fn_name}_aot_dispatch(\
+         self_handle: i64, \
          {captures_binding}: *const i64, _n_captures: usize, \
          args: *const i64, n_args: usize) -> i64 {{\n"
     ));
@@ -368,10 +369,12 @@ fn write_aot_dispatch_wrapper(src: &mut String, f: &Function) {
         "    debug_assert_eq!(n_args, {arity}, \"{fn_name}_aot_dispatch: arity\");\n"
     ));
 
-    // Unpack captures (RC3 iter 2.4) + args + invoke. Captures
-    // come first to match the typed fn's signature
-    // (`fn(__cap<sym0>, __cap<sym1>, ..., v_param0, ...)`).
-    let mut all_loads: Vec<String> = Vec::with_capacity(n_captures + arity);
+    // Unpack captures (RC3 iter 2.4) + args + invoke. self_handle
+    // comes first (iter 2.12), then captures, then args — matching
+    // the typed fn's signature
+    // (`fn(__self_handle, __cap<sym0>, ..., v_param0, ...)`).
+    let mut all_loads: Vec<String> = Vec::with_capacity(1 + n_captures + arity);
+    all_loads.push("self_handle".to_string());
     for i in 0..n_captures {
         all_loads.push(format!("*captures.add({i})"));
     }
@@ -410,15 +413,22 @@ fn write_single_entry_main(src: &mut String, entry: &Function, mode: EmitMode, a
     src.push_str("        std::process::exit(2);\n");
     src.push_str("    }\n");
 
-    let arg_exprs: Vec<String> = (0..n_params)
-        .map(|i| match mode {
+    let mut arg_exprs: Vec<String> = Vec::with_capacity(n_params + 1);
+    // RC3 iter 2.12 — direct typed-fn calls (single-entry main shim)
+    // pass 0 as `__self_handle`. The body never reads it (the user's
+    // top-level entry doesn't capture itself via MakeClosure'd inner
+    // closures from CLI), and AOT'd top-level fns suppress the
+    // unused-binding warning via `let _ = __self_handle;`.
+    arg_exprs.push("0i64".to_string());
+    for i in 0..n_params {
+        arg_exprs.push(match mode {
             EmitMode::RawI64 => format!("args[{}].parse::<i64>().unwrap()", i + 1),
             EmitMode::Nb => format!(
                 "cs_vm::vm::NanboxValue::fixnum(args[{}].parse::<i64>().unwrap()).into_raw()",
                 i + 1
             ),
-        })
-        .collect();
+        });
+    }
 
     src.push_str(&format!(
         "    let raw_result: i64 = {entry_name}({});\n",
@@ -513,15 +523,21 @@ fn write_multi_procedure_main(
         src.push_str("                std::process::exit(2);\n");
         src.push_str("            }\n");
 
-        let arg_exprs: Vec<String> = (0..n_params)
-            .map(|i| match mode {
+        // RC3 iter 2.12 — pass 0i64 as __self_handle (the CLI doesn't
+        // have access to the closure's own NB Procedure handle). Top-
+        // level fns that don't MakeClosure inner lambdas referencing
+        // themselves never read it. Body suppresses unused warning.
+        let mut arg_exprs: Vec<String> = Vec::with_capacity(n_params + 1);
+        arg_exprs.push("0i64".to_string());
+        for i in 0..n_params {
+            arg_exprs.push(match mode {
                 EmitMode::RawI64 => format!("args[{}].parse::<i64>().unwrap()", i + 2),
                 EmitMode::Nb => format!(
                     "cs_vm::vm::NanboxValue::fixnum(args[{}].parse::<i64>().unwrap()).into_raw()",
                     i + 2
                 ),
-            })
-            .collect();
+            });
+        }
 
         src.push_str(&format!(
             "            let raw_result: i64 = {name}({});\n",

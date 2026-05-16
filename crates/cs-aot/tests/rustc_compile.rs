@@ -30,10 +30,12 @@ fn build_aot_binary(emitted: &str, fn_name: &str, n_params: usize) -> PathBuf {
     src.push_str("fn main() {\n");
     src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
     let mut call_args = String::new();
+    // RC3 iter 2.12 — every AOT'd fn takes __self_handle as first
+    // arg. The test main passes 0 (unused here since these tests
+    // exercise simple numeric kernels with no inner closures).
+    call_args.push_str("0i64");
     for i in 0..n_params {
-        if i > 0 {
-            call_args.push_str(", ");
-        }
+        call_args.push_str(", ");
         call_args.push_str(&format!("args[{}].parse::<i64>().unwrap()", i + 1));
     }
     src.push_str(&format!("    let result: i64 = {fn_name}({call_args});\n"));
@@ -333,11 +335,10 @@ opt-level = 3
     src.push_str("use cs_vm::vm::NanboxValue;\n");
     src.push_str("fn main() {\n");
     src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
-    let mut call_args = String::new();
+    // RC3 iter 2.12 — every AOT'd fn takes __self_handle: i64 first.
+    let mut call_args = String::from("0i64");
     for i in 0..n_params {
-        if i > 0 {
-            call_args.push_str(", ");
-        }
+        call_args.push_str(", ");
         call_args.push_str(&format!(
             "NanboxValue::fixnum(args[{}].parse::<i64>().unwrap()).into_raw()",
             i + 1
@@ -455,7 +456,8 @@ opt-level = 3
     src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
     src.push_str("    let x = NanboxValue::flonum(args[1].parse::<f64>().unwrap()).into_raw();\n");
     src.push_str("    let y = NanboxValue::flonum(args[2].parse::<f64>().unwrap()).into_raw();\n");
-    src.push_str(&format!("    let r: i64 = {fn_name}(x, y);\n"));
+    // RC3 iter 2.12 — every AOT'd fn takes __self_handle: i64 first.
+    src.push_str(&format!("    let r: i64 = {fn_name}(0i64, x, y);\n"));
     src.push_str("    let f = NanboxValue(r).as_flonum().expect(\"result is a Flonum\");\n");
     src.push_str("    println!(\"{}\", f);\n");
     src.push_str("}\n");
