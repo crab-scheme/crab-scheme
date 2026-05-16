@@ -632,6 +632,128 @@ fn inst_rhs(
             (*dst, format!("v{}", src.0))
         }
 
+        // ---- Type predicates (RC2 iter L) ----
+        //
+        // Each lowers to a single runtime-helper call returning 0/1
+        // i64 (the helpers themselves are bool-as-i64, not NB-encoded).
+        // RawI64 mode passes through; Nb mode wraps with the OR-with-
+        // NB_FALSE_BITS trick so the result is an NB Boolean usable
+        // by Branch and downstream consumers.
+        (Inst::PairP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_pair_p_gc", src, m))
+        }
+        (Inst::NullP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_null_p_gc", src, m))
+        }
+        (Inst::VecP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_vector_p_gc", src, m))
+        }
+        (Inst::ProcedureP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_procedure_p_gc", src, m))
+        }
+        (Inst::SymbolP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_symbol_p_gc", src, m))
+        }
+        (Inst::FixnumP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_fixnum_p_gc", src, m))
+        }
+        (Inst::FlonumP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_flonum_p_gc", src, m))
+        }
+
+        // ---- Vector primitives (RC2 iter M) ----
+        //
+        // All call into cs-vm's `vm_*_vector_*_gc` runtime helpers.
+        // Operands and results are NB carriers (Gc handles for the
+        // vector, Fixnum-NB for indices/length, NB Any for values).
+        // Identical lowering in both EmitModes because the heap
+        // helpers operate on NB carriers regardless of the caller's
+        // ABI choice.
+        //
+        // VecAlloc: `dst = make-vector(n, fill)` — n is Fixnum, fill
+        // is Any (defaulting to Unspecified via the bytecode
+        // compiler's desugaring), dst is a vector Gc handle.
+        (Inst::VecAlloc(dst, n, fill), _) => {
+            check(*n)?;
+            check(*fill)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_alloc_vector_gc(v{}, v{}) }}",
+                    n.0, fill.0
+                ),
+            )
+        }
+        (Inst::VecRef(dst, vec, idx), _) => {
+            check(*vec)?;
+            check(*idx)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_vector_ref_gc(v{}, v{}) }}",
+                    vec.0, idx.0
+                ),
+            )
+        }
+        (Inst::VecSet(dst, vec, idx, val), _) => {
+            check(*vec)?;
+            check(*idx)?;
+            check(*val)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_vector_set_gc(v{}, v{}, v{}) }}",
+                    vec.0, idx.0, val.0
+                ),
+            )
+        }
+        (Inst::VecLength(dst, vec), _) => {
+            check(*vec)?;
+            (
+                *dst,
+                format!("unsafe {{ cs_vm::vm::vm_vector_length_gc(v{}) }}", vec.0),
+            )
+        }
+
+        // ---- Pair primitives (RC2 iter N) ----
+        //
+        // Cons takes per-operand tag bytes (NB JIT_RT_* values
+        // embedded at translate time) that vm_alloc_pair_gc passes
+        // to the underlying allocator. car/cdr are simple slot
+        // accessors via the *_gc helpers.
+        (Inst::Cons(dst, car_v, car_tag, cdr_v, cdr_tag), _) => {
+            check(*car_v)?;
+            check(*cdr_v)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_alloc_pair_gc(v{}, {}u8, v{}, {}u8) }}",
+                    car_v.0, car_tag, cdr_v.0, cdr_tag
+                ),
+            )
+        }
+        (Inst::Car(dst, pair), _) => {
+            check(*pair)?;
+            (
+                *dst,
+                format!("unsafe {{ cs_vm::vm::vm_pair_car_gc(v{}) }}", pair.0),
+            )
+        }
+        (Inst::Cdr(dst, pair), _) => {
+            check(*pair)?;
+            (
+                *dst,
+                format!("unsafe {{ cs_vm::vm::vm_pair_cdr_gc(v{}) }}", pair.0),
+            )
+        }
+
         // ---- Division ----
         //
         // RawI64 mode: integer division via `wrapping_div`. Panics on
@@ -1019,6 +1141,19 @@ fn fpredicate_nb_rust(method: &str, src: &Value) -> String {
     )
 }
 
+/// Type-predicate runtime-helper call (RC2 iter L).
+/// `helper_name` is one of the `vm_*_p_gc` functions in cs_vm::vm,
+/// each returning 0/1 i64 for the predicate result. RawI64 mode
+/// passes through; Nb mode encodes as NB Boolean via the same OR-
+/// with-NB_FALSE trick used for Lt/Eq results.
+fn tpred_rust(helper_name: &str, src: &Value, mode: EmitMode) -> String {
+    let call = format!("unsafe {{ cs_vm::vm::{helper_name}(v{}) }}", src.0);
+    match mode {
+        EmitMode::RawI64 => call,
+        EmitMode::Nb => format!("(({call} as u64) | 0xfff8_8000_0000_0000u64) as i64"),
+    }
+}
+
 /// The NB-encoded `#f` literal as a Rust source expression. Used by
 /// NB-mode Branch terminators for the truthiness test.
 fn nb_false_literal() -> &'static str {
@@ -1055,6 +1190,21 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         | Inst::AnyTruthy(v, _)
         | Inst::FixToFlo(v, _)
         | Inst::IntCharBitcast(v, _) => Some(*v),
+        // RC2 iter L — type predicates.
+        Inst::PairP(v, _)
+        | Inst::NullP(v, _)
+        | Inst::VecP(v, _)
+        | Inst::ProcedureP(v, _)
+        | Inst::SymbolP(v, _)
+        | Inst::FixnumP(v, _)
+        | Inst::FlonumP(v, _) => Some(*v),
+        // RC2 iter M — vector primitives.
+        Inst::VecAlloc(v, _, _)
+        | Inst::VecRef(v, _, _)
+        | Inst::VecSet(v, _, _, _)
+        | Inst::VecLength(v, _) => Some(*v),
+        // RC2 iter N — pair primitives.
+        Inst::Cons(v, _, _, _, _) | Inst::Car(v, _) | Inst::Cdr(v, _) => Some(*v),
         // RC2 iter D — Flonum unary / binary / predicate Insts.
         Inst::FlonumSqrt(v, _)
         | Inst::FlonumAbs(v, _)
