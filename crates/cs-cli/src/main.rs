@@ -1034,25 +1034,40 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
         }
     };
 
-    // Enumerate top-level lambdas + filter to AOT-compatible ones.
-    let mut compatible_funcs: Vec<cs_rir::Function> = Vec::new();
-    let mut skipped: Vec<(String, String)> = Vec::new();
+    // RC3 iter 2.2 Step 5: enumerate ALL lambdas in bc.lambdas
+    // (not just SetVar-bound ones) so that nested anonymous
+    // lambdas referenced via `Inst::MakeClosure(_, idx)` from
+    // other functions can be resolved by cs-aot's LambdaResolver.
+    //
+    // Named lambdas (those with MakeClosure+SetVar pairs) get
+    // their original name from the SetVar sym. Anonymous lambdas
+    // get a synthetic name `__aot_lambda_<idx>` so they have a
+    // stable Rust identifier for emission.
+    let mut name_by_idx: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
     for window in bc.insts.windows(2) {
         if let (cs_vm::opcode::Inst::MakeClosure(idx), cs_vm::opcode::Inst::SetVar(sym)) =
             (&window[0], &window[1])
         {
-            let name = syms.name(*sym).to_string();
-            let lam = &bc.lambdas[*idx];
-            match bytecode_to_rir_aot(lam, name.as_str(), Some(*sym)) {
-                Ok(mut rir) => {
-                    // RC3 iter 2.2 Step 1 — annotate the RIR with
-                    // its source lambda index so cs-aot's MakeClosure
-                    // resolver can find this function by index.
-                    rir.lambda_index = Some(*idx);
-                    compatible_funcs.push(rir);
-                }
-                Err(e) => skipped.push((name.clone(), format!("{e:?}"))),
+            name_by_idx.insert(*idx, syms.name(*sym).to_string());
+        }
+    }
+    let mut compatible_funcs: Vec<cs_rir::Function> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    for (idx, lam) in bc.lambdas.iter().enumerate() {
+        let (name, self_sym) = match name_by_idx.get(&idx) {
+            Some(n) => (n.clone(), Some(syms.intern(n))),
+            None => (format!("__aot_lambda_{idx}"), None),
+        };
+        match bytecode_to_rir_aot(lam, name.as_str(), self_sym) {
+            Ok(mut rir) => {
+                // RC3 iter 2.2 Step 1 — annotate the RIR with its
+                // source lambda index so cs-aot's MakeClosure
+                // resolver can find this function by index.
+                rir.lambda_index = Some(idx);
+                compatible_funcs.push(rir);
             }
+            Err(e) => skipped.push((name, format!("{e:?}"))),
         }
     }
 
