@@ -602,7 +602,7 @@ fn run_aot(
     };
 
     // --- Translate to RIR ----
-    let rir = match bytecode_to_rir_aot(&lam, &entry_name, Some(entry_sym)) {
+    let mut rir = match bytecode_to_rir_aot(&lam, &entry_name, Some(entry_sym)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("crabscheme aot: bytecode→RIR error: {e:?}");
@@ -614,6 +614,13 @@ fn run_aot(
             return ExitCode::from(3);
         }
     };
+    // RC3 iter 2.2 Step 1 — record the source lambda index for
+    // cs-aot's MakeClosure resolver. For single-entry mode we
+    // also annotate so any nested MakeClosure inside the entry
+    // can reference itself (degenerate, but consistent).
+    if let Some(idx) = lambda_index_for(&bc, entry_sym) {
+        rir.lambda_index = Some(idx);
+    }
 
     // RC2 iter R: --emit-rir dumps the post-translate RIR to stdout
     // before emission. Useful when an UnsupportedInst surfaces:
@@ -1037,7 +1044,13 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
             let name = syms.name(*sym).to_string();
             let lam = &bc.lambdas[*idx];
             match bytecode_to_rir_aot(lam, name.as_str(), Some(*sym)) {
-                Ok(rir) => compatible_funcs.push(rir),
+                Ok(mut rir) => {
+                    // RC3 iter 2.2 Step 1 — annotate the RIR with
+                    // its source lambda index so cs-aot's MakeClosure
+                    // resolver can find this function by index.
+                    rir.lambda_index = Some(*idx);
+                    compatible_funcs.push(rir);
+                }
                 Err(e) => skipped.push((name.clone(), format!("{e:?}"))),
             }
         }

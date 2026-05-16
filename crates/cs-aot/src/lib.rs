@@ -378,6 +378,66 @@ pub fn emit(func: &Function) -> Result<String, AotError> {
 /// The result is a complete definition: one `pub extern "C" fn`
 /// matching the JIT's outer-trampoline signature.
 pub fn emit_with(mode: EmitMode, func: &Function) -> Result<String, AotError> {
+    emit_with_resolver(mode, func, &LambdaResolver::empty())
+}
+
+/// RC3 iter 2.2 Step 3 — resolver for MakeClosure / general Call.
+///
+/// Maps a bytecode-lambda-index (as it appears in
+/// `Inst::MakeClosure(_, idx)`) to the AOT-emitted dispatch
+/// wrapper's name + the lambda's arity. The project emitter
+/// builds one of these from the funcs slice's `lambda_index`
+/// field before calling `emit_with_resolver`.
+///
+/// When `MakeClosure(_, N)` references an index not in the
+/// resolver, cs-aot emits the standard `UnsupportedInst`
+/// diagnostic — the lambda was either not AOT-translated or
+/// lives outside the AOT-emitted set.
+#[derive(Debug, Clone, Default)]
+pub struct LambdaResolver {
+    pub by_idx: std::collections::HashMap<usize, LambdaInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LambdaInfo {
+    /// Sanitized fn name as it appears in the emitted Rust source.
+    pub fn_name: String,
+    /// Number of positional args the underlying AOT'd fn takes.
+    pub arity: usize,
+}
+
+impl LambdaResolver {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+    pub fn from_funcs(funcs: &[Function]) -> Self {
+        let mut by_idx = std::collections::HashMap::new();
+        for f in funcs {
+            if let Some(idx) = f.lambda_index {
+                by_idx.insert(
+                    idx,
+                    LambdaInfo {
+                        fn_name: sanitize_ident(&f.name),
+                        arity: f.params.len(),
+                    },
+                );
+            }
+        }
+        Self { by_idx }
+    }
+}
+
+/// Like [`emit_with`] but also accepts a [`LambdaResolver`] that
+/// `Inst::MakeClosure(_, idx)` and `Inst::Call(_, _, _)` use to
+/// resolve cross-Function references. The project emitter calls
+/// this directly with `LambdaResolver::from_funcs(funcs)`; the
+/// no-resolver `emit_with` wrapper is kept for back-compat with
+/// callers that don't care about closure / general-call lowering.
+pub fn emit_with_resolver(
+    mode: EmitMode,
+    func: &Function,
+    resolver: &LambdaResolver,
+) -> Result<String, AotError> {
     // ---- Function-level validation -------------------------------
     if func.blocks.is_empty() {
         return Err(AotError::EmptyFunction);
@@ -442,9 +502,9 @@ pub fn emit_with(mode: EmitMode, func: &Function) -> Result<String, AotError> {
     out.push_str(") -> i64 {\n");
 
     if straight_line {
-        emit_straight_line(&mut out, func, mode)?;
+        emit_straight_line(&mut out, func, mode, resolver)?;
     } else {
-        emit_loop_match(&mut out, func, mode)?;
+        emit_loop_match(&mut out, func, mode, resolver)?;
     }
 
     out.push_str("}\n");
@@ -455,13 +515,18 @@ pub fn emit_with(mode: EmitMode, func: &Function) -> Result<String, AotError> {
 /// Return value as a trailing tail expression. Preserves snapshot-
 /// test output for simple functions and is more readable when the
 /// CFG is degenerate.
-fn emit_straight_line(out: &mut String, func: &Function, mode: EmitMode) -> Result<(), AotError> {
+fn emit_straight_line(
+    out: &mut String,
+    func: &Function,
+    mode: EmitMode,
+    resolver: &LambdaResolver,
+) -> Result<(), AotError> {
     let block = &func.blocks[0];
     let mut defined: HashSet<Value> = func.params.iter().map(|(v, _)| *v).collect();
 
     let fn_name = sanitize_ident(&func.name);
     for inst in &block.insts {
-        emit_inst_let(out, inst, &defined, mode, &fn_name)?;
+        emit_inst_let(out, inst, &defined, mode, &fn_name, resolver)?;
         if let Some(dst) = inst_dst(inst) {
             defined.insert(dst);
         }
@@ -485,7 +550,12 @@ fn emit_straight_line(out: &mut String, func: &Function, mode: EmitMode) -> Resu
 /// `loop { match block { ... } }` state machine for block dispatch.
 /// Verbose but always correct for arbitrary CFGs without needing
 /// liveness analysis.
-fn emit_loop_match(out: &mut String, func: &Function, mode: EmitMode) -> Result<(), AotError> {
+fn emit_loop_match(
+    out: &mut String,
+    func: &Function,
+    mode: EmitMode,
+    resolver: &LambdaResolver,
+) -> Result<(), AotError> {
     // Pre-declare every Value that ISN'T already a function
     // parameter. Block params and Inst destinations all go here.
     // Using `let mut` + assignment (not `let`) means a Value defined
@@ -524,7 +594,7 @@ fn emit_loop_match(out: &mut String, func: &Function, mode: EmitMode) -> Result<
     for block in &func.blocks {
         writeln!(out, "            {} => {{", block.id.0).unwrap();
         for inst in &block.insts {
-            emit_inst_assign(out, inst, mode, &fn_name)?;
+            emit_inst_assign(out, inst, mode, &fn_name, resolver)?;
         }
         emit_terminator(out, &block.terminator, func, mode)?;
         writeln!(out, "            }}").unwrap();
@@ -548,8 +618,9 @@ fn emit_inst_let(
     defined: &HashSet<Value>,
     mode: EmitMode,
     self_fn_name: &str,
+    resolver: &LambdaResolver,
 ) -> Result<(), AotError> {
-    let (dst, expr) = inst_rhs(inst, Some(defined), mode, self_fn_name)?;
+    let (dst, expr) = inst_rhs(inst, Some(defined), mode, self_fn_name, resolver)?;
     writeln!(out, "    let v{}: i64 = {};", dst.0, expr).unwrap();
     Ok(())
 }
@@ -561,12 +632,13 @@ fn emit_inst_assign(
     inst: &Inst,
     mode: EmitMode,
     self_fn_name: &str,
+    resolver: &LambdaResolver,
 ) -> Result<(), AotError> {
     // The loop+match shape pre-declares all values; SSA validity is
     // a property of well-formed RIR, not something we re-check here
     // (the check requires cross-block dataflow analysis we don't yet
     // do in the emitter). Pass `None` to skip.
-    let (dst, expr) = inst_rhs(inst, None, mode, self_fn_name)?;
+    let (dst, expr) = inst_rhs(inst, None, mode, self_fn_name, resolver)?;
     writeln!(out, "                v{} = {};", dst.0, expr).unwrap();
     Ok(())
 }
@@ -580,6 +652,7 @@ fn inst_rhs(
     defined: Option<&HashSet<Value>>,
     mode: EmitMode,
     self_fn_name: &str,
+    resolver: &LambdaResolver,
 ) -> Result<(Value, String), AotError> {
     let check = |v: Value| -> Result<(), AotError> {
         match defined {
@@ -1121,6 +1194,63 @@ fn inst_rhs(
             (*dst, call)
         }
 
+        // ---- MakeClosure (RC3 iter 2.2 Step 3) ----
+        //
+        // Wraps an AOT-emitted lambda's dispatch fn pointer in a
+        // VmAotClosure via cs-vm's `vm_alloc_aot_procedure`. The
+        // resolver maps the bytecode-lambda-index to the AOT'd
+        // fn name + arity; if the lookup misses, the lambda wasn't
+        // part of the AOT'd set and we fail cleanly.
+        (Inst::MakeClosure(dst, lambda_idx), EmitMode::Nb) => {
+            let info = resolver
+                .by_idx
+                .get(&(*lambda_idx as usize))
+                .ok_or_else(|| {
+                    // The standard UnsupportedInst diagnostic already
+                    // covers MakeClosure; the resolver miss case is
+                    // semantically the same ("we can't emit this") for
+                    // the user.
+                    AotError::UnsupportedInst("MakeClosure")
+                })?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_alloc_aot_procedure({}_aot_dispatch as usize, {}u32) }}",
+                    info.fn_name, info.arity
+                ),
+            )
+        }
+
+        // ---- general Call (RC3 iter 2.2 Step 4) ----
+        //
+        // Dispatch through a Procedure-value via cs-vm's
+        // `vm_call_aot_procedure`. The callee is an NB carrier
+        // (Procedure tag), args are NB-encoded i64s.
+        //
+        // The emitted call boxes args into a stack-allocated array
+        // + passes a pointer + len. arity validation happens inside
+        // vm_call_aot_procedure.
+        (Inst::Call(dst, callee, args), EmitMode::Nb) => {
+            check(*callee)?;
+            for arg in args {
+                check(*arg)?;
+            }
+            let args_csv = args
+                .iter()
+                .map(|a| format!("v{}", a.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let n = args.len();
+            (
+                *dst,
+                format!(
+                    "{{ let __aot_args: [i64; {n}] = [{args_csv}]; \
+                     unsafe {{ cs_vm::vm::vm_call_aot_procedure(v{}, __aot_args.as_ptr(), {n}) }} }}",
+                    callee.0
+                ),
+            )
+        }
+
         // ---- Unsupported ----
         (other, _) => return Err(AotError::UnsupportedInst(inst_variant_name(other))),
     })
@@ -1293,6 +1423,9 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         Inst::Lt(v, _, _) | Inst::Eq(v, _, _) => Some(*v),
         Inst::Move(v, _) => Some(*v),
         Inst::CallSelf(v, _) => Some(*v),
+        // RC3 iter 2.2 Steps 3-4 — MakeClosure + general Call.
+        Inst::MakeClosure(v, _) => Some(*v),
+        Inst::Call(v, _, _) => Some(*v),
         // RC2 iter C — Flonum arith/cmp Insts.
         Inst::FlonumAdd(v, _, _)
         | Inst::FlonumSub(v, _, _)
@@ -1869,19 +2002,20 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_inst() {
-        // `Call` (general procedure call) isn't yet handled — needs
-        // closure / Procedure-table support that's post-1.0 work.
+        // `CallGeneral` (the slow-path general procedure call into
+        // closures the JIT couldn't resolve to Self/Builtin) isn't
+        // yet handled — needs iter 2.4's closure-capture story.
         // Used here as the canary that the unsupported-Inst error
         // path still fires; the list of supported Insts grew in
-        // RC2 iter C (Div + FlonumArith landed).
-        let mut f = Function::new("call_unsup");
+        // RC3 iter 2.2 (MakeClosure + Call now lower).
+        let mut f = Function::new("callgen_unsup");
         f.params.push((Value(0), Type::Procedure));
         f.params.push((Value(1), Type::Fixnum));
         f.entry = BlockId(0);
         f.blocks.push(Block {
             id: BlockId(0),
             params: vec![],
-            insts: vec![Inst::Call(Value(2), Value(0), vec![Value(1)])],
+            insts: vec![Inst::CallGeneral(Value(2), Value(0), vec![Value(1)])],
             terminator: Term::Return(Value(2)),
         });
         f.return_type = Type::Fixnum;
@@ -1889,7 +2023,7 @@ mod tests {
         // path to exercise the unsupported-Inst rejection.
         assert_eq!(
             emit_with(EmitMode::Nb, &f),
-            Err(AotError::UnsupportedInst("Call"))
+            Err(AotError::UnsupportedInst("CallGeneral"))
         );
     }
 

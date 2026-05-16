@@ -32,7 +32,10 @@ use std::path::{Path, PathBuf};
 
 use cs_rir::Function;
 
-use crate::{emit_with, nb_helpers_source, sanitize_ident_for_project, AotError, EmitMode};
+use crate::{
+    emit_with_resolver, nb_helpers_source, sanitize_ident_for_project, AotError, EmitMode,
+    LambdaResolver,
+};
 
 /// Errors specific to project emission (separate from per-function
 /// emit errors; those bubble through `Aot`).
@@ -284,12 +287,21 @@ fn render_main_rs(
         src.push_str(nb_helpers_source());
     }
 
+    // RC3 iter 2.2 Step 3: build a resolver from the funcs slice's
+    // `lambda_index` fields. MakeClosure(_, idx) in any emitted
+    // Function looks up `idx` here to find the dispatch wrapper
+    // name + arity. Functions without `lambda_index` set don't
+    // contribute (their MakeClosure references would fail with
+    // UnsupportedInst — same as before this iter).
+    let resolver = LambdaResolver::from_funcs(funcs);
+
     // Emit every Function in declaration order. Self-recursion (via
     // `CallSelf`) works because each function refers to itself by
     // its sanitized name — Rust resolves the recursive reference at
     // the module scope.
     for f in funcs {
-        let body = emit_with(opts.mode, f).map_err(|e| ProjectError::Emit(f.name.clone(), e))?;
+        let body = emit_with_resolver(opts.mode, f, &resolver)
+            .map_err(|e| ProjectError::Emit(f.name.clone(), e))?;
         src.push_str(&body);
         src.push('\n');
 
