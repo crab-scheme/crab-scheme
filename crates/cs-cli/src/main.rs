@@ -96,8 +96,14 @@ fn eval_with_tier(
 fn run_eval(src: &str, via_vm: bool, with_jit: bool, color: bool) -> ExitCode {
     let mut rt = Runtime::new();
     if with_jit {
+        #[cfg(feature = "jit")]
         if let Err(e) = rt.install_jit() {
             eprintln!("crabscheme: failed to install JIT: {e}");
+            return ExitCode::from(1);
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            eprintln!("crabscheme: --tier vm-jit requested but binary built without `jit` feature");
             return ExitCode::from(1);
         }
     }
@@ -132,8 +138,14 @@ fn run_file(
     };
     let mut rt = Runtime::new();
     if with_jit {
+        #[cfg(feature = "jit")]
         if let Err(e) = rt.install_jit() {
             eprintln!("crabscheme: failed to install JIT: {e}");
+            return ExitCode::from(1);
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            eprintln!("crabscheme: --tier vm-jit requested but binary built without `jit` feature");
             return ExitCode::from(1);
         }
     }

@@ -9,8 +9,16 @@ license.workspace = true
 name = "crabscheme"
 path = "src/main.rs"
 
+[features]
+# M10 Track W iter 1 — mirror cs-runtime's feature flags. The CLI's
+# default keeps the full native build (jit + ffi). --no-default-
+# features produces a minimal build suitable for WASM (W2+).
+default = ["jit", "ffi"]
+jit = ["cs-runtime/jit"]
+ffi = ["cs-runtime/ffi"]
+
 [dependencies]
 cs-core = { workspace = true }
 cs-diag = { workspace = true }
-cs-runtime = { workspace = true }
+cs-runtime = { workspace = true, default-features = false }
 clap = { workspace = true }

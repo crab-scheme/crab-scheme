@@ -1,9 +1,12 @@
 //! CrabScheme runtime: tree-walking interpreter, environments, builtins.
 
+pub mod active;
 pub mod builtins;
 pub mod env;
 pub mod eval;
+#[cfg(feature = "ffi")]
 pub mod ffi;
+#[cfg(feature = "jit")]
 pub mod jit;
 pub mod proc;
 
@@ -45,16 +48,23 @@ pub struct Runtime {
     /// Shared libraries loaded via [`Runtime::load_shared_library`].
     /// Held here only so the plugin's text segment stays mapped for
     /// the runtime's lifetime; we never inspect them after register.
+    /// (M10 W1: gated on the `ffi` feature — WASM doesn't have
+    /// `dlopen`.)
+    #[cfg(feature = "ffi")]
     loaded_libs: Vec<libloading::Library>,
     /// Cached C-ABI context. Lazily initialized on first FFI use;
     /// kept alive for the runtime's lifetime so registered host
     /// procedures' captured back-pointers stay valid. Boxed so the
     /// runtime back-pointer (which equals `self`) stays valid even
     /// if Runtime fields are reordered.
+    #[cfg(feature = "ffi")]
     ffi_ctx: Option<Box<crate::ffi::RuntimeFfiContext>>,
     /// JIT lowerer; populated by [`Runtime::install_jit`]. None
     /// means the runtime hasn't opted into JIT (closures stay on
     /// the bytecode VM regardless of tier-up).
+    /// (M10 W1: gated on the `jit` feature — WASM has no runtime
+    /// native codegen.)
+    #[cfg(feature = "jit")]
     pub(crate) jit_lowerer: Option<cs_jit_cranelift::Lowerer>,
     /// Override for `(command-line)`. R6RS specifies that
     /// command-line returns `(<program-path> <arg> ...)` — the
@@ -1634,8 +1644,11 @@ impl Runtime {
             // "null" ValueRef. Internal Pinned guards never use 0
             // either, so the convention is consistent across users.
             next_pin_id: Rc::new(Cell::new(1)),
+            #[cfg(feature = "ffi")]
             loaded_libs: Vec::new(),
+            #[cfg(feature = "ffi")]
             ffi_ctx: None,
+            #[cfg(feature = "jit")]
             jit_lowerer: None,
             command_line: None,
         }
@@ -1750,6 +1763,10 @@ impl Runtime {
     ///
     /// See `.spec-workflow/specs/ffi/{requirements,design}.md` and
     /// `docs/adr/0008-ffi-design.md`.
+    ///
+    /// (M10 W1: gated on the `ffi` feature — WASM doesn't have
+    /// `dlopen`, and the HostProcedure trait lives in `cs-ffi`.)
+    #[cfg(feature = "ffi")]
     pub fn register_host_procedure(&mut self, proc: std::sync::Arc<dyn cs_ffi::HostProcedure>) {
         let name_owned: String = proc.name().to_string();
         let name_static: &'static str = Box::leak(name_owned.into_boxed_str());

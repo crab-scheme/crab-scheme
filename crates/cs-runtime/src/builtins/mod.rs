@@ -9701,7 +9701,14 @@ fn b_eval(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
 }
 
 // ---- load-shared-library ----
+//
+// M10 W1: gated on the `ffi` feature. With the feature disabled
+// (e.g. WASM builds) the builtin reports an error explaining the
+// missing capability rather than silently being absent — keeps the
+// builtin name available so Scheme code's existence check remains
+// well-defined.
 
+#[cfg(feature = "ffi")]
 fn b_load_shared_library(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("load-shared-library", "1", args.len()));
@@ -9718,6 +9725,12 @@ fn b_load_shared_library(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, St
     rt.load_shared_library(&path)
         .map_err(|e| format!("load-shared-library: {}", e))?;
     Ok(Value::Unspecified)
+}
+
+#[cfg(not(feature = "ffi"))]
+fn b_load_shared_library(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> {
+    let _ = args;
+    Err("load-shared-library: FFI not available in this build (built --no-default-features without `ffi`)".to_string())
 }
 
 // ---- error-object accessors ----
@@ -11516,9 +11529,16 @@ fn b_jit_installed_p(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("jit-installed?", "0", args.len()));
     }
+    // M10 W1: `jit_installed` only exists when the `jit` feature is
+    // enabled. `(jit-installed?)` always returns `#f` in builds
+    // without it (WASM target most notably) — the predicate is
+    // semantically correct.
+    #[cfg(feature = "jit")]
     let installed = unsafe { crate::Runtime::active() }
         .map(|rt| rt.jit_installed())
         .unwrap_or(false);
+    #[cfg(not(feature = "jit"))]
+    let installed = false;
     Ok(Value::Boolean(installed))
 }
 

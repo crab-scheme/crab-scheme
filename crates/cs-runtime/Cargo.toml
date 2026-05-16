@@ -5,19 +5,36 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# M10 Track W iter 1 — feature-flag JIT + FFI so the runtime can build
+# for targets that don't support runtime native codegen (WASM) or
+# dynamic library loading (WASM, sandboxed embeds).
+#
+# `default` keeps the native build's surface identical to pre-M10.
+# `--no-default-features` produces a minimal runtime suitable for
+# wasm32-wasip1 (track W iter 2+).
+default = ["jit", "ffi"]
+# Enables `cs-jit*` deps and `Runtime::install_jit` / `jit_lowerer`.
+# Disabled in WASM and AOT-binary builds (which inline their codegen
+# at build time instead of at runtime).
+jit = ["dep:cs-jit", "dep:cs-jit-cranelift"]
+# Enables `cs-ffi*` deps and `Runtime::load_shared_library` /
+# `register_host_procedure`. Disabled in WASM (no `dlopen`).
+ffi = ["dep:cs-ffi", "dep:libloading"]
+
 [dependencies]
 cs-core = { workspace = true }
 cs-diag = { workspace = true }
 cs-expand = { workspace = true }
-cs-ffi = { workspace = true }
+cs-ffi = { workspace = true, optional = true }
 cs-gc = { workspace = true }
 cs-ir = { workspace = true }
 cs-lex = { workspace = true }
 cs-parse = { workspace = true }
 cs-vm = { workspace = true }
-cs-jit = { workspace = true }
-cs-jit-cranelift = { workspace = true }
-libloading = { workspace = true }
+cs-jit = { workspace = true, optional = true }
+cs-jit-cranelift = { workspace = true, optional = true }
+libloading = { workspace = true, optional = true }
 num-traits = { workspace = true }
 thiserror = { workspace = true }
 
