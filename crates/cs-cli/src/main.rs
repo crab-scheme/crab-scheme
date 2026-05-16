@@ -130,6 +130,21 @@ enum Cmd {
         /// match, non-zero with diagnostic on mismatch.
         #[arg(long = "verify", value_name = "ARGS")]
         verify: Option<String>,
+        /// RC3 Phase 6 iter 6.4: cross-compile target triple. Passed
+        /// verbatim to `cargo build --target=<TRIPLE>`. Requires the
+        /// target to be installed via `rustup target add <TRIPLE>`.
+        ///
+        /// Examples:
+        ///   --target wasm32-wasip1       — WASM (run with wasmtime)
+        ///   --target x86_64-unknown-linux-gnu — Linux glibc x86_64
+        ///   --target aarch64-apple-darwin     — Apple Silicon Mac
+        ///
+        /// On success, the binary path is reported with the target
+        /// triple in it (target/<triple>/release/<name>). --verify
+        /// is skipped when --target is set since the cross-compiled
+        /// binary likely can't run on the host.
+        #[arg(long = "target", value_name = "TRIPLE")]
+        target: Option<String>,
     },
     /// RC3 Phase 4 iter 4.5: self-test the AOT installation. Runs
     /// a baked-in `(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))`
@@ -167,6 +182,7 @@ fn main() -> ExitCode {
             explain,
             multi,
             verify,
+            target,
         }) => {
             if explain {
                 run_aot_explain(&file)
@@ -180,11 +196,18 @@ fn main() -> ExitCode {
                     build,
                     emit_rir,
                     emit_rust_source,
+                    target.as_deref(),
                 );
-                // RC3 iter 6.6: --verify is a post-step on top of
-                // --build. Only runs if the AOT build succeeded.
+                // RC3 iter 6.6: --verify post-step. Skipped when
+                // --target is set (cross-compiled binary likely
+                // can't run on the host).
                 if let Some(args) = verify {
-                    if matches!(code, ExitCode::SUCCESS) && build {
+                    if target.is_some() {
+                        eprintln!(
+                            "crabscheme aot --verify skipped (cross-compiled binary can't run on the host)"
+                        );
+                        code
+                    } else if matches!(code, ExitCode::SUCCESS) && build {
                         let sample_args: Vec<&str> = args.split_whitespace().collect();
                         run_aot_verify(&file, entry.as_deref(), output.as_deref(), &sample_args)
                     } else {
@@ -440,6 +463,7 @@ fn run_aot(
     build: bool,
     emit_rir: bool,
     emit_rust_source: bool,
+    target: Option<&str>,
 ) -> ExitCode {
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -689,19 +713,57 @@ fn run_aot(
         return ExitCode::SUCCESS;
     }
 
-    println!("  building (cargo build --release)...");
-    let status = Command::new("cargo")
-        .current_dir(&emitted.project_dir)
+    // RC3 iter 6.4: --target cross-compile. Builds with
+    // `cargo build --release --target=<triple>` so the output
+    // lives at `target/<triple>/release/<pkg>` instead of
+    // `target/release/<pkg>`.
+    let target_blurb = if let Some(t) = target {
+        format!(" --target={t}")
+    } else {
+        String::new()
+    };
+    println!("  building (cargo build --release{target_blurb})...");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&emitted.project_dir)
         .arg("build")
-        .arg("--release")
-        .status();
+        .arg("--release");
+    if let Some(t) = target {
+        cmd.arg(format!("--target={t}"));
+    }
+    let status = cmd.status();
     match status {
         Ok(s) if s.success() => {
-            println!("  built: {}", emitted.built_binary_path.display());
+            // Re-derive the binary path: cargo's output dir gets
+            // the target triple inserted when --target is set.
+            // WASM targets (`wasm32-*`) produce a `.wasm` extension
+            // cargo doesn't include on the file-name we stored.
+            let bin_dir = if let Some(t) = target {
+                emitted.project_dir.join("target").join(t).join("release")
+            } else {
+                emitted.project_dir.join("target").join("release")
+            };
+            let base_name = emitted.built_binary_path.file_name().unwrap();
+            let bin_path = if target.map(|t| t.starts_with("wasm32-")).unwrap_or(false) {
+                let mut p = bin_dir.join(base_name);
+                p.set_extension("wasm");
+                p
+            } else {
+                bin_dir.join(base_name)
+            };
+            println!("  built: {}", bin_path.display());
+            if target.map(|t| t.starts_with("wasm32-")).unwrap_or(false) {
+                println!("  usage: wasmtime run {} <args...>", bin_path.display());
+            }
             ExitCode::SUCCESS
         }
         Ok(s) => {
             eprintln!("crabscheme aot: cargo build failed (exit {})", s);
+            if target.is_some() {
+                eprintln!(
+                    "  hint: the target may need `rustup target add {}` before cross-compile works",
+                    target.unwrap()
+                );
+            }
             ExitCode::from(5)
         }
         Err(e) => {
