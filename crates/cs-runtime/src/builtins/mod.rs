@@ -335,6 +335,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // to assert hot paths actually tier'd up.
         ("jit-installed?", b_jit_installed_p),
         ("jit-stats", b_jit_stats),
+        ("gc-stats", b_gc_stats),
         ("string-split", b_string_split),
         ("string-join", b_string_join),
         ("string->vector", b_string_to_vector),
@@ -11531,6 +11532,21 @@ fn b_jit_stats(args: &[Value]) -> Result<Value, String> {
         Value::fixnum(cs_vm::vm::deopt_count() as i64),
         Value::fixnum(cs_vm::vm::jit_ic_hit_count() as i64),
         Value::fixnum(cs_vm::vm::jit_ic_miss_count() as i64),
+    ]))
+}
+
+/// Phase 6 Stage B analysis — expose GC alloc + collect counts so
+/// benches can report allocation pressure. Returns `(alloc-count
+/// collect-count)`.
+fn b_gc_stats(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("gc-stats", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-stats: no active runtime".to_string())?;
+    Ok(Value::list(vec![
+        Value::fixnum(rt.heap().alloc_count() as i64),
+        Value::fixnum(rt.heap().collect_count() as i64),
     ]))
 }
 
