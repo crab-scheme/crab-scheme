@@ -39,7 +39,7 @@
 //! - Ownership / refcount semantics audit on `BoxTyped` / `AnyTo*`
 //!   when inlining transfers ownership across the splice boundary.
 
-use crate::{BlockId, Function, Inst, Value};
+use crate::{Block, BlockId, Function, Inst, Term, Value};
 
 /// Hard cap on RIR-inst count for an inlineable callee. Above this,
 /// inlining bloats caller code with diminishing benefit. Tuned to
@@ -91,6 +91,19 @@ pub enum InlineRejection {
     /// real bytecode-derived RIR, but the analyzer surfaces it
     /// rather than silently accepting.
     NoReturn,
+
+    /// Body contains an `Inst` variant the splice walker doesn't
+    /// know how to remap (the supported set is the "pure-arithmetic
+    /// + simple memory read" subset for iter 2). The string is the
+    /// variant name for diagnostics; iter 3+ widens the set or
+    /// switches to a derive-based walker.
+    UnsupportedInst(&'static str),
+
+    /// Body contains a terminator the splice walker doesn't handle.
+    /// Iter 2 supports `Return`, `Jump`, and `Branch` (i.e. all
+    /// current Term variants — this arm is reserved for if Term
+    /// grows new shapes).
+    UnsupportedTerm(&'static str),
 }
 
 /// What the analyzer learned about an inlineable callee. Iter 2
@@ -181,7 +194,23 @@ pub fn analyze_for_inline(func: &Function) -> Result<InlineMetadata, InlineRejec
                 Inst::EnvSet(_, _) | Inst::EnvDefineLocal(_, _) => {
                     return Err(InlineRejection::HasEnvMutation);
                 }
+                // EnvLookup/EnvLookupAny in the callee would resolve
+                // in the inlined-into env (caller's), not the original
+                // callee's env. Without env retargeting (iter 4+), the
+                // free-var binding semantics break. Reject so iter 2's
+                // matrix-elt-class candidates (which only reference
+                // params) flow through and free-var-touching callees
+                // stay as CallGeneral.
+                Inst::EnvLookup(_, _) | Inst::EnvLookupAny(_, _) => {
+                    return Err(InlineRejection::UnsupportedInst("EnvLookup*"));
+                }
                 _ => {}
+            }
+            // Walker support gate — reject anything the splice walker
+            // can't remap. Keeps the analyzer's acceptance set and the
+            // walker's coverage in lockstep.
+            if !is_inline_supported(inst) {
+                return Err(InlineRejection::UnsupportedInst(inst_variant_name(inst)));
             }
             // Track the destination value (if any) to update max_value.
             // We use a lightweight inst_dst helper rather than walking
@@ -194,6 +223,14 @@ pub fn analyze_for_inline(func: &Function) -> Result<InlineMetadata, InlineRejec
                     max_value = dst.0;
                 }
             }
+        }
+        // Terminator must also be one the walker handles. Today every
+        // Term variant (Return / Jump / Branch) is supported, but the
+        // explicit gate guards against future Term additions.
+        if !is_term_inline_supported(&block.terminator) {
+            return Err(InlineRejection::UnsupportedTerm(term_variant_name(
+                &block.terminator,
+            )));
         }
 
         if let crate::Term::Return(v) = &block.terminator {
@@ -340,10 +377,423 @@ impl BlockRemap {
     }
 }
 
+/// Splice request: combine a remap base with per-param substitutions
+/// the way iter 2's translator splice site needs. Construct via
+/// [`SpliceRequest::new`].
+///
+/// Iter 2 (single-block callee) builds one of these per inline site:
+/// the caller's existing arg `Value`s replace the callee's param
+/// `Value`s, and all other callee values are offset-renumbered to
+/// avoid collision with the caller's existing SSA id space.
+///
+/// The param substitution is necessary because the callee's params
+/// are SSA ids 0..n-1, while the caller's argument values come from
+/// arbitrary positions in the caller's SSA id space. A pure offset
+/// remap would shift the callee's param ids to fresh ones that
+/// aren't bound to anything — the splice would emit dead code.
+#[derive(Debug, Clone)]
+pub struct SpliceRequest {
+    /// Per-param substitution table — `param_subst[i]` is the
+    /// caller-side `Value` that replaces the callee's `params[i].0`
+    /// throughout the inlined body. Length must match the callee's
+    /// param count; iter 2 enforces this at the call site.
+    pub param_subst: Vec<Value>,
+    /// Offset applied to every callee-side `Value` that isn't a
+    /// parameter. Pass `caller_max_value + 1` to guarantee no
+    /// collision with caller's existing ids.
+    pub value_offset: u32,
+    /// Offset applied to every callee-side `BlockId`. Iter 2's
+    /// single-block case doesn't use this (the single block's insts
+    /// get appended to the caller's current block, no block id
+    /// survives); reserved for iter 3's multi-block splice.
+    pub block_offset: u32,
+}
+
+impl SpliceRequest {
+    pub fn new(param_subst: Vec<Value>, value_offset: u32, block_offset: u32) -> Self {
+        Self {
+            param_subst,
+            value_offset,
+            block_offset,
+        }
+    }
+
+    /// Remap a single callee-side `Value` to its caller-side
+    /// substitute. Param indices (callee values 0..n-1) hit the
+    /// substitution table; everything else gets the offset.
+    pub fn remap_value(&self, v: Value, n_params: u32) -> Value {
+        if v.0 < n_params {
+            self.param_subst[v.0 as usize]
+        } else {
+            // Non-param callee values are renumbered by offset.
+            // The base is value_offset; subtract n_params so the
+            // first non-param value (callee `Value(n_params)`) maps
+            // to caller `Value(value_offset)` rather than
+            // `Value(value_offset + n_params)`. This makes the
+            // caller-side allocator predictably the next free id.
+            Value(
+                v.0.checked_sub(n_params)
+                    .and_then(|x| x.checked_add(self.value_offset))
+                    .expect("SpliceRequest remap underflow/overflow"),
+            )
+        }
+    }
+
+    /// Remap a callee-side `BlockId`. Iter 2's single-block path
+    /// never calls this (no block survives the splice into a single
+    /// caller block), but the API exists for iter 3.
+    pub fn remap_block(&self, b: BlockId) -> BlockId {
+        BlockId(
+            b.0.checked_add(self.block_offset)
+                .expect("SpliceRequest block remap overflow"),
+        )
+    }
+}
+
+/// Walker over an `Inst`'s `Value` operands. Iter 2's splice path
+/// uses this to renumber every callee value (via `SpliceRequest`)
+/// when cloning the callee's instructions into the caller.
+///
+/// **Coverage:** the matrix-elt-class "pure-arithmetic + simple
+/// memory read" subset. The eligibility analyzer
+/// (`analyze_for_inline`) rejects callees containing any
+/// unsupported variant, so a successful analyze implies this walker
+/// can handle every inst in the body — i.e. an `unreachable!()` arm
+/// at the end is safe.
+///
+/// `f` is called once per `Value` reference in the inst. Includes
+/// destinations (so renumbering picks up the dst's new id) and all
+/// operand sources. Does NOT visit non-`Value` fields (constants,
+/// type tags, symbol ids, lambda indices).
+pub fn for_each_value_in_inst<F: FnMut(&mut Value)>(inst: &mut Inst, mut f: F) {
+    match inst {
+        // Destination-only (no Value sources).
+        Inst::LoadConst(d, _) => f(d),
+
+        // dst + 2 sources — the arith/cmp common shape.
+        Inst::Add(d, a, b)
+        | Inst::Sub(d, a, b)
+        | Inst::Mul(d, a, b)
+        | Inst::Div(d, a, b)
+        | Inst::FlonumAdd(d, a, b)
+        | Inst::FlonumSub(d, a, b)
+        | Inst::FlonumMul(d, a, b)
+        | Inst::FlonumDiv(d, a, b)
+        | Inst::FlonumLt(d, a, b)
+        | Inst::FlonumEq(d, a, b)
+        | Inst::FlonumMax(d, a, b)
+        | Inst::FlonumMin(d, a, b)
+        | Inst::FlonumExpt(d, a, b)
+        | Inst::Lt(d, a, b)
+        | Inst::Eq(d, a, b)
+        | Inst::Quotient(d, a, b)
+        | Inst::Remainder(d, a, b)
+        | Inst::Modulo(d, a, b)
+        | Inst::FloorQuotient(d, a, b)
+        | Inst::Gcd(d, a, b)
+        | Inst::Lcm(d, a, b)
+        | Inst::BitAnd(d, a, b)
+        | Inst::BitOr(d, a, b)
+        | Inst::BitXor(d, a, b)
+        | Inst::BitwiseArithShiftLeft(d, a, b)
+        | Inst::BitwiseArithShiftRight(d, a, b)
+        | Inst::BitwiseBitSetP(d, a, b)
+        | Inst::EqAny(d, a, b)
+        | Inst::EqualAny(d, a, b)
+        | Inst::VecRef(d, a, b)
+        | Inst::StrRef(d, a, b) => {
+            f(d);
+            f(a);
+            f(b);
+        }
+
+        // dst + 1 source — unary ops.
+        Inst::FlonumSqrt(d, s)
+        | Inst::FlonumAbs(d, s)
+        | Inst::FlonumFloor(d, s)
+        | Inst::FlonumCeil(d, s)
+        | Inst::FlonumTrunc(d, s)
+        | Inst::FlonumRound(d, s)
+        | Inst::FlonumSin(d, s)
+        | Inst::FlonumCos(d, s)
+        | Inst::FlonumTan(d, s)
+        | Inst::FlonumLog(d, s)
+        | Inst::FlonumExp(d, s)
+        | Inst::FlonumAsin(d, s)
+        | Inst::FlonumAcos(d, s)
+        | Inst::FlonumAtan(d, s)
+        | Inst::FlEvenP(d, s)
+        | Inst::FlOddP(d, s)
+        | Inst::BitwiseBitCount(d, s)
+        | Inst::BitwiseLength(d, s)
+        | Inst::FxFirstBitSet(d, s)
+        | Inst::FixToFlo(d, s)
+        | Inst::IntCharBitcast(d, s)
+        | Inst::VecLength(d, s)
+        | Inst::VecP(d, s)
+        | Inst::StrLength(d, s)
+        | Inst::StrP(d, s)
+        | Inst::AnyToFix(d, s)
+        | Inst::AnyToBool(d, s)
+        | Inst::AnyToFlo(d, s)
+        | Inst::AnyTruthy(d, s)
+        | Inst::Move(d, s) => {
+            f(d);
+            f(s);
+        }
+
+        // dst + 1 source + tag (u8).
+        Inst::BoxTyped(d, s, _tag) => {
+            f(d);
+            f(s);
+        }
+
+        // 1 source + Type — DeoptCheck has no dst, just a guard on src.
+        Inst::DeoptCheck(s, _t) => f(s),
+
+        // Any other Inst variant landing here means `analyze_for_inline`
+        // accepted a callee whose body the walker doesn't actually
+        // cover — a discipline mismatch between the analyzer's
+        // `is_inline_supported` set and this walker. The two must stay
+        // in lockstep; if you add a variant to one, add it to the other.
+        // Reaching this arm is a programmer error, not a runtime error.
+        _ => unreachable!(
+            "for_each_value_in_inst: variant {} not in walker but accepted by analyzer",
+            inst_variant_name(inst)
+        ),
+    }
+}
+
+/// Walker over a `Term`'s `Value` operands. Same lockstep discipline
+/// with `is_term_inline_supported` as `for_each_value_in_inst` has
+/// with `is_inline_supported`. Iter 2 covers every existing Term
+/// variant; the explicit gate is for future-proofing.
+pub fn for_each_value_in_term<F: FnMut(&mut Value)>(term: &mut Term, mut f: F) {
+    match term {
+        Term::Return(v) => f(v),
+        Term::Jump(_block, args) => {
+            for a in args {
+                f(a);
+            }
+        }
+        Term::Branch(cond, _then, _else) => f(cond),
+    }
+}
+
+/// Walker over a `Term`'s `BlockId` operands. Iter 3 (multi-block
+/// splice) uses this; iter 2 doesn't call it directly because the
+/// single-block path doesn't preserve callee block ids.
+pub fn for_each_block_in_term<F: FnMut(&mut BlockId)>(term: &mut Term, mut f: F) {
+    match term {
+        Term::Return(_) => {}
+        Term::Jump(b, _) => f(b),
+        Term::Branch(_, t, e) => {
+            f(t);
+            f(e);
+        }
+    }
+}
+
+/// Eligibility predicate for the splice walker. Kept in lockstep
+/// with `for_each_value_in_inst`'s match arms — every variant the
+/// walker handles, this returns true for; every variant outside the
+/// supported set, this returns false for, and the analyzer rejects
+/// callees containing it.
+pub fn is_inline_supported(inst: &Inst) -> bool {
+    matches!(
+        inst,
+        Inst::LoadConst(_, _)
+            | Inst::Add(_, _, _)
+            | Inst::Sub(_, _, _)
+            | Inst::Mul(_, _, _)
+            | Inst::Div(_, _, _)
+            | Inst::FlonumAdd(_, _, _)
+            | Inst::FlonumSub(_, _, _)
+            | Inst::FlonumMul(_, _, _)
+            | Inst::FlonumDiv(_, _, _)
+            | Inst::FlonumLt(_, _, _)
+            | Inst::FlonumEq(_, _, _)
+            | Inst::FlonumMax(_, _, _)
+            | Inst::FlonumMin(_, _, _)
+            | Inst::FlonumExpt(_, _, _)
+            | Inst::Lt(_, _, _)
+            | Inst::Eq(_, _, _)
+            | Inst::Quotient(_, _, _)
+            | Inst::Remainder(_, _, _)
+            | Inst::Modulo(_, _, _)
+            | Inst::FloorQuotient(_, _, _)
+            | Inst::Gcd(_, _, _)
+            | Inst::Lcm(_, _, _)
+            | Inst::BitAnd(_, _, _)
+            | Inst::BitOr(_, _, _)
+            | Inst::BitXor(_, _, _)
+            | Inst::BitwiseArithShiftLeft(_, _, _)
+            | Inst::BitwiseArithShiftRight(_, _, _)
+            | Inst::BitwiseBitSetP(_, _, _)
+            | Inst::EqAny(_, _, _)
+            | Inst::EqualAny(_, _, _)
+            | Inst::VecRef(_, _, _)
+            | Inst::StrRef(_, _, _)
+            | Inst::FlonumSqrt(_, _)
+            | Inst::FlonumAbs(_, _)
+            | Inst::FlonumFloor(_, _)
+            | Inst::FlonumCeil(_, _)
+            | Inst::FlonumTrunc(_, _)
+            | Inst::FlonumRound(_, _)
+            | Inst::FlonumSin(_, _)
+            | Inst::FlonumCos(_, _)
+            | Inst::FlonumTan(_, _)
+            | Inst::FlonumLog(_, _)
+            | Inst::FlonumExp(_, _)
+            | Inst::FlonumAsin(_, _)
+            | Inst::FlonumAcos(_, _)
+            | Inst::FlonumAtan(_, _)
+            | Inst::FlEvenP(_, _)
+            | Inst::FlOddP(_, _)
+            | Inst::BitwiseBitCount(_, _)
+            | Inst::BitwiseLength(_, _)
+            | Inst::FxFirstBitSet(_, _)
+            | Inst::FixToFlo(_, _)
+            | Inst::IntCharBitcast(_, _)
+            | Inst::VecLength(_, _)
+            | Inst::VecP(_, _)
+            | Inst::StrLength(_, _)
+            | Inst::StrP(_, _)
+            | Inst::AnyToFix(_, _)
+            | Inst::AnyToBool(_, _)
+            | Inst::AnyToFlo(_, _)
+            | Inst::AnyTruthy(_, _)
+            | Inst::Move(_, _)
+            | Inst::BoxTyped(_, _, _)
+            | Inst::DeoptCheck(_, _)
+    )
+}
+
+/// Eligibility predicate for terminators in the splice walker. Today
+/// covers every existing Term variant; reserved for future Term
+/// additions.
+pub fn is_term_inline_supported(term: &Term) -> bool {
+    matches!(
+        term,
+        Term::Return(_) | Term::Jump(_, _) | Term::Branch(_, _, _)
+    )
+}
+
+/// Variant-name diagnostics for `UnsupportedInst` rejections. Keeps
+/// the rejection reason explicit so iter 2's caller-side logging
+/// can attribute "tried to inline X but rejected because variant
+/// `Foo` isn't in the walker yet".
+fn inst_variant_name(inst: &Inst) -> &'static str {
+    // Match arms ordered by ergonomic groupings (arith, cmp, mem,
+    // env, call). Falls through to "<other>" rather than failing
+    // hard so the rejection still produces actionable telemetry
+    // when a new variant lands without a corresponding name arm.
+    match inst {
+        Inst::LoadConst(..) => "LoadConst",
+        Inst::Add(..) => "Add",
+        Inst::Sub(..) => "Sub",
+        Inst::Mul(..) => "Mul",
+        Inst::Div(..) => "Div",
+        Inst::FlonumAdd(..) => "FlonumAdd",
+        Inst::FlonumSub(..) => "FlonumSub",
+        Inst::FlonumMul(..) => "FlonumMul",
+        Inst::FlonumDiv(..) => "FlonumDiv",
+        Inst::Lt(..) => "Lt",
+        Inst::Eq(..) => "Eq",
+        Inst::FlonumLt(..) => "FlonumLt",
+        Inst::FlonumEq(..) => "FlonumEq",
+        Inst::Call(..) => "Call",
+        Inst::CallSelf(..) => "CallSelf",
+        Inst::CallGeneral(..) => "CallGeneral",
+        Inst::EnvLookup(..) => "EnvLookup",
+        Inst::EnvLookupAny(..) => "EnvLookupAny",
+        Inst::EnvSet(..) => "EnvSet",
+        Inst::EnvDefineLocal(..) => "EnvDefineLocal",
+        Inst::MakeClosure(..) => "MakeClosure",
+        Inst::VecAlloc(..) => "VecAlloc",
+        Inst::VecSet(..) => "VecSet",
+        Inst::StrAlloc(..) => "StrAlloc",
+        Inst::BoxTyped(..) => "BoxTyped",
+        Inst::DeoptCheck(..) => "DeoptCheck",
+        _ => "<other>",
+    }
+}
+
+fn term_variant_name(term: &Term) -> &'static str {
+    match term {
+        Term::Return(_) => "Return",
+        Term::Jump(_, _) => "Jump",
+        Term::Branch(_, _, _) => "Branch",
+    }
+}
+
+/// Splice a single-block inlineable callee into the caller's current
+/// block. Iter 2's primary entry point — given the caller-side block
+/// receiving the inline (typically the one mid-translation that's
+/// about to emit a `CallGeneral`), the callee's RIR, the analyzer's
+/// metadata, and a splice request mapping params + offsetting
+/// values, append the callee's instructions to the caller-side
+/// instruction vector and return the caller-side value that holds
+/// the callee's return result.
+///
+/// Caller is responsible for:
+/// - Verifying eligibility via `analyze_for_inline` BEFORE calling
+///   this (the precondition is that the analyzer accepted the
+///   callee; this fn does not re-validate).
+/// - Constructing the `SpliceRequest` with the right `param_subst`
+///   (one entry per callee param, in order) and `value_offset`
+///   (caller's `next_value_id`).
+/// - Advancing the caller's `next_value_id` to
+///   `splice.value_offset + callee.max_value - n_params + 1` after
+///   the splice (the highest fresh id the callee body claimed).
+/// - Wiring the returned `Value` into wherever the original
+///   `CallGeneral`'s dst would have flowed.
+///
+/// Iter 2 only handles single-block callees (one block = entry
+/// block, terminator = `Return v`). Multi-block is iter 3.
+pub fn splice_single_block(
+    caller_block_insts: &mut Vec<Inst>,
+    callee: &Function,
+    metadata: &InlineMetadata,
+    splice: &SpliceRequest,
+) -> Value {
+    debug_assert_eq!(
+        callee.blocks.len(),
+        1,
+        "splice_single_block: callee must be single-block (iter 2)"
+    );
+    debug_assert_eq!(
+        splice.param_subst.len(),
+        callee.params.len(),
+        "splice_single_block: param_subst len must match callee params"
+    );
+    let n_params = callee.params.len() as u32;
+    let callee_block: &Block = &callee.blocks[0];
+    debug_assert_eq!(
+        callee_block.id, metadata.return_block,
+        "splice_single_block: single-block callee's only block must be the return block"
+    );
+
+    for inst in &callee_block.insts {
+        let mut cloned = inst.clone();
+        for_each_value_in_inst(&mut cloned, |v| {
+            *v = splice.remap_value(*v, n_params);
+        });
+        caller_block_insts.push(cloned);
+    }
+    // The callee's `Return` value, remapped, is what the caller's
+    // post-splice code should see in place of the original
+    // CallGeneral's dst. Caller is responsible for wiring this
+    // through (e.g. via a final `Move dst <- returned` if dst is
+    // pre-allocated, or by using the returned `Value` directly as
+    // the new dst for downstream insts).
+    splice.remap_value(metadata.return_value, n_params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Block, Const, Term, Type};
+    use crate::{Const, Type};
 
     /// Helper: build a single-block matrix-elt-shaped function.
     /// Shape: `(define (matrix-elt i j) ...)` — eligible for inline.
@@ -578,5 +1028,233 @@ mod tests {
     fn value_remap_overflow_panics() {
         let r = ValueRemap::new(u32::MAX);
         r.map(Value(1));
+    }
+
+    // ===== Iter 2 — walker + splice tests =====
+
+    #[test]
+    fn walker_visits_all_values_in_arith_inst() {
+        let mut inst = Inst::Add(Value(10), Value(20), Value(30));
+        let mut seen: Vec<u32> = Vec::new();
+        for_each_value_in_inst(&mut inst, |v| seen.push(v.0));
+        assert_eq!(seen, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn walker_renumbers_in_place() {
+        let mut inst = Inst::Mul(Value(5), Value(7), Value(9));
+        for_each_value_in_inst(&mut inst, |v| *v = Value(v.0 + 100));
+        if let Inst::Mul(d, a, b) = inst {
+            assert_eq!(d, Value(105));
+            assert_eq!(a, Value(107));
+            assert_eq!(b, Value(109));
+        } else {
+            panic!("variant changed");
+        }
+    }
+
+    #[test]
+    fn walker_handles_unary_loadconst_and_deoptcheck() {
+        let mut load = Inst::LoadConst(Value(3), Const::Fixnum(42));
+        let mut seen: Vec<u32> = Vec::new();
+        for_each_value_in_inst(&mut load, |v| seen.push(v.0));
+        assert_eq!(seen, vec![3]); // only dst
+
+        let mut deopt = Inst::DeoptCheck(Value(8), Type::Fixnum);
+        seen.clear();
+        for_each_value_in_inst(&mut deopt, |v| seen.push(v.0));
+        assert_eq!(seen, vec![8]); // only src (no dst)
+    }
+
+    #[test]
+    fn walker_handles_boxtyped_three_fields() {
+        let mut bt = Inst::BoxTyped(Value(11), Value(22), 3 /* JIT_RT_FLONUM */);
+        let mut seen: Vec<u32> = Vec::new();
+        for_each_value_in_inst(&mut bt, |v| seen.push(v.0));
+        assert_eq!(seen, vec![11, 22]); // tag (u8) is NOT a Value
+    }
+
+    #[test]
+    fn term_walker_visits_jump_args() {
+        let mut term = Term::Jump(BlockId(7), vec![Value(1), Value(2), Value(3)]);
+        let mut seen: Vec<u32> = Vec::new();
+        for_each_value_in_term(&mut term, |v| seen.push(v.0));
+        assert_eq!(seen, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn term_walker_visits_branch_cond() {
+        let mut term = Term::Branch(Value(42), BlockId(1), BlockId(2));
+        let mut seen: Vec<u32> = Vec::new();
+        for_each_value_in_term(&mut term, |v| seen.push(v.0));
+        assert_eq!(seen, vec![42]); // blocks aren't Values
+    }
+
+    #[test]
+    fn term_walker_blocks_visits_branch_targets() {
+        let mut term = Term::Branch(Value(0), BlockId(3), BlockId(7));
+        let mut seen: Vec<u32> = Vec::new();
+        for_each_block_in_term(&mut term, |b| seen.push(b.0));
+        assert_eq!(seen, vec![3, 7]);
+    }
+
+    #[test]
+    fn is_inline_supported_accepts_arith() {
+        assert!(is_inline_supported(&Inst::Add(
+            Value(0),
+            Value(1),
+            Value(2)
+        )));
+        assert!(is_inline_supported(&Inst::FlonumMul(
+            Value(0),
+            Value(1),
+            Value(2)
+        )));
+        assert!(is_inline_supported(&Inst::LoadConst(
+            Value(0),
+            Const::Fixnum(1)
+        )));
+    }
+
+    #[test]
+    fn is_inline_supported_rejects_calls_and_closures() {
+        assert!(!is_inline_supported(&Inst::Call(
+            Value(0),
+            Value(1),
+            vec![Value(2)]
+        )));
+        assert!(!is_inline_supported(&Inst::CallGeneral(
+            Value(0),
+            Value(1),
+            vec![]
+        )));
+        assert!(!is_inline_supported(&Inst::MakeClosure(Value(0), 7)));
+        assert!(!is_inline_supported(&Inst::EnvLookup(Value(0), 42)));
+        assert!(!is_inline_supported(&Inst::EnvSet(42, Value(0))));
+    }
+
+    #[test]
+    fn analyzer_rejects_unsupported_variant() {
+        // VecAlloc isn't in iter 2's supported set (allocates,
+        // ownership-tracking deferred to iter 4+). Should produce
+        // UnsupportedInst rather than silently accepting.
+        let mut f = Function::new("alloc-body");
+        f.params.push((Value(0), Type::Fixnum));
+        f.params.push((Value(1), Type::Any));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::VecAlloc(Value(2), Value(0), Value(1))],
+            terminator: Term::Return(Value(2)),
+        });
+        match analyze_for_inline(&f) {
+            Err(InlineRejection::UnsupportedInst(name)) => {
+                assert_eq!(name, "VecAlloc");
+            }
+            other => panic!("expected UnsupportedInst, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn splice_request_remaps_params_via_substitution() {
+        // Callee with 2 params [Value(0), Value(1)] and a body using
+        // Value(2)..Value(4). Splice substitutes caller args [V(100),
+        // V(200)] for the params, and offsets non-param values by 50.
+        let req = SpliceRequest::new(vec![Value(100), Value(200)], 50, 0);
+        // Param 0 -> substitution
+        assert_eq!(req.remap_value(Value(0), 2), Value(100));
+        assert_eq!(req.remap_value(Value(1), 2), Value(200));
+        // Non-param values get offset (callee Value(2) -> caller
+        // Value(50), Value(3) -> Value(51), etc.)
+        assert_eq!(req.remap_value(Value(2), 2), Value(50));
+        assert_eq!(req.remap_value(Value(3), 2), Value(51));
+        assert_eq!(req.remap_value(Value(4), 2), Value(52));
+    }
+
+    #[test]
+    fn splice_request_zero_params_pure_offset() {
+        // No params -> all values get offset. The substitution table
+        // is empty.
+        let req = SpliceRequest::new(vec![], 100, 0);
+        assert_eq!(req.remap_value(Value(0), 0), Value(100));
+        assert_eq!(req.remap_value(Value(5), 0), Value(105));
+    }
+
+    #[test]
+    fn splice_single_block_inlines_matrix_elt_like() {
+        // Build a 2-param callee with 3 insts + Return — the
+        // matrix-elt-shape test fixture.
+        let callee = matrix_elt_like();
+        let md = analyze_for_inline(&callee).expect("eligible");
+
+        // Caller's "current block" insts buffer starts empty for the
+        // test. Caller's args for the call are Value(100), Value(101).
+        // Caller's next_value_id is 200 — every callee non-param value
+        // gets renumbered starting from 200.
+        let mut caller_insts: Vec<Inst> = Vec::new();
+        let req = SpliceRequest::new(vec![Value(100), Value(101)], 200, 0);
+        let returned = splice_single_block(&mut caller_insts, &callee, &md, &req);
+
+        // The callee had:
+        //   Add(V(2), V(0)=i, V(1)=j)
+        //   LoadConst(V(3), Fixnum(1))
+        //   Add(V(4), V(2), V(3))
+        //   Return V(4)
+        //
+        // After splicing with params=[V(100), V(101)] and offset=200:
+        //   Add(V(200), V(100), V(101))
+        //   LoadConst(V(201), Fixnum(1))
+        //   Add(V(202), V(200), V(201))
+        // The returned `Value` is the remapped Return value V(4) -> V(202).
+        assert_eq!(caller_insts.len(), 3);
+        match &caller_insts[0] {
+            Inst::Add(d, a, b) => {
+                assert_eq!(*d, Value(200));
+                assert_eq!(*a, Value(100));
+                assert_eq!(*b, Value(101));
+            }
+            _ => panic!("inst 0 should be Add"),
+        }
+        match &caller_insts[1] {
+            Inst::LoadConst(d, Const::Fixnum(1)) => {
+                assert_eq!(*d, Value(201));
+            }
+            _ => panic!("inst 1 should be LoadConst(_, 1)"),
+        }
+        match &caller_insts[2] {
+            Inst::Add(d, a, b) => {
+                assert_eq!(*d, Value(202));
+                assert_eq!(*a, Value(200));
+                assert_eq!(*b, Value(201));
+            }
+            _ => panic!("inst 2 should be Add"),
+        }
+        assert_eq!(returned, Value(202));
+    }
+
+    #[test]
+    fn splice_appends_to_existing_caller_insts() {
+        // Verify the splice APPENDS rather than overwrites the
+        // caller's existing insts. Iter 2's translator wiring relies
+        // on this.
+        let callee = matrix_elt_like();
+        let md = analyze_for_inline(&callee).expect("eligible");
+        let mut caller_insts: Vec<Inst> = vec![
+            Inst::LoadConst(Value(50), Const::Fixnum(99)),
+            Inst::Add(Value(51), Value(50), Value(50)),
+        ];
+        let req = SpliceRequest::new(vec![Value(51), Value(50)], 60, 0);
+        let returned = splice_single_block(&mut caller_insts, &callee, &md, &req);
+        // 2 pre-existing + 3 callee insts = 5 total
+        assert_eq!(caller_insts.len(), 5);
+        // Pre-existing insts unchanged.
+        match &caller_insts[0] {
+            Inst::LoadConst(Value(50), Const::Fixnum(99)) => {}
+            _ => panic!("caller_insts[0] mutated"),
+        }
+        // Returned is the remapped final value.
+        // Callee's V(4) Return -> V(62) caller-side (60 + (4 - 2))
+        assert_eq!(returned, Value(62));
     }
 }
