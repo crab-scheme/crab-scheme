@@ -27,7 +27,7 @@
 //!   stay on the VM.
 
 use cs_jit_cranelift::Lowerer;
-use cs_vm::jit_translate::bytecode_to_rir_with_hints;
+use cs_vm::jit_translate::bytecode_to_rir_full;
 use cs_vm::vm::{install_tier_up_hook, VmClosure};
 use cs_vm::RirType;
 
@@ -132,11 +132,19 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     // Self-name flows from VmClosure::self_name (set by the Define
     // / Set call sites in cs-vm), letting the translator recognize
     // recursive `LoadVar(self) ... Call N` patterns.
-    let rir = match bytecode_to_rir_with_hints(
+    //
+    // Phase 6 Stage A iter 2: pass `Some(&closure.env)` as the
+    // caller_env so the translator's CallGeneral splice site can
+    // resolve free-var callees to top-level VmClosure bindings and
+    // attempt leaf-callee inlining. `inline_depth = 0` because this
+    // is the top-level body of a JIT'd function.
+    let rir = match bytecode_to_rir_full(
         lam,
         "anon-jit",
         closure.self_name(),
         Some(&param_hints),
+        Some(&closure.env),
+        0,
     ) {
         Ok(r) => r,
         Err(_) => return,

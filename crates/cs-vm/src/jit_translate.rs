@@ -19,12 +19,16 @@
 //! every JumpIfFalse/Jump target, and every offset just after a
 //! Jump or Return.
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
 
-use cs_core::Symbol;
+use cs_core::{Procedure, Symbol, Value};
+use cs_rir::inline::{analyze_for_inline, splice_single_block, SpliceRequest};
 use cs_rir::{Block, BlockId, Const, Function, Inst as RirInst, Term, Type, Value as RirValue};
 
 use crate::opcode::{CompiledLambda, Inst};
+use crate::vm::{Env, VmClosure};
 
 /// Errors the translator can surface. `Unsupported` is the dominant
 /// signal — when the runtime asks the JIT to compile a closure
@@ -66,6 +70,18 @@ pub fn bytecode_to_rir(
     bytecode_to_rir_with_hints(lambda, name, self_name, None)
 }
 
+/// Phase 6 Stage A iter 2 — maximum inline-recursion depth. Caps
+/// nested leaf-callee inlining so a body that calls another body
+/// that calls another body doesn't blow up code size or recurse
+/// infinitely through mutually-recursive lambdas.
+///
+/// Depth 0 = the JIT'd body itself; depth 1+ = inlined callees.
+/// Iter 2 keeps the cap conservative at 1 (caller can inline a
+/// single layer of leaf callees, but inlined callees themselves
+/// fall back to CallGeneral). Iter 3+ may raise this once
+/// measurement shows code-size cost is contained.
+pub const MAX_INLINE_DEPTH: usize = 1;
+
 /// Like `bytecode_to_rir` but accepts an optional per-param type
 /// hint. When provided, params are seeded with the given types in
 /// the per-Value type table so flonum-arg bodies emit the right
@@ -77,6 +93,31 @@ pub fn bytecode_to_rir_with_hints(
     name: impl Into<String>,
     self_name: Option<Symbol>,
     param_type_hints: Option<&[Type]>,
+) -> Result<Function, TranslateError> {
+    bytecode_to_rir_full(lambda, name, self_name, param_type_hints, None, 0)
+}
+
+/// Phase 6 Stage A iter 2 — the env-aware translator entry. Same
+/// as `bytecode_to_rir_with_hints` plus two new parameters:
+///
+/// - `caller_env`: when present, free-var callees at `CallGeneral`
+///   sites can be resolved against this env and their bodies inlined
+///   in place. The runtime hook supplies `Some(&closure.env)`.
+/// - `inline_depth`: how many layers of leaf-callee inlining have
+///   already happened. Recursive calls (when iter 2 inlines a callee)
+///   pass `current_depth + 1`; the analyzer rejects further inlining
+///   once it reaches `MAX_INLINE_DEPTH`.
+///
+/// Callers without env access (tests, the legacy `bytecode_to_rir`
+/// wrapper) pass `None` + `0`; the inlining path then simply doesn't
+/// trigger, and translation matches the pre-iter-2 behavior exactly.
+pub fn bytecode_to_rir_full(
+    lambda: &CompiledLambda,
+    name: impl Into<String>,
+    self_name: Option<Symbol>,
+    param_type_hints: Option<&[Type]>,
+    caller_env: Option<&Rc<Env>>,
+    inline_depth: usize,
 ) -> Result<Function, TranslateError> {
     if lambda.rest.is_some() {
         return Err(TranslateError::Unsupported(
@@ -140,10 +181,17 @@ pub fn bytecode_to_rir_with_hints(
     func.entry = BlockId(0);
 
     // SSA value allocator. Param values reserved 0..params.len()-1.
-    let mut next_value_id: u32 = lambda.params.len() as u32;
+    //
+    // Phase 6 Stage A iter 2: `next_value_id` lives in a `Cell` so
+    // the inlining splice path (which needs to read/bump the id
+    // counter directly to pick its `SpliceRequest::value_offset`)
+    // can do so without colliding with `alloc`'s mutable borrow.
+    // The closure stays `Fn` instead of `FnMut`; existing call sites
+    // (`alloc()`) are unchanged.
+    let next_value_id: Cell<u32> = Cell::new(lambda.params.len() as u32);
     let mut alloc = || -> RirValue {
-        let v = RirValue(next_value_id);
-        next_value_id += 1;
+        let v = RirValue(next_value_id.get());
+        next_value_id.set(v.0 + 1);
         v
     };
 
@@ -6065,6 +6113,50 @@ pub fn bytecode_to_rir_with_hints(
                             }
                         }
                         StackEntry::Value(callee_v) => {
+                            // Phase 6 Stage A iter 2 — leaf-callee
+                            // inlining. Before falling through to the
+                            // CallGeneral path below, try to resolve
+                            // the callee in `caller_env` to a small,
+                            // pure VmClosure and splice its body in
+                            // place. Conditions for attempting:
+                            //  - `caller_env` was supplied (true on
+                            //    the runtime tier-up path; tests pass
+                            //    None and skip inlining).
+                            //  - `inline_depth < MAX_INLINE_DEPTH` —
+                            //    don't recurse into inlined callees.
+                            //  - The callee Value flows from an
+                            //    `EnvLookup`/`EnvLookupAny` whose
+                            //    symbol we can read off the producer
+                            //    inst. (Other shapes — `EnvDefineLocal`
+                            //    result, Call result — aren't direct
+                            //    binding lookups.)
+                            //
+                            // `try_inline_leaf_callee` itself enforces
+                            // the analyzer's eligibility gate (size,
+                            // purity, single-block, single-exit, etc.).
+                            let inlined_result: Option<(RirValue, Type)> = (|| {
+                                if inline_depth >= MAX_INLINE_DEPTH {
+                                    return None;
+                                }
+                                let env_ref = caller_env?;
+                                let callee_sym = find_envlookup_sym(&insts, callee_v)?;
+                                try_inline_leaf_callee(
+                                    callee_sym,
+                                    &args_entries,
+                                    env_ref,
+                                    inline_depth,
+                                    &mut value_types,
+                                    &mut insts,
+                                    &next_value_id,
+                                )
+                            })(
+                            );
+                            if let Some((inlined_v, inlined_t)) = inlined_result {
+                                value_types.insert(inlined_v, inlined_t);
+                                sim_stack.push(StackEntry::Value(inlined_v));
+                                continue;
+                            }
+
                             // ADR 0012 D-1 (iter BU) — slow-path
                             // general Call. The bytecode invoked a
                             // procedure that the translator couldn't
@@ -6528,6 +6620,277 @@ fn promote_envlookup_to_any(
         }
     }
     false
+}
+
+/// Phase 6 Stage A iter 2 — recover the binding symbol from the
+/// `EnvLookup`/`EnvLookupAny` producer that emitted `v`. Walks the
+/// already-emitted RIR insts backwards; returns `Some(sym)` on
+/// first match.
+///
+/// Returns `None` if `v` was produced by anything other than an
+/// env-lookup (constant, arithmetic, call result, etc.) — those
+/// shapes don't represent a top-level binding so inlining can't
+/// resolve them anyway.
+fn find_envlookup_sym(insts: &[RirInst], v: RirValue) -> Option<Symbol> {
+    for inst in insts.iter().rev() {
+        match inst {
+            RirInst::EnvLookup(d, sym) | RirInst::EnvLookupAny(d, sym) if *d == v => {
+                return Some(Symbol(*sym));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Phase 6 Stage A iter 2 — demote `EnvDefineLocal`/`EnvLookupAny`
+/// env round-trips to SSA aliases in the first block of `func`.
+/// Returns `true` if the transformation succeeded, `false` if any
+/// env op references a sym we didn't see defined (signal to bail
+/// on inlining this callee).
+///
+/// Single-pass walk:
+/// - `EnvDefineLocal(sym, src)` — record `sym -> src`, drop the inst.
+/// - `EnvLookupAny(d, sym)` — if `sym` is recorded, rewrite into
+///   `Move(d, src)`. Move is in the inline-walker's supported set
+///   (an SSA copy) so analyzer + splice handle it natively.
+/// - All other insts pass through unchanged.
+///
+/// Soundness — why aliasing is safe here:
+/// - iter9's compile-time let* inlining emits `EnterScope` /
+///   `DefineLocal` / body / `LeaveScope` for non-escaping bindings.
+///   The translator only routes through env when the body has
+///   `MakeClosure` (a closure might capture the binding); for
+///   leaf-callee bodies the analyzer already rejects MakeClosure
+///   (`HasMakeClosure`), so the bindings here provably don't escape.
+/// - Multi-use of an SSA value with NB-inline type (Fixnum, Flonum,
+///   Boolean, Character) is refcount-free in the uniform-NB lowering
+///   (FlonumAdd, Add, etc. bitcast / unbox without touching counts).
+///   Heap-typed sources would need incref per use; the iter 2
+///   conservative posture is "pass through unchanged if the source
+///   is NOT one of the inline types" — i.e. the analyzer's
+///   downstream `UnsupportedInst` arms reject any inst that consumes
+///   a heap-typed value with multi-use shape. iter 4+ widens this.
+fn demote_env_to_ssa_in_first_block(func: &mut cs_rir::Function) -> bool {
+    use cs_rir::inline::{for_each_value_in_inst, for_each_value_in_term, is_inline_supported};
+
+    if func.blocks.is_empty() {
+        return true;
+    }
+    let block = &mut func.blocks[0];
+    // sym -> source RirValue from each EnvDefineLocal we drop.
+    let mut sym_to_src: HashMap<u32, RirValue> = HashMap::new();
+    // dst-of-EnvLookup -> aliased source. Subsequent insts have
+    // their Value operands rewritten via this table. Substituting
+    // at the operand level (rather than emitting Move insts) avoids
+    // a uniform-NB tier hazard: Move is just an alias of i64 bits,
+    // but in uniform-NB the bits carry an NB tag; if the source has
+    // a Character / Boolean / Flonum tag and downstream consumers
+    // assume Fixnum, the value decodes wrong. Substituting through
+    // means downstream consumers see the SAME SSA value the
+    // analyzer/translator already type-tracked correctly.
+    let mut alias: HashMap<RirValue, RirValue> = HashMap::new();
+    // Resolve transitively in case of alias-of-alias from nested
+    // let* bindings — `(let* ((a x) (b a)) ...)` chains through.
+    let resolve = |v: RirValue, alias: &HashMap<RirValue, RirValue>| -> RirValue {
+        let mut cur = v;
+        for _ in 0..=alias.len() {
+            match alias.get(&cur) {
+                Some(&next) if next != cur => cur = next,
+                _ => return cur,
+            }
+        }
+        cur
+    };
+    let mut rewritten: Vec<RirInst> = Vec::with_capacity(block.insts.len());
+    for inst in block.insts.drain(..) {
+        match inst {
+            RirInst::EnvDefineLocal(sym, src) => {
+                // Resolve src before recording so chains stay flat.
+                sym_to_src.insert(sym, resolve(src, &alias));
+                // drop the inst
+            }
+            RirInst::EnvLookupAny(d, sym) | RirInst::EnvLookup(d, sym) => {
+                let src = match sym_to_src.get(&sym) {
+                    Some(&s) => s,
+                    None => {
+                        // EnvLookup on a sym we didn't see defined
+                        // locally — it's a free-var binding that
+                        // lives in the captured env. Inlining would
+                        // need env retargeting; bail.
+                        return false;
+                    }
+                };
+                // Record d -> src; don't emit any inst.
+                alias.insert(d, src);
+            }
+            mut other => {
+                // Substitute every Value operand via the alias table,
+                // then push the rewritten inst into the output stream.
+                //
+                // Skip the walker for variants outside
+                // `is_inline_supported` (MakeClosure, VecAlloc, ...)
+                // — those would hit the walker's unreachable!() arm.
+                // The follow-up `analyze_for_inline` rejects bodies
+                // containing them anyway, so demote correctness
+                // doesn't depend on rewriting their operands.
+                if is_inline_supported(&other) {
+                    for_each_value_in_inst(&mut other, |v| {
+                        *v = resolve(*v, &alias);
+                    });
+                }
+                rewritten.push(other);
+            }
+        }
+    }
+    block.insts = rewritten;
+    // Substitute through the terminator (Return value, Jump args,
+    // Branch cond). Iter 2's single-block case has only Return, but
+    // doing this uniformly future-proofs for iter 3's multi-block.
+    for_each_value_in_term(&mut func.blocks[0].terminator, |v| {
+        *v = resolve(*v, &alias);
+    });
+    true
+}
+
+/// Phase 6 Stage A iter 2 — leaf-callee inlining splice driver.
+///
+/// Resolves `callee_sym` against `caller_env`, gets the callee's
+/// VmClosure + compiled lambda, recursively translates the callee
+/// body to RIR (with `inline_depth + 1` so nested calls stay as
+/// `CallGeneral`), runs the eligibility analyzer, and on accept
+/// splices the callee body into `insts` via
+/// [`cs_rir::inline::splice_single_block`]. Returns the caller-side
+/// `Value` bound to the callee's return result, along with the
+/// callee's inferred return type so the caller can update its
+/// `value_types` map.
+///
+/// On any failure (sym not bound, not a VmClosure, callee body
+/// doesn't translate, multi-block, eligibility rejection, arity
+/// mismatch, rest param, ...) returns `None`. The caller falls
+/// through to the regular `CallGeneral` emission path.
+///
+/// Iter 2 restrictions:
+/// - Single-block callee only (multi-block is iter 3).
+/// - Callee body must pass `analyze_for_inline` (no internal calls,
+///   no closures, no env mutation, no env lookups, size <= 20 insts).
+/// - Caller-side EnvLookup that produced the callee value is left
+///   in `insts` as dead code; Cranelift's DCE handles it.
+#[allow(clippy::too_many_arguments)]
+fn try_inline_leaf_callee(
+    callee_sym: Symbol,
+    args_entries: &[StackEntry],
+    caller_env: &Rc<Env>,
+    inline_depth: usize,
+    value_types: &mut HashMap<RirValue, Type>,
+    insts: &mut Vec<RirInst>,
+    next_value_id: &Cell<u32>,
+) -> Option<(RirValue, Type)> {
+    // 1. Resolve symbol → VmClosure.
+    let bound = caller_env.get(callee_sym)?;
+    let proc_rc = match bound {
+        Value::Procedure(p) => p,
+        _ => return None,
+    };
+    let closure = proc_rc.as_any().downcast_ref::<VmClosure>()?;
+
+    // 2. Get callee's CompiledLambda.
+    let bc = closure.bc.clone();
+    let lambda_idx = closure.lambda_idx;
+    if lambda_idx >= bc.lambdas.len() {
+        return None;
+    }
+    let callee_lambda = &bc.lambdas[lambda_idx];
+    if callee_lambda.rest.is_some() {
+        return None;
+    }
+    if callee_lambda.params.len() != args_entries.len() {
+        return None;
+    }
+
+    // 3. Collect raw arg values + their types from args_entries.
+    //    Only StackEntry::Value is acceptable; SelfRef/BuiltinRef
+    //    would have been caught by the outer arm.
+    let mut raw_args: Vec<(RirValue, Type)> = Vec::with_capacity(args_entries.len());
+    for e in args_entries {
+        let v = match e {
+            StackEntry::Value(v) => *v,
+            _ => return None,
+        };
+        let t = value_types.get(&v).copied().unwrap_or(Type::Fixnum);
+        raw_args.push((v, t));
+    }
+
+    // 4. Translate callee body to RIR with arg-type hints. Recursive
+    //    call passes `inline_depth + 1` to gate further inlining;
+    //    `None` for `caller_env` so inlined callees don't themselves
+    //    try to inline (iter 2 keeps the depth window at 1 layer).
+    let hints: Vec<Type> = raw_args.iter().map(|(_, t)| *t).collect();
+    let mut callee_rir = bytecode_to_rir_full(
+        callee_lambda,
+        format!("inlined-sym{}", callee_sym.0),
+        // No self-name for the inlined body — recursive callees in
+        // the callee aren't being self-recursion-detected in this
+        // context (and the analyzer would reject CallSelf anyway).
+        None,
+        Some(&hints),
+        None,
+        inline_depth + 1,
+    )
+    .ok()?;
+
+    // 5. Iter 2 restriction: single-block only. Multi-block needs
+    //    block-id remapping (iter 3 territory).
+    if callee_rir.blocks.len() != 1 {
+        return None;
+    }
+
+    // 5b. Demote any env ops to SSA aliases. iter9's compile-time
+    //     let* inlining emits `EnterScope` + `DefineLocal` + body +
+    //     `LeaveScope`, which the translator lowers to
+    //     `EnvDefineLocal`/`EnvLookupAny`. These store and read
+    //     bindings through `JIT_CALLER_ENV` — which post-splice
+    //     points to the CALLER's env, not the callee's, so the
+    //     bindings would land in the wrong layer. For pure-leaf
+    //     callees with no nested closures (the only shape we'd want
+    //     to inline anyway), the env round-trip is unnecessary; the
+    //     bindings can live as direct SSA aliases. The pass walks
+    //     the single block, drops every `EnvDefineLocal(sym, src)`
+    //     while recording `sym -> src`, and rewrites every
+    //     `EnvLookupAny(d, sym)` into a `Move(d, src)`. AnyTo*
+    //     conversions immediately upstream of those LoadVars stay
+    //     as-is (identity in uniform-NB lowering). Aborts if any
+    //     env op references a sym we didn't see defined.
+    if !demote_env_to_ssa_in_first_block(&mut callee_rir) {
+        return None;
+    }
+
+    // 6. Eligibility analysis. Returns Err for too-large, contains-
+    //    Call, contains-MakeClosure, env-mutation, unsupported-Inst,
+    //    multi-return, no-return, etc. — all of which mean the
+    //    splice would either explode in size or produce wrong code.
+    let md = analyze_for_inline(&callee_rir).ok()?;
+
+    // 7. Splice. value_offset starts at the caller's current
+    //    next_value_id; callee's non-param values get renumbered
+    //    starting from there.
+    let n_params = callee_rir.params.len() as u32;
+    let base = next_value_id.get();
+    let param_subst: Vec<RirValue> = raw_args.iter().map(|(v, _)| *v).collect();
+    let splice = SpliceRequest::new(param_subst, base, 0);
+    let result = splice_single_block(insts, &callee_rir, &md, &splice);
+
+    // 8. Advance the caller's id counter past the highest id the
+    //    splice consumed. Callee non-param values were [n_params,
+    //    md.max_value]; they got remapped to [base, base + (md.max_value
+    //    - n_params)]. The next free caller-side id is one past that.
+    let highest_used = base.saturating_add(md.max_value.saturating_sub(n_params));
+    next_value_id.set(highest_used + 1);
+
+    // 9. Tell the caller what type the inlined result holds so its
+    //    `value_types` map stays accurate for downstream consumers
+    //    (BoxTyped decisions, type-feedback, …).
+    Some((result, callee_rir.return_type))
 }
 
 fn infer_return_type(func: &cs_rir::Function) -> Type {
