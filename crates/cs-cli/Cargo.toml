@@ -20,5 +20,9 @@ ffi = ["cs-runtime/ffi"]
 [dependencies]
 cs-core = { workspace = true }
 cs-diag = { workspace = true }
-cs-runtime = { workspace = true, default-features = false }
+# Workspace dep declares default-features = false; cs-cli's own
+# features explicitly turn on `cs-runtime/jit` / `cs-runtime/ffi`
+# when requested. --no-default-features on cs-cli produces a
+# minimal runtime (target for W2's wasm32-wasip1 build).
+cs-runtime = { workspace = true }
 clap = { workspace = true }

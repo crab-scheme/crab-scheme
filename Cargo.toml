@@ -34,7 +34,7 @@ cs-lex = { path = "crates/cs-lex" }
 cs-parse = { path = "crates/cs-parse" }
 cs-ir = { path = "crates/cs-ir" }
 cs-expand = { path = "crates/cs-expand" }
-cs-runtime = { path = "crates/cs-runtime" }
+cs-runtime = { path = "crates/cs-runtime", default-features = false }
 cs-vm = { path = "crates/cs-vm" }
 cs-gc = { path = "crates/cs-gc" }
 cs-rir = { path = "crates/cs-rir" }

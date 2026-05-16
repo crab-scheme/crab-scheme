@@ -12,6 +12,13 @@
     enable = true;
     channel = "stable";
     version = "1.95.0";
+    # M10 Track W (WASM target). Adding the wasm32-wasip1 target makes
+    # `cargo build --target wasm32-wasip1 -p cs-cli --no-default-features`
+    # work — the WASM std library lands in the Nix-managed sysroot.
+    # `rust-toolchain.toml` doesn't need to change; it pins the channel
+    # for rustup users (who can `rustup target add wasm32-wasip1`
+    # separately).
+    targets = [ "wasm32-wasip1" ];
   };
 
   # ---- packages ------------------------------------------------------------
