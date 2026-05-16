@@ -1753,23 +1753,49 @@ pub fn bytecode_to_rir_with_hints(
                                             value_types.insert(dst, Type::Any);
                                         }
                                     }
-                                    ("car", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        // Lower to vm_pair_car. We only
-                                        // accept Any-tagged operands —
-                                        // everything else deopts. (A
-                                        // future iter can add a
-                                        // monomorphic IC for Pair-typed
-                                        // ops.)
+                                    ("car", 1) => {
+                                        // Phase 5 iter4 — promote a free-var
+                                        // EnvLookup arg to Any before
+                                        // requiring it (e.g., `(car p)` where
+                                        // `p` is captured from outer scope).
+                                        let arg0_ty = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        if arg0_ty != Type::Any {
+                                            promote_envlookup_to_any(
+                                                &mut insts,
+                                                &mut value_types,
+                                                args[0],
+                                            );
+                                        }
+                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
+                                            return Err(TranslateError::Unsupported(format!(
+                                                "car on non-Any operand (type={:?})",
+                                                arg0_ty
+                                            )));
+                                        }
                                         insts.push(RirInst::Car(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
-                                    ("cdr", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
+                                    ("cdr", 1) => {
+                                        let arg0_ty = value_types
+                                            .get(&args[0])
+                                            .copied()
+                                            .unwrap_or(Type::Fixnum);
+                                        if arg0_ty != Type::Any {
+                                            promote_envlookup_to_any(
+                                                &mut insts,
+                                                &mut value_types,
+                                                args[0],
+                                            );
+                                        }
+                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
+                                            return Err(TranslateError::Unsupported(format!(
+                                                "cdr on non-Any operand (type={:?})",
+                                                arg0_ty
+                                            )));
+                                        }
                                         insts.push(RirInst::Cdr(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
                                     }
