@@ -698,6 +698,128 @@ fn inst_rhs(
             (*dst, fcmp_nb_rust("==", lhs, rhs))
         }
 
+        // ---- Flonum unary ops (RC2 iter D) ----
+        //
+        // All lower to Rust stdlib f64 methods. The JIT uses
+        // Cranelift intrinsics for sqrt/abs/floor/ceil/trunc/round
+        // (single x86 instructions) and runtime-helper calls for
+        // the transcendentals — `rustc -O` produces equivalent
+        // code for the AOT case (calls into libm for the
+        // transcendentals, single instructions for the cheap ones).
+        // Identical in both EmitModes; operand and dst are i64
+        // carriers of f64 bit patterns.
+        (Inst::FlonumSqrt(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("sqrt", src))
+        }
+        (Inst::FlonumAbs(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("abs", src))
+        }
+        (Inst::FlonumFloor(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("floor", src))
+        }
+        (Inst::FlonumCeil(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("ceil", src))
+        }
+        (Inst::FlonumTrunc(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("trunc", src))
+        }
+        (Inst::FlonumRound(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("round", src))
+        }
+        (Inst::FlonumSin(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("sin", src))
+        }
+        (Inst::FlonumCos(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("cos", src))
+        }
+        (Inst::FlonumTan(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("tan", src))
+        }
+        (Inst::FlonumLog(dst, src), _) => {
+            check(*src)?;
+            // Scheme `log` is the natural log → Rust's `f64::ln`.
+            (*dst, funary_rust_method("ln", src))
+        }
+        (Inst::FlonumExp(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("exp", src))
+        }
+        (Inst::FlonumAsin(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("asin", src))
+        }
+        (Inst::FlonumAcos(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("acos", src))
+        }
+        (Inst::FlonumAtan(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("atan", src))
+        }
+
+        // ---- Flonum binary ops (RC2 iter D) ----
+        (Inst::FlonumMax(dst, lhs, rhs), _) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fbinop_method_rust("max", lhs, rhs))
+        }
+        (Inst::FlonumMin(dst, lhs, rhs), _) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fbinop_method_rust("min", lhs, rhs))
+        }
+        // Per the JIT lowering, all three are (dst, n, base) shape.
+        // Rust stdlib mappings:
+        //   FlonumLog2 → n.log(base)  (log base `base` of n)
+        //   FlonumAtan2 → n.atan2(base)
+        //   FlonumExpt  → n.powf(base)
+        (Inst::FlonumLog2(dst, n, base), _) => {
+            check(*n)?;
+            check(*base)?;
+            (*dst, fbinop_method_rust("log", n, base))
+        }
+        (Inst::FlonumAtan2(dst, n, base), _) => {
+            check(*n)?;
+            check(*base)?;
+            (*dst, fbinop_method_rust("atan2", n, base))
+        }
+        (Inst::FlonumExpt(dst, n, base), _) => {
+            check(*n)?;
+            check(*base)?;
+            (*dst, fbinop_method_rust("powf", n, base))
+        }
+
+        // ---- Flonum predicates (RC2 iter D) ----
+        //
+        // is_nan + is_infinite return bool. Encode the same way as
+        // FlonumLt/Eq: 0/1 i64 in RawI64 mode; (cmp | NB_FALSE_BITS)
+        // in Nb mode.
+        (Inst::FlonumIsNan(dst, src), EmitMode::RawI64) => {
+            check(*src)?;
+            (*dst, fpredicate_raw_rust("is_nan", src))
+        }
+        (Inst::FlonumIsInfinite(dst, src), EmitMode::RawI64) => {
+            check(*src)?;
+            (*dst, fpredicate_raw_rust("is_infinite", src))
+        }
+        (Inst::FlonumIsNan(dst, src), EmitMode::Nb) => {
+            check(*src)?;
+            (*dst, fpredicate_nb_rust("is_nan", src))
+        }
+        (Inst::FlonumIsInfinite(dst, src), EmitMode::Nb) => {
+            check(*src)?;
+            (*dst, fpredicate_nb_rust("is_infinite", src))
+        }
+
         // ---- CallSelf (recursive call) ----
         //
         // Both modes lower identically: a direct Rust call to the
@@ -828,6 +950,47 @@ fn fcmp_nb_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
     )
 }
 
+/// Flonum unary method call: `f64::from_bits(v0 as u64).METHOD()
+/// .to_bits() as i64`. Used for sqrt/abs/floor/ceil/trunc/round/sin/
+/// cos/tan/ln/exp/asin/acos/atan.
+fn funary_rust_method(method: &str, src: &Value) -> String {
+    format!(
+        "f64::from_bits(v{s} as u64).{method}().to_bits() as i64",
+        s = src.0,
+        method = method,
+    )
+}
+
+/// Flonum binary method call: `lhs.METHOD(rhs)` shape. Used for
+/// max/min/log (base)/atan2/powf.
+fn fbinop_method_rust(method: &str, lhs: &Value, rhs: &Value) -> String {
+    format!(
+        "f64::from_bits(v{l} as u64).{method}(f64::from_bits(v{r} as u64)).to_bits() as i64",
+        l = lhs.0,
+        r = rhs.0,
+        method = method,
+    )
+}
+
+/// RawI64-mode Flonum predicate (`is_nan` / `is_infinite`): result
+/// is 0/1 i64.
+fn fpredicate_raw_rust(method: &str, src: &Value) -> String {
+    format!(
+        "if f64::from_bits(v{s} as u64).{method}() {{ 1 }} else {{ 0 }}",
+        s = src.0,
+        method = method,
+    )
+}
+
+/// Nb-mode Flonum predicate: NB Boolean via OR-with-NB_FALSE.
+fn fpredicate_nb_rust(method: &str, src: &Value) -> String {
+    format!(
+        "((f64::from_bits(v{s} as u64).{method}() as u64) | 0xfff8_8000_0000_0000u64) as i64",
+        s = src.0,
+        method = method,
+    )
+}
+
 /// The NB-encoded `#f` literal as a Rust source expression. Used by
 /// NB-mode Branch terminators for the truthiness test.
 fn nb_false_literal() -> &'static str {
@@ -854,6 +1017,26 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         | Inst::FlonumMul(v, _, _)
         | Inst::FlonumDiv(v, _, _) => Some(*v),
         Inst::FlonumLt(v, _, _) | Inst::FlonumEq(v, _, _) => Some(*v),
+        // RC2 iter D — Flonum unary / binary / predicate Insts.
+        Inst::FlonumSqrt(v, _)
+        | Inst::FlonumAbs(v, _)
+        | Inst::FlonumFloor(v, _)
+        | Inst::FlonumCeil(v, _)
+        | Inst::FlonumTrunc(v, _)
+        | Inst::FlonumRound(v, _)
+        | Inst::FlonumSin(v, _)
+        | Inst::FlonumCos(v, _)
+        | Inst::FlonumTan(v, _)
+        | Inst::FlonumLog(v, _)
+        | Inst::FlonumExp(v, _)
+        | Inst::FlonumAsin(v, _)
+        | Inst::FlonumAcos(v, _)
+        | Inst::FlonumAtan(v, _) => Some(*v),
+        Inst::FlonumMax(v, _, _) | Inst::FlonumMin(v, _, _) => Some(*v),
+        Inst::FlonumLog2(v, _, _) | Inst::FlonumAtan2(v, _, _) | Inst::FlonumExpt(v, _, _) => {
+            Some(*v)
+        }
+        Inst::FlonumIsNan(v, _) | Inst::FlonumIsInfinite(v, _) => Some(*v),
         // Any inst not in the supported set: returning None is fine
         // because the emitter rejects unsupported variants before
         // pre-declaration anyway. Keeps this helper lean.
@@ -1293,6 +1476,61 @@ mod tests {
         assert!(src.contains("f64::from_bits(v1 as u64)"));
         assert!(src.contains(".to_bits() as i64"));
         assert!(src.contains(" + "));
+    }
+
+    #[test]
+    fn flonum_unary_emits_method_call() {
+        // RC2 iter D: FlonumSqrt → `f64::from_bits(...).sqrt().to_bits()
+        // as i64`. Same template for all the unary f64 methods.
+        let mut f = Function::new("rt");
+        f.params.push((Value(0), Type::Flonum));
+        f.return_type = Type::Flonum;
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::FlonumSqrt(Value(1), Value(0))],
+            terminator: Term::Return(Value(1)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(src.contains("f64::from_bits(v0 as u64).sqrt().to_bits() as i64"));
+    }
+
+    #[test]
+    fn flonum_binary_method_emits_method_call_chain() {
+        // FlonumExpt(dst, n, base) → n.powf(base) per cs-rir docs +
+        // JIT lowering.
+        let mut f = Function::new("p");
+        f.params.push((Value(0), Type::Flonum));
+        f.params.push((Value(1), Type::Flonum));
+        f.return_type = Type::Flonum;
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::FlonumExpt(Value(2), Value(0), Value(1))],
+            terminator: Term::Return(Value(2)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(src.contains(".powf(f64::from_bits(v1 as u64))"));
+    }
+
+    #[test]
+    fn flonum_predicate_nb_encodes_as_nb_boolean() {
+        // FlonumIsNan in Nb mode uses the same NB-Boolean OR-with-
+        // NB_FALSE_BITS encoding as FlonumLt.
+        let mut f = Function::new("nan_p");
+        f.params.push((Value(0), Type::Flonum));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::FlonumIsNan(Value(1), Value(0))],
+            terminator: Term::Return(Value(1)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(src.contains("f64::from_bits(v0 as u64).is_nan()"));
+        assert!(src.contains("0xfff8_8000_0000_0000u64"));
     }
 
     #[test]

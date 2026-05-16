@@ -531,6 +531,52 @@ fn aot_energy_flonum_nb() {
 }
 
 #[test]
+fn aot_distance_flonum_nb() {
+    // (define (distance x y) (sqrt (+ (* x x) (* y y))))
+    // RC2 iter D — exercises FlonumSqrt on top of iter C's
+    // FlonumMul + FlonumAdd. Pythagorean distance is the
+    // textbook canary; (3.0, 4.0) → 5.0 is exact in f64.
+    let mut f = Function::new("distance");
+    f.params.push((Value(0), Type::Flonum));
+    f.params.push((Value(1), Type::Flonum));
+    f.return_type = Type::Flonum;
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            Inst::FlonumMul(Value(2), Value(0), Value(0)),
+            Inst::FlonumMul(Value(3), Value(1), Value(1)),
+            Inst::FlonumAdd(Value(4), Value(2), Value(3)),
+            Inst::FlonumSqrt(Value(5), Value(4)),
+        ],
+        terminator: Term::Return(Value(5)),
+    });
+
+    let src = emit_with(EmitMode::Nb, &f).unwrap();
+    let bin = build_aot_binary_flonum_nb(&src, "distance");
+
+    let run = |x: f64, y: f64| -> f64 {
+        let out = Command::new(&bin)
+            .arg(format!("{x}"))
+            .arg(format!("{y}"))
+            .output()
+            .expect("binary executes");
+        assert!(out.status.success());
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .parse::<f64>()
+            .expect("f64 parse")
+    };
+
+    assert_eq!(run(3.0, 4.0), 5.0);
+    assert_eq!(run(0.0, 0.0), 0.0);
+    assert_eq!(run(5.0, 12.0), 13.0);
+    assert_eq!(run(-3.0, -4.0), 5.0);
+}
+
+#[test]
 fn aot_iterative_sum_nb_via_jump() {
     // Same iterative sum as the RawI64 variant — but emitted under
     // NB ABI. This proves loop+match + Jump-with-args + NB
