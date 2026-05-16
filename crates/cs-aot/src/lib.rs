@@ -259,13 +259,19 @@ impl std::fmt::Display for AotError {
         match self {
             AotError::EmptyFunction => write!(f, "cs-aot: function has no blocks"),
             AotError::UnsupportedInst(name) => {
-                write!(f, "cs-aot: Inst::{name} not yet supported (iter 1)")
+                let (description, suggestion) = inst_user_hint(name);
+                write!(
+                    f,
+                    "cs-aot: Inst::{name} not yet supported — {description}\n  \
+                     suggestion: {suggestion}\n  \
+                     reference: docs/user/aot.md (Supported/Unsupported tables)"
+                )
             }
             AotError::UnsupportedTerm(name) => {
-                write!(f, "cs-aot: Term::{name} not yet supported (iter 1)")
+                write!(f, "cs-aot: Term::{name} not yet supported")
             }
             AotError::UnsupportedConst(name) => {
-                write!(f, "cs-aot: Const::{name} not yet supported (iter 1)")
+                write!(f, "cs-aot: Const::{name} not yet supported")
             }
             AotError::UnsupportedReturnType => {
                 write!(f, "cs-aot: return type other than Fixnum not yet supported")
@@ -275,6 +281,68 @@ impl std::fmt::Display for AotError {
             }
             AotError::UndefinedValue(v) => write!(f, "cs-aot: value v{} used before defined", v.0),
         }
+    }
+}
+
+/// RC3 Phase 4 iter 4.1 + 4.4 — translate an Inst variant name into
+/// (user-meaningful description, suggested workaround). Drives the
+/// `UnsupportedInst` diagnostic format so users hit actionable
+/// guidance instead of internal Inst names.
+fn inst_user_hint(inst_name: &str) -> (&'static str, &'static str) {
+    match inst_name {
+        "MakeClosure" => (
+            "your program uses a nested lambda or closure that captures variables \
+             from an enclosing scope (e.g., `(lambda (x) ...)` inside another \
+             function, or `(let* ((f (lambda ...))) ...)`)",
+            "rewrite the inner lambda as a top-level `(define (f args) ...)` and \
+             pass any captured values as extra arguments. AOT support for closures \
+             is post-RC3 work (see Phase 2.1-2.4 in aot-hardening-plan.md).",
+        ),
+        "Call" | "CallGeneral" => (
+            "your program calls a procedure value that AOT can't yet resolve to \
+             a specific top-level define (the common case: passing a function as \
+             an argument, or calling something looked up from a non-self global)",
+            "AOT today only supports `CallSelf` (recursive calls to the function \
+             being AOT'd). If the called function is also at the top level, \
+             AOT each separately and chain them externally; otherwise this needs \
+             Phase 2.2-2.3 (general-Call lowering).",
+        ),
+        "EnvLookupAny" | "EnvLookup" => (
+            "your program references a variable that isn't an argument or a \
+             let-binding within the AOT'd function — typically a free variable \
+             captured from an enclosing scope, or a global that AOT can't yet \
+             reach without runtime env support",
+            "if the variable is a top-level define, inline the value or pass it \
+             as an argument. For deeper fixes, this needs Phase 2.4 (env install \
+             API) so AOT'd code can read from the runtime env.",
+        ),
+        "EnvDefineLocal" => (
+            "an internal `(let ...)` or `(define ...)` binding the demote-to-SSA \
+             pass couldn't lift — usually because the same name is defined in \
+             multiple branches (multi-block + multi-define ambiguity)",
+            "rename one of the bindings, OR restructure as a single shadowing \
+             chain. iter 2.5's tier-strict rule bails on multi-block + multi-\
+             define cases; future iters add φ-merge support.",
+        ),
+        "EnvSet" => (
+            "your program uses `set!` on a free variable that AOT can't reach \
+             without runtime env support",
+            "rewrite the mutation as a recursive parameter pass (functional \
+             style). Full `set!` support needs Phase 2.4 (env install API).",
+        ),
+        "Div" => (
+            "Scheme `/` on Fixnum operands can produce a Rational, which the \
+             AOT pipeline doesn't yet box; this Inst appears for Div in modes \
+             newer cs-aot doesn't support",
+            "use `quotient` for integer division if exactness isn't needed, OR \
+             call this from a JIT'd context.",
+        ),
+        _ => (
+            "cs-aot doesn't yet lower this Inst variant",
+            "check docs/user/aot.md's supported-Inst table; if the gap is real \
+             and your use case is important, file an issue with a minimal \
+             reproducer.",
+        ),
     }
 }
 
