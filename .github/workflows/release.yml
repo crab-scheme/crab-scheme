@@ -53,11 +53,16 @@ jobs:
             asset: darwin-aarch64
             cargo_args: "--release -p cs-cli"
             bin_path: "target/release/crabscheme"
-          - target: x86_64-apple-darwin
-            os: macos-13
-            asset: darwin-x86_64
-            cargo_args: "--release -p cs-cli"
-            bin_path: "target/release/crabscheme"
+          # x86_64-apple-darwin (Intel Macs) dropped from the
+          # release matrix 2026-05-16: Apple is deprecating Intel
+          # runners; the GitHub-hosted `macos-13` pool has become
+          # so starved that `1.0-rc1`'s build queued >1 hour
+          # without starting while the four other targets all
+          # finished in ~2-5 min each. Apple Silicon (`darwin-
+          # aarch64`) is the dominant macOS dev hardware now;
+          # Intel users can `cargo install --git ...` or build
+          # from source. Future iter can add it back if/when the
+          # macos-13 pool stabilizes.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
             asset: linux-x86_64
