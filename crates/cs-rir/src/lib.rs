@@ -12,6 +12,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod inline;
+
 /// SSA value identifier within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Value(pub u32);
