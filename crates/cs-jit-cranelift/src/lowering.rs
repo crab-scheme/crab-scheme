@@ -6800,15 +6800,17 @@ fn lower_inst_uniform_nb(
                     emit_nb_arith_fixnum_fast(b, helpers.mul, a, bv, |b, l, r| b.ins().imul(l, r));
                 map.insert(dst, r);
             }
-            // Phase 5b iter7 — Inst::Div always routes through the
-            // helper. Fixnum/Fixnum can produce a Rational (R6RS
-            // exact division), Flonum operands need IEEE-754 division
-            // semantics — neither fits a simple inline fast path.
+            // Phase 6 Stage B1 — Inst::Div uses a speculative
+            // exact-integer fast path for the (NB Fixnum) / (NB
+            // Fixnum) case where the divide is exact. Falls back
+            // to `vm_value_div_nb` for any other shape (non-Fixnum
+            // operands, non-divisible result, sdiv-trap edge cases).
+            // The motivating case is spectral-norm's `matrix-elt`
+            // where `(/ (* ij (+ ij 1)) 2)` is always exact.
             &Inst::Div(dst, lhs, rhs) => {
                 let a = lookup(map, lhs)?;
                 let bv = lookup(map, rhs)?;
-                let call = b.ins().call(helpers.div, &[a, bv]);
-                let r = b.inst_results(call)[0];
+                let r = emit_nb_div_fixnum_fast(b, helpers.div, a, bv);
                 map.insert(dst, r);
             }
             &Inst::Lt(dst, lhs, rhs) => {
@@ -7390,6 +7392,108 @@ fn emit_nb_arith_fixnum_fast(
     b.ins()
         .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(r_ov)]);
 
+    b.switch_to_block(slow_bb);
+    b.seal_block(slow_bb);
+    let call_slow = b.ins().call(slow_fnref, &[a, bv]);
+    let r_slow = b.inst_results(call_slow)[0];
+    b.ins()
+        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(r_slow)]);
+
+    b.switch_to_block(join_bb);
+    b.seal_block(join_bb);
+    b.block_params(join_bb)[0]
+}
+
+/// Phase 6 Stage B1 — speculative exact-integer fast path for NB
+/// Fixnum-Fixnum division. Inlines `sdiv` + `srem` and takes the
+/// fast path only when the divide is exact (rem == 0); otherwise
+/// falls back to `vm_value_div_nb` which handles the Rational
+/// path. Eliminates the ~3 ephemeral Rational allocations per
+/// always-divisible `(/ Fixnum Fixnum)` call.
+///
+/// Motivating case: spectral-norm's `matrix-elt` computes
+/// `(/ (* ij (+ ij 1)) 2)` where the product of consecutive
+/// integers is always even — every call hits the fast path.
+///
+/// Guards (any failure → slow path call to `slow_fnref`):
+/// - Both operands NB Fixnum-tagged.
+/// - `b != 0` (sdiv with zero divisor traps on x86).
+/// - NOT (`a == INT_MIN && b == -1`) (sdiv overflow trap).
+/// - `rem == 0` (exact divisibility).
+/// - `quot` fits in 47-bit NB Fixnum payload range.
+///
+/// `slow_bb` is shared across every "fast path failed" branch;
+/// it's sealed last so all predecessors get registered.
+fn emit_nb_div_fixnum_fast(
+    b: &mut FunctionBuilder,
+    slow_fnref: cranelift_codegen::ir::FuncRef,
+    a: cranelift_codegen::ir::Value,
+    bv: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    use cs_vm::vm::{NB_PAYLOAD_MASK, NB_SIGNATURE_BITS, NB_SIGNATURE_MASK, NB_TAG_MASK};
+
+    let combined_mask = (NB_SIGNATURE_MASK | NB_TAG_MASK) as i64;
+    let fixnum_pattern = NB_SIGNATURE_BITS as i64; // NB_TAG_FIXNUM == 0.
+
+    // Check 1: both operands NB Fixnum-tagged.
+    let a_masked = b.ins().band_imm(a, combined_mask);
+    let b_masked = b.ins().band_imm(bv, combined_mask);
+    let a_fix = b.ins().icmp_imm(IntCC::Equal, a_masked, fixnum_pattern);
+    let b_fix = b.ins().icmp_imm(IntCC::Equal, b_masked, fixnum_pattern);
+    let both_fix = b.ins().band(a_fix, b_fix);
+
+    let try_fast_bb = b.create_block();
+    let do_div_bb = b.create_block();
+    let encode_bb = b.create_block();
+    let slow_bb = b.create_block();
+    let join_bb = b.create_block();
+    b.append_block_param(join_bb, I64);
+
+    b.ins().brif(both_fix, try_fast_bb, &[], slow_bb, &[]);
+
+    // Extract sign-extended payloads. Check b != 0 and not the
+    // INT_MIN / -1 overflow case before sdiv (those would trap).
+    b.switch_to_block(try_fast_bb);
+    b.seal_block(try_fast_bb);
+    let a_payload = b.ins().band_imm(a, NB_PAYLOAD_MASK as i64);
+    let b_payload = b.ins().band_imm(bv, NB_PAYLOAD_MASK as i64);
+    let a_shl = b.ins().ishl_imm(a_payload, 17);
+    let av = b.ins().sshr_imm(a_shl, 17);
+    let b_shl = b.ins().ishl_imm(b_payload, 17);
+    let bvv = b.ins().sshr_imm(b_shl, 17);
+
+    let b_nonzero = b.ins().icmp_imm(IntCC::NotEqual, bvv, 0);
+    // sdiv trap on i64::MIN / -1; gate explicitly.
+    let a_eq_min = b.ins().icmp_imm(IntCC::Equal, av, i64::MIN);
+    let b_eq_neg1 = b.ins().icmp_imm(IntCC::Equal, bvv, -1);
+    let would_overflow = b.ins().band(a_eq_min, b_eq_neg1);
+    let no_overflow = b.ins().bxor_imm(would_overflow, 1);
+    let safe_to_divide = b.ins().band(b_nonzero, no_overflow);
+    b.ins().brif(safe_to_divide, do_div_bb, &[], slow_bb, &[]);
+
+    // Do the divide, check rem == 0 and quot fits 47-bit Fixnum.
+    b.switch_to_block(do_div_bb);
+    b.seal_block(do_div_bb);
+    let quot = b.ins().sdiv(av, bvv);
+    let rem = b.ins().srem(av, bvv);
+    let rem_zero = b.ins().icmp_imm(IntCC::Equal, rem, 0);
+    let quot_shl = b.ins().ishl_imm(quot, 17);
+    let quot_ext = b.ins().sshr_imm(quot_shl, 17);
+    let quot_fits = b.ins().icmp(IntCC::Equal, quot, quot_ext);
+    let fast_ok = b.ins().band(rem_zero, quot_fits);
+    b.ins().brif(fast_ok, encode_bb, &[], slow_bb, &[]);
+
+    // Fast path: encode quot as NB Fixnum.
+    b.switch_to_block(encode_bb);
+    b.seal_block(encode_bb);
+    let payload_only = b.ins().band_imm(quot, NB_PAYLOAD_MASK as i64);
+    let encoded = b.ins().bor_imm(payload_only, NB_SIGNATURE_BITS as i64);
+    b.ins()
+        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(encoded)]);
+
+    // Slow path: call vm_value_div_nb. Reached when any of the
+    // guards failed (non-Fixnum operands, divide-by-zero, sdiv
+    // overflow, non-exact result, or quot out of 47-bit range).
     b.switch_to_block(slow_bb);
     b.seal_block(slow_bb);
     let call_slow = b.ins().call(slow_fnref, &[a, bv]);
