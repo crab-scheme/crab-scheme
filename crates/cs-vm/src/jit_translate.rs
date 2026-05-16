@@ -85,6 +85,18 @@ pub fn bytecode_to_rir_with_hints(
     }
     let body = &lambda.body[..];
 
+    // Phase 5 iter5 — pre-scan for MakeClosure in body. We use this
+    // to gate `/` lowering: the variadic-/ lowering emits FlonumDiv
+    // which only works on Flonum-NB; emitting it in a body that
+    // creates inner closures (e.g. let*-expansion or named-let
+    // bindings) risks letting the body tier-up while losing TCO
+    // across the CallGeneral chain to those closures, burning host
+    // stack (this is what hit mandelbrot's col-loop in iter4).
+    // Pure-arithmetic bodies that just call builtins (matrix-elt's
+    // `(/ 1.0 denom)` inner let* lambda) have no MakeClosure and
+    // are safe.
+    let body_has_makeclosure = body.iter().any(|inst| matches!(inst, Inst::MakeClosure(_)));
+
     // Identify block-start offsets.
     let mut starts: BTreeSet<usize> = BTreeSet::new();
     starts.insert(0);
@@ -5526,6 +5538,56 @@ pub fn bytecode_to_rir_with_hints(
                                     | ("eof-object?", 1) => {
                                         let _ = args[0];
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
+                                    }
+                                    // Phase 5 iter5 — variadic / for
+                                    // Flonum operands (n >= 2). Gated
+                                    // on `body_has_any_call == false`
+                                    // to avoid lifting col-loop-style
+                                    // bodies into uniform-NB where
+                                    // their let*-CallGeneral chain
+                                    // burns host stack. Pure-arith
+                                    // lambdas (matrix-elt's inner
+                                    // let*) are safe.
+                                    ("/", n) if n >= 2 && !body_has_makeclosure => {
+                                        let any_flonum = args.iter().any(|v| {
+                                            value_types.get(v).copied() == Some(Type::Flonum)
+                                        });
+                                        if !any_flonum {
+                                            return Err(TranslateError::Unsupported(format!(
+                                                "Call to builtin `/` (arity {}) on non-Flonum operands",
+                                                args.len()
+                                            )));
+                                        }
+                                        let promoted: Vec<RirValue> = args
+                                            .iter()
+                                            .map(|v| {
+                                                let t = value_types
+                                                    .get(v)
+                                                    .copied()
+                                                    .unwrap_or(Type::Fixnum);
+                                                if t == Type::Flonum {
+                                                    *v
+                                                } else {
+                                                    let p = alloc();
+                                                    insts.push(RirInst::FixToFlo(p, *v));
+                                                    value_types.insert(p, Type::Flonum);
+                                                    p
+                                                }
+                                            })
+                                            .collect();
+                                        let mut acc = promoted[0];
+                                        for &x in &promoted[1..promoted.len() - 1] {
+                                            let next = alloc();
+                                            insts.push(RirInst::FlonumDiv(next, acc, x));
+                                            value_types.insert(next, Type::Flonum);
+                                            acc = next;
+                                        }
+                                        insts.push(RirInst::FlonumDiv(
+                                            dst,
+                                            acc,
+                                            *promoted.last().unwrap(),
+                                        ));
+                                        value_types.insert(dst, Type::Flonum);
                                     }
                                     // Variadic +/-/*. The bytecode VM
                                     // compiler only specializes 2-arg
