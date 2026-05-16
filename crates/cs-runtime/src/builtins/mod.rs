@@ -11529,6 +11529,8 @@ fn b_jit_stats(args: &[Value]) -> Result<Value, String> {
         Value::fixnum(cs_vm::vm::tier_up_count() as i64),
         Value::fixnum(cs_vm::vm::jit_call_count() as i64),
         Value::fixnum(cs_vm::vm::deopt_count() as i64),
+        Value::fixnum(cs_vm::vm::jit_ic_hit_count() as i64),
+        Value::fixnum(cs_vm::vm::jit_ic_miss_count() as i64),
     ]))
 }
 
