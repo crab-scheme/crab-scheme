@@ -5,17 +5,28 @@
 //! the same `cs-rir` IR feeds both the JIT (Cranelift → native
 //! bytes) and the AOT (cs-aot → Rust source → rustc → native bytes).
 //!
-//! ## Status: M10 Track A iter 1 (skeleton)
+//! ## Status: M10 Track A iter 2a (multi-block + comparisons)
 //!
-//! - Single-block functions only (multi-block lands in A2 via
-//!   loop+match block dispatch).
-//! - Supported Inst variants this iter: `LoadConst(Fixnum)`,
-//!   `Add` / `Sub` / `Mul` on i64. Other variants → `AotError::Unsupported`.
-//! - All-i64 ABI: each SSA value maps to a Rust `i64`. NanboxValue
-//!   carriers + non-Fixnum types arrive in A2.
+//! - **Multi-block**: functions with branching / loops now compile.
+//!   The emitter falls into one of two shapes:
+//!   - **Straight-line shape** (single block, `Return` terminator):
+//!     emits `let v_N = ...;` lines and a tail `v_R`. Preserves the
+//!     iter-1 output exactly for the simple case.
+//!   - **Loop+match shape** (anything else): pre-declares every
+//!     non-param SSA value as `let mut v_N: i64 = 0;` at function
+//!     top, then dispatches via a `loop { match block { ... } }`
+//!     state machine. `Jump(target, args)` assigns block params and
+//!     `continue`s; `Branch(cond, t, e)` reads `cond != 0` and
+//!     dispatches; `Return(v)` exits the loop via `return v_N;`.
+//! - **Supported Inst variants** (added in iter 2a):
+//!   - `LoadConst(Fixnum)`, `Add`, `Sub`, `Mul` (iter 1)
+//!   - `Lt`, `Eq` — comparisons return 0/1 as i64, matching the
+//!     JIT's `emit_nb_cmp_fixnum_fast` shape.
+//!   - `Move` — SSA alias copy.
+//! - **All-i64 ABI** remains. NanboxValue carriers + non-Fixnum
+//!   types still arrive in A2b.
 //! - The emitter does not invoke `rustc`; it returns the source as a
-//!   `String`. Callers (tests, the future `cs-aot-cli`) feed that to
-//!   their build system.
+//!   `String`. Callers feed that to their build system.
 //!
 //! ## Invariants & contracts
 //!
@@ -43,16 +54,14 @@ pub enum AotError {
     /// well-formed RIR).
     EmptyFunction,
 
-    /// Iter-1 scope is single-block only; the supplied function has
-    /// more than one block. A2 lifts this restriction.
-    MultipleBlocks { count: usize },
-
-    /// Encountered an `Inst` variant the iter-1 emitter doesn't yet
-    /// handle. The string is the variant name for diagnostics.
+    /// Encountered an `Inst` variant the emitter doesn't yet handle.
+    /// The string is the variant name for diagnostics. See the
+    /// module doc for the supported set.
     UnsupportedInst(&'static str),
 
-    /// Encountered a `Term` variant the iter-1 emitter doesn't yet
-    /// handle. Iter 1 only handles `Return`; iter 2 adds Jump/Branch.
+    /// Encountered a `Term` variant the emitter doesn't yet handle.
+    /// All current Term variants (Return / Jump / Branch) are
+    /// supported in iter 2a; reserved for future Term additions.
     UnsupportedTerm(&'static str),
 
     /// A `Const::Fixnum` value is the only constant flavor iter 1
@@ -75,10 +84,6 @@ impl std::fmt::Display for AotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AotError::EmptyFunction => write!(f, "cs-aot: function has no blocks"),
-            AotError::MultipleBlocks { count } => write!(
-                f,
-                "cs-aot: iter-1 supports single-block functions only (got {count})"
-            ),
             AotError::UnsupportedInst(name) => {
                 write!(f, "cs-aot: Inst::{name} not yet supported (iter 1)")
             }
@@ -105,17 +110,12 @@ impl std::error::Error for AotError {}
 /// definition: one `pub extern "C" fn` matching the JIT's outer-
 /// trampoline signature.
 ///
-/// Iter-1 scope per the module doc. See [`AotError`] for the exact
-/// rejection set.
+/// See the module doc for supported variants and the two output
+/// shapes (straight-line vs loop+match).
 pub fn emit(func: &Function) -> Result<String, AotError> {
     // ---- Function-level validation -------------------------------
     if func.blocks.is_empty() {
         return Err(AotError::EmptyFunction);
-    }
-    if func.blocks.len() > 1 {
-        return Err(AotError::MultipleBlocks {
-            count: func.blocks.len(),
-        });
     }
     if func.return_type != Type::Fixnum {
         return Err(AotError::UnsupportedReturnType);
@@ -126,22 +126,32 @@ pub fn emit(func: &Function) -> Result<String, AotError> {
         }
     }
 
-    let block = &func.blocks[0];
-
     // ---- Build the source --------------------------------------
     let mut out = String::new();
     let fn_name = sanitize_ident(&func.name);
 
-    // Doc comment so the AOT-emitted source carries provenance
-    // when read by humans (the `cargo doc` of an AOT'd crate
-    // surfaces the original Scheme procedure names).
+    // Decide which shape to emit. Straight-line is reserved for the
+    // simplest case (1 block, Return terminator) so iter-1 output is
+    // preserved exactly for the snapshot tests + readability.
+    let straight_line = func.blocks.len() == 1
+        && matches!(func.blocks[0].terminator, Term::Return(_))
+        && func.blocks[0].params.is_empty();
+
+    // Doc comment: provenance + shape annotation so humans reading
+    // the AOT'd source know which emitter path produced it.
     writeln!(out, "/// AOT-emitted from cs-rir Function `{}`.", func.name).unwrap();
     writeln!(out, "///").unwrap();
     writeln!(
         out,
-        "/// {} param(s) · {} inst(s) · single-block · all-i64 ABI",
+        "/// {} param(s) · {} block(s) · {} inst(s) · {} · all-i64 ABI",
         func.params.len(),
-        block.insts.len()
+        func.blocks.len(),
+        func.blocks.iter().map(|b| b.insts.len()).sum::<usize>(),
+        if straight_line {
+            "straight-line"
+        } else {
+            "loop+match"
+        }
     )
     .unwrap();
 
@@ -157,71 +167,242 @@ pub fn emit(func: &Function) -> Result<String, AotError> {
     }
     out.push_str(") -> i64 {\n");
 
-    // Track defined SSA values so we can reject use-before-def.
-    let mut defined: HashSet<Value> = func.params.iter().map(|(v, _)| *v).collect();
-    // Track block params too (iter-1 has 1 block whose params are
-    // always empty for a Return-terminated entry, but defensive).
-    for (v, _) in &block.params {
-        defined.insert(*v);
-    }
-
-    // ---- Emit each instruction ---------------------------------
-    for inst in &block.insts {
-        match inst {
-            Inst::LoadConst(dst, c) => {
-                let lit = const_to_rust_i64(c)?;
-                writeln!(out, "    let v{}: i64 = {};", dst.0, lit).unwrap();
-                defined.insert(*dst);
-            }
-            Inst::Add(dst, lhs, rhs) => {
-                require_defined(&defined, *lhs)?;
-                require_defined(&defined, *rhs)?;
-                writeln!(
-                    out,
-                    "    let v{}: i64 = v{}.wrapping_add(v{});",
-                    dst.0, lhs.0, rhs.0
-                )
-                .unwrap();
-                defined.insert(*dst);
-            }
-            Inst::Sub(dst, lhs, rhs) => {
-                require_defined(&defined, *lhs)?;
-                require_defined(&defined, *rhs)?;
-                writeln!(
-                    out,
-                    "    let v{}: i64 = v{}.wrapping_sub(v{});",
-                    dst.0, lhs.0, rhs.0
-                )
-                .unwrap();
-                defined.insert(*dst);
-            }
-            Inst::Mul(dst, lhs, rhs) => {
-                require_defined(&defined, *lhs)?;
-                require_defined(&defined, *rhs)?;
-                writeln!(
-                    out,
-                    "    let v{}: i64 = v{}.wrapping_mul(v{});",
-                    dst.0, lhs.0, rhs.0
-                )
-                .unwrap();
-                defined.insert(*dst);
-            }
-            other => return Err(AotError::UnsupportedInst(inst_variant_name(other))),
-        }
-    }
-
-    // ---- Terminator -------------------------------------------
-    match &block.terminator {
-        Term::Return(v) => {
-            require_defined(&defined, *v)?;
-            writeln!(out, "    v{}", v.0).unwrap();
-        }
-        Term::Jump(_, _) => return Err(AotError::UnsupportedTerm("Jump")),
-        Term::Branch(_, _, _) => return Err(AotError::UnsupportedTerm("Branch")),
+    if straight_line {
+        emit_straight_line(&mut out, func)?;
+    } else {
+        emit_loop_match(&mut out, func)?;
     }
 
     out.push_str("}\n");
     Ok(out)
+}
+
+/// Iter-1 shape: emit each Inst as a `let v_N = expr;` then the
+/// Return value as a trailing tail expression. Preserves snapshot-
+/// test output for simple functions and is more readable when the
+/// CFG is degenerate.
+fn emit_straight_line(out: &mut String, func: &Function) -> Result<(), AotError> {
+    let block = &func.blocks[0];
+    let mut defined: HashSet<Value> = func.params.iter().map(|(v, _)| *v).collect();
+
+    for inst in &block.insts {
+        emit_inst_let(out, inst, &defined)?;
+        if let Some(dst) = inst_dst(inst) {
+            defined.insert(dst);
+        }
+    }
+
+    if let Term::Return(v) = &block.terminator {
+        require_defined(&defined, *v)?;
+        writeln!(out, "    v{}", v.0).unwrap();
+        Ok(())
+    } else {
+        // Should be unreachable given straight_line gate, but
+        // defensive.
+        Err(AotError::UnsupportedTerm(term_variant_name(
+            &block.terminator,
+        )))
+    }
+}
+
+/// Iter-2a shape: pre-declare every non-param SSA Value as
+/// `let mut v_N: i64 = 0;` at function top, then run a
+/// `loop { match block { ... } }` state machine for block dispatch.
+/// Verbose but always correct for arbitrary CFGs without needing
+/// liveness analysis.
+fn emit_loop_match(out: &mut String, func: &Function) -> Result<(), AotError> {
+    // Pre-declare every Value that ISN'T already a function
+    // parameter. Block params and Inst destinations all go here.
+    // Using `let mut` + assignment (not `let`) means a Value defined
+    // in one block can be read in another without scope issues.
+    let params: HashSet<Value> = func.params.iter().map(|(v, _)| *v).collect();
+    let mut all_values: Vec<Value> = Vec::new();
+    for block in &func.blocks {
+        for (v, _) in &block.params {
+            if !params.contains(v) {
+                all_values.push(*v);
+            }
+        }
+        for inst in &block.insts {
+            if let Some(dst) = inst_dst(inst) {
+                if !params.contains(&dst) {
+                    all_values.push(dst);
+                }
+            }
+        }
+    }
+    all_values.sort_by_key(|v| v.0);
+    all_values.dedup();
+
+    for v in &all_values {
+        writeln!(out, "    let mut v{}: i64 = 0;", v.0).unwrap();
+    }
+
+    // Dispatch state machine. `block` carries the current block id;
+    // `loop { match block { ... } }` runs forever, with each block
+    // arm either jumping (`block = ...; continue;`) or returning.
+    writeln!(out, "    let mut block: u32 = {};", func.entry.0).unwrap();
+    writeln!(out, "    loop {{").unwrap();
+    writeln!(out, "        match block {{").unwrap();
+
+    for block in &func.blocks {
+        writeln!(out, "            {} => {{", block.id.0).unwrap();
+        for inst in &block.insts {
+            emit_inst_assign(out, inst)?;
+        }
+        emit_terminator(out, &block.terminator, func)?;
+        writeln!(out, "            }}").unwrap();
+    }
+
+    // unreachable!() is the safety net: well-formed RIR never
+    // dispatches to a non-existent block id, but rustc demands a
+    // catch-all for non-exhaustive integer matches.
+    writeln!(out, "            _ => unreachable!(),").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    Ok(())
+}
+
+/// Emit an Inst as `let v_N: i64 = expr;` (straight-line shape).
+/// Used only by `emit_straight_line`; the loop+match shape uses
+/// `emit_inst_assign` instead (assignment to pre-declared mut).
+fn emit_inst_let(out: &mut String, inst: &Inst, defined: &HashSet<Value>) -> Result<(), AotError> {
+    let (dst, expr) = inst_rhs(inst, Some(defined))?;
+    writeln!(out, "    let v{}: i64 = {};", dst.0, expr).unwrap();
+    Ok(())
+}
+
+/// Emit an Inst as `v_N = expr;` (loop+match shape). The Value is
+/// pre-declared as `let mut` at function top.
+fn emit_inst_assign(out: &mut String, inst: &Inst) -> Result<(), AotError> {
+    // The loop+match shape pre-declares all values; SSA validity is
+    // a property of well-formed RIR, not something we re-check here
+    // (the check requires cross-block dataflow analysis we don't yet
+    // do in the emitter). Pass `None` to skip.
+    let (dst, expr) = inst_rhs(inst, None)?;
+    writeln!(out, "                v{} = {};", dst.0, expr).unwrap();
+    Ok(())
+}
+
+/// Compute the (dst, RHS-expression) pair for an Inst. The expression
+/// is in Rust source form ready to be assigned. When `defined` is
+/// `Some(set)`, perform use-before-def detection against it; when
+/// `None`, skip (the loop+match shape uses this).
+fn inst_rhs(inst: &Inst, defined: Option<&HashSet<Value>>) -> Result<(Value, String), AotError> {
+    let check = |v: Value| -> Result<(), AotError> {
+        match defined {
+            Some(set) if !set.contains(&v) => Err(AotError::UndefinedValue(v)),
+            _ => Ok(()),
+        }
+    };
+
+    Ok(match inst {
+        Inst::LoadConst(dst, c) => (*dst, const_to_rust_i64(c)?),
+        Inst::Add(dst, lhs, rhs) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, format!("v{}.wrapping_add(v{})", lhs.0, rhs.0))
+        }
+        Inst::Sub(dst, lhs, rhs) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, format!("v{}.wrapping_sub(v{})", lhs.0, rhs.0))
+        }
+        Inst::Mul(dst, lhs, rhs) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, format!("v{}.wrapping_mul(v{})", lhs.0, rhs.0))
+        }
+        Inst::Lt(dst, lhs, rhs) => {
+            // Match the JIT's `emit_nb_cmp_fixnum_fast` shape:
+            // comparison returns 0/1 as an i64 (the bare integer,
+            // pre-NB-tag — A2b adds the NB Boolean tag).
+            check(*lhs)?;
+            check(*rhs)?;
+            (
+                *dst,
+                format!("if v{} < v{} {{ 1 }} else {{ 0 }}", lhs.0, rhs.0),
+            )
+        }
+        Inst::Eq(dst, lhs, rhs) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (
+                *dst,
+                format!("if v{} == v{} {{ 1 }} else {{ 0 }}", lhs.0, rhs.0),
+            )
+        }
+        Inst::Move(dst, src) => {
+            check(*src)?;
+            (*dst, format!("v{}", src.0))
+        }
+        other => return Err(AotError::UnsupportedInst(inst_variant_name(other))),
+    })
+}
+
+/// Emit the terminator for a block in the loop+match shape.
+fn emit_terminator(out: &mut String, term: &Term, func: &Function) -> Result<(), AotError> {
+    match term {
+        Term::Return(v) => {
+            writeln!(out, "                return v{};", v.0).unwrap();
+        }
+        Term::Jump(target, args) => {
+            // Assign target block's params from `args` before
+            // jumping. RIR contract: args.len() == target.params.len().
+            let target_block = func
+                .blocks
+                .iter()
+                .find(|b| b.id == *target)
+                .ok_or(AotError::UnsupportedTerm("Jump to unknown block"))?;
+            if args.len() != target_block.params.len() {
+                // Malformed RIR: arg/param count mismatch.
+                return Err(AotError::UnsupportedTerm(
+                    "Jump arity mismatch with target block params",
+                ));
+            }
+            for (arg_v, (param_v, _ty)) in args.iter().zip(target_block.params.iter()) {
+                writeln!(out, "                v{} = v{};", param_v.0, arg_v.0).unwrap();
+            }
+            writeln!(out, "                block = {};", target.0).unwrap();
+            writeln!(out, "                continue;").unwrap();
+        }
+        Term::Branch(cond, then_target, else_target) => {
+            // The JIT (and our Lt/Eq emission) produces 0/1 as i64;
+            // any non-zero value is truthy, matching cs-vm's NB
+            // brif semantics (NB Boolean payload's low bit).
+            writeln!(out, "                if v{} != 0 {{", cond.0).unwrap();
+            writeln!(out, "                    block = {};", then_target.0).unwrap();
+            writeln!(out, "                    continue;").unwrap();
+            writeln!(out, "                }} else {{").unwrap();
+            writeln!(out, "                    block = {};", else_target.0).unwrap();
+            writeln!(out, "                    continue;").unwrap();
+            writeln!(out, "                }}").unwrap();
+        }
+    }
+    Ok(())
+}
+
+/// Return the destination Value an Inst writes, if any. Used for
+/// pre-declaring all non-param Values in the loop+match shape.
+fn inst_dst(inst: &Inst) -> Option<Value> {
+    match inst {
+        Inst::LoadConst(v, _) => Some(*v),
+        Inst::Add(v, _, _) | Inst::Sub(v, _, _) | Inst::Mul(v, _, _) => Some(*v),
+        Inst::Lt(v, _, _) | Inst::Eq(v, _, _) => Some(*v),
+        Inst::Move(v, _) => Some(*v),
+        // Any inst not in the supported set: returning None is fine
+        // because the emitter rejects unsupported variants before
+        // pre-declaration anyway. Keeps this helper lean.
+        _ => None,
+    }
+}
+
+fn term_variant_name(term: &Term) -> &'static str {
+    match term {
+        Term::Return(_) => "Return",
+        Term::Jump(_, _) => "Jump",
+        Term::Branch(_, _, _) => "Branch",
+    }
 }
 
 /// Sanitize a Scheme procedure name into a valid Rust identifier.
@@ -425,57 +606,135 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multiple_blocks() {
-        let mut f = Function::new("multi");
+    fn multi_block_jump_emits_loop_match() {
+        // Two-block trivial: entry jumps to block 1 which returns 7.
+        // Exercises Jump(no args) + the loop+match shape.
+        let mut f = Function::new("jump_to_return");
         f.entry = BlockId(0);
         f.blocks.push(Block {
             id: BlockId(0),
             params: vec![],
+            insts: vec![Inst::LoadConst(Value(0), Const::Fixnum(7))],
+            terminator: Term::Jump(BlockId(1), vec![Value(0)]),
+        });
+        f.blocks.push(Block {
+            id: BlockId(1),
+            params: vec![(Value(1), Type::Fixnum)],
             insts: vec![],
-            terminator: Term::Jump(BlockId(1), vec![]),
+            terminator: Term::Return(Value(1)),
+        });
+        let src = emit(&f).unwrap();
+        // Multi-block always uses loop+match shape.
+        assert!(src.contains("let mut v0: i64 = 0;"));
+        assert!(src.contains("let mut v1: i64 = 0;"));
+        assert!(src.contains("let mut block: u32 = 0;"));
+        assert!(src.contains("loop {"));
+        assert!(src.contains("match block {"));
+        assert!(src.contains("0 => {"));
+        assert!(src.contains("v0 = 7i64;"));
+        // Jump assigns block param then dispatches.
+        assert!(src.contains("v1 = v0;"));
+        assert!(src.contains("block = 1;"));
+        assert!(src.contains("continue;"));
+        assert!(src.contains("1 => {"));
+        assert!(src.contains("return v1;"));
+        assert!(src.contains("_ => unreachable!(),"));
+    }
+
+    #[test]
+    fn branch_emits_if_else_dispatch() {
+        // (define (abs-ish x) (if (< x 0) (- 0 x) x))
+        // Translated to RIR with Branch:
+        //   block 0: v1 = 0; v2 = v0 < v1; Branch(v2, 1, 2)
+        //   block 1: v3 = 0; v4 = v3 - v0; Return v4
+        //   block 2: Return v0
+        let mut f = Function::new("abs_ish");
+        f.params.push((Value(0), Type::Fixnum));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(Value(1), Const::Fixnum(0)),
+                Inst::Lt(Value(2), Value(0), Value(1)),
+            ],
+            terminator: Term::Branch(Value(2), BlockId(1), BlockId(2)),
         });
         f.blocks.push(Block {
             id: BlockId(1),
             params: vec![],
-            insts: vec![Inst::LoadConst(Value(0), Const::Fixnum(0))],
+            insts: vec![
+                Inst::LoadConst(Value(3), Const::Fixnum(0)),
+                Inst::Sub(Value(4), Value(3), Value(0)),
+            ],
+            terminator: Term::Return(Value(4)),
+        });
+        f.blocks.push(Block {
+            id: BlockId(2),
+            params: vec![],
+            insts: vec![],
             terminator: Term::Return(Value(0)),
         });
-        match emit(&f) {
-            Err(AotError::MultipleBlocks { count }) => assert_eq!(count, 2),
-            other => panic!("expected MultipleBlocks, got {other:?}"),
-        }
+        let src = emit(&f).unwrap();
+        assert!(src.contains("v2 = if v0 < v1 { 1 } else { 0 };"));
+        assert!(src.contains("if v2 != 0 {"));
+        assert!(src.contains("block = 1;"));
+        assert!(src.contains("block = 2;"));
     }
 
     #[test]
-    fn rejects_unsupported_inst() {
-        // Inst::Lt isn't handled in iter 1.
-        let mut f = Function::new("less");
+    fn lt_and_eq_emit_zero_one() {
+        let mut f = Function::new("cmp");
         f.params.push((Value(0), Type::Fixnum));
         f.params.push((Value(1), Type::Fixnum));
         f.entry = BlockId(0);
         f.blocks.push(Block {
             id: BlockId(0),
             params: vec![],
-            insts: vec![Inst::Lt(Value(2), Value(0), Value(1))],
-            terminator: Term::Return(Value(2)),
+            insts: vec![
+                Inst::Lt(Value(2), Value(0), Value(1)),
+                Inst::Eq(Value(3), Value(0), Value(1)),
+                Inst::Add(Value(4), Value(2), Value(3)),
+            ],
+            terminator: Term::Return(Value(4)),
         });
-        // Use Fixnum return type so we pass the return-type check.
-        f.return_type = Type::Fixnum;
-        assert_eq!(emit(&f), Err(AotError::UnsupportedInst("Lt")));
+        let src = emit(&f).unwrap();
+        // Single-block + Return uses straight-line shape.
+        assert!(src.contains("let v2: i64 = if v0 < v1 { 1 } else { 0 };"));
+        assert!(src.contains("let v3: i64 = if v0 == v1 { 1 } else { 0 };"));
     }
 
     #[test]
-    fn rejects_unsupported_terminator() {
-        let mut f = Function::new("br");
+    fn move_emits_alias() {
+        let mut f = Function::new("alias");
         f.params.push((Value(0), Type::Fixnum));
         f.entry = BlockId(0);
         f.blocks.push(Block {
             id: BlockId(0),
             params: vec![],
-            insts: vec![],
-            terminator: Term::Jump(BlockId(0), vec![]),
+            insts: vec![Inst::Move(Value(1), Value(0))],
+            terminator: Term::Return(Value(1)),
         });
-        assert_eq!(emit(&f), Err(AotError::UnsupportedTerm("Jump")));
+        let src = emit(&f).unwrap();
+        assert!(src.contains("let v1: i64 = v0;"));
+    }
+
+    #[test]
+    fn rejects_unsupported_inst() {
+        // Inst::Div isn't yet handled (no plain integer-divide
+        // emitted yet; A2b adds it via NB-aware helper).
+        let mut f = Function::new("div");
+        f.params.push((Value(0), Type::Fixnum));
+        f.params.push((Value(1), Type::Fixnum));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::Div(Value(2), Value(0), Value(1))],
+            terminator: Term::Return(Value(2)),
+        });
+        f.return_type = Type::Fixnum;
+        assert_eq!(emit(&f), Err(AotError::UnsupportedInst("Div")));
     }
 
     #[test]

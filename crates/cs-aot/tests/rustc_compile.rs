@@ -145,6 +145,121 @@ fn aot_arith_chain_with_const() {
 }
 
 #[test]
+fn aot_abs_via_branch_runs_correctly() {
+    // (define (abs x) (if (< x 0) (- 0 x) x))
+    // RIR shape (loop+match):
+    //   block 0: v1=0; v2=v0<v1; Branch(v2, then=1, else=2)
+    //   block 1 (then): v3=0; v4=v3-v0; Return v4
+    //   block 2 (else): Return v0
+    let mut f = Function::new("abs");
+    f.params.push((Value(0), Type::Fixnum));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            Inst::LoadConst(Value(1), Const::Fixnum(0)),
+            Inst::Lt(Value(2), Value(0), Value(1)),
+        ],
+        terminator: Term::Branch(Value(2), BlockId(1), BlockId(2)),
+    });
+    f.blocks.push(Block {
+        id: BlockId(1),
+        params: vec![],
+        insts: vec![
+            Inst::LoadConst(Value(3), Const::Fixnum(0)),
+            Inst::Sub(Value(4), Value(3), Value(0)),
+        ],
+        terminator: Term::Return(Value(4)),
+    });
+    f.blocks.push(Block {
+        id: BlockId(2),
+        params: vec![],
+        insts: vec![],
+        terminator: Term::Return(Value(0)),
+    });
+
+    let src = emit(&f).unwrap();
+    let bin = build_aot_binary(&src, "abs", 1);
+
+    assert_eq!(run_aot_binary(&bin, &[0]), 0);
+    assert_eq!(run_aot_binary(&bin, &[5]), 5);
+    assert_eq!(run_aot_binary(&bin, &[-5]), 5);
+    assert_eq!(run_aot_binary(&bin, &[-12345]), 12345);
+    assert_eq!(run_aot_binary(&bin, &[i64::MAX]), i64::MAX);
+}
+
+#[test]
+fn aot_iterative_sum_loop_via_jump() {
+    // Iterative sum 1..n via a back-edge Jump with block params.
+    //   (define (sum n)
+    //     (let loop ((i 1) (acc 0))
+    //       (if (> i n) acc (loop (+ i 1) (+ acc i)))))
+    //
+    // RIR (using Lt-with-swapped-args since RIR has Lt but not Gt;
+    // condition is (i <= n), which we encode as NOT (n < i) — but
+    // RIR also has no Not, so we encode "i > n" as Lt(n, i) and put
+    // the exit on the then-branch.
+    //
+    //   block 0 (entry):
+    //     v1=1; v2=0;
+    //     Jump(block 1, [v1, v2])
+    //   block 1 (loop, params i=v3, acc=v4):
+    //     v5 = Lt(v0_n, v3_i)         ; n < i, i.e. i > n
+    //     Branch(v5, then=2, else=3)
+    //   block 2 (exit):
+    //     Return v4
+    //   block 3 (body):
+    //     v6 = 1
+    //     v7 = Add(v3_i, v6)         ; i+1
+    //     v8 = Add(v4_acc, v3_i)     ; acc+i
+    //     Jump(block 1, [v7, v8])
+    let mut f = Function::new("sum");
+    f.params.push((Value(0), Type::Fixnum)); // n
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            Inst::LoadConst(Value(1), Const::Fixnum(1)),
+            Inst::LoadConst(Value(2), Const::Fixnum(0)),
+        ],
+        terminator: Term::Jump(BlockId(1), vec![Value(1), Value(2)]),
+    });
+    f.blocks.push(Block {
+        id: BlockId(1),
+        params: vec![(Value(3), Type::Fixnum), (Value(4), Type::Fixnum)],
+        insts: vec![Inst::Lt(Value(5), Value(0), Value(3))],
+        terminator: Term::Branch(Value(5), BlockId(2), BlockId(3)),
+    });
+    f.blocks.push(Block {
+        id: BlockId(2),
+        params: vec![],
+        insts: vec![],
+        terminator: Term::Return(Value(4)),
+    });
+    f.blocks.push(Block {
+        id: BlockId(3),
+        params: vec![],
+        insts: vec![
+            Inst::LoadConst(Value(6), Const::Fixnum(1)),
+            Inst::Add(Value(7), Value(3), Value(6)),
+            Inst::Add(Value(8), Value(4), Value(3)),
+        ],
+        terminator: Term::Jump(BlockId(1), vec![Value(7), Value(8)]),
+    });
+
+    let src = emit(&f).unwrap();
+    let bin = build_aot_binary(&src, "sum", 1);
+
+    assert_eq!(run_aot_binary(&bin, &[0]), 0);
+    assert_eq!(run_aot_binary(&bin, &[1]), 1);
+    assert_eq!(run_aot_binary(&bin, &[10]), 55);
+    assert_eq!(run_aot_binary(&bin, &[100]), 5050);
+    assert_eq!(run_aot_binary(&bin, &[1000]), 500500);
+}
+
+#[test]
 fn aot_wrapping_arith_matches_jit_semantics() {
     // Verify that emitted Add uses wrapping_add (not checked), so
     // overflow matches the JIT's underlying i64 ops rather than
