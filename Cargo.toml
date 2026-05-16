@@ -16,7 +16,10 @@ members = [
     "crates/cs-ffi",
     "crates/cs-ffi-macros",
     "crates/cs-ffi-example",
+    "crates/cs-ffi-sha2",
+    "crates/cs-ffi-http",
     "crates/cs-cli",
+    "crates/cs-cli-sha2",
 ]
 
 [workspace.package]

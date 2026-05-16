@@ -1,0 +1,23 @@
+[package]
+name = "cs-ffi-sha2"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+description = "Example CrabScheme FFI plugin: SHA-256 via the `sha2` crate. Builds as both cdylib (for `(load-shared-library)` on native) and rlib (for static linking into a custom embedder binary — used by `cs-cli-sha2` to demonstrate the WASM-compatible static-registration path)."
+
+[lib]
+# cdylib: native build can `(load-shared-library "libcs_ffi_sha2.dylib")`.
+# rlib:   any Rust embedder (including a WASM build) can call
+#         `make_sha256_proc()` and pass the result to
+#         `Runtime::register_host_procedure`.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cs-ffi = { workspace = true }
+cs-core = { workspace = true }
+# `sha2` is pure Rust + no_std-compatible; works on native and WASM
+# (the `compress` feature uses platform intrinsics where available
+# and falls back to a portable implementation everywhere else).
+sha2 = "0.10"
+hex = "0.4"

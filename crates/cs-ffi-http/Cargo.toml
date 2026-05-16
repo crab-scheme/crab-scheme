@@ -1,0 +1,19 @@
+[package]
+name = "cs-ffi-http"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+description = "Example CrabScheme FFI plugin: synchronous HTTP GET via `reqwest::blocking` (which uses tokio internally). Native-only: requires libc + a real network stack, so this plugin is built as a cdylib for `(load-shared-library)` on native. The WASM build path skips it — WASI does not yet have an outbound HTTP capability the way wasi-http (Preview 2 component model) will provide."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cs-ffi = { workspace = true }
+cs-core = { workspace = true }
+# reqwest's blocking API uses tokio under the hood — wraps the
+# async core in a `tokio::runtime::Runtime` and blocks on each call.
+# `default-features = false` + just `rustls-tls` + `blocking` keeps
+# the dep tree smaller (no native OpenSSL).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

@@ -1,0 +1,21 @@
+[package]
+name = "cs-cli-sha2"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+description = "Custom CrabScheme CLI demonstrating static FFI registration. Statically links cs-ffi-sha2 + calls Runtime::register_host_procedure at startup so `(sha256 ...)` is available without `(load-shared-library)`. This is the WASM-compatible path: the same binary builds for native AND wasm32-wasip1."
+
+[[bin]]
+name = "crabscheme-sha2"
+path = "src/main.rs"
+
+[dependencies]
+# Pulls ffi-trait (for register_host_procedure) — no ffi-dynamic
+# needed since we register the plugin statically rather than via
+# dlopen. This is what makes the WASM build work.
+cs-runtime = { workspace = true, features = ["ffi-trait"] }
+cs-core = { workspace = true }
+cs-diag = { workspace = true }
+cs-ffi-sha2 = { path = "../cs-ffi-sha2" }
+clap = { workspace = true }
