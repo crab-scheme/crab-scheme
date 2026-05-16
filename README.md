@@ -1,9 +1,8 @@
 # CrabScheme
 
-R6RS-flavored Scheme implementation in Rust. Two execution tiers (tree-walker
-and bytecode VM) verified to produce identical results across 33 conformance
-files (~700 R6RS test cases). VM tier runs 2.5–3× faster than the walker on
-recursion-heavy workloads.
+R6RS-flavored Scheme implementation in Rust with four execution tiers
+(tree-walker, bytecode VM, Cranelift JIT, Rust-source AOT) and a
+`wasm32-wasip1` target.
 
 ```
 $ crabscheme -e '(letrec ((fib (lambda (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))) (fib 25))'
@@ -12,145 +11,197 @@ $ crabscheme -e '(letrec ((fib (lambda (n) (if (< n 2) n (+ (fib (- n 1)) (fib (
 
 ## Status
 
-The implementation is a working subset of R6RS suitable for running real
-programs. Foundation milestones M0–M4 (lexer, parser, expander, tree-walker,
-bytecode VM) and M9 (~85% of the R6RS standard library surface) are complete;
-M8 (escape-only `call/cc`) shipped in the latest iteration.
+**1.0 Release Candidate 1** tagged at commit
+`17632e7` (`git tag -l 1.0-*`). All ROADMAP milestones M0–M10 are
+complete and tagged. See
+[`docs/measurements/2026-05-16-1.0-rc-readiness.md`](docs/measurements/2026-05-16-1.0-rc-readiness.md)
+for the full RC sign-off framing and gate-by-gate posture.
 
-What works:
+| Surface          | State                                                       |
+|------------------|-------------------------------------------------------------|
+| R6RS conformance | **100%** on the 117-fixture corpus (2,464 assertions)       |
+| WASM conformance | **100%** — 0pp gap to native via `bench/wasm-conformance.sh`|
+| Workspace tests  | 0 failures across 24 test executables                       |
+| JIT perf gates   | All three ADR-0013 gates **MET** — ~11.6× walker geomean    |
+| AOT pipeline     | fib(40) RawI64 ABI matches `rustc -O` to the centisecond    |
 
-- Lexer + reader + R6RS-flavored expander (incl. `syntax-rules` with
-  hygienic binder renaming, `let`, `let*`, `letrec`, `do`, `case`,
-  `cond`, `guard`, `quasiquote`, `define-record-type`)
-- Numeric tower: fixnum, bignum, rational, flonum (auto-promote on overflow)
-- Strings, characters, vectors, bytevectors, hashtables (eq/eqv/equal),
-  ports (string-input, string-output, file-input), promises, parameters,
-  conditions
-- Tree-walking interpreter with proper TCE
-- Bytecode VM with stack machine + TCE + const-folded globals
-- Cross-tier higher-order bridge: `apply`, `map`, `for-each`, `filter`,
-  `find`, `any`, `every`, `fold-left`, `fold-right`, `reduce`, `count`,
-  `partition`, `values`, `call-with-values`, `vector-map`,
-  `vector-for-each`, `vector-fold`, `vector-filter`, `string-map`,
-  `string-for-each`, `hashtable-walk`, `hashtable-fold`,
-  `hashtable-for-each`, `hashtable-update!`, `unfold`, `tabulate`,
-  `remove`, `force`, `display`, `write`, `newline`, `read`, `read-line`,
-  `with-output-to-string`, `with-input-from-string`,
-  `current-input-port`, `current-output-port`, `raise`, `error`,
-  `with-exception-handler`, `dynamic-wind`, `call/cc`,
-  `call-with-current-continuation`, `eval`, `list-sort`, `vector-sort`,
-  `vector-sort!`
-- 33 conformance files run identically on both tiers
+## What works
 
-What's deferred (post-M9):
-
-- M5: precise tracing GC (currently uses Rc; cycles aren't reclaimed)
-- M6/M7: Cranelift JIT, HolyJIT integration
-- M8: full multi-shot `call/cc` (only escape-only is implemented;
-  capturing a continuation and invoking it after its dynamic extent has
-  ended is not supported)
-- M10: AOT compilation, WASM target
-- M11: verified core proofs
+- **Lexer + reader + R6RS-flavored expander.** `syntax-rules` with
+  hygienic binder renaming; `let`, `let*`, `letrec`, `do`, `case`,
+  `cond`, `guard`, `quasiquote`, `define-record-type`.
+- **Full numeric tower:** fixnum, bignum, rational, flonum, with
+  auto-promote on overflow; NaN-boxed compact representation in the
+  VM/JIT tiers.
+- **Strings, characters, vectors, bytevectors, hashtables** (eq/eqv/
+  equal); ports (string-in, string-out, file-in/out, binary,
+  transcoded); promises, parameters, conditions.
+- **Four execution tiers:**
+  - Tree-walking interpreter with proper tail-call elimination.
+  - Bytecode VM with stack machine + TCE + const-folded globals.
+  - Cranelift JIT with type-feedback specialization, NB-typed slow
+    paths, and inline caches. Beats Chez/Guile/Gambit-interp geomean.
+  - AOT compiler: `cs_rir::Function` → Rust source → cargo project →
+    standalone native binary. RawI64 ABI matches hand-written Rust;
+    Nb ABI within 2× of `rustc -O` on fib post-RC2 fast-path inlining.
+- **WASM target.** `cargo build --target wasm32-wasip1 -p cs-cli
+  --no-default-features` produces a 2.2 MB `crabscheme.wasm` that runs
+  under wasmtime. Conformance matches native to the byte.
+- **First-class call/cc** on the VM tier (M8).
+- **Rust FFI** with two flavors: trait-based (WASM-portable) and
+  dynamic-library (`libloading`, native-only). See `crates/cs-ffi*`.
+- **R6RS standard library foundation** (M9): `(rnrs)`, `(rnrs base)`,
+  `(rnrs lists)`, `(rnrs sorting)`, `(rnrs hashtables)`, `(rnrs io
+  ports)`, `(rnrs records)`, `(rnrs enums)`, plus prioritized SRFIs.
 
 ## Quickstart
 
 ```bash
-# Evaluate an expression and print the result.
+# Evaluate an expression.
 cargo run --release -- -e '(* 6 7)'
 
 # Run a Scheme source file.
 cargo run --release -- run examples/factorial.scm
 
-# Start an interactive REPL (tree-walker by default).
+# Pick a tier explicitly.
+cargo run --release -- --tier walker run program.scm
+cargo run --release -- --tier vm     run program.scm
+cargo run --release -- --tier vm-jit run program.scm   # default
+
+# Interactive REPL.
 cargo run --release -- repl
 
-# Same, on the bytecode VM tier.
-cargo run --release -- --tier vm repl
-
-# Force colored or plain diagnostics (default `auto` colors when stderr is a TTY).
-cargo run --release -- --color always -e '(foo 1 2)'
-cargo run --release -- --color never -e '(foo 1 2)'
+# WASM build + run.
+cargo build --target wasm32-wasip1 --release -p cs-cli --no-default-features
+wasmtime run --dir=. target/wasm32-wasip1/release/crabscheme.wasm run program.scm
 ```
 
 ### REPL commands
 
-The REPL accepts both Scheme expressions and `:`-prefixed commands:
-
-| Command | Effect |
-|---|---|
-| `:help` | List commands |
-| `:quit` | Exit (also `^D`) |
-| `:tier walker\|vm` | Switch execution tier |
-| `:time <expr>` | Evaluate `<expr>` and print wall-clock time |
-| `:load <path>` | Load and run a Scheme file in this session |
-| `:reset` | Reinitialize the runtime, dropping all definitions |
-
-Example session:
-
-```
-crabscheme 0.0.1 (walker) — :help for commands, ^D to exit
-> (define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
-> :time (fib 25)
-75025
-; 105.012ms
-> :tier vm
-tier: vm
-vm> :time (fib 25)
-75025
-; 38.940ms
-```
+| Command            | Effect                                          |
+|--------------------|-------------------------------------------------|
+| `:help`            | List commands                                   |
+| `:quit`            | Exit (also `^D`)                                |
+| `:tier walker\|vm\|vm-jit` | Switch execution tier                    |
+| `:time <expr>`     | Evaluate and print wall-clock time              |
+| `:load <path>`     | Load and run a Scheme file in this session      |
+| `:reset`           | Reinitialize the runtime, dropping definitions  |
 
 ## Architecture
 
-Crate layout:
+```
+                ┌────────────────────────────┐
+   source ──▶  │ cs-lex → cs-parse → cs-expand│
+                └─────────────┬──────────────┘
+                              │ CoreExpr
+              ┌───────────────┼───────────────────┐
+              ▼               ▼                   ▼
+       cs-runtime          cs-vm           cs-rir + cs-jit-cranelift
+       (tree-walker)    (bytecode VM)        (Cranelift JIT, native)
+                              │
+                              └──▶ cs-aot ─▶ Rust source ─▶ rustc ─▶ static binary
+```
 
-| Crate | Purpose |
-|---|---|
-| `cs-core` | Universal `Value` enum, `Symbol`/`SymbolTable`, numeric tower, eq/eqv/equal |
-| `cs-diag` | Spans, source map, diagnostic rendering |
-| `cs-lex` | Tokenizer |
-| `cs-parse` | Reader producing `Datum` from token stream |
-| `cs-ir` | `CoreExpr` — post-expansion AST |
-| `cs-expand` | Macro expander (R6RS `syntax-rules`, derived forms) |
-| `cs-runtime` | Tree-walking interpreter, environments, ~80 builtins |
-| `cs-vm` | Stack-based bytecode VM with const-folded globals |
-| `cs-cli` | `crabscheme` binary (REPL, `-e`, `run`) |
+| Crate                 | Purpose                                                  |
+|-----------------------|----------------------------------------------------------|
+| `cs-core`             | Universal `Value`, `Symbol`, numeric tower, eq/eqv/equal |
+| `cs-diag`             | Spans, source map, diagnostic rendering                  |
+| `cs-lex` / `cs-parse` | Tokenizer + reader producing `Datum`                     |
+| `cs-ir`               | `CoreExpr` — post-expansion AST                          |
+| `cs-expand`           | R6RS `syntax-rules` macro expander                       |
+| `cs-runtime`          | Tree-walking interpreter, environments, builtins         |
+| `cs-vm`               | Stack-based bytecode VM with NB-typed values             |
+| `cs-gc`               | Precise tracing GC (`Gc<T>` smart pointer)               |
+| `cs-rir`              | RIR — the JIT/AOT-shared regional IR                     |
+| `cs-jit`              | JIT trait + tier abstraction                             |
+| `cs-jit-cranelift`    | Cranelift backend (native codegen)                       |
+| `cs-aot`              | AOT compiler: RIR → Rust source → static binary          |
+| `cs-ffi` / `cs-ffi-*` | Trait FFI + libloading FFI + macros + example plugins    |
+| `cs-cli`              | `crabscheme` binary (REPL, `-e`, `run`)                  |
 
-Both interpreters dispatch to the same `cs-core::Value` types and call into
-the same `cs-runtime` builtins where possible. The VM has an HO-bridge layer
-(`vm_call_sync`) that re-enters the VM for each closure invocation from a
-higher-order builtin.
+All tiers dispatch to the same `cs-core::Value`; the VM and JIT share
+a NaN-boxed compact representation (`cs_vm::vm::NanboxValue`). AOT-NB
+binaries link `cs-vm` for runtime helpers; AOT-RawI64 binaries are
+fully self-contained.
 
 ## Testing
 
 ```bash
-# Full workspace test suite (~205 Rust tests + 33 VM conformance + 33 walker conformance).
-cargo test --workspace
+# Full workspace test suite (24 test executables).
+cargo test --workspace --release
 
-# Performance baseline (native Rust vs walker vs VM).
-cargo test --release --test perf_baseline -- --ignored --nocapture
+# Native conformance — 117 fixtures, 117/117 pass.
+cargo test -p cs-cli --test conformance
+
+# WASM conformance — 117 fixtures, 2,464/0/0 via wasmtime.
+bash bench/wasm-conformance.sh
+
+# AOT pipeline — factorial + fib compile to standalone binaries.
+cargo test -p cs-aot
+
+# Microbench cross-implementation perf table.
+bash bench/microbench/run.sh
 ```
-
-Differential testing: every conformance file runs through both tiers and
-their pass counts must match exactly. The VM is ~3× faster than the walker
-across the suite.
 
 ## Performance
 
-Release-mode benchmarks vs native hand-rolled Rust (lower is better):
+### Microbench (median of 3, seconds)
 
-| Workload | Native Rust | Walker | VM | VM/Walker |
-|---|---|---|---|---|
-| `fib(25)` recursive | 150 µs | 105 ms | 39 ms | 2.7× |
-| `loop 100k` (tail-call) | 8 ns | 47 ms | 16 ms | 2.9× |
-| `ackermann(3,6)` | 410 µs | 91 ms | 32 ms | 2.8× |
-| `fold-left + 0 (range 10k)` | 2.7 µs | 6.0 ms | 2.7 ms | 2.4× |
-| `(map (lambda (x) (* x x)) (range 1k))` | 130 ns | 760 µs | 400 µs | 1.9× |
+```
+benchmark        walker     vm        jit       chez      guile     gambit    rust-O
+fib              0.752      0.022     0.008     0.040     0.054     0.044     0.008
+tak              0.042      0.015     0.008     0.031     0.020     0.011     0.008
+ack              0.091      0.020     0.008     0.032     0.019     0.016     0.008
+nqueens          0.098      0.029     0.023     0.033     0.019     0.016     0.009
+mandelbrot       0.297      0.070     0.015     0.036     0.031     0.038     0.008
+spectral-norm    0.259      0.081     0.017     0.036     0.021     0.028     0.008
+binary-trees     0.125      0.049     0.016     ERR       ERR       0.019     0.009
+alloc-stress    0.116      0.033     0.020     0.032     0.019     0.017     0.012
+```
 
-Interpreter overhead vs native Rust ranges from ~200× (fib) to ~5M× (the
-trivial `loop` workload, where the native loop is just `acc++; n--`).
-There's plenty of headroom for a future JIT to capture.
+CrabScheme JIT beats Chez (~2.6× geomean), Guile (~1.4×) and
+Gambit-interp (~1.4×) across the suite. See
+[`docs/adr/0013-perf-gate-reframe.md`](docs/adr/0013-perf-gate-reframe.md)
+for the three ADR-0013 perf gates and `bench/microbench/run.sh` for
+the harness.
+
+### AOT (fib(40), best-of-3)
+
+| Binary                          | fib(40) | Notes                                      |
+|---------------------------------|--------:|--------------------------------------------|
+| Reference `rustc -O fib.rs`     |  0.15 s | Hand-written Rust baseline                 |
+| cs-aot **RawI64** ABI           |  0.14 s | Self-contained, no runtime dep             |
+| cs-aot **Nb** ABI (post-RC2)    |  0.29 s | 1.93× of rustc-O; NB Fixnum fast-path inlined |
+
+See
+[`docs/measurements/2026-05-16-rc2-aot-nb-inline.md`](docs/measurements/2026-05-16-rc2-aot-nb-inline.md)
+for the AOT NB inline-fast-path numbers.
+
+## Documentation
+
+- **[ROADMAP.md](ROADMAP.md)** — milestone plan + RC posture.
+- **[docs/milestones/](docs/milestones/)** — per-milestone exit reports.
+  Notable: `m6-phase6-exit.md` (Phase 6 JIT close), `m10-trackW-exit.md`
+  (WASM ship), `m10-trackA-exit.md` (AOT ship).
+- **[docs/adr/](docs/adr/)** — architecture decisions. Notable: ADR
+  0013 (perf-gate reframe), ADR 0009 (HolyJIT parked).
+- **[docs/measurements/](docs/measurements/)** — perf + conformance
+  measurement snapshots.
 
 ## License
 
-TBD.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  http://opensource.org/licenses/MIT)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms
+or conditions.
