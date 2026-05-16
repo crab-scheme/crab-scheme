@@ -4988,14 +4988,14 @@ impl Lowerer {
                     }
                 }
             }
+            // All current `Term` variants are supported in uniform-NB.
+            // If a new variant is added to cs-rir, this match becomes
+            // non-exhaustive and rustc fails the build — preferable to
+            // a runtime error during JIT lowering. (Earlier code had
+            // a defensive `other =>` arm here, but rustc flagged it
+            // unreachable since the explicit arm matches everything.)
             match &blk.terminator {
                 Term::Return(_) | Term::Jump(_, _) | Term::Branch(_, _, _) => {}
-                other => {
-                    return Err(JitError::Unsupported(format!(
-                        "uniform-nb: Term {:?} not yet supported",
-                        other
-                    )));
-                }
             }
         }
 
@@ -6719,8 +6719,17 @@ struct NbHelpers {
     div: cranelift_codegen::ir::FuncRef,
     lt: cranelift_codegen::ir::FuncRef,
     eq: cranelift_codegen::ir::FuncRef,
+    // `le`, `gt`, `ge` are wired through but not currently emitted —
+    // the translator lowers `(> a b)` and `(>= a b)` by swapping
+    // operands and calling `lt`/`le`. Keeping the FuncRefs declared
+    // means a future code-path that wants direct calls can use them
+    // without revisiting the helper-registration plumbing. (Without
+    // #[allow(dead_code)] the compiler flags these unread.)
+    #[allow(dead_code)]
     le: cranelift_codegen::ir::FuncRef,
+    #[allow(dead_code)]
     gt: cranelift_codegen::ir::FuncRef,
+    #[allow(dead_code)]
     ge: cranelift_codegen::ir::FuncRef,
     // Pair primitives.
     alloc_pair: cranelift_codegen::ir::FuncRef,

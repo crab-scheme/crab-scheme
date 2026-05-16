@@ -23,7 +23,7 @@ use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
-use cs_core::{Procedure, Symbol, Value};
+use cs_core::{Symbol, Value};
 use cs_rir::inline::{analyze_for_inline, splice_single_block, SpliceRequest};
 use cs_rir::{Block, BlockId, Const, Function, Inst as RirInst, Term, Type, Value as RirValue};
 
@@ -5608,11 +5608,19 @@ pub fn bytecode_to_rir_full(
                                     // contract), so any predicate that
                                     // discriminates "is this a non-numeric
                                     // type?" reduces to Const(0).
+                                    // `vector?` removed from the alternation:
+                                    // the unconditional `("vector?", 1) => ...`
+                                    // arm above matches first, making the
+                                    // entry here dead (rustc unreachable_
+                                    // patterns lint). Other predicates here
+                                    // are still reachable — their earlier
+                                    // arms have `if arg0 == Type::Any`
+                                    // guards, so non-Any operands fall
+                                    // through to this always-false fallback.
                                     ("pair?", 1)
                                     | ("null?", 1)
                                     | ("symbol?", 1)
                                     | ("string?", 1)
-                                    | ("vector?", 1)
                                     | ("bytevector?", 1)
                                     | ("procedure?", 1)
                                     | ("port?", 1)
