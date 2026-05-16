@@ -8,20 +8,41 @@
 `crabscheme aot bench/microbench/scheme/<bench>.scm --entry <fn> --build`
 on the 8 microbenches shipped in `bench/microbench/scheme/`:
 
-| Bench           | AOT? | Time at canonical N | Blocker if not                             |
-|-----------------|------|---------------------|--------------------------------------------|
-| fib             | ✅   | 0.03 s @ fib(35)    | —                                          |
-| ack             | ✅   | 0.00 s @ ack(3,6)   | —                                          |
-| tak             | ❌   | —                   | `Inst::EnvLookupAny` (deep nested self-call) |
-| nqueens         | ❌   | —                   | `Inst::EnvDefineLocal` (internal lets)     |
-| mandelbrot      | ❌   | —                   | `Inst::EnvDefineLocal`                     |
-| spectral-norm   | ❌   | —                   | `Inst::MakeClosure` (nested lambdas)       |
-| binary-trees    | ❌   | —                   | `Inst::EnvDefineLocal`                     |
-| alloc-stress    | ❌   | —                   | `Inst::EnvDefineLocal`                     |
+| Bench           | AOT? | Time at canonical N | Blocker if not (post-iter-J) |
+|-----------------|------|---------------------|------------------------------|
+| fib             | ✅   | 0.03 s @ fib(35)    | —                            |
+| ack             | ✅   | 0.00 s @ ack(3,6)   | —                            |
+| tak             | ❌   | —                   | `EnvLookupAny` (multi-block — demote skipped) |
+| nqueens         | ❌   | —                   | `MakeClosure` (nested lambdas) |
+| mandelbrot      | ❌   | —                   | `MakeClosure`                |
+| spectral-norm   | ❌   | —                   | demote edge case (chained aliases — single-block + use-before-def) |
+| binary-trees    | ❌   | —                   | `MakeClosure`                |
+| alloc-stress    | ❌   | —                   | `MakeClosure`                |
 
 2 / 8 AOT cleanly today. The 6 that don't surface the exact RIR
 `Inst` variant cs-aot doesn't yet handle — each one is the iter
 that adds it.
+
+### Iter-J update (commit `c1c8222`)
+
+RC2 iter J landed `bytecode_to_rir_aot` + identity-in-NB Inst
+lowering (BoxTyped/AnyToFix/AnyToBool/AnyToFlo/AnyTruthy/FixToFlo/
+IntCharBitcast), which AOT-enables `let`-binding programs. The
+shifted blocker map:
+
+|                              | Pre-iter-J | Post-iter-J |
+|------------------------------|------------|-------------|
+| `EnvDefineLocal` blockers    | 4 benches  | 0           |
+| `EnvLookupAny` blockers      | 1 bench    | 1 (tak — multi-block, demote skipped) |
+| `MakeClosure` blockers       | 1 bench    | 4 (nqueens, mandelbrot, binary-trees, alloc-stress — newly visible after EnvDefineLocal fix) |
+| Demote-pass edge case        | 0          | 1 (spectral-norm) |
+
+External OK count unchanged (still 2/8) because the four
+EnvDefineLocal-blocked benches also have nested lambdas — the
+iter-J fix exposed the OTHER reason they don't AOT. But pure
+`let`-using programs without nested lambdas now AOT (proven by
+`source_to_aot_function_with_let_binding` +
+`source_to_aot_function_with_nested_lets` tests).
 
 `nbody.scm` not in the table — it uses top-level vector globals,
 which AOT can't drive from CLI args (extracting one lambda by
