@@ -15,6 +15,11 @@ cs-rir = { workspace = true }
 # Dev-only because cs-aot itself doesn't depend on the runtime —
 # it just emits source that references the runtime's public API.
 cs-vm = { workspace = true }
+# RC2 iter E — bytecode_pipeline tests build a CompiledLambda
+# (needs cs-core's Value/Symbol/Number + cs-diag's Span) and pipe
+# it through cs-vm's bytecode_to_rir into cs-aot's project emitter.
+cs-core = { workspace = true }
+cs-diag = { workspace = true }
 # `syn` parses the emitted Rust source as a sanity check that we
 # produce well-formed code, separate from compilation tests that
 # actually invoke rustc on the output.
