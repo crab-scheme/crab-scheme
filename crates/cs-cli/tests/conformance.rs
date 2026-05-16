@@ -591,6 +591,51 @@ fn conformance_cond_expand_assert() {
     run_conformance_file("cond_expand_assert.scm");
 }
 
+// ---------------------------------------------------------------------
+// Post-M10 cleanup (2026-05-16): wire the 5 remaining unwired fixtures
+// per the "always wire fixtures into the runner" lesson from the
+// cond-expand-library silent-failure bug.
+// ---------------------------------------------------------------------
+
+#[test]
+fn conformance_call_cc() {
+    // Exercises call/cc escape continuations on the walker tier.
+    // Independent of the M8 first-class call/cc work (that's about
+    // the VM tier); the walker has always supported escape
+    // continuations via direct host-stack unwind.
+    run_conformance_file("call_cc.scm");
+}
+
+#[test]
+fn conformance_case_lambda() {
+    // case-lambda arity-dispatched procedures, including rest patterns.
+    run_conformance_file("case_lambda.scm");
+}
+
+#[test]
+fn conformance_jit_cross_lambda_loop() {
+    // Regression test for the cross-lambda Fixnum-return loop bug
+    // (docs/research/jit_loop_cross_lambda_bug.md). The fix landed
+    // in M6 Phase 4 iter 3 via BoxTyped support in uniform-NB; this
+    // fixture pins the test so re-introducing the bug fails CI.
+    run_conformance_file("jit_cross_lambda_loop.scm");
+}
+
+#[test]
+fn conformance_named_let_assert() {
+    // Named-let smoke (sum / list-build / fact) + `assert` semantics
+    // (truthy returns unspecified; falsy raises a condition).
+    run_conformance_file("named_let_assert.scm");
+}
+
+#[test]
+fn conformance_enumerations() {
+    // (rnrs enums) — R6RS §13. Per the fixture header it was
+    // expected to error pre-M9 iter 2, but landed alongside the
+    // M9 foundation builtins. Wiring it in pins coverage.
+    run_conformance_file("enumerations.scm");
+}
+
 #[test]
 fn conformance_r7rs_bytevector_list() {
     run_conformance_file("r7rs_bytevector_list.scm");
@@ -787,6 +832,11 @@ fn conformance_aggregate_count() {
                 "macros.scm",
                 "macros2.scm",
                 "macro_hygiene.scm",
+                "call_cc.scm",
+                "case_lambda.scm",
+                "jit_cross_lambda_loop.scm",
+                "named_let_assert.scm",
+                "enumerations.scm",
             ];
             let mut total_pass = 0u64;
             for f in files {
