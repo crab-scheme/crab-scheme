@@ -38,6 +38,11 @@
     guile_3_0 # GNU Guile (R7RS-ish via #!r7rs)
     gambit # gsi for Gambit Scheme
     racket # Racket — needed for R6RS conformance suite measurement
+
+    # M10 Track W (WASM) — runtime for executing the wasm32-wasip1
+    # build of crabscheme. W3 smoke test + W4 conformance run use
+    # `wasmtime run target/wasm32-wasip1/release/crabscheme.wasm`.
+    wasmtime
   ];
 
   # ---- scripts ------------------------------------------------------------
