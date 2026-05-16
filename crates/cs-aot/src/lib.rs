@@ -604,6 +604,423 @@ fn inst_rhs(
             (*dst, format!("v{}", src.0))
         }
 
+        // ---- Identity-in-NB ops (RC2 iter J) ----
+        //
+        // In the uniform-NB ABI cs-aot's Nb mode shares with the JIT,
+        // these box/unbox/bitcast Insts are all no-ops because every
+        // typed-lane value is already an NB carrier with its proper
+        // tag. The JIT's lowering at cs-jit-cranelift/src/lowering.rs
+        // explicitly comments "BoxTyped is an identity in uniform-NB"
+        // and groups the rest of this set under the same identity arm.
+        // cs-aot mirrors that — emit as Move.
+        //
+        // In RawI64 mode these don't have a defined meaning (RawI64
+        // doesn't track NB tags), so we accept the identity emission
+        // as the natural fallback; callers using RawI64 shouldn't be
+        // feeding it programs that rely on Any/Fixnum unboxing.
+        (Inst::AnyToFix(dst, src), _)
+        | (Inst::AnyToBool(dst, src), _)
+        | (Inst::AnyToFlo(dst, src), _)
+        | (Inst::AnyTruthy(dst, src), _)
+        | (Inst::FixToFlo(dst, src), _)
+        | (Inst::IntCharBitcast(dst, src), _) => {
+            check(*src)?;
+            (*dst, format!("v{}", src.0))
+        }
+        (Inst::BoxTyped(dst, src, _tag), _) => {
+            check(*src)?;
+            (*dst, format!("v{}", src.0))
+        }
+
+        // ---- Type predicates (RC2 iter L) ----
+        //
+        // Each lowers to a single runtime-helper call returning 0/1
+        // i64 (the helpers themselves are bool-as-i64, not NB-encoded).
+        // RawI64 mode passes through; Nb mode wraps with the OR-with-
+        // NB_FALSE_BITS trick so the result is an NB Boolean usable
+        // by Branch and downstream consumers.
+        (Inst::PairP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_pair_p_gc", src, m))
+        }
+        (Inst::NullP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_null_p_gc", src, m))
+        }
+        (Inst::VecP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_vector_p_gc", src, m))
+        }
+        (Inst::ProcedureP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_procedure_p_gc", src, m))
+        }
+        (Inst::SymbolP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_symbol_p_gc", src, m))
+        }
+        (Inst::FixnumP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_fixnum_p_gc", src, m))
+        }
+        (Inst::FlonumP(dst, src), m) => {
+            check(*src)?;
+            (*dst, tpred_rust("vm_flonum_p_gc", src, m))
+        }
+
+        // ---- Vector primitives (RC2 iter M) ----
+        //
+        // All call into cs-vm's `vm_*_vector_*_gc` runtime helpers.
+        // Operands and results are NB carriers (Gc handles for the
+        // vector, Fixnum-NB for indices/length, NB Any for values).
+        // Identical lowering in both EmitModes because the heap
+        // helpers operate on NB carriers regardless of the caller's
+        // ABI choice.
+        //
+        // VecAlloc: `dst = make-vector(n, fill)` — n is Fixnum, fill
+        // is Any (defaulting to Unspecified via the bytecode
+        // compiler's desugaring), dst is a vector Gc handle.
+        (Inst::VecAlloc(dst, n, fill), _) => {
+            check(*n)?;
+            check(*fill)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_alloc_vector_gc(v{}, v{}) }}",
+                    n.0, fill.0
+                ),
+            )
+        }
+        (Inst::VecRef(dst, vec, idx), _) => {
+            check(*vec)?;
+            check(*idx)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_vector_ref_gc(v{}, v{}) }}",
+                    vec.0, idx.0
+                ),
+            )
+        }
+        (Inst::VecSet(dst, vec, idx, val), _) => {
+            check(*vec)?;
+            check(*idx)?;
+            check(*val)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_vector_set_gc(v{}, v{}, v{}) }}",
+                    vec.0, idx.0, val.0
+                ),
+            )
+        }
+        (Inst::VecLength(dst, vec), _) => {
+            check(*vec)?;
+            (
+                *dst,
+                format!("unsafe {{ cs_vm::vm::vm_vector_length_gc(v{}) }}", vec.0),
+            )
+        }
+
+        // ---- Pair primitives (RC2 iter N) ----
+        //
+        // Cons takes per-operand tag bytes (NB JIT_RT_* values
+        // embedded at translate time) that vm_alloc_pair_gc passes
+        // to the underlying allocator. car/cdr are simple slot
+        // accessors via the *_gc helpers.
+        (Inst::Cons(dst, car_v, car_tag, cdr_v, cdr_tag), _) => {
+            check(*car_v)?;
+            check(*cdr_v)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_alloc_pair_gc(v{}, {}u8, v{}, {}u8) }}",
+                    car_v.0, car_tag, cdr_v.0, cdr_tag
+                ),
+            )
+        }
+        (Inst::Car(dst, pair), _) => {
+            check(*pair)?;
+            (
+                *dst,
+                format!("unsafe {{ cs_vm::vm::vm_pair_car_gc(v{}) }}", pair.0),
+            )
+        }
+        (Inst::Cdr(dst, pair), _) => {
+            check(*pair)?;
+            (
+                *dst,
+                format!("unsafe {{ cs_vm::vm::vm_pair_cdr_gc(v{}) }}", pair.0),
+            )
+        }
+
+        // ---- Equality predicates (RC2 iter S) ----
+        //
+        // EqAny / EqualAny both call cs-vm runtime helpers and
+        // return 0/1 i64. Same NB-Boolean wrap pattern as iter L's
+        // type predicates.
+        (Inst::EqAny(dst, lhs, rhs), m) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            let call = format!(
+                "unsafe {{ cs_vm::vm::vm_eq_any_gc(v{}, v{}) }}",
+                lhs.0, rhs.0
+            );
+            let expr = match m {
+                EmitMode::RawI64 => call,
+                EmitMode::Nb => {
+                    format!("(({call} as u64) | 0xfff8_8000_0000_0000u64) as i64")
+                }
+            };
+            (*dst, expr)
+        }
+        (Inst::EqualAny(dst, lhs, rhs), m) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            let call = format!(
+                "unsafe {{ cs_vm::vm::vm_equal_gc(v{}, v{}) }}",
+                lhs.0, rhs.0
+            );
+            let expr = match m {
+                EmitMode::RawI64 => call,
+                EmitMode::Nb => {
+                    format!("(({call} as u64) | 0xfff8_8000_0000_0000u64) as i64")
+                }
+            };
+            (*dst, expr)
+        }
+
+        // ---- AnyClone (RC2 iter T) ----
+        //
+        // Bumps the refcount on an Any-tagged box. Lowers to
+        // `vm_value_clone_gc(r)` which returns a fresh handle with
+        // an incremented refcount on the same payload. Used when a
+        // value needs to be consumed twice (e.g., passed to two
+        // different runtime helpers).
+        (Inst::AnyClone(dst, src), _) => {
+            check(*src)?;
+            (
+                *dst,
+                format!("unsafe {{ cs_vm::vm::vm_value_clone_gc(v{}) }}", src.0),
+            )
+        }
+
+        // ---- Division ----
+        //
+        // RawI64 mode: integer division via `wrapping_div`. Panics on
+        // /0 and on i64::MIN/-1 — both are caller errors, same shape
+        // as Rust's stdlib `/` operator. Different semantics from
+        // Scheme `(/ a b)` which can produce a Rational; RawI64 is
+        // explicitly the unboxed-fixnum lane.
+        //
+        // Nb mode: delegate to vm_value_div_nb. Per cs-rir's Div doc,
+        // there's no inline fast path because Fixnum/Fixnum can
+        // produce a Rational (R6RS exact division), which doesn't
+        // fit the NB Fixnum lane — always slow-path.
+        (Inst::Div(dst, lhs, rhs), EmitMode::RawI64) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, format!("v{}.wrapping_div(v{})", lhs.0, rhs.0))
+        }
+        (Inst::Div(dst, lhs, rhs), EmitMode::Nb) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_value_div_nb(v{}, v{}) }}",
+                    lhs.0, rhs.0
+                ),
+            )
+        }
+
+        // ---- Flonum arithmetic ----
+        //
+        // Both modes use the same emission: bitcast both i64 operands
+        // to f64, apply the IEEE-754 op, bitcast result back to i64.
+        // Matches the JIT's `fbinop` shape (cs-jit-cranelift/src/
+        // lowering.rs).
+        //
+        // NB carrier note: NB Flonum encoding is raw f64 bits unless
+        // the bit pattern collides with the tagged-NaN range, in
+        // which case the runtime canonicalizes to `NB_NAN_BITS`. The
+        // emitter doesn't do that canonicalization here — same as
+        // the JIT — so arith producing such a NaN can in theory
+        // round-trip as a "tagged" pattern. Practically, normal
+        // arith never produces a sign=1 quiet NaN; the only path
+        // is explicit `f64::from_bits(0xFFF8_...)` operands.
+        (Inst::FlonumAdd(dst, lhs, rhs), _) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fbinop_rust("+", lhs, rhs))
+        }
+        (Inst::FlonumSub(dst, lhs, rhs), _) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fbinop_rust("-", lhs, rhs))
+        }
+        (Inst::FlonumMul(dst, lhs, rhs), _) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fbinop_rust("*", lhs, rhs))
+        }
+        (Inst::FlonumDiv(dst, lhs, rhs), _) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fbinop_rust("/", lhs, rhs))
+        }
+
+        // ---- Flonum comparisons ----
+        //
+        // IEEE-754 ordering, distinct from `Lt`/`Eq` which would
+        // compare bit patterns and mishandle -0.0 / NaN. Result is:
+        //   RawI64: 0/1 i64 (matches non-Flonum cmp emission).
+        //   Nb:     NB Boolean — encoded by ORing the {0,1} compare
+        //           result with NB_FALSE_BITS so 0→NB_FALSE and
+        //           1→NB_TRUE. Mirrors the JIT's FlonumLt lowering.
+        (Inst::FlonumLt(dst, lhs, rhs), EmitMode::RawI64) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fcmp_raw_rust("<", lhs, rhs))
+        }
+        (Inst::FlonumEq(dst, lhs, rhs), EmitMode::RawI64) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fcmp_raw_rust("==", lhs, rhs))
+        }
+        (Inst::FlonumLt(dst, lhs, rhs), EmitMode::Nb) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fcmp_nb_rust("<", lhs, rhs))
+        }
+        (Inst::FlonumEq(dst, lhs, rhs), EmitMode::Nb) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fcmp_nb_rust("==", lhs, rhs))
+        }
+
+        // ---- Flonum unary ops (RC2 iter D) ----
+        //
+        // All lower to Rust stdlib f64 methods. The JIT uses
+        // Cranelift intrinsics for sqrt/abs/floor/ceil/trunc/round
+        // (single x86 instructions) and runtime-helper calls for
+        // the transcendentals — `rustc -O` produces equivalent
+        // code for the AOT case (calls into libm for the
+        // transcendentals, single instructions for the cheap ones).
+        // Identical in both EmitModes; operand and dst are i64
+        // carriers of f64 bit patterns.
+        (Inst::FlonumSqrt(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("sqrt", src))
+        }
+        (Inst::FlonumAbs(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("abs", src))
+        }
+        (Inst::FlonumFloor(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("floor", src))
+        }
+        (Inst::FlonumCeil(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("ceil", src))
+        }
+        (Inst::FlonumTrunc(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("trunc", src))
+        }
+        (Inst::FlonumRound(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("round", src))
+        }
+        (Inst::FlonumSin(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("sin", src))
+        }
+        (Inst::FlonumCos(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("cos", src))
+        }
+        (Inst::FlonumTan(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("tan", src))
+        }
+        (Inst::FlonumLog(dst, src), _) => {
+            check(*src)?;
+            // Scheme `log` is the natural log → Rust's `f64::ln`.
+            (*dst, funary_rust_method("ln", src))
+        }
+        (Inst::FlonumExp(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("exp", src))
+        }
+        (Inst::FlonumAsin(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("asin", src))
+        }
+        (Inst::FlonumAcos(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("acos", src))
+        }
+        (Inst::FlonumAtan(dst, src), _) => {
+            check(*src)?;
+            (*dst, funary_rust_method("atan", src))
+        }
+
+        // ---- Flonum binary ops (RC2 iter D) ----
+        (Inst::FlonumMax(dst, lhs, rhs), _) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fbinop_method_rust("max", lhs, rhs))
+        }
+        (Inst::FlonumMin(dst, lhs, rhs), _) => {
+            check(*lhs)?;
+            check(*rhs)?;
+            (*dst, fbinop_method_rust("min", lhs, rhs))
+        }
+        // Per the JIT lowering, all three are (dst, n, base) shape.
+        // Rust stdlib mappings:
+        //   FlonumLog2 → n.log(base)  (log base `base` of n)
+        //   FlonumAtan2 → n.atan2(base)
+        //   FlonumExpt  → n.powf(base)
+        (Inst::FlonumLog2(dst, n, base), _) => {
+            check(*n)?;
+            check(*base)?;
+            (*dst, fbinop_method_rust("log", n, base))
+        }
+        (Inst::FlonumAtan2(dst, n, base), _) => {
+            check(*n)?;
+            check(*base)?;
+            (*dst, fbinop_method_rust("atan2", n, base))
+        }
+        (Inst::FlonumExpt(dst, n, base), _) => {
+            check(*n)?;
+            check(*base)?;
+            (*dst, fbinop_method_rust("powf", n, base))
+        }
+
+        // ---- Flonum predicates (RC2 iter D) ----
+        //
+        // is_nan + is_infinite return bool. Encode the same way as
+        // FlonumLt/Eq: 0/1 i64 in RawI64 mode; (cmp | NB_FALSE_BITS)
+        // in Nb mode.
+        (Inst::FlonumIsNan(dst, src), EmitMode::RawI64) => {
+            check(*src)?;
+            (*dst, fpredicate_raw_rust("is_nan", src))
+        }
+        (Inst::FlonumIsInfinite(dst, src), EmitMode::RawI64) => {
+            check(*src)?;
+            (*dst, fpredicate_raw_rust("is_infinite", src))
+        }
+        (Inst::FlonumIsNan(dst, src), EmitMode::Nb) => {
+            check(*src)?;
+            (*dst, fpredicate_nb_rust("is_nan", src))
+        }
+        (Inst::FlonumIsInfinite(dst, src), EmitMode::Nb) => {
+            check(*src)?;
+            (*dst, fpredicate_nb_rust("is_infinite", src))
+        }
+
         // ---- CallSelf (recursive call) ----
         //
         // Both modes lower identically: a direct Rust call to the
@@ -699,6 +1116,95 @@ fn emit_terminator(
     Ok(())
 }
 
+/// Emit a Flonum binary op as a Rust expression. The two operands
+/// are i64 carriers of f64 bit patterns; emit
+/// `(f64::from_bits(va as u64) <op> f64::from_bits(vb as u64))
+/// .to_bits() as i64`. Identical in both EmitModes.
+fn fbinop_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
+    format!(
+        "(f64::from_bits(v{l} as u64) {op} f64::from_bits(v{r} as u64)).to_bits() as i64",
+        l = lhs.0,
+        r = rhs.0,
+        op = op,
+    )
+}
+
+/// RawI64-mode Flonum comparison: result is 0/1 i64.
+fn fcmp_raw_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
+    format!(
+        "if f64::from_bits(v{l} as u64) {op} f64::from_bits(v{r} as u64) {{ 1 }} else {{ 0 }}",
+        l = lhs.0,
+        r = rhs.0,
+        op = op,
+    )
+}
+
+/// Nb-mode Flonum comparison: result is an NB Boolean encoded by
+/// OR'ing the (0|1) compare with `NB_FALSE_BITS` — so 0→NB_FALSE,
+/// 1→NB_TRUE. Mirrors the JIT's FlonumLt lowering shape.
+fn fcmp_nb_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
+    format!(
+        "((if f64::from_bits(v{l} as u64) {op} f64::from_bits(v{r} as u64) {{ 1u64 }} else {{ 0u64 }}) | 0xfff8_8000_0000_0000u64) as i64",
+        l = lhs.0,
+        r = rhs.0,
+        op = op,
+    )
+}
+
+/// Flonum unary method call: `f64::from_bits(v0 as u64).METHOD()
+/// .to_bits() as i64`. Used for sqrt/abs/floor/ceil/trunc/round/sin/
+/// cos/tan/ln/exp/asin/acos/atan.
+fn funary_rust_method(method: &str, src: &Value) -> String {
+    format!(
+        "f64::from_bits(v{s} as u64).{method}().to_bits() as i64",
+        s = src.0,
+        method = method,
+    )
+}
+
+/// Flonum binary method call: `lhs.METHOD(rhs)` shape. Used for
+/// max/min/log (base)/atan2/powf.
+fn fbinop_method_rust(method: &str, lhs: &Value, rhs: &Value) -> String {
+    format!(
+        "f64::from_bits(v{l} as u64).{method}(f64::from_bits(v{r} as u64)).to_bits() as i64",
+        l = lhs.0,
+        r = rhs.0,
+        method = method,
+    )
+}
+
+/// RawI64-mode Flonum predicate (`is_nan` / `is_infinite`): result
+/// is 0/1 i64.
+fn fpredicate_raw_rust(method: &str, src: &Value) -> String {
+    format!(
+        "if f64::from_bits(v{s} as u64).{method}() {{ 1 }} else {{ 0 }}",
+        s = src.0,
+        method = method,
+    )
+}
+
+/// Nb-mode Flonum predicate: NB Boolean via OR-with-NB_FALSE.
+fn fpredicate_nb_rust(method: &str, src: &Value) -> String {
+    format!(
+        "((f64::from_bits(v{s} as u64).{method}() as u64) | 0xfff8_8000_0000_0000u64) as i64",
+        s = src.0,
+        method = method,
+    )
+}
+
+/// Type-predicate runtime-helper call (RC2 iter L).
+/// `helper_name` is one of the `vm_*_p_gc` functions in cs_vm::vm,
+/// each returning 0/1 i64 for the predicate result. RawI64 mode
+/// passes through; Nb mode encodes as NB Boolean via the same OR-
+/// with-NB_FALSE trick used for Lt/Eq results.
+fn tpred_rust(helper_name: &str, src: &Value, mode: EmitMode) -> String {
+    let call = format!("unsafe {{ cs_vm::vm::{helper_name}(v{}) }}", src.0);
+    match mode {
+        EmitMode::RawI64 => call,
+        EmitMode::Nb => format!("(({call} as u64) | 0xfff8_8000_0000_0000u64) as i64"),
+    }
+}
+
 /// The NB-encoded `#f` literal as a Rust source expression. Used by
 /// NB-mode Branch terminators for the truthiness test.
 fn nb_false_literal() -> &'static str {
@@ -713,10 +1219,67 @@ fn nb_false_literal() -> &'static str {
 fn inst_dst(inst: &Inst) -> Option<Value> {
     match inst {
         Inst::LoadConst(v, _) => Some(*v),
-        Inst::Add(v, _, _) | Inst::Sub(v, _, _) | Inst::Mul(v, _, _) => Some(*v),
+        Inst::Add(v, _, _) | Inst::Sub(v, _, _) | Inst::Mul(v, _, _) | Inst::Div(v, _, _) => {
+            Some(*v)
+        }
         Inst::Lt(v, _, _) | Inst::Eq(v, _, _) => Some(*v),
         Inst::Move(v, _) => Some(*v),
         Inst::CallSelf(v, _) => Some(*v),
+        // RC2 iter C — Flonum arith/cmp Insts.
+        Inst::FlonumAdd(v, _, _)
+        | Inst::FlonumSub(v, _, _)
+        | Inst::FlonumMul(v, _, _)
+        | Inst::FlonumDiv(v, _, _) => Some(*v),
+        Inst::FlonumLt(v, _, _) | Inst::FlonumEq(v, _, _) => Some(*v),
+        // RC2 iter J — identity-in-NB ops (BoxTyped, AnyTo*, FixToFlo,
+        // IntCharBitcast). All emit to a Move-style alias; their dst
+        // must be pre-declared for loop+match emission.
+        Inst::BoxTyped(v, _, _) => Some(*v),
+        Inst::AnyToFix(v, _)
+        | Inst::AnyToBool(v, _)
+        | Inst::AnyToFlo(v, _)
+        | Inst::AnyTruthy(v, _)
+        | Inst::FixToFlo(v, _)
+        | Inst::IntCharBitcast(v, _) => Some(*v),
+        // RC2 iter L — type predicates.
+        Inst::PairP(v, _)
+        | Inst::NullP(v, _)
+        | Inst::VecP(v, _)
+        | Inst::ProcedureP(v, _)
+        | Inst::SymbolP(v, _)
+        | Inst::FixnumP(v, _)
+        | Inst::FlonumP(v, _) => Some(*v),
+        // RC2 iter M — vector primitives.
+        Inst::VecAlloc(v, _, _)
+        | Inst::VecRef(v, _, _)
+        | Inst::VecSet(v, _, _, _)
+        | Inst::VecLength(v, _) => Some(*v),
+        // RC2 iter N — pair primitives.
+        Inst::Cons(v, _, _, _, _) | Inst::Car(v, _) | Inst::Cdr(v, _) => Some(*v),
+        // RC2 iter S — equality predicates on Any values.
+        Inst::EqAny(v, _, _) | Inst::EqualAny(v, _, _) => Some(*v),
+        // RC2 iter T — Any-handle refcount clone.
+        Inst::AnyClone(v, _) => Some(*v),
+        // RC2 iter D — Flonum unary / binary / predicate Insts.
+        Inst::FlonumSqrt(v, _)
+        | Inst::FlonumAbs(v, _)
+        | Inst::FlonumFloor(v, _)
+        | Inst::FlonumCeil(v, _)
+        | Inst::FlonumTrunc(v, _)
+        | Inst::FlonumRound(v, _)
+        | Inst::FlonumSin(v, _)
+        | Inst::FlonumCos(v, _)
+        | Inst::FlonumTan(v, _)
+        | Inst::FlonumLog(v, _)
+        | Inst::FlonumExp(v, _)
+        | Inst::FlonumAsin(v, _)
+        | Inst::FlonumAcos(v, _)
+        | Inst::FlonumAtan(v, _) => Some(*v),
+        Inst::FlonumMax(v, _, _) | Inst::FlonumMin(v, _, _) => Some(*v),
+        Inst::FlonumLog2(v, _, _) | Inst::FlonumAtan2(v, _, _) | Inst::FlonumExpt(v, _, _) => {
+            Some(*v)
+        }
+        Inst::FlonumIsNan(v, _) | Inst::FlonumIsInfinite(v, _) => Some(*v),
         // Any inst not in the supported set: returning None is fine
         // because the emitter rejects unsupported variants before
         // pre-declaration anyway. Keeps this helper lean.
@@ -1090,10 +1653,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_inst() {
-        // Inst::Div isn't yet handled (no plain integer-divide
-        // emitted yet; A2b adds it via NB-aware helper).
-        let mut f = Function::new("div");
+    fn div_raw_emits_wrapping_div() {
+        // RawI64 mode: Div compiles to `wrapping_div` (integer
+        // division with Rust's usual panic-on-zero / overflow
+        // semantics). Different shape from Add/Sub/Mul because
+        // there's no inline fast path possible in NB mode either
+        // (Fixnum/Fixnum can produce Rational).
+        let mut f = Function::new("d");
         f.params.push((Value(0), Type::Fixnum));
         f.params.push((Value(1), Type::Fixnum));
         f.entry = BlockId(0);
@@ -1103,8 +1669,160 @@ mod tests {
             insts: vec![Inst::Div(Value(2), Value(0), Value(1))],
             terminator: Term::Return(Value(2)),
         });
+        let src = emit(&f).unwrap();
+        assert!(src.contains("let v2: i64 = v0.wrapping_div(v1);"));
+    }
+
+    #[test]
+    fn div_nb_emits_runtime_helper() {
+        // Nb mode: Div always slow-pathed to vm_value_div_nb (per
+        // cs-rir's Div doc — Fixnum/Fixnum can produce a Rational
+        // which doesn't fit the NB Fixnum lane).
+        let mut f = Function::new("d_nb");
+        f.params.push((Value(0), Type::Fixnum));
+        f.params.push((Value(1), Type::Fixnum));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::Div(Value(2), Value(0), Value(1))],
+            terminator: Term::Return(Value(2)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(
+            src.contains("vm_value_div_nb"),
+            "Div in Nb mode should call vm_value_div_nb: {src}"
+        );
+    }
+
+    #[test]
+    fn flonum_arith_emits_bitcast_pattern() {
+        // FlonumAdd/Sub/Mul/Div lower identically in both modes:
+        // bitcast i64→f64, apply op, bitcast back via to_bits.
+        // Matches the JIT's fbinop helper in cs-jit-cranelift.
+        let mut f = Function::new("fadd");
+        f.params.push((Value(0), Type::Flonum));
+        f.params.push((Value(1), Type::Flonum));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::FlonumAdd(Value(2), Value(0), Value(1))],
+            terminator: Term::Return(Value(2)),
+        });
+        f.return_type = Type::Flonum;
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        // The exact f64::from_bits / .to_bits as i64 shape is the
+        // contract; downstream consumers depend on this being
+        // syntactically a pure expression (no helper call).
+        assert!(src.contains("f64::from_bits(v0 as u64)"));
+        assert!(src.contains("f64::from_bits(v1 as u64)"));
+        assert!(src.contains(".to_bits() as i64"));
+        assert!(src.contains(" + "));
+    }
+
+    #[test]
+    fn flonum_unary_emits_method_call() {
+        // RC2 iter D: FlonumSqrt → `f64::from_bits(...).sqrt().to_bits()
+        // as i64`. Same template for all the unary f64 methods.
+        let mut f = Function::new("rt");
+        f.params.push((Value(0), Type::Flonum));
+        f.return_type = Type::Flonum;
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::FlonumSqrt(Value(1), Value(0))],
+            terminator: Term::Return(Value(1)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(src.contains("f64::from_bits(v0 as u64).sqrt().to_bits() as i64"));
+    }
+
+    #[test]
+    fn flonum_binary_method_emits_method_call_chain() {
+        // FlonumExpt(dst, n, base) → n.powf(base) per cs-rir docs +
+        // JIT lowering.
+        let mut f = Function::new("p");
+        f.params.push((Value(0), Type::Flonum));
+        f.params.push((Value(1), Type::Flonum));
+        f.return_type = Type::Flonum;
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::FlonumExpt(Value(2), Value(0), Value(1))],
+            terminator: Term::Return(Value(2)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(src.contains(".powf(f64::from_bits(v1 as u64))"));
+    }
+
+    #[test]
+    fn flonum_predicate_nb_encodes_as_nb_boolean() {
+        // FlonumIsNan in Nb mode uses the same NB-Boolean OR-with-
+        // NB_FALSE_BITS encoding as FlonumLt.
+        let mut f = Function::new("nan_p");
+        f.params.push((Value(0), Type::Flonum));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::FlonumIsNan(Value(1), Value(0))],
+            terminator: Term::Return(Value(1)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(src.contains("f64::from_bits(v0 as u64).is_nan()"));
+        assert!(src.contains("0xfff8_8000_0000_0000u64"));
+    }
+
+    #[test]
+    fn flonum_cmp_nb_encodes_via_or_with_nb_false() {
+        // FlonumLt in Nb mode uses the OR-with-NB_FALSE_BITS trick
+        // the JIT uses: compare → {0,1} → | NB_FALSE → NB_BOOLEAN.
+        // Different shape from Lt/Eq because those go through the
+        // nb_lt_inline / nb_eq_inline helpers (Fixnum-typed fast
+        // path); FlonumLt is bit-pattern-bitcast → IEEE-754 cmp.
+        let mut f = Function::new("flt");
+        f.params.push((Value(0), Type::Flonum));
+        f.params.push((Value(1), Type::Flonum));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::FlonumLt(Value(2), Value(0), Value(1))],
+            terminator: Term::Return(Value(2)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(src.contains("0xfff8_8000_0000_0000u64"));
+        assert!(src.contains("f64::from_bits(v0 as u64)"));
+        assert!(src.contains(" < "));
+    }
+
+    #[test]
+    fn rejects_unsupported_inst() {
+        // `Call` (general procedure call) isn't yet handled — needs
+        // closure / Procedure-table support that's post-1.0 work.
+        // Used here as the canary that the unsupported-Inst error
+        // path still fires; the list of supported Insts grew in
+        // RC2 iter C (Div + FlonumArith landed).
+        let mut f = Function::new("call_unsup");
+        f.params.push((Value(0), Type::Procedure));
+        f.params.push((Value(1), Type::Fixnum));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::Call(Value(2), Value(0), vec![Value(1)])],
+            terminator: Term::Return(Value(2)),
+        });
         f.return_type = Type::Fixnum;
-        assert_eq!(emit(&f), Err(AotError::UnsupportedInst("Div")));
+        // Nb mode accepts any param/return type; that's the easier
+        // path to exercise the unsupported-Inst rejection.
+        assert_eq!(
+            emit_with(EmitMode::Nb, &f),
+            Err(AotError::UnsupportedInst("Call"))
+        );
     }
 
     #[test]

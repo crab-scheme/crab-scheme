@@ -28,3 +28,8 @@ Thumbs.db
 .devenv/
 .devenv.flake.nix
 .direnv/
+
+# RC2 iter G: `crabscheme aot prog.scm` emits to `<basename>-aot/`
+# by default. Ignore these tmp project directories so dev-loop
+# usage doesn't pollute the workspace.
+*-aot/

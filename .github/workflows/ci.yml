@@ -1,0 +1,83 @@
+name: ci
+
+# Pull-request + push-to-main / push-to-rc* gate. Catches build /
+# test regressions before they land. Separate from the release
+# workflow (which only fires on version tags); this one runs on
+# every code-changing event to keep the default and rc branches
+# green.
+#
+# Matrix: just ubuntu-x86_64 + macos-aarch64. Linux for the
+# common-denominator dev target; macos-aarch64 for the
+# Apple-Silicon dev box the maintainers work on. WASM build is
+# its own job (no test step — WASM-runtime testing happens
+# through bench/wasm-conformance.sh which needs wasmtime; that's
+# a separate weekly job, not part of every-PR CI).
+
+on:
+  push:
+    branches: [main, "rc*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.os }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build workspace
+        run: cargo build --workspace --release
+
+      - name: Run workspace tests
+        run: cargo test --workspace --release
+
+  wasm-build:
+    name: wasm32-wasip1 build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + wasm32-wasip1 target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          targets: wasm32-wasip1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-wasm
+
+      - name: Build wasm32-wasip1
+        # Confirms the no-default-features build still produces a
+        # valid WASM binary. Doesn't run it (no wasmtime on the
+        # runner by default; see bench/wasm-conformance.sh for the
+        # runtime sweep).
+        run: cargo build --target wasm32-wasip1 --release -p cs-cli --no-default-features

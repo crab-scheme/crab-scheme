@@ -411,6 +411,171 @@ fn aot_sq_nb_runs_correctly() {
     assert_eq!(run_aot_binary(&bin, &[12345]), 152399025);
 }
 
+/// Flonum kernel canary for RC2 iter C: `(define (energy x y)
+/// (+ (* x x) (* y y)))` lowered via FlonumMul + FlonumAdd. Proves
+/// the bitcast-f64-and-go pattern works end-to-end through the Nb
+/// ABI scaffold + the f64 NB encoding.
+fn build_aot_binary_flonum_nb(emitted: &str, fn_name: &str) -> PathBuf {
+    let pid = std::process::id();
+    let tmpdir = std::env::temp_dir().join(format!("cs-aot-nb-flonum-{fn_name}-{pid}"));
+    let _ = fs::remove_dir_all(&tmpdir);
+    fs::create_dir_all(tmpdir.join("src")).expect("create src");
+
+    let cs_aot_manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cs_vm_path = cs_aot_manifest_dir.parent().expect("crates/").join("cs-vm");
+
+    let pkg_name = format!("aot_nb_flonum_{fn_name}");
+    let bin_name = format!("aot_bin_{fn_name}");
+    let cargo_toml = format!(
+        r#"[package]
+name = "{pkg_name}"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+cs-vm = {{ path = "{cs_vm_path}" }}
+
+[[bin]]
+name = "{bin_name}"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+"#,
+        cs_vm_path = cs_vm_path.display(),
+    );
+    fs::write(tmpdir.join("Cargo.toml"), cargo_toml).expect("write Cargo.toml");
+
+    let mut src = String::from("#![allow(unused, unused_unsafe)]\n");
+    src.push_str(nb_helpers_source());
+    src.push_str(emitted);
+    src.push('\n');
+    src.push_str("use cs_vm::vm::NanboxValue;\n");
+    src.push_str("fn main() {\n");
+    src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
+    src.push_str("    let x = NanboxValue::flonum(args[1].parse::<f64>().unwrap()).into_raw();\n");
+    src.push_str("    let y = NanboxValue::flonum(args[2].parse::<f64>().unwrap()).into_raw();\n");
+    src.push_str(&format!("    let r: i64 = {fn_name}(x, y);\n"));
+    src.push_str("    let f = NanboxValue(r).as_flonum().expect(\"result is a Flonum\");\n");
+    src.push_str("    println!(\"{}\", f);\n");
+    src.push_str("}\n");
+    fs::write(tmpdir.join("src/main.rs"), &src).expect("write main.rs");
+
+    let workspace_root = cs_aot_manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    let target_dir = workspace_root.join("target/aot-nb-tests");
+    let output = Command::new("cargo")
+        .current_dir(&tmpdir)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .arg("build")
+        .arg("--release")
+        .arg("--bin")
+        .arg(&bin_name)
+        .arg("--offline")
+        .output()
+        .expect("cargo executes");
+    assert!(
+        output.status.success(),
+        "cargo build failed for flonum NB AOT:\n--- src ---\n{}\n--- stderr ---\n{}\n--- stdout ---\n{}",
+        src,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+    target_dir.join(format!("release/{bin_name}"))
+}
+
+#[test]
+fn aot_energy_flonum_nb() {
+    // (define (energy x y) (+ (* x x) (* y y))) — Flonum.
+    // Exercises FlonumMul + FlonumAdd via the Nb-mode bitcast-and-
+    // go path. Result: energy(3.0, 4.0) = 25.0.
+    let mut f = Function::new("energy");
+    f.params.push((Value(0), Type::Flonum));
+    f.params.push((Value(1), Type::Flonum));
+    f.return_type = Type::Flonum;
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            Inst::FlonumMul(Value(2), Value(0), Value(0)), // x²
+            Inst::FlonumMul(Value(3), Value(1), Value(1)), // y²
+            Inst::FlonumAdd(Value(4), Value(2), Value(3)), // x² + y²
+        ],
+        terminator: Term::Return(Value(4)),
+    });
+
+    let src = emit_with(EmitMode::Nb, &f).unwrap();
+    let bin = build_aot_binary_flonum_nb(&src, "energy");
+
+    let run = |x: f64, y: f64| -> f64 {
+        let out = Command::new(&bin)
+            .arg(format!("{x}"))
+            .arg(format!("{y}"))
+            .output()
+            .expect("binary executes");
+        assert!(out.status.success(), "energy binary failed: {out:?}");
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .parse::<f64>()
+            .expect("f64 parse")
+    };
+
+    assert_eq!(run(3.0, 4.0), 25.0);
+    assert_eq!(run(0.0, 0.0), 0.0);
+    assert_eq!(run(1.5, 2.5), 1.5 * 1.5 + 2.5 * 2.5);
+    assert_eq!(run(-3.0, 4.0), 25.0);
+}
+
+#[test]
+fn aot_distance_flonum_nb() {
+    // (define (distance x y) (sqrt (+ (* x x) (* y y))))
+    // RC2 iter D — exercises FlonumSqrt on top of iter C's
+    // FlonumMul + FlonumAdd. Pythagorean distance is the
+    // textbook canary; (3.0, 4.0) → 5.0 is exact in f64.
+    let mut f = Function::new("distance");
+    f.params.push((Value(0), Type::Flonum));
+    f.params.push((Value(1), Type::Flonum));
+    f.return_type = Type::Flonum;
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            Inst::FlonumMul(Value(2), Value(0), Value(0)),
+            Inst::FlonumMul(Value(3), Value(1), Value(1)),
+            Inst::FlonumAdd(Value(4), Value(2), Value(3)),
+            Inst::FlonumSqrt(Value(5), Value(4)),
+        ],
+        terminator: Term::Return(Value(5)),
+    });
+
+    let src = emit_with(EmitMode::Nb, &f).unwrap();
+    let bin = build_aot_binary_flonum_nb(&src, "distance");
+
+    let run = |x: f64, y: f64| -> f64 {
+        let out = Command::new(&bin)
+            .arg(format!("{x}"))
+            .arg(format!("{y}"))
+            .output()
+            .expect("binary executes");
+        assert!(out.status.success());
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .parse::<f64>()
+            .expect("f64 parse")
+    };
+
+    assert_eq!(run(3.0, 4.0), 5.0);
+    assert_eq!(run(0.0, 0.0), 0.0);
+    assert_eq!(run(5.0, 12.0), 13.0);
+    assert_eq!(run(-3.0, -4.0), 5.0);
+}
+
 #[test]
 fn aot_iterative_sum_nb_via_jump() {
     // Same iterative sum as the RawI64 variant — but emitted under

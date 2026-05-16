@@ -70,6 +70,148 @@ pub fn bytecode_to_rir(
     bytecode_to_rir_with_hints(lambda, name, self_name, None)
 }
 
+/// RC2 iter J — `bytecode_to_rir` plus a post-translation pass that
+/// demotes non-escaping `EnvDefineLocal`/`EnvLookup*` pairs to SSA
+/// aliases in the entry block. The transformation is the same one
+/// the JIT already runs on inlined leaf-callees (see
+/// `demote_env_to_ssa_in_first_block`'s doc) — it eliminates env
+/// round-trips that arise from `(let ((x ...)) body)` desugaring
+/// when `x` doesn't escape the body.
+///
+/// **Why expose this as a separate entry point:** the JIT only
+/// applies the demote during inlining because for top-level JIT
+/// bodies the env round-trip is harmless (the helpers exist
+/// because JIT bodies run with `JIT_CALLER_ENV` installed). cs-aot
+/// has no equivalent install API, so `EnvDefineLocal`/`EnvLookup*`
+/// don't lower — programs that use `let` fail today. Demoting at
+/// the top level makes `let`-using programs AOT-able without
+/// adding Env-Inst support to cs-aot.
+///
+/// On failure (env op references a symbol not defined in this body
+/// — i.e. a free variable from an enclosing closure): falls back
+/// to the un-demoted RIR. cs-aot will then surface the specific
+/// unhandled Inst in its `UnsupportedInst` error, same as today.
+pub fn bytecode_to_rir_aot(
+    lambda: &CompiledLambda,
+    name: impl Into<String>,
+    self_name: Option<Symbol>,
+) -> Result<Function, TranslateError> {
+    let mut func = bytecode_to_rir(lambda, name, self_name)?;
+    // RC2 iter J: single-block demote.
+    // RC2 iter O attempted multi-block demote but regressed tak —
+    // blocks 1+ have their own EnvDefineLocal/EnvLookup ops the
+    // simple "alias-rewrite blocks 1+" extension didn't handle.
+    // Properly demoting multi-block functions needs per-block
+    // alias maps OR a join lattice across blocks; deferred to
+    // post-RC2 work. Reverted to the single-block gate so
+    // multi-block let-using programs surface clean
+    // `UnsupportedInst("EnvLookupAny")` diagnostics rather than
+    // post-build cargo errors.
+    if func.blocks.len() == 1 {
+        let _ = demote_env_to_ssa_all_blocks(&mut func);
+    }
+    Ok(func)
+}
+
+/// RC2 iter O — extends `demote_env_to_ssa_in_first_block` to
+/// multi-block functions. The previous version only rewrote the
+/// first block's Insts + terminator; values demoted in block 0
+/// would surface as undefined references in blocks 1+ (`tak`-style
+/// nested-self-call programs hit this).
+///
+/// Algorithm:
+/// 1. Walk block 0 to collect `sym → src` from EnvDefineLocal +
+///    `dst → src` alias from EnvLookupAny/EnvLookup. Same as the
+///    single-block version.
+/// 2. Drop the demoted Insts from block 0 + rewrite operands of
+///    its remaining Insts and terminator via the alias map.
+/// 3. NEW: walk blocks 1+, rewriting Value operands of every
+///    `is_inline_supported`-eligible Inst and every terminator
+///    via the SAME alias map. Insts outside the supported set
+///    (MakeClosure, Vec*, Cons/Car/Cdr, type predicates, etc.)
+///    have their operands left untouched — they panic
+///    `unreachable!()` in `for_each_value_in_inst`. If a demoted
+///    let-binding is referenced by such an inst in a non-block-0
+///    block, the AOT emitter will still surface a clean
+///    use-before-def error rather than corrupting the value.
+///
+/// Returns false (same contract as the original) if any EnvLookup
+/// references a sym not defined locally — the free-var case
+/// signals the AOT path should leave func untouched.
+fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
+    use cs_rir::inline::{for_each_value_in_inst, for_each_value_in_term, is_inline_supported};
+
+    if func.blocks.is_empty() {
+        return true;
+    }
+
+    let mut sym_to_src: HashMap<u32, RirValue> = HashMap::new();
+    let mut alias: HashMap<RirValue, RirValue> = HashMap::new();
+    let resolve = |v: RirValue, alias: &HashMap<RirValue, RirValue>| -> RirValue {
+        let mut cur = v;
+        for _ in 0..=alias.len() {
+            match alias.get(&cur) {
+                Some(&next) if next != cur => cur = next,
+                _ => return cur,
+            }
+        }
+        cur
+    };
+
+    // Step 1+2: process block 0 — collect alias + drop env insts +
+    // rewrite block-0 operands. Mirrors the single-block helper.
+    let block0_insts: Vec<_> = func.blocks[0].insts.drain(..).collect();
+    let mut rewritten: Vec<RirInst> = Vec::with_capacity(block0_insts.len());
+    for inst in block0_insts {
+        match inst {
+            RirInst::EnvDefineLocal(sym, src) => {
+                sym_to_src.insert(sym, resolve(src, &alias));
+            }
+            RirInst::EnvLookupAny(d, sym) | RirInst::EnvLookup(d, sym) => {
+                let src = match sym_to_src.get(&sym) {
+                    Some(&s) => s,
+                    None => return false,
+                };
+                alias.insert(d, src);
+            }
+            mut other => {
+                if is_inline_supported(&other) {
+                    for_each_value_in_inst(&mut other, |v| {
+                        *v = resolve(*v, &alias);
+                    });
+                }
+                rewritten.push(other);
+            }
+        }
+    }
+    func.blocks[0].insts = rewritten;
+    for_each_value_in_term(&mut func.blocks[0].terminator, |v| {
+        *v = resolve(*v, &alias);
+    });
+
+    // Step 3 (iter O): walk blocks 1+ applying the alias rewrite.
+    // Don't try to drop EnvDefineLocal/Lookup in later blocks; the
+    // simple "lets at function top" pattern is what we target. Any
+    // env op in block 1+ that references our alias map gets its
+    // operand rewritten; env ops with their own non-block-0 sym
+    // bindings pass through (Type::Any source-of-truth left to the
+    // emitter).
+    for block in func.blocks.iter_mut().skip(1) {
+        for inst in block.insts.iter_mut() {
+            if is_inline_supported(inst) {
+                for_each_value_in_inst(inst, |v| {
+                    *v = resolve(*v, &alias);
+                });
+            }
+        }
+        for_each_value_in_term(&mut block.terminator, |v| {
+            *v = resolve(*v, &alias);
+        });
+    }
+
+    true
+}
+
 /// Phase 6 Stage A iter 2 — maximum inline-recursion depth. Caps
 /// nested leaf-callee inlining so a body that calls another body
 /// that calls another body doesn't blow up code size or recurse
