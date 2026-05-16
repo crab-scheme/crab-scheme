@@ -95,6 +95,14 @@ pub enum Inst {
     /// `dst = lhs * rhs`. cs-vm: `Inst::Mul`.
     Mul(Value, Value, Value),
 
+    /// `dst = lhs / rhs`. cs-vm: handled via runtime helper
+    /// `vm_value_div_nb` (Number::div). Unlike Add/Sub/Mul there is
+    /// no inline Fixnum fast path because Fixnum/Fixnum can produce
+    /// a Rational (R6RS exact-division semantics) which doesn't fit
+    /// the NB Fixnum lane. Lowered as a direct call to the helper
+    /// regardless of operand tags. Phase 5b iter7.
+    Div(Value, Value, Value),
+
     /// `dst = lhs + rhs` interpreted as flonums. Operands and dst are
     /// i64 carriers of f64 bit patterns; the lowerer bitcasts to f64,
     /// runs Cranelift's `fadd`, and bitcasts back. Used when the

@@ -143,6 +143,10 @@ pub struct Lowerer {
     /// FuncId of `vm_value_mul_nb(a, b) -> i64` (Stage 3 baseline). See
     /// [`Self::value_add_nb_func`].
     value_mul_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_value_div_nb(a, b) -> i64` (Phase 5b iter7).
+    /// No inline fast path — Fixnum/Fixnum can return Rational.
+    /// `Inst::Div` lowering calls this unconditionally.
+    value_div_nb_func: cranelift_module::FuncId,
     /// FuncId of `vm_value_lt_nb(a, b) -> i64` (Stage 3 baseline). See
     /// [`Self::value_add_nb_func`].
     value_lt_nb_func: cranelift_module::FuncId,
@@ -882,6 +886,10 @@ impl Lowerer {
         builder.symbol("vm_value_add_nb", cs_vm::vm::vm_value_add_nb as *const u8);
         builder.symbol("vm_value_sub_nb", cs_vm::vm::vm_value_sub_nb as *const u8);
         builder.symbol("vm_value_mul_nb", cs_vm::vm::vm_value_mul_nb as *const u8);
+        // Phase 5b iter7 — Fixnum/Fixnum division can produce a
+        // Rational so there's no inline fast path; always call the
+        // helper.
+        builder.symbol("vm_value_div_nb", cs_vm::vm::vm_value_div_nb as *const u8);
         builder.symbol("vm_value_lt_nb", cs_vm::vm::vm_value_lt_nb as *const u8);
         builder.symbol("vm_value_eq_nb", cs_vm::vm::vm_value_eq_nb as *const u8);
         builder.symbol("vm_value_le_nb", cs_vm::vm::vm_value_le_nb as *const u8);
@@ -1989,6 +1997,13 @@ impl Lowerer {
                 &nb_arith_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_value_mul_nb: {e}")))?;
+        let value_div_nb_func = module
+            .declare_function(
+                "vm_value_div_nb",
+                cranelift_module::Linkage::Import,
+                &nb_arith_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_value_div_nb: {e}")))?;
         let value_lt_nb_func = module
             .declare_function(
                 "vm_value_lt_nb",
@@ -4456,6 +4471,7 @@ impl Lowerer {
             value_add_nb_func,
             value_sub_nb_func,
             value_mul_nb_func,
+            value_div_nb_func,
             value_lt_nb_func,
             value_eq_nb_func,
             value_le_nb_func,
@@ -4865,6 +4881,7 @@ impl Lowerer {
                     | Inst::Add(_, _, _)
                     | Inst::Sub(_, _, _)
                     | Inst::Mul(_, _, _)
+                    | Inst::Div(_, _, _)
                     | Inst::Lt(_, _, _)
                     | Inst::Eq(_, _, _)
                     | Inst::FlonumAdd(_, _, _)
@@ -5041,6 +5058,9 @@ impl Lowerer {
                 mul: self
                     .module
                     .declare_func_in_func(self.value_mul_nb_func, builder.func),
+                div: self
+                    .module
+                    .declare_func_in_func(self.value_div_nb_func, builder.func),
                 lt: self
                     .module
                     .declare_func_in_func(self.value_lt_nb_func, builder.func),
@@ -6676,6 +6696,9 @@ struct NbHelpers {
     add: cranelift_codegen::ir::FuncRef,
     sub: cranelift_codegen::ir::FuncRef,
     mul: cranelift_codegen::ir::FuncRef,
+    /// Phase 5b iter7 — Fixnum/Fixnum-compatible NB division. No
+    /// inline fast path; `Inst::Div` always calls this.
+    div: cranelift_codegen::ir::FuncRef,
     lt: cranelift_codegen::ir::FuncRef,
     eq: cranelift_codegen::ir::FuncRef,
     le: cranelift_codegen::ir::FuncRef,
@@ -6756,6 +6779,17 @@ fn lower_inst_uniform_nb(
                 let bv = lookup(map, rhs)?;
                 let r =
                     emit_nb_arith_fixnum_fast(b, helpers.mul, a, bv, |b, l, r| b.ins().imul(l, r));
+                map.insert(dst, r);
+            }
+            // Phase 5b iter7 — Inst::Div always routes through the
+            // helper. Fixnum/Fixnum can produce a Rational (R6RS
+            // exact division), Flonum operands need IEEE-754 division
+            // semantics — neither fits a simple inline fast path.
+            &Inst::Div(dst, lhs, rhs) => {
+                let a = lookup(map, lhs)?;
+                let bv = lookup(map, rhs)?;
+                let call = b.ins().call(helpers.div, &[a, bv]);
+                let r = b.inst_results(call)[0];
                 map.insert(dst, r);
             }
             &Inst::Lt(dst, lhs, rhs) => {
@@ -7773,6 +7807,14 @@ fn lower_inst(
         Inst::Add(dst, lhs, rhs) => binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().iadd(l, r))?,
         Inst::Sub(dst, lhs, rhs) => binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().isub(l, r))?,
         Inst::Mul(dst, lhs, rhs) => binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().imul(l, r))?,
+        // Phase 5b iter7 — Specialized tier can't safely inline Div
+        // (Fixnum/Fixnum may return Rational). Reject so the body
+        // falls back to bytecode for this RIR.
+        Inst::Div(_, _, _) => {
+            return Err(JitError::Unsupported(
+                "specialized: Inst::Div not supported (use uniform-NB tier)".into(),
+            ));
+        }
         Inst::Quotient(dst, lhs, rhs) => {
             binop(b, map, *dst, *lhs, *rhs, |b, l, r| b.ins().sdiv(l, r))?
         }

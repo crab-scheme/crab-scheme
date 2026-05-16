@@ -5959,6 +5959,21 @@ pub unsafe extern "C" fn vm_value_mul_nb(a: i64, b: i64) -> i64 {
     run_generic_arith_nb(a, b, GenericArith::Mul)
 }
 
+/// `(/ a b)` — NB-typed. Phase 5b iter7. Unlike `vm_value_add_nb`
+/// et al, there's no inline Fixnum fast path: Fixnum/Fixnum division
+/// can produce a Rational (e.g. `(/ 3 2) = 3/2`) which doesn't fit
+/// the NB Fixnum lane. So every call drops to `run_generic_arith_nb`
+/// → `generic_arith2` → `Number::div`, which handles Fixnum/Bigint/
+/// Rational/Flonum operands and produces the correct Number.
+///
+/// # Safety
+///
+/// Same as [`vm_value_add_nb`].
+#[no_mangle]
+pub unsafe extern "C" fn vm_value_div_nb(a: i64, b: i64) -> i64 {
+    run_generic_arith_nb(a, b, GenericArith::Div)
+}
+
 /// `(< a b)` — NB-typed. Result is `Value::Boolean` NB.
 ///
 /// # Safety
@@ -12866,6 +12881,7 @@ enum GenericArith {
     Add,
     Sub,
     Mul,
+    Div,
 }
 
 #[derive(Clone, Copy)]
@@ -12898,6 +12914,16 @@ fn generic_arith2(
         GenericArith::Add => an.add(&bn),
         GenericArith::Sub => an.sub(&bn),
         GenericArith::Mul => an.mul(&bn),
+        // Number::div returns Result<Number, NumError> (only error
+        // case is exact division by exact zero). Surface that as
+        // a raised VmError matching how the bytecode VM handles
+        // `/` errors.
+        GenericArith::Div => match an.div(&bn) {
+            Ok(n) => n,
+            Err(_) => {
+                return Err(builtin_err_to_raised(name, "division by zero", syms, span));
+            }
+        },
     };
     Ok(Value::Number(r))
 }
@@ -12970,6 +12996,7 @@ fn op_arith_name(op: GenericArith) -> &'static str {
         GenericArith::Add => "+",
         GenericArith::Sub => "-",
         GenericArith::Mul => "*",
+        GenericArith::Div => "/",
     }
 }
 

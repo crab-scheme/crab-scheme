@@ -85,16 +85,12 @@ pub fn bytecode_to_rir_with_hints(
     }
     let body = &lambda.body[..];
 
-    // Phase 5 iter5 — pre-scan for MakeClosure in body. We use this
-    // to gate `/` lowering: the variadic-/ lowering emits FlonumDiv
-    // which only works on Flonum-NB; emitting it in a body that
-    // creates inner closures (e.g. let*-expansion or named-let
-    // bindings) risks letting the body tier-up while losing TCO
-    // across the CallGeneral chain to those closures, burning host
-    // stack (this is what hit mandelbrot's col-loop in iter4).
-    // Pure-arithmetic bodies that just call builtins (matrix-elt's
-    // `(/ 1.0 denom)` inner let* lambda) have no MakeClosure and
-    // are safe.
+    // Phase 5b iter7 — pre-scan for MakeClosure in body. Retained
+    // from iter5 to gate the FlonumDiv path (which would lift bodies
+    // like mandelbrot's col-loop into uniform-NB JIT where their
+    // let*-CallGeneral chain burns host stack). Inst::Div (the
+    // helper-based slow path) doesn't need this gate — the helper
+    // call has no stack-burn risk beyond a normal CallGeneral.
     let body_has_makeclosure = body.iter().any(|inst| matches!(inst, Inst::MakeClosure(_)));
 
     // Identify block-start offsets.
@@ -5539,55 +5535,100 @@ pub fn bytecode_to_rir_with_hints(
                                         let _ = args[0];
                                         insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
                                     }
-                                    // Phase 5 iter5 — variadic / for
-                                    // Flonum operands (n >= 2). Gated
-                                    // on `body_has_any_call == false`
-                                    // to avoid lifting col-loop-style
-                                    // bodies into uniform-NB where
-                                    // their let*-CallGeneral chain
-                                    // burns host stack. Pure-arith
-                                    // lambdas (matrix-elt's inner
-                                    // let*) are safe.
-                                    ("/", n) if n >= 2 && !body_has_makeclosure => {
+                                    // Phase 5b iter7 — variadic / for
+                                    // any operand types. When all
+                                    // operands are statically Flonum,
+                                    // emit FlonumDiv (with FixToFlo
+                                    // promotion for any Fixnum stragglers
+                                    // — Flonum contagion). Otherwise
+                                    // emit Inst::Div, which lowers to a
+                                    // direct call to `vm_value_div_nb`
+                                    // (no inline fast path because
+                                    // Fixnum/Fixnum can return a
+                                    // Rational per R6RS exact division).
+                                    //
+                                    // The iter5 MakeClosure-presence
+                                    // gate no longer applies: with Inst::
+                                    // Div handling the slow case via a
+                                    // helper, col-loop-style bodies don't
+                                    // need to bail out — they get the
+                                    // helper call which is identical to
+                                    // what they'd do through vm_call_general.
+                                    ("/", n) if n >= 2 => {
                                         let any_flonum = args.iter().any(|v| {
                                             value_types.get(v).copied() == Some(Type::Flonum)
                                         });
-                                        if !any_flonum {
+                                        // Apply iter5's MakeClosure
+                                        // gate ONLY to the FlonumDiv
+                                        // path — that path would lift
+                                        // bodies that recursively call
+                                        // themselves through let* into
+                                        // uniform-NB and burn host
+                                        // stack (mandelbrot's col-loop).
+                                        // The Inst::Div path (helper
+                                        // call) doesn't have the
+                                        // stack-burn risk.
+                                        if any_flonum && body_has_makeclosure {
                                             return Err(TranslateError::Unsupported(format!(
-                                                "Call to builtin `/` (arity {}) on non-Flonum operands",
+                                                "Call to builtin `/` (arity {}, Flonum) in body with MakeClosure",
                                                 args.len()
                                             )));
                                         }
-                                        let promoted: Vec<RirValue> = args
-                                            .iter()
-                                            .map(|v| {
-                                                let t = value_types
-                                                    .get(v)
-                                                    .copied()
-                                                    .unwrap_or(Type::Fixnum);
-                                                if t == Type::Flonum {
-                                                    *v
-                                                } else {
-                                                    let p = alloc();
-                                                    insts.push(RirInst::FixToFlo(p, *v));
-                                                    value_types.insert(p, Type::Flonum);
-                                                    p
-                                                }
-                                            })
-                                            .collect();
-                                        let mut acc = promoted[0];
-                                        for &x in &promoted[1..promoted.len() - 1] {
-                                            let next = alloc();
-                                            insts.push(RirInst::FlonumDiv(next, acc, x));
-                                            value_types.insert(next, Type::Flonum);
-                                            acc = next;
+                                        if any_flonum {
+                                            // Promote Fixnum operands to
+                                            // Flonum, then chain FlonumDiv.
+                                            let promoted: Vec<RirValue> = args
+                                                .iter()
+                                                .map(|v| {
+                                                    let t = value_types
+                                                        .get(v)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    if t == Type::Flonum {
+                                                        *v
+                                                    } else {
+                                                        let p = alloc();
+                                                        insts.push(RirInst::FixToFlo(p, *v));
+                                                        value_types.insert(p, Type::Flonum);
+                                                        p
+                                                    }
+                                                })
+                                                .collect();
+                                            let mut acc = promoted[0];
+                                            for &x in &promoted[1..promoted.len() - 1] {
+                                                let next = alloc();
+                                                insts.push(RirInst::FlonumDiv(next, acc, x));
+                                                value_types.insert(next, Type::Flonum);
+                                                acc = next;
+                                            }
+                                            insts.push(RirInst::FlonumDiv(
+                                                dst,
+                                                acc,
+                                                *promoted.last().unwrap(),
+                                            ));
+                                            value_types.insert(dst, Type::Flonum);
+                                        } else {
+                                            // Fixnum (or Any) operand chain.
+                                            // Use Inst::Div which calls
+                                            // `vm_value_div_nb` — returns
+                                            // Fixnum / Rational / Bigint /
+                                            // Flonum depending on values.
+                                            // Result type is Any since we
+                                            // can't predict.
+                                            let mut acc = args[0];
+                                            for &x in &args[1..args.len() - 1] {
+                                                let next = alloc();
+                                                insts.push(RirInst::Div(next, acc, x));
+                                                value_types.insert(next, Type::Any);
+                                                acc = next;
+                                            }
+                                            insts.push(RirInst::Div(
+                                                dst,
+                                                acc,
+                                                *args.last().unwrap(),
+                                            ));
+                                            value_types.insert(dst, Type::Any);
                                         }
-                                        insts.push(RirInst::FlonumDiv(
-                                            dst,
-                                            acc,
-                                            *promoted.last().unwrap(),
-                                        ));
-                                        value_types.insert(dst, Type::Flonum);
                                     }
                                     // Variadic +/-/*. The bytecode VM
                                     // compiler only specializes 2-arg
