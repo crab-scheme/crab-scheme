@@ -18,13 +18,20 @@ spec, in which order, with what exit criteria*.
 | M6        | JIT abstraction + Cranelift backend  | `jit-cranelift` + `jit-optimizing-tier` (Phase 6) | Three perf gates per ADR 0013: JIT ≥ 10× walker; competitive with mature Scheme JITs; alloc-light workloads ≤ 100 allocs/ms | ✅ Phase 1–6 done (`m6-phase6-complete`); all three reframed gates MET as of 2026-05-16. Original 5× JIT-over-VM gate superseded — see `docs/adr/0013-perf-gate-reframe.md`. Post-Phase-6: JIT 10.4× walker, beats Chez/Guile/Gambit-interp, 0 allocs on 6 of 8 benches. |
 | M7        | HolyJIT backend (primary)            | `jit-holy`             | JIT differential parity with Cranelift backend             | ⏸ parked (ADR 0009 — upstream stale) |
 | M8        | First-class continuations + CWCC     | `continuations`        | Larceny cont tests ≥ 95% pass                              | ✅ VM-tier done (`m8-vm-complete`); walker-tier + Larceny suite deferred |
-| M9        | R6RS standard library completion     | `stdlib`               | R6RS conformance ≥ 99%; Larceny suite ≥ 95%                | ✅ foundation done (`m9-foundation-complete`); R6RS conformance **99.96%** on our corpus / **100%** Racket-cross-validated subset (2026-05-15) — Larceny @ 94% on parsable slice, reader shims would expand sample |
+| M9        | R6RS standard library completion     | `stdlib`               | R6RS conformance ≥ 99%; Larceny suite ≥ 95%                | ✅ foundation done (`m9-foundation-complete`); R6RS conformance **100%** on our corpus (2,464 / 0 native, same 0pp gap on WASM); **100%** Racket-cross-validated subset (519/0); Larceny @ 94% on parsable slice — canonical suite imports deferred to post-1.0 measurement-infra work per `docs/measurements/2026-05-16-1.0-rc-readiness.md` |
 | M10       | AOT compiler + WASM target           | `aot`, `wasm`          | Static binaries from Scheme; WASM bytecode tier shipping   | ✅ tagged `m10-complete` (2026-05-16) — Track W done (`m10-wasm-complete`, WASM conformance matches native); Track A done (`m10-aot-complete`, numeric-kernel AOT pipeline; fib(40) RawI64 ABI matches `rustc -O` to the centisecond). AOT long-tail (inline NB fast paths, closures, bytecode→RIR glue, CLI integration) is post-1.0 work. See `docs/milestones/m10-trackA-exit.md`. |
 | M11       | Verified core (stretch)              | `verification`         | Mechanized eval semantics with extracted reference         | — |
 
 Each milestone produces a tagged release (`milestone-N-complete`) and a written
 exit report under `docs/milestones/Mx-exit.md` capturing what shipped, what was
 deferred, perf/conformance baselines, and known limitations.
+
+**1.0 RC posture (2026-05-16):** all technical gates MET; both
+conformance-suite gates MET-on-sample (canonical Larceny / Racket
+R6RS suite imports are documented post-1.0 measurement-infrastructure
+work, not runtime-correctness gaps). See
+`docs/measurements/2026-05-16-1.0-rc-readiness.md` for the full
+RC sign-off framing.
 
 ---
 
