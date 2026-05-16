@@ -546,6 +546,33 @@ fn source_to_aot_forward_self_ref_capture() {
 }
 
 #[test]
+fn source_to_aot_transitive_capture_propagation() {
+    // RC3 iter 2.16 — transitive capture propagation. The inner
+    // anonymous lambda `(lambda (x) (+ outer-y x))` is passed to a
+    // higher-order helper that has its own inner `loop`. The loop
+    // doesn't directly reference outer-y, but the lambda it
+    // MakeClosures DOES. Iter 2.16's analysis pass propagates the
+    // capture upward so loop's captures include outer-y, which
+    // then resolves via outer's local_defs at MakeClosure time.
+    //
+    // Without iter 2.16 this fails at "MakeClosure with unresolved
+    // capture" because the immediate caller (loop) doesn't have
+    // outer-y in its scope.
+    let bin = aot_compile_multi_and_run(
+        "(define (apply-each f n) \
+           (let loop ((i 0) (acc 0)) \
+             (if (= i n) acc (loop (+ i 1) (+ acc (f i)))))) \
+         (define (outer y) (apply-each (lambda (x) (+ y x)) 5))",
+        "outer",
+        "transitive_capture",
+    );
+    // outer(y) = sum of (y+0)+(y+1)+(y+2)+(y+3)+(y+4) = 5y + 10
+    assert_eq!(run_multi_with_args(&bin, "outer", &[0]), 10);
+    assert_eq!(run_multi_with_args(&bin, "outer", &[10]), 60);
+    assert_eq!(run_multi_with_args(&bin, "outer", &[100]), 510);
+}
+
+#[test]
 fn source_to_aot_list_length_and_cons() {
     // RC3 iter 2.15 — closures over list / pair operations.
     // alloc-stress builds a 1000-element list with cons + length.

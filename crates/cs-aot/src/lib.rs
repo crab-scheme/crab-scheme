@@ -900,11 +900,29 @@ fn inst_rhs(
         (Inst::AnyToFix(dst, src), _)
         | (Inst::AnyToBool(dst, src), _)
         | (Inst::AnyToFlo(dst, src), _)
-        | (Inst::AnyTruthy(dst, src), _)
         | (Inst::FixToFlo(dst, src), _)
         | (Inst::IntCharBitcast(dst, src), _) => {
             check(*src)?;
             (*dst, format!("v{}", src.0))
+        }
+        // RC3 iter 2.16 — AnyTruthy must actually check truthiness in
+        // NB mode. NB Boolean false = 0xFFF8_8000_0000_0000; anything
+        // else (including NB Fixnum 0, NB Null, NB Pair, etc.) is
+        // truthy per R6RS (only #f is falsy). Emit as `(v != NB_FALSE)
+        // as NB Boolean` — uses xor-with-1 trick: NB_FALSE | 0 stays
+        // NB_FALSE, NB_FALSE | 1 = NB_TRUE. So result is NB Boolean
+        // (true if v is truthy, false if v is NB_FALSE).
+        // RawI64 mode: pass through as i64 0/1.
+        (Inst::AnyTruthy(dst, src), mode) => {
+            check(*src)?;
+            let expr = match mode {
+                EmitMode::RawI64 => format!("(v{} != 0) as i64", src.0),
+                EmitMode::Nb => format!(
+                    "((((v{} != 0xfff8_8000_0000_0000u64 as i64) as u64) | 0xfff8_8000_0000_0000u64) as i64)",
+                    src.0
+                ),
+            };
+            (*dst, expr)
         }
         // RC3 iter 2.14 — boolean negation. NB_TRUE / NB_FALSE differ
         // only in bit 0 (NB_TRUE = NB_FALSE | 1); xor with 1 flips
@@ -1949,6 +1967,7 @@ fn const_to_rust_nb(c: &Const) -> Result<String, AotError> {
     const NB_TAG_FIXNUM: u64 = 0;
     const NB_TAG_BOOLEAN: u64 = 1;
     const NB_TAG_CHARACTER: u64 = 2;
+    const NB_TAG_SYMBOL: u64 = 3;
     const NB_TAG_NULL: u64 = 4;
     const NB_TAG_UNSPECIFIED: u64 = 5;
     const NB_TAG_EOF: u64 = 6;
@@ -1964,7 +1983,11 @@ fn const_to_rust_nb(c: &Const) -> Result<String, AotError> {
         Const::Unspecified => nb_make(NB_TAG_UNSPECIFIED, 0),
         Const::Eof => nb_make(NB_TAG_EOF, 0),
         Const::Flonum(f) => f.to_bits(), // NB Flonum = raw f64 bits
-        Const::Symbol(_) => return Err(AotError::UnsupportedConst("Symbol")),
+        // RC3 iter 2.16 — Symbol payload is the cs_core::Symbol u32.
+        // The runtime symbol table stays in cs-vm; AOT'd programs
+        // that compare symbols (e.g., spectral-norm's `'av` / `'au`
+        // case-marker sentinel) just need the sym id to round-trip.
+        Const::Symbol(s) => nb_make(NB_TAG_SYMBOL, *s as u64),
         Const::StringRef(_) => return Err(AotError::UnsupportedConst("StringRef")),
     };
     // Render as a hex literal with the i64 suffix. Using hex makes

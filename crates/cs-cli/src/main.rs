@@ -1242,18 +1242,17 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
             Some(n) => (n.clone(), sym_by_idx.get(&idx).copied()),
             None => (format!("__aot_lambda_{idx}"), None),
         };
-        // RC3 iter 2.15 + 2.16 — default ALL params to Type::Any
-        // (including top-level fns). Inner lambdas need it for
-        // pair / list values. Top-level fns also need it for the
-        // same reason (binary-trees's `(define (check-tree node)
-        // ...)` uses car/cdr on node). Pure numeric kernels (fib,
-        // fact) take a tiny hit because AnyClone + AnyDrop emit
-        // as no-ops in AOT NB mode and arith goes through the
-        // same nb_*_inline helpers either way — fib(40) is
-        // ~470ms both before and after this change.
-        let is_top_level = sym_by_idx
-            .get(&idx)
-            .is_some_and(|s| known_globals.contains(&s.0));
+        // RC3 iter 2.15 + 2.16 — default ALL params to Type::Any.
+        // The nb_*_inline helpers tag-dispatch correctly for both
+        // Fixnum and Flonum operands. Fixnum-default is UNSAFE for
+        // top-level fns called with non-Fixnum args (e.g.,
+        // mandelbrot-pixel's cr/ci come from Flonum arith) — Fixnum-
+        // typed params would emit AddFx2/MulFx2 that interpret NB
+        // Flonum bits as raw fixnums. Any-default routes through
+        // generic nb_add_inline etc. which dispatch on the runtime
+        // tag. Note: mandelbrot still produces wrong results
+        // independently of param type (separate iter 2.17 work on
+        // Flonum-NB arith correctness in the inner loop).
         let any_hints: Vec<cs_rir::Type> = vec![cs_rir::Type::Any; lam.params.len()];
         let hints: Option<&[cs_rir::Type]> = Some(&any_hints);
         match cs_vm::jit_translate::bytecode_to_rir_aot_with_param_types(

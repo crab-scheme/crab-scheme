@@ -1729,9 +1729,19 @@ pub fn bytecode_to_rir_full(
                                         insts.push(RirInst::NotBoolean(dst, args[0]));
                                         value_types.insert(dst, Type::Boolean);
                                     }
-                                    // Any operand: route through AnyTruthy
-                                    // (returns 0 iff inner is #f) and Eq
-                                    // with 0 to invert.
+                                    // Any operand: AnyTruthy returns NB
+                                    // Boolean (true if truthy, false if
+                                    // NB_FALSE). NotBoolean flips. Result
+                                    // is NB Boolean (NB false if input
+                                    // truthy, NB true if input was #f).
+                                    //
+                                    // RC3 iter 2.16 fix — previously this
+                                    // emitted `Eq(truthy, Fixnum(0))`
+                                    // which works in JIT i64-boolean mode
+                                    // but fails in NB-AOT (Eq routes
+                                    // through generic_cmp2 which rejects
+                                    // boolean operands). binary-trees's
+                                    // `(if (not (car t)) ...)` hit this.
                                     ("not", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
@@ -1739,9 +1749,8 @@ pub fn bytecode_to_rir_full(
                                         let truthy = alloc();
                                         insts.push(RirInst::AnyTruthy(truthy, args[0]));
                                         value_types.insert(truthy, Type::Boolean);
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Eq(dst, truthy, zero));
+                                        insts.push(RirInst::NotBoolean(dst, truthy));
+                                        value_types.insert(dst, Type::Boolean);
                                     }
                                     // Other primitive types (Fixnum,
                                     // Character, Flonum, Symbol, Null): the
