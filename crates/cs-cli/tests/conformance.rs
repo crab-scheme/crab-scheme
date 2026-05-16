@@ -579,6 +579,19 @@ fn conformance_r7rs_cond_expand_lib() {
 }
 
 #[test]
+fn conformance_cond_expand_assert() {
+    // Added 2026-05-16 during M10 Track W closeout. The fixture
+    // existed in `tests/conformance/foundation/` but was never wired
+    // into the cargo test runner — that's why the W4 conformance
+    // sweep surfaced a `cond-expand-library-false` failure that
+    // `cargo test` was silent about. The fixture is also fixed to
+    // assert both polarities of `(library ...)` against the
+    // expander's actual `cond_expand_match` behavior (R7RS stdlib
+    // names return #t; clearly-fake names return #f).
+    run_conformance_file("cond_expand_assert.scm");
+}
+
+#[test]
 fn conformance_r7rs_bytevector_list() {
     run_conformance_file("r7rs_bytevector_list.scm");
 }

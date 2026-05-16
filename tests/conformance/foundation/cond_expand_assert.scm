@@ -29,10 +29,19 @@
   "default"
   (cond-expand ((not crabscheme) "skipped") (else "default")))
 
-; (library ...) — we have no library system, so always false.
-(test-equal "cond-expand-library-false"
-  "no library system"
-  (cond-expand ((library (scheme base)) "yes") (else "no library system")))
+; (library ...) — true for R7RS stdlib names whose bindings we install
+; at the top level (matching the expander's `cond_expand_match` arm,
+; see crates/cs-expand/src/lib.rs ~line 2790). The negative case uses
+; a deliberately-fake library name that can never be registered.
+(test-equal "cond-expand-library-scheme-base-true"
+  "yes"
+  (cond-expand ((library (scheme base)) "yes") (else "no")))
+
+(test-equal "cond-expand-library-unknown-false"
+  "no such library"
+  (cond-expand
+    ((library (totally fake nonexistent library)) "yes")
+    (else "no such library")))
 
 ; First matching clause wins, even if a later one would match.
 (test-equal "cond-expand-first-wins"
