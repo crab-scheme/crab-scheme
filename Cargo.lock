@@ -390,6 +390,8 @@ version = "0.0.1"
 dependencies = [
  "cs-core",
  "cs-diag",
+ "cs-expand",
+ "cs-parse",
  "cs-rir",
  "cs-vm",
  "syn",

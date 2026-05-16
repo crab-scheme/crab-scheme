@@ -20,6 +20,11 @@ cs-vm = { workspace = true }
 # it through cs-vm's bytecode_to_rir into cs-aot's project emitter.
 cs-core = { workspace = true }
 cs-diag = { workspace = true }
+# RC2 iter F — source_pipeline tests close the loop: literal
+# Scheme source string → read_all → expand_program → compile →
+# bytecode → RIR → AOT. Pulls in the parse + expand layers.
+cs-parse = { workspace = true }
+cs-expand = { workspace = true }
 # `syn` parses the emitted Rust source as a sanity check that we
 # produce well-formed code, separate from compilation tests that
 # actually invoke rustc on the output.
