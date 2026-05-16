@@ -1038,27 +1038,51 @@ fn inst_rhs(
                 ),
             )
         }
+        // RC3 iter 2.16 follow-up: vm_pair_car_gc / vm_pair_cdr_gc /
+        // vm_length_gc CONSUME their input handle (linear ownership).
+        // The demote pass aliases EnvLookupAny so multiple Scheme-
+        // level references to the SAME let-bound pair collapse to a
+        // single SSA Value. When two cs-rir Insts then consume that
+        // Value (e.g., `(let ((p (cons 1 2))) (+ (car p) (cdr p)))`),
+        // the second consumer hits a freed/borrowed pair → panic.
+        //
+        // Fix: clone the input handle (refcount bump via
+        // vm_value_clone_gc) before each consume so each helper gets
+        // its own owned reference. NB inline immediates (Fixnum etc.)
+        // make the clone a no-op (vm_value_clone_gc checks
+        // any_i64_is_inline). The cost is one branch per pair op for
+        // the common heap path — negligible vs the helper call itself.
         (Inst::Car(dst, pair), _) => {
             check(*pair)?;
             (
                 *dst,
-                format!("unsafe {{ cs_vm::vm::vm_pair_car_gc(v{}) }}", pair.0),
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_pair_car_gc(cs_vm::vm::vm_value_clone_gc(v{})) }}",
+                    pair.0
+                ),
             )
         }
         (Inst::Cdr(dst, pair), _) => {
             check(*pair)?;
             (
                 *dst,
-                format!("unsafe {{ cs_vm::vm::vm_pair_cdr_gc(v{}) }}", pair.0),
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_pair_cdr_gc(cs_vm::vm::vm_value_clone_gc(v{})) }}",
+                    pair.0
+                ),
             )
         }
         // RC3 iter 2.15 — `(length list)`. vm_length_gc returns the
         // raw i64 count (not NB-encoded). Wrap in NanboxValue::fixnum
         // so downstream NB-consuming ops see a proper Fixnum carrier.
         // RawI64 mode passes the raw count through directly.
+        // Also clones the input per the consume-on-use story above.
         (Inst::Length(dst, list), mode) => {
             check(*list)?;
-            let call = format!("unsafe {{ cs_vm::vm::vm_length_gc(v{}) }}", list.0);
+            let call = format!(
+                "unsafe {{ cs_vm::vm::vm_length_gc(cs_vm::vm::vm_value_clone_gc(v{})) }}",
+                list.0
+            );
             let expr = match mode {
                 EmitMode::RawI64 => call,
                 EmitMode::Nb => {
@@ -1555,6 +1579,28 @@ fn inst_rhs(
             )
         }
 
+        // RC3 iter 2.16 — ArithShift: positive count is left shift,
+        // negative is arithmetic right shift. NB mode unpacks /
+        // re-encodes; RawI64 passes through to vm_arith_shift_fx
+        // which takes raw i64s.
+        (Inst::ArithShift(dst, n, c), mode) => {
+            check(*n)?;
+            check(*c)?;
+            let expr = match mode {
+                EmitMode::RawI64 => format!(
+                    "unsafe {{ cs_vm::vm::vm_arith_shift_fx(v{}, v{}) }}",
+                    n.0, c.0
+                ),
+                EmitMode::Nb => format!(
+                    "cs_vm::vm::NanboxValue::fixnum(unsafe {{ cs_vm::vm::vm_arith_shift_fx(\
+                     cs_vm::vm::NanboxValue(v{}).as_fixnum().unwrap_or(0), \
+                     cs_vm::vm::NanboxValue(v{}).as_fixnum().unwrap_or(0)) }}).into_raw()",
+                    n.0, c.0
+                ),
+            };
+            (*dst, expr)
+        }
+
         // ---- Unsupported ----
         (other, _) => return Err(AotError::UnsupportedInst(inst_variant_name(other))),
     })
@@ -1780,6 +1826,8 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         Inst::Cons(v, _, _, _, _) | Inst::Car(v, _) | Inst::Cdr(v, _) => Some(*v),
         // RC3 iter 2.15 — list length.
         Inst::Length(v, _) => Some(*v),
+        // RC3 iter 2.16 — arithmetic shift.
+        Inst::ArithShift(v, _, _) => Some(*v),
         // RC2 iter S — equality predicates on Any values.
         Inst::EqAny(v, _, _) | Inst::EqualAny(v, _, _) => Some(*v),
         // RC2 iter T — Any-handle refcount clone.

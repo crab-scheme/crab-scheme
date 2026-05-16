@@ -1242,22 +1242,20 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
             Some(n) => (n.clone(), sym_by_idx.get(&idx).copied()),
             None => (format!("__aot_lambda_{idx}"), None),
         };
-        // RC3 iter 2.15 — for LETREC-bound / anonymous inner lambdas,
-        // default params to Type::Any so closures that take pair /
-        // list values (like nqueens's `(let loop ((p placed)) ...)`)
-        // can car/cdr them. Top-level fns keep the None default
-        // (Fixnum); they're called from CLI with parsed Fixnum args
-        // and pure numeric kernels benefit from the typed-Fixnum
-        // RIR shape.
+        // RC3 iter 2.15 + 2.16 — default ALL params to Type::Any
+        // (including top-level fns). Inner lambdas need it for
+        // pair / list values. Top-level fns also need it for the
+        // same reason (binary-trees's `(define (check-tree node)
+        // ...)` uses car/cdr on node). Pure numeric kernels (fib,
+        // fact) take a tiny hit because AnyClone + AnyDrop emit
+        // as no-ops in AOT NB mode and arith goes through the
+        // same nb_*_inline helpers either way — fib(40) is
+        // ~470ms both before and after this change.
         let is_top_level = sym_by_idx
             .get(&idx)
             .is_some_and(|s| known_globals.contains(&s.0));
-        let any_hints: Vec<cs_rir::Type> = if is_top_level {
-            Vec::new()
-        } else {
-            vec![cs_rir::Type::Any; lam.params.len()]
-        };
-        let hints: Option<&[cs_rir::Type]> = if is_top_level { None } else { Some(&any_hints) };
+        let any_hints: Vec<cs_rir::Type> = vec![cs_rir::Type::Any; lam.params.len()];
+        let hints: Option<&[cs_rir::Type]> = Some(&any_hints);
         match cs_vm::jit_translate::bytecode_to_rir_aot_with_param_types(
             lam,
             name.as_str(),
