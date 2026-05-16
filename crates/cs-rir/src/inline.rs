@@ -570,6 +570,11 @@ pub fn for_each_value_in_inst<F: FnMut(&mut Value)>(inst: &mut Inst, mut f: F) {
             f(d);
             f(s);
         }
+        // RC3 iter 2.15 — AnyDrop has no dst, just a source.
+        // Emitted at function exit by the AOT translator when
+        // params are Any-typed (so the cloned Box on entry is
+        // freed before return).
+        Inst::AnyDrop(s) => f(s),
 
         // RC3 iter 2.7 — the demote-pass now walks every surviving
         // Inst (not just is_inline_supported ones) to rewrite operands

@@ -716,6 +716,16 @@ fn emit_inst_let(
     if matches!(inst, Inst::EnvDefineLocal(..)) {
         return Ok(());
     }
+    // RC3 iter 2.15 — AnyDrop is a JIT-tier refcount-bookkeeping
+    // op (frees the Box cloned at param-LoadVar time). In NB-AOT
+    // mode the params arrive as plain i64 NB carriers — no
+    // separate Box to drop — so the inst is a no-op. Heap-pointer-
+    // tagged NB values (Pair, Vector, etc.) have their own
+    // lifetime story tied to the proc_table / Gc heap, not to
+    // explicit AnyDrop.
+    if matches!(inst, Inst::AnyDrop(..)) {
+        return Ok(());
+    }
     let (dst, expr) = inst_rhs(
         inst,
         Some(defined),
@@ -744,6 +754,10 @@ fn emit_inst_assign(
 ) -> Result<(), AotError> {
     // Same no-op as emit_inst_let for surviving EnvDefineLocal.
     if matches!(inst, Inst::EnvDefineLocal(..)) {
+        return Ok(());
+    }
+    // Same no-op as emit_inst_let for AnyDrop (iter 2.15).
+    if matches!(inst, Inst::AnyDrop(..)) {
         return Ok(());
     }
     // The loop+match shape pre-declares all values; SSA validity is
@@ -1025,6 +1039,21 @@ fn inst_rhs(
                 *dst,
                 format!("unsafe {{ cs_vm::vm::vm_pair_cdr_gc(v{}) }}", pair.0),
             )
+        }
+        // RC3 iter 2.15 — `(length list)`. vm_length_gc returns the
+        // raw i64 count (not NB-encoded). Wrap in NanboxValue::fixnum
+        // so downstream NB-consuming ops see a proper Fixnum carrier.
+        // RawI64 mode passes the raw count through directly.
+        (Inst::Length(dst, list), mode) => {
+            check(*list)?;
+            let call = format!("unsafe {{ cs_vm::vm::vm_length_gc(v{}) }}", list.0);
+            let expr = match mode {
+                EmitMode::RawI64 => call,
+                EmitMode::Nb => {
+                    format!("cs_vm::vm::NanboxValue::fixnum({call}).into_raw()")
+                }
+            };
+            (*dst, expr)
         }
 
         // ---- Equality predicates (RC2 iter S) ----
@@ -1459,11 +1488,6 @@ fn inst_rhs(
                             other.fn_name, other.arity
                         ));
                     } else {
-                        // Sym is neither in our captures nor locally
-                        // defined via EnvDefineLocal nor a known
-                        // top-level AOT'd function nor our own
-                        // letrec binding. The bytecode likely binds
-                        // it via a path we don't yet model.
                         return Err(AotError::UnsupportedInst(
                             "MakeClosure with unresolved capture",
                         ));
@@ -1742,6 +1766,8 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         | Inst::VecLength(v, _) => Some(*v),
         // RC2 iter N — pair primitives.
         Inst::Cons(v, _, _, _, _) | Inst::Car(v, _) | Inst::Cdr(v, _) => Some(*v),
+        // RC3 iter 2.15 — list length.
+        Inst::Length(v, _) => Some(*v),
         // RC2 iter S — equality predicates on Any values.
         Inst::EqAny(v, _, _) | Inst::EqualAny(v, _, _) => Some(*v),
         // RC2 iter T — Any-handle refcount clone.

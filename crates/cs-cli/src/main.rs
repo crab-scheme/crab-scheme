@@ -1091,6 +1091,30 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
             sym_by_idx.entry(idx).or_insert(sym);
         }
     }
+    // RC3 iter 2.15 — disambiguate name collisions. Multiple
+    // letrec / named-let inner lambdas can share a binding name
+    // (`loop` is the canonical case — alloc-stress has two of
+    // them in different scopes). The bytecode-lambda-index is
+    // globally unique so suffix it onto duplicates: first
+    // occurrence keeps the bare name (for the common case);
+    // duplicates become `loop_2`, `loop_3`, etc.
+    {
+        let mut name_to_first_idx: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let entries: Vec<(usize, String)> =
+            name_by_idx.iter().map(|(i, n)| (*i, n.clone())).collect();
+        for (idx, name) in entries {
+            match name_to_first_idx.get(&name) {
+                None => {
+                    name_to_first_idx.insert(name.clone(), idx);
+                }
+                Some(&first) if first == idx => {}
+                Some(_) => {
+                    name_by_idx.insert(idx, format!("{name}_{idx}"));
+                }
+            }
+        }
+    }
     // RC3 iter 2.7 — known-globals set so the translator excludes
     // top-level AOT'd function names from the captures list.
     // Surviving EnvLookups of these syms then resolve through the
@@ -1112,15 +1136,39 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
     let mut compatible_funcs: Vec<cs_rir::Function> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     for (idx, lam) in bc.lambdas.iter().enumerate() {
+        // RC3 iter 2.15 — self_sym must be the ORIGINAL Scheme sym
+        // (from sym_by_idx), NOT syms.intern(name). When the
+        // disambiguator suffixes a collision (e.g., the second
+        // `loop` becomes `loop_42`), `syms.intern("loop_42")` would
+        // create a fresh sym that doesn't match the lambda's body's
+        // EnvLookup(loop_sym) → the CallSelf detection misses and
+        // `loop` becomes a capture.
         let (name, self_sym) = match name_by_idx.get(&idx) {
-            Some(n) => (n.clone(), Some(syms.intern(n))),
+            Some(n) => (n.clone(), sym_by_idx.get(&idx).copied()),
             None => (format!("__aot_lambda_{idx}"), None),
         };
-        match cs_vm::jit_translate::bytecode_to_rir_aot_with_globals(
+        // RC3 iter 2.15 — for LETREC-bound / anonymous inner lambdas,
+        // default params to Type::Any so closures that take pair /
+        // list values (like nqueens's `(let loop ((p placed)) ...)`)
+        // can car/cdr them. Top-level fns keep the None default
+        // (Fixnum); they're called from CLI with parsed Fixnum args
+        // and pure numeric kernels benefit from the typed-Fixnum
+        // RIR shape.
+        let is_top_level = sym_by_idx
+            .get(&idx)
+            .is_some_and(|s| known_globals.contains(&s.0));
+        let any_hints: Vec<cs_rir::Type> = if is_top_level {
+            Vec::new()
+        } else {
+            vec![cs_rir::Type::Any; lam.params.len()]
+        };
+        let hints: Option<&[cs_rir::Type]> = if is_top_level { None } else { Some(&any_hints) };
+        match cs_vm::jit_translate::bytecode_to_rir_aot_with_param_types(
             lam,
             name.as_str(),
             self_sym,
             Some(&known_globals),
+            hints,
         ) {
             Ok(mut rir) => {
                 // RC3 iter 2.2 Step 1 — annotate the RIR with its

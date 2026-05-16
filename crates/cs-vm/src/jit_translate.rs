@@ -112,7 +112,23 @@ pub fn bytecode_to_rir_aot_with_globals(
     self_name: Option<Symbol>,
     known_globals: Option<&std::collections::HashSet<u32>>,
 ) -> Result<Function, TranslateError> {
-    let mut func = bytecode_to_rir(lambda, name, self_name)?;
+    bytecode_to_rir_aot_with_param_types(lambda, name, self_name, known_globals, None)
+}
+
+/// RC3 iter 2.15 — full AOT translator with per-param type hints.
+/// cs-cli's aot --multi uses this to default LETREC-bound inner
+/// lambdas' params to `Type::Any` (so they accept pair/list values
+/// that the parent passes via named-let / letrec). Top-level fns
+/// keep the `None` default (Fixnum) since they're called from CLI
+/// with parsed Fixnum args.
+pub fn bytecode_to_rir_aot_with_param_types(
+    lambda: &CompiledLambda,
+    name: impl Into<String>,
+    self_name: Option<Symbol>,
+    known_globals: Option<&std::collections::HashSet<u32>>,
+    param_type_hints: Option<&[Type]>,
+) -> Result<Function, TranslateError> {
+    let mut func = bytecode_to_rir_with_hints(lambda, name, self_name, param_type_hints)?;
     // RC3 iter 2.13 — seed self_binding_sym from self_name so
     // record_captures (which runs below) can exclude self-EnvLookups
     // from the captures list (they resolve to __self_handle instead).

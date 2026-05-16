@@ -32,7 +32,9 @@ use cs_expand::Expander;
 use cs_parse::read_all;
 use cs_vm::compile_with_globals_and_primops;
 use cs_vm::compiler::PrimOp;
-use cs_vm::jit_translate::{bytecode_to_rir_aot, bytecode_to_rir_aot_with_globals};
+use cs_vm::jit_translate::{
+    bytecode_to_rir_aot, bytecode_to_rir_aot_with_globals, bytecode_to_rir_aot_with_param_types,
+};
 
 /// Mirrors cs_runtime's private primop_table. The compiler uses
 /// this to emit AddFx2/SubFx2/etc. specialized opcodes instead of
@@ -355,7 +357,8 @@ fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> P
         Err("stub builtin called from AOT test driver".into())
     }
     for name in &[
-        "not", "display", "newline", "/", "quotient", "modulo", "abs",
+        "not", "display", "newline", "/", "quotient", "modulo", "abs", "cons", "car", "cdr",
+        "length", "null?", "pair?",
     ] {
         let sym = syms.intern(name);
         let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
@@ -398,22 +401,57 @@ fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> P
         .into_iter()
         .map(|(_, s)| s.0)
         .collect();
+    // RC3 iter 2.15 — disambiguate name collisions (multiple `loop`
+    // letrec bindings); suffix the lambda index on duplicates.
+    {
+        let mut name_to_first_idx: HashMap<String, usize> = HashMap::new();
+        let entries: Vec<(usize, String)> =
+            name_by_idx.iter().map(|(i, n)| (*i, n.clone())).collect();
+        for (idx, name) in entries {
+            match name_to_first_idx.get(&name) {
+                None => {
+                    name_to_first_idx.insert(name.clone(), idx);
+                }
+                Some(&first) if first == idx => {}
+                Some(_) => {
+                    name_by_idx.insert(idx, format!("{name}_{idx}"));
+                }
+            }
+        }
+    }
     let mut compatible: Vec<cs_rir::Function> = Vec::new();
     for (idx, lam) in bc.lambdas.iter().enumerate() {
         let (name, self_sym) = match name_by_idx.get(&idx) {
-            Some(n) => (n.clone(), Some(syms.intern(n))),
+            // RC3 iter 2.15 — pass ORIGINAL sym for self_sym (not
+            // syms.intern(name)), since disambiguation may have
+            // suffixed the name.
+            Some(n) => (n.clone(), sym_by_idx.get(&idx).copied()),
             None => (format!("__aot_lambda_{idx}"), None),
         };
-        let mut rir =
-            bytecode_to_rir_aot_with_globals(lam, name.as_str(), self_sym, Some(&known_globals))
-                .unwrap_or_else(|e| panic!("bytecode_to_rir_aot failed on lambda {idx}: {e:?}"));
+        // RC3 iter 2.15 — inner lambdas default params to Type::Any.
+        let is_top_level = sym_by_idx
+            .get(&idx)
+            .is_some_and(|s| known_globals.contains(&s.0));
+        let any_hints: Vec<cs_rir::Type> = if is_top_level {
+            Vec::new()
+        } else {
+            vec![cs_rir::Type::Any; lam.params.len()]
+        };
+        let hints: Option<&[cs_rir::Type]> = if is_top_level { None } else { Some(&any_hints) };
+        let mut rir = bytecode_to_rir_aot_with_param_types(
+            lam,
+            name.as_str(),
+            self_sym,
+            Some(&known_globals),
+            hints,
+        )
+        .unwrap_or_else(|e| panic!("bytecode_to_rir_aot failed on lambda {idx}: {e:?}"));
         rir.lambda_index = Some(idx);
-        rir.name_sym = if known_globals.contains(&sym_by_idx.get(&idx).map_or(0, |s| s.0)) {
+        rir.name_sym = if is_top_level {
             sym_by_idx.get(&idx).map(|s| s.0)
         } else {
             None
         };
-        // RC3 iter 2.12 — self_binding_sym covers letrec bindings too.
         rir.self_binding_sym = sym_by_idx.get(&idx).map(|s| s.0);
         compatible.push(rir);
     }
@@ -505,6 +543,36 @@ fn source_to_aot_forward_self_ref_capture() {
     assert_eq!(run_multi_with_args(&bin, "f", &[3]), 4);
     assert_eq!(run_multi_with_args(&bin, "f", &[5]), 6);
     assert_eq!(run_multi_with_args(&bin, "f", &[10]), 11);
+}
+
+#[test]
+fn source_to_aot_list_length_and_cons() {
+    // RC3 iter 2.15 — closures over list / pair operations.
+    // alloc-stress builds a 1000-element list with cons + length.
+    // Pre-iter-2.15 the inner `loop` named-let failed three ways:
+    //   1. Param `acc` defaulted to Fixnum but flowed as a Pair →
+    //      `cons on non-Any operand` translator error.
+    //   2. `length` builtin had no cs-aot lowering →
+    //      `Inst::Length not yet supported` emit error.
+    //   3. Two named-lets both named `loop` collided in the
+    //      generated Rust source.
+    //
+    // Fix bundle: (a) inner-lambda params default to Type::Any;
+    // (b) Inst::Length lowers to `vm_length_gc` wrapped in
+    // NanboxValue::fixnum; (c) cs-cli disambiguates colliding
+    // letrec-binding names by suffixing the lambda index.
+    let bin = aot_compile_multi_and_run(
+        "(define (mk n) (let loop ((i 0) (acc '())) \
+           (if (= i n) acc (loop (+ i 1) (cons i acc))))) \
+         (define (sum-len n) (let loop ((r 0) (sum 0)) \
+           (if (= r n) sum (loop (+ r 1) (+ sum (length (mk 100)))))))",
+        "sum-len",
+        "list_length_cons",
+    );
+    assert_eq!(run_multi_with_args(&bin, "sum-len", &[0]), 0);
+    assert_eq!(run_multi_with_args(&bin, "sum-len", &[1]), 100);
+    assert_eq!(run_multi_with_args(&bin, "sum-len", &[5]), 500);
+    assert_eq!(run_multi_with_args(&bin, "sum-len", &[10]), 1000);
 }
 
 #[test]
