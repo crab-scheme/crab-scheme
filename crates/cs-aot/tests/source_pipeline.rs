@@ -328,6 +328,132 @@ fn source_to_aot_function_with_nested_lets() {
     assert_eq!(run_with_arg(&bin, 7), 49);
 }
 
+/// RC3 iter 2.4 — multi-procedure AOT helper. Translates *every*
+/// lambda in the bytecode (not just one entry) and emits a single
+/// binary with multi-procedure dispatch. Returns the binary path
+/// + the original Scheme name of the first top-level entry so the
+/// caller can invoke `<bin> <name> <args...>`.
+fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> PathBuf {
+    let mut sources = SourceMap::new();
+    let file_id = sources.add("<test>", src);
+    let mut syms = SymbolTable::new();
+    let data = read_all(file_id, src, &mut syms).expect("read_all");
+    let mut macros = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = expander.expand_program(&data).expect("expand");
+    drop(expander);
+    let globals = HashMap::new();
+    let primops = build_primops(&mut syms);
+    let bc = compile_with_globals_and_primops(&core, &globals, &primops).expect("compile");
+
+    // Mirror cs-cli's --multi name scan so the test path matches.
+    let mut name_by_idx: HashMap<usize, String> = HashMap::new();
+    for window in bc.insts.windows(2) {
+        if let (cs_vm::opcode::Inst::MakeClosure(idx), cs_vm::opcode::Inst::SetVar(sym)) =
+            (&window[0], &window[1])
+        {
+            name_by_idx.insert(*idx, syms.name(*sym).to_string());
+        }
+    }
+    let mut compatible: Vec<cs_rir::Function> = Vec::new();
+    for (idx, lam) in bc.lambdas.iter().enumerate() {
+        let (name, self_sym) = match name_by_idx.get(&idx) {
+            Some(n) => (n.clone(), Some(syms.intern(n))),
+            None => (format!("__aot_lambda_{idx}"), None),
+        };
+        let mut rir = bytecode_to_rir_aot(lam, name.as_str(), self_sym)
+            .unwrap_or_else(|e| panic!("bytecode_to_rir_aot failed on lambda {idx}: {e:?}"));
+        rir.lambda_index = Some(idx);
+        compatible.push(rir);
+    }
+    assert!(
+        !compatible.is_empty(),
+        "no AOT-compatible lambdas in source"
+    );
+
+    let pid = std::process::id();
+    let tmpdir = std::env::temp_dir().join(format!("cs-aot-multi-{pkg_suffix}-{pid}"));
+    let _ = std::fs::remove_dir_all(&tmpdir);
+
+    let opts = ProjectOptions {
+        mode: EmitMode::Nb,
+        package_name: format!("aot_multi_{pkg_suffix}"),
+        entry_fn_name: entry_name.to_string(),
+        cs_vm_dep: None,
+        cs_vm_path: Some(cs_vm_workspace_path()),
+        multi_procedure: true,
+    };
+
+    let emitted = emit_project(&compatible, &tmpdir, &opts)
+        .unwrap_or_else(|e| panic!("emit_project failed for multi {pkg_suffix}: {e}"));
+
+    let target_dir = workspace_target_dir();
+    let bin_name = &opts.package_name;
+    let output = Command::new("cargo")
+        .current_dir(&emitted.project_dir)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .arg("build")
+        .arg("--release")
+        .arg("--bin")
+        .arg(bin_name)
+        .arg("--offline")
+        .output()
+        .expect("cargo executes");
+    assert!(
+        output.status.success(),
+        "cargo build failed for multi {pkg_suffix}:\n--- stderr ---\n{}\n",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    target_dir.join(format!("release/{bin_name}"))
+}
+
+fn run_multi_with_args(bin: &PathBuf, entry: &str, args: &[i64]) -> i64 {
+    let mut cmd = Command::new(bin);
+    cmd.arg(entry);
+    for a in args {
+        cmd.arg(a.to_string());
+    }
+    let out = cmd.output().expect("binary executes");
+    assert!(
+        out.status.success(),
+        "binary failed: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8(out.stdout)
+        .expect("utf8")
+        .trim()
+        .parse::<i64>()
+        .expect("i64 parse")
+}
+
+#[test]
+fn source_to_aot_capturing_closure_inline_call() {
+    // RC3 iter 2.4 — capturing closure end-to-end. The outer
+    // `adder` builds an inner lambda that captures `x`, then
+    // immediately calls it with `y`.
+    //
+    // Exercises the full new path:
+    //   1. translator's record_captures populates inner.captures = [x_sym]
+    //   2. cs-aot emits inner with `__cap<x_sym>: i64` prefix param
+    //   3. outer's MakeClosure resolves the inner's capture to the
+    //      outer's `x` value and calls
+    //      vm_alloc_aot_procedure_with_captures
+    //   4. outer's Call routes through vm_call_aot_procedure which
+    //      forwards the captures slice to the inner's dispatch
+    //      wrapper
+    //   5. inner's body reads `__cap<x_sym>` and adds it to `z`
+    let bin = aot_compile_multi_and_run(
+        "(define (adder x y) ((lambda (z) (+ x z)) y))",
+        "adder",
+        "capturing_inline",
+    );
+    assert_eq!(run_multi_with_args(&bin, "adder", &[5, 10]), 15);
+    assert_eq!(run_multi_with_args(&bin, "adder", &[0, 0]), 0);
+    assert_eq!(run_multi_with_args(&bin, "adder", &[100, -50]), 50);
+    assert_eq!(run_multi_with_args(&bin, "adder", &[-7, -3]), -10);
+}
+
 #[test]
 fn compile_source_diagnostics_list_available_entries_on_typo() {
     // Negative-path coverage: if --entry NAME doesn't match any

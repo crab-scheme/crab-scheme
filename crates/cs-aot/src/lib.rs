@@ -404,6 +404,12 @@ pub struct LambdaInfo {
     pub fn_name: String,
     /// Number of positional args the underlying AOT'd fn takes.
     pub arity: usize,
+    /// RC3 iter 2.4 — syms this lambda captures from its parent
+    /// lexical scope. The caller of `MakeClosure` is responsible
+    /// for gathering NB values for each sym (from its own captures
+    /// or local defines) and passing them to
+    /// `vm_alloc_aot_procedure_with_captures`.
+    pub captures: Vec<u32>,
 }
 
 impl LambdaResolver {
@@ -419,6 +425,7 @@ impl LambdaResolver {
                     LambdaInfo {
                         fn_name: sanitize_ident(&f.name),
                         arity: f.params.len(),
+                        captures: f.captures.clone(),
                     },
                 );
             }
@@ -492,11 +499,26 @@ pub fn emit_with_resolver(
     // Function header. `extern "C"` matches the JIT's outer
     // trampoline so the runtime's dispatch path can `transmute` the
     // AOT'd fn pointer just like a JIT'd one.
+    //
+    // RC3 iter 2.4 Step 3: capturing functions prepend `__cap<sym>`
+    // params (one per entry in func.captures) before the user-level
+    // params. The dispatch wrapper unpacks captures + args and
+    // passes both. EnvLookup(_, sym) in the body resolves to
+    // `__cap<sym>` via the captures-index lookup.
     write!(out, "pub extern \"C\" fn {fn_name}(").unwrap();
-    for (i, (v, _ty)) in func.params.iter().enumerate() {
-        if i > 0 {
+    let mut first_param = true;
+    for sym in &func.captures {
+        if !first_param {
             out.push_str(", ");
         }
+        first_param = false;
+        write!(out, "__cap{sym}: i64").unwrap();
+    }
+    for (v, _ty) in func.params.iter() {
+        if !first_param {
+            out.push_str(", ");
+        }
+        first_param = false;
         write!(out, "v{}: i64", v.0).unwrap();
     }
     out.push_str(") -> i64 {\n");
@@ -523,10 +545,20 @@ fn emit_straight_line(
 ) -> Result<(), AotError> {
     let block = &func.blocks[0];
     let mut defined: HashSet<Value> = func.params.iter().map(|(v, _)| *v).collect();
+    let local_defs = collect_local_defines(func);
 
     let fn_name = sanitize_ident(&func.name);
     for inst in &block.insts {
-        emit_inst_let(out, inst, &defined, mode, &fn_name, resolver)?;
+        emit_inst_let(
+            out,
+            inst,
+            &defined,
+            mode,
+            &fn_name,
+            resolver,
+            &func.captures,
+            &local_defs,
+        )?;
         if let Some(dst) = inst_dst(inst) {
             defined.insert(dst);
         }
@@ -591,10 +623,19 @@ fn emit_loop_match(
     writeln!(out, "        match block {{").unwrap();
 
     let fn_name = sanitize_ident(&func.name);
+    let local_defs = collect_local_defines(func);
     for block in &func.blocks {
         writeln!(out, "            {} => {{", block.id.0).unwrap();
         for inst in &block.insts {
-            emit_inst_assign(out, inst, mode, &fn_name, resolver)?;
+            emit_inst_assign(
+                out,
+                inst,
+                mode,
+                &fn_name,
+                resolver,
+                &func.captures,
+                &local_defs,
+            )?;
         }
         emit_terminator(out, &block.terminator, func, mode)?;
         writeln!(out, "            }}").unwrap();
@@ -612,6 +653,22 @@ fn emit_loop_match(
 /// Emit an Inst as `let v_N: i64 = expr;` (straight-line shape).
 /// Used only by `emit_straight_line`; the loop+match shape uses
 /// `emit_inst_assign` instead (assignment to pre-declared mut).
+/// RC3 iter 2.4 — scan a function for `EnvDefineLocal(sym, value)`
+/// insts and build a `sym → Value` map. `MakeClosure` lowering uses
+/// this to resolve callee-capture-syms that refer to local defines
+/// (the other source is the caller's own captures list).
+fn collect_local_defines(func: &Function) -> std::collections::HashMap<u32, Value> {
+    let mut map = std::collections::HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let Inst::EnvDefineLocal(sym, val) = inst {
+                map.insert(*sym, *val);
+            }
+        }
+    }
+    map
+}
+
 fn emit_inst_let(
     out: &mut String,
     inst: &Inst,
@@ -619,8 +676,18 @@ fn emit_inst_let(
     mode: EmitMode,
     self_fn_name: &str,
     resolver: &LambdaResolver,
+    captures: &[u32],
+    local_defs: &std::collections::HashMap<u32, Value>,
 ) -> Result<(), AotError> {
-    let (dst, expr) = inst_rhs(inst, Some(defined), mode, self_fn_name, resolver)?;
+    let (dst, expr) = inst_rhs(
+        inst,
+        Some(defined),
+        mode,
+        self_fn_name,
+        resolver,
+        captures,
+        local_defs,
+    )?;
     writeln!(out, "    let v{}: i64 = {};", dst.0, expr).unwrap();
     Ok(())
 }
@@ -633,12 +700,22 @@ fn emit_inst_assign(
     mode: EmitMode,
     self_fn_name: &str,
     resolver: &LambdaResolver,
+    captures: &[u32],
+    local_defs: &std::collections::HashMap<u32, Value>,
 ) -> Result<(), AotError> {
     // The loop+match shape pre-declares all values; SSA validity is
     // a property of well-formed RIR, not something we re-check here
     // (the check requires cross-block dataflow analysis we don't yet
     // do in the emitter). Pass `None` to skip.
-    let (dst, expr) = inst_rhs(inst, None, mode, self_fn_name, resolver)?;
+    let (dst, expr) = inst_rhs(
+        inst,
+        None,
+        mode,
+        self_fn_name,
+        resolver,
+        captures,
+        local_defs,
+    )?;
     writeln!(out, "                v{} = {};", dst.0, expr).unwrap();
     Ok(())
 }
@@ -653,6 +730,8 @@ fn inst_rhs(
     mode: EmitMode,
     self_fn_name: &str,
     resolver: &LambdaResolver,
+    captures: &[u32],
+    local_defs: &std::collections::HashMap<u32, Value>,
 ) -> Result<(Value, String), AotError> {
     let check = |v: Value| -> Result<(), AotError> {
         match defined {
@@ -1182,25 +1261,61 @@ fn inst_rhs(
             for arg in args {
                 check(*arg)?;
             }
+            // RC3 iter 2.4: CallSelf in a capturing function passes
+            // through the same captures (recursive calls are within
+            // the same closure, so captures don't change).
             let mut call = String::from(self_fn_name);
             call.push('(');
-            for (i, arg) in args.iter().enumerate() {
-                if i > 0 {
+            let mut first = true;
+            for sym in captures {
+                if !first {
                     call.push_str(", ");
                 }
+                first = false;
+                call.push_str(&format!("__cap{sym}"));
+            }
+            for arg in args {
+                if !first {
+                    call.push_str(", ");
+                }
+                first = false;
                 call.push_str(&format!("v{}", arg.0));
             }
             call.push(')');
             (*dst, call)
         }
 
-        // ---- MakeClosure (RC3 iter 2.2 Step 3) ----
+        // ---- EnvLookup / EnvLookupAny (RC3 iter 2.4) ----
+        //
+        // After the demote pass, surviving EnvLookups reference
+        // captured free variables. The translator's `record_captures`
+        // post-pass populated `func.captures` in declaration order;
+        // each EnvLookup's sym maps to a `__cap<sym>` param the
+        // dispatch wrapper unpacked from the captures slice. Identity
+        // copy in NB mode (the capture is already an NB carrier).
+        (Inst::EnvLookup(dst, sym), _) | (Inst::EnvLookupAny(dst, sym), _)
+            if captures.contains(sym) =>
+        {
+            (*dst, format!("__cap{sym}"))
+        }
+
+        // ---- MakeClosure (RC3 iter 2.2 Step 3 + 2.4) ----
         //
         // Wraps an AOT-emitted lambda's dispatch fn pointer in a
-        // VmAotClosure via cs-vm's `vm_alloc_aot_procedure`. The
-        // resolver maps the bytecode-lambda-index to the AOT'd
-        // fn name + arity; if the lookup misses, the lambda wasn't
-        // part of the AOT'd set and we fail cleanly.
+        // VmAotClosure via cs-vm's `vm_alloc_aot_procedure` (no
+        // captures) or `vm_alloc_aot_procedure_with_captures` (with
+        // captures). The resolver maps the bytecode-lambda-index to
+        // the AOT'd fn name + arity + captures; if the lookup misses,
+        // the lambda wasn't part of the AOT'd set and we fail cleanly.
+        //
+        // RC3 iter 2.4: gather captured values from the caller's
+        // scope. Each callee-capture-sym resolves to either:
+        //   - the caller's own captures list → emit `__cap<sym>`
+        //   - an `EnvDefineLocal(sym, v)` earlier in the function →
+        //     emit `v<v.0>`
+        //   - neither → UnsupportedInst (sym not in scope at this
+        //     MakeClosure point — likely a cross-block flow we don't
+        //     yet model).
         (Inst::MakeClosure(dst, lambda_idx), EmitMode::Nb) => {
             let info = resolver
                 .by_idx
@@ -1212,13 +1327,44 @@ fn inst_rhs(
                     // the user.
                     AotError::UnsupportedInst("MakeClosure")
                 })?;
-            (
-                *dst,
-                format!(
-                    "unsafe {{ cs_vm::vm::vm_alloc_aot_procedure({}_aot_dispatch as usize, {}u32) }}",
-                    info.fn_name, info.arity
-                ),
-            )
+            if info.captures.is_empty() {
+                (
+                    *dst,
+                    format!(
+                        "unsafe {{ cs_vm::vm::vm_alloc_aot_procedure({}_aot_dispatch as usize, {}u32) }}",
+                        info.fn_name, info.arity
+                    ),
+                )
+            } else {
+                let mut cap_exprs: Vec<String> = Vec::with_capacity(info.captures.len());
+                for sym in &info.captures {
+                    if captures.contains(sym) {
+                        cap_exprs.push(format!("__cap{sym}"));
+                    } else if let Some(v) = local_defs.get(sym) {
+                        cap_exprs.push(format!("v{}", v.0));
+                    } else {
+                        // Sym is neither in our captures nor locally
+                        // defined via EnvDefineLocal. The bytecode
+                        // likely binds it via a path we don't yet
+                        // model (e.g., direct env install from a
+                        // letrec frame outside our scan).
+                        return Err(AotError::UnsupportedInst(
+                            "MakeClosure with unresolved capture",
+                        ));
+                    }
+                }
+                let cap_csv = cap_exprs.join(", ");
+                let n_caps = info.captures.len();
+                (
+                    *dst,
+                    format!(
+                        "{{ let __aot_caps: [i64; {n_caps}] = [{cap_csv}]; \
+                         unsafe {{ cs_vm::vm::vm_alloc_aot_procedure_with_captures(\
+                         {}_aot_dispatch as usize, {}u32, __aot_caps.to_vec()) }} }}",
+                        info.fn_name, info.arity
+                    ),
+                )
+            }
         }
 
         // ---- general Call (RC3 iter 2.2 Step 4) ----
@@ -1426,6 +1572,8 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         // RC3 iter 2.2 Steps 3-4 — MakeClosure + general Call.
         Inst::MakeClosure(v, _) => Some(*v),
         Inst::Call(v, _, _) => Some(*v),
+        // RC3 iter 2.4 — EnvLookup post-demote (captures).
+        Inst::EnvLookup(v, _) | Inst::EnvLookupAny(v, _) => Some(*v),
         // RC2 iter C — Flonum arith/cmp Insts.
         Inst::FlonumAdd(v, _, _)
         | Inst::FlonumSub(v, _, _)

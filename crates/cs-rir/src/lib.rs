@@ -1377,6 +1377,19 @@ pub struct Function {
     /// `Function::new(...)` constructions stay valid without the
     /// caller needing a sentinel value.
     pub lambda_index: Option<usize>,
+    /// RC3 iter 2.4 — captured free-var sym IDs, in declaration order.
+    /// Empty for non-capturing functions. The bytecode→RIR translator
+    /// analyzes the body's `EnvLookup`/`EnvLookupAny` references to
+    /// non-local syms and records them here; cs-aot's MakeClosure
+    /// emission uses this list to know how many values to gather as
+    /// captures + in what order, and the dispatch wrapper uses it to
+    /// know how many captures to unpack from the slice.
+    ///
+    /// The lambda's body Insts use `EnvLookup(_, sym)` to reference
+    /// captures (translator unchanged); cs-aot resolves each EnvLookup
+    /// against this list to compute the capture-slice index. See
+    /// `docs/milestones/aot-iter-24-design.md`.
+    pub captures: Vec<u32>,
 }
 
 impl Function {
@@ -1389,6 +1402,7 @@ impl Function {
             blocks: Vec::new(),
             return_type: Type::Fixnum,
             lambda_index: None,
+            captures: Vec::new(),
         }
     }
 

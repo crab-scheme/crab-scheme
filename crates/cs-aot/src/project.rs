@@ -344,27 +344,41 @@ fn write_aot_dispatch_wrapper(src: &mut String, f: &Function) {
     let fn_name = sanitize_ident_for_project(&f.name);
     let arity = f.params.len();
 
+    let n_captures = f.captures.len();
     src.push_str(&format!(
-        "/// RC3 iter 2.2 + 2.4: dispatch wrapper for `{fn_name}` (arity {arity}).\n\
+        "/// RC3 iter 2.2 + 2.4: dispatch wrapper for `{fn_name}` (arity {arity}, captures {n_captures}).\n\
          /// Called via cs_vm::vm::vm_call_aot_procedure when the\n\
          /// procedure value is invoked from Scheme code. Signature\n\
-         /// matches cs_vm::vm::AotDispatchFn (captures + args).\n\
-         /// Non-capturing wrappers ignore the captures slice.\n"
+         /// matches cs_vm::vm::AotDispatchFn (captures + args).\n"
     ));
+    let captures_binding = if n_captures == 0 {
+        "_captures"
+    } else {
+        "captures"
+    };
     src.push_str(&format!(
         "#[no_mangle]\npub unsafe extern \"C\" fn {fn_name}_aot_dispatch(\
-         _captures: *const i64, _n_captures: usize, \
+         {captures_binding}: *const i64, _n_captures: usize, \
          args: *const i64, n_args: usize) -> i64 {{\n"
+    ));
+    src.push_str(&format!(
+        "    debug_assert_eq!(_n_captures, {n_captures}, \"{fn_name}_aot_dispatch: n_captures\");\n"
     ));
     src.push_str(&format!(
         "    debug_assert_eq!(n_args, {arity}, \"{fn_name}_aot_dispatch: arity\");\n"
     ));
 
-    // Unpack args + invoke. Non-capturing today; iter 2.4's cs-aot
-    // side will extend the unpack to also load captures and pass
-    // them as extra params to the typed fn.
-    let arg_loads: Vec<String> = (0..arity).map(|i| format!("*args.add({i})")).collect();
-    src.push_str(&format!("    {fn_name}({})\n}}\n\n", arg_loads.join(", ")));
+    // Unpack captures (RC3 iter 2.4) + args + invoke. Captures
+    // come first to match the typed fn's signature
+    // (`fn(__cap<sym0>, __cap<sym1>, ..., v_param0, ...)`).
+    let mut all_loads: Vec<String> = Vec::with_capacity(n_captures + arity);
+    for i in 0..n_captures {
+        all_loads.push(format!("*captures.add({i})"));
+    }
+    for i in 0..arity {
+        all_loads.push(format!("*args.add({i})"));
+    }
+    src.push_str(&format!("    {fn_name}({})\n}}\n\n", all_loads.join(", ")));
 }
 
 /// Single-entry main shim (RC2 baseline; default).

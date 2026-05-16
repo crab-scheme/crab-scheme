@@ -105,7 +105,40 @@ pub fn bytecode_to_rir_aot(
     // On bail, downstream sees the original RIR + a clean
     // UnsupportedInst diagnostic from cs-aot.
     let _ = demote_env_to_ssa_all_blocks(&mut func);
+    // RC3 iter 2.4 Step 1: capture analysis post-pass. The demote
+    // dropped EnvLookup/EnvLookupAny for locally-defined syms; any
+    // surviving env op references a free variable that must be
+    // captured at MakeClosure time. Collect those syms in
+    // first-seen order into func.captures; cs-aot uses this list
+    // to emit the dispatch wrapper's capture-slice unpacking +
+    // MakeClosure's capture-gathering.
+    record_captures(&mut func);
     Ok(func)
+}
+
+/// RC3 iter 2.4 Step 1 — walk a translated Function looking for
+/// `EnvLookup` / `EnvLookupAny` insts referring to syms NOT locally
+/// defined. Each such sym is a captured free variable; we record
+/// them on `func.captures` in first-seen order.
+///
+/// Run AFTER `demote_env_to_ssa_all_blocks` so the demote-able
+/// lookups (those paired with EnvDefineLocal in the same function)
+/// are already gone. Surviving lookups are the captures by
+/// definition.
+fn record_captures(func: &mut cs_rir::Function) {
+    use std::collections::HashSet;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut order: Vec<u32> = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let RirInst::EnvLookup(_, sym) | RirInst::EnvLookupAny(_, sym) = inst {
+                if seen.insert(*sym) {
+                    order.push(*sym);
+                }
+            }
+        }
+    }
+    func.captures = order;
 }
 
 /// RC2 iter O — extends `demote_env_to_ssa_in_first_block` to
