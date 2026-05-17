@@ -6,3 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "CrabScheme precise tracing garbage collector"
+
+[features]
+default = []
+# Gate the Rc-backed `Gc<T>` representation and the synchronous
+# cycle-collector module (`cs_gc::cycle`). When disabled, the M5
+# Phase 1 tracing infrastructure (`Heap`, `Trace`, `Marker`, mark-
+# sweep `collect()`) is the only path. See
+# `.spec-workflow/specs/countable-memory/` for the migration plan.
+countable-memory = []
