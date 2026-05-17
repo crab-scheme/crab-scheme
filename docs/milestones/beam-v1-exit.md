@@ -166,6 +166,31 @@ called — non-actor builds (e.g., WASM via `--no-default-features`)
 skip the entire dependency tree because the `actor` feature is
 off.
 
+## Verification follow-up (post-exit-doc honesty pass)
+
+After the initial exit doc, all five "NOT verified" gaps were
+exercised in dedicated test files:
+
+| Gap | File | Result |
+|-----|------|--------|
+| Procedure-version hot reload | `crates/cs-runtime/tests/beam_verification.rs` | ✓ Re-registration swaps for future spawns; running actors keep their original version (the Arc is captured at spawn time). |
+| JIT-tier integration | `crates/cs-runtime/tests/beam_verification.rs` | ✓ beam builtins are callable through the VM tier inside a Runtime with the JIT installed; tier-up fires + correct results. Direct JIT-emitted dispatch into Syms-shape builtins is a cs-jit-cranelift extension, tracked with #107. |
+| Soak / load | `crates/cs-runtime/tests/beam_verification.rs` | ✓ 100 actors × 20 msgs = 2000 round-trips in 7ms (280k msg/s), p99 latency 77µs. Not the spec's 1000×10M acceptance (needs the scheduler swap) but confirms no deadlock and bounded latency at modest scale. |
+| Throughput bench | `crates/cs-runtime/tests/beam_verification.rs` | ✓ Records spawn 8.2µs/op, send 487ns/op, table-insert 1.06µs/op. Not statistically rigorous; a regression check. |
+| Scheme prelude macros | `crates/cs-runtime/tests/beam_prelude_macros.rs` | ⚠ Building blocks all work (case-lambda, define-record-type, simpler `(receive (pat action))`, helper procs). Loading the full `lib/beam/prelude.scm` FAILS — the prelude uses Racket-style `#:keyword` argument syntax that cs-lex doesn't recognize. Two other expander edges (cs-diag span-merge across eval_str units; ellipsis-in-cond producing empty application) were surfaced and documented as `#[ignore]`-tracked regressions. |
+
+The prelude finding is the load-bearing one: as written,
+`lib/beam/prelude.scm` is design-validated but not loadable.
+Closing that gap is one of:
+
+1. Rewrite `make-supervisor` / `define-behavior` to use plain
+   positional args or symbol-key args instead of `#:strategy`,
+   `#:init`, etc.
+2. Extend cs-lex + cs-parse + cs-expand to handle the `#:foo`
+   keyword syntax.
+
+Tracked as #109.
+
 ## What's explicitly deferred (post-1.0)
 
 ### #105 — B7 second half: JIT invalidation on hot reload
