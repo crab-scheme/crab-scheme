@@ -124,9 +124,65 @@ makes "let it crash" work.
 - **Hot reload pause**: wall time the running actor is paused
   during `(reload-module! mod)`. Target: < 10 ms for a small module.
 
+## Rust / Scheme split
+
+The instinct on first read of the spec is to push lots of policy
+into Rust crates. That's wrong. Each new feature should live as
+high in the stack as it can run cleanly. After implementing B1
+(per-Heap gc-stats) and B2 (cs-actor primops), the right split
+looks like this:
+
+**Belongs in Rust (the floor — anything Scheme can't safely do):**
+
+- Tokio runtime + per-actor OS-level scheduling
+- Mailbox channel + atomic PID allocator
+- Per-actor Heap activation (the `with_active` machinery from B1)
+- Reduction-counting hook in the bytecode dispatch loop (B3)
+- Cross-thread Value transport (deep-copy on send) — needs
+  unsafe Send wrappers around the !Send `Value`
+- The four primops that bridge Scheme to tokio: `spawn`, `send`,
+  raw `receive`, `self`
+
+**Belongs in Scheme (the policy — built on the four primops):**
+
+- `(receive ((pattern) action) (after timeout action))` — selective
+  receive with pattern matching is much cleaner as a macro than a
+  Rust DSL
+- `(call pid msg [timeout])` — just
+  `(send pid (list (self) msg))` then `(receive (((reply)) reply))`.
+  No primop needed.
+- `(link)` / `(monitor)` — built on `(spawn)` + a
+  system-message convention. A "linked exit" is just a message
+  with a known tag; receivers can pattern-match it like any other.
+- All of cs-supervisor — child specs, restart strategies, intensity
+  caps. OTP's `supervisor.erl` is ~600 lines of Erlang on top of
+  `gen_server`; ours can be ~300 lines of Scheme on top of
+  `spawn`/`receive`/`monitor`. Strategies (`one_for_one`,
+  `one_for_all`, `rest_for_one`) are just different message-handling
+  policies — pure dispatch logic, no system calls.
+- `define-behavior` (the gen_server analogue) — already planned as
+  a Scheme macro.
+- The code-change callback dispatch in cs-hotreload — Rust manages
+  the version table, Scheme manages "what to do when versions
+  differ."
+- cs-table's transactional patterns (writer-process wrapper, etc.)
+  — single-writer-actor convention is pure Scheme.
+
+**Implications for the crate breakdown below**:
+
+- `cs-actor` stays narrow (~1.5 KLoC, not 3-4) — four primops
+  and the tokio plumbing, no behaviors.
+- `cs-supervisor` shrinks to almost nothing in Rust — most of it
+  is Scheme prelude. The crate still exists but holds at most the
+  "trap_exit" flag plumbing and a couple of utility types.
+- `cs-hotreload` keeps the version table + epoch tracking; the
+  callback dispatch and state migration ergonomics are Scheme.
+- `cs-table` keeps the concurrent map storage; the writer-process
+  and transactional patterns are Scheme.
+
 ## Crate breakdown
 
-### `cs-actor` (~3-4 KLoC)
+### `cs-actor` (~1.5 KLoC)
 
 Core actor primitive + tokio integration. Owns the runtime.
 

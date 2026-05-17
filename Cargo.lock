@@ -388,9 +388,7 @@ dependencies = [
 name = "cs-actor"
 version = "0.0.1"
 dependencies = [
- "cs-core",
- "cs-gc",
- "cs-runtime",
+ "rustc-hash",
  "thiserror 1.0.69",
  "tokio",
 ]

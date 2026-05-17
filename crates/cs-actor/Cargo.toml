@@ -8,11 +8,14 @@ repository.workspace = true
 description = "CrabScheme BEAM-style actor system: per-actor Runtime + tokio mpsc mailbox + reduction-based preemption. See docs/research/beam_runtime_spec.md."
 
 [dependencies]
-cs-core = { workspace = true }
-cs-runtime = { workspace = true }
-cs-gc = { workspace = true }
+# cs-core / cs-runtime / cs-gc are deliberately NOT depended on in
+# B2 — the actor system is type-erased over a Send+Sync payload so
+# the (still !Send) cs_core::Value type doesn't constrain the
+# design. Real Value transport lands when Scheme primops
+# integrate (post-B3) via copy-on-send wrappers.
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
 thiserror = { workspace = true }
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
