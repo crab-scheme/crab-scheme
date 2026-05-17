@@ -78,6 +78,14 @@ pub struct Checker<'tab> {
     /// specialization only when every inner Vec is equal.
     top_level_call_arg_types:
         std::cell::RefCell<std::collections::HashMap<cs_core::Symbol, Vec<Vec<Type>>>>,
+    /// Stack of top-level lambda names whose body the Checker
+    /// is currently inside. Used by the per-call-site arg-type
+    /// recorder to skip self-recursive calls — those carry no
+    /// information about the OUTER caller's intent and would
+    /// otherwise spuriously block monomorphization (a recursive
+    /// `(fib (- n 1))` with n: Any infers as `[Number]`, which
+    /// disagrees with the outer `(fib 25): [Fixnum]`).
+    current_lambda_stack: std::cell::RefCell<Vec<cs_core::Symbol>>,
 }
 
 impl<'tab> Checker<'tab> {
@@ -96,6 +104,7 @@ impl<'tab> Checker<'tab> {
             inferred_param_hints: std::cell::RefCell::new(std::collections::HashMap::new()),
             top_level_lambda_names: std::cell::RefCell::new(std::collections::HashSet::new()),
             top_level_call_arg_types: std::cell::RefCell::new(std::collections::HashMap::new()),
+            current_lambda_stack: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -180,10 +189,20 @@ impl<'tab> Checker<'tab> {
             if hints.contains_key(name) {
                 continue;
             }
-            let Some(first) = call_sites.first() else {
+            // Discard call sites where ALL arg types are Any —
+            // those carry no information (typically the body's
+            // recursive self-call before the typer has any
+            // hypothesis for the param's type). Keeping them
+            // would spuriously block specialization whenever the
+            // outer caller passes a concrete type.
+            let definitive: Vec<&Vec<Type>> = call_sites
+                .iter()
+                .filter(|c| !c.iter().all(|t| matches!(t, Type::Any)))
+                .collect();
+            let Some(first) = definitive.first().copied() else {
                 continue;
             };
-            if !call_sites.iter().all(|c| c == first) {
+            if !definitive.iter().all(|c| *c == first) {
                 continue;
             }
             if first.iter().any(|t| matches!(t, Type::Any)) {
@@ -393,7 +412,9 @@ impl<'tab> Checker<'tab> {
         // arg types so that after the walk we can detect names
         // whose call sites all agree, and emit hints for them.
         if let CoreExpr::Ref { name, .. } = func {
-            if self.top_level_lambda_names.borrow().contains(name) {
+            if self.top_level_lambda_names.borrow().contains(name)
+                && !self.current_lambda_stack.borrow().contains(name)
+            {
                 let arg_types: Vec<Type> = args.iter().map(|a| self.infer(a)).collect();
                 self.top_level_call_arg_types
                     .borrow_mut()
@@ -869,7 +890,18 @@ impl<'tab> Checker<'tab> {
         if matches!(value, CoreExpr::Lambda { .. }) && self.table.ascription(name).is_none() {
             self.top_level_lambda_names.borrow_mut().insert(name);
         }
-        self.check(value, &target)?;
+        // Track the in-progress lambda body so the per-call-site
+        // recorder can skip self-recursive calls (see comment on
+        // `current_lambda_stack`).
+        let is_lambda = matches!(value, CoreExpr::Lambda { .. });
+        if is_lambda {
+            self.current_lambda_stack.borrow_mut().push(name);
+        }
+        let result = self.check(value, &target);
+        if is_lambda {
+            self.current_lambda_stack.borrow_mut().pop();
+        }
+        result?;
         // Phase 5++ recommendation #3: seed env with the
         // unannotated lambda's INFERRED ProcType so downstream
         // callers' `infer(App(Ref(name), …))` returns the
@@ -889,6 +921,20 @@ impl<'tab> Checker<'tab> {
                     self.env
                         .define_top_level(name, Type::Procedure_(Box::new(pt)));
                 }
+            }
+        } else if self.table.ascription(name).is_none() {
+            // Non-lambda value with no user ascription — seed env
+            // with the value's inferred type so downstream callers
+            // see a concrete type for `Ref name`. Critical for the
+            // monomorphization recorder: `(define n 25)` followed
+            // by `(fib n)` should record fib's arg-type vector as
+            // `[Fixnum]`, not `[Any]`. Without this, the recorder
+            // sees `Any` (the default for unannotated top-level
+            // bindings) and the monomorphization gate drops the
+            // call site.
+            let inferred = self.infer(value);
+            if !matches!(inferred, Type::Any) {
+                self.env.define_top_level(name, inferred);
             }
         }
         // Set itself returns the unspecified value; treat as Any.

@@ -457,6 +457,24 @@ fn infer_value_types(func: &Function) -> std::collections::HashMap<Value, Type> 
                 | Inst::FlonumAtan2(dst, _, _) => Some((*dst, Type::Flonum)),
                 // SSA alias copy: dst inherits src's type.
                 Inst::Move(dst, src) => types.get(src).cloned().map(|t| (*dst, t)),
+                // Refcount bump preserves the underlying NB type
+                // bits; the value is still the same logical Scheme
+                // datum. Propagating this lets fixnum fast paths
+                // fire across clone chains (e.g., fib's nb_lt /
+                // nb_sub / nb_add).
+                Inst::AnyClone(dst, src) => types.get(src).cloned().map(|t| (*dst, t)),
+                // Self-recursion: the result carries the
+                // function's declared return type. Unlocks
+                // fast paths on combinators like fib's
+                // `(+ (fib n-1) (fib n-2))` where both
+                // operands are CallSelf returns.
+                Inst::CallSelf(dst, _) => {
+                    if matches!(func.return_type, Type::Any) {
+                        None
+                    } else {
+                        Some((*dst, func.return_type.clone()))
+                    }
+                }
                 _ => None,
             };
             if let Some((d, t)) = entry {
