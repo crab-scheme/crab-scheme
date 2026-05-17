@@ -141,6 +141,18 @@ impl AnnotationTable {
             .find(|a| a.name == name)
             .map(|a| &a.target)
     }
+
+    /// User-written top-level ascription for `name`, if any.
+    /// Looks at `top_level` only — never the primop table or
+    /// the env. The checker uses this to distinguish "user
+    /// asked for this type" from "an unrelated primop happens
+    /// to share the name".
+    pub fn ascription(&self, name: Symbol) -> Option<&Type> {
+        self.top_level
+            .iter()
+            .find(|ta| ta.name == name)
+            .map(|ta| &ta.type_ann)
+    }
 }
 
 #[cfg(test)]

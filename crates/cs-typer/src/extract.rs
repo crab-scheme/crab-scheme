@@ -368,7 +368,16 @@ fn build_proper_list(items: Vec<Datum>, list_span: Span) -> Datum {
         let s = d.span();
         tail = Datum::Pair(Rc::new(d), Rc::new(tail), s);
     }
-    tail
+    // Repair the outermost pair's span to be the full list span.
+    // cs-parse assigns the *enclosing* `(...)` source range to the
+    // outermost Pair's span; the iteration above leaves it as the
+    // first element's span (e.g. just `define` for `(define ...)`).
+    // The typechecker keys `LambdaAnnotation`s by the outer span,
+    // so a mismatch here loses the annotation at lookup time.
+    match tail {
+        Datum::Pair(a, b, _) => Datum::Pair(a, b, list_span),
+        other => other,
+    }
 }
 
 fn type_ann_diag(err: TypeAnnError, span: Span) -> Diagnostic {
