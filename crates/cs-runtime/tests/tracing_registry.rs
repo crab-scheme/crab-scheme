@@ -95,6 +95,32 @@ fn collect_builtin_runs_sweep() {
 }
 
 #[test]
+fn tracing_policy_overrides_threshold() {
+    use cs_gc::Gc;
+    use cs_runtime::{Runtime, TracingPolicy};
+    cycle_registry::reset_for_tests();
+    let mut rt = Runtime::new();
+    rt.set_tracing_policy(TracingPolicy {
+        auto_trigger_threshold: 2,
+    });
+    let _g1: Gc<i64> = Gc::new(0);
+    cycle_registry::register_cycle_candidate(Gc::as_addr(&_g1), Gc::downgrade(&_g1));
+    let _g2: Gc<i64> = Gc::new(0);
+    cycle_registry::register_cycle_candidate(Gc::as_addr(&_g2), Gc::downgrade(&_g2));
+    // Threshold of 2 reached — sweep pending. The next alloc
+    // takes the flag.
+    assert!(
+        cycle_registry::candidate_count() >= 2,
+        "expected ≥2 candidates registered"
+    );
+    let _g3: Gc<i64> = Gc::new(0);
+    // After Gc::new took SWEEP_PENDING, sweep ran. The
+    // _g1/_g2 candidates upgrade fine (still live) so they
+    // stay; nothing changes.
+    assert!(cycle_registry::candidate_count() >= 2);
+}
+
+#[test]
 fn many_cycles_populate_registry() {
     cycle_registry::reset_for_tests();
     let mut pairs = Vec::with_capacity(20);

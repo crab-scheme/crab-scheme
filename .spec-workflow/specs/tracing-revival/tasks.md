@@ -1,5 +1,10 @@
 # Tracing Revival — Tasks
 
+> Status: **CLOSED** (2026-05-17). Iters 1-5 complete; tasks
+> #4 Phase 2/3 (full Bacon-Rajan trial-deletion) and the
+> `Runtime::start_background_sweep` half of task #7 deferred
+> — see `docs/milestones/tracing-revival-exit.md` and
+> `docs/adr/0018-tracing-cycle-collector.md`.
 > Companion: `requirements.md`, `design.md`.
 > Format mirrors the countable-memory / region-memory specs.
 
@@ -214,7 +219,7 @@ region exclusion). Independent of the `escape-analysis` spec
 
 ## Iter 5 — Embedder API + ADR 0018 + exit report
 
-- [ ] 7. `TracingPolicy` + `Runtime::set_tracing_policy`
+- [x] 7. `TracingPolicy` + `Runtime::set_tracing_policy`
   - File: `crates/cs-runtime/src/lib.rs`
   - Implement per design.md §"Component 5":
     - `pub struct TracingPolicy { auto_trigger_threshold: usize, background_tick: Option<Duration> }`
@@ -238,7 +243,7 @@ region exclusion). Independent of the `escape-analysis` spec
     application, background-sweep start (test asserts
     a sweep ran via a counter)._
 
-- [ ] 8. ADR 0018 + exit report + spec close
+- [x] 8. ADR 0018 + exit report + spec close
   - File: `docs/adr/0018-tracing-cycle-collector.md` (new),
     `docs/milestones/tracing-revival-exit.md` (new),
     spec files status update.

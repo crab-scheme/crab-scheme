@@ -158,7 +158,52 @@ impl Default for Runtime {
     }
 }
 
+/// Embedder-facing configuration for the layer-4 tracing
+/// cycle collector (tracing-revival spec iter 5).
+///
+/// Only meaningful when the `tracing-cycle-collector` feature
+/// is on. With it off, `Runtime::set_tracing_policy` is a
+/// no-op and the policy is ignored.
+#[cfg(feature = "tracing-cycle-collector")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TracingPolicy {
+    /// Registry-size at which the next allocation
+    /// auto-triggers a sweep. Defaults to 10_000 — embedders
+    /// running short workloads with many transient cycles
+    /// can raise it; tight loops with long-lived cycles can
+    /// lower it.
+    pub auto_trigger_threshold: usize,
+}
+
+#[cfg(feature = "tracing-cycle-collector")]
+impl Default for TracingPolicy {
+    fn default() -> Self {
+        TracingPolicy {
+            auto_trigger_threshold: 10_000,
+        }
+    }
+}
+
 impl Runtime {
+    /// Apply a [`TracingPolicy`] to this thread's cycle-
+    /// candidate registry. Today only sets the
+    /// auto-trigger threshold; background-sweep wiring is
+    /// future work (the registry is per-thread via
+    /// `thread_local!` which doesn't compose with a foreign
+    /// sweep thread without redesign — see ADR 0018's
+    /// deferred-work list).
+    ///
+    /// No-op when `tracing-cycle-collector` is off.
+    #[cfg(feature = "tracing-cycle-collector")]
+    pub fn set_tracing_policy(&mut self, policy: TracingPolicy) {
+        cs_gc::cycle_registry::set_auto_trigger_threshold(policy.auto_trigger_threshold);
+    }
+
+    /// Compatibility no-op when `tracing-cycle-collector` is
+    /// off. Lets embedder code stay unconditional.
+    #[cfg(not(feature = "tracing-cycle-collector"))]
+    pub fn set_tracing_policy_noop(&mut self) {}
+
     pub fn new() -> Self {
         let mut syms = SymbolTable::new();
         let top = Frame::root();

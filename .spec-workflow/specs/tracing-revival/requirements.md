@@ -1,6 +1,9 @@
 # Tracing Revival — Requirements
 
-> Status: **Draft**.
+> Status: **CLOSED** (2026-05-17, with Phase 2/3 trial-
+> deletion + background-sweep deferred — see
+> `docs/milestones/tracing-revival-exit.md` and
+> `docs/adr/0018-tracing-cycle-collector.md`).
 > Spec slug: `tracing-revival`
 > Roadmap slot: Layer 4 of the unified memory management
 > architecture (ADR 0015).

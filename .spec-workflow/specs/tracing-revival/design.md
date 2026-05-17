@@ -1,6 +1,8 @@
 # Tracing Revival — Design
 
-> Status: **Draft**.
+> Status: **CLOSED** (2026-05-17). See
+> `docs/milestones/tracing-revival-exit.md` and
+> `docs/adr/0018-tracing-cycle-collector.md`.
 > Companion: `requirements.md`, `tasks.md`.
 
 ## Overview
