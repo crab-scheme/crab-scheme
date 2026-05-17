@@ -71,8 +71,14 @@ impl Procedure for Closure {
     }
     #[cfg(feature = "countable-memory")]
     fn visit_closure_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
-        // Captured env chain. body is shared immutable IR
-        // (Rc<CoreExpr>) with no Scheme values.
+        // Dedup on the closure's own Rc identity AND descend
+        // into the env (which itself dedup-checks Frame). Body
+        // is shared immutable IR (Rc<CoreExpr>) with no Scheme
+        // values.
+        let addr = self as *const Self as usize;
+        if !ctx.visit_addr(addr) {
+            return;
+        }
         self.env.visit_children(ctx);
     }
 }

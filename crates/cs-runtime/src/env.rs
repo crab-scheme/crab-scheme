@@ -70,23 +70,33 @@ impl cs_core::Trace for Frame {
 #[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Frame {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Frame is Rc<Self>; the address-based dedup keeps the
+        // detector from re-entering the same frame when a
+        // closure binding points back through its capturing env.
+        // (E.g. `(define (f) f)` — bindings has f → Closure(env)
+        // where env is this same Frame.)
+        let addr = self as *const Self as usize;
+        if !ctx.visit_addr(addr) {
+            return;
+        }
+        // Walk THIS frame's bindings only. The parent chain is
+        // not traversed: in mutation-driven cycle detection the
+        // relevant question is "does the freshly mutated cell
+        // reach back to itself through user data?", not "does
+        // it reach back through the stdlib root env?".
+        // Parent-chain traversal would recurse through hundreds
+        // of defining frames (each holding builtins and prior
+        // user definitions) and blow the host stack on deeply
+        // nested test environments.
+        //
+        // Iter 8's planned Weak<Frame> refactor would close
+        // this with a structural guarantee; the iter-11 safe
+        // behavior is identity-dedup + skip-parent.
         for (_, val) in self.bindings.borrow().iter() {
             if ctx.done() {
                 return;
             }
             val.visit_children(ctx);
-        }
-        if let Some(p) = &self.parent {
-            if ctx.done() {
-                return;
-            }
-            // Iter 6: parent is still strong here (Rc<Frame>); the
-            // iter-8 refactor converts it to Weak<Frame> and walks
-            // upward via upgrade(). For now, descend through the
-            // existing strong link — cycle detection works either
-            // way; structural prevention via Weak is the iter-8
-            // perf+correctness layer.
-            p.visit_children(ctx);
         }
     }
 }

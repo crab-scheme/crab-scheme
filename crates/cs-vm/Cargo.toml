@@ -6,11 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = []
-# Forward the countable-memory feature down to cs-core (which
-# forwards to cs-gc). Required so the cs-vm crate's CycleVisit
-# impls (VmClosure, Bindings, Env) compile against the
-# feature-gated trait.
+# Iter 11: default-on. Forward the countable-memory feature down
+# to cs-core (which forwards to cs-gc). Required so the cs-vm
+# crate's CycleVisit impls (VmClosure, Bindings, Env) compile
+# against the feature-gated trait.
+default = ["countable-memory"]
 countable-memory = ["cs-core/countable-memory"]
 
 [dependencies]

@@ -87,13 +87,18 @@ fn cycle_check_p99_under_100us_on_1k_node_chain() {
         p50, p99, max
     );
 
-    // Spec gate: p99 < 100 µs. Allow generous margin so CI
-    // noise doesn't flake the test; tighten when iter 7.1 lands
-    // and the storage refactor lets the detector short-circuit
-    // on Weak edges.
+    // Spec gate: p99 < 100 µs (release). Debug builds are ~10×
+    // slower due to lack of inlining + bounds checks; the spec
+    // applies to optimized binaries, so we widen the ceiling
+    // when debug_assertions are enabled.
+    let ceiling = if cfg!(debug_assertions) {
+        Duration::from_millis(5)
+    } else {
+        Duration::from_micros(500)
+    };
     assert!(
-        p99 < Duration::from_micros(500),
-        "p99={p99:?} exceeded 500 µs ceiling (spec target 100 µs)"
+        p99 < ceiling,
+        "p99={p99:?} exceeded {ceiling:?} ceiling (spec target 100 µs release)"
     );
 
     unlink(&root);
@@ -115,9 +120,14 @@ fn cycle_check_self_loop_under_10us() {
     samples.sort();
     let p99 = samples[(samples.len() * 99) / 100];
     println!("cycle_check self-loop p99={p99:?}");
+    let ceiling = if cfg!(debug_assertions) {
+        Duration::from_micros(500)
+    } else {
+        Duration::from_micros(50)
+    };
     assert!(
-        p99 < Duration::from_micros(50),
-        "p99={p99:?} exceeded 50 µs ceiling for trivial self-loop"
+        p99 < ceiling,
+        "p99={p99:?} exceeded {ceiling:?} ceiling for trivial self-loop"
     );
 
     root.children.borrow_mut().clear();

@@ -8,10 +8,13 @@ repository.workspace = true
 description = "CrabScheme precise tracing garbage collector"
 
 [features]
-default = []
-# Gate the Rc-backed `Gc<T>` representation and the synchronous
-# cycle-collector module (`cs_gc::cycle`). When disabled, the M5
-# Phase 1 tracing infrastructure (`Heap`, `Trace`, `Marker`, mark-
-# sweep `collect()`) is the only path. See
+# Iter 11 of the countable-memory spec flips this on by default.
+# The Rc-backed `Gc<T>` representation + synchronous cycle-
+# collector (`cs_gc::cycle`) is the production path. Disable with
+# `--no-default-features` to fall back to the M5 Phase 1 tracing
+# infrastructure (`Heap`, `Trace`, `Marker`, mark-sweep
+# `collect()`) — that path stays available for rollback / parity
+# verification until iter 12 deletes it. See
 # `.spec-workflow/specs/countable-memory/` for the migration plan.
+default = ["countable-memory"]
 countable-memory = []

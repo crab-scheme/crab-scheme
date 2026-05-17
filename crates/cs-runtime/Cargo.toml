@@ -13,7 +13,11 @@ license.workspace = true
 # `default` keeps the native build's surface identical to pre-M10.
 # `--no-default-features` produces a minimal runtime suitable for
 # wasm32-wasip1.
-default = ["jit", "ffi-dynamic"]
+# Iter 11 of the countable-memory spec: include `countable-memory`
+# in the default set so the rc-only Gc<T> + cycle collector path
+# is the production tier. Disable with `--no-default-features
+# --features jit,ffi-dynamic` to fall back to the M5 tracing GC.
+default = ["jit", "ffi-dynamic", "countable-memory"]
 # Enables `cs-jit*` deps and `Runtime::install_jit` / `jit_lowerer`.
 # Disabled in WASM and AOT-binary builds (which inline their codegen
 # at build time instead of at runtime).

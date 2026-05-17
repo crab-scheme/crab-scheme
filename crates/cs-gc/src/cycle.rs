@@ -125,6 +125,34 @@ impl CycleVisitor {
     pub fn done(&self) -> bool {
         self.found || self.over_limit
     }
+
+    /// Register a non-`Gc<T>` heap address (e.g. `Rc<T>` for
+    /// `Frame` / `Closure`) and report whether the caller should
+    /// descend into it. The dedup machinery is the same as
+    /// [`visit`] but without the typed `Gc<T>` requirement, so
+    /// arbitrary Rust-`Rc`-backed nodes (the walker's
+    /// `Rc<Frame>` chain, the VM's `Rc<Env>` chain, dyn-`Procedure`
+    /// closures) can be deduped against the visited set.
+    ///
+    /// Returns `true` to descend (first visit), `false` to skip
+    /// (already visited, cycle target reached, or limit hit).
+    pub fn visit_addr(&mut self, addr: usize) -> bool {
+        if self.found || self.over_limit {
+            return false;
+        }
+        if addr == self.root_addr {
+            self.found = true;
+            return false;
+        }
+        if !self.visited.insert(addr) {
+            return false;
+        }
+        if self.visited.len() > self.limit {
+            self.over_limit = true;
+            return false;
+        }
+        true
+    }
 }
 
 thread_local! {

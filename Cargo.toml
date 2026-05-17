@@ -39,7 +39,13 @@ cs-lex = { path = "crates/cs-lex" }
 cs-parse = { path = "crates/cs-parse" }
 cs-ir = { path = "crates/cs-ir" }
 cs-expand = { path = "crates/cs-expand" }
-cs-runtime = { path = "crates/cs-runtime", default-features = false }
+# countable-memory is included by default at the workspace level
+# (iter 11 of .spec-workflow/specs/countable-memory/) so every
+# downstream crate inherits the rc-only Gc<T> + cycle collector
+# path even when they pin specific cs-runtime features. cs-runtime
+# default features stay off here so callers can opt in/out of
+# `jit` / `ffi-dynamic` independently.
+cs-runtime = { path = "crates/cs-runtime", default-features = false, features = ["countable-memory"] }
 cs-vm = { path = "crates/cs-vm" }
 cs-gc = { path = "crates/cs-gc" }
 cs-rir = { path = "crates/cs-rir" }

@@ -10616,6 +10616,12 @@ impl cs_gc::Trace for VmClosure {
 #[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for VmClosure {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Dedup on VmClosure's Rc identity; descend into env
+        // (which itself dedups Env identity).
+        let addr = self as *const Self as usize;
+        if !ctx.visit_addr(addr) {
+            return;
+        }
         self.env.visit_children(ctx);
     }
 }
@@ -10898,13 +10904,15 @@ impl cs_gc::cycle::CycleVisit for Bindings {
 #[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Env {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
-        self.bindings.borrow().visit_children(ctx);
-        if let Some(p) = &self.parent {
-            if ctx.done() {
-                return;
-            }
-            p.visit_children(ctx);
+        // Dedup on this Env's Rc identity so the detector
+        // doesn't re-enter via a binding that closes back
+        // over this env. Same parent-skip rationale as Frame
+        // in cs-runtime.
+        let addr = self as *const Self as usize;
+        if !ctx.visit_addr(addr) {
+            return;
         }
+        self.bindings.borrow().visit_children(ctx);
     }
 }
 

@@ -6,11 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = []
-# Forward the countable-memory feature down to cs-gc so consumer
-# crates need only enable it once at the top of the dependency
-# graph. Adds parallel CycleVisit impls alongside the existing
-# Trace impls under the same #[cfg].
+# Iter 11: default-on. Forward the countable-memory feature down
+# to cs-gc so consumer crates inherit transparently. Adds
+# parallel CycleVisit impls alongside the existing Trace impls
+# under the same #[cfg].
+default = ["countable-memory"]
 countable-memory = ["cs-gc/countable-memory"]
 
 [dependencies]
