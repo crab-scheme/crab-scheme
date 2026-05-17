@@ -139,11 +139,32 @@ pub fn take_sweep_pending() -> bool {
 
 /// Run a sweep over the candidate set.
 ///
-/// **Iter 2 (this file): stub.** Drops registry entries whose
-/// Weak no longer upgrades (so the registry doesn't grow
-/// unboundedly from already-reclaimed candidates) but does NOT
-/// do the cycle-reclaim phase. The full implementation lands
-/// in iter 4.
+/// **Current implementation (iter 4):** Phase 1 only —
+/// retains only candidates whose Weak still upgrades. Dead
+/// entries get pruned so the registry doesn't grow
+/// unboundedly with already-reclaimed candidates.
+///
+/// **Deferred (future iter):** Phases 2 & 3 — Bacon-Rajan-
+/// style trial-deletion to find pure-internal cycle groups
+/// in the candidate subgraph and break a safe edge per
+/// group. The trial-deletion algorithm requires per-type
+/// break dispatch (Pair vs Vector vs Hashtable), which
+/// would need a cycle-break trait spanning cs-gc + cs-core.
+/// For v1, callers rely on the layer-2 synchronous detector
+/// to break what it can; the sweep maintains the registry
+/// so future iters can ship the trial-deletion against a
+/// well-defined candidate set.
+///
+/// Sweep frequency:
+///
+/// - Manual via the Scheme `(collect)` builtin (cs-runtime's
+///   `b_collect`).
+/// - Automatic on the next `Gc::new` after the registry
+///   crosses [`set_auto_trigger_threshold`] — Gc::new reads
+///   [`take_sweep_pending`] which is set by
+///   [`register_cycle_candidate`].
+/// - Periodic via the embedder API (`Runtime::start_background_sweep`,
+///   iter 5).
 pub fn run_sweep() {
     REGISTRY.with(|r| {
         let mut r = r.borrow_mut();

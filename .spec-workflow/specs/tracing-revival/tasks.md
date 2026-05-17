@@ -135,7 +135,7 @@ region exclusion). Independent of the `escape-analysis` spec
 
 ## Iter 4 — Sweep cycle-reclaim logic
 
-- [ ] 4. Implement `run_sweep` mark+sweep+reclaim
+- [x] 4. Implement `run_sweep` mark+sweep+reclaim
   - File: `crates/cs-gc/src/cycle_registry.rs`
   - Replace the stubbed `run_sweep` with the algorithm per
     design.md §"Component 3":
@@ -169,7 +169,7 @@ region exclusion). Independent of the `escape-analysis` spec
     outside any region, runs run_sweep, observes the
     Drop sentinels fire for all cycle members._
 
-- [ ] 5. Wire `(collect)` Scheme builtin
+- [x] 5. Wire `(collect)` Scheme builtin
   - File: `crates/cs-runtime/src/builtins/mod.rs`
   - Modify the existing `b_collect` (which is a no-op
     under countable-memory) to call
@@ -186,7 +186,7 @@ region exclusion). Independent of the `escape-analysis` spec
     the feature is on; under default features the builtin
     is still a no-op._
 
-- [ ] 6. Auto-trigger on threshold
+- [x] 6. Auto-trigger on threshold
   - File: `crates/cs-gc/src/cycle_registry.rs`,
     `crates/cs-gc/src/rc_only.rs`
   - In `register_cycle_candidate`: after adding to

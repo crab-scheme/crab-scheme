@@ -47,6 +47,54 @@ fn region_cycle_does_not_register_candidate() {
 }
 
 #[test]
+fn auto_trigger_fires_sweep_on_next_alloc() {
+    use cs_gc::Gc;
+    cycle_registry::reset_for_tests();
+    cycle_registry::set_auto_trigger_threshold(3);
+    // Register 3 candidates from dropped Gc<i64> — their
+    // Weaks will be dead, so the sweep will clear them.
+    for _ in 0..3 {
+        let g: Gc<i64> = Gc::new(0);
+        cycle_registry::register_cycle_candidate(Gc::as_addr(&g), Gc::downgrade(&g));
+        drop(g);
+    }
+    assert_eq!(cycle_registry::candidate_count(), 3, "all registered");
+    // Threshold reached → SWEEP_PENDING is set; next Gc::new
+    // takes the flag and runs run_sweep, which drops the
+    // dead-Weak entries.
+    let _next: Gc<i64> = Gc::new(99);
+    assert_eq!(
+        cycle_registry::candidate_count(),
+        0,
+        "sweep should have cleared dead entries via auto-trigger"
+    );
+}
+
+#[test]
+fn collect_builtin_runs_sweep() {
+    use cs_gc::Gc;
+    use cs_runtime::Runtime;
+    cycle_registry::reset_for_tests();
+    // Seed registry with a dead-Weak entry.
+    let addr = {
+        let g: Gc<i64> = Gc::new(0);
+        let a = Gc::as_addr(&g);
+        cycle_registry::register_cycle_candidate(a, Gc::downgrade(&g));
+        a
+    };
+    let _ = addr;
+    assert_eq!(cycle_registry::candidate_count(), 1);
+    // Invoke (collect) through the runtime.
+    let mut rt = Runtime::new();
+    rt.eval_str("<collect>", "(collect)").expect("collect ok");
+    assert_eq!(
+        cycle_registry::candidate_count(),
+        0,
+        "(collect) should run the sweep"
+    );
+}
+
+#[test]
 fn many_cycles_populate_registry() {
     cycle_registry::reset_for_tests();
     let mut pairs = Vec::with_capacity(20);

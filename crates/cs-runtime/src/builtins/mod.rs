@@ -695,7 +695,18 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // (hashtable-update! is higher-order — see below)
         // R7RS portability
         ("crabscheme-version", b_crabscheme_version),
+        // Layer-4 tracing-cycle-collector (tracing-revival
+        // iter 4). Triggers a sweep of the cycle-candidate
+        // registry. Under default features (no
+        // `tracing-cycle-collector`) it's a no-op.
+        ("collect", b_collect),
     ]
+}
+
+fn b_collect(_args: &[Value]) -> Result<Value, String> {
+    #[cfg(feature = "tracing-cycle-collector")]
+    cs_gc::cycle_registry::run_sweep();
+    Ok(Value::Unspecified)
 }
 
 pub fn higher_order_builtins() -> Vec<HoEntry> {

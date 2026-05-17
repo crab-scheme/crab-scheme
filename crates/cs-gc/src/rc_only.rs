@@ -268,6 +268,15 @@ impl<T: 'static> Gc<T> {
     /// For region-allocated values, use
     /// [`Gc::new_in`](Self::new_in) (region-memory iter 3).
     pub fn new(value: T) -> Self {
+        // Layer-4 auto-trigger (tracing-revival iter 4): when
+        // the cycle-candidate registry has crossed its
+        // threshold, the next allocation runs the sweep
+        // before the new alloc lands. Single TLS read on the
+        // hot path when the flag is false (the common case).
+        #[cfg(feature = "tracing-cycle-collector")]
+        if crate::cycle_registry::take_sweep_pending() {
+            crate::cycle_registry::run_sweep();
+        }
         Gc(GcRepr::Rc(Rc::new(value)))
     }
 
