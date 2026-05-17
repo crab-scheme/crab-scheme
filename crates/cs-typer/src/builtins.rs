@@ -238,6 +238,91 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
         ("display", p1(any(), any())),
         ("write", p1(any(), any())),
         ("newline", p0(any())),
+        // ---- iter 6.6 stdlib annotations ----
+        // Numeric: rounding + conversions + bitwise.
+        ("floor", p1(num(), num())),
+        ("ceiling", p1(num(), num())),
+        ("round", p1(num(), num())),
+        ("truncate", p1(num(), num())),
+        ("exact", p1(num(), num())),
+        ("inexact", p1(num(), num())),
+        ("exact?", pred(fx())),
+        ("inexact?", pred(fl())),
+        ("exact->inexact", p1(num(), fl())),
+        ("inexact->exact", p1(num(), fx())),
+        ("bitwise-and", p2(fx(), fx(), fx())),
+        ("bitwise-or", p2(fx(), fx(), fx())),
+        ("bitwise-xor", p2(fx(), fx(), fx())),
+        ("bitwise-not", p1(fx(), fx())),
+        // Character classification (predicates) and case.
+        ("char-alphabetic?", pred(ch())),
+        ("char-numeric?", pred(ch())),
+        ("char-whitespace?", pred(ch())),
+        ("char-upper-case?", pred(ch())),
+        ("char-lower-case?", pred(ch())),
+        ("char-upcase", p1(ch(), ch())),
+        ("char-downcase", p1(ch(), ch())),
+        ("char-foldcase", p1(ch(), ch())),
+        ("char<=?", p2(ch(), ch(), bool_())),
+        ("char>=?", p2(ch(), ch(), bool_())),
+        // String operations.
+        ("string<=?", p2(str_(), str_(), bool_())),
+        ("string>=?", p2(str_(), str_(), bool_())),
+        ("string-upcase", p1(str_(), str_())),
+        ("string-downcase", p1(str_(), str_())),
+        ("string-foldcase", p1(str_(), str_())),
+        ("string-titlecase", p1(str_(), str_())),
+        ("string-prefix?", p2(str_(), str_(), bool_())),
+        ("string-suffix?", p2(str_(), str_(), bool_())),
+        (
+            "string-contains",
+            p2(str_(), str_(), Type::union(vec![fx(), bool_()])),
+        ),
+        ("string-copy", p1(str_(), str_())),
+        ("string->list", p1(str_(), Type::Listof(Box::new(ch())))),
+        ("list->string", p1(pair(), str_())),
+        // List operations beyond Phase 2's `cons/car/cdr/length`.
+        ("append", p2(pair(), pair(), pair())),
+        ("list-copy", p1(pair(), pair())),
+        (
+            "memq",
+            p2(any(), pair(), Type::union(vec![pair(), bool_()])),
+        ),
+        (
+            "memv",
+            p2(any(), pair(), Type::union(vec![pair(), bool_()])),
+        ),
+        (
+            "assq",
+            p2(any(), pair(), Type::union(vec![pair(), bool_()])),
+        ),
+        (
+            "assv",
+            p2(any(), pair(), Type::union(vec![pair(), bool_()])),
+        ),
+        ("iota", p1(fx(), Type::Listof(Box::new(fx())))),
+        ("first", p1(pair(), any())),
+        ("second", p1(pair(), any())),
+        ("third", p1(pair(), any())),
+        ("last", p1(pair(), any())),
+        // Vector operations beyond Phase 2.
+        ("vector-fill!", p2(vec_(), any(), any())),
+        ("vector-copy", p1(vec_(), vec_())),
+        ("vector-append", p2(vec_(), vec_(), vec_())),
+        ("vector->list", p1(vec_(), Type::Listof(Box::new(any())))),
+        ("list->vector", p1(pair(), vec_())),
+        // Hashtables.
+        ("hashtable?", pred(any())),
+        ("hashtable-size", p1(any(), fx())),
+        ("hashtable-keys", p1(any(), vec_())),
+        ("hashtable-values", p1(any(), vec_())),
+        ("make-eq-hashtable", p0(any())),
+        ("make-eqv-hashtable", p0(any())),
+        // EOF/port predicates.
+        ("eof-object?", pred(any())),
+        ("port?", pred(any())),
+        ("input-port?", pred(any())),
+        ("output-port?", pred(any())),
     ]
 }
 
@@ -270,10 +355,12 @@ mod tests {
 
     #[test]
     fn table_is_nontrivial_size() {
-        // Lower-bound only — we want a sanity check that the
-        // table actually got populated, not a brittle exact count.
+        // Lower-bound only — sanity check the table got
+        // populated, not a brittle exact count. Iter 6.6 grew
+        // this to ~140; we keep the bound conservative so
+        // future trims don't break the test.
         let t = primop_table();
-        assert!(t.len() >= 80, "expected ≥80 primops, got {}", t.len());
+        assert!(t.len() >= 130, "expected ≥130 primops, got {}", t.len());
     }
 
     #[test]
