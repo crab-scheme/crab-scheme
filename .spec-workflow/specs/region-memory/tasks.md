@@ -270,7 +270,7 @@ iter is a single commit per the per-iter commit policy.
 
 ## Iter 5 — Cycle-detector integration
 
-- [ ] 9. `Gc::is_region(&self) -> bool` accessor
+- [x] 9. `Gc::is_region(&self) -> bool` accessor
   - File: `crates/cs-gc/src/rc_only.rs`
   - Add a simple discriminator query:
     ```rust
@@ -292,7 +292,7 @@ iter is a single commit per the per-iter commit policy.
     asserts `Gc::is_region(Gc::new(0))` is false and
     `Gc::is_region(Gc::new_in(&Region::new(), 0))` is true._
 
-- [ ] 10. Skip cycle detection on region-allocated mutations
+- [x] 10. Skip cycle detection on region-allocated mutations
   - File: `crates/cs-runtime/src/builtins/mod.rs`
   - In `b_set_car` and `b_set_cdr`, guard the
     `check_and_break` call:

@@ -2437,6 +2437,17 @@ fn b_set_car(args: &[Value]) -> Result<Value, String> {
     match &args[0] {
         Value::Pair(p) => {
             p.set_car(args[1].clone());
+            // Region-memory iter 5 (FR-8): skip cycle
+            // detection for region-allocated pairs. Cycles
+            // inside a region are fine — the region's bulk
+            // free handles them regardless of internal
+            // refs. Running the detector would just waste
+            // cycles and could falsely refuse to break a
+            // benign cycle.
+            #[cfg(feature = "regions")]
+            if cs_gc::Gc::is_region(p) {
+                return Ok(Value::Unspecified);
+            }
             #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(p, |p| {
                 crate::countable_memory_cycle::record_cycle_detected();
@@ -2463,6 +2474,11 @@ fn b_set_cdr(args: &[Value]) -> Result<Value, String> {
     match &args[0] {
         Value::Pair(p) => {
             p.set_cdr(args[1].clone());
+            // Region-memory iter 5 (FR-8): see b_set_car.
+            #[cfg(feature = "regions")]
+            if cs_gc::Gc::is_region(p) {
+                return Ok(Value::Unspecified);
+            }
             #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(p, |p| {
                 crate::countable_memory_cycle::record_cycle_detected();
@@ -3662,6 +3678,11 @@ fn b_vector_set(args: &[Value]) -> Result<Value, String> {
                     return Err("vector-set!: index out of range".into());
                 }
                 vw[i as usize] = args[2].clone();
+            }
+            // Region-memory iter 5 (FR-8): see b_set_car.
+            #[cfg(feature = "regions")]
+            if cs_gc::Gc::is_region(v) {
+                return Ok(Value::Unspecified);
             }
             #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(v, |_| {
@@ -5797,6 +5818,11 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             let k = h.items.borrow()[i].0.clone();
             if ht_eq_ctx(&h, &k, &args[1], ctx)? {
                 h.items.borrow_mut()[i].1 = args[2].clone();
+                // Region-memory iter 5 (FR-8): see b_set_car.
+                #[cfg(feature = "regions")]
+                if cs_gc::Gc::is_region(&h) {
+                    return Ok(Value::Unspecified);
+                }
                 #[cfg(feature = "countable-memory")]
                 cs_gc::cycle::check_and_break(&h, |_| {
                     crate::countable_memory_cycle::record_cycle_detected();
@@ -5807,6 +5833,10 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         h.items
             .borrow_mut()
             .push((args[1].clone(), args[2].clone()));
+        #[cfg(feature = "regions")]
+        if cs_gc::Gc::is_region(&h) {
+            return Ok(Value::Unspecified);
+        }
         #[cfg(feature = "countable-memory")]
         cs_gc::cycle::check_and_break(&h, |_| {
             crate::countable_memory_cycle::record_cycle_detected();
@@ -5821,6 +5851,11 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         } else {
             items.push((args[1].clone(), args[2].clone()));
         }
+    }
+    // Region-memory iter 5 (FR-8): see b_set_car.
+    #[cfg(feature = "regions")]
+    if cs_gc::Gc::is_region(&h) {
+        return Ok(Value::Unspecified);
     }
     #[cfg(feature = "countable-memory")]
     cs_gc::cycle::check_and_break(&h, |_| {
