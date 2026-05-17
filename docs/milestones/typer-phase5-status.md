@@ -260,9 +260,75 @@ matter more for programs with:
 - Let-bound results from helper calls (#3)
 - Vector-of-Flonum data access patterns (#5)
 
-A broader bench across nbody, spectral-norm, fft etc.
-would exercise these paths more directly; that's a
-follow-up scorecard run.
+## Broader bench scorecard
+
+Run via `bench/typer-scorecard.sh` (defaults to 200 iters
+to amortize process startup):
+
+| Benchmark        | Rust ref | CrabScheme AOT | Ratio | Note |
+|------------------|----------|----------------|-------|------|
+| fib              | 0.41s    | 0.67s          | 1.6×  | recursion + integer arith |
+| tak              | 0.39s    | 0.56s          | 1.4×  | deep recursion |
+| ack              | 0.45s    | 0.75s          | 1.7×  | non-primitive recursion |
+| spectral-norm    | 0.38s    | 0.49s          | **1.3×** | vector + float — meets gate |
+| mandelbrot       | 0.41s    | 1.62s          | 4.0×  | Flonum kernel + named-let |
+| mandelbrot-typed | 0.41s    | 1.66s          | 4.0×  | annotated; same steady-state |
+| nqueens          | 0.39s    | 1.73s          | 4.4×  | list-heavy backtracking |
+| nbody            | 9.05s    | aot:fail       | n/a   | uses nested closures + string consts; cs-aot limitation |
+
+(Wall time for 200 iterations; CrabScheme AOT runs via
+`crabscheme aot --multi --build`. Typer inference runs
+automatically — no annotations required.)
+
+### Scorecard analysis
+
+**Integer / recursion benches (fib, tak, ack):** 1.4-1.7×
+Rust. Within the spec exit gate (≤ 2× Rust). Per-call
+ABI overhead dominates the gap; the typer's hints carry
+Fixnum types correctly so arithmetic emits inline
+opcodes.
+
+**Vector + Flonum (spectral-norm):** 1.3× Rust. The
+polymorphic vector primops (#5) propagate Flonum through
+`vector-ref` calls; combined with the named-let
+inference covering the matrix iteration loop, the inner
+arithmetic emits inline f64. This bench is the cleanest
+demonstration of the typer paying off without
+annotations.
+
+**Flonum kernels (mandelbrot / nqueens):** 4.0-4.4× Rust.
+Inner-let inference + polymorphic primops do their job —
+proc_loop emits inline Flonum dispatch — but per-call
+NanBox encoding still costs ~3× the raw f64 work. Typed
+vs untyped mandelbrot converges to identical steady-
+state perf at 200 iters: at low iter counts the typed
+version's slightly different startup path matters; at
+high counts both binaries do the same work.
+
+**nbody:** doesn't AOT-compile due to nested closures
+and string literals in the warmup-curve dispatcher
+(cs-aot's `Inst::MakeClosure not yet supported` for
+captured-variable closures). Pre-existing cs-aot
+limitation; not typer-related.
+
+### What's holding back the Flonum benches
+
+The remaining 4× on mandelbrot / nqueens isn't
+inference's fault — it's NanBox runtime cost:
+
+1. Every Flonum value lives as a NaN-boxed i64 at the
+   ABI; every arithmetic op decodes (`f64::from_bits`),
+   computes, and re-encodes (`f64::to_bits`).
+2. The recursive `proc_loop` allocates a stack frame
+   per call vs Rust's tight loop.
+3. Vectors hold NB-encoded i64 elements — no
+   unboxed-f64-array path (the actual Bigloo-style #5
+   work).
+
+Closing this gap needs cs-vm / cs-rir / cs-aot codegen
+extensions outside the typer's purview. With those in
+place, mandelbrot / nqueens should join the
+sub-2×-Rust tier.
 
 ## Test counts (final)
 
