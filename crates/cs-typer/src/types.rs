@@ -64,11 +64,20 @@ pub enum Type {
 /// Procedure signature with positional params, optional rest
 /// parameter, and a return type. Procedure type arity is
 /// `params.len()` (or `>= params.len()` when rest is set).
+///
+/// `filter` (Phase 4) is an optional "positive proposition" for
+/// the 0-th positional arg. When set, the procedure is a
+/// predicate: if it returns true, the arg's type narrows to the
+/// `filter` type in the then-branch; if false, the arg narrows
+/// to the difference. E.g., `number? : (-> Any Boolean) +
+/// filter (U Fixnum Flonum)` means "in `(if (number? x) …)`,
+/// `x` is `(U Fixnum Flonum)` in the then-branch."
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProcType {
     pub params: Vec<Type>,
     pub return_type: Type,
     pub rest: Option<Type>,
+    pub filter: Option<Type>,
 }
 
 impl Type {

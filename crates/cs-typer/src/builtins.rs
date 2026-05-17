@@ -57,21 +57,35 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
         params: vec![a, b],
         return_type: r,
         rest: None,
+        filter: None,
     };
     let p1 = |a, r| ProcType {
         params: vec![a],
         return_type: r,
         rest: None,
+        filter: None,
     };
     let p0 = |r| ProcType {
         params: vec![],
         return_type: r,
         rest: None,
+        filter: None,
     };
     let p3 = |a, b, c, r| ProcType {
         params: vec![a, b, c],
         return_type: r,
         rest: None,
+        filter: None,
+    };
+    // Predicate builder: takes a positive proposition (the
+    // filter) and returns a `(-> Any Boolean)` ProcType with
+    // `filter: Some(positive)` populated. Used for all
+    // type-predicate primops below.
+    let pred = |positive: Type| ProcType {
+        params: vec![Type::Any],
+        return_type: Type::Boolean,
+        rest: None,
+        filter: Some(positive),
     };
 
     vec![
@@ -129,21 +143,27 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
         ("flsqrt", p1(fl(), fl())),
         ("flabs", p1(fl(), fl())),
         ("fixnum->flonum", p1(fx(), fl())),
-        // ---- type predicates ----
-        ("fixnum?", p1(any(), bool_())),
-        ("flonum?", p1(any(), bool_())),
-        ("number?", p1(any(), bool_())),
-        ("integer?", p1(any(), bool_())),
-        ("boolean?", p1(any(), bool_())),
-        ("pair?", p1(any(), bool_())),
-        ("null?", p1(any(), bool_())),
-        ("list?", p1(any(), bool_())),
-        ("symbol?", p1(any(), bool_())),
-        ("string?", p1(any(), bool_())),
-        ("char?", p1(any(), bool_())),
-        ("vector?", p1(any(), bool_())),
-        ("procedure?", p1(any(), bool_())),
-        ("bytevector?", p1(any(), bool_())),
+        // ---- type predicates (Phase 4 occurrence typing) ----
+        // Each gets a `filter` field carrying the positive
+        // proposition. In `(if (string? x) …)` the then-branch
+        // sees `x` narrowed to `String`; the else-branch sees
+        // the difference.
+        ("fixnum?", pred(fx())),
+        ("flonum?", pred(fl())),
+        ("number?", pred(num())),
+        ("integer?", pred(fx())),
+        ("boolean?", pred(bool_())),
+        ("pair?", pred(pair())),
+        ("null?", pred(null())),
+        // `list?` accepts non-pair non-null inputs too (proper
+        // list check), so its filter is `(U Pair Null)`.
+        ("list?", pred(Type::union(vec![pair(), null()]))),
+        ("symbol?", pred(sym())),
+        ("string?", pred(str_())),
+        ("char?", pred(ch())),
+        ("vector?", pred(vec_())),
+        ("procedure?", pred(proc_())),
+        ("bytevector?", pred(bv())),
         // ---- pairs / lists ----
         // Variadic list / vector constructors — Phase 3.4
         // exposes `rest` in ProcType so these get proper
@@ -156,6 +176,7 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
                 params: vec![],
                 return_type: Type::Listof(Box::new(Type::Any)),
                 rest: Some(Type::Any),
+                filter: None,
             },
         ),
         (
@@ -164,6 +185,7 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
                 params: vec![],
                 return_type: vec_(),
                 rest: Some(Type::Any),
+                filter: None,
             },
         ),
         ("cons", p2(any(), any(), pair())),

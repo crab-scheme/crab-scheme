@@ -480,6 +480,7 @@ fn lambda_proc_type_all_any(params: &Params) -> Type {
         params: param_types,
         return_type: Type::Any,
         rest,
+        filter: None,
     }))
 }
 
@@ -508,6 +509,7 @@ fn lambda_proc_type(params: &Params, ann: &LambdaAnnotation) -> Type {
         params: param_types,
         return_type,
         rest,
+        filter: None,
     }))
 }
 

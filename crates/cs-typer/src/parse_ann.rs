@@ -233,6 +233,7 @@ fn parse_arrow(args: &[TypeDatum], aliases: &[(String, Type)]) -> Result<TypeAnn
         params: parsed_params?,
         return_type,
         rest: parsed_rest,
+        filter: None,
     })))
 }
 
@@ -306,6 +307,7 @@ mod tests {
                 params: vec![],
                 return_type: Type::Fixnum,
                 rest: None,
+                filter: None,
             }))
         );
     }
@@ -384,6 +386,7 @@ mod tests {
                 params: vec![Type::Fixnum, Type::Fixnum],
                 return_type: Type::Fixnum,
                 rest: None,
+                filter: None,
             }))
         );
     }
@@ -442,6 +445,7 @@ mod tests {
                     params: vec![Type::Fixnum],
                     return_type: Type::Fixnum,
                     rest: None,
+                    filter: None,
                 })),
             ])
         );

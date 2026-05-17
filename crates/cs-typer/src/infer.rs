@@ -285,6 +285,7 @@ mod tests {
             params: vec![num.clone(), num.clone()],
             return_type: num,
             rest: None,
+            filter: None,
         }));
         assert_eq!(infer(&expr, &env), want);
     }

@@ -374,11 +374,13 @@ mod tests {
             params: vec![union_arg.clone()],
             return_type: Type::Fixnum,
             rest: None,
+            filter: None,
         }));
         let proc_fx = Type::Procedure_(Box::new(ProcType {
             params: vec![Type::Fixnum],
             return_type: Type::Fixnum,
             rest: None,
+            filter: None,
         }));
         // (-> (U Fx Fl) Fx) is a subtype of (-> Fx Fx):
         // contravariantly, Fx <: (U Fx Fl).

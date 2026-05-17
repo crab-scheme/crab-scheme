@@ -457,6 +457,7 @@ mod tests {
             params: vec![want_num.clone()],
             return_type: want_num,
             rest: None,
+            filter: None,
         }));
         assert_eq!(table.top_level[0].type_ann, want);
     }

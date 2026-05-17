@@ -50,6 +50,7 @@ fn typed_fib_round_trips_through_pipeline() {
         params: vec![Type::Fixnum],
         return_type: Type::Fixnum,
         rest: None,
+        filter: None,
     }));
     assert_eq!(table.top_level[0].type_ann, want);
 
