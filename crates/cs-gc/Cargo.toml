@@ -18,3 +18,11 @@ description = "CrabScheme precise tracing garbage collector"
 # `.spec-workflow/specs/countable-memory/` for the migration plan.
 default = ["countable-memory"]
 countable-memory = []
+# Layer 3 of the unified memory management architecture
+# (ADR 0015). Adds `cs_gc::Region` — a bump arena whose
+# allocations bulk-free when the region drops. Off by default
+# in iters 1-5 of the region-memory spec; iter 6 flips on.
+regions = ["dep:bumpalo"]
+
+[dependencies]
+bumpalo = { workspace = true, optional = true }

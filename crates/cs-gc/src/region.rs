@@ -1,0 +1,288 @@
+//! Region-memory: layer 3 of the unified memory management
+//! architecture (ADR 0015).
+//!
+//! A [`Region`] is a bump arena that owns its allocations.
+//! Values allocated through [`Region::alloc`] live until the
+//! region drops, at which point all of them free in one
+//! operation — no per-allocation refcount cycle, no per-object
+//! tracing.
+//!
+//! # When to use a region
+//!
+//! Region allocation is faster than `Rc<T>` for both
+//! per-allocation cost (just a bump pointer increment) and
+//! reclamation (one bulk free vs. one `Rc::drop` per object).
+//! It's the right choice when:
+//!
+//! - The allocation's lifetime is provably bounded by some
+//!   surrounding dynamic scope (a `let` body, a function call,
+//!   a `map`/`filter` pipeline).
+//! - The value never escapes its region — i.e., never gets
+//!   stored in a longer-lived holder. Layer 5 (escape
+//!   analysis) proves this property; without it, manual
+//!   region use requires the programmer's own discipline.
+//! - Cycles inside the region are fine: the bulk free handles
+//!   them regardless of internal references.
+//!
+//! # Per-allocation header
+//!
+//! Each region allocation gets an 8-byte in-line header
+//! containing a 32-bit refcount. The count exists for ABI
+//! compatibility with the JIT raw-handle ABI (ADR 0012 D-2)
+//! and to let [`Gc::strong_count`] report a meaningful value
+//! on region-allocated handles. The count does NOT drive
+//! reclamation — the region's bulk free runs regardless.
+//!
+//! # Debug-mode validity (iter 3)
+//!
+//! Iter 3 of the region-memory spec adds a thread-local
+//! `LIVE_REGION_IDS` set: every `Gc<T>` dereference (under
+//! `cfg(debug_assertions)`) checks that the region the value
+//! was allocated from is still alive. Use-after-region-drop
+//! panics with a clear diagnostic in dev builds; in release
+//! it's UB.
+//!
+//! # Status
+//!
+//! - **Iter 1** (this file): `Region`, `RegionId`, `RegionSlot<T>`,
+//!   `Region::alloc` returning a raw `NonNull<RegionSlot<T>>`.
+//!   `Gc::new_in` wiring lands in iter 2 alongside the
+//!   `Gc<T>` discriminated-union refactor.
+//! - **Iter 2**: `Gc<T>` discriminated union over Rc and
+//!   Region backings.
+//! - **Iter 3**: `Gc::new_in` + debug-mode validity.
+//! - **Iter 4**: `Gc::promote` for escape-to-Rc.
+//! - **Iter 5**: cycle-detector region skip.
+//! - **Iter 6**: flip default-on + ADR 0016 + exit report.
+
+#![cfg(feature = "regions")]
+
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::num::NonZeroU64;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use bumpalo::Bump;
+
+/// Per-region identity used to validate region membership in
+/// debug builds and to disambiguate handles from sibling
+/// regions.
+///
+/// The id is a 64-bit non-zero counter minted from a global
+/// atomic. Roll-over after 2⁶³ regions per process is a
+/// theoretical concern only — realistically the counter never
+/// approaches u64::MAX in any program.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct RegionId(NonZeroU64);
+
+static REGION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+impl RegionId {
+    /// Mint a fresh `RegionId` distinct from every other id
+    /// produced this process.
+    fn fresh() -> Self {
+        let raw = REGION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Counter starts at 1 and only ever increments; the
+        // NonZero invariant holds.
+        RegionId(NonZeroU64::new(raw).expect("RegionId counter overflowed to 0"))
+    }
+
+    /// Raw u64 form for diagnostic printing.
+    pub fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Per-allocation header carrying a region-local strong count.
+///
+/// The header sits immediately before the value payload. The
+/// `strong` count tracks how many `Gc<T>` handles point at this
+/// slot (incremented on `Clone`, decremented on `Drop`); the
+/// count exists for ABI compatibility with the JIT raw-handle
+/// ABI and to let `Gc::strong_count` report a meaningful value.
+/// **Reclamation is driven by the owning `Region`'s drop, not
+/// by this count reaching zero.**
+///
+/// Layout: `#[repr(C)]` ensures the strong/_pad fields come
+/// before the payload at a predictable offset. The 4-byte
+/// `_pad` keeps `value` 8-byte aligned for the common case of
+/// `T` containing pointers; types with stricter alignment
+/// (>8) are over-aligned by the arena's alignment guarantee.
+#[repr(C)]
+#[allow(dead_code)] // wired into Gc<T> in iter 2 of the region-memory spec
+pub(crate) struct RegionSlot<T: ?Sized> {
+    pub(crate) strong: Cell<u32>,
+    _pad: u32,
+    pub(crate) value: T,
+}
+
+/// A bump-allocator arena that owns all values allocated
+/// through [`Region::alloc`]. Dropping the region bulk-frees
+/// every allocation regardless of outstanding `Gc<T>` handles.
+///
+/// Single-threaded only (`!Send`, `!Sync`): the
+/// `_not_send` marker prevents accidental cross-thread moves.
+pub struct Region {
+    id: RegionId,
+    arena: Bump,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Default for Region {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Region {
+    /// Create a fresh region with a unique id and an empty
+    /// bump arena. The arena grows on demand as allocations
+    /// arrive.
+    pub fn new() -> Self {
+        Region {
+            id: RegionId::fresh(),
+            arena: Bump::new(),
+            _not_send: PhantomData,
+        }
+    }
+
+    /// The region's per-process unique id.
+    pub fn id(&self) -> RegionId {
+        self.id
+    }
+
+    /// Total bytes allocated through this region's arena (a
+    /// monotonically-growing counter; doesn't shrink on
+    /// individual allocations being dropped, only on region
+    /// drop).
+    pub fn allocated_bytes(&self) -> usize {
+        self.arena.allocated_bytes()
+    }
+
+    /// Allocate `value` in this region and return a
+    /// `NonNull<RegionSlot<T>>` pointing at the in-arena slot.
+    ///
+    /// `pub(crate)` because the public API for callers is
+    /// `Gc::new_in(region, value)` (lands in iter 2). The
+    /// raw slot pointer is an implementation detail of the
+    /// `Gc<T>` discriminated-union representation.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is valid for reads and writes
+    /// until this region drops. Callers must not retain the
+    /// pointer past the region's lifetime.
+    #[allow(dead_code)] // wired into Gc::new_in in iter 2 of the region-memory spec
+    pub(crate) fn alloc<T: 'static>(&self, value: T) -> NonNull<RegionSlot<T>> {
+        let slot = self.arena.alloc(RegionSlot {
+            strong: Cell::new(1),
+            _pad: 0,
+            value,
+        });
+        // `bumpalo::Bump::alloc` returns `&mut T` with a
+        // lifetime tied to the Bump. We convert to NonNull to
+        // erase the borrow so callers can hold the pointer
+        // across the Region's life; correctness depends on
+        // the region outliving every outstanding handle (iter
+        // 3 adds debug-mode validation; iter 5 / escape
+        // analysis enforce statically).
+        NonNull::from(slot)
+    }
+}
+
+// Region intentionally does NOT implement Drop — the Bump
+// arena's own Drop frees the entire backing memory, which
+// is the bulk-free behaviour we want. Adding a custom Drop
+// here would risk double-free or interfere with iter-3's
+// debug-mode region-validity tracking (which needs to run
+// BEFORE the arena frees). Iter 3 wires that.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_ids_are_unique() {
+        let r1 = Region::new();
+        let r2 = Region::new();
+        let r3 = Region::new();
+        assert_ne!(r1.id(), r2.id());
+        assert_ne!(r2.id(), r3.id());
+        assert_ne!(r1.id(), r3.id());
+    }
+
+    #[test]
+    fn region_id_is_nonzero() {
+        let r = Region::new();
+        assert!(r.id().as_u64() > 0);
+    }
+
+    #[test]
+    fn region_alloc_returns_distinct_addresses() {
+        let r = Region::new();
+        let s1 = r.alloc(10_i64);
+        let s2 = r.alloc(20_i64);
+        let s3 = r.alloc(30_i64);
+        let addrs = [
+            s1.as_ptr() as usize,
+            s2.as_ptr() as usize,
+            s3.as_ptr() as usize,
+        ];
+        // All distinct.
+        assert_ne!(addrs[0], addrs[1]);
+        assert_ne!(addrs[1], addrs[2]);
+        assert_ne!(addrs[0], addrs[2]);
+    }
+
+    #[test]
+    fn region_alloc_payload_is_readable() {
+        let r = Region::new();
+        let slot_ptr = r.alloc(42_i64);
+        // SAFETY: slot is alive while `r` is in scope.
+        let value = unsafe { (*slot_ptr.as_ptr()).value };
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn region_alloc_strong_count_initialized_to_one() {
+        let r = Region::new();
+        let slot_ptr = r.alloc("hello".to_string());
+        // SAFETY: slot alive while r in scope.
+        let strong = unsafe { (*slot_ptr.as_ptr()).strong.get() };
+        assert_eq!(strong, 1);
+    }
+
+    #[test]
+    fn allocated_bytes_grows_monotonically() {
+        let r = Region::new();
+        let b0 = r.allocated_bytes();
+        for i in 0..100_i64 {
+            let _ = r.alloc(i);
+        }
+        let b1 = r.allocated_bytes();
+        assert!(b1 > b0, "allocated_bytes should grow after 100 allocs");
+        // Allocate more, ensure monotone.
+        for i in 0..1000_i64 {
+            let _ = r.alloc(i);
+        }
+        let b2 = r.allocated_bytes();
+        assert!(b2 >= b1, "allocated_bytes must be monotone");
+    }
+
+    #[test]
+    fn region_drop_releases_arena() {
+        // Indirect test: a region allocates a Vec<u8> wrapping
+        // a large buffer; after region drop, the system
+        // should have reclaimed the buffer. We can't directly
+        // observe the free (Bump's drop is opaque), so we
+        // just exercise the path and assert no panic.
+        {
+            let r = Region::new();
+            for _ in 0..1000_u64 {
+                let _ = r.alloc(vec![0_u8; 1024]);
+            }
+            // r drops at end of scope.
+        }
+    }
+}

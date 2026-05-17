@@ -39,3 +39,8 @@ pub use rc_only::{Gc, Weak};
 
 #[cfg(feature = "countable-memory")]
 pub mod cycle;
+
+#[cfg(feature = "regions")]
+pub mod region;
+#[cfg(feature = "regions")]
+pub use region::{Region, RegionId};

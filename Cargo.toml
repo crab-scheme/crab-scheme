@@ -83,6 +83,14 @@ rustc-hash = "2.1"
 # SmallVec is the same size as a Vec; ≤4 bindings stay inline,
 # eliminating the per-call frame heap allocation.
 smallvec = { version = "1", features = ["union"] }
+# Region-memory spec iter 1 — bump arena allocator for layer 3
+# of the unified memory management architecture (ADR 0015).
+# Allocations made through a Region's arena live until the
+# region drops, at which point all of them free in one
+# operation. Used by `cs_gc::Region` (gated on the `regions`
+# feature) to implement bounded-extent allocation as an
+# alternative to global `Rc<T>`.
+bumpalo = "3"
 
 [profile.release]
 lto = "thin"
