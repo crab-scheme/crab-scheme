@@ -40,6 +40,9 @@ pub use rc_only::{Gc, Weak};
 #[cfg(feature = "countable-memory")]
 pub mod cycle;
 
+#[cfg(feature = "tracing-cycle-collector")]
+pub mod cycle_registry;
+
 #[cfg(feature = "regions")]
 pub mod region;
 #[cfg(feature = "regions")]

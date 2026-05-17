@@ -53,7 +53,7 @@ region exclusion). Independent of the `escape-analysis` spec
 
 ## Iter 2 — `cs_gc::cycle_registry` module
 
-- [ ] 2. Implement `cycle_registry` module
+- [x] 2. Implement `cycle_registry` module
   - File: `crates/cs-gc/src/cycle_registry.rs` (new),
     `crates/cs-gc/src/lib.rs`
   - Implement per design.md §"Component 1":
