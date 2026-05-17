@@ -83,42 +83,52 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
         None => return,
     };
     let lam = &closure.bc.lambdas[closure.lambda_idx];
-    // Type-feedback signature: derive each param's type from the
-    // value passed at the triggering call. The translator uses this
-    // to seed value_types so flonum-arg bodies dispatch through
-    // FlonumAdd/Mul/etc. directly. Args that don't match any of our
-    // immediate types (heap-pointer Values) fall back to Fixnum,
-    // and the dispatcher type-guard will reject them anyway.
-    let param_hints: Vec<RirType> = args
-        .iter()
-        .map(|v| match v {
-            Value::Number(Number::Fixnum(_)) => RirType::Fixnum,
-            Value::Number(Number::Flonum(_)) => RirType::Flonum,
-            Value::Boolean(_) => RirType::Boolean,
-            Value::Character(_) => RirType::Character,
-            // Heap-pointer Values (Pair, Vector, String, ...) hint
-            // as Type::Any so the translator accepts them and the
-            // dispatcher boxes them via value_to_any_i64. The JIT
-            // body must consume each Any-tagged i64 linearly (via
-            // car/cdr/pair?/null?/return) — multi-use of the same
-            // RirValue isn't yet supported on the Any lane.
-            Value::Pair(_)
-            | Value::Vector(_)
-            | Value::String(_)
-            | Value::ByteVector(_)
-            | Value::Hashtable(_)
-            | Value::Port(_)
-            | Value::Promise(_)
-            | Value::Symbol(_)
-            | Value::Null
-            | Value::Procedure(_) => RirType::Any,
-            // Unspecified / Eof we leave as Fixnum for now — they
-            // can't be passed to any of the Any-consumers we
-            // currently lower, so they'll deopt at the type guard
-            // and tier back down to bytecode.
-            _ => RirType::Fixnum,
-        })
-        .collect();
+    // Phase 5.4: prefer typer-derived hints when the user
+    // annotated this function. The Runtime's
+    // `typer_hints_by_lambda_id` map (populated by
+    // `install_typer_hints` after the typer ran) is keyed by the
+    // lambda's process-wide unique id. When present, treat as
+    // authoritative — annotations are the user's explicit promise
+    // and beat observation, which is single-sample and can mis-
+    // specialize on polymorphic call sites. Hints get padded with
+    // Any to args.len() in case the annotation was partial.
+    let lambda_id = lam.profile.lambda_id;
+    let param_hints: Vec<RirType> = {
+        let typer = rt.typer_hints_by_lambda_id.borrow();
+        if let Some(h) = typer.get(&lambda_id) {
+            let mut v = h.clone();
+            v.resize(args.len(), RirType::Any);
+            v
+        } else {
+            drop(typer);
+            // Observation-based fallback: derive each param's type
+            // from the value passed at the triggering call. Args
+            // that don't match any of our immediate types
+            // (heap-pointer Values) hint as Any.
+            args.iter()
+                .map(|v| match v {
+                    Value::Number(Number::Fixnum(_)) => RirType::Fixnum,
+                    Value::Number(Number::Flonum(_)) => RirType::Flonum,
+                    Value::Boolean(_) => RirType::Boolean,
+                    Value::Character(_) => RirType::Character,
+                    // Heap-pointer Values hint as Any so the
+                    // translator accepts them; the JIT body must
+                    // consume each Any-tagged i64 linearly.
+                    Value::Pair(_)
+                    | Value::Vector(_)
+                    | Value::String(_)
+                    | Value::ByteVector(_)
+                    | Value::Hashtable(_)
+                    | Value::Port(_)
+                    | Value::Promise(_)
+                    | Value::Symbol(_)
+                    | Value::Null
+                    | Value::Procedure(_) => RirType::Any,
+                    _ => RirType::Fixnum,
+                })
+                .collect()
+        }
+    };
     let param_tags: Vec<u8> = param_hints
         .iter()
         .map(|t| match t {

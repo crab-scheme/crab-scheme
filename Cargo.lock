@@ -569,6 +569,7 @@ dependencies = [
  "cs-jit-cranelift",
  "cs-lex",
  "cs-parse",
+ "cs-rir",
  "cs-vm",
  "libloading",
  "num-traits",
