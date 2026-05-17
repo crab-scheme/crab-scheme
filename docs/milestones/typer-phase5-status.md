@@ -193,3 +193,81 @@ table from the structure of the program.
   desugars to `App-on-Lambda`, not `Letrec`, so iter
   4.5's per-binding refinement handles it at typecheck
   time (separately, no hint export yet).
+
+## Follow-on extensions (post-Phase-5)
+
+After the initial inner-let inference shipped, four
+research-brief recommendations landed (see
+`docs/milestones/typer-plan.md` and the typer commit log
+for per-recommendation rationale):
+
+| # | Extension | Commit | Coverage |
+|---|-----------|--------|----------|
+| 1 | Generalize letrec (= named-let)            | (covered by inner-let above) | named-let / explicit letrec body call |
+| 2 | Predicate narrowing → AOT hints (Chez cp0) | `bce18f9` | `(if (fixnum? x) (helper x) …)` records [Fixnum] |
+| 3 | Result-type propagation through let-bindings| `b3eb8ec` | unannotated lambda return inferred; downstream let-bindings inherit |
+| 4 | Per-call-site spec for top-level fns (Truffle splitting) | `ebd95fa` | helpers called with monomorphic arg types get hints |
+| 5 | Polymorphic vector primops (typer-side #5 variant) | `d58b29b` | `make-vector` / `vector-ref` / `vector-set!` become `(All (T) …)`; element type propagates |
+
+The Bigloo-style true escape-analysis (unboxed
+flonum-vector storage) remains future work — would
+require cs-rir / cs-vm / cs-aot codegen extensions.
+
+## Latest perf (post-all-extensions)
+
+Mandelbrot, 100 iterations at N=100, 3 interleaved runs,
+warm cache, release builds:
+
+| Build                              | Real   | Speedup |
+|------------------------------------|--------|---------|
+| Rust reference (`rustc -C opt-level=3`)        | 0.21s | 1.0× |
+| CrabScheme AOT (typed)                         | 0.76s | 3.6× Rust |
+| CrabScheme AOT (untyped)                       | 0.74s | 3.5× Rust |
+| CrabScheme AOT pre-inference baseline          | 4.79s | 22.8× Rust |
+
+Speedup vs pre-inference baseline: **6.5×**, identical
+for typed and untyped (the inference is annotation-
+agnostic).
+
+Per-iteration user-time ratio to Rust: ~6.7× — closer to
+the spec exit gate (≤ 2×) than the original 22.8× but
+still over. The remaining gap is:
+
+1. **NanBox encode/decode** on every Flonum value
+   (bit-pack to i64, bit-unpack to f64 at each
+   arithmetic op).
+2. **Function-call ABI overhead** per `proc_loop`
+   invocation (Rust just has a tight loop).
+3. **No unboxed flonum vectors** — the actual
+   Bigloo-style escape analysis (#5 in its full form).
+
+Closing the last 2× to Rust requires cs-vm / cs-rir /
+cs-aot codegen changes outside the typer's purview. The
+typer has reached the limits of what annotation-free
+inference can deliver on the current AOT pipeline.
+
+### Per-extension impact
+
+Most of the speedup (4.79s → ~0.82s) came from the
+initial inner-let inference. The four subsequent
+extensions (#2-#5) brought the remaining 0.82s → 0.74s
+(~11% additional on mandelbrot). Mandelbrot mostly
+exercises the named-let inference; the other extensions
+matter more for programs with:
+
+- Top-level helpers called from inner loops (#4)
+- Predicate-guarded type refinement (#2)
+- Let-bound results from helper calls (#3)
+- Vector-of-Flonum data access patterns (#5)
+
+A broader bench across nbody, spectral-norm, fft etc.
+would exercise these paths more directly; that's a
+follow-up scorecard run.
+
+## Test counts (final)
+
+```
+cargo test -p cs-typer                            # 191 unit + 3 integration
+cargo test -p cs-runtime --features jit --lib     # 47
+cargo test -p cs-cli --features aot               # all pass
+```
