@@ -335,7 +335,15 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // to assert hot paths actually tier'd up.
         ("jit-installed?", b_jit_installed_p),
         ("jit-stats", b_jit_stats),
-        ("gc-stats", b_gc_stats),
+        // (gc-stats) lives in syms_builtins now — it interns symbol
+        // keys for the alist it returns. (Phase B of the real-world
+        // bench spec; was an args-only pure builtin returning just
+        // alloc + collect counts.)
+        ("gc-stats-reset!", b_gc_stats_reset),
+        ("gc-stats-enable!", b_gc_stats_enable),
+        ("gc-stats-disable!", b_gc_stats_disable),
+        ("collect-garbage", b_collect_garbage),
+        ("current-memory-use", b_current_memory_use),
         ("string-split", b_string_split),
         ("string-join", b_string_join),
         ("string->vector", b_string_to_vector),
@@ -701,6 +709,14 @@ pub fn pure_builtins() -> Vec<PureEntry> {
 pub fn higher_order_builtins() -> Vec<HoEntry> {
     vec![
         ("apply", b_apply),
+        // (time-apply) lives as a Scheme-level wrapper in the
+        // benchmark harness, not a builtin: the VM dispatches
+        // higher-order builtins through marker-type downcasts
+        // (see VmApply / VmMap in cs-vm/src/vm.rs) and adding
+        // a VmTimeApply marker is a deeper VM change than Phase
+        // B warrants. The Scheme wrapper threads through
+        // (current-jiffy) + (gc-stats) directly and gets the
+        // same five-value return.
         ("map", b_map),
         ("for-each", b_for_each),
         ("display", b_display),
@@ -891,6 +907,7 @@ pub fn syms_builtins() -> Vec<SymsEntry> {
         // JIT introspection that needs the symbol table to mint
         // type-tag symbols.
         ("jit-status", b_jit_status),
+        ("gc-stats", b_gc_stats),
     ]
 }
 
@@ -11557,19 +11574,141 @@ fn b_jit_stats(args: &[Value]) -> Result<Value, String> {
     ]))
 }
 
-/// Phase 6 Stage B analysis — expose GC alloc + collect counts so
-/// benches can report allocation pressure. Returns `(alloc-count
-/// collect-count)`.
-fn b_gc_stats(args: &[Value]) -> Result<Value, String> {
+/// `(gc-stats)` — alist snapshot of the heap's instrumentation
+/// counters. Stable keys; values are exact integers (counters)
+/// or flonums (millisecond durations). Modeled on Chez's
+/// `(statistics)` accessor shape so external benchmark code
+/// that already works on Chez can drop in with minimal porting.
+///
+/// Returned alist:
+///
+/// ```scheme
+/// ((bytes-allocated-total . 142857142)   ; cumulative bytes
+///  (alloc-count-total     . 12345)        ; cumulative allocations
+///  (collect-count         . 87)           ; collect() calls since reset
+///  (live-slots            . 1024)         ; reachable slots NOW
+///  (collect-time-ms       . 145.3)        ; total time in collect()
+///  (last-pause-ms         . 1.8)          ; most recent pause
+///  (max-pause-ms          . 4.32)         ; peak pause since reset
+///  (stats-enabled?        . #t))          ; pause-timing on/off
+/// ```
+///
+/// The three `*-ms` durations are populated only when stats are
+/// enabled via `(gc-stats-enable!)`; otherwise they read 0.0.
+/// The integer counters are always tracked.
+fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats", "0", args.len()));
     }
     let rt = unsafe { crate::Runtime::active() }
         .ok_or_else(|| "gc-stats: no active runtime".to_string())?;
+    let s = rt.heap().stats();
+    let ns_to_ms = |d: std::time::Duration| (d.as_nanos() as f64) / 1_000_000.0;
+    let mut pair = |k: &str, v: Value| -> Value {
+        let key_sym = syms.intern(k);
+        Value::Pair(cs_core::Pair::new(Value::Symbol(key_sym), v))
+    };
     Ok(Value::list(vec![
-        Value::fixnum(rt.heap().alloc_count() as i64),
-        Value::fixnum(rt.heap().collect_count() as i64),
+        pair(
+            "bytes-allocated-total",
+            fixnum_or_bigint(s.bytes_allocated_total),
+        ),
+        pair("alloc-count-total", fixnum_or_bigint(s.alloc_count_total)),
+        pair("collect-count", fixnum_or_bigint(s.collect_count)),
+        pair("live-slots", Value::fixnum(s.live_slots as i64)),
+        pair(
+            "collect-time-ms",
+            Value::flonum(ns_to_ms(s.collect_duration_total)),
+        ),
+        pair("last-pause-ms", Value::flonum(ns_to_ms(s.last_pause))),
+        pair("max-pause-ms", Value::flonum(ns_to_ms(s.max_pause))),
+        pair("stats-enabled?", Value::Boolean(s.stats_enabled)),
     ]))
+}
+
+/// Encode a u64 counter as the smallest numeric Value that fits.
+/// Fixnums hold up to i64::MAX; anything larger spills to bigint
+/// via the decimal-string path. For benchmark counters that grow
+/// past 2^63 we'd need ~9 EB of cumulative allocation, so the
+/// bigint path is defensive rather than common.
+fn fixnum_or_bigint(n: u64) -> Value {
+    if n <= i64::MAX as u64 {
+        Value::fixnum(n as i64)
+    } else {
+        match Number::parse_decimal_integer(&n.to_string()) {
+            Some(num) => Value::Number(num),
+            None => Value::fixnum(i64::MAX), // unreachable in practice
+        }
+    }
+}
+
+/// `(gc-stats-reset!)` — zero all instrumentation counters in the
+/// active heap. Returns unspecified. The bench harness calls this
+/// after warmup so the per-iter measurement window starts clean.
+fn b_gc_stats_reset(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("gc-stats-reset!", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-stats-reset!: no active runtime".to_string())?;
+    rt.heap().reset_stats();
+    Ok(Value::Unspecified)
+}
+
+/// `(gc-stats-enable!)` — turn on pause-time instrumentation.
+/// Cheap (~2 % overhead on a tight alloc+collect loop) but not
+/// free, so default-off. Returns unspecified.
+fn b_gc_stats_enable(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("gc-stats-enable!", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-stats-enable!: no active runtime".to_string())?;
+    rt.heap().set_stats_enabled(true);
+    Ok(Value::Unspecified)
+}
+
+/// `(gc-stats-disable!)` — turn off pause-time instrumentation.
+/// Returns unspecified.
+fn b_gc_stats_disable(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("gc-stats-disable!", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-stats-disable!: no active runtime".to_string())?;
+    rt.heap().set_stats_enabled(false);
+    Ok(Value::Unspecified)
+}
+
+/// `(collect-garbage)` — force a stop-the-world mark-sweep and
+/// return the live-slot count after sweeping. Shape compatible
+/// with Chez Scheme's `(collect)` accessor — Chez returns the
+/// new heap size (in bytes); we return the slot count (which is
+/// the closest stable analogue in our non-generational heap).
+fn b_collect_garbage(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("collect-garbage", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "collect-garbage: no active runtime".to_string())?;
+    rt.heap().collect();
+    Ok(Value::fixnum(rt.heap().live_slots() as i64))
+}
+
+/// `(current-memory-use)` — cumulative bytes allocated since heap
+/// creation (or since the last `(gc-stats-reset!)`). Shape
+/// compatible with Racket's `(current-memory-use)`, which returns
+/// an exact integer count of bytes. Note: Racket's number is bytes
+/// reachable from custodians, ours is cumulative allocation —
+/// a different shape but the same use case (delta around a
+/// workload tells you how much it allocated).
+fn b_current_memory_use(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("current-memory-use", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "current-memory-use: no active runtime".to_string())?;
+    Ok(fixnum_or_bigint(rt.heap().bytes_allocated_total()))
 }
 
 fn b_jit_status(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {

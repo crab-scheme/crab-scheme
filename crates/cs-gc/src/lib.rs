@@ -41,7 +41,21 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Process-global cumulative byte counter, bumped by every
+/// `Gc::new` and `Heap::alloc`. CrabScheme is single-threaded
+/// today and runs one `Heap` per process; a static counter is
+/// simpler than thread-local plumbing while still giving the
+/// benchmark harness the numbers it needs.
+///
+/// The Heap's `bytes_allocated_total()` accessor returns this
+/// value (offset by a per-Heap reset baseline). Future work
+/// could split this into per-Heap counters if multi-tenant
+/// embedding becomes a real use case.
+static GLOBAL_BYTES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// A heap-allocated, GC-managed value.
 ///
@@ -167,6 +181,15 @@ impl<T: Trace + 'static> Gc<T> {
     /// `Heap::alloc(value)` so the slot participates in tracing and
     /// can be reclaimed across cycles.
     pub fn new(value: T) -> Self {
+        // Track the cumulative byte cost even for unregistered
+        // Gc::new — most of the runtime currently allocates via
+        // this path (Pair::new, Hashtable::new, etc.). Relaxed
+        // atomic add: monotonic, no synchronization needed since
+        // we're single-threaded today, and Acquire/Release would
+        // pessimize the per-alloc cost.
+        let slot_bytes = std::mem::size_of::<Slot<T>>() as u64;
+        GLOBAL_BYTES_ALLOCATED.fetch_add(slot_bytes, Ordering::Relaxed);
+        GLOBAL_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         Gc {
             inner: Rc::new(Slot {
                 mark: Cell::new(false),
@@ -443,15 +466,13 @@ pub struct Heap {
     /// telemetry for tooling and test assertions.
     collect_count: Cell<usize>,
 
-    /// Cumulative bytes allocated (approximate — counts payload
-    /// `size_of::<Slot<T>>` per `alloc<T>`, not Rc overhead). Always
-    /// tracked; the increment per alloc is a single u64 add.
-    bytes_allocated_total: Cell<u64>,
-
-    /// Cumulative count of allocations across all `alloc<T>` calls.
-    /// Distinct from `alloc_count` (which resets on every collect to
-    /// drive the auto-collect threshold).
-    alloc_count_total: Cell<u64>,
+    /// Baseline byte counter captured at `reset_stats` time. The
+    /// reported `bytes_allocated_total` is `GLOBAL_BYTES_ALLOCATED
+    /// - baseline_bytes`. This lets the benchmark harness ask for
+    /// "bytes allocated since I called reset" without coordinating
+    /// with other Heap instances or the static counter.
+    baseline_bytes: Cell<u64>,
+    baseline_allocs: Cell<u64>,
 
     /// Pause-time instrumentation. Gated by `stats_enabled` so the
     /// `Instant::now()` cost around `collect()` is paid only when
@@ -485,8 +506,13 @@ impl Heap {
             threshold: Cell::new(4096),
             auto_collect: Cell::new(false),
             collect_count: Cell::new(0),
-            bytes_allocated_total: Cell::new(0),
-            alloc_count_total: Cell::new(0),
+            // Initialize baselines to current process-global
+            // values so the first read of `bytes_allocated_total`
+            // returns 0 for a fresh Heap, rather than the
+            // accumulated total from prior runtimes in the
+            // process.
+            baseline_bytes: Cell::new(GLOBAL_BYTES_ALLOCATED.load(Ordering::Relaxed)),
+            baseline_allocs: Cell::new(GLOBAL_ALLOC_COUNT.load(Ordering::Relaxed)),
             stats_enabled: Cell::new(false),
             collect_duration_total: Cell::new(Duration::ZERO),
             last_pause: Cell::new(Duration::ZERO),
@@ -513,15 +539,14 @@ impl Heap {
         let weak: Weak<dyn Marked> = Rc::downgrade(&(slot.clone() as Rc<dyn Marked>));
         self.slots.borrow_mut().push(weak);
         self.alloc_count.set(self.alloc_count.get() + 1);
-        // Byte counting is always-on: a single u64 add per alloc
-        // is sub-nanosecond, well under the 2 % target. The
-        // pause-time stats above are the expensive ones and stay
-        // gated by stats_enabled.
+        // Byte counting routes through the same global counter
+        // Gc::new updates, so Heap::alloc and Gc::new converge
+        // on a single source of truth. (Heap-allocated values
+        // become the dominant path once the migration step 4.E
+        // in cs-gc lands; today Gc::new dominates.)
         let slot_bytes = std::mem::size_of::<Slot<T>>() as u64;
-        self.bytes_allocated_total
-            .set(self.bytes_allocated_total.get().saturating_add(slot_bytes));
-        self.alloc_count_total
-            .set(self.alloc_count_total.get().saturating_add(1));
+        GLOBAL_BYTES_ALLOCATED.fetch_add(slot_bytes, Ordering::Relaxed);
+        GLOBAL_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         Gc { inner: slot }
     }
 
@@ -648,15 +673,25 @@ impl Heap {
     /// Cumulative bytes allocated since heap creation (or last
     /// `reset_stats`). Approximate — counts `size_of::<Slot<T>>`
     /// per allocation, excluding Rc bookkeeping.
+    ///
+    /// Tracked across both `Heap::alloc` and the unregistered
+    /// `Gc::new` constructor (today the dominant path: cs-core's
+    /// Pair / Hashtable / Port / Promise / String all use
+    /// `Gc::new` directly while the heap-rooting migration is in
+    /// progress).
     pub fn bytes_allocated_total(&self) -> u64 {
-        self.bytes_allocated_total.get()
+        GLOBAL_BYTES_ALLOCATED
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.baseline_bytes.get())
     }
 
     /// Cumulative count of allocations since heap creation (or last
     /// `reset_stats`). Different from `alloc_count`, which resets
     /// every collect to drive the auto-collect threshold.
     pub fn alloc_count_total(&self) -> u64 {
-        self.alloc_count_total.get()
+        GLOBAL_ALLOC_COUNT
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.baseline_allocs.get())
     }
 
     /// Cumulative time spent inside `collect()`. Only meaningful
@@ -688,8 +723,12 @@ impl Heap {
     /// auto-collect threshold persist. Used by the benchmark harness
     /// to split warmup iterations from measurement iterations.
     pub fn reset_stats(&self) {
-        self.bytes_allocated_total.set(0);
-        self.alloc_count_total.set(0);
+        // Re-baseline against the current process-global counters
+        // so subsequent reads return deltas since this reset.
+        self.baseline_bytes
+            .set(GLOBAL_BYTES_ALLOCATED.load(Ordering::Relaxed));
+        self.baseline_allocs
+            .set(GLOBAL_ALLOC_COUNT.load(Ordering::Relaxed));
         self.collect_count.set(0);
         self.collect_duration_total.set(Duration::ZERO);
         self.last_pause.set(Duration::ZERO);
@@ -703,8 +742,8 @@ impl Heap {
     /// per-iter JSON capture.
     pub fn stats(&self) -> GcStats {
         GcStats {
-            bytes_allocated_total: self.bytes_allocated_total.get(),
-            alloc_count_total: self.alloc_count_total.get(),
+            bytes_allocated_total: self.bytes_allocated_total(),
+            alloc_count_total: self.alloc_count_total(),
             collect_count: self.collect_count.get() as u64,
             live_slots: self.live_slots(),
             collect_duration_total: self.collect_duration_total.get(),
@@ -919,24 +958,34 @@ mod tests {
 
     // ---- Phase A: instrumentation tests ----
 
+    // Byte-counter tests use deltas (and `>=` rather than `==`)
+    // because the counter is a process-global static — other
+    // cargo-test threads running in parallel can bump it between
+    // any two reads. The properties asserted here (monotonic,
+    // bumped per alloc, survives collect) hold regardless of
+    // concurrent traffic; the exact delta does not.
+
     #[test]
     fn bytes_allocated_total_increments_per_alloc() {
         let h = Heap::new();
-        assert_eq!(h.bytes_allocated_total(), 0);
-        assert_eq!(h.alloc_count_total(), 0);
+        let before = h.bytes_allocated_total();
+        let count_before = h.alloc_count_total();
 
         let _g = h.alloc(Leaf { n: 1 });
         let after_one = h.bytes_allocated_total();
-        assert!(after_one > 0, "alloc should bump byte counter");
-        assert_eq!(h.alloc_count_total(), 1);
+        let count_after_one = h.alloc_count_total();
+        assert!(
+            after_one > before,
+            "alloc should bump byte counter (before={before}, after={after_one})"
+        );
+        assert!(count_after_one > count_before);
 
         let _g2 = h.alloc(Leaf { n: 2 });
-        assert_eq!(
-            h.bytes_allocated_total(),
-            after_one * 2,
-            "two same-shape allocs should bump by 2x the per-alloc size"
-        );
-        assert_eq!(h.alloc_count_total(), 2);
+        let after_two = h.bytes_allocated_total();
+        let count_after_two = h.alloc_count_total();
+        // Second alloc strictly grows both counters.
+        assert!(after_two > after_one);
+        assert!(count_after_two > count_after_one);
     }
 
     #[test]
@@ -952,8 +1001,11 @@ mod tests {
         let bytes_before = h.bytes_allocated_total();
         let count_before = h.alloc_count_total();
         h.collect();
-        assert_eq!(h.bytes_allocated_total(), bytes_before);
-        assert_eq!(h.alloc_count_total(), count_before);
+        // Cumulative counters can only grow (collect doesn't roll
+        // them back). They may grow MORE if a concurrent test
+        // allocated during this test's window.
+        assert!(h.bytes_allocated_total() >= bytes_before);
+        assert!(h.alloc_count_total() >= count_before);
         assert_eq!(h.alloc_count(), 0, "rolling alloc_count resets");
     }
 
@@ -1007,10 +1059,19 @@ mod tests {
         assert!(h.alloc_count_total() > 0);
         assert!(h.collect_count() > 0);
         let live_before = h.live_slots();
+        let bytes_at_reset = GLOBAL_BYTES_ALLOCATED.load(Ordering::Relaxed);
         h.reset_stats();
-        // Counters zeroed.
-        assert_eq!(h.bytes_allocated_total(), 0);
-        assert_eq!(h.alloc_count_total(), 0);
+        // Counters that we own are zeroed. Byte-counter delta is
+        // computed against the post-reset baseline; if concurrent
+        // tests bumped the global between reset and the read it
+        // may be > 0, but it should be small (≤ bytes added by
+        // those tests, which are short).
+        let bytes_after = h.bytes_allocated_total();
+        let bytes_drift = GLOBAL_BYTES_ALLOCATED.load(Ordering::Relaxed) - bytes_at_reset;
+        assert_eq!(
+            bytes_after, bytes_drift,
+            "post-reset reading should equal global - new baseline"
+        );
         assert_eq!(h.collect_count(), 0);
         assert_eq!(h.last_pause(), Duration::ZERO);
         assert_eq!(h.max_pause(), Duration::ZERO);
@@ -1074,8 +1135,11 @@ mod tests {
         let _g = h.alloc(Leaf { n: 42 });
         h.collect();
         let s = h.stats();
+        // Counters that we own are exact; byte / alloc-count
+        // are shared with parallel tests so check >= rather
+        // than ==.
         assert!(s.bytes_allocated_total > 0);
-        assert_eq!(s.alloc_count_total, 1);
+        assert!(s.alloc_count_total >= 1);
         assert_eq!(s.collect_count, 1);
         assert!(s.stats_enabled);
         assert!(s.last_pause > Duration::ZERO);
