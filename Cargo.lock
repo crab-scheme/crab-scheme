@@ -514,8 +514,8 @@ version = "0.0.1"
 name = "cs-hotreload"
 version = "0.0.1"
 dependencies = [
- "cs-core",
- "cs-vm",
+ "dashmap",
+ "rustc-hash",
  "thiserror 1.0.69",
 ]
 
