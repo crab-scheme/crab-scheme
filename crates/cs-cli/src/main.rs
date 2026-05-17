@@ -1841,6 +1841,65 @@ fn run_file(
     }
 }
 
+/// Typer Phase 6.3: REPL annotation support.
+///
+/// Parses the REPL input through a throw-away SymbolTable,
+/// runs `extract_annotations`, and:
+///   - returns `None` if no annotations are present (so the
+///     caller short-circuits and feeds the original text to
+///     eval, no double-parse needed downstream),
+///   - otherwise runs the Checker, prints diagnostics to
+///     stderr, and returns the stringified stripped Datums
+///     (which cs-expand can consume without choking on the
+///     `:` markers).
+///
+/// Returns `None` on any parse error too — let the regular
+/// eval path report it through cs-runtime's own diagnostic
+/// machinery, so we don't double-print.
+#[cfg(feature = "aot")]
+fn typecheck_repl_input(src: &str, name: &str, color: bool) -> Option<String> {
+    use std::collections::HashMap;
+
+    use cs_core::SymbolTable;
+    use cs_expand::Expander;
+    use cs_parse::read_all;
+
+    let mut sources = SourceMap::new();
+    let file_id = sources.add(name, src);
+    let mut syms = SymbolTable::new();
+    let data = read_all(file_id, src, &mut syms).ok()?;
+    let (stripped, table, ann_diags) = cs_typer::extract_annotations(&data, &mut syms);
+    if table.is_empty() && ann_diags.is_empty() {
+        // Untyped input — pass-through.
+        return None;
+    }
+    for d in &ann_diags {
+        eprintln!("{}", render_diag(d, &sources, color));
+    }
+    // Run the checker on the expanded form. Errors only print
+    // diagnostics; we still eval (so the user can iterate on
+    // a partially-typechecked snippet). A future flag could
+    // gate eval on a clean check.
+    let mut macros: HashMap<cs_core::Symbol, cs_expand::Macro> = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = expander.expand_program(&stripped).ok()?;
+    drop(expander);
+    let mut checker = cs_typer::Checker::new(&table, &mut syms);
+    let type_errors = checker.check_program(&core);
+    for err in &type_errors {
+        let diag = err.to_diagnostic();
+        eprintln!("{}", render_diag(&diag, &sources, color));
+    }
+    // Stringify stripped Datums via `format_with` so cs-expand
+    // (called inside rt.eval_str) sees a clean form.
+    let mut out = String::new();
+    for d in &stripped {
+        out.push_str(&d.format_with(&syms));
+        out.push('\n');
+    }
+    Some(out)
+}
+
 fn run_repl(start_via_vm: bool, color: bool) -> ExitCode {
     let mut rt = Runtime::new();
     let mut counter: u32 = 0;
@@ -1884,7 +1943,20 @@ fn run_repl(start_via_vm: bool, color: bool) -> ExitCode {
         }
         counter += 1;
         let name = format!("<repl:{}>", counter);
-        let to_eval = std::mem::take(&mut buffer);
+        let mut to_eval = std::mem::take(&mut buffer);
+        // Phase 6.3: typer pre-pass for annotated REPL input.
+        // We parse once with a throw-away SymbolTable, run
+        // extract_annotations, and only if annotations are
+        // present do we (a) run the Checker and surface
+        // diagnostics, (b) replace `to_eval` with the
+        // stringified stripped form so cs-expand never sees
+        // `[x : T]` markers. Untyped input is left untouched
+        // and the parse is "wasted" — a fine tradeoff for an
+        // interactive REPL.
+        #[cfg(feature = "aot")]
+        {
+            to_eval = typecheck_repl_input(&to_eval, &name, color).unwrap_or(to_eval);
+        }
         let result = if via_vm {
             rt.eval_str_via_vm(&name, &to_eval)
         } else {
