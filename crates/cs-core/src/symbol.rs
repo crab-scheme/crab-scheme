@@ -8,7 +8,7 @@ use std::rc::Rc;
 /// Symbols are scoped to a single [`SymbolTable`] (and therefore a single
 /// `Runtime`); two `Symbol`s from different tables are never equal even if
 /// their backing strings match.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct Symbol(pub u32);
 
 #[derive(Default)]

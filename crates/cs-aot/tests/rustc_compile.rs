@@ -30,10 +30,12 @@ fn build_aot_binary(emitted: &str, fn_name: &str, n_params: usize) -> PathBuf {
     src.push_str("fn main() {\n");
     src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
     let mut call_args = String::new();
+    // RC3 iter 2.12 — every AOT'd fn takes __self_handle as first
+    // arg. The test main passes 0 (unused here since these tests
+    // exercise simple numeric kernels with no inner closures).
+    call_args.push_str("0i64");
     for i in 0..n_params {
-        if i > 0 {
-            call_args.push_str(", ");
-        }
+        call_args.push_str(", ");
         call_args.push_str(&format!("args[{}].parse::<i64>().unwrap()", i + 1));
     }
     src.push_str(&format!("    let result: i64 = {fn_name}({call_args});\n"));
@@ -161,7 +163,7 @@ fn aot_abs_via_branch_runs_correctly() {
             Inst::LoadConst(Value(1), Const::Fixnum(0)),
             Inst::Lt(Value(2), Value(0), Value(1)),
         ],
-        terminator: Term::Branch(Value(2), BlockId(1), BlockId(2)),
+        terminator: Term::Branch(Value(2), BlockId(1), BlockId(2), Vec::new()),
     });
     f.blocks.push(Block {
         id: BlockId(1),
@@ -230,7 +232,7 @@ fn aot_iterative_sum_loop_via_jump() {
         id: BlockId(1),
         params: vec![(Value(3), Type::Fixnum), (Value(4), Type::Fixnum)],
         insts: vec![Inst::Lt(Value(5), Value(0), Value(3))],
-        terminator: Term::Branch(Value(5), BlockId(2), BlockId(3)),
+        terminator: Term::Branch(Value(5), BlockId(2), BlockId(3), Vec::new()),
     });
     f.blocks.push(Block {
         id: BlockId(2),
@@ -333,11 +335,10 @@ opt-level = 3
     src.push_str("use cs_vm::vm::NanboxValue;\n");
     src.push_str("fn main() {\n");
     src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
-    let mut call_args = String::new();
+    // RC3 iter 2.12 — every AOT'd fn takes __self_handle: i64 first.
+    let mut call_args = String::from("0i64");
     for i in 0..n_params {
-        if i > 0 {
-            call_args.push_str(", ");
-        }
+        call_args.push_str(", ");
         call_args.push_str(&format!(
             "NanboxValue::fixnum(args[{}].parse::<i64>().unwrap()).into_raw()",
             i + 1
@@ -385,9 +386,11 @@ opt-level = 3
 #[test]
 fn aot_sq_nb_runs_correctly() {
     // Same RIR as aot_sq_runs_correctly, but emitted under NB ABI.
-    // (* x x) lowers to nb_mul_inline(v0, v0); the helper inlines
-    // the Fixnum fast path and falls back to vm_value_mul_nb on a
-    // tag miss. Result is an NB Fixnum.
+    // (* x x) lowers to nb_mul_inline(v0, v0); when both operands
+    // are typed Fixnum the per-Value type analysis picks
+    // nb_mul_fixnum_inline (the skip-tag-check fast path), which
+    // is a strict subset name of nb_mul_inline. The substring
+    // assertion matches either.
     let mut f = Function::new("sq_nb");
     f.params.push((Value(0), Type::Fixnum));
     f.entry = BlockId(0);
@@ -400,8 +403,8 @@ fn aot_sq_nb_runs_correctly() {
 
     let src = emit_with(EmitMode::Nb, &f).unwrap();
     assert!(
-        src.contains("nb_mul_inline"),
-        "NB emit should call nb_mul_inline helper: {src}"
+        src.contains("nb_mul_inline") || src.contains("nb_mul_fixnum_inline"),
+        "NB emit should call nb_mul_inline or its fixnum fast path: {src}"
     );
     let bin = build_aot_binary_nb(&src, "sq_nb", 1);
 
@@ -455,7 +458,8 @@ opt-level = 3
     src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
     src.push_str("    let x = NanboxValue::flonum(args[1].parse::<f64>().unwrap()).into_raw();\n");
     src.push_str("    let y = NanboxValue::flonum(args[2].parse::<f64>().unwrap()).into_raw();\n");
-    src.push_str(&format!("    let r: i64 = {fn_name}(x, y);\n"));
+    // RC3 iter 2.12 — every AOT'd fn takes __self_handle: i64 first.
+    src.push_str(&format!("    let r: i64 = {fn_name}(0i64, x, y);\n"));
     src.push_str("    let f = NanboxValue(r).as_flonum().expect(\"result is a Flonum\");\n");
     src.push_str("    println!(\"{}\", f);\n");
     src.push_str("}\n");
@@ -598,7 +602,7 @@ fn aot_iterative_sum_nb_via_jump() {
         id: BlockId(1),
         params: vec![(Value(3), Type::Fixnum), (Value(4), Type::Fixnum)],
         insts: vec![Inst::Lt(Value(5), Value(0), Value(3))],
-        terminator: Term::Branch(Value(5), BlockId(2), BlockId(3)),
+        terminator: Term::Branch(Value(5), BlockId(2), BlockId(3), Vec::new()),
     });
     f.blocks.push(Block {
         id: BlockId(2),

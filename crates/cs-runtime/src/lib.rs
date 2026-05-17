@@ -83,6 +83,18 @@ pub struct Runtime {
     /// falls back to `std::env::args()` for backward compat (REPL,
     /// `-e` evaluation, etc.).
     pub(crate) command_line: Option<Vec<String>>,
+    /// Typer-derived param-type hints, keyed by
+    /// `LambdaProfile::lambda_id`. The JIT tier-up hook prefers
+    /// these over the observation-based `param_hints` it would
+    /// otherwise derive from the first call's argument types —
+    /// the user's annotation is authoritative, while observations
+    /// are single-sample and can mis-specialize on polymorphic
+    /// call sites. Phase 5.4. Populated by
+    /// [`Runtime::install_typer_hints`] after the typer has
+    /// run; empty otherwise (no behavior change for untyped
+    /// programs).
+    pub(crate) typer_hints_by_lambda_id:
+        std::cell::RefCell<std::collections::HashMap<u32, Vec<cs_rir::Type>>>,
 }
 
 /// Opaque handle for a [`Pinned`] slot. See [`Runtime::pin`].
@@ -1658,7 +1670,18 @@ impl Runtime {
             #[cfg(feature = "jit")]
             jit_lowerer: None,
             command_line: None,
+            typer_hints_by_lambda_id: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Install typer-derived param-type hints (Phase 5.4). Keyed
+    /// by `LambdaProfile::lambda_id`. Hints replace whatever was
+    /// previously installed; pass an empty map to clear. The JIT
+    /// tier-up hook consults this map before falling back to
+    /// observation-based inference, so installing must happen
+    /// before the lambda first crosses the tier-up threshold.
+    pub fn install_typer_hints(&self, hints: std::collections::HashMap<u32, Vec<cs_rir::Type>>) {
+        *self.typer_hints_by_lambda_id.borrow_mut() = hints;
     }
 
     /// Set the `(command-line)` override for this runtime. Call
@@ -1741,6 +1764,23 @@ impl Runtime {
 
     pub fn symbols(&self) -> &SymbolTable {
         &self.syms
+    }
+
+    /// RC3 iter 2.14 — snapshot the runtime's vm-env builtin
+    /// procedure bindings, re-keyed by NAME. cs-cli's aot pipeline
+    /// uses this to pass a globals snapshot to the compiler so that
+    /// `(/ a b)`, `(display x)`, `(not p)`, etc. fold to
+    /// `Const(Procedure)` (which the translator converts to a
+    /// BuiltinRef → specialized RIR Inst) instead of `LoadVar` (which
+    /// becomes an EnvLookup → unresolved capture in AOT).
+    pub fn builtin_procs_by_name(&self) -> std::collections::HashMap<String, Value> {
+        let mut m = std::collections::HashMap::new();
+        for (sym, val) in self.vm_env.snapshot_bindings() {
+            if matches!(val, Value::Procedure(_)) {
+                m.insert(self.syms.name(sym).to_string(), val);
+            }
+        }
+        m
     }
 
     pub fn source_map(&self) -> &SourceMap {
@@ -2254,6 +2294,35 @@ mod tests {
     fn add_two_numbers() {
         let v = run("(+ 1 2)");
         assert_eq!(format!("{}", v), "3");
+    }
+
+    // Phase 5.4: install_typer_hints API round-trip.
+    #[test]
+    fn install_typer_hints_round_trips() {
+        let rt = Runtime::new();
+        let mut h = std::collections::HashMap::new();
+        h.insert(42u32, vec![cs_rir::Type::Flonum, cs_rir::Type::Fixnum]);
+        rt.install_typer_hints(h.clone());
+        let installed = rt.typer_hints_by_lambda_id.borrow();
+        assert_eq!(
+            installed.get(&42),
+            Some(&vec![cs_rir::Type::Flonum, cs_rir::Type::Fixnum])
+        );
+    }
+
+    #[test]
+    fn install_typer_hints_replaces_existing() {
+        let rt = Runtime::new();
+        let mut h = std::collections::HashMap::new();
+        h.insert(1u32, vec![cs_rir::Type::Fixnum]);
+        rt.install_typer_hints(h);
+        let mut h2 = std::collections::HashMap::new();
+        h2.insert(2u32, vec![cs_rir::Type::Flonum]);
+        rt.install_typer_hints(h2);
+        // Old entry should be gone; new one present.
+        let installed = rt.typer_hints_by_lambda_id.borrow();
+        assert!(installed.get(&1).is_none(), "old entry leaked");
+        assert_eq!(installed.get(&2), Some(&vec![cs_rir::Type::Flonum]));
     }
 
     #[test]

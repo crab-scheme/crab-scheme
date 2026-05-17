@@ -96,21 +96,108 @@ pub fn bytecode_to_rir_aot(
     name: impl Into<String>,
     self_name: Option<Symbol>,
 ) -> Result<Function, TranslateError> {
-    let mut func = bytecode_to_rir(lambda, name, self_name)?;
-    // RC2 iter J: single-block demote.
-    // RC2 iter O attempted multi-block demote but regressed tak —
-    // blocks 1+ have their own EnvDefineLocal/EnvLookup ops the
-    // simple "alias-rewrite blocks 1+" extension didn't handle.
-    // Properly demoting multi-block functions needs per-block
-    // alias maps OR a join lattice across blocks; deferred to
-    // post-RC2 work. Reverted to the single-block gate so
-    // multi-block let-using programs surface clean
-    // `UnsupportedInst("EnvLookupAny")` diagnostics rather than
-    // post-build cargo errors.
-    if func.blocks.len() == 1 {
-        let _ = demote_env_to_ssa_all_blocks(&mut func);
+    bytecode_to_rir_aot_with_globals(lambda, name, self_name, None)
+}
+
+/// RC3 iter 2.7 — same as `bytecode_to_rir_aot` but accepts a set of
+/// top-level sym IDs that are known to be AOT'd as separate
+/// functions. Such syms are EXCLUDED from `func.captures` so the
+/// emitter can resolve them as direct cross-procedure references via
+/// the resolver's by-name-sym table rather than expecting them to be
+/// passed in as closure captures. Pass `None` (or an empty set) for
+/// the legacy single-procedure path.
+pub fn bytecode_to_rir_aot_with_globals(
+    lambda: &CompiledLambda,
+    name: impl Into<String>,
+    self_name: Option<Symbol>,
+    known_globals: Option<&std::collections::HashSet<u32>>,
+) -> Result<Function, TranslateError> {
+    bytecode_to_rir_aot_with_param_types(lambda, name, self_name, known_globals, None)
+}
+
+/// RC3 iter 2.15 — full AOT translator with per-param type hints.
+/// cs-cli's aot --multi uses this to default LETREC-bound inner
+/// lambdas' params to `Type::Any` (so they accept pair/list values
+/// that the parent passes via named-let / letrec). Top-level fns
+/// keep the `None` default (Fixnum) since they're called from CLI
+/// with parsed Fixnum args.
+pub fn bytecode_to_rir_aot_with_param_types(
+    lambda: &CompiledLambda,
+    name: impl Into<String>,
+    self_name: Option<Symbol>,
+    known_globals: Option<&std::collections::HashSet<u32>>,
+    param_type_hints: Option<&[Type]>,
+) -> Result<Function, TranslateError> {
+    let mut func = bytecode_to_rir_with_hints(lambda, name, self_name, param_type_hints)?;
+    // RC3 iter 2.13 — seed self_binding_sym from self_name so
+    // record_captures (which runs below) can exclude self-EnvLookups
+    // from the captures list (they resolve to __self_handle instead).
+    // cs-cli also sets this field after translation, but record_captures
+    // needs it FIRST.
+    if let Some(sym) = self_name {
+        func.self_binding_sym = Some(sym.0);
     }
+    // RC3 Phase 2 iter 2.5: demote runs for any function shape,
+    // single- or multi-block. Pre-scan inside the helper bails
+    // cleanly without mutating `func` on free-vars / duplicate
+    // defines / forward cross-block lookups (the iter-2.6 atomicity
+    // fix combined with iter-2.5's no-duplicate-define invariant).
+    // On bail, downstream sees the original RIR + a clean
+    // UnsupportedInst diagnostic from cs-aot.
+    let _ = demote_env_to_ssa_all_blocks(&mut func);
+    // RC3 iter 2.4 Step 1 + iter 2.7: capture analysis post-pass.
+    // The demote dropped EnvLookup/EnvLookupAny for locally-defined
+    // syms; any surviving env op references either (a) a free
+    // variable that must be captured at MakeClosure time, or (b) a
+    // top-level global known to be AOT'd separately. Record (a) in
+    // first-seen order into func.captures; cs-aot resolves (b)
+    // through the LambdaResolver's by_name_sym table at emit time.
+    record_captures(&mut func, known_globals);
     Ok(func)
+}
+
+/// RC3 iter 2.4 Step 1 + iter 2.7 — walk a translated Function
+/// looking for `EnvLookup` / `EnvLookupAny` insts referring to syms
+/// NOT locally defined AND NOT in `known_globals`. Each such sym is
+/// a captured free variable; we record them on `func.captures` in
+/// first-seen order. Syms that ARE in `known_globals` are
+/// cross-procedure references that cs-aot resolves at emit time
+/// via the LambdaResolver.
+///
+/// Run AFTER `demote_env_to_ssa_all_blocks` so the demote-able
+/// lookups (those paired with EnvDefineLocal in the same function)
+/// are already gone. Surviving lookups are captures or globals
+/// by definition.
+fn record_captures(
+    func: &mut cs_rir::Function,
+    known_globals: Option<&std::collections::HashSet<u32>>,
+) {
+    use std::collections::HashSet;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut order: Vec<u32> = Vec::new();
+    // RC3 iter 2.13 — exclude the function's own self-binding-sym
+    // from captures. EnvLookups of THIS sym resolve to __self_handle
+    // (iter 2.12 + iter 2.13's EnvLookup arm), not a capture slot.
+    // Including it as a capture would force the caller to provide a
+    // value it can't have: at MakeClosure time, the closure is being
+    // CREATED — its handle doesn't exist yet.
+    let self_sym = func.self_binding_sym;
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let RirInst::EnvLookup(_, sym) | RirInst::EnvLookupAny(_, sym) = inst {
+                if known_globals.is_some_and(|g| g.contains(sym)) {
+                    continue;
+                }
+                if self_sym == Some(*sym) {
+                    continue;
+                }
+                if seen.insert(*sym) {
+                    order.push(*sym);
+                }
+            }
+        }
+    }
+    func.captures = order;
 }
 
 /// RC2 iter O — extends `demote_env_to_ssa_in_first_block` to
@@ -138,11 +225,90 @@ pub fn bytecode_to_rir_aot(
 /// Returns false (same contract as the original) if any EnvLookup
 /// references a sym not defined locally — the free-var case
 /// signals the AOT path should leave func untouched.
+/// RC3 iter 2.11 — clone an Inst and rewrite its operand Values
+/// through the alias map. Used by demote when we choose to KEEP an
+/// Inst (rather than dropping it as an alias-target) but still want
+/// operand rewrites — same machinery as the catch-all arm.
+fn other_with_alias(inst: &RirInst, alias: &HashMap<RirValue, RirValue>) -> RirInst {
+    use cs_rir::inline::for_each_value_in_inst;
+    let mut cloned = inst.clone();
+    for_each_value_in_inst(&mut cloned, |v| {
+        let mut cur = *v;
+        for _ in 0..=alias.len() {
+            match alias.get(&cur) {
+                Some(&next) if next != cur => cur = next,
+                _ => break,
+            }
+        }
+        *v = cur;
+    });
+    cloned
+}
+
 fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
-    use cs_rir::inline::{for_each_value_in_inst, for_each_value_in_term, is_inline_supported};
+    use cs_rir::inline::{for_each_value_in_inst, for_each_value_in_term};
 
     if func.blocks.is_empty() {
         return true;
+    }
+
+    // RC3 Phase 2 iter 2.5 — proper multi-block demote via the
+    // pre-scan pattern from iter 2.6.
+    //
+    // Two-tier strictness:
+    // - **Single-block functions**: same posture as iter J — pre-
+    //   scan just verifies every lookup's sym is defined somewhere
+    //   in block 0. Multiple defines of the same sym are fine
+    //   (re-bindings; last define wins in textual order, matching
+    //   the iter-J behavior the scorecard already validated).
+    // - **Multi-block functions**: stricter. Pre-scan requires
+    //   every looked-up sym to be defined EXACTLY ONCE across the
+    //   whole function — multiple defines would need φ-merge at
+    //   branch points, which iter 2.5 doesn't implement. Bails
+    //   cleanly without mutating `func` on either constraint
+    //   miss (free var, duplicate define, forward cross-block ref).
+    let single_block = func.blocks.len() == 1;
+    // RC3 iter 2.11 — track defines per-block + the lookups. A sym
+    // with multiple defines all in the SAME block is a re-binding
+    // (letrec/named-let emits a placeholder Unspecified-define then
+    // overwrites after MakeClosure); the alias safely tracks the
+    // LAST define in textual order, even in multi-block functions.
+    // The strict bail only applies when defines span multiple blocks
+    // (which truly needs φ-merge).
+    let mut defined_blocks: HashMap<u32, std::collections::HashSet<usize>> = HashMap::new();
+    let mut all_lookup_syms: Vec<u32> = Vec::new();
+    for (bidx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.insts {
+            match inst {
+                RirInst::EnvDefineLocal(sym, _) => {
+                    defined_blocks.entry(*sym).or_default().insert(bidx);
+                }
+                RirInst::EnvLookupAny(_, sym) | RirInst::EnvLookup(_, sym) => {
+                    all_lookup_syms.push(*sym);
+                }
+                _ => {}
+            }
+        }
+    }
+    // demote_eligible: syms whose lookups we CAN safely alias to a
+    // single source Value. Free vars / captures / globals NOT
+    // eligible — they survive as EnvLookups for the AOT resolver to
+    // handle. Multi-block + cross-block multi-define also NOT
+    // eligible — needs φ-merge.
+    let mut demote_eligible: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for sym in &all_lookup_syms {
+        match defined_blocks.get(sym) {
+            None => {} // free var — skip
+            Some(blocks) if blocks.len() == 1 => {
+                // All defines in one block — safe re-binding (last
+                // define wins in textual order).
+                demote_eligible.insert(*sym);
+            }
+            Some(_) if single_block => {
+                demote_eligible.insert(*sym);
+            }
+            Some(_) => {} // defines span multiple blocks — needs φ-merge
+        }
     }
 
     let mut sym_to_src: HashMap<u32, RirValue> = HashMap::new();
@@ -158,52 +324,75 @@ fn demote_env_to_ssa_all_blocks(func: &mut cs_rir::Function) -> bool {
         cur
     };
 
-    // Step 1+2: process block 0 — collect alias + drop env insts +
-    // rewrite block-0 operands. Mirrors the single-block helper.
-    let block0_insts: Vec<_> = func.blocks[0].insts.drain(..).collect();
-    let mut rewritten: Vec<RirInst> = Vec::with_capacity(block0_insts.len());
-    for inst in block0_insts {
-        match inst {
-            RirInst::EnvDefineLocal(sym, src) => {
-                sym_to_src.insert(sym, resolve(src, &alias));
-            }
-            RirInst::EnvLookupAny(d, sym) | RirInst::EnvLookup(d, sym) => {
-                let src = match sym_to_src.get(&sym) {
-                    Some(&s) => s,
-                    None => return false,
-                };
-                alias.insert(d, src);
-            }
-            mut other => {
-                if is_inline_supported(&other) {
-                    for_each_value_in_inst(&mut other, |v| {
+    // Per-block rewritten buffer + alias-build walk. Done in dominator
+    // order (block 0 first) so EnvLookupAny in block N can resolve
+    // through the alias map built from block M's EnvDefineLocal for
+    // M < N.
+    let mut per_block_rewritten: Vec<Vec<RirInst>> = Vec::with_capacity(func.blocks.len());
+    for block in &func.blocks {
+        let mut rewritten = Vec::with_capacity(block.insts.len());
+        for inst in &block.insts {
+            match inst {
+                RirInst::EnvDefineLocal(sym, src) => {
+                    if demote_eligible.contains(sym) {
+                        sym_to_src.insert(*sym, resolve(*src, &alias));
+                    } else {
+                        // Non-eligible sym (multi-define in multi-
+                        // block) — keep the define so subsequent
+                        // operations against this sym still work.
+                        rewritten.push(other_with_alias(inst, &alias));
+                    }
+                }
+                RirInst::EnvLookupAny(d, sym) | RirInst::EnvLookup(d, sym) => {
+                    // RC3 iter 2.11 — three-way dispatch:
+                    //   1. Sym is demote-eligible AND we have a
+                    //      sym_to_src entry → add to alias map, drop
+                    //      this EnvLookup.
+                    //   2. Sym is demote-eligible but no sym_to_src
+                    //      yet (forward cross-block ref) → keep the
+                    //      EnvLookup; downstream cs-aot uses its
+                    //      captures / local_defs / by_name_sym
+                    //      resolver. The d Value still gets defined
+                    //      by the surviving EnvLookup.
+                    //   3. Sym is not eligible → same as (2).
+                    if demote_eligible.contains(sym) {
+                        if let Some(&src) = sym_to_src.get(sym) {
+                            alias.insert(*d, src);
+                        } else {
+                            rewritten.push(other_with_alias(inst, &alias));
+                        }
+                    } else {
+                        rewritten.push(other_with_alias(inst, &alias));
+                    }
+                }
+                other => {
+                    // RC3 iter 2.7 — apply the alias map to operand
+                    // Values in EVERY surviving inst, not just
+                    // is_inline_supported ones. The former check was
+                    // a leftover from when the demote pass piggybacked
+                    // on the JIT inliner's eligibility predicate;
+                    // CallGeneral / MakeClosure / Cons / etc. all need
+                    // their operands rewritten so a callee read of a
+                    // demoted let-binding resolves to the right SSA
+                    // Value. Without this, a named-let lambda
+                    // reference (`(let loop ...) (loop i acc)`) ends
+                    // up with an unresolved Value(N) in CallGeneral's
+                    // callee slot.
+                    let mut cloned = other.clone();
+                    for_each_value_in_inst(&mut cloned, |v| {
                         *v = resolve(*v, &alias);
                     });
+                    rewritten.push(cloned);
                 }
-                rewritten.push(other);
             }
         }
+        per_block_rewritten.push(rewritten);
     }
-    func.blocks[0].insts = rewritten;
-    for_each_value_in_term(&mut func.blocks[0].terminator, |v| {
-        *v = resolve(*v, &alias);
-    });
 
-    // Step 3 (iter O): walk blocks 1+ applying the alias rewrite.
-    // Don't try to drop EnvDefineLocal/Lookup in later blocks; the
-    // simple "lets at function top" pattern is what we target. Any
-    // env op in block 1+ that references our alias map gets its
-    // operand rewritten; env ops with their own non-block-0 sym
-    // bindings pass through (Type::Any source-of-truth left to the
-    // emitter).
-    for block in func.blocks.iter_mut().skip(1) {
-        for inst in block.insts.iter_mut() {
-            if is_inline_supported(inst) {
-                for_each_value_in_inst(inst, |v| {
-                    *v = resolve(*v, &alias);
-                });
-            }
-        }
+    // Commit: assign the per-block rewritten Insts back + rewrite
+    // each block's terminator via the now-complete alias map.
+    for (block, rewritten) in func.blocks.iter_mut().zip(per_block_rewritten) {
+        block.insts = rewritten;
         for_each_value_in_term(&mut block.terminator, |v| {
             *v = resolve(*v, &alias);
         });
@@ -314,11 +503,15 @@ pub fn bytecode_to_rir_full(
     // When the caller supplied per-param type hints (arg-side
     // feedback), use them; else default to Fixnum.
     let mut func = Function::new(name);
-    for (i, _sym) in lambda.params.iter().enumerate() {
+    for (i, sym) in lambda.params.iter().enumerate() {
         let t = param_type_hints
             .and_then(|h| h.get(i).copied())
             .unwrap_or(Type::Fixnum);
         func.params.push((RirValue(i as u32), t));
+        // RC3 iter 2.7 — record the param's sym ID so cs-aot can
+        // map EnvLookup(sym) of a param to the right Value when
+        // resolving an inner closure's captures.
+        func.param_syms.push(sym.0);
     }
     func.entry = BlockId(0);
 
@@ -667,6 +860,20 @@ pub fn bytecode_to_rir_full(
                     };
                     let target_block = lookup_block(&offset_to_block, *target, "JumpIfFalse")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "JumpIfFalse fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -684,7 +891,12 @@ pub fn bytecode_to_rir_full(
                         &sim_stack_values(&sim_stack),
                     )?;
                     // JumpIfFalse jumps when cond is falsy. brif: cond truthy -> first, else second.
-                    term = Some(Term::Branch(cond, fall_block, target_block));
+                    // RC3 iter 2.13 — Term::Branch now carries args
+                    // for the target blocks' params, same shape as
+                    // Term::Jump. Both successors get the same args
+                    // (the pre-branch sim_stack values).
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, fall_block, target_block, branch_args));
                     break;
                 }
                 Inst::BranchOnGeFx2(target) => {
@@ -692,6 +904,20 @@ pub fn bytecode_to_rir_full(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnGeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGeFx2 fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -708,7 +934,12 @@ pub fn bytecode_to_rir_full(
                         fall_block,
                         &sim_stack_values(&sim_stack),
                     )?;
-                    term = Some(Term::Branch(cond, fall_block, target_block));
+                    // RC3 iter 2.13 — Term::Branch now carries args
+                    // for the target blocks' params, same shape as
+                    // Term::Jump. Both successors get the same args
+                    // (the pre-branch sim_stack values).
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, fall_block, target_block, branch_args));
                     break;
                 }
                 Inst::BranchOnGtFx2(target) => {
@@ -716,6 +947,20 @@ pub fn bytecode_to_rir_full(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, b, a);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnGtFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGtFx2 fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -732,7 +977,8 @@ pub fn bytecode_to_rir_full(
                         fall_block,
                         &sim_stack_values(&sim_stack),
                     )?;
-                    term = Some(Term::Branch(cond, target_block, fall_block));
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, target_block, fall_block, branch_args));
                     break;
                 }
                 Inst::BranchOnLeFx2(target) => {
@@ -740,6 +986,20 @@ pub fn bytecode_to_rir_full(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, b, a);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnLeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLeFx2 fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -756,7 +1016,12 @@ pub fn bytecode_to_rir_full(
                         fall_block,
                         &sim_stack_values(&sim_stack),
                     )?;
-                    term = Some(Term::Branch(cond, fall_block, target_block));
+                    // RC3 iter 2.13 — Term::Branch now carries args
+                    // for the target blocks' params, same shape as
+                    // Term::Jump. Both successors get the same args
+                    // (the pre-branch sim_stack values).
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, fall_block, target_block, branch_args));
                     break;
                 }
                 Inst::BranchOnLtFx2(target) => {
@@ -764,6 +1029,20 @@ pub fn bytecode_to_rir_full(
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnLtFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLtFx2 fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -780,7 +1059,8 @@ pub fn bytecode_to_rir_full(
                         fall_block,
                         &sim_stack_values(&sim_stack),
                     )?;
-                    term = Some(Term::Branch(cond, target_block, fall_block));
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, target_block, fall_block, branch_args));
                     break;
                 }
                 Inst::BranchOnNeFx2(target) => {
@@ -788,6 +1068,20 @@ pub fn bytecode_to_rir_full(
                     let cond = emit_typed_eq(&mut insts, &mut value_types, &mut alloc, a, b);
                     let target_block = lookup_block(&offset_to_block, *target, "BranchOnNeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnNeFx2 fall")?;
+                    // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
+                    // markers before the branch so they survive across
+                    // blocks as concrete Values. Without this, the
+                    // merge successor sees a smaller stack than the
+                    // predecessor pushed (`sim_stack_values` strips
+                    // markers), and downstream `Call(n)` trips its
+                    // "stack has only K entries" invariant.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     seed_block_entry(
                         &mut block_entry_stack,
                         &mut block_params,
@@ -804,11 +1098,25 @@ pub fn bytecode_to_rir_full(
                         fall_block,
                         &sim_stack_values(&sim_stack),
                     )?;
-                    term = Some(Term::Branch(cond, fall_block, target_block));
+                    // RC3 iter 2.13 — Term::Branch now carries args
+                    // for the target blocks' params, same shape as
+                    // Term::Jump. Both successors get the same args
+                    // (the pre-branch sim_stack values).
+                    let branch_args = sim_stack_values(&sim_stack);
+                    term = Some(Term::Branch(cond, fall_block, target_block, branch_args));
                     break;
                 }
                 Inst::Jump(target) => {
                     let target_block = lookup_block(&offset_to_block, *target, "Jump")?;
+                    // RC3 iter 2.13 — same marker-materialization as
+                    // JumpIfFalse so the markers flow as Values.
+                    materialize_markers_at_branch(
+                        &mut sim_stack,
+                        &mut insts,
+                        &mut value_types,
+                        &mut alloc,
+                        self_name,
+                    )?;
                     // Pull the current stack out as the jump-args.
                     // The first jump to a target seeds its block
                     // params; subsequent jumps must match the count
@@ -1406,19 +1714,34 @@ pub fn bytecode_to_rir_full(
                                         insts.push(RirInst::Eq(dst, bit, zero));
                                     }
                                     // ADR 0012 D-2 (iter EQ) — type-aware (not x).
-                                    // Boolean operand: Eq(x, 0) flips the
-                                    // 0/1 carrier (existing fast path).
+                                    // Boolean operand: lower to the dedicated
+                                    // `Inst::NotBoolean` so AOT and JIT can
+                                    // emit a specialized bit-flip rather
+                                    // than re-using numeric Eq (which calls
+                                    // generic_cmp2 and FAILS on boolean
+                                    // operands, making the previous (not x)
+                                    // path return #f for every boolean — the
+                                    // bug tak hit on `(not (< y x))`).
                                     ("not", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Boolean) =>
                                     {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Eq(dst, args[0], zero));
+                                        insts.push(RirInst::NotBoolean(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
                                     }
-                                    // Any operand: route through AnyTruthy
-                                    // (returns 0 iff inner is #f) and Eq
-                                    // with 0 to invert.
+                                    // Any operand: AnyTruthy returns NB
+                                    // Boolean (true if truthy, false if
+                                    // NB_FALSE). NotBoolean flips. Result
+                                    // is NB Boolean (NB false if input
+                                    // truthy, NB true if input was #f).
+                                    //
+                                    // RC3 iter 2.16 fix — previously this
+                                    // emitted `Eq(truthy, Fixnum(0))`
+                                    // which works in JIT i64-boolean mode
+                                    // but fails in NB-AOT (Eq routes
+                                    // through generic_cmp2 which rejects
+                                    // boolean operands). binary-trees's
+                                    // `(if (not (car t)) ...)` hit this.
                                     ("not", 1)
                                         if value_types.get(&args[0]).copied()
                                             == Some(Type::Any) =>
@@ -1426,9 +1749,8 @@ pub fn bytecode_to_rir_full(
                                         let truthy = alloc();
                                         insts.push(RirInst::AnyTruthy(truthy, args[0]));
                                         value_types.insert(truthy, Type::Boolean);
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Eq(dst, truthy, zero));
+                                        insts.push(RirInst::NotBoolean(dst, truthy));
+                                        value_types.insert(dst, Type::Boolean);
                                     }
                                     // Other primitive types (Fixnum,
                                     // Character, Flonum, Symbol, Null): the
@@ -3461,9 +3783,12 @@ pub fn bytecode_to_rir_full(
                                     // immediate (e.g. Fixnum), box it via
                                     // BoxTyped first.
                                     // ADR 0012 D-2 (iter JE) — (make-vector n) 1-arg.
+                                    // RC3 iter 2.18 — accept Any-typed n too.
                                     ("make-vector", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Fixnum) =>
+                                        if matches!(
+                                            value_types.get(&args[0]).copied(),
+                                            Some(Type::Fixnum) | Some(Type::Any)
+                                        ) =>
                                     {
                                         insts.push(RirInst::MakeVectorUnspec(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
@@ -3477,11 +3802,20 @@ pub fn bytecode_to_rir_full(
                                             .get(&args[1])
                                             .copied()
                                             .unwrap_or(Type::Fixnum);
-                                        if len_t != Type::Fixnum {
-                                            return Err(TranslateError::Unsupported(
-                                                "make-vector: length must be Fixnum-typed at JIT translate"
-                                                    .into(),
-                                            ));
+                                        // RC3 iter 2.18 — accept Any-typed
+                                        // length too. The cs-aot VecAlloc
+                                        // lowering decodes NB carriers
+                                        // (Fixnum payload extraction) so
+                                        // raw length works regardless of
+                                        // tracked type. Previously we
+                                        // bailed on non-Fixnum, blocking
+                                        // spectral-norm's
+                                        // (make-vector n 1.0) where n
+                                        // defaults to Any (iter 2.16).
+                                        if len_t != Type::Fixnum && len_t != Type::Any {
+                                            return Err(TranslateError::Unsupported(format!(
+                                                "make-vector: length must be Fixnum or Any (got {len_t:?})"
+                                            )));
                                         }
                                         let fill = if fill_t == Type::Any {
                                             args[1]
@@ -3926,6 +4260,21 @@ pub fn bytecode_to_rir_full(
                                         insts.push(RirInst::FixToFlo(promoted, args[0]));
                                         value_types.insert(promoted, Type::Flonum);
                                         insts.push(RirInst::FlonumSqrt(dst, promoted));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    // RC3 iter 2.18 — sqrt for Any-typed args.
+                                    // cs-aot's FlonumSqrt lowering is
+                                    // NB-Fixnum-aware (iter 2.17) so we can
+                                    // hand the Any operand directly to
+                                    // FlonumSqrt; the lowering will decode
+                                    // NB Fixnum payload to f64 or use the
+                                    // raw f64 bits for NB Flonum. Spectral-
+                                    // norm's `(sqrt (/ vBv vv))` hits this.
+                                    ("sqrt", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::FlonumSqrt(dst, args[0]));
                                         value_types.insert(dst, Type::Flonum);
                                     }
                                     ("flabs", 1)
@@ -7573,6 +7922,51 @@ fn sim_stack_values(sim_stack: &[StackEntry]) -> Vec<RirValue> {
         .collect()
 }
 
+/// RC3 iter 2.13 — at a branch point, any non-Value entries on the
+/// stack (SelfRef, BuiltinRef) would be silently DROPPED by the
+/// previous `sim_stack_values` filter, causing the merge-block
+/// successor to see a smaller stack than the predecessor pushed. The
+/// downstream `Call(n)` then trips its "stack has only K entries"
+/// invariant.
+///
+/// Fix: materialize each marker as a concrete RIR Value before the
+/// branch. SelfRef becomes an `EnvLookup(self_name)` (which lowers to
+/// `__self_handle` via iter 2.12's resolver path). BuiltinRef is
+/// rejected — the AOT pipeline can't materialize a builtin
+/// procedure handle (would need runtime allocation + a name → handle
+/// registry); programs that branch with a builtin on the stack stay
+/// blocked and surface a clean UnsupportedInst at lower time.
+fn materialize_markers_at_branch(
+    sim_stack: &mut [StackEntry],
+    insts: &mut Vec<RirInst>,
+    value_types: &mut HashMap<RirValue, Type>,
+    alloc: &mut impl FnMut() -> RirValue,
+    self_name: Option<Symbol>,
+) -> Result<(), TranslateError> {
+    for entry in sim_stack.iter_mut() {
+        match entry {
+            StackEntry::Value(_) => {}
+            StackEntry::SelfRef => {
+                let sym = self_name.ok_or_else(|| {
+                    TranslateError::Invalid("SelfRef on stack at branch but no self_name".into())
+                })?;
+                let dst = alloc();
+                insts.push(RirInst::EnvLookupAny(dst, sym.0));
+                value_types.insert(dst, Type::Any);
+                *entry = StackEntry::Value(dst);
+            }
+            StackEntry::BuiltinRef(name) => {
+                return Err(TranslateError::Unsupported(format!(
+                    "builtin-ref `{name}` on stack at branch (RC3 iter 2.13: \
+                     materialization across blocks needs a builtin → AOT-handle \
+                     registry that doesn't exist yet)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn seed_block_entry(
     entry_stack: &mut HashMap<BlockId, Vec<RirValue>>,
     block_params: &mut HashMap<BlockId, Vec<(RirValue, Type)>>,
@@ -7912,7 +8306,7 @@ mod tests {
         assert_eq!(f.blocks.len(), 3);
         // Entry ends in Branch.
         match &f.blocks[0].terminator {
-            Term::Branch(_, _, _) => {}
+            Term::Branch(_, _, _, _) => {}
             other => panic!("entry terminator: {:?}", other),
         }
         // The else arm body should contain at least 2 CallSelf insts.

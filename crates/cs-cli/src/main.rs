@@ -100,6 +100,81 @@ enum Cmd {
         /// codegen issues.
         #[arg(long = "emit-rust-source")]
         emit_rust_source: bool,
+        /// RC3 Phase 4 iter 4.3: print a per-lambda AOT-compatibility
+        /// report and exit. Doesn't emit a cargo project or build
+        /// anything. For each top-level `(define (name args) body)`
+        /// in the source, tries `bytecode_to_rir_aot` and reports
+        /// whether the resulting RIR is in cs-aot's supported set.
+        /// Useful for surveying coverage before picking `--entry`.
+        #[arg(long = "explain")]
+        explain: bool,
+        /// RC3 Phase 6 iter 6.3: emit a multi-procedure binary
+        /// instead of a single-entry one. The resulting binary
+        /// takes `<fn-name> <args...>` on the CLI and dispatches
+        /// to whichever AOT-compatible top-level lambda matches.
+        /// Incompatible lambdas (e.g., MakeClosure-blocked) are
+        /// skipped with a warning printed at emit time, not
+        /// included in the binary. Useful when a single source
+        /// file defines several utility functions you want to
+        /// AOT together.
+        #[arg(long = "multi")]
+        multi: bool,
+        /// RC3 Phase 6 iter 6.6: after `--build`, also run the
+        /// AOT'd binary AND the JIT tier on the given sample arg
+        /// list, and warn if the two outputs disagree. Cheap
+        /// insurance against silent codegen regressions; use when
+        /// shipping a binary you can't independently verify.
+        ///
+        /// Format: `--verify "1 2 3"` (space-separated args, same
+        /// shape the AOT'd binary would receive). Exit code 0 on
+        /// match, non-zero with diagnostic on mismatch.
+        #[arg(long = "verify", value_name = "ARGS")]
+        verify: Option<String>,
+        /// Typer Phase 6.2: run the typer's checker before
+        /// AOT'ing. Surfaces type-mismatch / arity errors as
+        /// `cs_diag::Diagnostic`s and exits 1 before invoking
+        /// cs-aot. Default off (preserves the iter 5.3
+        /// warn-and-proceed behavior where syntactic
+        /// annotation errors print but don't block AOT).
+        #[arg(long = "typecheck")]
+        typecheck: bool,
+        /// RC3 Phase 6 iter 6.4: cross-compile target triple. Passed
+        /// verbatim to `cargo build --target=<TRIPLE>`. Requires the
+        /// target to be installed via `rustup target add <TRIPLE>`.
+        ///
+        /// Examples:
+        ///   --target wasm32-wasip1       — WASM (run with wasmtime)
+        ///   --target x86_64-unknown-linux-gnu — Linux glibc x86_64
+        ///   --target aarch64-apple-darwin     — Apple Silicon Mac
+        ///
+        /// On success, the binary path is reported with the target
+        /// triple in it (target/<triple>/release/<name>). --verify
+        /// is skipped when --target is set since the cross-compiled
+        /// binary likely can't run on the host.
+        #[arg(long = "target", value_name = "TRIPLE")]
+        target: Option<String>,
+    },
+    /// RC3 Phase 4 iter 4.5: self-test the AOT installation. Runs
+    /// a baked-in `(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))`
+    /// through the full pipeline (parse → expand → compile → RIR →
+    /// emit project → cargo build → run) and asserts the resulting
+    /// binary returns `120` for `fact(5)`. Exit code 0 on success;
+    /// non-zero (with diagnostic) on any pipeline stage failure.
+    /// Useful for verifying a release-installed binary works on
+    /// the user's platform before pointing it at real source files.
+    #[cfg(feature = "aot")]
+    AotDoctor,
+    /// Typer Phase 6.1: typecheck a Scheme source file.
+    ///
+    /// Runs parse → extract annotations → expand → checker;
+    /// prints diagnostics in the standard format. Exit code 0
+    /// when no type errors surface, 1 when type errors surface,
+    /// 2 on parse / expand errors. Untyped programs always exit
+    /// 0 (typer is a no-op without annotations).
+    #[cfg(feature = "aot")]
+    Check {
+        /// Path to the .scm source file.
+        file: String,
     },
 }
 
@@ -124,15 +199,283 @@ fn main() -> ExitCode {
             build,
             emit_rir,
             emit_rust_source,
-        }) => run_aot(
-            &file,
-            output.as_deref(),
-            entry.as_deref(),
-            build,
-            emit_rir,
-            emit_rust_source,
-        ),
+            explain,
+            multi,
+            verify,
+            target,
+            typecheck,
+        }) => {
+            if explain {
+                run_aot_explain(&file)
+            } else if multi {
+                run_aot_multi(&file, output.as_deref(), build, typecheck, color)
+            } else {
+                let code = run_aot(
+                    &file,
+                    output.as_deref(),
+                    entry.as_deref(),
+                    build,
+                    emit_rir,
+                    emit_rust_source,
+                    target.as_deref(),
+                );
+                // RC3 iter 6.6: --verify post-step. Skipped when
+                // --target is set (cross-compiled binary likely
+                // can't run on the host).
+                if let Some(args) = verify {
+                    if target.is_some() {
+                        eprintln!(
+                            "crabscheme aot --verify skipped (cross-compiled binary can't run on the host)"
+                        );
+                        code
+                    } else if matches!(code, ExitCode::SUCCESS) && build {
+                        let sample_args: Vec<&str> = args.split_whitespace().collect();
+                        run_aot_verify(&file, entry.as_deref(), output.as_deref(), &sample_args)
+                    } else {
+                        eprintln!(
+                            "crabscheme aot --verify requires --build (and a successful AOT build); skipping verify"
+                        );
+                        code
+                    }
+                } else {
+                    code
+                }
+            }
+        }
+        #[cfg(feature = "aot")]
+        Some(Cmd::AotDoctor) => run_aot_doctor(),
+        #[cfg(feature = "aot")]
+        Some(Cmd::Check { file }) => run_check(&file, color),
     }
+}
+
+/// RC3 Phase 4 iter 4.5: AOT installation self-test.
+///
+/// Pipeline check matrix:
+///
+/// | Step                    | What goes wrong if this fails       |
+/// |-------------------------|-------------------------------------|
+/// | 1. parse                | cs-parse not in cs-cli's deps       |
+/// | 2. expand               | cs-expand not in cs-cli's deps      |
+/// | 3. compile              | cs-vm not in cs-cli's deps          |
+/// | 4. bytecode_to_rir_aot  | translator bug or RIR variant gap   |
+/// | 5. emit_project         | cs-aot Inst-coverage gap            |
+/// | 6. resolve cs-vm dep    | path = unreachable from this binary |
+/// | 7. cargo build          | rust toolchain / cargo install      |
+/// | 8. run + verify         | NB ABI / runtime helper mismatch    |
+///
+/// Prints each step's result; exits 0 if all pass.
+#[cfg(feature = "aot")]
+fn run_aot_doctor() -> ExitCode {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use cs_aot::project::{emit_project, ProjectOptions};
+    use cs_aot::EmitMode;
+    use cs_core::SymbolTable;
+    use cs_expand::Expander;
+    use cs_parse::read_all;
+    use cs_vm::compiler::PrimOp;
+    use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir_aot};
+
+    println!("crabscheme aot-doctor: self-test");
+    println!();
+
+    let src = "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))";
+    let mut step = 0;
+    let mut report = |label: &str, ok: bool, detail: &str| {
+        step += 1;
+        let badge = if ok { "  OK  " } else { " FAIL " };
+        println!(
+            "[{badge}] step {step}: {label}{}",
+            if detail.is_empty() {
+                "".to_string()
+            } else {
+                format!(" — {detail}")
+            }
+        );
+    };
+    let bail = |msg: &str| -> ExitCode {
+        eprintln!("\ncrabscheme aot-doctor: failed: {msg}");
+        ExitCode::from(1)
+    };
+
+    // ---- Steps 1-3: source → bytecode -----
+    let mut sources = SourceMap::new();
+    let file_id = sources.add("<doctor>", src);
+    let mut syms = SymbolTable::new();
+    let data = match read_all(file_id, src, &mut syms) {
+        Ok(d) => {
+            report("parse", true, &format!("{} datum(s)", d.len()));
+            d
+        }
+        Err(e) => {
+            report("parse", false, &e[0].message());
+            return bail("parse failed");
+        }
+    };
+
+    let mut macros = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = match expander.expand_program(&data) {
+        Ok(c) => {
+            report("expand", true, "");
+            c
+        }
+        Err(e) => {
+            let m = e.message().to_string();
+            report("expand", false, &m);
+            return bail("expand failed");
+        }
+    };
+    drop(expander);
+
+    let globals = HashMap::new();
+    let primops = {
+        let mut m = HashMap::new();
+        for (op, kind) in &[
+            ("+", PrimOp::Add),
+            ("-", PrimOp::Sub),
+            ("*", PrimOp::Mul),
+            ("=", PrimOp::Eq),
+            ("<", PrimOp::Lt),
+        ] {
+            m.insert(syms.intern(op), *kind);
+        }
+        m
+    };
+    let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
+        Ok(b) => {
+            report(
+                "compile",
+                true,
+                &format!(
+                    "{} top-level inst(s), {} lambda(s)",
+                    bc_inst_count(&b),
+                    b.lambdas.len()
+                ),
+            );
+            b
+        }
+        Err(e) => {
+            report("compile", false, &e.message);
+            return bail("compile failed");
+        }
+    };
+
+    // ---- Step 4: bytecode → RIR -----
+    let fact_sym = syms.intern("fact");
+    let lam = match bc.lambdas.first() {
+        Some(l) => l,
+        None => {
+            report("bytecode_to_rir", false, "no lambdas in bytecode");
+            return bail("no lambdas — compile may have folded fact away");
+        }
+    };
+    let rir = match bytecode_to_rir_aot(lam, "fact", Some(fact_sym)) {
+        Ok(r) => {
+            report(
+                "bytecode_to_rir_aot",
+                true,
+                &format!("{} block(s)", r.blocks.len()),
+            );
+            r
+        }
+        Err(e) => {
+            report("bytecode_to_rir_aot", false, &format!("{e:?}"));
+            return bail("bytecode→RIR failed");
+        }
+    };
+
+    // ---- Step 5: emit_project -----
+    let cs_vm_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .join("cs-vm");
+    let cs_vm_present = cs_vm_path.exists();
+    report(
+        "resolve cs-vm dep",
+        cs_vm_present,
+        &cs_vm_path.display().to_string(),
+    );
+    if !cs_vm_present {
+        return bail(
+            "cs-vm not at the expected dev-tree path — release-installed binaries can't AOT yet (Phase 1.3 crates.io publish addresses this)",
+        );
+    }
+
+    let tmpdir = std::env::temp_dir().join(format!("crabscheme-aot-doctor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmpdir);
+    let opts = ProjectOptions {
+        mode: EmitMode::Nb,
+        package_name: "doctor_fact".to_string(),
+        entry_fn_name: "fact".to_string(),
+        cs_vm_dep: None,
+        cs_vm_path: Some(cs_vm_path),
+        multi_procedure: false,
+    };
+    let emitted = match emit_project(&[rir], &tmpdir, &opts) {
+        Ok(e) => {
+            report("emit_project", true, &e.project_dir.display().to_string());
+            e
+        }
+        Err(e) => {
+            report("emit_project", false, &format!("{e}"));
+            return bail("project emit failed");
+        }
+    };
+
+    // ---- Step 7: cargo build ------
+    println!("  ...running cargo build --release (may take ~10s on a cold cache)...");
+    let build_status = Command::new("cargo")
+        .current_dir(&emitted.project_dir)
+        .arg("build")
+        .arg("--release")
+        .status();
+    match build_status {
+        Ok(s) if s.success() => report("cargo build --release", true, ""),
+        Ok(s) => {
+            report("cargo build --release", false, &format!("exit {s}"));
+            return bail("cargo build failed — is the rust toolchain installed?");
+        }
+        Err(e) => {
+            report("cargo build --release", false, &format!("spawn: {e}"));
+            return bail("cargo not on PATH");
+        }
+    }
+
+    // ---- Step 8: run + verify ------
+    let bin = &emitted.built_binary_path;
+    let out = match Command::new(bin).arg("5").output() {
+        Ok(o) => o,
+        Err(e) => {
+            report("run AOT binary", false, &format!("spawn: {e}"));
+            return bail("binary couldn't be spawned");
+        }
+    };
+    if !out.status.success() {
+        report("run AOT binary", false, &format!("exit {}", out.status));
+        return bail("binary exited non-zero");
+    }
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let want = "120";
+    if got == want {
+        report("verify fact(5) = 120", true, "");
+    } else {
+        report("verify fact(5) = 120", false, &format!("got {got:?}"));
+        return bail("AOT binary returned wrong result — silent codegen bug");
+    }
+
+    println!();
+    println!("crabscheme aot-doctor: all checks passed.");
+    println!("  AOT-compiled binary at: {}", bin.display());
+    ExitCode::SUCCESS
+}
+
+#[cfg(feature = "aot")]
+fn bc_inst_count(bc: &cs_vm::opcode::Bytecode) -> usize {
+    bc.insts.len()
 }
 
 #[cfg(feature = "aot")]
@@ -143,6 +486,7 @@ fn run_aot(
     build: bool,
     emit_rir: bool,
     emit_rust_source: bool,
+    target: Option<&str>,
 ) -> ExitCode {
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -281,7 +625,7 @@ fn run_aot(
     };
 
     // --- Translate to RIR ----
-    let rir = match bytecode_to_rir_aot(&lam, &entry_name, Some(entry_sym)) {
+    let mut rir = match bytecode_to_rir_aot(&lam, &entry_name, Some(entry_sym)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("crabscheme aot: bytecode→RIR error: {e:?}");
@@ -293,6 +637,13 @@ fn run_aot(
             return ExitCode::from(3);
         }
     };
+    // RC3 iter 2.2 Step 1 — record the source lambda index for
+    // cs-aot's MakeClosure resolver. For single-entry mode we
+    // also annotate so any nested MakeClosure inside the entry
+    // can reference itself (degenerate, but consistent).
+    if let Some(idx) = lambda_index_for(&bc, entry_sym) {
+        rir.lambda_index = Some(idx);
+    }
 
     // RC2 iter R: --emit-rir dumps the post-translate RIR to stdout
     // before emission. Useful when an UnsupportedInst surfaces:
@@ -347,7 +698,9 @@ fn run_aot(
         mode: EmitMode::Nb,
         package_name: pkg_name.clone(),
         entry_fn_name: entry_name.clone(),
+        cs_vm_dep: None, // fall through to legacy cs_vm_path
         cs_vm_path: Some(cs_vm_path),
+        multi_procedure: false,
     };
 
     let emitted = match emit_project(&[rir], &out_dir, &opts) {
@@ -390,19 +743,57 @@ fn run_aot(
         return ExitCode::SUCCESS;
     }
 
-    println!("  building (cargo build --release)...");
-    let status = Command::new("cargo")
-        .current_dir(&emitted.project_dir)
+    // RC3 iter 6.4: --target cross-compile. Builds with
+    // `cargo build --release --target=<triple>` so the output
+    // lives at `target/<triple>/release/<pkg>` instead of
+    // `target/release/<pkg>`.
+    let target_blurb = if let Some(t) = target {
+        format!(" --target={t}")
+    } else {
+        String::new()
+    };
+    println!("  building (cargo build --release{target_blurb})...");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&emitted.project_dir)
         .arg("build")
-        .arg("--release")
-        .status();
+        .arg("--release");
+    if let Some(t) = target {
+        cmd.arg(format!("--target={t}"));
+    }
+    let status = cmd.status();
     match status {
         Ok(s) if s.success() => {
-            println!("  built: {}", emitted.built_binary_path.display());
+            // Re-derive the binary path: cargo's output dir gets
+            // the target triple inserted when --target is set.
+            // WASM targets (`wasm32-*`) produce a `.wasm` extension
+            // cargo doesn't include on the file-name we stored.
+            let bin_dir = if let Some(t) = target {
+                emitted.project_dir.join("target").join(t).join("release")
+            } else {
+                emitted.project_dir.join("target").join("release")
+            };
+            let base_name = emitted.built_binary_path.file_name().unwrap();
+            let bin_path = if target.map(|t| t.starts_with("wasm32-")).unwrap_or(false) {
+                let mut p = bin_dir.join(base_name);
+                p.set_extension("wasm");
+                p
+            } else {
+                bin_dir.join(base_name)
+            };
+            println!("  built: {}", bin_path.display());
+            if target.map(|t| t.starts_with("wasm32-")).unwrap_or(false) {
+                println!("  usage: wasmtime run {} <args...>", bin_path.display());
+            }
             ExitCode::SUCCESS
         }
         Ok(s) => {
             eprintln!("crabscheme aot: cargo build failed (exit {})", s);
+            if target.is_some() {
+                eprintln!(
+                    "  hint: the target may need `rustup target add {}` before cross-compile works",
+                    target.unwrap()
+                );
+            }
             ExitCode::from(5)
         }
         Err(e) => {
@@ -419,6 +810,895 @@ fn basename_no_ext(path: &str) -> &str {
         .and_then(|s| s.to_str())
         .unwrap_or("aot");
     stem
+}
+
+/// RC3 Phase 4 iter 4.3: AOT compatibility survey for a Scheme
+/// source file. Lists every top-level `(define (name args) body)`
+/// the bytecode compiler emits and reports whether each one passes
+/// `bytecode_to_rir_aot` + `emit_with(Nb)` cleanly.
+///
+/// Doesn't emit a cargo project or build anything — just enumerates
+/// + probes. Useful for users debugging "why doesn't my program
+/// AOT" who want to know which entries are compatible before
+/// picking `--entry` and trying `--build`.
+#[cfg(feature = "aot")]
+fn run_aot_explain(file: &str) -> ExitCode {
+    use std::collections::HashMap;
+
+    use cs_aot::{emit_with, EmitMode};
+    use cs_core::SymbolTable;
+    use cs_expand::Expander;
+    use cs_parse::read_all;
+    use cs_vm::compiler::PrimOp;
+    use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir_aot};
+
+    let src = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("crabscheme aot --explain: cannot read {file}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut sources = SourceMap::new();
+    let file_id = sources.add(file, &src);
+    let mut syms = SymbolTable::new();
+    let data = match read_all(file_id, &src, &mut syms) {
+        Ok(d) => d,
+        Err(errs) => {
+            eprintln!(
+                "crabscheme aot --explain: parse error: {}",
+                errs[0].message()
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let mut macros = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = match expander.expand_program(&data) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("crabscheme aot --explain: expand error: {}", e.message());
+            return ExitCode::from(2);
+        }
+    };
+    drop(expander);
+    let globals = HashMap::new();
+    let primops = {
+        let mut m = HashMap::new();
+        for (op, kind) in &[
+            ("+", PrimOp::Add),
+            ("-", PrimOp::Sub),
+            ("*", PrimOp::Mul),
+            ("<", PrimOp::Lt),
+            ("<=", PrimOp::Le),
+            (">", PrimOp::Gt),
+            (">=", PrimOp::Ge),
+            ("=", PrimOp::Eq),
+        ] {
+            m.insert(syms.intern(op), *kind);
+        }
+        m
+    };
+    let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("crabscheme aot --explain: compile error: {}", e.message);
+            return ExitCode::from(2);
+        }
+    };
+
+    // Build the name → lambda-index map via MakeClosure+SetVar
+    // pairs (same scanner the run_aot uses for --entry resolution).
+    let mut entries: Vec<(String, usize)> = Vec::new();
+    for window in bc.insts.windows(2) {
+        if let (cs_vm::opcode::Inst::MakeClosure(idx), cs_vm::opcode::Inst::SetVar(sym)) =
+            (&window[0], &window[1])
+        {
+            entries.push((syms.name(*sym).to_string(), *idx));
+        }
+    }
+
+    println!("crabscheme aot --explain: {}", file);
+    println!("  {} top-level lambda(s)", entries.len());
+    println!();
+
+    if entries.is_empty() {
+        println!(
+            "  no top-level defines found — AOT requires at least one\n  \
+             (define (name args...) body) form in the source."
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let mut compatible: Vec<String> = Vec::new();
+    let mut incompatible: Vec<(String, String)> = Vec::new();
+
+    for (name, idx) in &entries {
+        let entry_sym = syms.intern(name);
+        let lam = &bc.lambdas[*idx];
+        let arity = lam.params.len();
+        match bytecode_to_rir_aot(lam, name.as_str(), Some(entry_sym)) {
+            Ok(rir) => match emit_with(EmitMode::Nb, &rir) {
+                Ok(_) => {
+                    println!(
+                        "  ✓ {name}  ({arity} param{}, RIR: {} block(s), {} inst(s))",
+                        if arity == 1 { "" } else { "s" },
+                        rir.blocks.len(),
+                        rir.blocks.iter().map(|b| b.insts.len()).sum::<usize>(),
+                    );
+                    compatible.push(name.clone());
+                }
+                Err(e) => {
+                    // Just the first line of the diagnostic — full
+                    // user-hint output would be too verbose for a
+                    // survey table.
+                    let summary = format!("{e}")
+                        .lines()
+                        .next()
+                        .unwrap_or("emit error")
+                        .to_string();
+                    println!("  ✗ {name}  ({arity} param) — {summary}");
+                    incompatible.push((name.clone(), summary));
+                }
+            },
+            Err(e) => {
+                let summary = format!("bytecode→RIR error: {e:?}");
+                println!("  ✗ {name}  ({arity} param) — {summary}");
+                incompatible.push((name.clone(), summary));
+            }
+        }
+    }
+
+    println!();
+    if !compatible.is_empty() {
+        println!("AOT-compatible entries ({}):", compatible.len());
+        for n in &compatible {
+            println!("  crabscheme aot {file} --entry {n} --build");
+        }
+    }
+    if !incompatible.is_empty() {
+        println!();
+        println!("Incompatible entries ({}):", incompatible.len());
+        for (n, reason) in &incompatible {
+            println!("  {n}: {reason}");
+        }
+        println!();
+        println!(
+            "See `docs/user/aot.md` for the supported-Inst table and rewrite\n\
+             suggestions per blocker."
+        );
+    }
+
+    if compatible.is_empty() {
+        ExitCode::from(3)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// RC3 Phase 6 iter 6.3: emit a multi-procedure AOT'd binary.
+///
+/// Reads the source, enumerates every top-level `(define (NAME args) body)`,
+/// tries `bytecode_to_rir_aot` + emit on each. Compatible entries become
+/// match arms in the emitted binary's dispatch shim; incompatible ones
+/// are warned at emit time and skipped.
+///
+/// Resulting binary takes `<fn> <args...>`:
+///
+///   $ ./mylib-aot/target/release/mylib square 5
+///   25
+///   $ ./mylib-aot/target/release/mylib cube 5
+///   125
+/// RC3 iter 2.16 — transitive capture propagation for AOT.
+///
+/// For each function F: if F's body contains `MakeClosure(I)` for
+/// inner lambda I, and I captures sym S, then F must ALSO capture
+/// S unless S is already in F's locals (params, EnvDefineLocal,
+/// self_binding_sym, or top-level globals). Iterates to a fixed
+/// point so multi-level lifting (nqueens's anon → place → nqueens)
+/// resolves correctly in one pass.
+///
+/// Mutates each function's `captures` field in place; the cs-aot
+/// emitter then picks up the new captures via its existing arms:
+/// the function header gets `__cap<sym>` for the new entry, the
+/// dispatch wrapper unpacks one more capture slot, and the parent's
+/// MakeClosure capture-gather provides a value.
+#[cfg(feature = "aot")]
+fn propagate_transitive_captures(
+    funcs: &mut [cs_rir::Function],
+    known_globals: &std::collections::HashSet<u32>,
+) {
+    use std::collections::{HashMap, HashSet};
+
+    // Build idx → position in funcs slice for fast lookup. funcs
+    // were translated in bytecode-lambda-index order so position ==
+    // lambda_index, but be defensive.
+    let mut by_idx: HashMap<usize, usize> = HashMap::new();
+    for (pos, f) in funcs.iter().enumerate() {
+        if let Some(idx) = f.lambda_index {
+            by_idx.insert(idx, pos);
+        }
+    }
+
+    // Snapshot each function's "locals" (the syms a capture-need
+    // can be satisfied by without becoming a transitive capture):
+    // - param_syms (function's positional args)
+    // - EnvDefineLocal syms (let-binding scans inside the body)
+    // - self_binding_sym (the function's own letrec/top-level name)
+    // - known_globals (top-level fns resolvable via by_name_sym)
+    let locals: Vec<HashSet<u32>> = funcs
+        .iter()
+        .map(|f| {
+            let mut set: HashSet<u32> = HashSet::new();
+            set.extend(f.param_syms.iter().copied());
+            if let Some(s) = f.self_binding_sym {
+                set.insert(s);
+            }
+            set.extend(known_globals.iter().copied());
+            for block in &f.blocks {
+                for inst in &block.insts {
+                    if let cs_rir::Inst::EnvDefineLocal(sym, _) = inst {
+                        set.insert(*sym);
+                    }
+                }
+            }
+            set
+        })
+        .collect();
+
+    // Fixed-point: propagate inner-lambda captures upward.
+    loop {
+        let mut changed = false;
+        // Collect all MakeClosure edges before mutating funcs (so
+        // we can read inner.captures without holding two borrows).
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for (parent_pos, f) in funcs.iter().enumerate() {
+            for block in &f.blocks {
+                for inst in &block.insts {
+                    if let cs_rir::Inst::MakeClosure(_, inner_idx) = inst {
+                        if let Some(&inner_pos) = by_idx.get(&(*inner_idx as usize)) {
+                            edges.push((parent_pos, inner_pos));
+                        }
+                    }
+                }
+            }
+        }
+        for (parent_pos, inner_pos) in edges {
+            // Snapshot the inner's captures so we don't hold a
+            // borrow across the mutating parent update.
+            let inner_caps: Vec<u32> = funcs[inner_pos].captures.clone();
+            for sym in inner_caps {
+                if locals[parent_pos].contains(&sym) {
+                    continue;
+                }
+                let parent = &mut funcs[parent_pos];
+                if !parent.captures.contains(&sym) {
+                    parent.captures.push(sym);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+#[cfg(feature = "aot")]
+/// Typer Phase 6.1: `crabscheme check FILE.scm`.
+///
+/// Runs parse → extract annotations → expand → checker.
+/// Prints type-error diagnostics via cs-diag's standard
+/// renderer (color-aware). Exit code:
+///   0 — clean (no type errors)
+///   1 — type errors found
+///   2 — parse / expand / I/O failure before checking
+#[cfg(feature = "aot")]
+fn run_check(file: &str, color: bool) -> ExitCode {
+    use std::collections::HashMap;
+
+    use cs_core::SymbolTable;
+    use cs_expand::Expander;
+    use cs_parse::read_all;
+
+    let src = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("crabscheme check: cannot read {file}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut sources = SourceMap::new();
+    let file_id = sources.add(file, &src);
+    let mut syms = SymbolTable::new();
+    let data = match read_all(file_id, &src, &mut syms) {
+        Ok(d) => d,
+        Err(errs) => {
+            for e in &errs {
+                eprintln!("crabscheme check: parse error: {}", e.message());
+            }
+            return ExitCode::from(2);
+        }
+    };
+    // Typer pre-pass: strip annotations + diagnostics for
+    // malformed ones (typer-bad-annotation).
+    let (data, table, ann_diags) = cs_typer::extract_annotations(&data, &mut syms);
+    let mut any_error = false;
+    for d in &ann_diags {
+        if matches!(d.severity, cs_diag::Severity::Error) {
+            any_error = true;
+        }
+        eprintln!("{}", render_diag(d, &sources, color));
+    }
+    let mut macros = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = match expander.expand_program(&data) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("crabscheme check: expand error: {}", e.message());
+            return ExitCode::from(2);
+        }
+    };
+    drop(expander);
+    // Type check. Untyped programs (table.is_empty()) get
+    // an empty error list — we still run the walker but
+    // every node falls through the unannotated path.
+    let mut checker = cs_typer::Checker::new(&table, &mut syms);
+    let type_errors = checker.check_program(&core);
+    for err in &type_errors {
+        any_error = true;
+        let diag = err.to_diagnostic();
+        eprintln!("{}", render_diag(&diag, &sources, color));
+    }
+    if any_error {
+        let count = type_errors.len()
+            + ann_diags
+                .iter()
+                .filter(|d| matches!(d.severity, cs_diag::Severity::Error))
+                .count();
+        eprintln!(
+            "crabscheme check: {} type error{} in {file}",
+            count,
+            if count == 1 { "" } else { "s" }
+        );
+        ExitCode::from(1)
+    } else {
+        eprintln!("crabscheme check: {file} ok");
+        ExitCode::SUCCESS
+    }
+}
+
+fn run_aot_multi(
+    file: &str,
+    output: Option<&str>,
+    build: bool,
+    typecheck: bool,
+    color: bool,
+) -> ExitCode {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use cs_aot::project::{emit_project, ProjectOptions};
+    use cs_aot::EmitMode;
+    use cs_core::SymbolTable;
+    use cs_expand::Expander;
+    use cs_parse::read_all;
+    use cs_vm::compile_with_globals_and_primops;
+    use cs_vm::compiler::PrimOp;
+
+    let src = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("crabscheme aot --multi: cannot read {file}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut sources = SourceMap::new();
+    let file_id = sources.add(file, &src);
+    let mut syms = SymbolTable::new();
+    let data = match read_all(file_id, &src, &mut syms) {
+        Ok(d) => d,
+        Err(errs) => {
+            eprintln!("crabscheme aot --multi: parse error: {}", errs[0].message());
+            return ExitCode::from(2);
+        }
+    };
+    // Phase 5.3: extract user annotations BEFORE expansion so
+    // cs-expand never sees `[x : T]` markers, then later in
+    // this function consult the typer's hint table to seed
+    // per-lambda `param_type_hints`. Annotation diagnostics
+    // print as warnings but don't block AOT; full Checker
+    // validation is iter 6.2 territory.
+    let (data, typer_table, typer_diags) = cs_typer::extract_annotations(&data, &mut syms);
+    for d in &typer_diags {
+        eprintln!(
+            "crabscheme aot --multi: typer warning: {} ({:?})",
+            d.message, d.severity
+        );
+    }
+    let mut typer_hints = cs_typer::hints_by_name(&typer_table);
+    let mut macros = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = match expander.expand_program(&data) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("crabscheme aot --multi: expand error: {}", e.message());
+            return ExitCode::from(2);
+        }
+    };
+    drop(expander);
+    // Always run the Checker so inner-let named-loop bodies
+    // pick up inferred Flonum/Fixnum hints from their body's
+    // initial call. `--typecheck` additionally surfaces the
+    // diagnostics and fail-fasts on any type error; without it,
+    // we run the Checker silently for its side effect on
+    // `inferred_param_hints`.
+    let mut checker = cs_typer::Checker::new(&typer_table, &mut syms);
+    let type_errors = checker.check_program(&core);
+    // Merge typer-inferred hints (from named-let bodies etc.)
+    // with the by-name ascription map. Inferred hints win on
+    // collision since they reflect actual call-site shapes
+    // (relevant when a binding name shadows a top-level
+    // ascription, which shouldn't normally happen but is
+    // harmless to handle).
+    for (name, hints) in checker.inferred_hints_by_name() {
+        typer_hints.insert(name, hints);
+    }
+    if typecheck {
+        let ann_errors = typer_diags
+            .iter()
+            .filter(|d| matches!(d.severity, cs_diag::Severity::Error))
+            .count();
+        for err in &type_errors {
+            let diag = err.to_diagnostic();
+            eprintln!("{}", render_diag(&diag, &sources, color));
+        }
+        let total = ann_errors + type_errors.len();
+        if total > 0 {
+            eprintln!(
+                "crabscheme aot --multi: --typecheck failed: {} type error{} in {file}",
+                total,
+                if total == 1 { "" } else { "s" }
+            );
+            return ExitCode::from(1);
+        }
+    }
+    // RC3 iter 2.14 — populate globals from the runtime's builtins so
+    // the compiler folds (/ a b), (display x), (not p), etc. to
+    // Const(Procedure). Without this they'd compile to LoadVar which
+    // becomes an EnvLookup → unresolved capture in AOT.
+    let rt_globals = cs_runtime::Runtime::new().builtin_procs_by_name();
+    let mut globals: HashMap<cs_core::Symbol, cs_core::Value> = HashMap::new();
+    for (name, val) in rt_globals {
+        let sym = syms.intern(&name);
+        globals.insert(sym, val);
+    }
+    let primops = {
+        let mut m = HashMap::new();
+        for (op, kind) in &[
+            ("+", PrimOp::Add),
+            ("-", PrimOp::Sub),
+            ("*", PrimOp::Mul),
+            ("<", PrimOp::Lt),
+            ("<=", PrimOp::Le),
+            (">", PrimOp::Gt),
+            (">=", PrimOp::Ge),
+            ("=", PrimOp::Eq),
+        ] {
+            m.insert(syms.intern(op), *kind);
+        }
+        m
+    };
+    let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("crabscheme aot --multi: compile error: {}", e.message);
+            return ExitCode::from(2);
+        }
+    };
+
+    // RC3 iter 2.2 Step 5: enumerate ALL lambdas in bc.lambdas
+    // (not just SetVar-bound ones) so that nested anonymous
+    // lambdas referenced via `Inst::MakeClosure(_, idx)` from
+    // other functions can be resolved by cs-aot's LambdaResolver.
+    //
+    // Named lambdas (those with MakeClosure+SetVar pairs) get
+    // their original name from the SetVar sym. Anonymous lambdas
+    // get a synthetic name `__aot_lambda_<idx>` so they have a
+    // stable Rust identifier for emission.
+    let mut name_by_idx: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
+    let mut sym_by_idx: std::collections::HashMap<usize, cs_core::Symbol> =
+        std::collections::HashMap::new();
+    // RC3 iter 2.9 — self-name detection for letrec / named-let-
+    // bound inner lambdas. Scan EVERY lambda's body (not just the
+    // top-level insts) for MakeClosure(idx)+SetVar(sym) and
+    // MakeClosure(idx)+DefineLocal(sym) patterns. The first gives
+    // top-level (define) names; the second gives letrec / named-let
+    // (DefineLocal) names. Passing the right self_sym to the
+    // translator lets CallSelf detection kick in on the inner
+    // lambda's recursive calls, avoiding the chicken-and-egg
+    // "lambda captures itself" problem in MakeClosure.
+    let scan_pairs = |insts: &[cs_vm::opcode::Inst]| -> Vec<(usize, cs_core::Symbol)> {
+        let mut pairs = Vec::new();
+        for window in insts.windows(2) {
+            if let cs_vm::opcode::Inst::MakeClosure(idx) = &window[0] {
+                if let cs_vm::opcode::Inst::SetVar(sym)
+                | cs_vm::opcode::Inst::DefineGlobal(sym)
+                | cs_vm::opcode::Inst::DefineLocal(sym) = &window[1]
+                {
+                    pairs.push((*idx, *sym));
+                }
+            }
+        }
+        pairs
+    };
+    for (idx, sym) in scan_pairs(&bc.insts) {
+        name_by_idx.insert(idx, syms.name(sym).to_string());
+        sym_by_idx.insert(idx, sym);
+    }
+    for lam in bc.lambdas.iter() {
+        for (idx, sym) in scan_pairs(&lam.body) {
+            name_by_idx
+                .entry(idx)
+                .or_insert_with(|| syms.name(sym).to_string());
+            sym_by_idx.entry(idx).or_insert(sym);
+        }
+    }
+    // RC3 iter 2.15 — disambiguate name collisions. Multiple
+    // letrec / named-let inner lambdas can share a binding name
+    // (`loop` is the canonical case — alloc-stress has two of
+    // them in different scopes). The bytecode-lambda-index is
+    // globally unique so suffix it onto duplicates: first
+    // occurrence keeps the bare name (for the common case);
+    // duplicates become `loop_2`, `loop_3`, etc.
+    {
+        let mut name_to_first_idx: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let entries: Vec<(usize, String)> =
+            name_by_idx.iter().map(|(i, n)| (*i, n.clone())).collect();
+        for (idx, name) in entries {
+            match name_to_first_idx.get(&name) {
+                None => {
+                    name_to_first_idx.insert(name.clone(), idx);
+                }
+                Some(&first) if first == idx => {}
+                Some(_) => {
+                    name_by_idx.insert(idx, format!("{name}_{idx}"));
+                }
+            }
+        }
+    }
+    // RC3 iter 2.7 — known-globals set so the translator excludes
+    // top-level AOT'd function names from the captures list.
+    // Surviving EnvLookups of these syms then resolve through the
+    // emitter's by_name_sym table to direct
+    // `vm_alloc_aot_procedure` calls (cross-procedure references).
+    //
+    // RC3 iter 2.9: only TOP-LEVEL syms (those from bc.insts) belong
+    // here — letrec/named-let bindings are local and need their
+    // EnvDefineLocal-driven Value resolution, not a top-level lookup.
+    let top_level_syms: std::collections::HashSet<u32> = {
+        let mut s = std::collections::HashSet::new();
+        for (idx, sym) in scan_pairs(&bc.insts) {
+            let _ = idx;
+            s.insert(sym.0);
+        }
+        s
+    };
+    let known_globals: std::collections::HashSet<u32> = top_level_syms;
+    let mut compatible_funcs: Vec<cs_rir::Function> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    for (idx, lam) in bc.lambdas.iter().enumerate() {
+        // RC3 iter 2.15 — self_sym must be the ORIGINAL Scheme sym
+        // (from sym_by_idx), NOT syms.intern(name). When the
+        // disambiguator suffixes a collision (e.g., the second
+        // `loop` becomes `loop_42`), `syms.intern("loop_42")` would
+        // create a fresh sym that doesn't match the lambda's body's
+        // EnvLookup(loop_sym) → the CallSelf detection misses and
+        // `loop` becomes a capture.
+        let (name, self_sym) = match name_by_idx.get(&idx) {
+            Some(n) => (n.clone(), sym_by_idx.get(&idx).copied()),
+            None => (format!("__aot_lambda_{idx}"), None),
+        };
+        // Phase 5.3: consume typer-derived hints when the user
+        // annotated the function. Lookup by the lambda's bound
+        // symbol (which the MakeClosure+SetVar scan above
+        // populated). Annotated params override the safe Any
+        // default, recovering the JIT/AOT specialization the
+        // iter 2.15/2.16 generalization gave up.
+        //
+        // The typer's hint Vec length matches the user's
+        // declared `param_types.len()` from the annotation; we
+        // pad or truncate to `lam.params.len()` so call sites
+        // never get a mismatched-length slice. Padded slots use
+        // Any (same gradual default as the RC3 fallback).
+        let computed_hints: Vec<cs_rir::Type> = self_sym
+            .and_then(|s| typer_hints.get(&s))
+            .map(|h| {
+                let mut v: Vec<cs_rir::Type> = h.clone();
+                v.resize(lam.params.len(), cs_rir::Type::Any);
+                v
+            })
+            .unwrap_or_else(|| vec![cs_rir::Type::Any; lam.params.len()]);
+        let hints: Option<&[cs_rir::Type]> = Some(&computed_hints);
+        match cs_vm::jit_translate::bytecode_to_rir_aot_with_param_types(
+            lam,
+            name.as_str(),
+            self_sym,
+            Some(&known_globals),
+            hints,
+        ) {
+            Ok(mut rir) => {
+                // RC3 iter 2.2 Step 1 — annotate the RIR with its
+                // source lambda index so cs-aot's MakeClosure
+                // resolver can find this function by index.
+                rir.lambda_index = Some(idx);
+                // RC3 iter 2.7 — TOP-LEVEL binding sym so
+                // cross-procedure references through the resolver's
+                // by_name_sym table can find this function. Letrec /
+                // named-let inner-lambda bindings are intentionally
+                // excluded (they shouldn't be resolvable cross-fn).
+                rir.name_sym = if known_globals.contains(&sym_by_idx.get(&idx).map_or(0, |s| s.0)) {
+                    sym_by_idx.get(&idx).map(|s| s.0)
+                } else {
+                    None
+                };
+                // RC3 iter 2.12 — ALL binding syms (top-level OR
+                // letrec / named-let). When this fn's body emits a
+                // MakeClosure for an inner lambda whose captures
+                // include THIS fn's own binding sym, the capture-
+                // gather emits `__self_handle` (forward self-ref).
+                rir.self_binding_sym = sym_by_idx.get(&idx).map(|s| s.0);
+                compatible_funcs.push(rir);
+            }
+            Err(e) => skipped.push((name, format!("{e:?}"))),
+        }
+    }
+
+    if compatible_funcs.is_empty() {
+        eprintln!("crabscheme aot --multi: no AOT-compatible top-level lambdas in {file}");
+        if !skipped.is_empty() {
+            eprintln!("  skipped entries:");
+            for (n, r) in &skipped {
+                eprintln!("    {n}: {r}");
+            }
+        }
+        return ExitCode::from(3);
+    }
+    // RC3 iter 2.16 — transitive capture propagation. If function F
+    // contains MakeClosure(I) for inner lambda I, and I captures sym
+    // S, then F must ALSO capture S (so F can pass S as a value to
+    // I's vm_alloc_aot_procedure_with_captures call). Without this,
+    // the cs-aot capture-gather hits an "unresolved capture" error
+    // when S isn't in F's own scope.
+    //
+    // Example: nqueens's `(let loop ((p placed)) ...)` lambda. Inner
+    // let-body lambda captures col, row from safe?'s scope. loop
+    // MakeClosures the inner-let-body but doesn't itself reference
+    // col/row directly — so record_captures missed them for loop.
+    // Iter 2.16 closes this with a fixed-point analysis: for each
+    // lambda, walk its body for MakeClosure(I); for each capture
+    // sym of I that isn't in F's locals/params/self/by_name_sym/
+    // top-level globals, add it to F's captures.
+    propagate_transitive_captures(&mut compatible_funcs, &known_globals);
+    // Always report what got skipped so downstream MakeClosure
+    // failures (which surface as "MakeClosure not yet supported" in
+    // the resolver-miss case) can be traced back to their cause.
+    if !skipped.is_empty() {
+        eprintln!(
+            "crabscheme aot --multi: {} lambda(s) skipped during translation; downstream MakeClosure of these will fail:",
+            skipped.len()
+        );
+        for (n, r) in &skipped {
+            eprintln!("    {n}: {r}");
+        }
+    }
+
+    let basename = basename_no_ext(file).to_string();
+    let out_dir = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{basename}-aot")));
+    let cs_vm_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .join("cs-vm");
+    let pkg_name = sanitize_pkg_name(&basename);
+
+    let opts = ProjectOptions {
+        mode: EmitMode::Nb,
+        package_name: pkg_name.clone(),
+        // entry_fn_name is unused in multi mode but still required.
+        entry_fn_name: compatible_funcs[0].name.clone(),
+        cs_vm_dep: None,
+        cs_vm_path: Some(cs_vm_path),
+        multi_procedure: true,
+    };
+
+    let emitted = match emit_project(&compatible_funcs, &out_dir, &opts) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("crabscheme aot --multi: project emit error: {e}");
+            return ExitCode::from(4);
+        }
+    };
+
+    println!(
+        "crabscheme aot --multi: emitted project at {} with {} entr{}",
+        emitted.project_dir.display(),
+        compatible_funcs.len(),
+        if compatible_funcs.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+    );
+    println!(
+        "  entries: {}",
+        compatible_funcs
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if !skipped.is_empty() {
+        println!(
+            "  skipped {} incompatible entr{}:",
+            skipped.len(),
+            if skipped.len() == 1 { "y" } else { "ies" }
+        );
+        for (n, r) in &skipped {
+            // First line of the diagnostic only — keeps the CLI output tidy.
+            let summary = r.lines().next().unwrap_or(r);
+            println!("    {n}: {summary}");
+        }
+    }
+
+    if !build {
+        println!("  (re-run with --build to invoke `cargo build --release`)");
+        return ExitCode::SUCCESS;
+    }
+
+    println!("  building (cargo build --release)...");
+    let status = Command::new("cargo")
+        .current_dir(&emitted.project_dir)
+        .arg("build")
+        .arg("--release")
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("  built: {}", emitted.built_binary_path.display());
+            println!(
+                "  usage: {} <fn> <args...>",
+                emitted.built_binary_path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(s) => {
+            eprintln!("crabscheme aot --multi: cargo build failed (exit {s})");
+            ExitCode::from(5)
+        }
+        Err(e) => {
+            eprintln!("crabscheme aot --multi: cargo not found / failed to spawn: {e}");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// RC3 Phase 6 iter 6.6: AOT-vs-JIT cross-check.
+///
+/// After a successful `crabscheme aot ... --build`, this helper
+/// runs both the AOT'd binary AND the JIT tier on the same sample
+/// args and asserts the outputs match. Mismatch = silent codegen
+/// regression; the diff harness in `tests/diff_aot_vs_jit.rs` uses
+/// the same pattern as test coverage.
+///
+/// The caller has already AOT-built the project at `<basename>-aot/`
+/// (or the user's `-o` dir). We re-derive the binary path, run it,
+/// then re-run via cs_runtime + JIT for the same `(entry args)`
+/// invocation. On mismatch, print both outputs + exit non-zero.
+#[cfg(feature = "aot")]
+fn run_aot_verify(
+    file: &str,
+    entry: Option<&str>,
+    output: Option<&str>,
+    sample_args: &[&str],
+) -> ExitCode {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    // 1. Resolve the entry name + binary path the same way run_aot did.
+    let entry_name = entry.unwrap_or_else(|| basename_no_ext(file)).to_string();
+    let pkg_name = sanitize_pkg_name(&entry_name);
+    let out_dir = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{}-aot", basename_no_ext(file))));
+    let bin_path = out_dir.join("target/release").join(&pkg_name);
+    if !bin_path.exists() {
+        eprintln!(
+            "crabscheme aot --verify: AOT binary not found at {} (did --build succeed?)",
+            bin_path.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    // 2. Run AOT binary with sample args.
+    let aot_out = Command::new(&bin_path)
+        .args(sample_args)
+        .output()
+        .expect("AOT binary executes");
+    if !aot_out.status.success() {
+        eprintln!(
+            "crabscheme aot --verify: AOT binary exited non-zero ({})",
+            aot_out.status
+        );
+        return ExitCode::from(2);
+    }
+    let aot_stdout = String::from_utf8_lossy(&aot_out.stdout).trim().to_string();
+
+    // 3. Run the same call through cs_runtime + JIT.
+    let src = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("crabscheme aot --verify: cannot re-read {file}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut rt = Runtime::new();
+    #[cfg(feature = "jit")]
+    if let Err(e) = rt.install_jit() {
+        eprintln!("crabscheme aot --verify: failed to install JIT: {e}");
+        return ExitCode::from(1);
+    }
+    if let Err(diag) = rt.eval_str_via_vm(file, &src) {
+        eprintln!(
+            "crabscheme aot --verify: JIT-tier eval failed on source: {}",
+            diag.message
+        );
+        return ExitCode::from(1);
+    }
+    let call_expr = format!("({entry_name} {})", sample_args.join(" "));
+    let v = match rt.eval_str_via_vm("<verify-call>", &call_expr) {
+        Ok(v) => v,
+        Err(diag) => {
+            eprintln!(
+                "crabscheme aot --verify: JIT-tier call `{call_expr}` failed: {}",
+                diag.message
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let jit_stdout = match &v {
+        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => n.to_string(),
+        // AOT today only returns Fixnums via the Nb shim; other Value
+        // variants would indicate a contract mismatch with AOT's
+        // emitted main shim.
+        other => {
+            eprintln!(
+                "crabscheme aot --verify: JIT-tier returned non-Fixnum Value: {other:?} \
+                 (AOT can only verify Fixnum-returning entries today)"
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    // 4. Compare.
+    if aot_stdout == jit_stdout {
+        println!(
+            "crabscheme aot --verify: OK — AOT and JIT agree on `({entry_name} {}): {jit_stdout}`",
+            sample_args.join(" ")
+        );
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "crabscheme aot --verify: MISMATCH on `({entry_name} {})`:\n  AOT: {aot_stdout:?}\n  JIT: {jit_stdout:?}\n\nThis indicates a codegen bug; please file an issue with the source + sample args.",
+            sample_args.join(" ")
+        );
+        ExitCode::from(6)
+    }
 }
 
 /// Walk top-level bytecode for `MakeClosure(i) + SetVar(sym)` pairs
@@ -570,6 +1850,65 @@ fn run_file(
     }
 }
 
+/// Typer Phase 6.3: REPL annotation support.
+///
+/// Parses the REPL input through a throw-away SymbolTable,
+/// runs `extract_annotations`, and:
+///   - returns `None` if no annotations are present (so the
+///     caller short-circuits and feeds the original text to
+///     eval, no double-parse needed downstream),
+///   - otherwise runs the Checker, prints diagnostics to
+///     stderr, and returns the stringified stripped Datums
+///     (which cs-expand can consume without choking on the
+///     `:` markers).
+///
+/// Returns `None` on any parse error too — let the regular
+/// eval path report it through cs-runtime's own diagnostic
+/// machinery, so we don't double-print.
+#[cfg(feature = "aot")]
+fn typecheck_repl_input(src: &str, name: &str, color: bool) -> Option<String> {
+    use std::collections::HashMap;
+
+    use cs_core::SymbolTable;
+    use cs_expand::Expander;
+    use cs_parse::read_all;
+
+    let mut sources = SourceMap::new();
+    let file_id = sources.add(name, src);
+    let mut syms = SymbolTable::new();
+    let data = read_all(file_id, src, &mut syms).ok()?;
+    let (stripped, table, ann_diags) = cs_typer::extract_annotations(&data, &mut syms);
+    if table.is_empty() && ann_diags.is_empty() {
+        // Untyped input — pass-through.
+        return None;
+    }
+    for d in &ann_diags {
+        eprintln!("{}", render_diag(d, &sources, color));
+    }
+    // Run the checker on the expanded form. Errors only print
+    // diagnostics; we still eval (so the user can iterate on
+    // a partially-typechecked snippet). A future flag could
+    // gate eval on a clean check.
+    let mut macros: HashMap<cs_core::Symbol, cs_expand::Macro> = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = expander.expand_program(&stripped).ok()?;
+    drop(expander);
+    let mut checker = cs_typer::Checker::new(&table, &mut syms);
+    let type_errors = checker.check_program(&core);
+    for err in &type_errors {
+        let diag = err.to_diagnostic();
+        eprintln!("{}", render_diag(&diag, &sources, color));
+    }
+    // Stringify stripped Datums via `format_with` so cs-expand
+    // (called inside rt.eval_str) sees a clean form.
+    let mut out = String::new();
+    for d in &stripped {
+        out.push_str(&d.format_with(&syms));
+        out.push('\n');
+    }
+    Some(out)
+}
+
 fn run_repl(start_via_vm: bool, color: bool) -> ExitCode {
     let mut rt = Runtime::new();
     let mut counter: u32 = 0;
@@ -613,7 +1952,20 @@ fn run_repl(start_via_vm: bool, color: bool) -> ExitCode {
         }
         counter += 1;
         let name = format!("<repl:{}>", counter);
-        let to_eval = std::mem::take(&mut buffer);
+        let mut to_eval = std::mem::take(&mut buffer);
+        // Phase 6.3: typer pre-pass for annotated REPL input.
+        // We parse once with a throw-away SymbolTable, run
+        // extract_annotations, and only if annotations are
+        // present do we (a) run the Checker and surface
+        // diagnostics, (b) replace `to_eval` with the
+        // stringified stripped form so cs-expand never sees
+        // `[x : T]` markers. Untyped input is left untouched
+        // and the parse is "wasted" — a fine tradeoff for an
+        // interactive REPL.
+        #[cfg(feature = "aot")]
+        {
+            to_eval = typecheck_repl_input(&to_eval, &name, color).unwrap_or(to_eval);
+        }
         let result = if via_vm {
             rt.eval_str_via_vm(&name, &to_eval)
         } else {

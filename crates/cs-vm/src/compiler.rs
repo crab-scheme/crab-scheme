@@ -406,6 +406,39 @@ fn compile_expr(
                     }
                 }
             }
+            // RC3 iter 2.10 — N-arg (N≥3) variadic primops where the
+            // op is left-fold safe: Add/Sub/Mul/Div. Lower as a chain
+            // of binary primops:
+            //   (* a b c d) → ((a * b) * c) * d
+            // This keeps AOT clean (no EnvLookup-of-primop → capture
+            // chain) without changing JIT behavior — both paths see
+            // the same specialized opcodes in the same order. The
+            // comparison primops (Lt/Le/Gt/Ge/Eq) are NOT lowered
+            // here because their N-arg semantics is "all adjacent
+            // pairs satisfy", not left-fold.
+            if args.len() >= 3 {
+                if let CoreExpr::Ref { name, .. } = &**func {
+                    if !is_locally_bound(scope, *name) {
+                        if let Some(op) = primops.get(name).copied() {
+                            let foldable = matches!(op, PrimOp::Add | PrimOp::Sub | PrimOp::Mul);
+                            if foldable {
+                                // Compile a, then for each subsequent
+                                // arg compile + emit the primop.
+                                compile_expr(
+                                    &args[0], out, lambdas, false, globals, primops, scope,
+                                )?;
+                                for rest in &args[1..] {
+                                    compile_expr(
+                                        rest, out, lambdas, false, globals, primops, scope,
+                                    )?;
+                                    out.push(primop_to_inst(op), *s);
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
             // Phase 5b iter9 — let* inlining at compile time.
             // Pattern: `((lambda (x) body) arg)` — produced by the
             // expander for `let*` (which rewrites to a nested chain

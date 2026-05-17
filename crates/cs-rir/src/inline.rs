@@ -551,15 +551,100 @@ pub fn for_each_value_in_inst<F: FnMut(&mut Value)>(inst: &mut Inst, mut f: F) {
         // 1 source + Type — DeoptCheck has no dst, just a guard on src.
         Inst::DeoptCheck(s, _t) => f(s),
 
-        // Any other Inst variant landing here means `analyze_for_inline`
-        // accepted a callee whose body the walker doesn't actually
-        // cover — a discipline mismatch between the analyzer's
-        // `is_inline_supported` set and this walker. The two must stay
-        // in lockstep; if you add a variant to one, add it to the other.
-        // Reaching this arm is a programmer error, not a runtime error.
+        // RC3 iter 2.14 — boolean negation, dst + 1 source.
+        Inst::NotBoolean(d, s) => {
+            f(d);
+            f(s);
+        }
+
+        // RC3 iter 2.14 — additional dst + 2 source arith / bit
+        // ops that surface from R6RS numeric tower programs (binary-
+        // trees, alloc-stress hit these). dst + 2 src shape.
+        Inst::ArithShift(d, a, b) | Inst::Expt(d, a, b) => {
+            f(d);
+            f(a);
+            f(b);
+        }
+        // dst + 1 source. Length is `(length pair)` — list length.
+        Inst::Length(d, s) => {
+            f(d);
+            f(s);
+        }
+        // RC3 iter 2.15 — AnyDrop has no dst, just a source.
+        // Emitted at function exit by the AOT translator when
+        // params are Any-typed (so the cloned Box on entry is
+        // freed before return).
+        Inst::AnyDrop(s) => f(s),
+
+        // RC3 iter 2.7 — the demote-pass now walks every surviving
+        // Inst (not just is_inline_supported ones) to rewrite operands
+        // via the alias map. The inliner's analyzer still uses
+        // is_inline_supported as its gate; the walker covers a strict
+        // superset so the demote pass doesn't crash on supported-by-
+        // cs-aot-but-not-the-inliner variants. Each arm below covers
+        // the Value operands of one such variant.
+        //
+        // ---- closure / call / env (post-demote survivors) ----
+        Inst::MakeClosure(d, _idx) => f(d),
+        Inst::Call(d, callee, args) | Inst::CallGeneral(d, callee, args) => {
+            f(d);
+            f(callee);
+            for a in args {
+                f(a);
+            }
+        }
+        Inst::CallSelf(d, args) => {
+            f(d);
+            for a in args {
+                f(a);
+            }
+        }
+        Inst::EnvLookup(d, _sym) | Inst::EnvLookupAny(d, _sym) => f(d),
+        Inst::EnvSet(_sym, v) => f(v),
+        Inst::EnvDefineLocal(_sym, v) => f(v),
+
+        // ---- vector / pair / type-predicate operands ----
+        Inst::VecAlloc(d, n, fill) => {
+            f(d);
+            f(n);
+            f(fill);
+        }
+        Inst::VecSet(d, v, idx, val) => {
+            f(d);
+            f(v);
+            f(idx);
+            f(val);
+        }
+        Inst::Cons(d, car_v, _car_tag, cdr_v, _cdr_tag) => {
+            f(d);
+            f(car_v);
+            f(cdr_v);
+        }
+        Inst::Car(d, p) | Inst::Cdr(d, p) => {
+            f(d);
+            f(p);
+        }
+        Inst::AnyClone(d, s)
+        | Inst::PairP(d, s)
+        | Inst::NullP(d, s)
+        | Inst::ProcedureP(d, s)
+        | Inst::SymbolP(d, s)
+        | Inst::FixnumP(d, s)
+        | Inst::FlonumP(d, s) => {
+            f(d);
+            f(s);
+        }
+
+        // Any other Inst variant landing here means a NEW Inst variant
+        // was added without extending this walker. The analyzer's
+        // `is_inline_supported` set was historically the discipline
+        // gate; today the demote pass relies on this walker covering
+        // all surviving Inst variants. If you add an Inst, add a match
+        // arm here that calls `f` on each Value operand.
         _ => unreachable!(
-            "for_each_value_in_inst: variant {} not in walker but accepted by analyzer",
-            inst_variant_name(inst)
+            "for_each_value_in_inst: variant {} not in walker — add an arm covering its Value operands. Full inst: {:?}",
+            inst_variant_name(inst),
+            inst
         ),
     }
 }
@@ -576,7 +661,12 @@ pub fn for_each_value_in_term<F: FnMut(&mut Value)>(term: &mut Term, mut f: F) {
                 f(a);
             }
         }
-        Term::Branch(cond, _then, _else) => f(cond),
+        Term::Branch(cond, _then, _else, args) => {
+            f(cond);
+            for a in args {
+                f(a);
+            }
+        }
     }
 }
 
@@ -587,7 +677,7 @@ pub fn for_each_block_in_term<F: FnMut(&mut BlockId)>(term: &mut Term, mut f: F)
     match term {
         Term::Return(_) => {}
         Term::Jump(b, _) => f(b),
-        Term::Branch(_, t, e) => {
+        Term::Branch(_, t, e, _) => {
             f(t);
             f(e);
         }
@@ -675,7 +765,7 @@ pub fn is_inline_supported(inst: &Inst) -> bool {
 pub fn is_term_inline_supported(term: &Term) -> bool {
     matches!(
         term,
-        Term::Return(_) | Term::Jump(_, _) | Term::Branch(_, _, _)
+        Term::Return(_) | Term::Jump(_, _) | Term::Branch(_, _, _, _)
     )
 }
 
@@ -723,7 +813,7 @@ fn term_variant_name(term: &Term) -> &'static str {
     match term {
         Term::Return(_) => "Return",
         Term::Jump(_, _) => "Jump",
-        Term::Branch(_, _, _) => "Branch",
+        Term::Branch(_, _, _, _) => "Branch",
     }
 }
 
@@ -925,7 +1015,7 @@ mod tests {
             id: BlockId(0),
             params: vec![],
             insts: vec![Inst::LoadConst(Value(1), Const::Fixnum(0))],
-            terminator: Term::Branch(Value(0), BlockId(1), BlockId(2)),
+            terminator: Term::Branch(Value(0), BlockId(1), BlockId(2), Vec::new()),
         });
         f.blocks.push(Block {
             id: BlockId(1),
@@ -970,7 +1060,7 @@ mod tests {
             id: BlockId(0),
             params: vec![],
             insts: vec![Inst::LoadConst(Value(1), Const::Fixnum(0))],
-            terminator: Term::Branch(Value(0), BlockId(1), BlockId(2)),
+            terminator: Term::Branch(Value(0), BlockId(1), BlockId(2), Vec::new()),
         });
         f.blocks.push(Block {
             id: BlockId(1),
@@ -1084,7 +1174,7 @@ mod tests {
 
     #[test]
     fn term_walker_visits_branch_cond() {
-        let mut term = Term::Branch(Value(42), BlockId(1), BlockId(2));
+        let mut term = Term::Branch(Value(42), BlockId(1), BlockId(2), Vec::new());
         let mut seen: Vec<u32> = Vec::new();
         for_each_value_in_term(&mut term, |v| seen.push(v.0));
         assert_eq!(seen, vec![42]); // blocks aren't Values
@@ -1092,7 +1182,7 @@ mod tests {
 
     #[test]
     fn term_walker_blocks_visits_branch_targets() {
-        let mut term = Term::Branch(Value(0), BlockId(3), BlockId(7));
+        let mut term = Term::Branch(Value(0), BlockId(3), BlockId(7), Vec::new());
         let mut seen: Vec<u32> = Vec::new();
         for_each_block_in_term(&mut term, |b| seen.push(b.0));
         assert_eq!(seen, vec![3, 7]);

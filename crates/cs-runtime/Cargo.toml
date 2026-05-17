@@ -43,6 +43,10 @@ cs-ffi = { workspace = true, optional = true }
 cs-gc = { workspace = true }
 cs-ir = { workspace = true }
 cs-lex = { workspace = true }
+# Phase 5.4: typer-derived param hints. cs-rir's `Type` is the
+# vocabulary the JIT translator consumes, so the Runtime needs
+# the alias to accept hints from external callers (cs-cli, etc.).
+cs-rir = { workspace = true }
 cs-parse = { workspace = true }
 cs-vm = { workspace = true }
 cs-jit = { workspace = true, optional = true }

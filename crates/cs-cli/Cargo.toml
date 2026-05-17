@@ -23,7 +23,7 @@ ffi-dynamic = ["cs-runtime/ffi-dynamic"]
 ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the
 # WASM build drops it (can't spawn cargo at WASI runtime).
-aot = ["dep:cs-aot", "dep:cs-vm", "dep:cs-parse", "dep:cs-expand"]
+aot = ["dep:cs-aot", "dep:cs-vm", "dep:cs-rir", "dep:cs-parse", "dep:cs-expand", "dep:cs-typer"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -37,6 +37,9 @@ cs-runtime = { workspace = true }
 # WASM/no-default-features minimal build slim.
 cs-aot = { workspace = true, optional = true }
 cs-vm = { workspace = true, optional = true }
+cs-rir = { workspace = true, optional = true }
 cs-parse = { workspace = true, optional = true }
 cs-expand = { workspace = true, optional = true }
+# Phase 5 — typer feeds param_type_hints into AOT.
+cs-typer = { workspace = true, optional = true }
 clap = { workspace = true }

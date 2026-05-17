@@ -32,7 +32,9 @@ use cs_expand::Expander;
 use cs_parse::read_all;
 use cs_vm::compile_with_globals_and_primops;
 use cs_vm::compiler::PrimOp;
-use cs_vm::jit_translate::bytecode_to_rir_aot;
+use cs_vm::jit_translate::{
+    bytecode_to_rir_aot, bytecode_to_rir_aot_with_globals, bytecode_to_rir_aot_with_param_types,
+};
 
 /// Mirrors cs_runtime's private primop_table. The compiler uses
 /// this to emit AddFx2/SubFx2/etc. specialized opcodes instead of
@@ -160,7 +162,9 @@ fn aot_compile_and_run(
         mode: EmitMode::Nb,
         package_name: format!("aot_src_{pkg_suffix}"),
         entry_fn_name: fn_name.to_string(),
+        cs_vm_dep: None,
         cs_vm_path: Some(cs_vm_workspace_path()),
+        multi_procedure: false,
     };
 
     let emitted = emit_project(&[rir], &tmpdir, &opts)
@@ -276,6 +280,35 @@ fn source_to_aot_function_with_let_binding() {
 }
 
 #[test]
+fn source_to_aot_function_with_let_then_branch() {
+    // RC3 Phase 2 iter 2.5 — multi-block demote. The `if`
+    // introduces multiple blocks; the `let` binding in the entry
+    // block needs to flow as an SSA alias into BOTH the then-
+    // and else- arms via the cross-block alias map.
+    //
+    // (define (h n)
+    //   (let ((doubled (* n 2)))
+    //     (if (< doubled 100)
+    //         doubled
+    //         (* doubled 2))))
+    //
+    // → h(n) = min(2n, 4n). Catches the multi-block alias
+    // propagation: the EnvLookupAny(doubled) reference inside
+    // each branch must resolve to the entry-block Mul's result.
+    let (lam, sym) = compile_source_to_lambda(
+        "(define (h n) (let ((doubled (* n 2))) (if (< doubled 100) doubled (* doubled 2))))",
+        "h",
+    );
+    let bin = aot_compile_and_run(lam, sym, "h", "let_then_branch");
+    // (< doubled 100) is strict less-than, so doubled == 100 → else branch.
+    assert_eq!(run_with_arg(&bin, 0), 0); // doubled=0; 0<100 → 0
+    assert_eq!(run_with_arg(&bin, 10), 20); // doubled=20; 20<100 → 20
+    assert_eq!(run_with_arg(&bin, 49), 98); // doubled=98; 98<100 → 98
+    assert_eq!(run_with_arg(&bin, 50), 200); // doubled=100; !<100 → 200
+    assert_eq!(run_with_arg(&bin, 100), 400); // doubled=200; !<100 → 400
+}
+
+#[test]
 fn source_to_aot_function_with_nested_lets() {
     // Two let bindings in sequence — iter J's demote pass needs
     // to handle a chain of EnvDefineLocal+EnvLookupAny round-trips,
@@ -295,6 +328,503 @@ fn source_to_aot_function_with_nested_lets() {
     assert_eq!(run_with_arg(&bin, 0), 0);
     assert_eq!(run_with_arg(&bin, 3), 9);
     assert_eq!(run_with_arg(&bin, 7), 49);
+}
+
+/// RC3 iter 2.4 — multi-procedure AOT helper. Translates *every*
+/// lambda in the bytecode (not just one entry) and emits a single
+/// binary with multi-procedure dispatch. Returns the binary path
+/// + the original Scheme name of the first top-level entry so the
+/// caller can invoke `<bin> <name> <args...>`.
+fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> PathBuf {
+    let mut sources = SourceMap::new();
+    let file_id = sources.add("<test>", src);
+    let mut syms = SymbolTable::new();
+    let data = read_all(file_id, src, &mut syms).expect("read_all");
+    let mut macros = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = expander.expand_program(&data).expect("expand");
+    drop(expander);
+    // RC3 iter 2.14 — populate globals with stub builtins for names
+    // the compiler folds (`not`, `display`, `newline`, `/`, etc.).
+    // Stubs are never CALLED here (the AOT-emitted code routes to
+    // its own builtin lowerings); they exist so the compiler's
+    // global-fold optimization fires and emits Const(Procedure)
+    // → BuiltinRef → specialized RIR Inst. Without this, every
+    // LoadVar of a builtin becomes an EnvLookup → unresolved
+    // capture in AOT.
+    let mut globals: HashMap<cs_core::Symbol, cs_core::Value> = HashMap::new();
+    fn stub(_args: &[cs_core::Value]) -> Result<cs_core::Value, String> {
+        Err("stub builtin called from AOT test driver".into())
+    }
+    for name in &[
+        "not",
+        "display",
+        "newline",
+        "/",
+        "quotient",
+        "modulo",
+        "abs",
+        "cons",
+        "car",
+        "cdr",
+        "length",
+        "null?",
+        "pair?",
+        "make-vector",
+        "vector-ref",
+        "vector-set!",
+        "sqrt",
+        "arithmetic-shift",
+    ] {
+        let sym = syms.intern(name);
+        let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+        globals.insert(sym, cs_vm::vm::make_vm_builtin(leaked, stub));
+    }
+    let primops = build_primops(&mut syms);
+    let bc = compile_with_globals_and_primops(&core, &globals, &primops).expect("compile");
+
+    // Mirror cs-cli's --multi scans (top-level + per-lambda) so
+    // letrec / named-let inner-lambda self-name detection works.
+    let scan_pairs = |insts: &[cs_vm::opcode::Inst]| -> Vec<(usize, cs_core::Symbol)> {
+        let mut pairs = Vec::new();
+        for window in insts.windows(2) {
+            if let cs_vm::opcode::Inst::MakeClosure(idx) = &window[0] {
+                if let cs_vm::opcode::Inst::SetVar(sym)
+                | cs_vm::opcode::Inst::DefineGlobal(sym)
+                | cs_vm::opcode::Inst::DefineLocal(sym) = &window[1]
+                {
+                    pairs.push((*idx, *sym));
+                }
+            }
+        }
+        pairs
+    };
+    let mut name_by_idx: HashMap<usize, String> = HashMap::new();
+    let mut sym_by_idx: HashMap<usize, cs_core::Symbol> = HashMap::new();
+    for (idx, sym) in scan_pairs(&bc.insts) {
+        name_by_idx.insert(idx, syms.name(sym).to_string());
+        sym_by_idx.insert(idx, sym);
+    }
+    for lam in bc.lambdas.iter() {
+        for (idx, sym) in scan_pairs(&lam.body) {
+            name_by_idx
+                .entry(idx)
+                .or_insert_with(|| syms.name(sym).to_string());
+            sym_by_idx.entry(idx).or_insert(sym);
+        }
+    }
+    let known_globals: std::collections::HashSet<u32> = scan_pairs(&bc.insts)
+        .into_iter()
+        .map(|(_, s)| s.0)
+        .collect();
+    // RC3 iter 2.15 — disambiguate name collisions (multiple `loop`
+    // letrec bindings); suffix the lambda index on duplicates.
+    {
+        let mut name_to_first_idx: HashMap<String, usize> = HashMap::new();
+        let entries: Vec<(usize, String)> =
+            name_by_idx.iter().map(|(i, n)| (*i, n.clone())).collect();
+        for (idx, name) in entries {
+            match name_to_first_idx.get(&name) {
+                None => {
+                    name_to_first_idx.insert(name.clone(), idx);
+                }
+                Some(&first) if first == idx => {}
+                Some(_) => {
+                    name_by_idx.insert(idx, format!("{name}_{idx}"));
+                }
+            }
+        }
+    }
+    let mut compatible: Vec<cs_rir::Function> = Vec::new();
+    for (idx, lam) in bc.lambdas.iter().enumerate() {
+        let (name, self_sym) = match name_by_idx.get(&idx) {
+            // RC3 iter 2.15 — pass ORIGINAL sym for self_sym (not
+            // syms.intern(name)), since disambiguation may have
+            // suffixed the name.
+            Some(n) => (n.clone(), sym_by_idx.get(&idx).copied()),
+            None => (format!("__aot_lambda_{idx}"), None),
+        };
+        // RC3 iter 2.15 — inner lambdas default params to Type::Any.
+        let is_top_level = sym_by_idx
+            .get(&idx)
+            .is_some_and(|s| known_globals.contains(&s.0));
+        let any_hints: Vec<cs_rir::Type> = if is_top_level {
+            Vec::new()
+        } else {
+            vec![cs_rir::Type::Any; lam.params.len()]
+        };
+        let hints: Option<&[cs_rir::Type]> = if is_top_level { None } else { Some(&any_hints) };
+        let mut rir = bytecode_to_rir_aot_with_param_types(
+            lam,
+            name.as_str(),
+            self_sym,
+            Some(&known_globals),
+            hints,
+        )
+        .unwrap_or_else(|e| panic!("bytecode_to_rir_aot failed on lambda {idx}: {e:?}"));
+        rir.lambda_index = Some(idx);
+        rir.name_sym = if is_top_level {
+            sym_by_idx.get(&idx).map(|s| s.0)
+        } else {
+            None
+        };
+        rir.self_binding_sym = sym_by_idx.get(&idx).map(|s| s.0);
+        compatible.push(rir);
+    }
+    assert!(
+        !compatible.is_empty(),
+        "no AOT-compatible lambdas in source"
+    );
+
+    let pid = std::process::id();
+    let tmpdir = std::env::temp_dir().join(format!("cs-aot-multi-{pkg_suffix}-{pid}"));
+    let _ = std::fs::remove_dir_all(&tmpdir);
+
+    let opts = ProjectOptions {
+        mode: EmitMode::Nb,
+        package_name: format!("aot_multi_{pkg_suffix}"),
+        entry_fn_name: entry_name.to_string(),
+        cs_vm_dep: None,
+        cs_vm_path: Some(cs_vm_workspace_path()),
+        multi_procedure: true,
+    };
+
+    let emitted = emit_project(&compatible, &tmpdir, &opts)
+        .unwrap_or_else(|e| panic!("emit_project failed for multi {pkg_suffix}: {e}"));
+
+    let target_dir = workspace_target_dir();
+    let bin_name = &opts.package_name;
+    let output = Command::new("cargo")
+        .current_dir(&emitted.project_dir)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .arg("build")
+        .arg("--release")
+        .arg("--bin")
+        .arg(bin_name)
+        .arg("--offline")
+        .output()
+        .expect("cargo executes");
+    assert!(
+        output.status.success(),
+        "cargo build failed for multi {pkg_suffix}:\n--- stderr ---\n{}\n",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    target_dir.join(format!("release/{bin_name}"))
+}
+
+fn run_multi_with_args(bin: &PathBuf, entry: &str, args: &[i64]) -> i64 {
+    let mut cmd = Command::new(bin);
+    cmd.arg(entry);
+    for a in args {
+        cmd.arg(a.to_string());
+    }
+    let out = cmd.output().expect("binary executes");
+    assert!(
+        out.status.success(),
+        "binary failed: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8(out.stdout)
+        .expect("utf8")
+        .trim()
+        .parse::<i64>()
+        .expect("i64 parse")
+}
+
+#[test]
+fn source_to_aot_forward_self_ref_capture() {
+    // RC3 iter 2.12 — forward self-reference capture. The inner
+    // loop2 calls back into loop1 (its lexical parent's letrec
+    // binding), but loop1's VmAotClosure handle doesn't exist as
+    // an SSA Value at MakeClosure-of-loop2 time (loop1's body is
+    // running INSIDE loop1's own dispatch). The iter-2.12 fix
+    // threads `__self_handle` (the closure's own NB Procedure
+    // handle) through the AotDispatchFn ABI; the capture-gather
+    // emits `__self_handle` when an inner-lambda capture-sym
+    // matches the caller's `self_binding_sym`.
+    //
+    // f(3) = 4: loop1 iterates i=0..3 (each iteration runs loop2
+    // for j=0..5 then bumps i), and on i=4 the (> i n) check fires
+    // and returns i=4.
+    let bin = aot_compile_multi_and_run(
+        "(define (f n) (let loop1 ((i 0)) \
+           (if (> i n) i \
+             (let loop2 ((j 0)) \
+               (if (> j 5) (loop1 (+ i 1)) (loop2 (+ j 1)))))))",
+        "f",
+        "forward_self_ref",
+    );
+    assert_eq!(run_multi_with_args(&bin, "f", &[0]), 1);
+    assert_eq!(run_multi_with_args(&bin, "f", &[3]), 4);
+    assert_eq!(run_multi_with_args(&bin, "f", &[5]), 6);
+    assert_eq!(run_multi_with_args(&bin, "f", &[10]), 11);
+}
+
+#[test]
+fn source_to_aot_make_vector_with_any_length() {
+    // RC3 iter 2.18 — make-vector now accepts an Any-typed length
+    // (e.g. a parameter that the translator hasn't type-narrowed
+    // to Fixnum). cs-aot's VecAlloc lowering decodes the NB Fixnum
+    // payload via NanboxValue::as_fixnum before passing to
+    // vm_alloc_vector_gc. Spectral-norm hit this with
+    // `(make-vector n 1.0)` where n is the entry's param.
+    //
+    // The test wraps make-vector in a fn that returns (vector-ref v 0)
+    // so we can verify it actually allocated correctly.
+    let bin = aot_compile_multi_and_run(
+        "(define (test n) (let ((v (make-vector n 42))) (vector-ref v 0)))",
+        "test",
+        "make_vector_any",
+    );
+    assert_eq!(run_multi_with_args(&bin, "test", &[1]), 42);
+    assert_eq!(run_multi_with_args(&bin, "test", &[5]), 42);
+    assert_eq!(run_multi_with_args(&bin, "test", &[100]), 42);
+}
+
+#[test]
+fn source_to_aot_mixed_fixnum_flonum_arith() {
+    // RC3 iter 2.17 — Flonum ops must handle NB-Fixnum operands
+    // correctly. Previous fbinop_rust / fcmp_*_rust / funary_rust_method
+    // assumed both operands are raw f64 bit patterns (NB Flonum's
+    // representation). When the translator fed a Flonum op an NB
+    // Fixnum (e.g., from a Fixnum-typed param flowing into mixed
+    // arith), `f64::from_bits(NB_Fixnum_bits)` interpreted the
+    // tagged-NaN range as a NaN, all subsequent f64 ops propagated
+    // NaN, and results were garbage.
+    //
+    // Mandelbrot returned 3 for any input vs the JIT's correct
+    // 27/45/157. With iter 2.17's NB-Fixnum-aware operand decode
+    // in each Flonum lowering helper, mandelbrot matches the JIT.
+    //
+    // This test exercises the specific bug shape with a smaller
+    // repro: (* x x) on Fixnum x mixed with (* 1.5 1.5) on Flonum.
+    let bin = aot_compile_multi_and_run(
+        "(define (test x) (let ((sum (+ (* x x) (* 1.5 1.5)))) \
+           (if (> sum 4.0) 1 0)))",
+        "test",
+        "mixed_fixnum_flonum",
+    );
+    // test(1): (* 1 1) = 1, (+ 1 2.25) = 3.25. 3.25 > 4.0 = #f → 0
+    assert_eq!(run_multi_with_args(&bin, "test", &[1]), 0);
+    // test(2): (* 2 2) = 4, (+ 4 2.25) = 6.25. 6.25 > 4.0 = #t → 1
+    assert_eq!(run_multi_with_args(&bin, "test", &[2]), 1);
+    // test(3): (* 3 3) = 9, (+ 9 2.25) = 11.25. > 4.0 → 1
+    assert_eq!(run_multi_with_args(&bin, "test", &[3]), 1);
+}
+
+#[test]
+fn source_to_aot_transitive_capture_propagation() {
+    // RC3 iter 2.16 — transitive capture propagation. The inner
+    // anonymous lambda `(lambda (x) (+ outer-y x))` is passed to a
+    // higher-order helper that has its own inner `loop`. The loop
+    // doesn't directly reference outer-y, but the lambda it
+    // MakeClosures DOES. Iter 2.16's analysis pass propagates the
+    // capture upward so loop's captures include outer-y, which
+    // then resolves via outer's local_defs at MakeClosure time.
+    //
+    // Without iter 2.16 this fails at "MakeClosure with unresolved
+    // capture" because the immediate caller (loop) doesn't have
+    // outer-y in its scope.
+    let bin = aot_compile_multi_and_run(
+        "(define (apply-each f n) \
+           (let loop ((i 0) (acc 0)) \
+             (if (= i n) acc (loop (+ i 1) (+ acc (f i)))))) \
+         (define (outer y) (apply-each (lambda (x) (+ y x)) 5))",
+        "outer",
+        "transitive_capture",
+    );
+    // outer(y) = sum of (y+0)+(y+1)+(y+2)+(y+3)+(y+4) = 5y + 10
+    assert_eq!(run_multi_with_args(&bin, "outer", &[0]), 10);
+    assert_eq!(run_multi_with_args(&bin, "outer", &[10]), 60);
+    assert_eq!(run_multi_with_args(&bin, "outer", &[100]), 510);
+}
+
+#[test]
+fn source_to_aot_list_length_and_cons() {
+    // RC3 iter 2.15 — closures over list / pair operations.
+    // alloc-stress builds a 1000-element list with cons + length.
+    // Pre-iter-2.15 the inner `loop` named-let failed three ways:
+    //   1. Param `acc` defaulted to Fixnum but flowed as a Pair →
+    //      `cons on non-Any operand` translator error.
+    //   2. `length` builtin had no cs-aot lowering →
+    //      `Inst::Length not yet supported` emit error.
+    //   3. Two named-lets both named `loop` collided in the
+    //      generated Rust source.
+    //
+    // Fix bundle: (a) inner-lambda params default to Type::Any;
+    // (b) Inst::Length lowers to `vm_length_gc` wrapped in
+    // NanboxValue::fixnum; (c) cs-cli disambiguates colliding
+    // letrec-binding names by suffixing the lambda index.
+    let bin = aot_compile_multi_and_run(
+        "(define (mk n) (let loop ((i 0) (acc '())) \
+           (if (= i n) acc (loop (+ i 1) (cons i acc))))) \
+         (define (sum-len n) (let loop ((r 0) (sum 0)) \
+           (if (= r n) sum (loop (+ r 1) (+ sum (length (mk 100)))))))",
+        "sum-len",
+        "list_length_cons",
+    );
+    assert_eq!(run_multi_with_args(&bin, "sum-len", &[0]), 0);
+    assert_eq!(run_multi_with_args(&bin, "sum-len", &[1]), 100);
+    assert_eq!(run_multi_with_args(&bin, "sum-len", &[5]), 500);
+    assert_eq!(run_multi_with_args(&bin, "sum-len", &[10]), 1000);
+}
+
+#[test]
+fn source_to_aot_not_boolean_lowering() {
+    // RC3 iter 2.14 — (not boolean) lowering. Previously the
+    // type-aware fast-path emitted `Eq(x, Fixnum(0))` which works
+    // in the JIT's i64 0/1 boolean representation but FAILS in
+    // NB mode (numeric Eq's generic_cmp2 rejects boolean
+    // operands, so the result is always #f and every if-with-not
+    // condition takes the else branch unconditionally).
+    //
+    // Tak hit this on `(not (< y x))` and infinite-recursed.
+    // The fix introduces a dedicated `Inst::NotBoolean` that
+    // lowers to xor-with-1 (NB_TRUE and NB_FALSE differ only in
+    // bit 0, so xor flips them correctly). Same lowering works
+    // for JIT i64 0/1 booleans.
+    let bin = aot_compile_multi_and_run(
+        "(define (test n) (if (not (= n 0)) 999 111))",
+        "test",
+        "not_boolean",
+    );
+    // test(0): (= 0 0) = #t, (not #t) = #f → else → 111
+    assert_eq!(run_multi_with_args(&bin, "test", &[0]), 111);
+    // test(5): (= 5 0) = #f, (not #f) = #t → then → 999
+    assert_eq!(run_multi_with_args(&bin, "test", &[5]), 999);
+    assert_eq!(run_multi_with_args(&bin, "test", &[-7]), 999);
+}
+
+#[test]
+fn source_to_aot_nested_named_lets_independent() {
+    // RC3 iter 2.11 — two nested named-lets where the inner one
+    // doesn't call out to the outer. Pre-iter-2.11 this failed
+    // because the demote pass's strict rule bailed on multi-block
+    // multi-define (letrec emits placeholder + post-MakeClosure
+    // overwrite for each binding sym). Iter 2.11 relaxes the rule:
+    // multiple defines of a sym in the SAME block are safe
+    // (re-binding; last define wins in textual order), even in
+    // multi-block functions.
+    //
+    // `(define (f n) (let loop1 ...) ...)` — outer loop1 has if;
+    // its else branch contains a let loop2 with its own body. loop2
+    // doesn't reference loop1, just sums j up to a limit.
+    let bin = aot_compile_multi_and_run(
+        "(define (f n) (let loop1 ((i 0)) \
+           (let loop2 ((j 0)) \
+             (if (> j 5) i (loop2 (+ j 1))))))",
+        "f",
+        "nested_named_lets",
+    );
+    // loop1's body has no if so it doesn't even iterate — just
+    // immediately enters loop2, sums j 0..6, returns i=0.
+    // (The point of the test is the demote pass survives + a
+    // binary builds + runs; numeric result is whatever loop2's
+    // result with the boxed i carries through. With our minimal
+    // emission, loop1's body returns loop2's result. loop2 returns
+    // i which is the closure's captured copy of loop1's i=0.)
+    assert_eq!(run_multi_with_args(&bin, "f", &[0]), 0);
+}
+
+#[test]
+fn source_to_aot_named_let_self_recursion() {
+    // RC3 iter 2.9 — named-let with an internally-recursive inner
+    // lambda. The named-let desugars to a letrec; the translator's
+    // self-name detection (extended in 2.9 to scan ALL lambdas'
+    // bodies for MakeClosure+DefineLocal pairs) passes `loop_sym`
+    // as the inner lambda's self_name. CallSelf detection then
+    // covers the recursive `(loop ...)` calls, so the inner lambda
+    // doesn't need to capture itself.
+    //
+    // Also exercises the proc_loop ident remapping (since `loop` is
+    // a Rust keyword) — sanitize_ident now guards against keywords.
+    let bin = aot_compile_multi_and_run(
+        "(define (sum-to n) (let loop ((i 0) (acc 0)) \
+           (if (> i n) acc (loop (+ i 1) (+ acc i)))))",
+        "sum-to",
+        "named_let",
+    );
+    assert_eq!(run_multi_with_args(&bin, "sum-to", &[0]), 0);
+    assert_eq!(run_multi_with_args(&bin, "sum-to", &[5]), 15);
+    assert_eq!(run_multi_with_args(&bin, "sum-to", &[10]), 55);
+    assert_eq!(run_multi_with_args(&bin, "sum-to", &[100]), 5050);
+}
+
+#[test]
+fn source_to_aot_mutual_recursion() {
+    // RC3 iter 2.8 (free-rides on iter 2.7) — mutual recursion
+    // between two top-level fns. `even?` calls `odd?` calls `even?`.
+    // The cross-procedure-reference mechanism resolves each call
+    // through the LambdaResolver's by_name_sym table; mutual
+    // recursion just works because both fns are emitted into the
+    // same project with the same resolver.
+    let bin = aot_compile_multi_and_run(
+        "(define (even? n) (if (= n 0) 1 (odd? (- n 1)))) \
+         (define (odd? n) (if (= n 0) 0 (even? (- n 1))))",
+        "even?",
+        "mutual_rec",
+    );
+    assert_eq!(run_multi_with_args(&bin, "even?", &[0]), 1);
+    assert_eq!(run_multi_with_args(&bin, "even?", &[4]), 1);
+    assert_eq!(run_multi_with_args(&bin, "even?", &[7]), 0);
+    assert_eq!(run_multi_with_args(&bin, "odd?", &[1]), 1);
+    assert_eq!(run_multi_with_args(&bin, "odd?", &[5]), 1);
+    assert_eq!(run_multi_with_args(&bin, "odd?", &[8]), 0);
+}
+
+#[test]
+fn source_to_aot_cross_procedure_reference() {
+    // RC3 iter 2.7 — top-level cross-procedure references. `apply-
+    // double` calls `double` by name; the bytecode emits
+    // `EnvLookupAny(double_sym) + CallGeneral`. With the iter-2.7
+    // resolver, the demote-surviving EnvLookup resolves through
+    // `LambdaResolver::by_name_sym` to a direct
+    // `vm_alloc_aot_procedure(double_aot_dispatch, 1)` call instead
+    // of failing on a missing capture.
+    //
+    // Exercises:
+    //   1. translator's known_globals excludes `double` from
+    //      `apply-double`'s captures list
+    //   2. cs-aot's EnvLookup arm emits the vm_alloc call directly
+    //   3. CallGeneral routes through vm_call_aot_procedure to the
+    //      other AOT'd fn's dispatch wrapper
+    let bin = aot_compile_multi_and_run(
+        "(define (double x) (* x 2)) (define (apply-double n) (double n))",
+        "apply-double",
+        "cross_proc",
+    );
+    assert_eq!(run_multi_with_args(&bin, "double", &[3]), 6);
+    assert_eq!(run_multi_with_args(&bin, "apply-double", &[5]), 10);
+    assert_eq!(run_multi_with_args(&bin, "apply-double", &[100]), 200);
+    assert_eq!(run_multi_with_args(&bin, "apply-double", &[-7]), -14);
+}
+
+#[test]
+fn source_to_aot_capturing_closure_inline_call() {
+    // RC3 iter 2.4 — capturing closure end-to-end. The outer
+    // `adder` builds an inner lambda that captures `x`, then
+    // immediately calls it with `y`.
+    //
+    // Exercises the full new path:
+    //   1. translator's record_captures populates inner.captures = [x_sym]
+    //   2. cs-aot emits inner with `__cap<x_sym>: i64` prefix param
+    //   3. outer's MakeClosure resolves the inner's capture to the
+    //      outer's `x` value and calls
+    //      vm_alloc_aot_procedure_with_captures
+    //   4. outer's Call routes through vm_call_aot_procedure which
+    //      forwards the captures slice to the inner's dispatch
+    //      wrapper
+    //   5. inner's body reads `__cap<x_sym>` and adds it to `z`
+    let bin = aot_compile_multi_and_run(
+        "(define (adder x y) ((lambda (z) (+ x z)) y))",
+        "adder",
+        "capturing_inline",
+    );
+    assert_eq!(run_multi_with_args(&bin, "adder", &[5, 10]), 15);
+    assert_eq!(run_multi_with_args(&bin, "adder", &[0, 0]), 0);
+    assert_eq!(run_multi_with_args(&bin, "adder", &[100, -50]), 50);
+    assert_eq!(run_multi_with_args(&bin, "adder", &[-7, -3]), -10);
 }
 
 #[test]

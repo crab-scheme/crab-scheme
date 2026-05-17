@@ -151,6 +151,7 @@ mod tests {
                 cs_rir::Value(2),
                 cs_rir::BlockId(1),
                 cs_rir::BlockId(2),
+                Vec::new(),
             ),
         });
         f.blocks.push(cs_rir::Block {

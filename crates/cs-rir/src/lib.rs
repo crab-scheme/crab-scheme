@@ -1328,6 +1328,17 @@ pub enum Inst {
     /// expected tag, deopt to the VM. cs-vm: implicit (interpreter
     /// always dispatches dynamically).
     DeoptCheck(Value, Type),
+
+    /// RC3 iter 2.14 — `dst = not(src)` where `src` is known to be a
+    /// Boolean (NB-encoded #t or #f). Specialized lowering: AOT
+    /// emits `if v == NB_FALSE { NB_TRUE } else { NB_FALSE }`; JIT
+    /// emits a single bxor with the low bit (NB_TRUE and NB_FALSE
+    /// differ only in bit 0). Avoids routing through `Inst::Eq`,
+    /// which means "numeric `=`" and FAILS on boolean operands
+    /// (generic_cmp2 only accepts numbers). Bytecode source:
+    /// `LoadVar(not) + LoadVar(boolean) + Call(1)` where the
+    /// `LoadVar(boolean)` produces a `Type::Boolean`-tracked value.
+    NotBoolean(Value, Value),
 }
 
 /// Block terminator. Every basic block ends in exactly one of these.
@@ -1341,7 +1352,16 @@ pub enum Term {
 
     /// Branch on `cond`. If `cond` is truthy go to `then_target`, else
     /// `else_target`. cs-vm: `Inst::JumpIf` / `JumpIfNot`.
-    Branch(Value, BlockId, BlockId),
+    ///
+    /// RC3 iter 2.13 — extended with `args: Vec<Value>` passed to BOTH
+    /// target blocks (same as Jump's args). The previous shape passed
+    /// no args, which meant block params on either successor went
+    /// uninitialized when the predecessor had a non-empty stack at the
+    /// branch point. The (lp (if cond then else)) pattern hit this:
+    /// SelfRef materialized to a Value flows from the pre-if block
+    /// into both arms, but `Term::Branch` with no args left it
+    /// dangling.
+    Branch(Value, BlockId, BlockId, Vec<Value>),
 }
 
 /// One basic block: a list of straight-line instructions plus a
@@ -1367,6 +1387,59 @@ pub struct Function {
     /// dispatcher how to *decode* the i64 back into a `Value`. Defaults
     /// to `Type::Fixnum` for back-compat with iter-6's i64-only ABI.
     pub return_type: Type,
+    /// RC3 iter 2.2 — the bytecode `lambdas` index this Function was
+    /// translated from, if known. The bytecode→RIR translator sets it
+    /// so cs-aot's `MakeClosure(_, idx)` lowering can resolve which
+    /// fn name to wrap. `None` for functions hand-built outside the
+    /// translator (e.g., tests).
+    ///
+    /// Stays as `Option<usize>` instead of `usize` so existing
+    /// `Function::new(...)` constructions stay valid without the
+    /// caller needing a sentinel value.
+    pub lambda_index: Option<usize>,
+    /// RC3 iter 2.4 — captured free-var sym IDs, in declaration order.
+    /// Empty for non-capturing functions. The bytecode→RIR translator
+    /// analyzes the body's `EnvLookup`/`EnvLookupAny` references to
+    /// non-local syms and records them here; cs-aot's MakeClosure
+    /// emission uses this list to know how many values to gather as
+    /// captures + in what order, and the dispatch wrapper uses it to
+    /// know how many captures to unpack from the slice.
+    ///
+    /// The lambda's body Insts use `EnvLookup(_, sym)` to reference
+    /// captures (translator unchanged); cs-aot resolves each EnvLookup
+    /// against this list to compute the capture-slice index. See
+    /// `docs/milestones/aot-iter-24-design.md`.
+    pub captures: Vec<u32>,
+    /// RC3 iter 2.7 — top-level binding sym id, if this function is
+    /// bound at top level via `(define (name args) body)`. Empty
+    /// for anonymous lambdas or internal `define`s. cs-aot uses this
+    /// to build a `sym → fn` resolver so cross-procedure references
+    /// (e.g. `(mandelbrot-pixel cr ci)` called from inside
+    /// `mandelbrot`) can be lowered as direct
+    /// `vm_alloc_aot_procedure` calls instead of failing on a
+    /// surviving `EnvLookup`.
+    pub name_sym: Option<u32>,
+    /// RC3 iter 2.7 — sym IDs for positional params, in the same
+    /// order as `params`. Empty by default; the translator
+    /// populates this for AOT-targeted lambdas so cs-aot can map
+    /// `EnvLookup(sym)` to the right param Value (e.g., a nested
+    /// closure inside `(define (f x) ...)` captures `x` which is
+    /// a *param* of `f`, not a local define).
+    pub param_syms: Vec<u32>,
+    /// RC3 iter 2.12 — sym this function is bound to in its IMMEDIATE
+    /// lexical parent. For top-level fns, equals `name_sym`. For
+    /// letrec / named-let inner lambdas, equals the letrec binding
+    /// sym (which differs from `name_sym` since iter 2.7 reserves
+    /// `name_sym` for top-level-only).
+    ///
+    /// cs-aot uses this for forward self-reference capture: when an
+    /// inner lambda's capture list contains the CALLER's
+    /// `self_binding_sym`, the caller emits `__self_handle` (its own
+    /// NB Procedure handle, threaded by the dispatch ABI) as the
+    /// capture value — solving the chicken-and-egg where a letrec
+    /// binding's value doesn't exist at MakeClosure time but is
+    /// needed by an inner lambda calling back into the parent.
+    pub self_binding_sym: Option<u32>,
 }
 
 impl Function {
@@ -1378,6 +1451,11 @@ impl Function {
             entry: BlockId(0),
             blocks: Vec::new(),
             return_type: Type::Fixnum,
+            lambda_index: None,
+            captures: Vec::new(),
+            name_sym: None,
+            param_syms: Vec::new(),
+            self_binding_sym: None,
         }
     }
 

@@ -407,7 +407,9 @@ dependencies = [
  "cs-diag",
  "cs-expand",
  "cs-parse",
+ "cs-rir",
  "cs-runtime",
+ "cs-typer",
  "cs-vm",
 ]
 
@@ -567,10 +569,24 @@ dependencies = [
  "cs-jit-cranelift",
  "cs-lex",
  "cs-parse",
+ "cs-rir",
  "cs-vm",
  "libloading",
  "num-traits",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cs-typer"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-diag",
+ "cs-expand",
+ "cs-ir",
+ "cs-parse",
+ "cs-rir",
+ "cs-vm",
 ]
 
 [[package]]
