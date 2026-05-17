@@ -222,8 +222,12 @@ impl<'tab> Checker<'tab> {
             self.env.define(*pname, pty);
         }
         if let Some(rest_name) = &params.rest {
-            let rest_ty = pt.rest.clone().unwrap_or(Type::Any);
-            self.env.define(*rest_name, rest_ty);
+            // Inside the body, the rest binding sees `(Listof T)`
+            // — the user's `T` is the per-element type, not the
+            // list type. Phase 3.4.
+            let rest_elem = pt.rest.clone().unwrap_or(Type::Any);
+            self.env
+                .define(*rest_name, Type::Listof(Box::new(rest_elem)));
         }
         let result = self.check(body, &pt.return_type);
         self.env.pop_to(mark);
@@ -257,16 +261,26 @@ impl<'tab> Checker<'tab> {
         let f_ty = self.infer(func);
         match &f_ty {
             Type::Procedure_(pt) => {
-                if pt.params.len() != args.len() {
+                // Arity: with no rest, must match exactly;
+                // with rest, args.len() ≥ fixed.len().
+                let fixed = pt.params.len();
+                let has_rest = pt.rest.is_some();
+                if (has_rest && args.len() < fixed) || (!has_rest && args.len() != fixed) {
                     return Err(TypeError::ArityMismatch {
-                        expected: pt.params.len(),
+                        expected: fixed,
                         found: args.len(),
                         span,
                     });
                 }
                 let params = pt.params.clone();
+                let rest = pt.rest.clone();
                 let return_ty = pt.return_type.clone();
-                for (arg, param_ty) in args.iter().zip(params.iter()) {
+                for (i, arg) in args.iter().enumerate() {
+                    let param_ty = if i < fixed {
+                        &params[i]
+                    } else {
+                        rest.as_ref().expect("has_rest holds when i >= fixed")
+                    };
                     self.check(arg, param_ty)?;
                 }
                 if !subtype(&return_ty, expected) {
@@ -347,8 +361,9 @@ impl<'tab> Checker<'tab> {
             self.env.define(*pname, pty);
         }
         if let Some(rest_name) = &params.rest {
-            let rest_ty = pt.rest.clone().unwrap_or(Type::Any);
-            self.env.define(*rest_name, rest_ty);
+            let rest_elem = pt.rest.clone().unwrap_or(Type::Any);
+            self.env
+                .define(*rest_name, Type::Listof(Box::new(rest_elem)));
         }
         let result = self.check(body, &body_expected);
         self.env.pop_to(mark);
@@ -739,6 +754,101 @@ mod tests {
         let mut checker = Checker::new(&table, &mut syms);
         let errors = checker.check_program(&core);
         assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    // -------- Phase 3 iter 3.4: variadic / rest args --------
+
+    #[test]
+    fn variadic_primop_accepts_any_arity() {
+        // `list` is `(-> Any ... (Listof Any))` — accepts any
+        // number of args.
+        let (core, table, mut syms) = parse_extract_expand("(list 1 2 3 \"hi\" #t)");
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn variadic_primop_zero_args_typechecks() {
+        // `(list)` — zero trailing args is valid for rest.
+        let (core, table, mut syms) = parse_extract_expand("(list)");
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn typed_variadic_function_call_typechecks() {
+        // The expander's `(define (name . xs) …)` sugar doesn't
+        // accept dotted-pair formals; use the explicit `lambda`
+        // with a single rest binding to get variadic shape.
+        let src = "\
+            (: sum (-> Fixnum ... Fixnum))
+            (define sum (lambda xs 0))
+            (: top (-> Fixnum))
+            (define top (lambda () (sum 1 2 3)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn typed_variadic_function_wrong_arg_type_caught() {
+        let src = "\
+            (: sum (-> Fixnum ... Fixnum))
+            (define sum (lambda xs 0))
+            (define caller (lambda () (sum 1 \"oops\" 3)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        let found = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::Mismatch {
+                    expected: Type::Fixnum,
+                    found: Type::String,
+                    ..
+                }
+            )
+        });
+        assert!(
+            found,
+            "expected Fixnum/String mismatch on rest arg, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn fixed_plus_rest_arity_works() {
+        // `(: f (-> Fixnum Fixnum ... Boolean))` — at least 1
+        // Fixnum followed by 0+ Fixnums; 0 args should fail
+        // arity.
+        let src = "\
+            (: f (-> Fixnum Fixnum ... Boolean))
+            (define f (lambda (first . rest) #t))
+            (define good (lambda () (f 1 2 3)))
+            (define also-good (lambda () (f 1)))
+            (define bad-arity (lambda () (f)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        let arity_err = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::ArityMismatch {
+                    expected: 1,
+                    found: 0,
+                    ..
+                }
+            )
+        });
+        assert!(
+            arity_err,
+            "expected ArityMismatch{{1, 0}} for empty call, got: {errors:?}"
+        );
     }
 
     // -------- Phase 3 iter 3.3: function-type checking --------

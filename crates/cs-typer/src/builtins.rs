@@ -145,6 +145,27 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
         ("procedure?", p1(any(), bool_())),
         ("bytevector?", p1(any(), bool_())),
         // ---- pairs / lists ----
+        // Variadic list / vector constructors — Phase 3.4
+        // exposes `rest` in ProcType so these get proper
+        // signatures: any number of Any-typed args, returns a
+        // homogeneous Listof Any / Vector. The `rest: Some(any())`
+        // means "zero or more trailing Any args."
+        (
+            "list",
+            ProcType {
+                params: vec![],
+                return_type: Type::Listof(Box::new(Type::Any)),
+                rest: Some(Type::Any),
+            },
+        ),
+        (
+            "vector",
+            ProcType {
+                params: vec![],
+                return_type: vec_(),
+                rest: Some(Type::Any),
+            },
+        ),
         ("cons", p2(any(), any(), pair())),
         ("car", p1(pair(), any())),
         ("cdr", p1(pair(), any())),

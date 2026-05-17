@@ -139,19 +139,58 @@ fn parse_arrow(args: &[TypeDatum]) -> Result<TypeAnn, TypeAnnError> {
     // require at least one element (the return type) — the
     // "params" of a 0-arg arrow are simply the empty params
     // vec. So `(-> Fixnum)` is a thunk returning Fixnum.
+    //
+    // Phase 3.4: `(-> A B C ... R)` is a rest-arg arrow:
+    //   params = [A, B]
+    //   rest   = C       (the type of each trailing arg)
+    //   return = R
+    // The literal symbol `...` marks the rest position.
     if args.is_empty() {
         return Err(TypeAnnError::MalformedConstructor(
             "->",
             "needs at least a return type, e.g. `(-> Fixnum)`".into(),
         ));
     }
-    let (return_d, param_ds) = args.split_last().unwrap();
-    let params: Result<Vec<Type>, _> = param_ds.iter().map(parse_type_ann).collect();
+    let dots_pos = args
+        .iter()
+        .position(|d| matches!(d, TypeDatum::Sym(s) if s == "..."));
+    let (params, rest, return_d) = match dots_pos {
+        None => {
+            let (ret, params) = args.split_last().unwrap();
+            (params, None, ret)
+        }
+        Some(i) => {
+            if i == 0 {
+                return Err(TypeAnnError::MalformedConstructor(
+                    "->",
+                    "`...` must be preceded by a type, e.g. `(-> Fixnum ... Fixnum)`".into(),
+                ));
+            }
+            if i + 1 >= args.len() {
+                return Err(TypeAnnError::MalformedConstructor(
+                    "->",
+                    "`...` must be followed by a return type".into(),
+                ));
+            }
+            if args.len() - (i + 1) != 1 {
+                return Err(TypeAnnError::MalformedConstructor(
+                    "->",
+                    "exactly one return type must follow `...`".into(),
+                ));
+            }
+            let fixed = &args[0..i - 1];
+            let rest_d = &args[i - 1];
+            let ret_d = &args[i + 1];
+            (fixed, Some(rest_d), ret_d)
+        }
+    };
+    let parsed_params: Result<Vec<Type>, _> = params.iter().map(parse_type_ann).collect();
+    let parsed_rest = rest.map(parse_type_ann).transpose()?;
     let return_type = parse_type_ann(return_d)?;
     Ok(Type::Procedure_(Box::new(ProcType {
-        params: params?,
+        params: parsed_params?,
         return_type,
-        rest: None,
+        rest: parsed_rest,
     })))
 }
 
@@ -224,6 +263,69 @@ mod tests {
                 rest: None,
             }))
         );
+    }
+
+    #[test]
+    fn arrow_with_rest_parses() {
+        // `(-> Fixnum ... Fixnum)` — variadic Fixnum → Fixnum.
+        let parsed = parse_type_ann(&list(vec![
+            sym("->"),
+            sym("Fixnum"),
+            sym("..."),
+            sym("Fixnum"),
+        ]))
+        .unwrap();
+        match parsed {
+            Type::Procedure_(pt) => {
+                assert!(pt.params.is_empty(), "fixed params should be empty");
+                assert_eq!(pt.rest, Some(Type::Fixnum));
+                assert_eq!(pt.return_type, Type::Fixnum);
+            }
+            other => panic!("expected Procedure_, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arrow_with_fixed_then_rest_parses() {
+        // `(-> A B C ... R)` → fixed=[A,B], rest=C, return=R.
+        let parsed = parse_type_ann(&list(vec![
+            sym("->"),
+            sym("Fixnum"),
+            sym("String"),
+            sym("Boolean"),
+            sym("..."),
+            sym("Fixnum"),
+        ]))
+        .unwrap();
+        match parsed {
+            Type::Procedure_(pt) => {
+                assert_eq!(pt.params, vec![Type::Fixnum, Type::String]);
+                assert_eq!(pt.rest, Some(Type::Boolean));
+                assert_eq!(pt.return_type, Type::Fixnum);
+            }
+            other => panic!("expected Procedure_, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arrow_with_dots_alone_errors() {
+        // `(-> ... Fixnum)` — `...` at index 0 has no preceding
+        // type. Should surface a MalformedConstructor.
+        let parsed = parse_type_ann(&list(vec![sym("->"), sym("..."), sym("Fixnum")]));
+        assert!(matches!(
+            parsed,
+            Err(TypeAnnError::MalformedConstructor("->", _))
+        ));
+    }
+
+    #[test]
+    fn arrow_with_dots_no_return_errors() {
+        // `(-> Fixnum ...)` — `...` not followed by a return.
+        let parsed = parse_type_ann(&list(vec![sym("->"), sym("Fixnum"), sym("...")]));
+        assert!(matches!(
+            parsed,
+            Err(TypeAnnError::MalformedConstructor("->", _))
+        ));
     }
 
     #[test]
