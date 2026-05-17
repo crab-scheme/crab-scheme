@@ -396,8 +396,21 @@ impl<'tab> Checker<'tab> {
         };
         let mark = self.env.push();
         for (i, pname) in params.fixed.iter().enumerate() {
-            let pty = pt.params.get(i).cloned().unwrap_or(Type::Any);
-            self.env.define(*pname, pty);
+            // Iter 4.5: per-binding refinement. When the param's
+            // declared type is `Any` (unannotated lambda — the
+            // typical `let` desugaring path), use the arg's
+            // inferred type instead. This is what makes
+            // `(let ((x (if cond 1 "hi"))) …)` see x as
+            // `(U Fixnum String)` in the body rather than `Any`.
+            // For explicitly-typed params (declared != Any), the
+            // declared type is the user's promise — keep it.
+            let declared = pt.params.get(i).cloned().unwrap_or(Type::Any);
+            let bound_ty = if declared == Type::Any {
+                args.get(i).map(|a| self.infer(a)).unwrap_or(Type::Any)
+            } else {
+                declared
+            };
+            self.env.define(*pname, bound_ty);
         }
         if let Some(rest_name) = &params.rest {
             let rest_elem = pt.rest.clone().unwrap_or(Type::Any);
@@ -1101,6 +1114,101 @@ mod tests {
         let mut checker = Checker::new(&table, &mut syms);
         let errors = checker.check_program(&core);
         assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    // -------- Phase 4 iter 4.5: per-binding refinement --------
+
+    #[test]
+    fn let_binding_inherits_inferred_arg_type() {
+        // `(let ((x (string-length "hi"))) ...)` — x should be
+        // inferred as Fixnum (string-length's return), so the
+        // body can use it where Fixnum is expected.
+        let src = "\
+            (: f (-> Fixnum))
+            (define (f) : Fixnum
+              (let ((x (string-length \"hi\")))
+                (fx+ x 1)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn let_binding_picks_up_lub_from_if_arg() {
+        // `(let ((x (if cond 1 "hi"))) ...)` — x's inferred
+        // type is `(U Fixnum String)`. In the body, calling
+        // `(string-length x)` should fail because x isn't
+        // narrowed to String.
+        let src = "\
+            (: f (-> Boolean Any))
+            (define (f [cond : Boolean]) : Any
+              (let ((x (if cond 1 \"hi\")))
+                (string-length x)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        let mismatch = errors
+            .iter()
+            .any(|e| matches!(e, TypeError::Mismatch { .. }));
+        assert!(
+            mismatch,
+            "expected Mismatch for string-length on (U Fixnum String), got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn let_binding_narrowed_via_predicate_in_body() {
+        // Combines iter 4.5 (inherited binding type) with iter
+        // 4.2 (predicate narrowing). The let-bound `x` gets the
+        // LUB; then `(if (string? x) (string-length x) 0)`
+        // narrows to String in the then-branch.
+        let src = "\
+            (: f (-> Boolean Fixnum))
+            (define (f [cond : Boolean]) : Fixnum
+              (let ((x (if cond 1 \"hi\")))
+                (if (string? x) (string-length x) 0)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn typed_let_binding_keeps_declared_type() {
+        // When the lambda param has an explicit type (via
+        // [x : T] sugar — though `let` doesn't currently have
+        // typed-binding syntax, this exercises the underlying
+        // "declared != Any → keep declared" path via
+        // top-level ascription).
+        //
+        // `(: g (-> Fixnum Any))` declares g takes Fixnum.
+        // Inside g, the param x is Fixnum (declared); calling
+        // string-length on it must fail.
+        let src = "\
+            (: g (-> Fixnum Any))
+            (define (g [x : Fixnum]) : Any (string-length x))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        let mismatch = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::Mismatch {
+                    expected: Type::String,
+                    found: Type::Fixnum,
+                    ..
+                }
+            )
+        });
+        assert!(
+            mismatch,
+            "expected String/Fixnum mismatch (declared type wins), got: {errors:?}"
+        );
     }
 
     // -------- Phase 4 iter 4.4: union refinement --------
