@@ -30,6 +30,20 @@ use crate::env::TypeEnv;
 use crate::infer::infer;
 use crate::types::{ProcType, Type};
 
+/// Narrowing decision produced by
+/// [`Checker::detect_predicate_narrowing`].
+///
+/// `x` is the operand whose type will be narrowed in each `If`
+/// branch. `filter` is the predicate's positive proposition.
+/// `negated` is set when the cond was wrapped in `(not …)` — at
+/// the call site, swap the positive/negative narrowings.
+#[derive(Clone, Debug)]
+struct Narrowing {
+    x: cs_core::Symbol,
+    filter: Type,
+    negated: bool,
+}
+
 /// The state a single typechecking run accumulates.
 ///
 /// `'tab` is the lifetime of the borrowed `AnnotationTable` —
@@ -131,14 +145,25 @@ impl<'tab> Checker<'tab> {
                 // Phase 4 iter 4.2: narrow operand types inside
                 // each branch based on a predicate filter.
                 let narrowing = self.detect_predicate_narrowing(cond);
-                if let Some((x, filter)) = narrowing {
-                    let x_ty = self.env.lookup(x).cloned().unwrap_or(Type::Any);
+                if let Some(n) = narrowing {
+                    let x_ty = self.env.lookup(n.x).cloned().unwrap_or(Type::Any);
+                    let (then_ty, alt_ty) = if n.negated {
+                        (
+                            narrow_negative(&x_ty, &n.filter),
+                            narrow_positive(&x_ty, &n.filter),
+                        )
+                    } else {
+                        (
+                            narrow_positive(&x_ty, &n.filter),
+                            narrow_negative(&x_ty, &n.filter),
+                        )
+                    };
                     let mark = self.env.push();
-                    self.env.define(x, narrow_positive(&x_ty, &filter));
+                    self.env.define(n.x, then_ty);
                     self.check_collect(then, expected, out);
                     self.env.pop_to(mark);
                     let mark = self.env.push();
-                    self.env.define(x, narrow_negative(&x_ty, &filter));
+                    self.env.define(n.x, alt_ty);
                     self.check_collect(alt, expected, out);
                     self.env.pop_to(mark);
                 } else {
@@ -400,16 +425,27 @@ impl<'tab> Checker<'tab> {
     ) -> Result<(), TypeError> {
         self.check(cond, &Type::Any)?;
         let narrowing = self.detect_predicate_narrowing(cond);
-        if let Some((x, filter)) = narrowing {
-            let x_ty = self.env.lookup(x).cloned().unwrap_or(Type::Any);
-            // then-branch: x narrowed to the positive proposition.
+        if let Some(n) = narrowing {
+            let x_ty = self.env.lookup(n.x).cloned().unwrap_or(Type::Any);
+            // For `(not …)` the polarity flips: then-branch
+            // sees the negative, else-branch sees the positive.
+            let (then_ty, alt_ty) = if n.negated {
+                (
+                    narrow_negative(&x_ty, &n.filter),
+                    narrow_positive(&x_ty, &n.filter),
+                )
+            } else {
+                (
+                    narrow_positive(&x_ty, &n.filter),
+                    narrow_negative(&x_ty, &n.filter),
+                )
+            };
             let mark = self.env.push();
-            self.env.define(x, narrow_positive(&x_ty, &filter));
+            self.env.define(n.x, then_ty);
             let then_res = self.check(then, expected);
             self.env.pop_to(mark);
-            // else-branch: x narrowed to the negative.
             let mark = self.env.push();
-            self.env.define(x, narrow_negative(&x_ty, &filter));
+            self.env.define(n.x, alt_ty);
             let alt_res = self.check(alt, expected);
             self.env.pop_to(mark);
             then_res?;
@@ -424,7 +460,16 @@ impl<'tab> Checker<'tab> {
     /// predicate-typed procedure (filter present) and `x` is a
     /// Ref to a name in scope, return `(x, filter_type)` so the
     /// caller can narrow `x` in the then/else branches.
-    fn detect_predicate_narrowing(&self, cond: &CoreExpr) -> Option<(cs_core::Symbol, Type)> {
+    fn detect_predicate_narrowing(&self, cond: &CoreExpr) -> Option<Narrowing> {
+        // (not <inner>) flips polarity and recurses.
+        if let Some(inner) = self.match_not_app(cond) {
+            let inner_narrow = self.detect_predicate_narrowing(inner)?;
+            return Some(Narrowing {
+                x: inner_narrow.x,
+                filter: inner_narrow.filter,
+                negated: !inner_narrow.negated,
+            });
+        }
         let CoreExpr::App { func, args, .. } = cond else {
             return None;
         };
@@ -445,7 +490,41 @@ impl<'tab> Checker<'tab> {
             return None;
         };
         let filter = pt.filter.as_ref()?.clone();
-        Some((*x, filter))
+        Some(Narrowing {
+            x: *x,
+            filter,
+            negated: false,
+        })
+    }
+
+    /// If `expr` is `(not e)`, return `e`. We identify `not` by
+    /// its shape in the env — `(-> Any Boolean)` with no
+    /// `filter`. Practical heuristic since the Checker doesn't
+    /// own a SymbolTable for name-based lookup. False positives
+    /// (some other 1-arg `(-> Any Boolean)` without filter)
+    /// only invert narrowing, which is harmless to typecheck.
+    fn match_not_app<'a>(&self, expr: &'a CoreExpr) -> Option<&'a CoreExpr> {
+        let CoreExpr::App { func, args, .. } = expr else {
+            return None;
+        };
+        if args.len() != 1 {
+            return None;
+        }
+        let CoreExpr::Ref { name, .. } = &**func else {
+            return None;
+        };
+        let pred_ty = self.env.lookup(*name)?;
+        let Type::Procedure_(pt) = pred_ty else {
+            return None;
+        };
+        if pt.params.len() != 1
+            || pt.params[0] != Type::Any
+            || pt.return_type != Type::Boolean
+            || pt.filter.is_some()
+        {
+            return None;
+        }
+        Some(&args[0])
     }
 
     fn check_letrec(
@@ -930,6 +1009,93 @@ mod tests {
             (: inc (-> Any Fixnum))
             (define (inc [x : Any]) : Fixnum
               (if (fixnum? x) (fx+ x 1) 0))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    // -------- Phase 4 iter 4.3: not / and / or --------
+
+    #[test]
+    fn not_inverts_narrowing_polarity() {
+        // `(if (not (null? lst)) (car lst) #f)` — `not` flips:
+        // then-branch now sees `lst : Pair` (the negative
+        // proposition of null?), so `(car lst)` typechecks.
+        let src = "\
+            (: head (-> (U Pair Null) Any))
+            (define (head [lst : (U Pair Null)]) : Any
+              (if (not (null? lst)) (car lst) #f))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn not_else_branch_sees_positive() {
+        // Symmetric: `(if (not (null? lst)) #t (car lst))` —
+        // else-branch sees the positive (Null), so `(car lst)`
+        // should fail.
+        let src = "\
+            (: head (-> (U Pair Null) Any))
+            (define (head [lst : (U Pair Null)]) : Any
+              (if (not (null? lst)) #t (car lst)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        let found = errors
+            .iter()
+            .any(|e| matches!(e, TypeError::Mismatch { .. }));
+        assert!(found, "expected Mismatch in else, got: {errors:?}");
+    }
+
+    #[test]
+    fn double_not_re_narrows_to_positive() {
+        // `(if (not (not (null? lst))) #f (car lst))` — two
+        // `not`s cancel; lst is Null in then, Pair in else, so
+        // `(car lst)` in else typechecks.
+        let src = "\
+            (: head (-> (U Pair Null) Any))
+            (define (head [lst : (U Pair Null)]) : Any
+              (if (not (not (null? lst))) #f (car lst)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn and_intersects_narrowings_via_desugaring() {
+        // `(and (pair? lst) (number? (car lst)))` desugars to
+        // `(if (pair? lst) (if (number? (car lst)) #t #f) #f)`.
+        // The outer If's then-branch narrows lst to Pair, so
+        // `(car lst)` typechecks; then the inner number? check
+        // proceeds. No standalone "and intersects" logic
+        // needed — narrowing composes via nested Ifs.
+        let src = "\
+            (: pair-head-number (-> (U Pair Null) Boolean))
+            (define (pair-head-number [lst : (U Pair Null)]) : Boolean
+              (and (pair? lst) (number? (car lst))))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn or_unions_via_desugaring() {
+        // `(or (null? lst) (pair? lst))` — desugars to nested
+        // If. With `lst : (U Pair Null)` both branches succeed.
+        let src = "\
+            (: nonempty (-> (U Pair Null) Boolean))
+            (define (nonempty [lst : (U Pair Null)]) : Boolean
+              (or (null? lst) (pair? lst)))
         ";
         let (core, table, mut syms) = parse_extract_expand(src);
         let mut checker = Checker::new(&table, &mut syms);
