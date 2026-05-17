@@ -563,6 +563,189 @@ pub fn primop_table_size(name: &str) -> Result<usize, String> {
 }
 
 // ============================================================
+// Scheme-builtin wrappers (Value <-> SendableValue at the edge).
+// ============================================================
+//
+// Each builtin takes a slice of `Value` from the dispatcher,
+// converts via `to_sendable_in` / `from_sendable`, calls the
+// primop, then converts the result back. Type errors are
+// returned as the "<who>: <message>" string the dispatcher
+// converts to a proper R6RS condition.
+
+/// Decode a PID from its symbol form. We carry PIDs across
+/// the Scheme boundary as symbols named like `<pid:<node.local>>`
+/// (see `from_sendable`). Parse the embedded `<node.local>`
+/// piece back into an `ActorPid`.
+fn parse_pid_symbol(name: &str) -> Option<ActorPid> {
+    // Format: "<pid:<NODE.LOCAL>>"
+    let inner = name.strip_prefix("<pid:<")?.strip_suffix(">>")?;
+    let (n, l) = inner.split_once('.')?;
+    Some(ActorPid {
+        node: n.parse().ok()?,
+        local_id: l.parse().ok()?,
+    })
+}
+
+fn value_to_pid(v: &Value, syms: &SymbolTable, who: &str) -> Result<ActorPid, String> {
+    match v {
+        Value::Symbol(s) => {
+            let name = syms.name(*s);
+            parse_pid_symbol(name).ok_or_else(|| {
+                format!(
+                    "{}: expected a PID symbol like <pid:<n.m>>, got '{}'",
+                    who, name
+                )
+            })
+        }
+        other => Err(format!(
+            "{}: expected a PID symbol, got {}",
+            who,
+            other.type_name()
+        )),
+    }
+}
+
+fn value_to_str<'a>(v: &'a Value, syms: &'a SymbolTable, who: &str) -> Result<String, String> {
+    match v {
+        Value::Symbol(s) => Ok(syms.name(*s).to_string()),
+        Value::String(g) => Ok(g.borrow().clone()),
+        other => Err(format!(
+            "{}: expected symbol or string, got {}",
+            who,
+            other.type_name()
+        )),
+    }
+}
+
+/// `(send pid value)` — fire-and-forget cast.
+pub fn b_beam_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("send: expected 2 arguments, got {}", args.len()));
+    }
+    let pid = value_to_pid(&args[0], syms, "send")?;
+    let sv = to_sendable_in(&args[1], syms)?;
+    primop_send(pid, sv)?;
+    Ok(Value::Unspecified)
+}
+
+/// `(make-table name type)` — create a named table. `type` is
+/// either the symbol `set` or `ordered-set`.
+pub fn b_beam_make_table(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "make-table: expected 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let name = value_to_str(&args[0], syms, "make-table")?;
+    let ty = value_to_str(&args[1], syms, "make-table")?;
+    primop_make_table(&name, &ty)?;
+    Ok(Value::Unspecified)
+}
+
+/// `(table-insert! name key value)` — set the cell at `key` to
+/// `value`. Overwrites any prior value (set / ordered_set
+/// semantics).
+pub fn b_beam_table_insert(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(format!(
+            "table-insert!: expected 3 arguments, got {}",
+            args.len()
+        ));
+    }
+    let name = value_to_str(&args[0], syms, "table-insert!")?;
+    let key = to_sendable_in(&args[1], syms)?;
+    let value = to_sendable_in(&args[2], syms)?;
+    primop_table_insert(&name, key, value)?;
+    Ok(Value::Unspecified)
+}
+
+/// `(table-lookup name key)` — returns the value or `#f`.
+pub fn b_beam_table_lookup(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "table-lookup: expected 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let name = value_to_str(&args[0], syms, "table-lookup")?;
+    let key = to_sendable_in(&args[1], syms)?;
+    match primop_table_lookup(&name, &key)? {
+        Some(sv) => Ok(from_sendable(&sv, syms)),
+        None => Ok(Value::Boolean(false)),
+    }
+}
+
+/// `(table-delete! name key)` — returns `#t` if the key was
+/// present (and is now removed), `#f` otherwise.
+pub fn b_beam_table_delete(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "table-delete!: expected 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let name = value_to_str(&args[0], syms, "table-delete!")?;
+    let key = to_sendable_in(&args[1], syms)?;
+    let removed = primop_table_delete(&name, &key)?;
+    Ok(Value::Boolean(removed))
+}
+
+/// `(table-size name)` — returns the current cell count.
+pub fn b_beam_table_size(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "table-size: expected 1 argument, got {}",
+            args.len()
+        ));
+    }
+    let name = value_to_str(&args[0], syms, "table-size")?;
+    let n = primop_table_size(&name)?;
+    Ok(Value::Number(Number::Fixnum(n as i64)))
+}
+
+/// `(spawn name arg ...)` — look up the named procedure in the
+/// process-wide ProcedureRegistry, spawn an actor that runs it
+/// with the (deep-cloned) `arg ...` values, return its PID.
+///
+/// In v1 the registry only accepts entries pre-registered from
+/// Rust (tests, FFI). A future iter wires
+/// `(register-procedure! 'name (lambda (args) ...))` so Scheme
+/// can register its own — that needs a Scheme-thunk -> Rust
+/// closure compiler (the eval target's job, not this builtin).
+pub fn b_beam_spawn(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("spawn: expected a procedure name and 0+ arguments".into());
+    }
+    let name = value_to_str(&args[0], syms, "spawn")?;
+    let mut sendable_args = Vec::with_capacity(args.len() - 1);
+    for a in &args[1..] {
+        sendable_args.push(to_sendable_in(a, syms)?);
+    }
+    let pid = primop_spawn(&name, sendable_args)?;
+    Ok(from_sendable(&SendableValue::Pid(pid), syms))
+}
+
+/// The list of Scheme-facing BEAM builtins, in the
+/// `(name, fn)` shape `syms_builtins()` accepts. cs-runtime
+/// merges this into its `install_into` registration loop when
+/// the `actor` feature is on.
+pub fn beam_syms_builtins() -> Vec<(
+    &'static str,
+    fn(&[Value], &mut SymbolTable) -> Result<Value, String>,
+)> {
+    vec![
+        ("send", b_beam_send),
+        ("spawn", b_beam_spawn),
+        ("make-table", b_beam_make_table),
+        ("table-insert!", b_beam_table_insert),
+        ("table-lookup", b_beam_table_lookup),
+        ("table-delete!", b_beam_table_delete),
+        ("table-size", b_beam_table_size),
+    ]
+}
+
+// ============================================================
 // Tests.
 // ============================================================
 
