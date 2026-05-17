@@ -741,6 +741,118 @@ mod tests {
         assert!(errors.is_empty(), "errors: {errors:?}");
     }
 
+    // -------- Phase 3 iter 3.3: function-type checking --------
+
+    #[test]
+    fn function_typed_param_typechecks() {
+        // `g` takes a procedure-typed param and calls it.
+        let src = "\
+            (: g (-> (-> Fixnum Fixnum) Fixnum))
+            (define (g [f : (-> Fixnum Fixnum)]) : Fixnum (f 5))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn calling_function_typed_param_with_non_proc_fails() {
+        // `g` expects a (-> Fixnum Fixnum), caller passes 42
+        // — should surface a Mismatch with `found: Fixnum`.
+        let src = "\
+            (: g (-> (-> Fixnum Fixnum) Fixnum))
+            (define (g [f : (-> Fixnum Fixnum)]) : Fixnum (f 5))
+            (define (caller) (g 42))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        let found = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::Mismatch {
+                    found: Type::Fixnum,
+                    ..
+                }
+            )
+        });
+        assert!(
+            found,
+            "expected Fixnum/procedure mismatch on g's arg, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn function_typed_param_callsite_wrong_arg_fails() {
+        // Inside g, calling f with a String fails — f expects
+        // Fixnum.
+        let src = "\
+            (: g (-> (-> Fixnum Fixnum) Fixnum))
+            (define (g [f : (-> Fixnum Fixnum)]) : Fixnum (f \"hi\"))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        let found = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::Mismatch {
+                    expected: Type::Fixnum,
+                    found: Type::String,
+                    ..
+                }
+            )
+        });
+        assert!(
+            found,
+            "expected Fixnum/String mismatch on f's arg, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn function_typed_param_arity_mismatch_at_call_fails() {
+        // g calls f with 2 args; f is declared 1-ary. Should
+        // surface ArityMismatch.
+        let src = "\
+            (: g (-> (-> Fixnum Fixnum) Fixnum))
+            (define (g [f : (-> Fixnum Fixnum)]) : Fixnum (f 1 2))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        let found = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::ArityMismatch {
+                    expected: 1,
+                    found: 2,
+                    ..
+                }
+            )
+        });
+        assert!(found, "expected ArityMismatch 1/2, got: {errors:?}");
+    }
+
+    #[test]
+    fn higher_order_application_chains() {
+        // h returns a (-> Fixnum Fixnum), and the result is
+        // immediately applied. Tests that App-on-App correctly
+        // typechecks through the function-valued return.
+        let src = "\
+            (: f (-> Fixnum Fixnum))
+            (define (f [n : Fixnum]) : Fixnum (fx+ n 1))
+            (: h (-> (-> Fixnum Fixnum)))
+            (define (h) : (-> Fixnum Fixnum) f)
+            (: top (-> Fixnum))
+            (define (top) : Fixnum ((h) 10))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
     #[test]
     fn let_pattern_walks_body_into_outer_expected_type() {
         // `(let ((x 1)) "oops")` lives inside a Fixnum-returning
