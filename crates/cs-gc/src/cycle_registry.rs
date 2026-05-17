@@ -39,7 +39,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use crate::cycle::CycleVisit;
+use crate::cycle::{BreakCycle, CycleVisit};
 use crate::{Gc, Weak};
 
 /// Erased Weak handle so the registry can hold mixed `T`
@@ -53,15 +53,28 @@ pub trait AnyWeak: Any {
     /// alive; `None` if it's been reclaimed (Weak no longer
     /// upgrades).
     fn upgrade_addr(&self) -> Option<usize>;
+    /// Strong count of the underlying allocation (for cycle
+    /// reachability analysis), or 0 if reclaimed.
+    fn strong_count(&self) -> usize;
     /// Upgrade and traverse the child set via the type's
     /// [`CycleVisit`] impl, if still live. Returns `true` if
     /// the traversal happened.
     fn upgrade_and_visit(&self, visitor: &mut crate::cycle::CycleVisitor) -> bool;
+    /// Gap C-3: upgrade and call the type's
+    /// [`BreakCycle::try_break_cycle`] impl. Returns `true`
+    /// if a slot was successfully demoted to `Weak`.
+    fn upgrade_and_try_break(&self) -> bool;
 }
 
-impl<T: 'static + CycleVisit> AnyWeak for Weak<T> {
+impl<T: 'static + CycleVisit + BreakCycle> AnyWeak for Weak<T> {
     fn upgrade_addr(&self) -> Option<usize> {
         self.upgrade().map(|g| Gc::as_addr(&g))
+    }
+    fn strong_count(&self) -> usize {
+        match self.upgrade() {
+            Some(g) => Gc::strong_count(&g),
+            None => 0,
+        }
     }
     fn upgrade_and_visit(&self, visitor: &mut crate::cycle::CycleVisitor) -> bool {
         match self.upgrade() {
@@ -69,6 +82,12 @@ impl<T: 'static + CycleVisit> AnyWeak for Weak<T> {
                 g.visit_children(visitor);
                 true
             }
+            None => false,
+        }
+    }
+    fn upgrade_and_try_break(&self) -> bool {
+        match self.upgrade() {
+            Some(g) => g.try_break_cycle(),
             None => false,
         }
     }
@@ -91,13 +110,23 @@ thread_local! {
     /// registry crosses the threshold. The next allocation
     /// (iter 4) checks this and runs `run_sweep` if true.
     static SWEEP_PENDING: Cell<bool> = const { Cell::new(false) };
+
+    /// Gap C-3: cumulative count of candidates the sweep
+    /// successfully broke via `BreakCycle::try_break_cycle`.
+    /// Embedders read it via `sweep_broken_count()`.
+    static SWEEP_BROKEN_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Register a Weak handle to `alloc` as a cycle candidate.
 /// Idempotent — if `addr` is already in the registry, the
 /// existing entry is preserved (rather than overwritten with
 /// a fresh Weak that would identify the same allocation).
-pub fn register_cycle_candidate<T: 'static + CycleVisit>(addr: usize, weak: Weak<T>) {
+///
+/// Gap C-3: now requires `T: BreakCycle` so the sweep can
+/// invoke `try_break_cycle` per-candidate. Existing call
+/// sites in cs-runtime pass `Weak<Pair>` etc., which already
+/// have impls in cs-core.
+pub fn register_cycle_candidate<T: 'static + CycleVisit + BreakCycle>(addr: usize, weak: Weak<T>) {
     REGISTRY.with(|r| {
         let mut r = r.borrow_mut();
         r.entry(addr).or_insert_with(|| Box::new(weak));
@@ -139,10 +168,31 @@ pub fn take_sweep_pending() -> bool {
 
 /// Run a sweep over the candidate set.
 ///
-/// **Current implementation (iter 4):** Phase 1 only —
-/// retains only candidates whose Weak still upgrades. Dead
-/// entries get pruned so the registry doesn't grow
-/// unboundedly with already-reclaimed candidates.
+/// **Current implementation (Gap C-3):** two phases.
+///
+/// 1. **Sweep dead entries.** Drop registry entries whose
+///    Weak no longer upgrades (the allocation already
+///    reclaimed by some other code path).
+/// 2. **Attempt per-candidate cycle break.** For each
+///    surviving candidate, call `AnyWeak::upgrade_and_try_break`,
+///    which dispatches to the type's `BreakCycle` impl.
+///    Pair uses `break_cdr_cycle(0)` then `break_car_cycle(0)`
+///    (baseline=0 is safe outside any mutation — no
+///    transient refs inflate the strong count). Vector /
+///    Hashtable have the default no-op impl until those
+///    types grow break dispatch.
+///
+/// After a successful break, the now-acyclic subgraph's
+/// strong refs drain naturally; the next sweep prunes the
+/// dead-Weak entry.
+///
+/// **Caveat — multi-pair cycles:** the per-candidate break
+/// breaks ONE pair's slot at a time. For a 2-pair cycle
+/// `A.cdr=B, B.cdr=A`, breaking A.cdr to Weak(B) makes A
+/// no longer hold B strongly; B's strong count drops; B
+/// becomes acyclic. So 2-pair cycles reclaim in one sweep.
+/// For larger N-pair cycles, one sweep may need to iterate
+/// — the next sweep finds the now-acyclic remainder.
 ///
 /// **Deferred (future iter):** Phases 2 & 3 — Bacon-Rajan-
 /// style trial-deletion to find pure-internal cycle groups
@@ -168,9 +218,39 @@ pub fn take_sweep_pending() -> bool {
 pub fn run_sweep() {
     REGISTRY.with(|r| {
         let mut r = r.borrow_mut();
+        // Phase 1: drop dead entries.
         r.retain(|_, weak| weak.upgrade_addr().is_some());
+        // Phase 2 (Gap C-3): attempt per-candidate break.
+        // Iterate addresses separately so we can mutate the
+        // map (drop succeeded entries) after each break. We
+        // collect addrs first to avoid borrow conflicts.
+        let addrs: Vec<usize> = r.keys().copied().collect();
+        for addr in addrs {
+            let broke = r
+                .get(&addr)
+                .map(|w| w.upgrade_and_try_break())
+                .unwrap_or(false);
+            if broke {
+                SWEEP_BROKEN_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+                // Don't drop the entry immediately — the
+                // break demoted one slot to Weak, but the
+                // Pair may still be referenced from
+                // elsewhere. Let the next sweep prune via
+                // Phase 1.
+            }
+        }
     });
     SWEEP_PENDING.with(|f| f.set(false));
+}
+
+/// Cumulative count of candidates the layer-4 sweep has
+/// successfully broken since process start. Embedders /
+/// benchmarks read this to attribute reclamation between
+/// the synchronous layer-2 detector (counted in
+/// `cs_runtime::countable_memory_cycle::cycle_broken_count`)
+/// and the asynchronous layer-4 sweep (counted here).
+pub fn sweep_broken_count() -> u64 {
+    SWEEP_BROKEN_COUNT.with(|c| c.get())
 }
 
 /// Clear the per-thread registry, threshold, and pending
@@ -194,6 +274,7 @@ mod tests {
     impl CycleVisit for Leaf {
         fn visit_children(&self, _ctx: &mut crate::cycle::CycleVisitor) {}
     }
+    impl BreakCycle for Leaf {}
 
     #[test]
     fn empty_registry() {

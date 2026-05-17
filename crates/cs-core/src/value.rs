@@ -202,6 +202,35 @@ impl Pair {
     }
 }
 
+/// Gap C-3: layer-4 sweep dispatch for `Pair`. Called by
+/// `cs_gc::cycle_registry::run_sweep` on every candidate.
+/// Tries cdr-cycle first (more common back-edge from list
+/// construction), then car-cycle. `baseline = 0` because the
+/// sweep runs outside any mutation — no transient args[…]
+/// refs inflate the strong count, so any strong_count > 0
+/// reflects only persistent holders.
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::BreakCycle for Pair {
+    fn try_break_cycle(&self) -> bool {
+        self.break_cdr_cycle(0) || self.break_car_cycle(0)
+    }
+}
+
+/// Default no-op `BreakCycle` impls for cs-core's own heap-
+/// bearing types. Vector / String / ByteVector are
+/// `RefCell<…>`-wrapped (foreign types) — their no-op impls
+/// live in cs-gc to satisfy the orphan rule. The cycle
+/// counter still fires for these types; the sweep just
+/// can't reclaim — Vector / Hashtable would need their own
+/// per-slot break-cycle dispatch (a future iter). Documented
+/// limitation in ADR 0018 §"Scope".
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::BreakCycle for Hashtable {}
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::BreakCycle for Port {}
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::BreakCycle for Promise {}
+
 /// Weak counterpart of [`Value`]'s heap-bearing variants, used by
 /// the cycle-break tombstone machinery on [`Pair`]. Each variant
 /// mirrors a `Value::*` heap variant with the underlying smart-

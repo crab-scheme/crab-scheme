@@ -11,6 +11,13 @@
 //! tests assert generous bounds so transient CI noise doesn't fail
 //! the suite, but a regression that doubles instrumentation cost
 //! still surfaces.
+//!
+//! Cfg-gated out under `feature = "countable-memory"` — `Heap` /
+//! `Marker` / `Trace` are the M5 tracing-variant types and don't
+//! exist under the Rc-only variant. The equivalent instrumentation
+//! for countable-memory lives in `cs_gc::alloc_telemetry` (Gap A-1).
+
+#![cfg(not(feature = "countable-memory"))]
 
 use std::time::{Duration, Instant};
 

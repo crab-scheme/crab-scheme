@@ -121,6 +121,37 @@ fn tracing_policy_overrides_threshold() {
 }
 
 #[test]
+fn sweep_breaks_pair_self_cycle() {
+    // Gap C-3: the layer-4 sweep should reclaim a Pair
+    // self-cycle that the layer-2 detector refused to
+    // break (its strong-count guard treats the self-cycle
+    // as "the only strong holder is the cycle itself"). The
+    // sweep runs with baseline=0 — outside any mutation, no
+    // transient refs to filter out — and successfully
+    // demotes the cdr slot to Weak.
+    use cs_gc::Gc;
+    cycle_registry::reset_for_tests();
+    let broken_baseline = cs_gc::cycle_registry::sweep_broken_count();
+    let p = Pair::new(Value::Boolean(true), Value::Null);
+    p.set_cdr(Value::Pair(p.clone()));
+    // Manually register (simulating what
+    // `record_cycle_with_candidate` does).
+    cycle_registry::register_cycle_candidate(Gc::as_addr(&p), Gc::downgrade(&p));
+    assert_eq!(cycle_registry::candidate_count(), 1);
+    // Sweep runs — should call Pair::try_break_cycle which
+    // calls break_cdr_cycle(0); strong_count > 0 → break
+    // fires.
+    cycle_registry::run_sweep();
+    assert!(
+        cs_gc::cycle_registry::sweep_broken_count() > broken_baseline,
+        "sweep should have broken the cycle"
+    );
+    // cdr slot demoted — strong slot is now Unspecified
+    // (the weak tombstone holds the back-edge).
+    assert!(matches!(*p.cdr.borrow(), Value::Unspecified));
+}
+
+#[test]
 fn many_cycles_populate_registry() {
     cycle_registry::reset_for_tests();
     let mut pairs = Vec::with_capacity(20);

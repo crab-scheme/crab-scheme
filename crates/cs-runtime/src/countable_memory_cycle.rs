@@ -78,7 +78,7 @@ pub fn reset_cycle_detection_count() {
 /// controls whether the candidate is also registered.
 pub fn record_cycle_with_candidate<T>(p: &cs_gc::Gc<T>)
 where
-    T: 'static + cs_gc::cycle::CycleVisit,
+    T: 'static + cs_gc::cycle::CycleVisit + cs_gc::cycle::BreakCycle,
 {
     record_cycle_detected();
     #[cfg(feature = "tracing-cycle-collector")]

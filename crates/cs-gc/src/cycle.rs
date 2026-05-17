@@ -56,6 +56,51 @@ pub trait CycleVisit {
     fn visit_children(&self, ctx: &mut CycleVisitor);
 }
 
+/// Per-type cycle-break dispatch for the layer-4 sweep
+/// (Gap C-3). When the candidate registry identifies a value
+/// that participates in a residual cycle, the sweep calls
+/// `try_break_cycle` to demote one outgoing strong slot to
+/// `Weak`. Returns `true` if a slot was successfully demoted;
+/// `false` if the type has no safe break action.
+///
+/// Implementations live in `cs-core` (`impl BreakCycle for
+/// Pair` is the only one shipped today; Vector / Hashtable
+/// stay at the default no-op — the cycle counter still
+/// fires for them, the layer-4 sweep just doesn't reclaim).
+///
+/// Required by every `T` registered as a cycle candidate
+/// (i.e., every `T: AnyWeak`). The blanket default keeps
+/// existing `CycleVisit` types compatible with `AnyWeak`
+/// without code changes — cs-core only overrides for Pair.
+pub trait BreakCycle {
+    fn try_break_cycle(&self) -> bool {
+        false
+    }
+}
+
+// Blanket no-op impls for the std container types cs-core
+// uses as `Gc<RefCell<...>>` payloads. Putting them here
+// (where `BreakCycle` is local) satisfies the orphan rule
+// — cs-core can't impl a foreign trait for a foreign type.
+// Per-type cycle-break dispatch for Vector / String /
+// ByteVector is a future iter; for now the cycle counter
+// fires but the layer-4 sweep can't reclaim them.
+impl<T: ?Sized> BreakCycle for std::cell::RefCell<T> {}
+
+// Leaf-primitive impls so test code and toy embedders can
+// use `Gc<i64>` / `Gc<String>` / etc. without needing a
+// per-type BreakCycle impl. Cycles can't form through these
+// types (no Gc back-edges) so the default no-op is correct.
+impl BreakCycle for i64 {}
+impl BreakCycle for u64 {}
+impl BreakCycle for i32 {}
+impl BreakCycle for u32 {}
+impl BreakCycle for f64 {}
+impl BreakCycle for bool {}
+impl BreakCycle for char {}
+impl BreakCycle for String {}
+impl BreakCycle for &'static str {}
+
 /// Opaque cycle witness. Returned by [`cycle_check`] when a cycle
 /// is found; the contained address is the root that closed the
 /// cycle.
