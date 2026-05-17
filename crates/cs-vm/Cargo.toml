@@ -10,8 +10,14 @@ license.workspace = true
 # to cs-core (which forwards to cs-gc). Required so the cs-vm
 # crate's CycleVisit impls (VmClosure, Bindings, Env) compile
 # against the feature-gated trait.
-default = ["countable-memory"]
+default = ["countable-memory", "regions"]
 countable-memory = ["cs-core/countable-memory"]
+# Forwards the cs-gc `regions` feature so the VM can
+# operate on region-allocated heap values. The VM has no
+# region-specific code paths today — it just sees Gc<T>
+# polymorphically — so this is purely about feature
+# propagation.
+regions = ["cs-core/regions", "cs-gc/regions"]
 
 [dependencies]
 cs-core = { workspace = true }

@@ -10,12 +10,12 @@ license.workspace = true
 # to cs-gc so consumer crates inherit transparently. Adds
 # parallel CycleVisit impls alongside the existing Trace impls
 # under the same #[cfg].
-default = ["countable-memory"]
+default = ["countable-memory", "regions"]
 countable-memory = ["cs-gc/countable-memory"]
 # Forwards the cs-gc `regions` feature so the layer-3 (region
-# memory) Promote trait + deep-promotion machinery becomes
-# available on Value. Off by default until region-memory spec
-# iter 6.
+# memory) Promote trait + deep-promotion machinery is
+# available on Value. Region-memory spec iter 6 flipped this
+# default-on.
 regions = ["cs-gc/regions"]
 
 [dependencies]

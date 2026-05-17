@@ -1,6 +1,8 @@
 # Region Memory — Design
 
-> Status: **Draft**.
+> Status: **CLOSED** (2026-05-17). See
+> `docs/milestones/region-memory-exit.md` and
+> `docs/adr/0016-region-types.md`.
 > Companion: `requirements.md`, `tasks.md`.
 
 ## Overview

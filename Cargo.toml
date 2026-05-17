@@ -45,7 +45,7 @@ cs-expand = { path = "crates/cs-expand" }
 # path even when they pin specific cs-runtime features. cs-runtime
 # default features stay off here so callers can opt in/out of
 # `jit` / `ffi-dynamic` independently.
-cs-runtime = { path = "crates/cs-runtime", default-features = false, features = ["countable-memory"] }
+cs-runtime = { path = "crates/cs-runtime", default-features = false, features = ["countable-memory", "regions"] }
 cs-vm = { path = "crates/cs-vm" }
 cs-gc = { path = "crates/cs-gc" }
 cs-rir = { path = "crates/cs-rir" }

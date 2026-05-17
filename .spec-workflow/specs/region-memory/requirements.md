@@ -1,7 +1,8 @@
 # Region Memory — Requirements
 
-> Status: **Draft** (proposed post-countable-memory perf/safety
-> track).
+> Status: **CLOSED** (2026-05-17). All 6 iters shipped; see
+> `docs/milestones/region-memory-exit.md` and
+> `docs/adr/0016-region-types.md`.
 > Spec slug: `region-memory`
 > Roadmap slot: Layer 3 of the unified memory management
 > architecture (ADR 0015).

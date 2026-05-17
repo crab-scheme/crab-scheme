@@ -182,6 +182,7 @@ fn region_alloc_microbench() {
     // 5ns is the design target; generous bound at 50ns for
     // CI noise tolerance. The point is to detect 10x+
     // regressions, not micro-benchmark precision.
+    println!("region_alloc_microbench: {per_alloc_ns:.2} ns/alloc over {N} allocations");
     assert!(
         per_alloc_ns < 50.0,
         "region alloc too slow: {per_alloc_ns:.2}ns/alloc (target <5ns, gated <50ns)"
@@ -207,6 +208,7 @@ fn region_bulk_free_microbench() {
     let start = std::time::Instant::now();
     drop(region);
     let elapsed = start.elapsed();
+    println!("region_bulk_free_microbench: {elapsed:?} for {N} allocations");
     assert!(
         elapsed < std::time::Duration::from_millis(500),
         "region bulk-free too slow: {elapsed:?} (target <50ms, gated <500ms)"

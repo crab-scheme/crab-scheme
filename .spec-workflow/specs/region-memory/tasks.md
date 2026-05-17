@@ -1,5 +1,7 @@
 # Region Memory — Tasks
 
+> Status: **CLOSED** (2026-05-17). All tasks complete; see
+> `docs/milestones/region-memory-exit.md`.
 > Companion: `requirements.md`, `design.md`.
 > Format mirrors the countable-memory / foundation spec tasks:
 > per-task file paths, leverage hooks, prompt scaffolds, exit
@@ -328,7 +330,7 @@ iter is a single commit per the per-iter commit policy.
 
 ## Iter 6 — Flip default + ADR 0016 + exit report
 
-- [ ] 11. Flip `regions` to default-on workspace-wide
+- [x] 11. Flip `regions` to default-on workspace-wide
   - File: `crates/cs-gc/Cargo.toml`, `crates/cs-core/Cargo.toml`,
     `crates/cs-runtime/Cargo.toml`, `crates/cs-vm/Cargo.toml`,
     workspace `Cargo.toml`
@@ -350,7 +352,7 @@ iter is a single commit per the per-iter commit policy.
     cs-runtime --no-default-features --features ffi-trait`
     both green; conformance 117/117 maintained._
 
-- [ ] 12. ADR 0016 + exit report + spec close
+- [x] 12. ADR 0016 + exit report + spec close
   - File: `docs/adr/0016-region-types.md` (new),
     `docs/milestones/region-memory-exit.md` (new),
     `.spec-workflow/specs/region-memory/{requirements,design,tasks}.md`
