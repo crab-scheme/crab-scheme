@@ -15,7 +15,7 @@ impl FileId {
 }
 
 /// A half-open byte range `[start, end)` inside a [`FileId`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Span {
     pub file: FileId,
     pub start: u32,
