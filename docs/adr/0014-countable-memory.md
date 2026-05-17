@@ -165,9 +165,23 @@ synchronous detector closes the gap with bounded per-call cost.
 
 ## Follow-ups
 
-- [ ] iter 7.1 — Strong/Weak storage slot enums on
-  `Pair` / `Vector` / `Hashtable` so detected cycles get
-  refcount-reclaimable storage downgrades.
+- [~] iter 7.1 — Strong/Weak storage tombstone infrastructure
+  on `Pair` shipped (`WeakValue` type, `Pair::car_weak` /
+  `cdr_weak` tombstone fields, `Pair::car()` / `cdr()` /
+  `set_car()` / `set_cdr()` accessors, ~250 reader sites
+  migrated workspace-wide, `Pair::break_car_cycle` /
+  `break_cdr_cycle` available but not currently invoked). The
+  naive "demote the freshly-mutated slot to Weak" break
+  attempted in iter-7.1 orphans the demoted value when the
+  slot was its only strong holder — common with
+  `(set-car! env (cons name val))` closures-over-env where
+  the cons cell has no external strong references. Detection
+  still fires (counter increments via
+  `cs_runtime::countable_memory_cycle::record_cycle_detected`)
+  but no structural break runs. The follow-up iter (7.1.x)
+  must implement a Bacon-Rajan-style trial-deletion that picks
+  a safe cycle edge to weaken. Vector and Hashtable tombstone
+  infrastructure (analogous to Pair) is also outstanding.
 - [x] iter 8 — `Frame.parent` / `Continuation` parent chain
   refactored to `Weak<Frame>` for structural cycle prevention.
   **Not applicable — closed as won't-do.** See "Iter 8

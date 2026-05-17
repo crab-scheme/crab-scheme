@@ -1631,21 +1631,28 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
     // build Pairs still use `cs_core::Pair::new` (unregistered),
     // mirroring the pre-NaN-box split where only JIT wrap allocs
     // were heap-tracked.
-    let pair = cs_core::Pair {
-        car: std::cell::RefCell::new(car_v),
-        cdr: std::cell::RefCell::new(cdr_v),
-    };
+    // Pair has private cycle-tombstone fields under
+    // countable-memory; use the public constructor which returns
+    // an already-allocated Gc<Pair>. The construct-via-struct-
+    // literal optimization below the JIT fast path is preserved
+    // on the tracing variant via the cfg branch.
     #[cfg(not(feature = "countable-memory"))]
-    let g: cs_gc::Gc<cs_core::Pair> = JIT_ACTIVE_HEAP.with(|c| {
-        let ptr = c.get();
-        if ptr.is_null() {
-            cs_gc::Gc::new(pair)
-        } else {
-            unsafe { (*ptr).alloc(pair) }
-        }
-    });
+    let g: cs_gc::Gc<cs_core::Pair> = {
+        let pair = cs_core::Pair {
+            car: std::cell::RefCell::new(car_v),
+            cdr: std::cell::RefCell::new(cdr_v),
+        };
+        JIT_ACTIVE_HEAP.with(|c| {
+            let ptr = c.get();
+            if ptr.is_null() {
+                cs_gc::Gc::new(pair)
+            } else {
+                unsafe { (*ptr).alloc(pair) }
+            }
+        })
+    };
     #[cfg(feature = "countable-memory")]
-    let g: cs_gc::Gc<cs_core::Pair> = cs_gc::Gc::new(pair);
+    let g: cs_gc::Gc<cs_core::Pair> = cs_core::Pair::new(car_v, cdr_v);
     let raw_ptr = cs_gc::Gc::into_raw_jit(g) as u64;
     debug_assert!(raw_ptr & !NB_PAYLOAD_MASK == 0);
     NanboxValue(nb_make(NB_TAG_PAIR, raw_ptr) as i64).into_raw()
@@ -1658,7 +1665,7 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
 pub unsafe extern "C" fn vm_pair_car_gc(pair: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(pair) };
     match v {
-        Value::Pair(p) => value_to_gc_i64(p.car.borrow().clone()),
+        Value::Pair(p) => value_to_gc_i64(p.car()),
         _ => {
             // Iter BW — type miss. Set sentinel + return a safe
             // placeholder (Gc-wrapped Unspecified). Dispatcher sees
@@ -1675,7 +1682,7 @@ pub unsafe extern "C" fn vm_pair_car_gc(pair: i64) -> i64 {
 pub unsafe extern "C" fn vm_pair_cdr_gc(pair: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(pair) };
     match v {
-        Value::Pair(p) => value_to_gc_i64(p.cdr.borrow().clone()),
+        Value::Pair(p) => value_to_gc_i64(p.cdr()),
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::Unspecified)
@@ -2151,8 +2158,8 @@ fn equal_hash_rec(v: &Value, acc: &mut u64) {
         }
         Value::Pair(p) => {
             mix(acc, 0x50);
-            equal_hash_rec(&p.car.borrow(), acc);
-            equal_hash_rec(&p.cdr.borrow(), acc);
+            equal_hash_rec(&p.car(), acc);
+            equal_hash_rec(&p.cdr(), acc);
         }
         Value::Vector(vc) => {
             mix(acc, 0x60);
@@ -2492,8 +2499,8 @@ pub unsafe extern "C" fn vm_delete_gc(target: i64, lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 if !cs_core::eq::equal(&car, &target_v) {
                     out.push(car);
                 }
@@ -2522,8 +2529,8 @@ pub unsafe extern "C" fn vm_delete_duplicates_gc(lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 if !seen.iter().any(|s| cs_core::eq::equal(s, &car)) {
                     seen.push(car);
                 }
@@ -2553,11 +2560,11 @@ pub unsafe extern "C" fn vm_alist_copy_gc(lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let entry = p.car.borrow().clone();
+                let entry = p.car();
                 match entry {
                     Value::Pair(pe) => {
-                        let car = pe.car.borrow().clone();
-                        let cdr = pe.cdr.borrow().clone();
+                        let car = pe.car();
+                        let cdr = pe.cdr();
                         out.push(Value::Pair(cs_core::Pair::new(car, cdr)));
                     }
                     _ => {
@@ -2565,7 +2572,7 @@ pub unsafe extern "C" fn vm_alist_copy_gc(lst: i64) -> i64 {
                         return value_to_gc_i64(Value::Null);
                     }
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             Value::Null => return value_to_gc_i64(Value::list(out)),
             _ => {
@@ -2591,8 +2598,8 @@ pub unsafe extern "C" fn vm_append_reverse_gc(rev: i64, tail: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 acc = Value::Pair(cs_core::Pair::new(car, acc));
                 cur = cdr;
             }
@@ -2851,7 +2858,7 @@ pub unsafe extern "C" fn vm_length_gc(r: i64) -> i64 {
         match cur {
             Value::Pair(p) => {
                 count += 1;
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             Value::Null => return count,
@@ -2878,7 +2885,7 @@ pub unsafe extern "C" fn vm_list_p_gc(r: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             Value::Null => return 1,
@@ -2908,9 +2915,9 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let entry = p.car.borrow().clone();
+                let entry = p.car();
                 if let Value::Pair(ep) = &entry {
-                    let entry_key = ep.car.borrow().clone();
+                    let entry_key = ep.car();
                     if cs_core::eq::eq(&needle, &entry_key) {
                         return value_to_gc_i64(entry);
                     }
@@ -2919,7 +2926,7 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
                 // typical Scheme convention for assq on improper
                 // shapes. The bytecode VM signals R6RS errors when
                 // strictness matters.
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -4272,7 +4279,7 @@ pub unsafe extern "C" fn vm_list_to_string_gc(r: i64) -> i64 {
                 return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))));
             }
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
+                let head = p.car();
                 match head {
                     Value::Character(c) => s.push(c),
                     _ => {
@@ -4280,7 +4287,7 @@ pub unsafe extern "C" fn vm_list_to_string_gc(r: i64) -> i64 {
                         return value_to_gc_i64(Value::Null);
                     }
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => {
@@ -4393,8 +4400,8 @@ pub unsafe extern "C" fn vm_list_to_vector_gc(r: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                items.push(p.car.borrow().clone());
-                let next = p.cdr.borrow().clone();
+                items.push(p.car());
+                let next = p.cdr();
                 cur = next;
             }
             Value::Null => {
@@ -4446,7 +4453,7 @@ pub unsafe extern "C" fn vm_u8_list_to_bytevector_gc(lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 let n = match car {
                     Value::Number(cs_core::Number::Fixnum(n)) => n,
                     _ => {
@@ -4463,7 +4470,7 @@ pub unsafe extern "C" fn vm_u8_list_to_bytevector_gc(lst: i64) -> i64 {
                     )));
                 }
                 out.push(n as u8);
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             Value::Null => {
                 return value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(
@@ -4552,8 +4559,8 @@ pub unsafe extern "C" fn vm_list_copy_gc(lst: i64) -> i64 {
     let tail = loop {
         match cur {
             Value::Pair(p) => {
-                elems.push(p.car.borrow().clone());
-                let next = p.cdr.borrow().clone();
+                elems.push(p.car());
+                let next = p.cdr();
                 cur = next;
             }
             other => break other,
@@ -4734,8 +4741,8 @@ pub unsafe extern "C" fn vm_append_buf(buf: *const i64, n: usize) -> i64 {
             match cur {
                 Value::Null => break,
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
-                    let cdr = p.cdr.borrow().clone();
+                    let car = p.car();
+                    let cdr = p.cdr();
                     items.push(car);
                     cur = cdr;
                 }
@@ -5622,7 +5629,7 @@ pub unsafe extern "C" fn vm_list_set_gc(lst: i64, n: i64, val: i64) -> i64 {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
                 i += 1;
             }
@@ -5634,7 +5641,7 @@ pub unsafe extern "C" fn vm_list_set_gc(lst: i64, n: i64, val: i64) -> i64 {
     }
     match cur {
         Value::Pair(p) => {
-            *p.car.borrow_mut() = new_v;
+            p.set_car(new_v);
             value_to_gc_i64(Value::Unspecified)
         }
         _ => {
@@ -5666,7 +5673,7 @@ pub unsafe extern "C" fn vm_list_tail_gc(lst: i64, n: i64) -> i64 {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
                 i += 1;
             }
@@ -5699,7 +5706,7 @@ pub unsafe extern "C" fn vm_list_ref_gc(lst: i64, n: i64) -> i64 {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
                 i += 1;
             }
@@ -5710,7 +5717,7 @@ pub unsafe extern "C" fn vm_list_ref_gc(lst: i64, n: i64) -> i64 {
         }
     }
     match cur {
-        Value::Pair(p) => value_to_gc_i64(p.car.borrow().clone()),
+        Value::Pair(p) => value_to_gc_i64(p.car()),
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::Null)
@@ -5735,11 +5742,11 @@ pub unsafe extern "C" fn vm_member_gc(item: i64, lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 if cs_core::eq::equal(&needle, &car) {
                     return value_to_gc_i64(Value::Pair(p.clone()));
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -5761,14 +5768,14 @@ pub unsafe extern "C" fn vm_assoc_gc(key: i64, alist: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let entry = p.car.borrow().clone();
+                let entry = p.car();
                 if let Value::Pair(ep) = &entry {
-                    let entry_key = ep.car.borrow().clone();
+                    let entry_key = ep.car();
                     if cs_core::eq::equal(&needle, &entry_key) {
                         return value_to_gc_i64(entry);
                     }
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -5793,11 +5800,11 @@ pub unsafe extern "C" fn vm_memv_gc(item: i64, lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 if cs_core::eq::eqv(&needle, &car) {
                     return value_to_gc_i64(Value::Pair(p.clone()));
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -5820,14 +5827,14 @@ pub unsafe extern "C" fn vm_assv_gc(key: i64, alist: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let entry = p.car.borrow().clone();
+                let entry = p.car();
                 if let Value::Pair(ep) = &entry {
-                    let entry_key = ep.car.borrow().clone();
+                    let entry_key = ep.car();
                     if cs_core::eq::eqv(&needle, &entry_key) {
                         return value_to_gc_i64(entry);
                     }
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -5852,7 +5859,7 @@ pub unsafe extern "C" fn vm_set_car_gc(p: i64, v: i64) -> i64 {
     let new_v = unsafe { gc_i64_to_value(v) };
     match pair {
         Value::Pair(pp) => {
-            *pp.car.borrow_mut() = new_v;
+            pp.set_car(new_v);
             value_to_gc_i64(Value::Unspecified)
         }
         _ => {
@@ -5874,7 +5881,7 @@ pub unsafe extern "C" fn vm_set_cdr_gc(p: i64, v: i64) -> i64 {
     let new_v = unsafe { gc_i64_to_value(v) };
     match pair {
         Value::Pair(pp) => {
-            *pp.cdr.borrow_mut() = new_v;
+            pp.set_cdr(new_v);
             value_to_gc_i64(Value::Unspecified)
         }
         _ => {
@@ -5904,11 +5911,11 @@ pub unsafe extern "C" fn vm_memq_gc(item: i64, lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 if cs_core::eq::eq(&needle, &car) {
                     return value_to_gc_i64(Value::Pair(p.clone()));
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -5935,9 +5942,9 @@ pub unsafe extern "C" fn vm_reverse_gc(r: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 acc = Value::Pair(cs_core::Pair::new(car, acc));
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             Value::Null => return value_to_gc_i64(acc),
@@ -7386,7 +7393,7 @@ pub unsafe extern "C" fn vm_last_pair_gc(lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.cdr();
                 if !matches!(cdr, Value::Pair(_)) {
                     return value_to_gc_i64(Value::Pair(p));
                 }
@@ -7415,9 +7422,9 @@ pub unsafe extern "C" fn vm_last_gc(lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.cdr();
                 if matches!(cdr, Value::Null) {
-                    return value_to_gc_i64(p.car.borrow().clone());
+                    return value_to_gc_i64(p.car());
                 }
                 if !matches!(cdr, Value::Pair(_)) {
                     // Improper tail — deopt and let the VM raise.
@@ -7451,15 +7458,15 @@ pub unsafe extern "C" fn vm_concatenate_gc(lists: i64) -> i64 {
         match outer {
             Value::Null => break,
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 let mut inner = car;
                 loop {
                     match inner {
                         Value::Null => break,
                         Value::Pair(ip) => {
-                            items.push(ip.car.borrow().clone());
-                            inner = ip.cdr.borrow().clone();
+                            items.push(ip.car());
+                            inner = ip.cdr();
                         }
                         _ => {
                             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
@@ -7507,13 +7514,13 @@ fn jit_list_classify(v: &Value) -> Option<bool> {
         match fast {
             Value::Null => return Some(true),
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 match next {
                     Value::Null => return Some(true),
                     Value::Pair(p2) => {
-                        let next2 = p2.cdr.borrow().clone();
+                        let next2 = p2.cdr();
                         slow = match slow {
-                            Value::Pair(sp) => sp.cdr.borrow().clone(),
+                            Value::Pair(sp) => sp.cdr(),
                             _ => return Some(true),
                         };
                         fast = next2;
@@ -7618,8 +7625,8 @@ pub unsafe extern "C" fn vm_take_gc(lst: i64, n: i64) -> i64 {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 taken.push(car);
                 cur = cdr;
                 i += 1;
@@ -7659,7 +7666,7 @@ pub unsafe extern "C" fn vm_drop_gc(lst: i64, n: i64) -> i64 {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.cdr();
                 cur = cdr;
                 i += 1;
             }
@@ -8187,8 +8194,8 @@ pub unsafe extern "C" fn vm_string_join_gc(parts: i64, sep: i64) -> i64 {
         match cur {
             Value::Null => break,
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 match car {
                     Value::String(s) => strs.push(s.borrow().clone()),
                     _ => {
@@ -8721,7 +8728,7 @@ pub unsafe extern "C" fn vm_vector_to_string_slice_gc(v: i64, start: i64, end: i
 pub unsafe extern "C" fn vm_pair_car(pair: i64) -> i64 {
     let v = unsafe { i64_to_value(pair, JIT_RT_ANY) };
     match v {
-        Value::Pair(p) => value_to_any_i64(p.car.borrow().clone()),
+        Value::Pair(p) => value_to_any_i64(p.car()),
         other => panic!("vm_pair_car: not a pair ({})", other.type_name()),
     }
 }
@@ -8732,7 +8739,7 @@ pub unsafe extern "C" fn vm_pair_car(pair: i64) -> i64 {
 pub unsafe extern "C" fn vm_pair_cdr(pair: i64) -> i64 {
     let v = unsafe { i64_to_value(pair, JIT_RT_ANY) };
     match v {
-        Value::Pair(p) => value_to_any_i64(p.cdr.borrow().clone()),
+        Value::Pair(p) => value_to_any_i64(p.cdr()),
         other => panic!("vm_pair_cdr: not a pair ({})", other.type_name()),
     }
 }
@@ -12676,8 +12683,8 @@ fn run_dispatch(
                             match cur {
                                 Value::Null => break,
                                 Value::Pair(pair) => {
-                                    spread.push(pair.car.borrow().clone());
-                                    cur = pair.cdr.borrow().clone();
+                                    spread.push(pair.car());
+                                    cur = pair.cdr();
                                 }
                                 other => {
                                     return Err(VmError::new(format!(
@@ -14121,8 +14128,8 @@ pub fn vm_call_sync(
                         match cur {
                             Value::Null => break,
                             Value::Pair(p) => {
-                                spread.push(p.car.borrow().clone());
-                                cur = p.cdr.borrow().clone();
+                                spread.push(p.car());
+                                cur = p.cdr();
                             }
                             other => {
                                 return Err(VmError::new(format!(
@@ -14873,8 +14880,8 @@ fn collect_proper_list(v: &Value) -> Result<Vec<Value>, VmError> {
         match cur {
             Value::Null => return Ok(out),
             Value::Pair(p) => {
-                out.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                out.push(p.car());
+                cur = p.cdr();
             }
             other => {
                 return Err(VmError::new(format!(
@@ -16391,8 +16398,8 @@ mod gc_helper_tests_extra {
         let back = unsafe { nb.to_value() };
         match back {
             Value::Pair(g) => {
-                let car = g.car.borrow().clone();
-                let cdr = g.cdr.borrow().clone();
+                let car = g.car();
+                let cdr = g.cdr();
                 match (&car, &cdr) {
                     (
                         Value::Number(cs_core::Number::Fixnum(a)),

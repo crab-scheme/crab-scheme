@@ -533,16 +533,16 @@ impl Runtime {
                 match cur {
                     Value::Null => return Ok(Value::Boolean(false)),
                     Value::Pair(p) => {
-                        let head = p.car.borrow().clone();
+                        let head = p.car();
                         match &head {
                             Value::Pair(pair) => {
-                                if pred(&pair.car.borrow(), key) {
+                                if pred(&pair.car(), key) {
                                     return Ok(head.clone());
                                 }
                             }
                             _ => return Err("assoc: list of pairs".into()),
                         }
-                        cur = p.cdr.borrow().clone();
+                        cur = p.cdr();
                     }
                     _ => return Err("assoc: proper list".into()),
                 }
@@ -559,10 +559,10 @@ impl Runtime {
                 match cur {
                     Value::Null => return Ok(Value::Boolean(false)),
                     Value::Pair(p) => {
-                        let head = p.car.borrow().clone();
+                        let head = p.car();
                         match &head {
                             Value::Pair(pair) => {
-                                let car = pair.car.borrow().clone();
+                                let car = pair.car();
                                 let r = cs_vm::vm::vm_call_sync(cmp, &[car, key.clone()], st)
                                     .map_err(|e| format!("{:?}", e))?;
                                 if r.is_truthy() {
@@ -571,7 +571,7 @@ impl Runtime {
                             }
                             _ => return Err("assoc: list of pairs".into()),
                         }
-                        cur = p.cdr.borrow().clone();
+                        cur = p.cdr();
                     }
                     _ => return Err("assoc: proper list".into()),
                 }
@@ -600,10 +600,10 @@ impl Runtime {
                 match cur.clone() {
                     Value::Null => return Ok(Value::Boolean(false)),
                     Value::Pair(p) => {
-                        if pred(&p.car.borrow(), obj) {
+                        if pred(&p.car(), obj) {
                             return Ok(cur);
                         }
-                        cur = p.cdr.borrow().clone();
+                        cur = p.cdr();
                     }
                     _ => return Err("member: proper list".into()),
                 }
@@ -620,13 +620,13 @@ impl Runtime {
                 match cur.clone() {
                     Value::Null => return Ok(Value::Boolean(false)),
                     Value::Pair(p) => {
-                        let car = p.car.borrow().clone();
+                        let car = p.car();
                         let r = cs_vm::vm::vm_call_sync(cmp, &[car, obj.clone()], st)
                             .map_err(|e| format!("{:?}", e))?;
                         if r.is_truthy() {
                             return Ok(cur);
                         }
-                        cur = p.cdr.borrow().clone();
+                        cur = p.cdr();
                     }
                     _ => return Err("member: proper list".into()),
                 }
@@ -2221,8 +2221,8 @@ fn collect_list(v: &Value) -> Vec<Value> {
         match cur {
             Value::Null => return out,
             Value::Pair(p) => {
-                out.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                out.push(p.car());
+                cur = p.cdr();
             }
             other => {
                 out.push(other);

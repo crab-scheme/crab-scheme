@@ -2276,7 +2276,7 @@ fn b_list_p(args: &[Value]) -> Result<Value, String> {
     }
     fn step(v: &Value) -> Option<Value> {
         match v {
-            Value::Pair(p) => Some(p.cdr.borrow().clone()),
+            Value::Pair(p) => Some(p.cdr()),
             _ => None,
         }
     }
@@ -2353,7 +2353,7 @@ fn b_car(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("car", "1", args.len()));
     }
     match &args[0] {
-        Value::Pair(p) => Ok(p.car.borrow().clone()),
+        Value::Pair(p) => Ok(p.car()),
         v => Err(type_err("car", "pair", v)),
     }
 }
@@ -2363,7 +2363,7 @@ fn b_cdr(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("cdr", "1", args.len()));
     }
     match &args[0] {
-        Value::Pair(p) => Ok(p.cdr.borrow().clone()),
+        Value::Pair(p) => Ok(p.cdr()),
         v => Err(type_err("cdr", "pair", v)),
     }
 }
@@ -2379,8 +2379,8 @@ fn cxr_apply(name: &str, ops: &str, mut v: Value) -> Result<Value, String> {
     // Right-to-left: caXr means apply X first, then car at the end.
     for c in ops.chars().rev() {
         v = match (c, &v) {
-            ('a', Value::Pair(p)) => p.car.borrow().clone(),
-            ('d', Value::Pair(p)) => p.cdr.borrow().clone(),
+            ('a', Value::Pair(p)) => p.car(),
+            ('d', Value::Pair(p)) => p.cdr(),
             (_, other) => return Err(type_err(name, "pair", other)),
         };
     }
@@ -2436,9 +2436,18 @@ fn b_set_car(args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Pair(p) => {
-            *p.car.borrow_mut() = args[1].clone();
+            p.set_car(args[1].clone());
             #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(p, |_| {
+                // Iter 7.1: cycle detector fires; record but do
+                // NOT call break_car_cycle. The naive "demote
+                // freshly-mutated slot to Weak" break orphans
+                // values when the slot is the only strong holder
+                // (common with `(set-car! env (cons name val))`
+                // closures-over-env). The infrastructure
+                // (WeakValue, Pair tombstone slots, accessors)
+                // is in place for a smarter Bacon-Rajan-style
+                // break — see iter 7.1.x follow-up.
                 crate::countable_memory_cycle::record_cycle_detected();
             });
             Ok(Value::Unspecified)
@@ -2453,7 +2462,7 @@ fn b_set_cdr(args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Pair(p) => {
-            *p.cdr.borrow_mut() = args[1].clone();
+            p.set_cdr(args[1].clone());
             #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(p, |_| {
                 crate::countable_memory_cycle::record_cycle_detected();
@@ -2479,7 +2488,7 @@ fn b_length(args: &[Value]) -> Result<Value, String> {
             Value::Null => return Ok(Value::fixnum(n)),
             Value::Pair(p) => {
                 n += 1;
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             v => return Err(type_err("length", "proper list", &v)),
         }
@@ -2496,8 +2505,8 @@ fn b_reverse(args: &[Value]) -> Result<Value, String> {
         match cur {
             Value::Null => return Ok(acc),
             Value::Pair(p) => {
-                acc = Value::Pair(Pair::new(p.car.borrow().clone(), acc));
-                cur = p.cdr.borrow().clone();
+                acc = Value::Pair(Pair::new(p.car(), acc));
+                cur = p.cdr();
             }
             v => return Err(type_err("reverse", "proper list", &v)),
         }
@@ -2518,8 +2527,8 @@ fn b_append(args: &[Value]) -> Result<Value, String> {
             match cur {
                 Value::Null => break,
                 Value::Pair(p) => {
-                    items.push(p.car.borrow().clone());
-                    cur = p.cdr.borrow().clone();
+                    items.push(p.car());
+                    cur = p.cdr();
                 }
                 v => return Err(type_err("append", "proper list", &v)),
             }
@@ -2545,7 +2554,7 @@ fn b_list_tail(args: &[Value]) -> Result<Value, String> {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
                 i += 1;
             }
             _ => return Err("list-tail: index out of range".into()),
@@ -2560,7 +2569,7 @@ fn b_list_ref(args: &[Value]) -> Result<Value, String> {
     }
     let tail = b_list_tail(args)?;
     match tail {
-        Value::Pair(p) => Ok(p.car.borrow().clone()),
+        Value::Pair(p) => Ok(p.car()),
         _ => Err("list-ref: index out of range".into()),
     }
 }
@@ -2574,7 +2583,7 @@ fn b_list_set_bang(args: &[Value]) -> Result<Value, String> {
     let tail = b_list_tail(&args[..2])?;
     match tail {
         Value::Pair(p) => {
-            *p.car.borrow_mut() = args[2].clone();
+            p.set_car(args[2].clone());
             Ok(Value::Unspecified)
         }
         _ => Err("list-set!: index out of range".into()),
@@ -2871,12 +2880,12 @@ fn b_list_to_string(args: &[Value]) -> Result<Value, String> {
         match cur {
             Value::Null => return Ok(Value::string(s)),
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
+                let head = p.car();
                 match head {
                     Value::Character(c) => s.push(c),
                     other => return Err(type_err("list->string", "character", &other)),
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             v => return Err(type_err("list->string", "list of characters", &v)),
         }
@@ -3197,8 +3206,8 @@ fn b_apply(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         match cur {
             Value::Null => break,
             Value::Pair(p) => {
-                all.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                all.push(p.car());
+                cur = p.cdr();
             }
             v => return Err(type_err("apply", "proper list (last arg)", &v)),
         }
@@ -3253,8 +3262,8 @@ fn collect_proper_list(name: &str, v: &Value) -> Result<Vec<Value>, String> {
         match cur {
             Value::Null => return Ok(out),
             Value::Pair(p) => {
-                out.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                out.push(p.car());
+                cur = p.cdr();
             }
             other => return Err(type_err(name, "proper list", &other)),
         }
@@ -3769,10 +3778,10 @@ fn assoc_search_with(
         match cur {
             Value::Null => return Ok(Value::Boolean(false)),
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
+                let head = p.car();
                 match &head {
                     Value::Pair(pair) => {
-                        let car = pair.car.borrow().clone();
+                        let car = pair.car();
                         let r = apply_procedure(cmp, &[car, key.clone()], ctx)
                             .map_err(|d| format!("{:?}", d))?;
                         if r.is_truthy() {
@@ -3781,7 +3790,7 @@ fn assoc_search_with(
                     }
                     _ => return Err(type_err(name, "list of pairs", &head)),
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             other => return Err(type_err(name, "proper list", &other)),
         }
@@ -3813,16 +3822,16 @@ fn assoc_search(
         match cur {
             Value::Null => return Ok(Value::Boolean(false)),
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
+                let head = p.car();
                 match &head {
                     Value::Pair(pair) => {
-                        if pred(&pair.car.borrow(), key) {
+                        if pred(&pair.car(), key) {
                             return Ok(head.clone());
                         }
                     }
                     _ => return Err(type_err(name, "list of pairs", &head)),
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             other => return Err(type_err(name, "proper list", &other)),
         }
@@ -3854,13 +3863,13 @@ fn member_search_with(
         match cur {
             Value::Null => return Ok(Value::Boolean(false)),
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 let r = apply_procedure(cmp, &[car, obj.clone()], ctx)
                     .map_err(|d| format!("{:?}", d))?;
                 if r.is_truthy() {
                     return Ok(Value::Pair(p.clone()));
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             other => return Err(type_err(name, "proper list", &other)),
         }
@@ -3892,10 +3901,10 @@ fn member_search(
         match cur {
             Value::Null => return Ok(Value::Boolean(false)),
             Value::Pair(p) => {
-                if pred(&p.car.borrow(), obj) {
+                if pred(&p.car(), obj) {
                     return Ok(Value::Pair(p));
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             other => return Err(type_err(name, "proper list", &other)),
         }
@@ -4980,8 +4989,8 @@ pub fn render_condition(c: &Value, syms: &SymbolTable) -> String {
                             match cur {
                                 Value::Null => break,
                                 Value::Pair(p) => {
-                                    irritants.push(p.car.borrow().clone());
-                                    cur = p.cdr.borrow().clone();
+                                    irritants.push(p.car());
+                                    cur = p.cdr();
                                 }
                                 other => {
                                     irritants.push(other);
@@ -5697,8 +5706,8 @@ fn equal_hash_rec(v: &Value, acc: &mut u64) {
         }
         Value::Pair(p) => {
             mix(acc, 0x50);
-            equal_hash_rec(&p.car.borrow(), acc);
-            equal_hash_rec(&p.cdr.borrow(), acc);
+            equal_hash_rec(&p.car(), acc);
+            equal_hash_rec(&p.cdr(), acc);
         }
         Value::Vector(vc) => {
             mix(acc, 0x60);
@@ -6187,9 +6196,9 @@ fn b_last(args: &[Value]) -> Result<Value, String> {
     loop {
         match cur {
             Value::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.cdr();
                 if matches!(cdr, Value::Null) {
-                    return Ok(p.car.borrow().clone());
+                    return Ok(p.car());
                 }
                 cur = cdr;
             }
@@ -6207,7 +6216,7 @@ fn b_last_pair(args: &[Value]) -> Result<Value, String> {
     loop {
         match cur {
             Value::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.cdr();
                 if !matches!(cdr, Value::Pair(_)) {
                     return Ok(Value::Pair(p));
                 }
@@ -6232,8 +6241,8 @@ fn b_take(args: &[Value]) -> Result<Value, String> {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                taken.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                taken.push(p.car());
+                cur = p.cdr();
                 i += 1;
             }
             _ => return Err("take: list shorter than n".into()),
@@ -6255,7 +6264,7 @@ fn b_drop(args: &[Value]) -> Result<Value, String> {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
                 i += 1;
             }
             _ => return Err("drop: list shorter than n".into()),
@@ -6555,12 +6564,12 @@ fn b_find_tail(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         match cur.clone() {
             Value::Null => return Ok(Value::Boolean(false)),
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 let r = apply_procedure(&pred, &[car], ctx).map_err(|e| e.message())?;
                 if r.is_truthy() {
                     return Ok(cur);
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             _ => return Err("find-tail: improper list".into()),
         }
@@ -6600,7 +6609,7 @@ fn b_pair_fold(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         match cur.clone() {
             Value::Null => return Ok(acc),
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 acc = apply_procedure(&kons, &[cur.clone(), acc], ctx).map_err(|e| e.message())?;
                 cur = next;
             }
@@ -6625,7 +6634,7 @@ fn b_pair_fold_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String>
             Value::Pair(_) => {
                 subs.push(cur.clone());
                 if let Value::Pair(p) = cur {
-                    cur = p.cdr.borrow().clone();
+                    cur = p.cdr();
                 }
             }
             _ => return Err("pair-fold-right: improper list".into()),
@@ -6650,7 +6659,7 @@ fn b_pair_for_each(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         match cur.clone() {
             Value::Null => return Ok(Value::Unspecified),
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 apply_procedure(&proc_val, &[cur.clone()], ctx).map_err(|e| e.message())?;
                 cur = next;
             }
@@ -9923,8 +9932,8 @@ fn b_alist_copy(args: &[Value]) -> Result<Value, String> {
     for e in entries {
         match &e {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 out.push(Value::Pair(cs_core::Pair::new(car, cdr)));
             }
             _ => return Err(type_err("alist-copy", "pair", &e)),
@@ -10026,14 +10035,14 @@ fn list_classify(v: &Value) -> Option<bool> {
         match fast {
             Value::Null => return Some(true),
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 match next {
                     Value::Null => return Some(true),
                     Value::Pair(p2) => {
-                        let next2 = p2.cdr.borrow().clone();
+                        let next2 = p2.cdr();
                         // advance slow once.
                         slow = match slow {
-                            Value::Pair(sp) => sp.cdr.borrow().clone(),
+                            Value::Pair(sp) => sp.cdr(),
                             _ => return Some(true),
                         };
                         fast = next2;
@@ -10138,12 +10147,12 @@ fn b_circular_list(args: &[Value]) -> Result<Value, String> {
     let mut cur = head.clone();
     loop {
         let next = match &cur {
-            Value::Pair(p) => p.cdr.borrow().clone(),
+            Value::Pair(p) => p.cdr(),
             _ => return Err("circular-list: internal error — not a pair".into()),
         };
         if matches!(next, Value::Null) {
             if let Value::Pair(p) = &cur {
-                *p.cdr.borrow_mut() = head.clone();
+                p.set_cdr(head.clone());
             }
             break;
         }
@@ -10225,8 +10234,8 @@ fn b_alist_to_hashtable(args: &[Value]) -> Result<Value, String> {
     for entry in items {
         match entry {
             Value::Pair(p) => {
-                let k = p.car.borrow().clone();
-                let v = p.cdr.borrow().clone();
+                let k = p.car();
+                let v = p.cdr();
                 h.items.borrow_mut().push((k, v));
             }
             other => {
@@ -11003,8 +11012,8 @@ fn b_list_copy(args: &[Value]) -> Result<Value, String> {
     let tail = loop {
         match cur {
             Value::Pair(p) => {
-                elems.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                elems.push(p.car());
+                cur = p.cdr();
             }
             other => break other,
         }
@@ -11978,7 +11987,7 @@ fn b_make_enumeration(args: &[Value]) -> Result<Value, String> {
         match cur {
             Value::Null => break,
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 match &car {
                     Value::Symbol(_) => universe.push(car.clone()),
                     other => {
@@ -11988,7 +11997,7 @@ fn b_make_enumeration(args: &[Value]) -> Result<Value, String> {
                         ));
                     }
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             v => {
                 return Err(type_err("make-enumeration", "list of symbols", &v));
@@ -12088,7 +12097,7 @@ fn b_enum_set_constructor(args: &[Value]) -> Result<Value, String> {
             match cur {
                 Value::Null => break,
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
+                    let car = p.car();
                     match &car {
                         Value::Symbol(s) => match symbols.iter().position(|p| p == s) {
                             Some(i) => bits |= 1i64 << i,
@@ -12098,7 +12107,7 @@ fn b_enum_set_constructor(args: &[Value]) -> Result<Value, String> {
                         },
                         v => return Err(type_err("constructor", "symbol", v)),
                     }
-                    cur = p.cdr.borrow().clone();
+                    cur = p.cdr();
                 }
                 v => return Err(type_err("constructor", "list of symbols", &v)),
             }
@@ -12493,8 +12502,8 @@ fn collect_field_spec(v: &Value) -> Option<Vec<Value>> {
         match cur {
             Value::Null => return Some(out),
             Value::Pair(p) => {
-                out.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                out.push(p.car());
+                cur = p.cdr();
             }
             _ => return None,
         }

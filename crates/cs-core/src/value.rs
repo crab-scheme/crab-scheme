@@ -14,10 +14,34 @@ use crate::symbol::{Symbol, SymbolTable};
 use cs_gc::cycle::CycleVisit as _;
 
 /// A pair (cons cell). Mutable per R6RS via `set-car!` / `set-cdr!`.
+///
+/// # Cycle-break tombstones (countable-memory iter 7.1)
+///
+/// Under `feature = "countable-memory"`, `car_weak` / `cdr_weak`
+/// are weak-reference tombstones. The mutation cycle detector
+/// in `cs-runtime` flips a slot from strong to weak via
+/// [`break_car_cycle`]/[`break_cdr_cycle`]: the strong `Value`
+/// gets replaced with `Unspecified` and a `WeakValue` referring
+/// to the same allocation is parked in the tombstone. Reads via
+/// the [`car`]/[`cdr`] accessors transparently `upgrade()` the
+/// tombstone, so the user-observable cyclic structure stays
+/// intact (R6RS requires `(set-cdr! x x)` to produce an
+/// observable cyclic list); but the strong-count chain is
+/// broken so refcount reclaims the cycle when no other strong
+/// reference remains.
+///
+/// Direct field access to `.car`/`.cdr` is preserved for
+/// backward compatibility with code paths that don't need to
+/// observe broken cycles (the strong slot is `Unspecified` for
+/// such cells). New code should prefer the accessors.
 #[derive(Debug)]
 pub struct Pair {
     pub car: RefCell<Value>,
     pub cdr: RefCell<Value>,
+    #[cfg(feature = "countable-memory")]
+    car_weak: RefCell<Option<WeakValue>>,
+    #[cfg(feature = "countable-memory")]
+    cdr_weak: RefCell<Option<WeakValue>>,
 }
 
 impl Pair {
@@ -25,7 +49,163 @@ impl Pair {
         cs_gc::Gc::new(Pair {
             car: RefCell::new(car),
             cdr: RefCell::new(cdr),
+            #[cfg(feature = "countable-memory")]
+            car_weak: RefCell::new(None),
+            #[cfg(feature = "countable-memory")]
+            cdr_weak: RefCell::new(None),
         })
+    }
+
+    /// Read the car as a `Value`. Under countable-memory, an
+    /// upgraded weak tombstone takes precedence over the strong
+    /// slot — so broken cycles still produce the user-observable
+    /// cyclic value as long as some other strong reference
+    /// holds the target alive. Returns `Value::Unspecified` if
+    /// the tombstone target has been fully reclaimed.
+    pub fn car(&self) -> Value {
+        #[cfg(feature = "countable-memory")]
+        {
+            if let Some(w) = self.car_weak.borrow().as_ref() {
+                return w.upgrade().unwrap_or(Value::Unspecified);
+            }
+        }
+        self.car.borrow().clone()
+    }
+
+    /// Read the cdr as a `Value`. See [`car`] for the
+    /// tombstone semantics.
+    pub fn cdr(&self) -> Value {
+        #[cfg(feature = "countable-memory")]
+        {
+            if let Some(w) = self.cdr_weak.borrow().as_ref() {
+                return w.upgrade().unwrap_or(Value::Unspecified);
+            }
+        }
+        self.cdr.borrow().clone()
+    }
+
+    /// Replace the car slot with `v`. Clears any weak tombstone
+    /// (the new value is unambiguously strong).
+    pub fn set_car(&self, v: Value) {
+        #[cfg(feature = "countable-memory")]
+        {
+            self.car_weak.replace(None);
+        }
+        self.car.replace(v);
+    }
+
+    /// Replace the cdr slot with `v`. Clears any weak tombstone.
+    pub fn set_cdr(&self, v: Value) {
+        #[cfg(feature = "countable-memory")]
+        {
+            self.cdr_weak.replace(None);
+        }
+        self.cdr.replace(v);
+    }
+
+    /// Cycle-break action for the car slot. Downgrades the
+    /// current strong `Value` to a `WeakValue`, parks it in
+    /// `car_weak`, and replaces the strong slot with
+    /// `Unspecified`. No-op if the current car is a leaf value
+    /// (no heap pointer to downgrade).
+    ///
+    /// **Not currently called by the runtime.** The iter-7.1
+    /// naive demote orphans values when the freshly-mutated
+    /// slot is the only strong holder of the value being
+    /// demoted (the `(set-car! env (cons name val))`
+    /// closures-over-env pattern, where the cons cell has no
+    /// external strong references). A future iter wires a
+    /// Bacon-Rajan-style trial-deletion break that picks a safe
+    /// cycle edge to weaken; until then, cycles detected by
+    /// the iter-7.1 detector are recorded in
+    /// `cs_runtime::countable_memory_cycle` but not
+    /// structurally broken (refcount leak persists).
+    #[cfg(feature = "countable-memory")]
+    #[allow(dead_code)]
+    pub fn break_car_cycle(&self) {
+        let val = self.car();
+        if let Some(weak) = WeakValue::from_value(&val) {
+            *self.car_weak.borrow_mut() = Some(weak);
+            *self.car.borrow_mut() = Value::Unspecified;
+        }
+    }
+
+    /// Cycle-break action for the cdr slot. See
+    /// [`break_car_cycle`].
+    #[cfg(feature = "countable-memory")]
+    #[allow(dead_code)]
+    pub fn break_cdr_cycle(&self) {
+        let val = self.cdr();
+        if let Some(weak) = WeakValue::from_value(&val) {
+            *self.cdr_weak.borrow_mut() = Some(weak);
+            *self.cdr.borrow_mut() = Value::Unspecified;
+        }
+    }
+}
+
+/// Weak counterpart of [`Value`]'s heap-bearing variants, used by
+/// the cycle-break tombstone machinery on [`Pair`]. Each variant
+/// mirrors a `Value::*` heap variant with the underlying smart-
+/// pointer downgraded.
+///
+/// Only present under `feature = "countable-memory"`; the tracing
+/// path doesn't need this because the mark-sweep collector breaks
+/// cycles via slot-zeroing rather than weak-pointer storage.
+#[cfg(feature = "countable-memory")]
+#[derive(Debug, Clone)]
+pub enum WeakValue {
+    String(cs_gc::Weak<RefCell<String>>),
+    Pair(cs_gc::Weak<Pair>),
+    Vector(cs_gc::Weak<RefCell<Vec<Value>>>),
+    ByteVector(cs_gc::Weak<RefCell<Vec<u8>>>),
+    Hashtable(cs_gc::Weak<Hashtable>),
+    Port(cs_gc::Weak<Port>),
+    Promise(cs_gc::Weak<Promise>),
+    Procedure(std::rc::Weak<dyn Procedure>),
+}
+
+#[cfg(feature = "countable-memory")]
+impl WeakValue {
+    /// Construct a `WeakValue` from `v` if `v` carries a heap
+    /// pointer. Returns `None` for leaf values (Null, Boolean,
+    /// Fixnum, Character, Symbol, Eof, Unspecified, immediate
+    /// Numbers) — those don't need weak storage because they
+    /// have no allocation to leak.
+    pub fn from_value(v: &Value) -> Option<Self> {
+        match v {
+            Value::String(s) => Some(WeakValue::String(cs_gc::Gc::downgrade(s))),
+            Value::Pair(p) => Some(WeakValue::Pair(cs_gc::Gc::downgrade(p))),
+            Value::Vector(v) => Some(WeakValue::Vector(cs_gc::Gc::downgrade(v))),
+            Value::ByteVector(b) => Some(WeakValue::ByteVector(cs_gc::Gc::downgrade(b))),
+            Value::Hashtable(h) => Some(WeakValue::Hashtable(cs_gc::Gc::downgrade(h))),
+            Value::Port(p) => Some(WeakValue::Port(cs_gc::Gc::downgrade(p))),
+            Value::Promise(p) => Some(WeakValue::Promise(cs_gc::Gc::downgrade(p))),
+            Value::Procedure(p) => Some(WeakValue::Procedure(Rc::downgrade(p))),
+            // Leaf values — no heap allocation to weaken.
+            Value::Null
+            | Value::Unspecified
+            | Value::Eof
+            | Value::Boolean(_)
+            | Value::Character(_)
+            | Value::Symbol(_)
+            | Value::Number(_) => None,
+        }
+    }
+
+    /// Attempt to upgrade this weak handle back to a strong
+    /// `Value`. Returns `None` if the underlying allocation has
+    /// been reclaimed (the cycle has been fully broken).
+    pub fn upgrade(&self) -> Option<Value> {
+        match self {
+            WeakValue::String(w) => w.upgrade().map(Value::String),
+            WeakValue::Pair(w) => w.upgrade().map(Value::Pair),
+            WeakValue::Vector(w) => w.upgrade().map(Value::Vector),
+            WeakValue::ByteVector(w) => w.upgrade().map(Value::ByteVector),
+            WeakValue::Hashtable(w) => w.upgrade().map(Value::Hashtable),
+            WeakValue::Port(w) => w.upgrade().map(Value::Port),
+            WeakValue::Promise(w) => w.upgrade().map(Value::Promise),
+            WeakValue::Procedure(w) => w.upgrade().map(Value::Procedure),
+        }
     }
 }
 
@@ -40,11 +220,19 @@ impl cs_gc::Trace for Pair {
 #[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Pair {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
-        self.car.borrow().visit_children(ctx);
+        // Walk via the accessors so the detector observes the
+        // user-visible cyclic structure even after a previous
+        // break_*_cycle has tombstoned the strong slot. The
+        // upgraded weak still represents the cycle from the
+        // user's perspective; if a new mutation reconstructs
+        // the cycle, the detector should still fire.
+        let car = self.car();
+        let cdr = self.cdr();
+        car.visit_children(ctx);
         if ctx.done() {
             return;
         }
-        self.cdr.borrow().visit_children(ctx);
+        cdr.visit_children(ctx);
     }
 }
 
@@ -671,8 +859,8 @@ fn write_pair_inner(
 ) -> fmt::Result {
     write!(out, "(")?;
     let mut first = true;
-    let mut cur_car = p.car.borrow().clone();
-    let mut cur_cdr = p.cdr.borrow().clone();
+    let mut cur_car = p.car();
+    let mut cur_cdr = p.cdr();
     loop {
         if !first {
             write!(out, " ")?;
@@ -687,8 +875,8 @@ fn write_pair_inner(
                     write!(out, " . #<cycle>")?;
                     break;
                 }
-                cur_car = next.car.borrow().clone();
-                cur_cdr = next.cdr.borrow().clone();
+                cur_car = next.car();
+                cur_cdr = next.cdr();
             }
             other => {
                 write!(out, " . ")?;
@@ -774,8 +962,8 @@ impl fmt::Display for Value {
 fn display_pair(f: &mut fmt::Formatter<'_>, p: &Pair) -> fmt::Result {
     write!(f, "(")?;
     let mut first = true;
-    let mut cur_car = p.car.borrow().clone();
-    let mut cur_cdr = p.cdr.borrow().clone();
+    let mut cur_car = p.car();
+    let mut cur_cdr = p.cdr();
     loop {
         if !first {
             write!(f, " ")?;
@@ -785,8 +973,8 @@ fn display_pair(f: &mut fmt::Formatter<'_>, p: &Pair) -> fmt::Result {
         match cur_cdr {
             Value::Null => break,
             Value::Pair(next) => {
-                cur_car = next.car.borrow().clone();
-                cur_cdr = next.cdr.borrow().clone();
+                cur_car = next.car();
+                cur_cdr = next.cdr();
             }
             other => {
                 write!(f, " . {}", other)?;
