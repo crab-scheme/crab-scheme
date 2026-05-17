@@ -33,14 +33,23 @@
 //! on region-allocated handles. The count does NOT drive
 //! reclamation — the region's bulk free runs regardless.
 //!
-//! # Debug-mode validity (iter 3)
+//! # Validity check (iter 3 + Gap E-6)
 //!
-//! Iter 3 of the region-memory spec adds a thread-local
-//! `LIVE_REGION_IDS` set: every `Gc<T>` dereference (under
-//! `cfg(debug_assertions)`) checks that the region the value
-//! was allocated from is still alive. Use-after-region-drop
-//! panics with a clear diagnostic in dev builds; in release
-//! it's UB.
+//! A thread-local `LIVE_REGION_IDS` set: every Region-arm
+//! `Gc<T>` operation (`Clone`, `Deref`, `strong_count`)
+//! checks that the region the value was allocated from is
+//! still alive. Use-after-region-drop panics with a clear
+//! diagnostic.
+//!
+//! Iter 3 originally gated this check on
+//! `#[cfg(debug_assertions)]` and accepted release-mode UB.
+//! Gap E-6 closed that window: the check runs unconditionally
+//! in every build. Cost is one HashSet lookup per Region-arm
+//! Deref (~5ns on a warm cache). The trade-off is favourable —
+//! protecting against UB in production is worth ~5ns/deref,
+//! and layer-5 escape analysis (when fully wired) eliminates
+//! the path entirely for compiled programs (all Region
+//! allocations become statically safe).
 //!
 //! # Status
 //!
@@ -139,26 +148,24 @@ impl Default for Region {
 thread_local! {
     /// Set of `RegionId`s for regions currently alive on this
     /// thread. `Region::new` inserts; `Region::Drop` removes
-    /// **before** the underlying Bump arena frees, so debug-
-    /// mode region-validity checks in `Gc<T>` methods can
-    /// detect use-after-region-drop.
-    ///
-    /// Used only under `#[cfg(debug_assertions)]` for the
-    /// validity check; updated unconditionally so the test
-    /// suite can interrogate it.
+    /// **before** the underlying Bump arena frees, so the
+    /// validity check in `Gc<T>` methods can detect
+    /// use-after-region-drop.
     static LIVE_REGION_IDS: RefCell<HashSet<RegionId>> = RefCell::new(HashSet::new());
 }
 
-/// Debug-mode check that `region_id` corresponds to a region
-/// currently alive on this thread. Panics with a clear
-/// diagnostic if not.
+/// Check that `region_id` corresponds to a region currently
+/// alive on this thread. Panics with a clear diagnostic if
+/// not.
 ///
-/// In release builds this compiles to nothing — correctness
-/// relies on layer-5 escape analysis (or manual region
-/// discipline) ensuring no `Gc<T>` outlives its region.
+/// **Gap E-6:** runs unconditionally in every build (debug
+/// and release) — protecting against use-after-region-drop
+/// UB in production is worth the ~5ns/deref cost. Layer-5
+/// escape analysis, once fully wired, eliminates this path
+/// for compiled programs (all `Gc::new_in` sites become
+/// statically safe).
 #[inline]
 pub(crate) fn assert_region_live(region_id: RegionId) {
-    #[cfg(debug_assertions)]
     LIVE_REGION_IDS.with(|s| {
         if !s.borrow().contains(&region_id) {
             panic!(
@@ -167,8 +174,6 @@ pub(crate) fn assert_region_live(region_id: RegionId) {
             );
         }
     });
-    #[cfg(not(debug_assertions))]
-    let _ = region_id;
 }
 
 /// `true` if `region_id` is currently alive on this thread.

@@ -141,17 +141,15 @@ fn region_drop_does_not_run_payload_drop() {
     assert_eq!(counter.get(), 0);
 }
 
-/// Debug-mode validity: dropping a region while a handle is
-/// still outstanding, then touching the handle, must panic
-/// with a clear diagnostic. Only meaningful under
-/// `cfg(debug_assertions)` — in release the check is
-/// compiled out (the design accepts UB in release in
-/// exchange for zero overhead; layer-5 escape analysis
-/// guarantees safety for compiled programs).
+/// Validity: dropping a region while a handle is still
+/// outstanding, then touching the handle, must panic with a
+/// clear diagnostic. **Gap E-6:** the check now runs
+/// unconditionally in both debug and release builds — the
+/// per-deref HashSet lookup cost is worth eliminating
+/// release-mode use-after-region-drop UB.
 #[test]
-#[cfg(debug_assertions)]
 #[should_panic(expected = "use-after-region-drop")]
-fn region_drop_releases_outstanding_handles_debug() {
+fn region_drop_releases_outstanding_handles() {
     let g = {
         let region = Region::new();
         Gc::new_in(&region, 42_i64)
