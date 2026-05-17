@@ -1,0 +1,14 @@
+[package]
+name = "cs-typer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "Optional/gradual type checker for CrabScheme (Typed Racket-inspired)."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-diag = { workspace = true }
+cs-ir = { workspace = true }
+cs-rir = { workspace = true }
