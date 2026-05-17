@@ -48,7 +48,15 @@ impl Runtime {
         // outlives the closure call below.
         let prev_heap = cs_vm::vm::current_jit_active_heap();
         unsafe { cs_vm::vm::set_jit_active_heap(&self.heap as *const cs_gc::Heap) };
+        // B1 (BEAM runtime spec): install this Runtime's Heap as the
+        // thread's active gc-stats target. cs_gc::Gc::new now bumps
+        // the active Heap's counters instead of a process-global
+        // static; without this hookup every `(gc-stats)` reading
+        // would report zero. The guard pops the previous active
+        // Heap (typically None) on scope exit.
+        let _gc_stats_guard = self.heap.activate();
         let result = f(self);
+        drop(_gc_stats_guard);
         // Restore previous heap pointer (typically null) so nested
         // with_active calls work correctly.
         unsafe { cs_vm::vm::set_jit_active_heap(prev_heap) };
