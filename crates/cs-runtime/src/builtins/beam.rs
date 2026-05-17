@@ -374,14 +374,69 @@ impl ProcedureRegistry {
 
 /// `(spawn 'name args...)` — look up the named entry in the
 /// procedure registry and spawn an actor that runs it.
+///
+/// The spawned thread installs an [`ActorContext`] for its
+/// lifetime so per-actor Scheme builtins (`(self)`,
+/// `(raw-receive)`) can find the current [`cs_actor::Actor`]
+/// without it being plumbed through every call.
 pub fn primop_spawn(name: &str, args: Vec<SendableValue>) -> Result<ActorPid, String> {
     let st = beam_state();
     let entry = st
         .procs
         .lookup(name)
         .ok_or_else(|| format!("spawn: no procedure registered under {:?}", name))?;
-    let actor_ref = st.actors.spawn(move |actor| entry(actor, args));
+    let actor_ref = st.actors.spawn(move |actor| {
+        // Hold a raw pointer to `actor` for the duration of the
+        // body so the (self) / (raw-receive) Scheme builtins can
+        // reach it via ACTOR_CTX. Safety: the pointer lives only
+        // on this blocking thread, and the Guard clears it before
+        // the closure returns (or unwinds), so a thread-pool
+        // worker reused for a later actor never sees a stale ptr.
+        let ptr: *mut cs_actor::Actor = actor;
+        ACTOR_CTX.with(|c| c.set(ptr));
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
+            }
+        }
+        let _g = Guard;
+        entry(actor, args);
+    });
     Ok(actor_ref.pid())
+}
+
+// ============================================================
+// ActorContext — thread-local pointer to the currently-running
+// Actor. Lets per-actor Scheme builtins ((self), (raw-receive))
+// find their context without it being threaded through every
+// builtin signature.
+// ============================================================
+
+std::thread_local! {
+    static ACTOR_CTX: std::cell::Cell<*mut cs_actor::Actor> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Run `f` with a `&mut` reference to the currently-running
+/// Actor. Returns `None` if we're not inside an actor body —
+/// i.e., the call site is from top-level Scheme rather than a
+/// spawned actor. Callers surface that as a Scheme error.
+pub fn with_current_actor<R>(f: impl FnOnce(&mut cs_actor::Actor) -> R) -> Option<R> {
+    ACTOR_CTX.with(|c| {
+        let p = c.get();
+        if p.is_null() {
+            None
+        } else {
+            // Safety: ACTOR_CTX is set only by primop_spawn for the
+            // lifetime of the body closure on this thread, and is
+            // cleared by the Drop guard before the closure
+            // returns/unwinds. The pointer never crosses thread
+            // boundaries (thread_local). The Actor outlives every
+            // borrow we take here.
+            Some(f(unsafe { &mut *p }))
+        }
+    })
 }
 
 /// `(send pid v)` — deliver `v` to the actor identified by `pid`.
@@ -726,6 +781,46 @@ pub fn b_beam_spawn(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Str
     Ok(from_sendable(&SendableValue::Pid(pid), syms))
 }
 
+/// `(self)` — return the calling actor's PID as a symbol.
+/// Errors if called from outside an actor body.
+pub fn b_beam_self(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(format!("self: expected 0 arguments, got {}", args.len()));
+    }
+    let pid = with_current_actor(|a| a.self_ref().pid())
+        .ok_or_else(|| "self: not inside an actor body".to_string())?;
+    Ok(from_sendable(&SendableValue::Pid(pid), syms))
+}
+
+/// `(raw-receive)` blocks until a message arrives;
+/// `(raw-receive timeout-ms)` returns `#f` if the deadline
+/// passes without one. System messages (Exit/Down) surface as
+/// tagged lists the Scheme `(receive)` macro can pattern-match.
+pub fn b_beam_raw_receive(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    let timeout_ms = match args.len() {
+        0 => None,
+        1 => match &args[0] {
+            Value::Boolean(false) => None,
+            Value::Number(Number::Fixnum(n)) if *n >= 0 => Some(*n as u64),
+            other => {
+                return Err(format!(
+                    "raw-receive: timeout must be #f or a non-negative integer, got {}",
+                    other.type_name()
+                ))
+            }
+        },
+        n => return Err(format!("raw-receive: expected 0 or 1 arguments, got {}", n)),
+    };
+
+    let outcome = with_current_actor(|a| primop_raw_receive(a, timeout_ms))
+        .ok_or_else(|| "raw-receive: not inside an actor body".to_string())??;
+
+    match outcome {
+        Some(sv) => Ok(from_sendable(&sv, syms)),
+        None => Ok(Value::Boolean(false)),
+    }
+}
+
 /// The list of Scheme-facing BEAM builtins, in the
 /// `(name, fn)` shape `syms_builtins()` accepts. cs-runtime
 /// merges this into its `install_into` registration loop when
@@ -737,6 +832,8 @@ pub fn beam_syms_builtins() -> Vec<(
     vec![
         ("send", b_beam_send),
         ("spawn", b_beam_spawn),
+        ("self", b_beam_self),
+        ("raw-receive", b_beam_raw_receive),
         ("make-table", b_beam_make_table),
         ("table-insert!", b_beam_table_insert),
         ("table-lookup", b_beam_table_lookup),

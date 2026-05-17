@@ -140,6 +140,138 @@ fn make_table_rejects_unknown_type() {
 }
 
 #[test]
+fn self_outside_actor_errors() {
+    let mut rt = Runtime::new();
+    let err = rt
+        .eval_str("<t>", r#"(self)"#)
+        .expect_err("self from top-level should fail");
+    let formatted = format!("{}", err);
+    assert!(
+        formatted.contains("not inside an actor"),
+        "got: {}",
+        formatted
+    );
+}
+
+#[test]
+fn raw_receive_outside_actor_errors() {
+    let mut rt = Runtime::new();
+    let err = rt
+        .eval_str("<t>", r#"(raw-receive)"#)
+        .expect_err("raw-receive from top-level should fail");
+    let formatted = format!("{}", err);
+    assert!(
+        formatted.contains("not inside an actor"),
+        "got: {}",
+        formatted
+    );
+}
+
+#[test]
+fn raw_receive_bad_timeout_errors() {
+    use cs_runtime::builtins::beam::beam_state;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    // Register a proc that tries (raw-receive 'oops) inside an
+    // actor body — the bad timeout should surface as an error.
+    let err_msg: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let err_clone = err_msg.clone();
+    beam_state().procs.register(
+        "test:bad-timeout-actor",
+        Arc::new(move |_actor, _args| {
+            // The Scheme body runs in *this* thread (the actor's
+            // tokio blocking worker). We don't have a Runtime in
+            // scope here; for the purposes of *this* assertion we
+            // can drive the Scheme builtin via the with_current_actor
+            // path indirectly by constructing a transient Runtime
+            // pinned to this thread. That mirrors the real path that
+            // an actor body running compiled Scheme would follow.
+            let mut rt = cs_runtime::Runtime::new();
+            let r = rt.eval_str("<t>", r#"(raw-receive 'oops)"#);
+            *err_clone.lock().unwrap() = Some(format!("{:?}", r.err()));
+        }),
+    );
+
+    let _pid = cs_runtime::builtins::beam::primop_spawn("test:bad-timeout-actor", vec![]).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while err_msg.lock().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            panic!("bad-timeout actor never finished");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let s = err_msg.lock().unwrap().clone().unwrap();
+    assert!(s.contains("timeout") || s.contains("must be"), "got: {}", s);
+}
+
+#[test]
+fn all_scheme_actor_body_self_send_receive() {
+    use cs_runtime::builtins::beam::{beam_state, primop_send, SendableValue};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    // The actor body is entirely Scheme: it calls (self) to get
+    // its PID, receives one message, and writes its own PID and
+    // the received message into a shared slot so the test can
+    // verify all three primops (self, raw-receive, and the
+    // surrounding ActorContext install) work end-to-end.
+    let result: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+    let result_clone = result.clone();
+    beam_state().procs.register(
+        "test:scheme-body-self-receive",
+        Arc::new(move |_actor, _args| {
+            // A fresh Runtime per spawn (each actor has its own
+            // Heap, matching the spec's per-actor Heap model).
+            let mut rt = cs_runtime::Runtime::new();
+            let me = rt.eval_str("<t>", "(self)").expect("self inside actor");
+            let msg = rt
+                .eval_str("<t>", "(raw-receive)")
+                .expect("raw-receive inside actor");
+            let me_s = rt.format_value(&me, cs_core::WriteMode::Display);
+            let msg_s = rt.format_value(&msg, cs_core::WriteMode::Display);
+            *result_clone.lock().unwrap() = Some((me_s, msg_s));
+        }),
+    );
+
+    let mut driver = Runtime::new();
+    let pid_val = driver
+        .eval_str("<t>", "(spawn 'test:scheme-body-self-receive)")
+        .expect("spawn");
+    let pid_display = disp(&driver, &pid_val);
+
+    // Use the Rust-side primop_send to deliver — we already
+    // covered the Scheme send path in another test, and this
+    // keeps the assertion focused on (self) + (raw-receive).
+    let target_pid = {
+        // Re-parse the symbol's name into ActorPid via the same
+        // logic the (send) builtin uses.
+        let inner = pid_display
+            .strip_prefix("<pid:<")
+            .and_then(|s| s.strip_suffix(">>"))
+            .unwrap();
+        let (n, l) = inner.split_once('.').unwrap();
+        cs_actor::ActorPid {
+            node: n.parse().unwrap(),
+            local_id: l.parse().unwrap(),
+        }
+    };
+    primop_send(target_pid, SendableValue::Symbol("payload".into())).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while result.lock().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            panic!("scheme actor body never finished");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let (me_s, msg_s) = result.lock().unwrap().clone().unwrap();
+    assert_eq!(me_s, pid_display, "(self) should match the spawn'd pid");
+    assert_eq!(msg_s, "payload");
+}
+
+#[test]
 fn spawn_registered_proc_round_trip() {
     use cs_runtime::builtins::beam::{beam_state, primop_send, primop_spawn, SendableValue};
     use std::sync::Arc;
