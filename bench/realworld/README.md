@@ -140,6 +140,87 @@ For now, `bytes_allocated_total` / `bytes/iter` are the meaningful
 columns — those track every `Gc::new` and `Heap::alloc` on the
 process-global counter.
 
+## Cross-impl correctness check
+
+Each bench's RESULT (independent of timing) is verified to match
+Chez Scheme via `check-result-vs-chez.sh`. Both engines run the
+same source file with a minimal "result-only" shim
+(`crab-shim.scm` / `chez-shim.scm`) that defines
+`(realworld-bench name params thunk)` to run the thunk once and
+`(write)` the result.
+
+```bash
+bench/realworld/check-result-vs-chez.sh             # all benches
+bench/realworld/check-result-vs-chez.sh --bench fib # one bench
+```
+
+Output shows shasums of each engine's stringified result + a
+MATCH/DIFFER status. Used as the Phase D correctness gate: a
+DIFFER means we computed a wrong answer relative to Chez (the
+reference R7RS implementation) and the bench needs investigation
+before its timing numbers are meaningful.
+
+## Bench coverage matrix
+
+Phase C + D ports as of 2026-05-17:
+
+| Bench           | Tier | Source           | Crab walker | Crab VM | Crab AOT | Chez result |
+|-----------------|------|------------------|-------------|---------|----------|-------------|
+| fib             | 1    | microbench       | (heavy)     | ok      | (Phase D follow-up) | match |
+| tak             | 1    | microbench       | (heavy)     | ok      | "        | match |
+| ack             | 1    | microbench       | (heavy)     | ok      | "        | match |
+| nqueens         | 1    | microbench       | (heavy)     | ok      | "        | match |
+| mandelbrot      | 1    | microbench       | (heavy)     | ok      | "        | match |
+| spectral-norm   | 1    | microbench       | (heavy)     | ok      | "        | match |
+| binary-trees    | 1    | microbench       | (heavy)     | ok      | "        | match |
+| alloc-stress    | 1    | microbench       | (heavy)     | ok      | "        | match |
+| maze            | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| lattice         | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| paraffins       | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| sboyer          | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| nboyer          | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| earley          | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+
+Walker "(heavy)" — runs, but the per-frame stack cost combined
+with our harness's let-heavy preamble blows the test-thread / CLI
+default stack on benches with deep recursion (which is most of
+them). Workaround: invoke from a larger-stack thread, like the
+`jit_conformance_cross_lambda_loop` test does. Tracked under the
+existing walker stack-discipline follow-up.
+
+AOT "(Phase D follow-up)" — AOT's primop subset doesn't yet
+include `(current-memory-use)` / `(gc-stats)` / `(collect-garbage)`,
+so the harness's timing loop won't run inside AOT-compiled code.
+Two paths to fix:
+1. Extend AOT's primop subset to call back into the runtime for
+   these (small wiring change in cs-aot).
+2. Compile only the bench's workload via AOT and have the
+   harness invoke it from VM-side timing wrappers (changes
+   runner.sh shape but no AOT changes needed).
+
+Plan: pick option 2 when we revisit AOT coverage.
+
+## Tier-2 ports that didn't land
+
+Source files from ecraven/r7rs-benchmarks that we attempted but
+parked due to CrabScheme subset limits:
+
+| Bench   | Blocker | Fix path |
+|---------|---------|----------|
+| gcbench | internal `define` inside a `let` body (the bench has `(let () (define-record-type ...) (define ...) (define ...) body)`). CrabScheme expander rejects the second `(define)` in expression position. | Extend the expander to body-position-hoist all internal defines in `(let)` and `(lambda)`, not just the leading one. R7RS allows this. |
+| mperm   | `(define (f . rest) ...)` rest-args dotted-pair shorthand in the placeholder definitions for `setup-boyer`. | Either teach the expander the shorthand, or rewrite manually to `(define f (lambda args ...))` like we did for nboyer. |
+| ray     | The bench's entry function writes to a file via `(tracer output-file res)` — not a pure thunk, doesn't fit our timing-loop shape. | Restructure to render into a string port instead, or skip and use a different Flonum-heavy bench. |
+| nucleic | not yet attempted (3500 LoC) — likely works but is large to vet. | Port in a follow-up; expected to be a clean Tier-2 row once vetted. |
+| peval   | not yet attempted — its input is a quoted lambda from stdin; needs to be embedded in the wrapper. | Port in a follow-up; mechanical, not blocked. |
+| compiler| not yet attempted (11k LoC) — likely hits multiple subset limits. | Defer; biggest bench, lowest ROI vs the others. |
+| conform | not attempted | follow-up |
+| dynamic | not attempted | follow-up |
+
+The first three (gcbench, mperm, ray) are concretely blocked by
+CrabScheme features rather than porting effort. Fixing the
+expander's internal-define handling and rest-args shorthand
+would unblock 2 of 3 — file as follow-up issues.
+
 ## Spec link
 
 See `docs/research/realworld_benchmarks_spec.md` for the full
