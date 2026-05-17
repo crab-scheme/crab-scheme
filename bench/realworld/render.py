@@ -82,6 +82,8 @@ def render(rows):
         "p99",
         "stddev",
         "bytes/iter",
+        "peak RSS",
+        "RSS growth",
         "GC%",
         "max pause",
         "status",
@@ -97,7 +99,7 @@ def render(rows):
         status = r.get("status", "ok")
         if status != "ok":
             # Error row — fill blanks.
-            cells = [bench, engine_tier, "-", "-", "-", "-", "-", "-", "-", "-", status]
+            cells = [bench, engine_tier] + ["-"] * (len(headers) - 3) + [status]
             print("| " + " | ".join(cells) + " |")
             continue
         wall = r.get("wall_time_seconds", {})
@@ -112,6 +114,16 @@ def render(rows):
         bpi = fmt_bytes(bytes_per)
         gc_pct = fmt_pct(mem.get("gc_time_pct", 0))
         max_pause = fmt_seconds(mem.get("max_pause_ms", 0) / 1000.0)
+        peak_rss = mem.get("peak_rss_bytes", 0)
+        peak_rss_s = fmt_bytes(peak_rss) if peak_rss else "-"
+        rss_growth = mem.get("rss_growth_bytes", 0)
+        # Signed display so leaks (positive growth) are obvious.
+        if rss_growth > 0:
+            rss_growth_s = "+" + fmt_bytes(rss_growth)
+        elif rss_growth < 0:
+            rss_growth_s = "-" + fmt_bytes(-rss_growth)
+        else:
+            rss_growth_s = "0"
         cells = [
             bench,
             engine_tier,
@@ -121,6 +133,8 @@ def render(rows):
             p99,
             stddev,
             bpi,
+            peak_rss_s,
+            rss_growth_s,
             gc_pct,
             max_pause,
             status,

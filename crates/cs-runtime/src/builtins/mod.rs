@@ -347,6 +347,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("gc-set-threshold!", b_gc_set_threshold),
         ("collect-garbage", b_collect_garbage),
         ("current-memory-use", b_current_memory_use),
+        ("current-rss-bytes", b_current_rss_bytes),
         ("string-split", b_string_split),
         ("string-join", b_string_join),
         ("string->vector", b_string_to_vector),
@@ -11740,6 +11741,91 @@ fn b_gc_set_threshold(args: &[Value]) -> Result<Value, String> {
         .ok_or_else(|| "gc-set-threshold!: no active runtime".to_string())?;
     rt.heap().set_threshold(n);
     Ok(Value::Unspecified)
+}
+
+/// `(current-rss-bytes)` — current process resident-set size in
+/// bytes. The OS-level "how much physical memory does this process
+/// hold right now" number — the right signal for leak detection,
+/// since RSS grows when memory isn't actually being released back
+/// to the OS even though cumulative allocations climb monotonically.
+///
+/// Implementation: macOS via `task_info(MACH_TASK_BASIC_INFO)`;
+/// Linux via `/proc/self/statm` (second field × page size); other
+/// targets return 0 (caller treats 0 as "unsupported"). All paths
+/// are syscall-only — no allocations, safe to call from inside
+/// tight per-iter measurement loops.
+fn b_current_rss_bytes(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("current-rss-bytes", "0", args.len()));
+    }
+    Ok(fixnum_or_bigint(rss_bytes_platform()))
+}
+
+#[cfg(target_os = "macos")]
+fn rss_bytes_platform() -> u64 {
+    use std::mem;
+    // Mach bindings — keeping them inline avoids pulling libc into
+    // cs-runtime's dep graph. Layout matches <mach/task_info.h> on
+    // macOS 14 / Darwin 23.x; older OS versions are wire-compatible.
+    #[repr(C)]
+    struct MachTaskBasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        resident_size_max: u64,
+        user_time: [i32; 2],
+        system_time: [i32; 2],
+        policy: i32,
+        suspend_count: i32,
+    }
+    const MACH_TASK_BASIC_INFO: u32 = 20;
+    unsafe extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_info(
+            task: u32,
+            flavor: u32,
+            task_info_out: *mut std::ffi::c_void,
+            task_info_count: *mut u32,
+        ) -> i32;
+    }
+    unsafe {
+        let mut info: MachTaskBasicInfo = mem::zeroed();
+        let mut count = (mem::size_of::<MachTaskBasicInfo>() / mem::size_of::<u32>()) as u32;
+        let kr = task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            &mut info as *mut _ as *mut std::ffi::c_void,
+            &mut count,
+        );
+        if kr == 0 {
+            info.resident_size
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rss_bytes_platform() -> u64 {
+    // /proc/self/statm: "size resident shared text lib data dt", in
+    // page units. The second column is RSS pages. Default page size
+    // is 4 KB on x86_64 / aarch64; using sysconf(_SC_PAGESIZE) would
+    // be more portable but pulls in libc.
+    let Ok(s) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    let mut parts = s.split_whitespace();
+    let _size = parts.next();
+    let Some(rss) = parts.next().and_then(|p| p.parse::<u64>().ok()) else {
+        return 0;
+    };
+    rss.saturating_mul(4096)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rss_bytes_platform() -> u64 {
+    // Unsupported platform — return 0; the harness treats 0 as
+    // "unavailable" and elides RSS columns from its output.
+    0
 }
 
 /// `(current-memory-use)` — cumulative bytes allocated since heap

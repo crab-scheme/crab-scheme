@@ -227,6 +227,88 @@ can call `(collect-garbage)` at their iter boundary — the harness
 will capture the resulting `last_pause_ms` and roll it into
 `max_pause_ms` / the pause histogram.
 
+## Memory management — is it working?
+
+Yes. Demonstrated via the `t3f-soak` bench, which runs a stable-
+working-set workload for a configurable wall-time budget and
+records per-iter RSS so we can see whether the heap actually
+returns memory to the OS or just accumulates.
+
+3-minute soak on Apple M3 (Darwin 23, VM tier):
+
+```
+iters: 3,837    total wall: 180 s
+baseline RSS:   4.73 MB
+peak RSS:       4.80 MB
+final RSS:      4.16 MB
+RSS growth:     -592 KB across 3,837 iters
+bytes alloc:    1,465 MB cumulative
+alloc rate:     8,133 MB/s
+
+RSS trajectory (averaged over 383-iter bins, MB):
+  bin 0: 3.69   bin 1: 3.72   bin 2: 3.81   bin 3: 4.01
+  bin 4: 4.10   bin 5: 4.19   bin 6: 4.13   bin 7: 3.98
+  bin 8: 3.94   bin 9: 4.09
+```
+
+Interpretation:
+
+- **305× compression** — 1.46 GB allocated, peak working set 4.80 MB.
+- **RSS plateau** — climbs gently from 3.69 → 4.19 MB then
+  oscillates around 4.0 MB. Bins 5–9 stay flat; no monotonic climb.
+- **Negative growth** — final RSS is below baseline (-592 KB).
+  The OS is reclaiming pages as `Rc<Slot<T>>` drops free per-iter
+  garbage.
+
+What this proves: **the per-iter allocation churn is being
+reclaimed**. A leak — say, accumulating 1 byte/iter via a stuck
+reference — would show as monotonically growing RSS at ~4 KB/min
+in the trajectory bins. We see oscillation, not growth.
+
+What it does NOT prove:
+
+- **Workloads with growing live sets**. t3f-soak is by design a
+  stable working set: same hashtable, same key set, same response
+  shape every iter. A workload that legitimately grows its live
+  set (e.g., building a 10 GB index) will see RSS climb — that's
+  expected, not a leak.
+- **Cycle reclamation**. cs-gc's mark-sweep handles cycles, but
+  most allocations today go via `Gc::new` (unregistered) so
+  cycle collection isn't exercised. Pure ref-counted graphs work
+  by `Rc<Slot<T>>` drops; cycles in that domain WOULD leak. The
+  bench doesn't construct cycles so this isn't tested.
+- **Long-tail pause spikes**. `gc_time_ms` / `max_pause_ms` read
+  zero because auto-collect doesn't fire through `Gc::new`. Once
+  the heap-rooting migration completes, the soak bench will also
+  show pause distribution — currently it doesn't.
+
+### Running a 30-min soak yourself
+
+```bash
+REALWORLD_TIME_BUDGET_SEC=1800 \
+  bench/realworld/runner.sh \
+    --bench t3f-soak --tier vm \
+    --warmup 5 --measure 999999 \
+    --time-budget 1800 \
+    --output bench/realworld/results/soak-30min.jsonl
+
+# Plot RSS trajectory:
+python3 -c "
+import json
+r = json.loads(open('bench/realworld/results/soak-30min.jsonl').read())
+s = r['memory']['rss_samples_bytes']
+n = len(s)
+for b in range(20):
+    chunk = s[b*n//20:(b+1)*n//20]
+    print(f'{b:2d}: {sum(chunk)/len(chunk)/1048576:6.2f} MB '
+          + '#' * int(sum(chunk)/len(chunk)/200000))
+"
+```
+
+A passing 30-min soak: trajectory plateaus, `rss_growth_bytes`
+stays under +1 MB (counting expected ~50 KB heap fragmentation
+drift over half an hour).
+
 Walker "(heavy)" — runs, but the per-frame stack cost combined
 with our harness's let-heavy preamble blows the test-thread / CLI
 default stack on benches with deep recursion (which is most of

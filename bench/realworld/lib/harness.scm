@@ -157,23 +157,35 @@
            (deadline-jiffy (+ (current-jiffy) budget-jiffies)))
       ; Measurement loop. Stops at iter cap OR time budget,
       ; whichever first.
-      (let loop ((i 0) (wall-samples '()) (byte-samples '()))
-        (if (or (>= i max-iters) (>= (current-jiffy) deadline-jiffy))
-            (emit-result name params engine engine-tier engine-version
-                         (reverse wall-samples) (reverse byte-samples))
-            (let ((b0 (current-memory-use))
-                  (t0 (current-jiffy)))
-              (thunk)
-              (let* ((t1 (current-jiffy))
-                     (b1 (current-memory-use))
-                     (wall-ns (- t1 t0))
-                     (bytes (- b1 b0)))
-                (loop (+ i 1)
-                      (cons wall-ns wall-samples)
-                      (cons bytes byte-samples)))))))))
+      ; RSS at the start of measurement — the reference "post-warmup
+      ; baseline" against which subsequent RSS samples are deltas.
+      ; If the heap's working set is stable, per-iter RSS samples
+      ; oscillate around this baseline. A monotonic climb is the
+      ; leak signal.
+      (let ((rss-baseline (current-rss-bytes)))
+        (let loop ((i 0)
+                   (wall-samples '())
+                   (byte-samples '())
+                   (rss-samples '()))
+          (if (or (>= i max-iters) (>= (current-jiffy) deadline-jiffy))
+              (emit-result name params engine engine-tier engine-version
+                           (reverse wall-samples) (reverse byte-samples)
+                           (reverse rss-samples) rss-baseline)
+              (let ((b0 (current-memory-use))
+                    (t0 (current-jiffy)))
+                (thunk)
+                (let* ((t1 (current-jiffy))
+                       (b1 (current-memory-use))
+                       (rss (current-rss-bytes))
+                       (wall-ns (- t1 t0))
+                       (bytes (- b1 b0)))
+                  (loop (+ i 1)
+                        (cons wall-ns wall-samples)
+                        (cons bytes byte-samples)
+                        (cons rss rss-samples))))))))))
 
 (define (emit-result name params engine engine-tier engine-version
-                     wall-samples byte-samples)
+                     wall-samples byte-samples rss-samples rss-baseline)
   (let* ((stats (gc-stats))
          (iters (length wall-samples))
          ; Convert ns → seconds for the wall-time fields.
@@ -197,7 +209,17 @@
          (gc-time-pct
            (if (> total-wall-ns 0)
                (* 100.0 (/ (* collect-time-ms 1000000.0) total-wall-ns))
-               0.0)))
+               0.0))
+         ; RSS analytics. Three numbers the bench harness reports:
+         ;   - peak_rss_bytes: max RSS observed during measurement
+         ;   - final_rss_bytes: RSS at the last iter boundary
+         ;   - rss_growth_bytes: final - baseline (post-warmup).
+         ;     Positive means heap grew during measurement; small or
+         ;     zero means working set is stable (no leak).
+         (rss-peak (if (null? rss-samples) rss-baseline (rw-max rss-samples)))
+         (rss-final (if (null? rss-samples) rss-baseline
+                        (car (reverse rss-samples))))
+         (rss-growth (- rss-final rss-baseline)))
     (jobj-of
       (list
         (cons "schema_version" (jstr-v "1.0"))
@@ -241,7 +263,13 @@
               (cons "last_pause_ms"
                 (jnum (alist-get 'last-pause-ms stats)))
               (cons "max_pause_ms"
-                (jnum (alist-get 'max-pause-ms stats))))))) ))
+                (jnum (alist-get 'max-pause-ms stats)))
+              (cons "rss_baseline_bytes" (jnum rss-baseline))
+              (cons "peak_rss_bytes" (jnum rss-peak))
+              (cons "final_rss_bytes" (jnum rss-final))
+              (cons "rss_growth_bytes" (jnum rss-growth))
+              (cons "rss_samples_bytes" (lambda ()
+                (jlist-of (map jnum rss-samples)))))))) ))
     (newline)))
 
 ; jiffies-per-second is constant; cache to avoid the primop call
