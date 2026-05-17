@@ -28,6 +28,7 @@ use crate::builtins::install_primops;
 use crate::check::{narrow_negative, narrow_positive, subtype, TypeError};
 use crate::env::TypeEnv;
 use crate::infer::infer;
+use crate::poly::{subst, unify};
 use crate::types::{ProcType, Type};
 
 /// Narrowing decision produced by
@@ -298,6 +299,11 @@ impl<'tab> Checker<'tab> {
             return self.check_app_lambda(lparams, lbody, *lspan, args, expected);
         }
         let f_ty = self.infer(func);
+        // Phase 7.4: if the operator's type is polymorphic,
+        // monomorphize it against the inferred arg types
+        // first. The resulting Procedure_ replaces f_ty for
+        // the remainder of this fn.
+        let f_ty = self.monomorphize_for_call(&f_ty, args);
         match &f_ty {
             Type::Procedure_(pt) => {
                 // Arity: with no rest, must match exactly;
@@ -337,6 +343,68 @@ impl<'tab> Checker<'tab> {
                 span: func.span(),
             }),
         }
+    }
+
+    /// Phase 7.4: implicit instantiation of a polymorphic
+    /// callee at a call site.
+    ///
+    /// When `f_ty` is `Forall(vs, Procedure_(pt))` and the
+    /// fixed arity matches `args.len()`, we infer each arg's
+    /// type, unify it against the corresponding `pt.params[i]`
+    /// (treating `vs` as the solvable variable set), accumulate
+    /// the bindings, and substitute through the procedure body
+    /// to produce a monomorphic version. Conflicts or shape
+    /// mismatches fall back to returning `f_ty` unchanged so
+    /// downstream error handling stays consistent.
+    fn monomorphize_for_call(&self, f_ty: &Type, args: &[CoreExpr]) -> Type {
+        let Type::Forall(vs, body) = f_ty else {
+            return f_ty.clone();
+        };
+        let Type::Procedure_(pt) = body.as_ref() else {
+            return f_ty.clone();
+        };
+        let fixed = pt.params.len();
+        let has_rest = pt.rest.is_some();
+        if (has_rest && args.len() < fixed) || (!has_rest && args.len() != fixed) {
+            return f_ty.clone();
+        }
+        // Accumulate var bindings across all (param, arg)
+        // unifications. Reject on conflict.
+        let mut combined: std::collections::HashMap<cs_core::Symbol, Type> =
+            std::collections::HashMap::new();
+        for (i, arg) in args.iter().enumerate() {
+            let param_ty = if i < fixed {
+                &pt.params[i]
+            } else {
+                pt.rest.as_ref().expect("has_rest holds when i >= fixed")
+            };
+            let arg_ty = self.infer(arg);
+            let Some(m) = unify(param_ty, &arg_ty, vs) else {
+                return f_ty.clone();
+            };
+            for (k, v) in m {
+                match combined.get(&k) {
+                    None => {
+                        combined.insert(k, v);
+                    }
+                    Some(existing) => {
+                        if existing != &v && existing != &Type::Any && v != Type::Any {
+                            return f_ty.clone();
+                        }
+                        if existing == &Type::Any {
+                            combined.insert(k, v);
+                        }
+                    }
+                }
+            }
+        }
+        // Fill any unconstrained vars with Any so substitution
+        // produces a fully-monomorphic Procedure_ (no lingering
+        // Var references in the return type).
+        for v in vs {
+            combined.entry(*v).or_insert(Type::Any);
+        }
+        subst(body, &combined)
     }
 
     /// Special-case `App(Lambda, args)` — the `let` pattern.
@@ -926,6 +994,108 @@ mod tests {
         let mut checker = Checker::new(&table, &mut syms);
         let errors = checker.check_program(&core);
         assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    // -------- Phase 7: polymorphism --------
+
+    #[test]
+    fn polymorphic_identity_call_instantiates_to_arg_type() {
+        // Seed a polymorphic `id` directly into the
+        // Checker's env (the typed-define surface for
+        // polymorphic params is post-Phase-7 work, but the
+        // call-site mechanics are what iter 7.4 delivers).
+        let src = "(id 5)";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let id_sym = syms.intern("id");
+        let tvar = cs_core::Symbol(0x9000_0001);
+        let id_ty = Type::Forall(
+            vec![tvar],
+            Box::new(Type::Procedure_(Box::new(ProcType {
+                params: vec![Type::Var(tvar)],
+                return_type: Type::Var(tvar),
+                rest: None,
+                filter: None,
+            }))),
+        );
+        checker.env.define_top_level(id_sym, id_ty);
+        // The App's inferred return type should be Fixnum
+        // (the arg's type) after instantiation.
+        assert_eq!(checker.infer(&core), Type::Fixnum);
+        // And it should typecheck against any reasonable
+        // expectation.
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn polymorphic_identity_call_with_string_instantiates_to_string() {
+        let src = "(id \"hi\")";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let id_sym = syms.intern("id");
+        let tvar = cs_core::Symbol(0x9000_0002);
+        let id_ty = Type::Forall(
+            vec![tvar],
+            Box::new(Type::Procedure_(Box::new(ProcType {
+                params: vec![Type::Var(tvar)],
+                return_type: Type::Var(tvar),
+                rest: None,
+                filter: None,
+            }))),
+        );
+        checker.env.define_top_level(id_sym, id_ty);
+        assert_eq!(checker.infer(&core), Type::String);
+    }
+
+    #[test]
+    fn polymorphic_pair_returns_correct_member_type() {
+        // pick-first : (All (A B) (-> A B A))
+        let src = "(pick-first 5 \"hi\")";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let pick_sym = syms.intern("pick-first");
+        let a = cs_core::Symbol(0x9000_0010);
+        let b = cs_core::Symbol(0x9000_0011);
+        let pick_ty = Type::Forall(
+            vec![a, b],
+            Box::new(Type::Procedure_(Box::new(ProcType {
+                params: vec![Type::Var(a), Type::Var(b)],
+                return_type: Type::Var(a),
+                rest: None,
+                filter: None,
+            }))),
+        );
+        checker.env.define_top_level(pick_sym, pick_ty);
+        assert_eq!(checker.infer(&core), Type::Fixnum);
+    }
+
+    #[test]
+    fn unannotated_lambda_satisfies_forall_ascription() {
+        // The gradual subtype rule: an Any→Any lambda
+        // satisfies a polymorphic ascription. This is what
+        // makes `(: id (All (T) (-> T T)))` + `(define (id x) x)`
+        // typecheck cleanly even though the define has no
+        // per-param annotations.
+        use crate::check::subtype;
+        let tvar = cs_core::Symbol(0x9000_0020);
+        let mono = Type::Procedure_(Box::new(ProcType {
+            params: vec![Type::Any],
+            return_type: Type::Any,
+            rest: None,
+            filter: None,
+        }));
+        let poly = Type::Forall(
+            vec![tvar],
+            Box::new(Type::Procedure_(Box::new(ProcType {
+                params: vec![Type::Var(tvar)],
+                return_type: Type::Var(tvar),
+                rest: None,
+                filter: None,
+            }))),
+        );
+        assert!(subtype(&mono, &poly));
+        assert!(subtype(&poly, &mono));
     }
 
     // -------- Phase 4 iter 4.2: branch narrowing --------

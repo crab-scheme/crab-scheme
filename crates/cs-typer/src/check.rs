@@ -225,6 +225,27 @@ pub fn subtype(sub: &Type, sup: &Type) -> bool {
     if let Type::Union(sups) = sup {
         return sups.iter().any(|s| subtype(sub, s));
     }
+    // Phase 7.4: gradual Forall subtyping. When either side is
+    // a `Forall`, we don't attempt alpha-equivalence or full
+    // higher-rank reasoning. Instead we instantiate with `Any`
+    // for every quantified variable and subtype the resulting
+    // bodies. This is sound under the gradual rule that `Any`
+    // flows freely: an unannotated `Any → Any` lambda satisfies
+    // `(All (T) (-> T T))`, and conversely a polymorphic value
+    // can flow into any expected position where its Any-
+    // instantiated body would.
+    if let Type::Forall(vs, body) = sup {
+        let mapping: std::collections::HashMap<cs_core::Symbol, Type> =
+            vs.iter().map(|v| (*v, Type::Any)).collect();
+        let instantiated = crate::poly::subst(body, &mapping);
+        return subtype(sub, &instantiated);
+    }
+    if let Type::Forall(vs, body) = sub {
+        let mapping: std::collections::HashMap<cs_core::Symbol, Type> =
+            vs.iter().map(|v| (*v, Type::Any)).collect();
+        let instantiated = crate::poly::subst(body, &mapping);
+        return subtype(&instantiated, sup);
+    }
     match (sub, sup) {
         (Type::Procedure_(a), Type::Procedure_(b)) => {
             if a.params.len() != b.params.len() {

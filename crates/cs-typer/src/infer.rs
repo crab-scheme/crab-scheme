@@ -80,6 +80,62 @@ fn infer_const(v: &Value) -> Type {
 /// once `Lambda` annotations are wired up.
 fn infer_app(func: &CoreExpr, args: &[CoreExpr], env: &TypeEnv) -> Type {
     let f_ty = infer(func, env);
+    // Phase 7.4: if the operator is polymorphic, try to
+    // monomorphize via unification against the arg types.
+    // Mirrors `Checker::monomorphize_for_call` but lives at
+    // free-fn scope since `infer` doesn't carry an
+    // AnnotationTable.
+    if let Type::Forall(vs, body) = &f_ty {
+        if let Type::Procedure_(pt) = body.as_ref() {
+            if pt.params.len() == args.len() {
+                let arg_types: Vec<Type> = args.iter().map(|a| infer(a, env)).collect();
+                let mut combined: std::collections::HashMap<cs_core::Symbol, Type> =
+                    std::collections::HashMap::new();
+                let mut ok = true;
+                for (param, arg_ty) in pt.params.iter().zip(arg_types.iter()) {
+                    match crate::poly::unify(param, arg_ty, vs) {
+                        Some(m) => {
+                            for (k, v) in m {
+                                match combined.get(&k) {
+                                    None => {
+                                        combined.insert(k, v);
+                                    }
+                                    Some(existing) => {
+                                        if existing != &v
+                                            && existing != &Type::Any
+                                            && v != Type::Any
+                                        {
+                                            ok = false;
+                                            break;
+                                        }
+                                        if existing == &Type::Any {
+                                            combined.insert(k, v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+                if ok {
+                    for v in vs {
+                        combined.entry(*v).or_insert(Type::Any);
+                    }
+                    let mono = crate::poly::subst(body, &combined);
+                    if let Type::Procedure_(monop) = mono {
+                        return monop.return_type;
+                    }
+                }
+            }
+        }
+    }
     if let Type::Procedure_(pt) = f_ty {
         if pt.params.len() == args.len() {
             return pt.return_type.clone();
