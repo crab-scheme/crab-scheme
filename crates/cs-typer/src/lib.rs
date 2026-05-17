@@ -45,7 +45,7 @@ pub use annotate::{
 pub use builtins::{install_primops, primop_pairs, primop_table};
 pub use check::{check, render_type, subtype, TypeError};
 pub use checker::Checker;
-pub use effect::{primitive_effect, AllocEffect, EscapeKind};
+pub use effect::{infer_effect, primitive_effect, AllocEffect, EscapeKind};
 pub use env::{Frame, TypeEnv};
 pub use extract::extract_annotations;
 pub use infer::infer;

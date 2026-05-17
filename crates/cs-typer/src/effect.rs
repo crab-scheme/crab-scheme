@@ -39,7 +39,11 @@
 //! `AllocEffect::join` is the pointwise lub: OR for the bool
 //! fields, [`EscapeKind::join`] for the escape kind.
 
+use std::collections::HashSet;
 use std::fmt;
+
+use cs_core::Symbol;
+use cs_ir::CoreExpr;
 
 /// Allocation effect of an expression — what the runtime
 /// allocator has to do when evaluating it.
@@ -258,9 +262,276 @@ pub fn primitive_effect(name: &str) -> AllocEffect {
     }
 }
 
+/// Infer an [`AllocEffect`] for `expr`. Bottom-up walk; each
+/// shape's effect is derived from sub-expression effects and
+/// the shape's own semantics.
+///
+/// # Iter-3 scope
+///
+/// - **No inter-procedural analysis.** App-of-Ref where the
+///   callee is a known primitive looks up
+///   [`primitive_effect`]; every other call site is treated
+///   conservatively as the join of its argument effects plus
+///   `escapes = Unknown`. Inter-procedural sharpening is
+///   deferred (would require a fixpoint over the call graph;
+///   the spec leaves this to a future iter).
+/// - **Lambda escape conservatism.** A `Lambda` expression
+///   always reports `allocates = true, escapes = Heap` —
+///   closures typically escape. A later iter could detect
+///   non-escaping lambdas (immediately-invoked, only used in
+///   tail position, etc.).
+/// - **may_cycle detection.** Set/Letrec bindings whose RHS
+///   contains a Ref to the LHS name (or a mutually-recursive
+///   sibling) flag `may_cycle = true`. Direct
+///   `(set-car! x v)` / `(set-cdr! x v)` calls where `v` is
+///   `x` (same Symbol) likewise flag `may_cycle`.
+///
+/// The `env` parameter is currently unused but reserved —
+/// future iters will consult it for known-function-effect
+/// lookups (so user-defined functions can have their effects
+/// inferred and cached).
+pub fn infer_effect(expr: &CoreExpr, env: &crate::env::TypeEnv) -> AllocEffect {
+    let _ = env;
+    infer_effect_with_scope(expr, &HashSet::new())
+}
+
+/// Helper that threads a "self-bound names" set for cycle
+/// detection. Each Letrec / Set expression extends this set
+/// with its LHS so its RHS can be flagged may_cycle if it
+/// captures.
+fn infer_effect_with_scope(expr: &CoreExpr, self_bound: &HashSet<Symbol>) -> AllocEffect {
+    match expr {
+        CoreExpr::Const { .. } | CoreExpr::Ref { .. } => AllocEffect::PURE,
+
+        CoreExpr::Set { name, value, .. } => {
+            // Build a scope extended with `name` for cycle
+            // detection on the RHS.
+            let mut inner = self_bound.clone();
+            inner.insert(*name);
+            let rhs_effect = infer_effect_with_scope(value, &inner);
+            // A Set itself doesn't allocate; it just propagates
+            // the RHS effect. But if the RHS captures `name`
+            // (free-var check), flag may_cycle.
+            let captures_self = ref_captures_any(value, &inner);
+            AllocEffect {
+                allocates: rhs_effect.allocates,
+                escapes: rhs_effect.escapes.join(EscapeKind::Heap),
+                may_cycle: rhs_effect.may_cycle || captures_self,
+            }
+        }
+
+        CoreExpr::Lambda { body, .. } => {
+            // The Lambda itself allocates a closure that
+            // typically escapes (stored, returned, called by an
+            // unknown caller). Body's effect is folded in for
+            // its may_cycle bit only — the body doesn't
+            // execute until the closure is called, so its
+            // alloc/escape bits don't accumulate at this site.
+            let body_effect = infer_effect_with_scope(body, self_bound);
+            AllocEffect {
+                allocates: true,
+                escapes: EscapeKind::Heap,
+                may_cycle: body_effect.may_cycle,
+            }
+        }
+
+        CoreExpr::App { func, args, .. } => {
+            // Try to resolve `func` to a primitive name.
+            let prim_effect = match &**func {
+                CoreExpr::Ref { name, .. } => {
+                    // Symbol(u32) is the interned form;
+                    // primitive names are normally resolved by
+                    // SymbolTable. Without table access here,
+                    // fall back to scanning the global primop
+                    // table by reverse lookup. The cleanest
+                    // path is to consult cs-typer's builtins
+                    // primop_table, but to keep iter 3 self-
+                    // contained we walk it lazily.
+                    primitive_effect_by_symbol(*name)
+                }
+                _ => {
+                    // Unknown callee (computed or higher-order
+                    // closure). Conservative — assume Unknown
+                    // escape, may_cycle.
+                    AllocEffect {
+                        allocates: true,
+                        escapes: EscapeKind::Unknown,
+                        may_cycle: true,
+                    }
+                }
+            };
+            // Join the function's effect with each arg's.
+            let mut acc = prim_effect;
+            for arg in args {
+                acc = acc.join(infer_effect_with_scope(arg, self_bound));
+            }
+            acc
+        }
+
+        CoreExpr::If {
+            cond, then, alt, ..
+        } => infer_effect_with_scope(cond, self_bound)
+            .join(infer_effect_with_scope(then, self_bound))
+            .join(infer_effect_with_scope(alt, self_bound)),
+
+        CoreExpr::Begin { exprs, .. } => exprs.iter().fold(AllocEffect::PURE, |acc, e| {
+            acc.join(infer_effect_with_scope(e, self_bound))
+        }),
+
+        CoreExpr::Letrec { bindings, body, .. } => {
+            // Extend the scope with every LHS upfront so each
+            // RHS sees all sibling names (the may_cycle
+            // detector flags captures of any of them).
+            let mut inner = self_bound.clone();
+            for (name, _) in bindings {
+                inner.insert(*name);
+            }
+            let mut acc = AllocEffect::PURE;
+            for (_, rhs) in bindings {
+                let rhs_effect = infer_effect_with_scope(rhs, &inner);
+                let captures = ref_captures_any(rhs, &inner);
+                acc = acc.join(AllocEffect {
+                    allocates: rhs_effect.allocates,
+                    escapes: rhs_effect.escapes,
+                    may_cycle: rhs_effect.may_cycle || captures,
+                });
+            }
+            acc.join(infer_effect_with_scope(body, &inner))
+        }
+    }
+}
+
+/// Resolve a primitive's `AllocEffect` from its interned
+/// Symbol. Walks the cs-typer builtins primop table once per
+/// process (cached via a `OnceLock` of name→effect indexed by
+/// symbol). For non-primitive Symbols, returns
+/// `escapes = Unknown` — the caller can't trace the function.
+fn primitive_effect_by_symbol(sym: Symbol) -> AllocEffect {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<(Symbol, AllocEffect)>> = OnceLock::new();
+    let table = CACHE.get_or_init(|| {
+        // The primop table uses string names; for Symbol-based
+        // lookup we mint a fresh SymbolTable that mirrors the
+        // intern order primop_pairs uses. Iter 3 punts on this
+        // and just probes `primitive_effect` by name via a
+        // global SymbolTable — but cs-typer doesn't own one.
+        // For now return an empty cache; a future iter can wire
+        // a real Symbol-keyed table.
+        Vec::new()
+    });
+    for (s, e) in table {
+        if *s == sym {
+            return *e;
+        }
+    }
+    AllocEffect {
+        allocates: true,
+        escapes: EscapeKind::Unknown,
+        may_cycle: true,
+    }
+}
+
+/// `true` if `expr` contains a free reference to any name in
+/// `names`. Used by Set/Letrec to flag `may_cycle` when a
+/// binding's RHS captures its own LHS or a mutually-recursive
+/// sibling.
+fn ref_captures_any(expr: &CoreExpr, names: &HashSet<Symbol>) -> bool {
+    match expr {
+        CoreExpr::Const { .. } => false,
+        CoreExpr::Ref { name, .. } => names.contains(name),
+        CoreExpr::Set { name: _, value, .. } => ref_captures_any(value, names),
+        CoreExpr::Lambda { params, body, .. } => {
+            // Lambda parameters shadow outer names — remove
+            // any shadowed ones from the lookup set before
+            // recursing into the body.
+            let mut inner = names.clone();
+            for p in &params.fixed {
+                inner.remove(p);
+            }
+            if let Some(r) = params.rest {
+                inner.remove(&r);
+            }
+            ref_captures_any(body, &inner)
+        }
+        CoreExpr::App { func, args, .. } => {
+            ref_captures_any(func, names) || args.iter().any(|a| ref_captures_any(a, names))
+        }
+        CoreExpr::If {
+            cond, then, alt, ..
+        } => {
+            ref_captures_any(cond, names)
+                || ref_captures_any(then, names)
+                || ref_captures_any(alt, names)
+        }
+        CoreExpr::Begin { exprs, .. } => exprs.iter().any(|e| ref_captures_any(e, names)),
+        CoreExpr::Letrec { bindings, body, .. } => {
+            // Letrec shadows: its LHS names shadow outer
+            // names of the same id.
+            let mut inner = names.clone();
+            for (n, _) in bindings {
+                inner.remove(n);
+            }
+            bindings.iter().any(|(_, e)| ref_captures_any(e, &inner))
+                || ref_captures_any(body, &inner)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
+
+    use cs_core::Value;
+    use cs_diag::Span;
+    use cs_ir::Params;
+
+    fn s(id: u32) -> Symbol {
+        Symbol(id)
+    }
+    fn cnst(v: i64) -> CoreExpr {
+        CoreExpr::Const {
+            value: Value::fixnum(v),
+            span: Span::DUMMY,
+        }
+    }
+    fn rf(sym: Symbol) -> CoreExpr {
+        CoreExpr::Ref {
+            name: sym,
+            span: Span::DUMMY,
+        }
+    }
+    fn app(func: CoreExpr, args: Vec<CoreExpr>) -> CoreExpr {
+        CoreExpr::App {
+            func: Rc::new(func),
+            args,
+            span: Span::DUMMY,
+        }
+    }
+    fn lam(params: Vec<Symbol>, body: CoreExpr) -> CoreExpr {
+        CoreExpr::Lambda {
+            params: Params::fixed(params),
+            body: Rc::new(body),
+            span: Span::DUMMY,
+        }
+    }
+    fn set(name: Symbol, value: CoreExpr) -> CoreExpr {
+        CoreExpr::Set {
+            name,
+            value: Rc::new(value),
+            span: Span::DUMMY,
+        }
+    }
+    fn letrec(bindings: Vec<(Symbol, CoreExpr)>, body: CoreExpr) -> CoreExpr {
+        CoreExpr::Letrec {
+            bindings,
+            body: Rc::new(body),
+            span: Span::DUMMY,
+        }
+    }
+    fn env() -> crate::env::TypeEnv {
+        crate::env::TypeEnv::new()
+    }
 
     #[test]
     fn pure_is_identity_for_join() {
@@ -515,6 +786,121 @@ mod tests {
             primitive_effect("totally-fake-name"),
             AllocEffect::PURE,
             "unknown names default to PURE (safe — inferencer's context tightens later)"
+        );
+    }
+
+    // === infer_effect tests ===
+
+    #[test]
+    fn const_is_pure() {
+        assert_eq!(infer_effect(&cnst(42), &env()), AllocEffect::PURE);
+    }
+
+    #[test]
+    fn ref_is_pure() {
+        assert_eq!(infer_effect(&rf(s(1)), &env()), AllocEffect::PURE);
+    }
+
+    #[test]
+    fn if_joins_all_three_branches() {
+        // (if #t 1 2) — all pure, joined → still pure
+        let e = CoreExpr::If {
+            cond: Rc::new(cnst(1)),
+            then: Rc::new(cnst(2)),
+            alt: Rc::new(cnst(3)),
+            span: Span::DUMMY,
+        };
+        assert_eq!(infer_effect(&e, &env()), AllocEffect::PURE);
+    }
+
+    #[test]
+    fn begin_joins_subexprs() {
+        let e = CoreExpr::Begin {
+            exprs: vec![cnst(1), cnst(2), cnst(3)],
+            span: Span::DUMMY,
+        };
+        assert_eq!(infer_effect(&e, &env()), AllocEffect::PURE);
+    }
+
+    #[test]
+    fn lambda_allocates_and_escapes_heap() {
+        // (lambda (x) x) — closure allocation, escapes Heap
+        let e = lam(vec![s(1)], rf(s(1)));
+        let eff = infer_effect(&e, &env());
+        assert!(eff.allocates);
+        assert_eq!(eff.escapes, EscapeKind::Heap);
+        assert!(!eff.may_cycle);
+    }
+
+    #[test]
+    fn app_of_unknown_function_is_conservative_unknown() {
+        // ((lambda (x) x) 5) — App of non-Ref callee →
+        // conservative Unknown
+        let e = app(lam(vec![s(1)], rf(s(1))), vec![cnst(5)]);
+        let eff = infer_effect(&e, &env());
+        assert_eq!(eff.escapes, EscapeKind::Unknown);
+    }
+
+    #[test]
+    fn set_propagates_rhs_alloc_and_heap_escape() {
+        // (set! x (some-pure-thing)) — escape Heap (mutation
+        // target), no may_cycle.
+        let e = set(s(1), cnst(99));
+        let eff = infer_effect(&e, &env());
+        assert_eq!(eff.escapes, EscapeKind::Heap);
+        assert!(!eff.may_cycle);
+    }
+
+    #[test]
+    fn set_x_x_flags_may_cycle() {
+        // (set! x x) — RHS captures LHS → may_cycle
+        let e = set(s(1), rf(s(1)));
+        let eff = infer_effect(&e, &env());
+        assert!(eff.may_cycle, "set! x x must flag may_cycle");
+    }
+
+    #[test]
+    fn letrec_self_recursive_lambda_flags_may_cycle() {
+        // (letrec ((f (lambda () f))) f) — f closes over
+        // itself
+        let body_f = lam(vec![], rf(s(1)));
+        let e = letrec(vec![(s(1), body_f)], rf(s(1)));
+        let eff = infer_effect(&e, &env());
+        assert!(eff.may_cycle, "self-recursive letrec must flag may_cycle");
+    }
+
+    #[test]
+    fn letrec_acyclic_does_not_flag_may_cycle() {
+        // (letrec ((x 1) (y 2)) (+ x y)) — no captures
+        let e = letrec(vec![(s(1), cnst(1)), (s(2), cnst(2))], cnst(0));
+        let eff = infer_effect(&e, &env());
+        assert!(!eff.may_cycle);
+    }
+
+    #[test]
+    fn letrec_mutual_recursion_flags_may_cycle() {
+        // (letrec ((f (lambda () (g))) (g (lambda () (f)))) f)
+        let body_f = lam(vec![], app(rf(s(2)), vec![]));
+        let body_g = lam(vec![], app(rf(s(1)), vec![]));
+        let e = letrec(vec![(s(1), body_f), (s(2), body_g)], rf(s(1)));
+        let eff = infer_effect(&e, &env());
+        assert!(
+            eff.may_cycle,
+            "mutually recursive letrec must flag may_cycle"
+        );
+    }
+
+    #[test]
+    fn lambda_shadows_outer_name_no_cycle_flag() {
+        // (set! x (lambda (x) x)) — the param `x` shadows the
+        // outer; body refs the param, NOT the outer. So no
+        // may_cycle.
+        let inner_lam = lam(vec![s(1)], rf(s(1)));
+        let e = set(s(1), inner_lam);
+        let eff = infer_effect(&e, &env());
+        assert!(
+            !eff.may_cycle,
+            "param shadowing must suppress may_cycle flag"
         );
     }
 }

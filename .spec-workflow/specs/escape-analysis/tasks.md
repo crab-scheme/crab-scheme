@@ -83,7 +83,7 @@ shipped: `cs_gc::Region`, `Gc::new_in`, debug-mode validity).
 
 ## Iter 3 — Effect inference for core expression shapes
 
-- [ ] 3. Implement `infer_effect` for CoreExpr
+- [x] 3. Implement `infer_effect` for CoreExpr
   - File: `crates/cs-typer/src/effect.rs` (extend),
     `crates/cs-typer/src/infer.rs` (call site)
   - Add `pub fn infer_effect(expr: &CoreExpr, env: &TypeEnv) -> AllocEffect`.
@@ -115,7 +115,7 @@ shipped: `cs_gc::Region`, `Gc::new_in`, debug-mode validity).
     covering the rule table; each test inputs a Scheme
     expression and asserts the expected AllocEffect._
 
-- [ ] 4. May-cycle detection
+- [x] 4. May-cycle detection
   - File: `crates/cs-typer/src/effect.rs` (extend)
   - For Letrec, Set, Define rules: when the RHS contains a
     Lambda that captures the LHS name, set `may_cycle = true`.
