@@ -575,6 +575,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-typer"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-diag",
+ "cs-expand",
+ "cs-ir",
+ "cs-parse",
+ "cs-rir",
+ "cs-vm",
+]
+
+[[package]]
 name = "cs-vm"
 version = "0.0.1"
 dependencies = [
