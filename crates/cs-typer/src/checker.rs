@@ -54,6 +54,16 @@ struct Narrowing {
 pub struct Checker<'tab> {
     pub table: &'tab AnnotationTable,
     pub env: TypeEnv,
+    /// Per-binding param hints inferred from `Letrec` body call
+    /// sites (Phase 5+ extension). When a `Letrec` binds a
+    /// lambda `NAME = (lambda (p…) …)` and the body
+    /// immediately calls `(NAME arg…)`, the arg types become
+    /// hints for the lambda's params. Consumers (cs-cli's
+    /// `aot --multi`, the JIT) merge this with
+    /// `hints_by_name(table)` to specialize inner-let inner
+    /// loops without surface annotation. Empty by default.
+    pub inferred_param_hints:
+        std::cell::RefCell<std::collections::HashMap<cs_core::Symbol, Vec<cs_rir::Type>>>,
 }
 
 impl<'tab> Checker<'tab> {
@@ -66,7 +76,11 @@ impl<'tab> Checker<'tab> {
         for ta in &table.top_level {
             env.define_top_level(ta.name, ta.type_ann.clone());
         }
-        Self { table, env }
+        Self {
+            table,
+            env,
+            inferred_param_hints: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
     }
 
     /// Infer the type of `expr`. Equivalent to the free
@@ -190,7 +204,8 @@ impl<'tab> Checker<'tab> {
                 // declared type, then walk the body against
                 // `expected`. Errors from each value-check land
                 // in `out` so we keep going.
-                let declared = letrec_binding_types(self.table, *span, bindings);
+                let mut declared = letrec_binding_types(self.table, *span, bindings);
+                self.refine_letrec_via_body_call(bindings, body, &mut declared);
                 let mark = self.env.push();
                 for ((name, _), ty) in bindings.iter().zip(declared.iter()) {
                     self.env.define(*name, ty.clone());
@@ -619,7 +634,20 @@ impl<'tab> Checker<'tab> {
         // (and the body). Bring the declared types into scope
         // FIRST so recursive references see them, then check
         // each value against its declared type.
-        let declared = letrec_binding_types(self.table, span, bindings);
+        //
+        // Phase 5+ refinement: when a binding's value is an
+        // unannotated Lambda and the body's first expression
+        // is a direct App to that binding, infer the lambda's
+        // param types from the App's arg types. This is what
+        // named-let bodies (`(let loop ((zr 0.0) …) (loop …))`)
+        // produce — the first call carries the initial values,
+        // which are the only call-site types AOT needs to
+        // specialize against. Record the inferred hints into
+        // `inferred_param_hints` and also use them as the
+        // binding's type so the lambda body sees its params
+        // typed instead of Any.
+        let mut declared = letrec_binding_types(self.table, span, bindings);
+        self.refine_letrec_via_body_call(bindings, body, &mut declared);
         let mark = self.env.push();
         for ((name, _), ty) in bindings.iter().zip(declared.iter()) {
             self.env.define(*name, ty.clone());
@@ -638,6 +666,92 @@ impl<'tab> Checker<'tab> {
             return Err(e);
         }
         body_result
+    }
+
+    /// Per-binding refinement for `Letrec` bindings: if the
+    /// body is `(BindingName arg…)`, replace the binding's
+    /// declared type with a `Procedure_` inferred from the
+    /// arg types. Also stash the lowered hints in
+    /// `inferred_param_hints` so downstream consumers (AOT)
+    /// pick them up.
+    ///
+    /// Only applies when:
+    /// - the binding value is a `Lambda` whose fixed-param
+    ///   count matches the App's arg count;
+    /// - the binding's declared type was `Any` (no user
+    ///   annotation to honor);
+    /// - the body's outermost expression is `App(Ref(name),
+    ///   args)` where `name` matches the binding.
+    ///
+    /// Conservative: ignores nested or multi-step bodies.
+    /// Suffices for the named-let desugaring pattern, which is
+    /// the dominant case that produces unannotated inner
+    /// lambdas in typed code.
+    fn refine_letrec_via_body_call(
+        &self,
+        bindings: &[(cs_core::Symbol, CoreExpr)],
+        body: &CoreExpr,
+        declared: &mut [Type],
+    ) {
+        let CoreExpr::App { func, args, .. } = body else {
+            return;
+        };
+        let CoreExpr::Ref {
+            name: called_name, ..
+        } = &**func
+        else {
+            return;
+        };
+        for (i, (binding_name, value)) in bindings.iter().enumerate() {
+            if binding_name != called_name {
+                continue;
+            }
+            if declared[i] != Type::Any {
+                continue;
+            }
+            let CoreExpr::Lambda {
+                params: lparams, ..
+            } = value
+            else {
+                continue;
+            };
+            if lparams.fixed.len() != args.len() || lparams.rest.is_some() {
+                continue;
+            }
+            // Infer each arg's type from the body's call site
+            // and build a Procedure_ with those as params.
+            let arg_types: Vec<Type> = args.iter().map(|a| self.infer(a)).collect();
+            // Record AOT-side hints by name.
+            let hints: Vec<cs_rir::Type> = arg_types.iter().map(crate::rir_bridge::lower).collect();
+            self.inferred_param_hints
+                .borrow_mut()
+                .insert(*binding_name, hints);
+            // Use the inferred ProcType as the binding's type
+            // so the lambda body checks under the refined
+            // env. Return type stays Any (we don't infer it
+            // from the body of the call — recursive calls
+            // would loop) and the JIT/AOT pipelines only care
+            // about params anyway.
+            declared[i] = Type::Procedure_(Box::new(ProcType {
+                params: arg_types,
+                return_type: Type::Any,
+                rest: None,
+                filter: None,
+            }));
+        }
+    }
+
+    /// Phase 5+ extension: name-keyed hint map populated by
+    /// `Letrec` body-driven inference. Merge with
+    /// `cs_typer::hints_by_name(table)` for the full AOT hint
+    /// table; callers handle the union (later entries from this
+    /// map override the by-name table when both have the same
+    /// key, but inner-let names won't collide with top-level
+    /// ascriptions in practice).
+    pub fn inferred_hints_by_name(
+        &self,
+    ) -> std::collections::HashMap<cs_core::Symbol, Vec<cs_rir::Type>> {
+        self.inferred_param_hints.borrow().clone()
     }
 
     fn check_set(
@@ -994,6 +1108,73 @@ mod tests {
         let mut checker = Checker::new(&table, &mut syms);
         let errors = checker.check_program(&core);
         assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    // -------- Phase 5+ inner-let inference --------
+
+    #[test]
+    fn named_let_body_call_seeds_inferred_hints() {
+        // The classic named-let pattern desugars to a Letrec
+        // whose body is `(loop initial-values)`. The Checker
+        // infers loop's params from those initial values and
+        // records hints by name.
+        let src = "\
+            (: top (-> Fixnum))
+            (define (top) : Fixnum
+              (let loop ((zr 0.0) (zi 0.0) (i 0))
+                (if (fx>? i 50) 0 (loop zr zi (fx+ i 1)))))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+        let hints = checker.inferred_hints_by_name();
+        let loop_sym = syms.intern("loop");
+        let v = hints.get(&loop_sym).expect("loop's hints recorded");
+        assert_eq!(
+            v,
+            &vec![
+                cs_rir::Type::Flonum,
+                cs_rir::Type::Flonum,
+                cs_rir::Type::Fixnum
+            ],
+            "loop should get Flonum/Flonum/Fixnum from initial body call"
+        );
+    }
+
+    #[test]
+    fn named_let_unannotated_top_level_still_gets_hints() {
+        // No outer annotation; the loop's hints come purely
+        // from the body's call. Confirms the Checker walks
+        // even when nothing about `top` is typed.
+        let src = "\
+            (define (top)
+              (let loop ((x 1.5) (n 0))
+                (if (fx>? n 10) x (loop x (fx+ n 1)))))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+        let hints = checker.inferred_hints_by_name();
+        let loop_sym = syms.intern("loop");
+        let v = hints.get(&loop_sym).expect("loop's hints recorded");
+        assert_eq!(v, &vec![cs_rir::Type::Flonum, cs_rir::Type::Fixnum]);
+    }
+
+    #[test]
+    fn letrec_with_no_body_call_yields_no_inferred_hints() {
+        // Body doesn't immediately call a binding — no
+        // inference should fire. The `let` here desugars to
+        // App-on-Lambda, not Letrec, so nothing populates the
+        // named map either.
+        let src = "\
+            (define (top)
+              (let ((x 1.5) (n 0))
+                (fx+ n 1)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+        assert!(checker.inferred_hints_by_name().is_empty());
     }
 
     // -------- Phase 7: polymorphism --------
