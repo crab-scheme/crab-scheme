@@ -288,6 +288,46 @@ impl std::fmt::Display for AotError {
 /// (user-meaningful description, suggested workaround). Drives the
 /// `UnsupportedInst` diagnostic format so users hit actionable
 /// guidance instead of internal Inst names.
+
+/// Detect a tail-call pattern at the end of `block`: when the
+/// block's last inst is `CallSelf(dst, args)` and the
+/// terminator flows the call's result straight into a
+/// `Return`, return the call's args so the emitter can
+/// rewrite the call into "rebind params + continue to entry"
+/// — replacing the recursive function call with a loop.
+///
+/// Two terminator shapes count as a tail call:
+///   1. `Return(dst)` directly — the call result is the
+///      function's return value.
+///   2. `Jump(B, [dst])` where block `B` has only one block
+///      param, no insts, and a `Return(that_param)`
+///      terminator — the call result threads through a
+///      trivial join block.
+///
+/// Returns `None` for anything more complicated.
+fn detect_tail_call<'a>(block: &'a cs_rir::Block, func: &'a Function) -> Option<&'a [Value]> {
+    let last = block.insts.last()?;
+    let (call_dst, args) = match last {
+        Inst::CallSelf(dst, args) => (*dst, args.as_slice()),
+        _ => return None,
+    };
+    match &block.terminator {
+        Term::Return(v) if *v == call_dst => Some(args),
+        Term::Jump(target, jump_args) if jump_args.len() == 1 && jump_args[0] == call_dst => {
+            let target_block = func.blocks.iter().find(|b| b.id == *target)?;
+            if target_block.params.len() != 1 || !target_block.insts.is_empty() {
+                return None;
+            }
+            let (param_v, _) = target_block.params[0];
+            match &target_block.terminator {
+                Term::Return(rv) if *rv == param_v => Some(args),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Walk a `Function` in block order and infer each Value's
 /// `Type` from the instruction that produced it. Used by the
 /// codegen helpers (`nb_to_f64_expr` and friends) to skip the
@@ -611,7 +651,11 @@ pub fn emit_with_resolver(
     }
     for (v, _ty) in func.params.iter() {
         out.push_str(", ");
-        write!(out, "v{}: i64", v.0).unwrap();
+        // `mut` — tail-call optimization (when it fires)
+        // reassigns these to the new args before
+        // `continue`ing to the entry block; harmless `mut`
+        // is fine for the cases where TCO doesn't fire.
+        write!(out, "mut v{}: i64", v.0).unwrap();
     }
     out.push_str(") -> i64 {\n");
     // Suppress unused warning when the body doesn't need self_handle.
@@ -730,7 +774,25 @@ fn emit_loop_match(
     let local_defs = collect_local_defines(func);
     for block in &func.blocks {
         writeln!(out, "            {} => {{", block.id.0).unwrap();
-        for inst in &block.insts {
+        // Phase 5++++: tail-call detection. If the block's
+        // last inst is a `CallSelf(dst, args)` whose result
+        // flows straight into a Return (either directly via
+        // this block's terminator OR via a Jump to a Return-
+        // only block), replace the recursive function call
+        // with "rebind params + continue to entry" — saves
+        // a stack frame per iteration, which matters a lot
+        // for inner-loop kernels like mandelbrot's proc_loop.
+        let tco = detect_tail_call(block, func);
+        let last_inst_is_tco = tco.is_some();
+        // Emit insts except the trailing CallSelf when
+        // TCO is firing — the CallSelf gets replaced
+        // wholesale with the param-rebind + continue.
+        let inst_count = if last_inst_is_tco {
+            block.insts.len().saturating_sub(1)
+        } else {
+            block.insts.len()
+        };
+        for inst in &block.insts[..inst_count] {
             emit_inst_assign(
                 out,
                 inst,
@@ -743,7 +805,20 @@ fn emit_loop_match(
                 types,
             )?;
         }
-        emit_terminator(out, &block.terminator, func, mode)?;
+        if let Some(args) = tco {
+            // Reassign params then jump to entry. Order is
+            // safe because each `args[i]` is an SSA Value
+            // (a `vN` variable distinct from any param `vM`),
+            // so `v{param} = v{arg}` writes don't clobber a
+            // value still needed by later assignments.
+            for ((param_v, _), arg_v) in func.params.iter().zip(args.iter()) {
+                writeln!(out, "                v{} = v{};", param_v.0, arg_v.0).unwrap();
+            }
+            writeln!(out, "                block = {};", func.entry.0).unwrap();
+            writeln!(out, "                continue;").unwrap();
+        } else {
+            emit_terminator(out, &block.terminator, func, mode)?;
+        }
         writeln!(out, "            }}").unwrap();
     }
 
@@ -2270,7 +2345,7 @@ mod tests {
     fn emits_sq() {
         let src = emit(&sq_function()).unwrap();
         // RC3 iter 2.12 — every fn gets `__self_handle: i64` first.
-        assert!(src.contains("pub extern \"C\" fn sq(__self_handle: i64, v0: i64) -> i64"));
+        assert!(src.contains("pub extern \"C\" fn sq(__self_handle: i64, mut v0: i64) -> i64"));
         assert!(src.contains("let v1: i64 = v0.wrapping_mul(v0);"));
         assert!(src.contains("    v1\n"));
     }
@@ -2279,7 +2354,7 @@ mod tests {
     fn emits_add3() {
         let src = emit(&add3_function()).unwrap();
         assert!(src.contains(
-            "pub extern \"C\" fn add3(__self_handle: i64, v0: i64, v1: i64, v2: i64) -> i64"
+            "pub extern \"C\" fn add3(__self_handle: i64, mut v0: i64, mut v1: i64, mut v2: i64) -> i64"
         ));
         assert!(src.contains("let v3: i64 = v0.wrapping_add(v1);"));
         assert!(src.contains("let v4: i64 = v3.wrapping_add(v2);"));
@@ -2376,6 +2451,125 @@ mod tests {
         assert!(src.contains("1 => {"));
         assert!(src.contains("return v1;"));
         assert!(src.contains("_ => unreachable!(),"));
+    }
+
+    #[test]
+    fn tail_callself_rewrites_to_param_rebind_continue() {
+        // A loop-shaped recursion: block 0 either Returns x,
+        // or CallSelfs with (x-1) and Returns the result.
+        // The CallSelf-then-Return pattern is exactly what
+        // `detect_tail_call` recognizes.
+        //
+        //   (define (countdown x)
+        //     (if (= x 0) x (countdown (- x 1))))
+        //
+        // RIR:
+        //   block 0: v1=0; v2=v0==v1; Branch(v2, 1, 2)
+        //   block 1: Return v0
+        //   block 2: v3=1; v4=v0-v3; v5=CallSelf(v4); Return v5
+        let mut f = Function::new("countdown");
+        f.params.push((Value(0), Type::Fixnum));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(Value(1), Const::Fixnum(0)),
+                Inst::Eq(Value(2), Value(0), Value(1)),
+            ],
+            terminator: Term::Branch(Value(2), BlockId(1), BlockId(2), vec![]),
+        });
+        f.blocks.push(Block {
+            id: BlockId(1),
+            params: vec![],
+            insts: vec![],
+            terminator: Term::Return(Value(0)),
+        });
+        f.blocks.push(Block {
+            id: BlockId(2),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(Value(3), Const::Fixnum(1)),
+                Inst::Sub(Value(4), Value(0), Value(3)),
+                Inst::CallSelf(Value(5), vec![Value(4)]),
+            ],
+            terminator: Term::Return(Value(5)),
+        });
+        let src = emit(&f).unwrap();
+        // Param decl is `mut` (TCO reassigns it).
+        assert!(
+            src.contains("mut v0: i64"),
+            "param should be mut for TCO; got:\n{src}"
+        );
+        // Tail call rewritten to rebind + continue — NO
+        // direct recursive call inside the body. The header
+        // `fn countdown(...)` always contains `countdown(`,
+        // so check for the CALL shape `= countdown(` (used
+        // by emit_inst_let / emit_inst_assign for non-TCO
+        // CallSelf).
+        assert!(
+            !src.contains("= countdown(__self_handle"),
+            "tail CallSelf should NOT emit a recursive call; got:\n{src}"
+        );
+        assert!(
+            src.contains("v0 = v4;"),
+            "tail call should rebind v0 to the new arg v4; got:\n{src}"
+        );
+        assert!(
+            src.contains("block = 0;"),
+            "tail call should continue to entry block; got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn non_tail_callself_keeps_recursive_call() {
+        // A non-tail recursive shape: the call result is
+        // ADDed before being returned. Detect_tail_call
+        // should NOT fire — the recursive call has to
+        // happen as a real function call so the post-call
+        // arithmetic runs.
+        //
+        //   (define (f x)
+        //     (if (= x 0) 1 (+ x (f (- x 1)))))
+        //
+        // RIR block 2: v3=1; v4=v0-v3; v5=CallSelf(v4);
+        //              v6=v0+v5; Return v6
+        let mut f = Function::new("non_tail");
+        f.params.push((Value(0), Type::Fixnum));
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(Value(1), Const::Fixnum(0)),
+                Inst::Eq(Value(2), Value(0), Value(1)),
+            ],
+            terminator: Term::Branch(Value(2), BlockId(1), BlockId(2), vec![]),
+        });
+        f.blocks.push(Block {
+            id: BlockId(1),
+            params: vec![],
+            insts: vec![Inst::LoadConst(Value(7), Const::Fixnum(1))],
+            terminator: Term::Return(Value(7)),
+        });
+        f.blocks.push(Block {
+            id: BlockId(2),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(Value(3), Const::Fixnum(1)),
+                Inst::Sub(Value(4), Value(0), Value(3)),
+                Inst::CallSelf(Value(5), vec![Value(4)]),
+                Inst::Add(Value(6), Value(0), Value(5)),
+            ],
+            terminator: Term::Return(Value(6)),
+        });
+        let src = emit(&f).unwrap();
+        // CallSelf is NOT the last inst — Add comes after.
+        // TCO doesn't fire; recursive call stays.
+        assert!(
+            src.contains("= non_tail(__self_handle"),
+            "non-tail CallSelf should emit a recursive call; got:\n{src}"
+        );
     }
 
     #[test]
