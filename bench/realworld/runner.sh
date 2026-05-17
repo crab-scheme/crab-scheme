@@ -119,8 +119,9 @@ run_one() {
   REALWORLD_MEASURE_ITERS="$MEASURE" \
   REALWORLD_TIME_BUDGET_SEC="$BUDGET" \
     "$CS_BIN" --tier "$tier" run "$tmpfile" \
-      2> "$tmpfile.stderr"
-  local rc=$?
+      2> "$tmpfile.stderr" \
+      || true  # never let set -e kill the loop on a failing bench
+  local rc=${PIPESTATUS[0]:-$?}
   if [ $rc -ne 0 ]; then
     # Emit a failure record so render.py can show "fail" cells
     # instead of dropping rows silently.

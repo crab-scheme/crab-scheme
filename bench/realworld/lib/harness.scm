@@ -135,6 +135,22 @@
     (let warm ((i 0))
       (if (< i warmup) (begin (thunk) (warm (+ i 1)))))
     ; Reset + enable stats for the measurement window.
+    ;
+    ; Note: auto-collect is enabled but doesn't yet fire from the
+    ; runtime's hot allocations — most values go through cs_gc::Gc::new
+    ; (the unregistered constructor used by Pair::new, Hashtable::new,
+    ; etc. while the heap-rooting migration is in progress), which
+    ; doesn't bump the heap's rolling alloc_count that drives the
+    ; auto-collect threshold. As a result GC% and max-pause stay at 0
+    ; in the harness output. The bytes_allocated_total and
+    ; alloc_rate_mb_per_sec columns remain meaningful — they pull
+    ; from the global counter Gc::new does bump. Real GC numbers will
+    ; surface once the migration completes.
+    ;
+    ; Benches that want to exercise the GC code path today can call
+    ; (collect-garbage) inside their thunk.
+    (gc-auto-collect-enable!)
+    (gc-set-threshold! 262144)
     (gc-stats-enable!)
     (gc-stats-reset!)
     (let* ((budget-jiffies (* budget-sec jiffies-per-sec))

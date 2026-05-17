@@ -162,24 +162,70 @@ before its timing numbers are meaningful.
 
 ## Bench coverage matrix
 
-Phase C + D ports as of 2026-05-17:
+Phase C + D + E ports as of 2026-05-17:
 
-| Bench           | Tier | Source           | Crab walker | Crab VM | Crab AOT | Chez result |
-|-----------------|------|------------------|-------------|---------|----------|-------------|
-| fib             | 1    | microbench       | (heavy)     | ok      | (Phase D follow-up) | match |
-| tak             | 1    | microbench       | (heavy)     | ok      | "        | match |
-| ack             | 1    | microbench       | (heavy)     | ok      | "        | match |
-| nqueens         | 1    | microbench       | (heavy)     | ok      | "        | match |
-| mandelbrot      | 1    | microbench       | (heavy)     | ok      | "        | match |
-| spectral-norm   | 1    | microbench       | (heavy)     | ok      | "        | match |
-| binary-trees    | 1    | microbench       | (heavy)     | ok      | "        | match |
-| alloc-stress    | 1    | microbench       | (heavy)     | ok      | "        | match |
-| maze            | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
-| lattice         | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
-| paraffins       | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
-| sboyer          | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
-| nboyer          | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
-| earley          | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| Bench               | Tier | Source           | Crab walker | Crab VM | Crab AOT | Chez result |
+|---------------------|------|------------------|-------------|---------|----------|-------------|
+| fib                 | 1    | microbench       | (heavy)     | ok      | (Phase D follow-up) | match |
+| tak                 | 1    | microbench       | (heavy)     | ok      | "        | match |
+| ack                 | 1    | microbench       | (heavy)     | ok      | "        | match |
+| nqueens             | 1    | microbench       | (heavy)     | ok      | "        | match |
+| mandelbrot          | 1    | microbench       | (heavy)     | ok      | "        | match |
+| spectral-norm       | 1    | microbench       | (heavy)     | ok      | "        | match |
+| binary-trees        | 1    | microbench       | (heavy)     | ok      | "        | match |
+| alloc-stress        | 1    | microbench       | (heavy)     | ok      | "        | match |
+| maze                | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| lattice             | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| paraffins           | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| sboyer              | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| nboyer              | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| earley              | 2    | ecraven/r7rs     | (heavy)     | ok      | "        | match |
+| t3a-tree-rewriter   | 3    | authored (Phase E) | (heavy)     | ok    | "        | match |
+| t3b-hashtable-bench | 3    | authored (Phase E) | (heavy)     | ok    | "        | match |
+| t3c-metacircular    | 3    | authored (Phase E) | (heavy)     | ok    | "        | match |
+| t3e-stateful-loop   | 3    | authored (Phase E) | (heavy)     | ok    | "        | match |
+| (t3d-sxml)          | 3    | spec deferral    | -           | -       | -        | -     |
+
+## Tier-3 long-running benches
+
+The Phase-E synthetics target what Tier 1/2 misses: minute-scale
+steady-state, per-iter variance under 1.5×, real allocation
+patterns rather than tight CPU-bound loops.
+
+| Bench               | Per-iter | Allocs/iter | p95/p50 | Notes |
+|---------------------|----------|-------------|---------|-------|
+| t3a-tree-rewriter   | 25 ms    | 3.5 MB      | 1.01    | Rebuilds + folds a 32k-node expr tree each iter. |
+| t3b-hashtable-bench | 1.2 s    | 1 MB        | 1.14    | 4k inserts + 16k Zipf-skewed lookups + 2k deletes. Final ht size verified. |
+| t3c-metacircular    | 9.5 s    | 454 MB      | 1.008   | SICP eval/apply running 8x quicksort(200) per iter. |
+| t3e-stateful-loop   | 365 ms   | 1.9 MB      | 1.020   | 50k KV-store requests per iter, 256-key working set. |
+
+p95/p50 numbers from 3–5 measurement iters on M3 Max, VM tier.
+All four meet the spec's < 1.5× variance gate. t3a's variance is
+exceptionally tight (1.01) — the per-iter work is large enough
+that scheduling jitter is amortized out.
+
+T3-D (SXML transformer) is deferred — the spec's design requires
+a Scheme XML parser, which isn't trivially available. The other
+four cover the spec's targeted axes (heap pressure, hashtable
+scaling, interpretive dispatch, stateful steady-state).
+
+### GC % column is 0 across all Tier-3 rows
+
+CrabScheme's runtime still allocates most values via
+`cs_gc::Gc::new` (the unregistered constructor, used by
+`Pair::new` / `Hashtable::new` / etc. during the in-progress
+heap-rooting migration). Those allocs bump the process-global
+byte / count counters (so `bytes_allocated_total` and
+`alloc_rate_mb_per_sec` are honest) but don't fire the heap's
+auto-collect-on-threshold trigger. Until the migration completes,
+the harness's `gc_time_ms` and `max_pause_ms` columns will read
+zero for all benches that don't manually invoke
+`(collect-garbage)` inside their thunk.
+
+Benches that want to exercise the collector deliberately today
+can call `(collect-garbage)` at their iter boundary — the harness
+will capture the resulting `last_pause_ms` and roll it into
+`max_pause_ms` / the pause histogram.
 
 Walker "(heavy)" — runs, but the per-frame stack cost combined
 with our harness's let-heavy preamble blows the test-thread / CLI

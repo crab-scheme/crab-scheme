@@ -342,6 +342,9 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("gc-stats-reset!", b_gc_stats_reset),
         ("gc-stats-enable!", b_gc_stats_enable),
         ("gc-stats-disable!", b_gc_stats_disable),
+        ("gc-auto-collect-enable!", b_gc_auto_collect_enable),
+        ("gc-auto-collect-disable!", b_gc_auto_collect_disable),
+        ("gc-set-threshold!", b_gc_set_threshold),
         ("collect-garbage", b_collect_garbage),
         ("current-memory-use", b_current_memory_use),
         ("string-split", b_string_split),
@@ -11693,6 +11696,50 @@ fn b_collect_garbage(args: &[Value]) -> Result<Value, String> {
         .ok_or_else(|| "collect-garbage: no active runtime".to_string())?;
     rt.heap().collect();
     Ok(Value::fixnum(rt.heap().live_slots() as i64))
+}
+
+/// `(gc-auto-collect-enable!)` — turn on the heap's
+/// auto-collect-on-alloc behavior. With it on, every `Heap::alloc`
+/// past the current threshold triggers a `(collect-garbage)`. Off
+/// by default (cs-gc Phase 1 invariant). Tier-3 benches that want
+/// real GC pressure to show up in the harness flip this on.
+fn b_gc_auto_collect_enable(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("gc-auto-collect-enable!", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-auto-collect-enable!: no active runtime".to_string())?;
+    rt.heap().set_auto_collect(true);
+    Ok(Value::Unspecified)
+}
+
+/// `(gc-auto-collect-disable!)` — inverse of the above.
+fn b_gc_auto_collect_disable(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("gc-auto-collect-disable!", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-auto-collect-disable!: no active runtime".to_string())?;
+    rt.heap().set_auto_collect(false);
+    Ok(Value::Unspecified)
+}
+
+/// `(gc-set-threshold! n)` — set the alloc-count threshold that
+/// drives auto-collect. Default 4096; tier-3 benches typically
+/// want to lower this so collection fires per inner loop rather
+/// than once at the end.
+fn b_gc_set_threshold(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("gc-set-threshold!", "1", args.len()));
+    }
+    let n = match &args[0] {
+        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as usize,
+        v => return Err(type_err("gc-set-threshold!", "non-negative fixnum", v)),
+    };
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-set-threshold!: no active runtime".to_string())?;
+    rt.heap().set_threshold(n);
+    Ok(Value::Unspecified)
 }
 
 /// `(current-memory-use)` — cumulative bytes allocated since heap
