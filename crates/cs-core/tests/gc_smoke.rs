@@ -4,6 +4,13 @@
 //! tests for that). The goal is to confirm the API shape works for
 //! the patterns `Value`'s heap variants need: Clone, Deref, Eq, and
 //! interior mutability via `RefCell`.
+//!
+//! Gated on the default (tracing) representation; under
+//! `feature = "countable-memory"` there is no `Trace`/`Marker` to
+//! exercise and the equivalent coverage lives in `cs-gc`'s own
+//! `rc_only` unit tests.
+
+#![cfg(not(feature = "countable-memory"))]
 
 use std::cell::RefCell;
 

@@ -29,7 +29,16 @@ pub use value::{
 /// behind a `Gc<T>` must implement it — leaf types satisfy this with
 /// an empty trace (and `cs-gc` provides blanket impls for primitives,
 /// `Vec`, `Option`, `RefCell`).
+///
+/// Under `feature = "countable-memory"` the tracing surface
+/// (`Heap`, `Marker`, `Trace`) is replaced by `Weak<T>` and the
+/// `cycle` module; consumer crates need only `cs_core::Gc<T>`
+/// (which is always exported) plus the optional `cycle` types.
+#[cfg(not(feature = "countable-memory"))]
 pub use cs_gc::{Gc, Heap, Marker, Trace};
+
+#[cfg(feature = "countable-memory")]
+pub use cs_gc::{Gc, Weak};
 
 thread_local! {
     /// One-element cache of the value most recently passed to a builtin's

@@ -8,6 +8,11 @@ use std::rc::Rc;
 use crate::number::Number;
 use crate::symbol::{Symbol, SymbolTable};
 
+// Bring the CycleVisit trait into scope so per-type
+// `visit_children` calls resolve under the feature.
+#[cfg(feature = "countable-memory")]
+use cs_gc::cycle::CycleVisit as _;
+
 /// A pair (cons cell). Mutable per R6RS via `set-car!` / `set-cdr!`.
 #[derive(Debug)]
 pub struct Pair {
@@ -24,10 +29,22 @@ impl Pair {
     }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_gc::Trace for Pair {
     fn trace(&self, marker: &mut cs_gc::Marker) {
         self.car.borrow().trace(marker);
         self.cdr.borrow().trace(marker);
+    }
+}
+
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::CycleVisit for Pair {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        self.car.borrow().visit_children(ctx);
+        if ctx.done() {
+            return;
+        }
+        self.cdr.borrow().visit_children(ctx);
     }
 }
 
@@ -86,6 +103,7 @@ impl Hashtable {
     }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_gc::Trace for Hashtable {
     fn trace(&self, marker: &mut cs_gc::Marker) {
         for (k, v) in self.items.borrow().iter() {
@@ -95,6 +113,32 @@ impl cs_gc::Trace for Hashtable {
         if let Some(c) = &self.custom {
             c.hash.trace(marker);
             c.equiv.trace(marker);
+        }
+    }
+}
+
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::CycleVisit for Hashtable {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        for (k, v) in self.items.borrow().iter() {
+            if ctx.done() {
+                return;
+            }
+            k.visit_children(ctx);
+            if ctx.done() {
+                return;
+            }
+            v.visit_children(ctx);
+        }
+        if let Some(c) = &self.custom {
+            if ctx.done() {
+                return;
+            }
+            c.hash.visit_children(ctx);
+            if ctx.done() {
+                return;
+            }
+            c.equiv.visit_children(ctx);
         }
     }
 }
@@ -192,11 +236,19 @@ impl Port {
     }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_gc::Trace for Port {
     fn trace(&self, _marker: &mut cs_gc::Marker) {
         // Leaf: every Port variant holds either chars/bytes/Strings or a
         // file-output buffer. None contain a Value or Gc<T>, so there's
         // nothing to mark transitively.
+    }
+}
+
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::CycleVisit for Port {
+    fn visit_children(&self, _ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Leaf: Port variants hold no Gc<...> children.
     }
 }
 
@@ -222,6 +274,7 @@ impl Promise {
     }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_gc::Trace for Promise {
     fn trace(&self, marker: &mut cs_gc::Marker) {
         match &*self.state.borrow() {
@@ -230,18 +283,46 @@ impl cs_gc::Trace for Promise {
     }
 }
 
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::CycleVisit for Promise {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        match &*self.state.borrow() {
+            PromiseState::Pending(v) | PromiseState::Forced(v) => v.visit_children(ctx),
+        }
+    }
+}
+
 /// Type-erased procedure dispatch. Concrete builtin and closure types live in
 /// `cs-runtime`; eval downcasts via [`as_any`].
 ///
-/// Procedure has `cs_gc::Trace` as a supertrait so closure environments
-/// (and any `Value` fields stored inside concrete procedure types)
-/// participate in GC tracing. Most builtins are leaves (their `trace` is
-/// empty); closures and parameters mark their captured Values.
+/// Under the default (tracing) representation, Procedure has
+/// `cs_gc::Trace` as a supertrait so closure environments and parameter
+/// cells participate in mark-sweep tracing. Under
+/// `feature = "countable-memory"` the supertrait is gone — reclamation
+/// runs by Rc refcount alone — and Procedure gains an optional
+/// `visit_closure_children` method that the synchronous cycle
+/// collector consults when walking a Value::Procedure. Most builtins
+/// hold no Scheme heap children and inherit the empty default impl;
+/// only closures and Parameter override it.
+#[cfg(not(feature = "countable-memory"))]
 pub trait Procedure: fmt::Debug + cs_gc::Trace + 'static {
     fn as_any(&self) -> &dyn Any;
     fn name(&self) -> Option<&str> {
         None
     }
+}
+
+#[cfg(feature = "countable-memory")]
+pub trait Procedure: fmt::Debug + 'static {
+    fn as_any(&self) -> &dyn Any;
+    fn name(&self) -> Option<&str> {
+        None
+    }
+    /// Visit every `Gc<...>` child this procedure holds in its
+    /// closure environment. Default impl is empty — appropriate
+    /// for builtins and zero-payload procedure markers. Closures,
+    /// continuations, and Parameter override it.
+    fn visit_closure_children(&self, _ctx: &mut cs_gc::cycle::CycleVisitor) {}
 }
 
 /// A dynamic parameter procedure (R6RS `make-parameter`). Lives in cs-core
@@ -259,11 +340,23 @@ impl Procedure for Parameter {
     fn name(&self) -> Option<&str> {
         Some("parameter")
     }
+    #[cfg(feature = "countable-memory")]
+    fn visit_closure_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        self.cell.borrow().visit_children(ctx);
+    }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_gc::Trace for Parameter {
     fn trace(&self, marker: &mut cs_gc::Marker) {
         self.cell.borrow().trace(marker);
+    }
+}
+
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::CycleVisit for Parameter {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        self.cell.borrow().visit_children(ctx);
     }
 }
 
@@ -318,6 +411,7 @@ pub enum WriteMode {
 /// walker top frame and the VM root env, both of which are root closures.
 /// True cycles that go *through* `Rc<dyn Procedure>` would leak in
 /// Phase 1; the M5 spec's exit gate calls this out explicitly.
+#[cfg(not(feature = "countable-memory"))]
 impl cs_gc::Trace for Value {
     fn trace(&self, marker: &mut cs_gc::Marker) {
         match self {
@@ -332,6 +426,70 @@ impl cs_gc::Trace for Value {
             // Rc-backed (Phase 1 limitation, see doc above).
             Value::Procedure(_) => {}
             // Leaf variants — no heap pointers.
+            Value::Null
+            | Value::Unspecified
+            | Value::Eof
+            | Value::Boolean(_)
+            | Value::Character(_)
+            | Value::Symbol(_)
+            | Value::Number(_) => {}
+        }
+    }
+}
+
+/// Under countable-memory, every heap-bearing Value variant
+/// (including Procedure) participates in cycle detection. Pair
+/// /Vector/etc. forward through the cs_gc blanket impl for Gc<T>;
+/// Procedure forwards through the trait's `visit_closure_children`
+/// hook so concrete closures and parameters can enumerate their
+/// captured values without each Value match-arm knowing the
+/// concrete type.
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::CycleVisit for Value {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        match self {
+            Value::String(s) => {
+                if ctx.visit(s) {
+                    s.visit_children(ctx);
+                }
+            }
+            Value::ByteVector(v) => {
+                if ctx.visit(v) {
+                    v.visit_children(ctx);
+                }
+            }
+            Value::Vector(v) => {
+                if ctx.visit(v) {
+                    v.visit_children(ctx);
+                }
+            }
+            Value::Pair(p) => {
+                if ctx.visit(p) {
+                    p.visit_children(ctx);
+                }
+            }
+            Value::Hashtable(h) => {
+                if ctx.visit(h) {
+                    h.visit_children(ctx);
+                }
+            }
+            Value::Port(p) => {
+                if ctx.visit(p) {
+                    p.visit_children(ctx);
+                }
+            }
+            Value::Promise(p) => {
+                if ctx.visit(p) {
+                    p.visit_children(ctx);
+                }
+            }
+            Value::Procedure(p) => {
+                // Procedure is Rc<dyn Procedure>; we don't have a
+                // Gc<...> to register identity for. Forward to the
+                // trait's closure-child hook so concrete impls
+                // enumerate their captured Gc<...> children.
+                p.visit_closure_children(ctx);
+            }
             Value::Null
             | Value::Unspecified
             | Value::Eof

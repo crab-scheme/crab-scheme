@@ -5,6 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Forward the countable-memory feature down to cs-gc so consumer
+# crates need only enable it once at the top of the dependency
+# graph. Adds parallel CycleVisit impls alongside the existing
+# Trace impls under the same #[cfg].
+countable-memory = ["cs-gc/countable-memory"]
+
 [dependencies]
 cs-diag = { workspace = true }
 cs-gc = { workspace = true }
