@@ -288,6 +288,86 @@ impl std::fmt::Display for AotError {
 /// (user-meaningful description, suggested workaround). Drives the
 /// `UnsupportedInst` diagnostic format so users hit actionable
 /// guidance instead of internal Inst names.
+/// Walk a `Function` in block order and infer each Value's
+/// `Type` from the instruction that produced it. Used by the
+/// codegen helpers (`nb_to_f64_expr` and friends) to skip the
+/// defensive `as_fixnum()` discrimination when the operand's
+/// type is statically known — Flonum operands of `FlonumAdd`
+/// / `FlonumMul` / `FlonumSub` / `FlonumDiv` / etc. account for
+/// the bulk of the gain on Flonum-heavy benches (mandelbrot,
+/// nbody, spectral-norm).
+///
+/// Seeded from `func.params` (which carry typer-derived hints
+/// per Phase 5+); subsequent Values pick up types from the
+/// producing inst (FlonumAdd → Flonum, Add → Fixnum,
+/// LoadConst(Flonum(_)) → Flonum, etc.). Unsupported insts
+/// leave the Value out of the map, in which case downstream
+/// helpers fall back to the defensive form.
+fn infer_value_types(func: &Function) -> std::collections::HashMap<Value, Type> {
+    let mut types: std::collections::HashMap<Value, Type> =
+        std::collections::HashMap::with_capacity(func.params.len() + 16);
+    for (v, ty) in &func.params {
+        types.insert(*v, ty.clone());
+    }
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let entry: Option<(Value, Type)> = match inst {
+                Inst::LoadConst(dst, c) => {
+                    let t = match c {
+                        Const::Fixnum(_) => Type::Fixnum,
+                        Const::Flonum(_) => Type::Flonum,
+                        Const::Boolean(_) => Type::Boolean,
+                        Const::Character(_) => Type::Character,
+                        Const::Null => Type::Null,
+                        Const::Symbol(_) => Type::Symbol,
+                        Const::Unspecified | Const::Eof | Const::StringRef(_) => Type::Any,
+                    };
+                    Some((*dst, t))
+                }
+                // Integer arithmetic → Fixnum result.
+                Inst::Add(dst, _, _) | Inst::Sub(dst, _, _) | Inst::Mul(dst, _, _) => {
+                    Some((*dst, Type::Fixnum))
+                }
+                // Comparisons → Boolean (NB) or 0/1 i64 (RawI64);
+                // we treat both as Boolean for type-propagation
+                // purposes since neither emits Flonum arithmetic.
+                Inst::Lt(dst, _, _)
+                | Inst::Eq(dst, _, _)
+                | Inst::FlonumLt(dst, _, _)
+                | Inst::FlonumEq(dst, _, _) => Some((*dst, Type::Boolean)),
+                // Flonum arithmetic → Flonum.
+                Inst::FlonumAdd(dst, _, _)
+                | Inst::FlonumSub(dst, _, _)
+                | Inst::FlonumMul(dst, _, _)
+                | Inst::FlonumDiv(dst, _, _)
+                | Inst::FlonumSqrt(dst, _)
+                | Inst::FlonumSin(dst, _)
+                | Inst::FlonumCos(dst, _)
+                | Inst::FlonumTan(dst, _)
+                | Inst::FlonumLog(dst, _)
+                | Inst::FlonumExp(dst, _)
+                | Inst::FlonumAsin(dst, _)
+                | Inst::FlonumAcos(dst, _)
+                | Inst::FlonumAtan(dst, _)
+                | Inst::FlonumLog2(dst, _, _)
+                | Inst::FlonumAtan2(dst, _, _) => Some((*dst, Type::Flonum)),
+                // SSA alias copy: dst inherits src's type.
+                Inst::Move(dst, src) => types.get(src).cloned().map(|t| (*dst, t)),
+                _ => None,
+            };
+            if let Some((d, t)) = entry {
+                types.insert(d, t);
+            }
+        }
+        // Block params get types from the predecessor's Jump
+        // args. For simplicity we don't model that here — block
+        // params fall through to "unknown" and the defensive
+        // form fires. Adequate for the common case (the hot
+        // path is the body, not the joins).
+    }
+    types
+}
+
 fn inst_user_hint(inst_name: &str) -> (&'static str, &'static str) {
     match inst_name {
         "MakeClosure" => (
@@ -537,10 +617,16 @@ pub fn emit_with_resolver(
     // Suppress unused warning when the body doesn't need self_handle.
     out.push_str("    let _ = __self_handle;\n");
 
+    // Pre-compute per-Value type map once; passed to all the
+    // Flonum codegen helpers via inst_rhs → fbinop_rust /
+    // fcmp_*_rust / funary_rust_method / fbinop_method_rust
+    // so the defensive `as_fixnum()` discrimination can be
+    // skipped when the operand's type is statically known.
+    let types = infer_value_types(func);
     if straight_line {
-        emit_straight_line(&mut out, func, mode, resolver)?;
+        emit_straight_line(&mut out, func, mode, resolver, &types)?;
     } else {
-        emit_loop_match(&mut out, func, mode, resolver)?;
+        emit_loop_match(&mut out, func, mode, resolver, &types)?;
     }
 
     out.push_str("}\n");
@@ -556,6 +642,7 @@ fn emit_straight_line(
     func: &Function,
     mode: EmitMode,
     resolver: &LambdaResolver,
+    types: &std::collections::HashMap<Value, Type>,
 ) -> Result<(), AotError> {
     let block = &func.blocks[0];
     let mut defined: HashSet<Value> = func.params.iter().map(|(v, _)| *v).collect();
@@ -573,6 +660,7 @@ fn emit_straight_line(
             &func.captures,
             &local_defs,
             func.self_binding_sym,
+            types,
         )?;
         if let Some(dst) = inst_dst(inst) {
             defined.insert(dst);
@@ -602,6 +690,7 @@ fn emit_loop_match(
     func: &Function,
     mode: EmitMode,
     resolver: &LambdaResolver,
+    types: &std::collections::HashMap<Value, Type>,
 ) -> Result<(), AotError> {
     // Pre-declare every Value that ISN'T already a function
     // parameter. Block params and Inst destinations all go here.
@@ -651,6 +740,7 @@ fn emit_loop_match(
                 &func.captures,
                 &local_defs,
                 func.self_binding_sym,
+                types,
             )?;
         }
         emit_terminator(out, &block.terminator, func, mode)?;
@@ -705,6 +795,7 @@ fn emit_inst_let(
     captures: &[u32],
     local_defs: &std::collections::HashMap<u32, Value>,
     self_binding_sym: Option<u32>,
+    types: &std::collections::HashMap<Value, Type>,
 ) -> Result<(), AotError> {
     // RC3 iter 2.11 — EnvDefineLocal that survived demote (the
     // multi-block + multi-define case) lowers to a no-op: the
@@ -735,6 +826,7 @@ fn emit_inst_let(
         captures,
         local_defs,
         self_binding_sym,
+        types,
     )?;
     writeln!(out, "    let v{}: i64 = {};", dst.0, expr).unwrap();
     Ok(())
@@ -751,6 +843,7 @@ fn emit_inst_assign(
     captures: &[u32],
     local_defs: &std::collections::HashMap<u32, Value>,
     self_binding_sym: Option<u32>,
+    types: &std::collections::HashMap<Value, Type>,
 ) -> Result<(), AotError> {
     // Same no-op as emit_inst_let for surviving EnvDefineLocal.
     if matches!(inst, Inst::EnvDefineLocal(..)) {
@@ -773,6 +866,7 @@ fn emit_inst_assign(
         captures,
         local_defs,
         self_binding_sym,
+        types,
     )?;
     writeln!(out, "                v{} = {};", dst.0, expr).unwrap();
     Ok(())
@@ -791,6 +885,7 @@ fn inst_rhs(
     captures: &[u32],
     local_defs: &std::collections::HashMap<u32, Value>,
     self_binding_sym: Option<u32>,
+    types: &std::collections::HashMap<Value, Type>,
 ) -> Result<(Value, String), AotError> {
     let check = |v: Value| -> Result<(), AotError> {
         match defined {
@@ -1232,22 +1327,22 @@ fn inst_rhs(
         (Inst::FlonumAdd(dst, lhs, rhs), _) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, fbinop_rust("+", lhs, rhs))
+            (*dst, fbinop_rust("+", lhs, rhs, types))
         }
         (Inst::FlonumSub(dst, lhs, rhs), _) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, fbinop_rust("-", lhs, rhs))
+            (*dst, fbinop_rust("-", lhs, rhs, types))
         }
         (Inst::FlonumMul(dst, lhs, rhs), _) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, fbinop_rust("*", lhs, rhs))
+            (*dst, fbinop_rust("*", lhs, rhs, types))
         }
         (Inst::FlonumDiv(dst, lhs, rhs), _) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, fbinop_rust("/", lhs, rhs))
+            (*dst, fbinop_rust("/", lhs, rhs, types))
         }
 
         // ---- Flonum comparisons ----
@@ -1261,22 +1356,22 @@ fn inst_rhs(
         (Inst::FlonumLt(dst, lhs, rhs), EmitMode::RawI64) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, fcmp_raw_rust("<", lhs, rhs))
+            (*dst, fcmp_raw_rust("<", lhs, rhs, types))
         }
         (Inst::FlonumEq(dst, lhs, rhs), EmitMode::RawI64) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, fcmp_raw_rust("==", lhs, rhs))
+            (*dst, fcmp_raw_rust("==", lhs, rhs, types))
         }
         (Inst::FlonumLt(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, fcmp_nb_rust("<", lhs, rhs))
+            (*dst, fcmp_nb_rust("<", lhs, rhs, types))
         }
         (Inst::FlonumEq(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, fcmp_nb_rust("==", lhs, rhs))
+            (*dst, fcmp_nb_rust("==", lhs, rhs, types))
         }
 
         // ---- Flonum unary ops (RC2 iter D) ----
@@ -1291,72 +1386,72 @@ fn inst_rhs(
         // carriers of f64 bit patterns.
         (Inst::FlonumSqrt(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("sqrt", src))
+            (*dst, funary_rust_method("sqrt", src, types))
         }
         (Inst::FlonumAbs(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("abs", src))
+            (*dst, funary_rust_method("abs", src, types))
         }
         (Inst::FlonumFloor(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("floor", src))
+            (*dst, funary_rust_method("floor", src, types))
         }
         (Inst::FlonumCeil(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("ceil", src))
+            (*dst, funary_rust_method("ceil", src, types))
         }
         (Inst::FlonumTrunc(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("trunc", src))
+            (*dst, funary_rust_method("trunc", src, types))
         }
         (Inst::FlonumRound(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("round", src))
+            (*dst, funary_rust_method("round", src, types))
         }
         (Inst::FlonumSin(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("sin", src))
+            (*dst, funary_rust_method("sin", src, types))
         }
         (Inst::FlonumCos(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("cos", src))
+            (*dst, funary_rust_method("cos", src, types))
         }
         (Inst::FlonumTan(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("tan", src))
+            (*dst, funary_rust_method("tan", src, types))
         }
         (Inst::FlonumLog(dst, src), _) => {
             check(*src)?;
             // Scheme `log` is the natural log → Rust's `f64::ln`.
-            (*dst, funary_rust_method("ln", src))
+            (*dst, funary_rust_method("ln", src, types))
         }
         (Inst::FlonumExp(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("exp", src))
+            (*dst, funary_rust_method("exp", src, types))
         }
         (Inst::FlonumAsin(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("asin", src))
+            (*dst, funary_rust_method("asin", src, types))
         }
         (Inst::FlonumAcos(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("acos", src))
+            (*dst, funary_rust_method("acos", src, types))
         }
         (Inst::FlonumAtan(dst, src), _) => {
             check(*src)?;
-            (*dst, funary_rust_method("atan", src))
+            (*dst, funary_rust_method("atan", src, types))
         }
 
         // ---- Flonum binary ops (RC2 iter D) ----
         (Inst::FlonumMax(dst, lhs, rhs), _) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, fbinop_method_rust("max", lhs, rhs))
+            (*dst, fbinop_method_rust("max", lhs, rhs, types))
         }
         (Inst::FlonumMin(dst, lhs, rhs), _) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, fbinop_method_rust("min", lhs, rhs))
+            (*dst, fbinop_method_rust("min", lhs, rhs, types))
         }
         // Per the JIT lowering, all three are (dst, n, base) shape.
         // Rust stdlib mappings:
@@ -1366,17 +1461,17 @@ fn inst_rhs(
         (Inst::FlonumLog2(dst, n, base), _) => {
             check(*n)?;
             check(*base)?;
-            (*dst, fbinop_method_rust("log", n, base))
+            (*dst, fbinop_method_rust("log", n, base, types))
         }
         (Inst::FlonumAtan2(dst, n, base), _) => {
             check(*n)?;
             check(*base)?;
-            (*dst, fbinop_method_rust("atan2", n, base))
+            (*dst, fbinop_method_rust("atan2", n, base, types))
         }
         (Inst::FlonumExpt(dst, n, base), _) => {
             check(*n)?;
             check(*base)?;
-            (*dst, fbinop_method_rust("powf", n, base))
+            (*dst, fbinop_method_rust("powf", n, base, types))
         }
 
         // ---- Flonum predicates (RC2 iter D) ----
@@ -1736,38 +1831,54 @@ fn emit_terminator(
 /// payload to f64; if NB Flonum (or RawI64 mode with raw f64
 /// bits), use bit pattern directly. NanboxValue::as_fixnum
 /// handles the discrimination.
-fn fbinop_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
-    // Helper that yields a Rust expression converting an NB carrier
-    // (Fixnum-or-Flonum) to f64.
-    let to_f64 = |v: &Value| -> String {
-        format!(
+/// Emit a Rust expression that converts the i64 NB carrier in
+/// `v{n}` to f64. When `ty == Some(Type::Flonum)`, skip the NB-
+/// Fixnum check and bitcast directly — this is the common path
+/// for FlonumAdd/Mul/etc. operands whose type is statically
+/// known from the inferred value-types map. When the type is
+/// unknown (None) or anything else, fall back to the defensive
+/// `as_fixnum() / from_bits` discrimination so a NB-Fixnum
+/// operand mistakenly fed where a Flonum was expected still
+/// promotes correctly. (RC3 iter 2.17 introduced the defensive
+/// form; this commit narrows it to the cases that actually
+/// need it.)
+fn nb_to_f64_expr(v: &Value, ty: Option<&Type>) -> String {
+    match ty {
+        Some(Type::Flonum) => format!("f64::from_bits(v{} as u64)", v.0),
+        _ => format!(
             "(if let Some(__nb_n) = cs_vm::vm::NanboxValue(v{v}).as_fixnum() {{ \
              __nb_n as f64 }} else {{ f64::from_bits(v{v} as u64) }})",
             v = v.0
-        )
-    };
+        ),
+    }
+}
+
+fn fbinop_rust(
+    op: &str,
+    lhs: &Value,
+    rhs: &Value,
+    types: &std::collections::HashMap<Value, Type>,
+) -> String {
     format!(
         "({lhs_f} {op} {rhs_f}).to_bits() as i64",
-        lhs_f = to_f64(lhs),
-        rhs_f = to_f64(rhs),
+        lhs_f = nb_to_f64_expr(lhs, types.get(lhs)),
+        rhs_f = nb_to_f64_expr(rhs, types.get(rhs)),
         op = op,
     )
 }
 
 /// RawI64-mode Flonum comparison: result is 0/1 i64.
 /// RC3 iter 2.17 — see fbinop_rust for NB-Fixnum handling rationale.
-fn fcmp_raw_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
-    let to_f64 = |v: &Value| -> String {
-        format!(
-            "(if let Some(__nb_n) = cs_vm::vm::NanboxValue(v{v}).as_fixnum() {{ \
-             __nb_n as f64 }} else {{ f64::from_bits(v{v} as u64) }})",
-            v = v.0
-        )
-    };
+fn fcmp_raw_rust(
+    op: &str,
+    lhs: &Value,
+    rhs: &Value,
+    types: &std::collections::HashMap<Value, Type>,
+) -> String {
     format!(
         "if {lhs_f} {op} {rhs_f} {{ 1 }} else {{ 0 }}",
-        lhs_f = to_f64(lhs),
-        rhs_f = to_f64(rhs),
+        lhs_f = nb_to_f64_expr(lhs, types.get(lhs)),
+        rhs_f = nb_to_f64_expr(rhs, types.get(rhs)),
         op = op,
     )
 }
@@ -1776,18 +1887,16 @@ fn fcmp_raw_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
 /// OR'ing the (0|1) compare with `NB_FALSE_BITS` — so 0→NB_FALSE,
 /// 1→NB_TRUE. Mirrors the JIT's FlonumLt lowering shape.
 /// RC3 iter 2.17 — NB-Fixnum-aware operand conversion.
-fn fcmp_nb_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
-    let to_f64 = |v: &Value| -> String {
-        format!(
-            "(if let Some(__nb_n) = cs_vm::vm::NanboxValue(v{v}).as_fixnum() {{ \
-             __nb_n as f64 }} else {{ f64::from_bits(v{v} as u64) }})",
-            v = v.0
-        )
-    };
+fn fcmp_nb_rust(
+    op: &str,
+    lhs: &Value,
+    rhs: &Value,
+    types: &std::collections::HashMap<Value, Type>,
+) -> String {
     format!(
         "((if {lhs_f} {op} {rhs_f} {{ 1u64 }} else {{ 0u64 }}) | 0xfff8_8000_0000_0000u64) as i64",
-        lhs_f = to_f64(lhs),
-        rhs_f = to_f64(rhs),
+        lhs_f = nb_to_f64_expr(lhs, types.get(lhs)),
+        rhs_f = nb_to_f64_expr(rhs, types.get(rhs)),
         op = op,
     )
 }
@@ -1796,26 +1905,36 @@ fn fcmp_nb_rust(op: &str, lhs: &Value, rhs: &Value) -> String {
 /// .to_bits() as i64`. Used for sqrt/abs/floor/ceil/trunc/round/sin/
 /// cos/tan/ln/exp/asin/acos/atan.
 /// RC3 iter 2.17 — NB-Fixnum-aware via NanboxValue::as_fixnum.
-fn funary_rust_method(method: &str, src: &Value) -> String {
-    format!(
-        "(if let Some(__nb_n) = cs_vm::vm::NanboxValue(v{s}).as_fixnum() {{ \
-         (__nb_n as f64).{method}() }} else {{ f64::from_bits(v{s} as u64).{method}() }}).to_bits() as i64",
-        s = src.0,
-        method = method,
-    )
+fn funary_rust_method(
+    method: &str,
+    src: &Value,
+    types: &std::collections::HashMap<Value, Type>,
+) -> String {
+    match types.get(src) {
+        Some(Type::Flonum) => format!(
+            "f64::from_bits(v{s} as u64).{method}().to_bits() as i64",
+            s = src.0,
+            method = method,
+        ),
+        _ => format!(
+            "(if let Some(__nb_n) = cs_vm::vm::NanboxValue(v{s}).as_fixnum() {{ \
+             (__nb_n as f64).{method}() }} else {{ f64::from_bits(v{s} as u64).{method}() }}).to_bits() as i64",
+            s = src.0,
+            method = method,
+        ),
+    }
 }
 
 /// Flonum binary method call: `lhs.METHOD(rhs)` shape. Used for
 /// max/min/log (base)/atan2/powf.
 /// RC3 iter 2.17 — NB-Fixnum-aware operand conversion.
-fn fbinop_method_rust(method: &str, lhs: &Value, rhs: &Value) -> String {
-    let to_f64 = |v: &Value| -> String {
-        format!(
-            "(if let Some(__nb_n) = cs_vm::vm::NanboxValue(v{v}).as_fixnum() {{ \
-             __nb_n as f64 }} else {{ f64::from_bits(v{v} as u64) }})",
-            v = v.0
-        )
-    };
+fn fbinop_method_rust(
+    method: &str,
+    lhs: &Value,
+    rhs: &Value,
+    types: &std::collections::HashMap<Value, Type>,
+) -> String {
+    let to_f64 = |v: &Value| -> String { nb_to_f64_expr(v, types.get(v)) };
     format!(
         "{lhs_f}.{method}({rhs_f}).to_bits() as i64",
         lhs_f = to_f64(lhs),
@@ -2421,13 +2540,20 @@ mod tests {
             terminator: Term::Return(Value(1)),
         });
         let src = emit_with(EmitMode::Nb, &f).unwrap();
-        // RC3 iter 2.17 — operand decode is NB-Fixnum-aware: each
-        // operand goes through `as_fixnum() → __nb_n as f64` else
-        // `f64::from_bits(...)`. The post-decode shape stays
-        // `.sqrt().to_bits() as i64`.
+        // Post-typer-hints (Phase-5+++): when the operand's
+        // type is statically known Flonum (here from the
+        // param-type hint), `infer_value_types` records it and
+        // the codegen skips the defensive `as_fixnum()`
+        // discrimination — direct `f64::from_bits` instead.
+        // The post-decode `.sqrt().to_bits() as i64` shape
+        // stays the same.
         assert!(src.contains(".sqrt()"));
         assert!(src.contains(".to_bits() as i64"));
-        assert!(src.contains("NanboxValue(v0).as_fixnum()"));
+        assert!(src.contains("f64::from_bits(v0 as u64)"));
+        assert!(
+            !src.contains("NanboxValue(v0).as_fixnum()"),
+            "param-typed Flonum should skip the as_fixnum check; got:\n{src}"
+        );
     }
 
     #[test]
@@ -2446,10 +2572,42 @@ mod tests {
             terminator: Term::Return(Value(2)),
         });
         let src = emit_with(EmitMode::Nb, &f).unwrap();
-        // RC3 iter 2.17 — operand decode is NB-Fixnum-aware.
+        // Same Phase-5+++ refinement: both operands are
+        // param-typed Flonum, so the as_fixnum check is gone.
         assert!(src.contains(".powf("));
-        assert!(src.contains("NanboxValue(v0).as_fixnum()"));
-        assert!(src.contains("NanboxValue(v1).as_fixnum()"));
+        assert!(src.contains("f64::from_bits(v0 as u64)"));
+        assert!(src.contains("f64::from_bits(v1 as u64)"));
+        assert!(!src.contains("NanboxValue(v0).as_fixnum()"));
+        assert!(!src.contains("NanboxValue(v1).as_fixnum()"));
+    }
+
+    #[test]
+    fn flonum_unknown_type_keeps_defensive_decode() {
+        // When the operand's type ISN'T statically known
+        // (e.g., a block param without an inferred type),
+        // the defensive `as_fixnum() / from_bits` pattern
+        // still fires. This preserves correctness for cases
+        // where a NB-Fixnum might sneak in.
+        //
+        // We construct a function whose Flonum op consumes a
+        // value defined by a non-Flonum-producing inst —
+        // here, AnyClone of a param — so infer_value_types
+        // doesn't record a Flonum for it.
+        let mut f = Function::new("u");
+        f.params.push((Value(0), Type::Any));
+        f.return_type = Type::Flonum;
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::FlonumSqrt(Value(1), Value(0))],
+            terminator: Term::Return(Value(1)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(
+            src.contains("NanboxValue(v0).as_fixnum()"),
+            "Any-typed operand should keep the defensive decode; got:\n{src}"
+        );
     }
 
     #[test]
