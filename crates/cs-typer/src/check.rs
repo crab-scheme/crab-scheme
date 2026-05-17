@@ -23,9 +23,50 @@ use crate::env::TypeEnv;
 use crate::infer::infer;
 use crate::types::Type;
 
+/// Pretty-print a `Type` for diagnostic messages.
+///
+/// Renders close to the user's source syntax: atoms by their
+/// canonical name, `(U …)` for unions, `(-> … R)` for procs
+/// (with `... T` for rest), `(Listof T)`, `(Vectorof T)`.
+/// Round-trips with `parse_type_ann` for the constructors the
+/// parser recognizes.
+pub fn render_type(t: &Type) -> String {
+    match t {
+        Type::Fixnum => "Fixnum".into(),
+        Type::Flonum => "Flonum".into(),
+        Type::Boolean => "Boolean".into(),
+        Type::Character => "Character".into(),
+        Type::Symbol => "Symbol".into(),
+        Type::Pair => "Pair".into(),
+        Type::Vector => "Vector".into(),
+        Type::String => "String".into(),
+        Type::ByteVector => "ByteVector".into(),
+        Type::Procedure => "Procedure".into(),
+        Type::Null => "Null".into(),
+        Type::Any => "Any".into(),
+        Type::Never => "Never".into(),
+        Type::Union(members) => {
+            let inner: Vec<String> = members.iter().map(render_type).collect();
+            format!("(U {})", inner.join(" "))
+        }
+        Type::Listof(elem) => format!("(Listof {})", render_type(elem)),
+        Type::Vectorof(elem) => format!("(Vectorof {})", render_type(elem)),
+        Type::Procedure_(pt) => {
+            let mut parts: Vec<String> = pt.params.iter().map(render_type).collect();
+            if let Some(rest) = &pt.rest {
+                parts.push(render_type(rest));
+                parts.push("...".into());
+            }
+            parts.push(render_type(&pt.return_type));
+            format!("(-> {})", parts.join(" "))
+        }
+    }
+}
+
 /// A type mismatch surfaced by `check`. Each variant carries the
-/// `Span` of the offending CoreExpr so iter 2.8 can render a
-/// per-source-location diagnostic.
+/// `Span` of the offending CoreExpr so iter 6.1's
+/// [`TypeError::to_diagnostic`] can render a per-source-location
+/// diagnostic.
 ///
 /// `TypeError` deliberately stays decoupled from `cs_diag` —
 /// iter 2.8 owns the conversion. Keeping it as a plain enum here
@@ -53,6 +94,77 @@ pub enum TypeError {
     /// fills empty bodies with `unspecified` — but the variant
     /// keeps the match exhaustive).
     EmptyBegin { span: Span },
+}
+
+impl TypeError {
+    /// The source span this error is attached to.
+    pub fn span(&self) -> Span {
+        match self {
+            TypeError::Mismatch { span, .. }
+            | TypeError::ArityMismatch { span, .. }
+            | TypeError::NotAProcedure { span, .. }
+            | TypeError::EmptyBegin { span } => *span,
+        }
+    }
+
+    /// Render as a `cs_diag::Diagnostic`. The `code` field is
+    /// stable and groups errors by kind for tooling.
+    pub fn to_diagnostic(&self) -> cs_diag::Diagnostic {
+        match self {
+            TypeError::Mismatch {
+                expected,
+                found,
+                span,
+            } => cs_diag::Diagnostic {
+                severity: cs_diag::Severity::Error,
+                code: Some("typer-mismatch"),
+                message: format!(
+                    "expected {}, found {}",
+                    render_type(expected),
+                    render_type(found)
+                ),
+                primary: *span,
+                labels: vec![],
+                notes: vec![],
+            },
+            TypeError::ArityMismatch {
+                expected,
+                found,
+                span,
+            } => cs_diag::Diagnostic {
+                severity: cs_diag::Severity::Error,
+                code: Some("typer-arity"),
+                message: format!(
+                    "procedure expects {} argument{}, got {}",
+                    expected,
+                    if *expected == 1 { "" } else { "s" },
+                    found
+                ),
+                primary: *span,
+                labels: vec![],
+                notes: vec![],
+            },
+            TypeError::NotAProcedure { found, span } => cs_diag::Diagnostic {
+                severity: cs_diag::Severity::Error,
+                code: Some("typer-not-a-procedure"),
+                message: format!(
+                    "tried to call a value of type {}; expected a procedure",
+                    render_type(found)
+                ),
+                primary: *span,
+                labels: vec![],
+                notes: vec![],
+            },
+            TypeError::EmptyBegin { span } => cs_diag::Diagnostic {
+                severity: cs_diag::Severity::Error,
+                code: Some("typer-empty-begin"),
+                message: "empty `begin` cannot satisfy a non-Any expected type".into(),
+                primary: *span,
+                labels: vec![],
+                notes: vec![],
+            },
+        }
+    }
 }
 
 /// Subtyping over the full Phase-3 type lattice.
@@ -557,6 +669,75 @@ mod tests {
     fn begin_fails_when_last_expr_mismatches() {
         let result = check_program("(begin 1 \"x\")", &Type::Fixnum);
         assert!(matches!(result, Err(TypeError::Mismatch { .. })));
+    }
+
+    // ---- render_type + to_diagnostic ----
+
+    #[test]
+    fn render_type_atoms() {
+        assert_eq!(render_type(&Type::Fixnum), "Fixnum");
+        assert_eq!(render_type(&Type::String), "String");
+        assert_eq!(render_type(&Type::Any), "Any");
+        assert_eq!(render_type(&Type::Never), "Never");
+    }
+
+    #[test]
+    fn render_type_union_and_containers() {
+        let u = Type::union(vec![Type::Fixnum, Type::Flonum]);
+        assert_eq!(render_type(&u), "(U Fixnum Flonum)");
+        assert_eq!(
+            render_type(&Type::Listof(Box::new(Type::Fixnum))),
+            "(Listof Fixnum)"
+        );
+    }
+
+    #[test]
+    fn render_type_procedure_with_rest() {
+        use crate::types::ProcType;
+        let pt = Type::Procedure_(Box::new(ProcType {
+            params: vec![Type::Fixnum],
+            return_type: Type::Boolean,
+            rest: Some(Type::String),
+            filter: None,
+        }));
+        assert_eq!(render_type(&pt), "(-> Fixnum String ... Boolean)");
+    }
+
+    #[test]
+    fn diagnostic_mismatch_renders_human_readable() {
+        use cs_diag::{FileId, Span};
+        let e = TypeError::Mismatch {
+            expected: Type::Fixnum,
+            found: Type::String,
+            span: Span::new(FileId(0), 0, 5),
+        };
+        let d = e.to_diagnostic();
+        assert_eq!(d.severity, cs_diag::Severity::Error);
+        assert_eq!(d.code, Some("typer-mismatch"));
+        assert_eq!(d.message, "expected Fixnum, found String");
+    }
+
+    #[test]
+    fn diagnostic_arity_renders_with_plural() {
+        use cs_diag::{FileId, Span};
+        let e = TypeError::ArityMismatch {
+            expected: 1,
+            found: 3,
+            span: Span::new(FileId(0), 0, 5),
+        };
+        assert_eq!(
+            e.to_diagnostic().message,
+            "procedure expects 1 argument, got 3"
+        );
+        let e2 = TypeError::ArityMismatch {
+            expected: 2,
+            found: 0,
+            span: Span::new(FileId(0), 0, 5),
+        };
+        assert_eq!(
+            e2.to_diagnostic().message,
+            "procedure expects 2 arguments, got 0"
+        );
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub use annotate::{
     AnnotationTable, LambdaAnnotation, LetrecAnnotation, TopLevelAnnotation, TypeAlias,
 };
 pub use builtins::{install_primops, primop_pairs, primop_table};
-pub use check::{check, subtype, TypeError};
+pub use check::{check, render_type, subtype, TypeError};
 pub use checker::Checker;
 pub use env::{Frame, TypeEnv};
 pub use extract::extract_annotations;

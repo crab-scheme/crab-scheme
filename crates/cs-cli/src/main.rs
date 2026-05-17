@@ -156,6 +156,18 @@ enum Cmd {
     /// the user's platform before pointing it at real source files.
     #[cfg(feature = "aot")]
     AotDoctor,
+    /// Typer Phase 6.1: typecheck a Scheme source file.
+    ///
+    /// Runs parse → extract annotations → expand → checker;
+    /// prints diagnostics in the standard format. Exit code 0
+    /// when no type errors surface, 1 when type errors surface,
+    /// 2 on parse / expand errors. Untyped programs always exit
+    /// 0 (typer is a no-op without annotations).
+    #[cfg(feature = "aot")]
+    Check {
+        /// Path to the .scm source file.
+        file: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -223,6 +235,8 @@ fn main() -> ExitCode {
         }
         #[cfg(feature = "aot")]
         Some(Cmd::AotDoctor) => run_aot_doctor(),
+        #[cfg(feature = "aot")]
+        Some(Cmd::Check { file }) => run_check(&file, color),
     }
 }
 
@@ -1063,6 +1077,89 @@ fn propagate_transitive_captures(
 }
 
 #[cfg(feature = "aot")]
+/// Typer Phase 6.1: `crabscheme check FILE.scm`.
+///
+/// Runs parse → extract annotations → expand → checker.
+/// Prints type-error diagnostics via cs-diag's standard
+/// renderer (color-aware). Exit code:
+///   0 — clean (no type errors)
+///   1 — type errors found
+///   2 — parse / expand / I/O failure before checking
+#[cfg(feature = "aot")]
+fn run_check(file: &str, color: bool) -> ExitCode {
+    use std::collections::HashMap;
+
+    use cs_core::SymbolTable;
+    use cs_expand::Expander;
+    use cs_parse::read_all;
+
+    let src = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("crabscheme check: cannot read {file}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut sources = SourceMap::new();
+    let file_id = sources.add(file, &src);
+    let mut syms = SymbolTable::new();
+    let data = match read_all(file_id, &src, &mut syms) {
+        Ok(d) => d,
+        Err(errs) => {
+            for e in &errs {
+                eprintln!("crabscheme check: parse error: {}", e.message());
+            }
+            return ExitCode::from(2);
+        }
+    };
+    // Typer pre-pass: strip annotations + diagnostics for
+    // malformed ones (typer-bad-annotation).
+    let (data, table, ann_diags) = cs_typer::extract_annotations(&data, &mut syms);
+    let mut any_error = false;
+    for d in &ann_diags {
+        if matches!(d.severity, cs_diag::Severity::Error) {
+            any_error = true;
+        }
+        eprintln!("{}", render_diag(d, &sources, color));
+    }
+    let mut macros = HashMap::new();
+    let mut expander = Expander::new(&mut syms, &mut macros);
+    let core = match expander.expand_program(&data) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("crabscheme check: expand error: {}", e.message());
+            return ExitCode::from(2);
+        }
+    };
+    drop(expander);
+    // Type check. Untyped programs (table.is_empty()) get
+    // an empty error list — we still run the walker but
+    // every node falls through the unannotated path.
+    let mut checker = cs_typer::Checker::new(&table, &mut syms);
+    let type_errors = checker.check_program(&core);
+    for err in &type_errors {
+        any_error = true;
+        let diag = err.to_diagnostic();
+        eprintln!("{}", render_diag(&diag, &sources, color));
+    }
+    if any_error {
+        let count = type_errors.len()
+            + ann_diags
+                .iter()
+                .filter(|d| matches!(d.severity, cs_diag::Severity::Error))
+                .count();
+        eprintln!(
+            "crabscheme check: {} type error{} in {file}",
+            count,
+            if count == 1 { "" } else { "s" }
+        );
+        ExitCode::from(1)
+    } else {
+        eprintln!("crabscheme check: {file} ok");
+        ExitCode::SUCCESS
+    }
+}
+
 fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
     use std::collections::HashMap;
     use std::path::PathBuf;
