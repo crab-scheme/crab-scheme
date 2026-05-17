@@ -271,6 +271,166 @@ fn all_scheme_actor_body_self_send_receive() {
     assert_eq!(msg_s, "payload");
 }
 
+// ----------------------------------------------------------
+// cs-hotreload builtins
+// ----------------------------------------------------------
+
+#[test]
+fn load_module_and_lookup_via_scheme() {
+    let mut rt = Runtime::new();
+    let epoch = rt
+        .eval_str(
+            "<t>",
+            r#"(load-module! 'beam-hotreload-test-1
+                 '(("init" . 0)
+                   ("max"  . 100)))"#,
+        )
+        .expect("load-module!");
+    assert_eq!(disp(&rt, &epoch), "1");
+
+    let init = rt
+        .eval_str("<t>", r#"(lookup-code 'beam-hotreload-test-1 "init")"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &init), "0");
+
+    let max = rt
+        .eval_str("<t>", r#"(lookup-code 'beam-hotreload-test-1 "max")"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &max), "100");
+
+    let miss = rt
+        .eval_str("<t>", r#"(lookup-code 'beam-hotreload-test-1 "absent")"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &miss), "#f");
+}
+
+#[test]
+fn reload_module_demotes_to_old() {
+    let mut rt = Runtime::new();
+    rt.eval_str(
+        "<t>",
+        r#"(load-module! 'beam-hotreload-test-2 '(("v" . 1)))"#,
+    )
+    .unwrap();
+    let epoch2 = rt
+        .eval_str(
+            "<t>",
+            r#"(load-module! 'beam-hotreload-test-2 '(("v" . 2)))"#,
+        )
+        .unwrap();
+    assert_eq!(disp(&rt, &epoch2), "2");
+
+    let cur = rt
+        .eval_str("<t>", r#"(lookup-code 'beam-hotreload-test-2 "v")"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &cur), "2");
+
+    let old = rt
+        .eval_str("<t>", r#"(lookup-code-old 'beam-hotreload-test-2 "v")"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &old), "1");
+
+    let versions = rt
+        .eval_str("<t>", r#"(code-versions 'beam-hotreload-test-2)"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &versions), "(1 2)");
+}
+
+#[test]
+fn code_versions_for_missing_module_returns_false() {
+    let mut rt = Runtime::new();
+    let v = rt
+        .eval_str("<t>", r#"(code-versions 'beam-no-such-module)"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "#f");
+}
+
+#[test]
+fn soft_purge_blocked_by_holder_count() {
+    let mut rt = Runtime::new();
+    rt.eval_str(
+        "<t>",
+        r#"(load-module! 'beam-hotreload-test-3 '(("x" . 1)))"#,
+    )
+    .unwrap();
+    rt.eval_str(
+        "<t>",
+        r#"(load-module! 'beam-hotreload-test-3 '(("x" . 2)))"#,
+    )
+    .unwrap();
+    // 3 holders pinned to old version => soft_purge refuses.
+    let err = rt
+        .eval_str("<t>", r#"(code-soft-purge! 'beam-hotreload-test-3 3)"#)
+        .expect_err("blocked purge should error");
+    let formatted = format!("{}", err);
+    assert!(formatted.contains("still pinned"), "got: {}", formatted);
+
+    // 0 holders => soft_purge succeeds; old slot is None afterward.
+    rt.eval_str("<t>", r#"(code-soft-purge! 'beam-hotreload-test-3 0)"#)
+        .expect("purge with 0 holders");
+    let old = rt
+        .eval_str("<t>", r#"(lookup-code-old 'beam-hotreload-test-3 "x")"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &old), "#f");
+}
+
+#[test]
+fn force_purge_removes_old_unconditionally() {
+    let mut rt = Runtime::new();
+    rt.eval_str(
+        "<t>",
+        r#"(load-module! 'beam-hotreload-test-4 '(("x" . 1)))"#,
+    )
+    .unwrap();
+    rt.eval_str(
+        "<t>",
+        r#"(load-module! 'beam-hotreload-test-4 '(("x" . 2)))"#,
+    )
+    .unwrap();
+    rt.eval_str("<t>", r#"(code-purge! 'beam-hotreload-test-4)"#)
+        .unwrap();
+    let old = rt
+        .eval_str("<t>", r#"(lookup-code-old 'beam-hotreload-test-4 "x")"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &old), "#f");
+    let cur = rt
+        .eval_str("<t>", r#"(lookup-code 'beam-hotreload-test-4 "x")"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &cur), "2");
+}
+
+#[test]
+fn unload_drops_both_versions() {
+    let mut rt = Runtime::new();
+    rt.eval_str(
+        "<t>",
+        r#"(load-module! 'beam-hotreload-test-5 '(("x" . 7)))"#,
+    )
+    .unwrap();
+    rt.eval_str("<t>", r#"(code-unload! 'beam-hotreload-test-5)"#)
+        .unwrap();
+    let v = rt
+        .eval_str("<t>", r#"(code-versions 'beam-hotreload-test-5)"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "#f");
+}
+
+#[test]
+fn load_module_accepts_nested_sendable_values() {
+    let mut rt = Runtime::new();
+    // Carry a pair-shaped value as an export — the boundary
+    // walks SendableValue::Pair correctly.
+    rt.eval_str(
+        "<t>",
+        r#"(load-module! 'beam-hotreload-test-6 '(("p" . (alpha . beta))))"#,
+    )
+    .unwrap();
+    let p = rt
+        .eval_str("<t>", r#"(lookup-code 'beam-hotreload-test-6 "p")"#)
+        .unwrap();
+    assert_eq!(disp(&rt, &p), "(alpha . beta)");
+}
+
 #[test]
 fn spawn_registered_proc_round_trip() {
     use cs_runtime::builtins::beam::{beam_state, primop_send, primop_spawn, SendableValue};

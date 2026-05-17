@@ -618,6 +618,77 @@ pub fn primop_table_size(name: &str) -> Result<usize, String> {
 }
 
 // ============================================================
+// cs-hotreload primop implementations.
+// ============================================================
+//
+// VersionRegistry exports are type-erased `Arc<dyn Any + Send + Sync>`;
+// we wrap a SendableValue inside the Arc so the same Value <->
+// boundary conversion the actor / table primops use applies. That
+// means modules in v1 carry data exports (constants, lookup
+// tables, behavior-state shapes); procedure exports stay in the
+// ProcedureRegistry, which already supports "register again under
+// the same name" as its hot-reload story.
+
+/// Load (or re-load) a module. Returns the new current version's
+/// epoch. The exports map keys are export names (e.g.,
+/// "init-state", "max-value"); the values are SendableValues
+/// produced by the Scheme caller.
+pub fn primop_load_module(
+    module: &str,
+    exports: cs_hotreload::ExportsMap<String, SendableValue>,
+) -> u32 {
+    let typed: cs_hotreload::ExportsMap<String, cs_hotreload::Export> = exports
+        .into_iter()
+        .map(|(k, v)| (k, Arc::new(v) as cs_hotreload::Export))
+        .collect();
+    beam_state().versions.load(module, typed)
+}
+
+/// Look up an export in the **current** version. Returns `None`
+/// if the module isn't loaded or the export doesn't exist.
+pub fn primop_lookup_code(module: &str, name: &str) -> Option<SendableValue> {
+    let export = beam_state().versions.lookup(module, name)?;
+    export.downcast_ref::<SendableValue>().cloned()
+}
+
+/// Look up an export in the **old** (pre-reload) version. Used
+/// by behavior actors that are still in-flight on the old code
+/// when a reload lands.
+pub fn primop_lookup_code_old(module: &str, name: &str) -> Option<SendableValue> {
+    let export = beam_state().versions.lookup_old(module, name)?;
+    export.downcast_ref::<SendableValue>().cloned()
+}
+
+pub fn primop_code_soft_purge(module: &str, holder_count: usize) -> Result<(), String> {
+    beam_state()
+        .versions
+        .soft_purge(module, holder_count)
+        .map_err(|e| format!("code-soft-purge!: {}", e))
+}
+
+pub fn primop_code_purge(module: &str) -> Result<(), String> {
+    beam_state()
+        .versions
+        .purge(module)
+        .map_err(|e| format!("code-purge!: {}", e))
+}
+
+/// `(old-epoch, current-epoch)` or `None` if the module isn't
+/// loaded. Either component is `None` when that slot is empty
+/// (e.g., a module loaded once has no old version).
+pub fn primop_code_versions(module: &str) -> Option<(Option<u32>, Option<u32>)> {
+    beam_state().versions.epochs(module)
+}
+
+pub fn primop_code_modules() -> Vec<String> {
+    beam_state().versions.modules()
+}
+
+pub fn primop_code_unload(module: &str) {
+    beam_state().versions.unload(module);
+}
+
+// ============================================================
 // Scheme-builtin wrappers (Value <-> SendableValue at the edge).
 // ============================================================
 //
@@ -821,6 +892,183 @@ pub fn b_beam_raw_receive(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
     }
 }
 
+/// Walk a proper Scheme list, returning `None` if it isn't
+/// proper (improper tail or atom encountered).
+fn proper_list(v: &Value) -> Option<Vec<Value>> {
+    let mut out = Vec::new();
+    let mut cur = v.clone();
+    loop {
+        match cur {
+            Value::Null => return Some(out),
+            Value::Pair(p) => {
+                out.push(p.car.borrow().clone());
+                cur = p.cdr.borrow().clone();
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// `(load-module! 'name '(("export" . value) ...))` — register
+/// (or re-register) a module's exports. Returns the new
+/// current version's epoch as a fixnum.
+pub fn b_beam_load_module(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "load-module!: expected 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let module = value_to_str(&args[0], syms, "load-module!")?;
+    let pairs = proper_list(&args[1])
+        .ok_or_else(|| "load-module!: second arg must be an alist of (name . value)".to_string())?;
+    let mut exports: cs_hotreload::ExportsMap<String, SendableValue> = Default::default();
+    for entry in pairs {
+        match entry {
+            Value::Pair(p) => {
+                let k = value_to_str(&p.car.borrow(), syms, "load-module!")?;
+                let v = to_sendable_in(&p.cdr.borrow(), syms)?;
+                exports.insert(k, v);
+            }
+            other => {
+                return Err(format!(
+                    "load-module!: alist entries must be pairs, got {}",
+                    other.type_name()
+                ))
+            }
+        }
+    }
+    let epoch = primop_load_module(&module, exports);
+    Ok(Value::Number(Number::Fixnum(epoch as i64)))
+}
+
+/// `(lookup-code 'module "export")` — current version. Returns
+/// the export value or `#f` if missing.
+pub fn b_beam_lookup_code(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "lookup-code: expected 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let module = value_to_str(&args[0], syms, "lookup-code")?;
+    let name = value_to_str(&args[1], syms, "lookup-code")?;
+    match primop_lookup_code(&module, &name) {
+        Some(sv) => Ok(from_sendable(&sv, syms)),
+        None => Ok(Value::Boolean(false)),
+    }
+}
+
+/// `(lookup-code-old 'module "export")` — pre-reload version.
+/// Returns `#f` for modules without a prior version.
+pub fn b_beam_lookup_code_old(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "lookup-code-old: expected 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let module = value_to_str(&args[0], syms, "lookup-code-old")?;
+    let name = value_to_str(&args[1], syms, "lookup-code-old")?;
+    match primop_lookup_code_old(&module, &name) {
+        Some(sv) => Ok(from_sendable(&sv, syms)),
+        None => Ok(Value::Boolean(false)),
+    }
+}
+
+/// `(code-soft-purge! 'module holder-count)` — drop the old
+/// version if no actor is pinned to it. Raises with a clear
+/// error if the count is non-zero.
+pub fn b_beam_code_soft_purge(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "code-soft-purge!: expected 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let module = value_to_str(&args[0], syms, "code-soft-purge!")?;
+    let count = match &args[1] {
+        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as usize,
+        other => {
+            return Err(format!(
+                "code-soft-purge!: holder-count must be a non-negative integer, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    primop_code_soft_purge(&module, count)?;
+    Ok(Value::Unspecified)
+}
+
+/// `(code-purge! 'module)` — force-drop the old version.
+pub fn b_beam_code_purge(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "code-purge!: expected 1 argument, got {}",
+            args.len()
+        ));
+    }
+    let module = value_to_str(&args[0], syms, "code-purge!")?;
+    primop_code_purge(&module)?;
+    Ok(Value::Unspecified)
+}
+
+/// `(code-versions 'module)` — returns `'(old-epoch current-epoch)`
+/// where each side is a fixnum or `#f`. Returns `#f` if the
+/// module isn't loaded.
+pub fn b_beam_code_versions(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "code-versions: expected 1 argument, got {}",
+            args.len()
+        ));
+    }
+    let module = value_to_str(&args[0], syms, "code-versions")?;
+    match primop_code_versions(&module) {
+        Some((old, cur)) => {
+            let epoch_v = |o: Option<u32>| match o {
+                Some(e) => Value::Number(Number::Fixnum(e as i64)),
+                None => Value::Boolean(false),
+            };
+            let tail = Pair::new(epoch_v(cur), Value::Null);
+            Ok(Value::Pair(Pair::new(epoch_v(old), Value::Pair(tail))))
+        }
+        None => Ok(Value::Boolean(false)),
+    }
+}
+
+/// `(code-modules)` — proper list of loaded module names as
+/// symbols.
+pub fn b_beam_code_modules(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(format!(
+            "code-modules: expected 0 arguments, got {}",
+            args.len()
+        ));
+    }
+    let mods = primop_code_modules();
+    let mut acc = Value::Null;
+    for name in mods.into_iter().rev() {
+        let sym = Value::Symbol(syms.intern(&name));
+        acc = Value::Pair(Pair::new(sym, acc));
+    }
+    Ok(acc)
+}
+
+/// `(code-unload! 'module)` — drop both versions. Idempotent
+/// for missing modules.
+pub fn b_beam_code_unload(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "code-unload!: expected 1 argument, got {}",
+            args.len()
+        ));
+    }
+    let module = value_to_str(&args[0], syms, "code-unload!")?;
+    primop_code_unload(&module);
+    Ok(Value::Unspecified)
+}
+
 /// The list of Scheme-facing BEAM builtins, in the
 /// `(name, fn)` shape `syms_builtins()` accepts. cs-runtime
 /// merges this into its `install_into` registration loop when
@@ -830,15 +1078,26 @@ pub fn beam_syms_builtins() -> Vec<(
     fn(&[Value], &mut SymbolTable) -> Result<Value, String>,
 )> {
     vec![
+        // actor
         ("send", b_beam_send),
         ("spawn", b_beam_spawn),
         ("self", b_beam_self),
         ("raw-receive", b_beam_raw_receive),
+        // table
         ("make-table", b_beam_make_table),
         ("table-insert!", b_beam_table_insert),
         ("table-lookup", b_beam_table_lookup),
         ("table-delete!", b_beam_table_delete),
         ("table-size", b_beam_table_size),
+        // hot-reload
+        ("load-module!", b_beam_load_module),
+        ("lookup-code", b_beam_lookup_code),
+        ("lookup-code-old", b_beam_lookup_code_old),
+        ("code-soft-purge!", b_beam_code_soft_purge),
+        ("code-purge!", b_beam_code_purge),
+        ("code-versions", b_beam_code_versions),
+        ("code-modules", b_beam_code_modules),
+        ("code-unload!", b_beam_code_unload),
     ]
 }
 

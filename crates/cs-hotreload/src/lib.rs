@@ -53,6 +53,11 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use rustc_hash::FxHashMap;
+
+// Re-export FxHashMap so downstream crates (cs-runtime's
+// `actor`-gated beam module) can build the exports map without
+// adding rustc_hash to their own deps.
+pub use rustc_hash::FxHashMap as ExportsMap;
 use thiserror::Error;
 
 // ---------- Types ----------
