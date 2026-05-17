@@ -1,0 +1,305 @@
+//! Built-in primop type signatures.
+//!
+//! Maps the Scheme names of common primitives to their `ProcType`
+//! signatures, so the bidirectional checker (iters 2.3-2.5) can
+//! treat `(car xs)` as a typed application without the user having
+//! to write a `:` ascription for it.
+//!
+//! **Scope (Phase 2).** Monomorphic signatures only — the table
+//! lists what each primop accepts in the *simplest* atomic case.
+//! `+` is `Fixnum → Fixnum → Fixnum` here, not `Number → … →
+//! Number`, because Phase 2 doesn't have unions or a `Number`
+//! supertype yet. Phase 3 widens these with `(U Fixnum Flonum)`
+//! and primop overloads.
+//!
+//! **Scope (Phase 2, variadics).** `+`, `*`, `cons*`, etc. are
+//! variadic; right now we type them as 2-ary (the common arity
+//! the checker actually sees in typed user code). The checker
+//! falls back to `Any` when the arity doesn't match the table
+//! (iter 2.7), so calls with extra args still typecheck loosely.
+//! Phase 3 introduces a proper `rest` field on `ProcType`.
+//!
+//! **Not in the table.** Anything missing falls through to `Any`
+//! at lookup time (untyped fallback) — including I/O,
+//! hashtables, records, conditions, the bulk of bytevector ops,
+//! and most port operations. Typed code that needs those gets
+//! `Any` for them; that's gradual typing's default.
+
+use cs_core::{Symbol, SymbolTable};
+
+use crate::env::TypeEnv;
+use crate::types::{ProcType, Type};
+
+/// Build the (name, ProcType) table. Allocated fresh on each call —
+/// the table is small (~80 entries) and only consulted once at the
+/// start of a check run.
+pub fn primop_table() -> Vec<(&'static str, ProcType)> {
+    let fx = || Type::Fixnum;
+    let fl = || Type::Flonum;
+    let bool_ = || Type::Boolean;
+    let ch = || Type::Character;
+    let sym = || Type::Symbol;
+    let pair = || Type::Pair;
+    let vec_ = || Type::Vector;
+    let str_ = || Type::String;
+    let bv = || Type::ByteVector;
+    let proc_ = || Type::Procedure;
+    let null = || Type::Null;
+    let any = || Type::Any;
+
+    // Builder shortcuts.
+    let p2 = |a, b, r| ProcType {
+        params: vec![a, b],
+        return_type: r,
+        rest: None,
+    };
+    let p1 = |a, r| ProcType {
+        params: vec![a],
+        return_type: r,
+        rest: None,
+    };
+    let p0 = |r| ProcType {
+        params: vec![],
+        return_type: r,
+        rest: None,
+    };
+    let p3 = |a, b, c, r| ProcType {
+        params: vec![a, b, c],
+        return_type: r,
+        rest: None,
+    };
+
+    vec![
+        // ---- generic arithmetic (Phase 3 will widen with unions) ----
+        ("+", p2(fx(), fx(), fx())),
+        ("-", p2(fx(), fx(), fx())),
+        ("*", p2(fx(), fx(), fx())),
+        ("/", p2(fx(), fx(), fx())),
+        ("=", p2(fx(), fx(), bool_())),
+        ("<", p2(fx(), fx(), bool_())),
+        (">", p2(fx(), fx(), bool_())),
+        ("<=", p2(fx(), fx(), bool_())),
+        (">=", p2(fx(), fx(), bool_())),
+        ("zero?", p1(fx(), bool_())),
+        ("positive?", p1(fx(), bool_())),
+        ("negative?", p1(fx(), bool_())),
+        ("odd?", p1(fx(), bool_())),
+        ("even?", p1(fx(), bool_())),
+        ("abs", p1(fx(), fx())),
+        ("min", p2(fx(), fx(), fx())),
+        ("max", p2(fx(), fx(), fx())),
+        ("modulo", p2(fx(), fx(), fx())),
+        ("quotient", p2(fx(), fx(), fx())),
+        ("remainder", p2(fx(), fx(), fx())),
+        ("expt", p2(fx(), fx(), fx())),
+        ("square", p1(fx(), fx())),
+        // ---- R6RS fixnum-only ops ----
+        ("fx+", p2(fx(), fx(), fx())),
+        ("fx-", p2(fx(), fx(), fx())),
+        ("fx*", p2(fx(), fx(), fx())),
+        ("fxdiv", p2(fx(), fx(), fx())),
+        ("fxmod", p2(fx(), fx(), fx())),
+        ("fx=?", p2(fx(), fx(), bool_())),
+        ("fx<?", p2(fx(), fx(), bool_())),
+        ("fx>?", p2(fx(), fx(), bool_())),
+        ("fx<=?", p2(fx(), fx(), bool_())),
+        ("fx>=?", p2(fx(), fx(), bool_())),
+        // ---- R6RS flonum-only ops ----
+        ("fl+", p2(fl(), fl(), fl())),
+        ("fl-", p2(fl(), fl(), fl())),
+        ("fl*", p2(fl(), fl(), fl())),
+        ("fl/", p2(fl(), fl(), fl())),
+        ("fl=?", p2(fl(), fl(), bool_())),
+        ("fl<?", p2(fl(), fl(), bool_())),
+        ("fl>?", p2(fl(), fl(), bool_())),
+        ("fl<=?", p2(fl(), fl(), bool_())),
+        ("fl>=?", p2(fl(), fl(), bool_())),
+        ("flsqrt", p1(fl(), fl())),
+        ("flabs", p1(fl(), fl())),
+        ("fixnum->flonum", p1(fx(), fl())),
+        // ---- type predicates ----
+        ("fixnum?", p1(any(), bool_())),
+        ("flonum?", p1(any(), bool_())),
+        ("number?", p1(any(), bool_())),
+        ("integer?", p1(any(), bool_())),
+        ("boolean?", p1(any(), bool_())),
+        ("pair?", p1(any(), bool_())),
+        ("null?", p1(any(), bool_())),
+        ("list?", p1(any(), bool_())),
+        ("symbol?", p1(any(), bool_())),
+        ("string?", p1(any(), bool_())),
+        ("char?", p1(any(), bool_())),
+        ("vector?", p1(any(), bool_())),
+        ("procedure?", p1(any(), bool_())),
+        ("bytevector?", p1(any(), bool_())),
+        // ---- pairs / lists ----
+        ("cons", p2(any(), any(), pair())),
+        ("car", p1(pair(), any())),
+        ("cdr", p1(pair(), any())),
+        ("set-car!", p2(pair(), any(), any())),
+        ("set-cdr!", p2(pair(), any(), any())),
+        ("length", p1(pair(), fx())),
+        ("reverse", p1(pair(), pair())),
+        ("list-ref", p2(pair(), fx(), any())),
+        ("list-tail", p2(pair(), fx(), pair())),
+        ("null", p0(null())),
+        // ---- equality ----
+        ("eq?", p2(any(), any(), bool_())),
+        ("eqv?", p2(any(), any(), bool_())),
+        ("equal?", p2(any(), any(), bool_())),
+        ("not", p1(any(), bool_())),
+        // ---- strings ----
+        ("string-length", p1(str_(), fx())),
+        ("string-ref", p2(str_(), fx(), ch())),
+        ("string=?", p2(str_(), str_(), bool_())),
+        ("string<?", p2(str_(), str_(), bool_())),
+        ("string>?", p2(str_(), str_(), bool_())),
+        ("string-append", p2(str_(), str_(), str_())),
+        ("substring", p3(str_(), fx(), fx(), str_())),
+        ("string->symbol", p1(str_(), sym())),
+        ("symbol->string", p1(sym(), str_())),
+        ("number->string", p1(fx(), str_())),
+        ("string->number", p1(str_(), fx())),
+        ("make-string", p2(fx(), ch(), str_())),
+        // ---- characters ----
+        ("char=?", p2(ch(), ch(), bool_())),
+        ("char<?", p2(ch(), ch(), bool_())),
+        ("char>?", p2(ch(), ch(), bool_())),
+        ("char->integer", p1(ch(), fx())),
+        ("integer->char", p1(fx(), ch())),
+        // ---- vectors ----
+        ("vector-length", p1(vec_(), fx())),
+        ("vector-ref", p2(vec_(), fx(), any())),
+        ("vector-set!", p3(vec_(), fx(), any(), any())),
+        ("make-vector", p2(fx(), any(), vec_())),
+        // ---- bytevectors ----
+        ("bytevector-length", p1(bv(), fx())),
+        ("bytevector-u8-ref", p2(bv(), fx(), fx())),
+        ("bytevector-u8-set!", p3(bv(), fx(), fx(), any())),
+        ("make-bytevector", p2(fx(), fx(), bv())),
+        // ---- procedure introspection ----
+        ("apply", p2(proc_(), pair(), any())),
+        // ---- I/O (returns are usually Any/unspecified) ----
+        ("display", p1(any(), any())),
+        ("write", p1(any(), any())),
+        ("newline", p0(any())),
+    ]
+}
+
+/// Install the primop table into `env` at the top-level frame.
+/// Intended to be called once after `TypeEnv::new()`, before any
+/// scopes are pushed.
+pub fn install_primops(env: &mut TypeEnv, syms: &mut SymbolTable) {
+    for (name, pt) in primop_table() {
+        let sym = syms.intern(name);
+        let ty = Type::Procedure_(Box::new(pt));
+        env.define_top_level(sym, ty);
+    }
+}
+
+/// Just the (Symbol, Type) seeding step — exposed for tests that
+/// want to build their own env without the install side effect.
+pub fn primop_pairs(syms: &mut SymbolTable) -> Vec<(Symbol, Type)> {
+    primop_table()
+        .into_iter()
+        .map(|(name, pt)| {
+            let s = syms.intern(name);
+            (s, Type::Procedure_(Box::new(pt)))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_is_nontrivial_size() {
+        // Lower-bound only — we want a sanity check that the
+        // table actually got populated, not a brittle exact count.
+        let t = primop_table();
+        assert!(t.len() >= 80, "expected ≥80 primops, got {}", t.len());
+    }
+
+    #[test]
+    fn no_duplicate_names() {
+        let t = primop_table();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (name, _) in &t {
+            assert!(
+                seen.insert(name),
+                "duplicate primop name in table: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn install_seeds_env() {
+        let mut syms = SymbolTable::new();
+        let mut env = TypeEnv::new();
+        install_primops(&mut env, &mut syms);
+        // A representative cross-section.
+        for name in [
+            "+",
+            "car",
+            "cdr",
+            "fx+",
+            "fl+",
+            "string-length",
+            "vector-length",
+        ] {
+            let s = syms.intern(name);
+            assert!(env.lookup(s).is_some(), "{name} not seeded into env");
+        }
+    }
+
+    #[test]
+    fn plus_signature_is_fixnum_fixnum_fixnum() {
+        let mut syms = SymbolTable::new();
+        let mut env = TypeEnv::new();
+        install_primops(&mut env, &mut syms);
+        let plus = syms.intern("+");
+        let ty = env.lookup(plus).cloned().unwrap();
+        match ty {
+            Type::Procedure_(pt) => {
+                assert_eq!(pt.params, vec![Type::Fixnum, Type::Fixnum]);
+                assert_eq!(pt.return_type, Type::Fixnum);
+                assert!(pt.rest.is_none());
+            }
+            other => panic!("expected Procedure_, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn car_signature_is_pair_to_any() {
+        let mut syms = SymbolTable::new();
+        let mut env = TypeEnv::new();
+        install_primops(&mut env, &mut syms);
+        let car = syms.intern("car");
+        let ty = env.lookup(car).cloned().unwrap();
+        match ty {
+            Type::Procedure_(pt) => {
+                assert_eq!(pt.params, vec![Type::Pair]);
+                assert_eq!(pt.return_type, Type::Any);
+            }
+            other => panic!("expected Procedure_, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_length_signature() {
+        let mut syms = SymbolTable::new();
+        let mut env = TypeEnv::new();
+        install_primops(&mut env, &mut syms);
+        let sl = syms.intern("string-length");
+        let ty = env.lookup(sl).cloned().unwrap();
+        match ty {
+            Type::Procedure_(pt) => {
+                assert_eq!(pt.params, vec![Type::String]);
+                assert_eq!(pt.return_type, Type::Fixnum);
+            }
+            other => panic!("expected Procedure_, got {other:?}"),
+        }
+    }
+}

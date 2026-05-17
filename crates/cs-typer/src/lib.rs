@@ -27,6 +27,7 @@
 //! - Phase 7 (optional): Polymorphism.
 
 pub mod annotate;
+pub mod builtins;
 pub mod env;
 pub mod extract;
 pub mod parse_ann;
@@ -35,6 +36,7 @@ pub mod types;
 pub use annotate::{
     AnnotationTable, LambdaAnnotation, LetrecAnnotation, TopLevelAnnotation, TypeAlias,
 };
+pub use builtins::{install_primops, primop_pairs, primop_table};
 pub use env::{Frame, TypeEnv};
 pub use extract::extract_annotations;
 pub use parse_ann::{parse_type_ann, TypeAnn, TypeAnnError, TypeDatum};
