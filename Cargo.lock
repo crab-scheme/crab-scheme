@@ -581,6 +581,7 @@ dependencies = [
 name = "cs-runtime"
 version = "0.0.1"
 dependencies = [
+ "cs-actor",
  "cs-core",
  "cs-diag",
  "cs-expand",
@@ -588,24 +589,17 @@ dependencies = [
  "cs-ffi-example",
  "cs-ffi-macros",
  "cs-gc",
+ "cs-hotreload",
  "cs-ir",
  "cs-jit",
  "cs-jit-cranelift",
  "cs-lex",
  "cs-parse",
  "cs-rir",
+ "cs-table",
  "cs-vm",
  "libloading",
  "num-traits",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "cs-supervisor"
-version = "0.0.1"
-dependencies = [
- "cs-actor",
- "cs-core",
  "thiserror 1.0.69",
 ]
 

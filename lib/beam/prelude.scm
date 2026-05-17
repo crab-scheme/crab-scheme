@@ -430,3 +430,62 @@
     (body
       (lambda args
         (call writer args)))))
+
+; ============================================================
+; PART 7 — define-state-migration (hot-reload state migration)
+; ============================================================
+;
+; (define-state-migration my-module
+;   ((from-version "1.0") state)
+;   <body producing new state>)
+;
+; Registers a migration function on the named module so when
+; cs-hotreload promotes a new version, gen_server behaviors
+; trigger code-change with the old version tag, and the
+; per-actor state is passed through the registered migration
+; to produce the new state.
+;
+; The migration table is itself a cs-table keyed by module name.
+; The cs-hotreload Rust crate stays out of migration policy —
+; it only tracks two versions of exports per module. The
+; migration table is pure Scheme.
+
+(define state-migrations (make-table 'beam:state-migrations 'set))
+
+(define-syntax define-state-migration
+  (syntax-rules ()
+    ((_ module-name
+        ((from-version from-ver-str) state-arg)
+        body ...)
+     (let ((existing (or (table-lookup 'beam:state-migrations 'module-name) '())))
+       (table-insert!
+         'beam:state-migrations 'module-name
+         (cons
+           (cons from-ver-str
+                 (lambda (state-arg) body ...))
+           existing))))))
+
+(define (run-state-migration module-name from-version state)
+  (let ((migrations (or (table-lookup 'beam:state-migrations module-name) '())))
+    (cond
+      ((assoc from-version migrations)
+       => (lambda (entry) ((cdr entry) state)))
+      ; No migration registered for this version pair — pass state
+      ; through unchanged. Matches OTP's default behavior when
+      ; code_change/3 isn't exported.
+      (else state))))
+
+; Wire into the behavior loop: when a *code-change* system
+; message arrives at a behavior actor, look up the migration
+; and produce new state before resuming the loop.
+;
+; (We don't redefine behavior-loop here — the version above
+; already calls cc-fn with from-version/state/extra. Behaviors
+; whose #:code-change wraps run-state-migration get the
+; registered migration for free.)
+;
+; Example wire-up inside a behavior body:
+;   #:code-change
+;     (lambda (from-ver state _extra)
+;       (values 'ok (run-state-migration 'counter from-ver state)))
+

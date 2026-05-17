@@ -22,10 +22,12 @@ members = [
     "crates/cs-aot",
     "crates/cs-cli",
     "crates/cs-cli-sha2",
-    # BEAM-style runtime (scaffold; see docs/research/beam_runtime_spec.md).
+    # BEAM-style runtime (see docs/research/beam_runtime_spec.md).
+    # cs-supervisor was removed: per the Rust/Scheme split, supervision
+    # trees live in lib/beam/prelude.scm on top of the four cs-actor
+    # primops — pure dispatch logic, no system calls.
     "crates/cs-actor",
     "crates/cs-table",
-    "crates/cs-supervisor",
     "crates/cs-hotreload",
 ]
 
@@ -55,6 +57,12 @@ cs-aot = { path = "crates/cs-aot" }
 cs-ffi = { path = "crates/cs-ffi" }
 cs-ffi-example = { path = "crates/cs-ffi-example" }
 cs-ffi-macros = { path = "crates/cs-ffi-macros" }
+# BEAM-style runtime crates. Optional deps of cs-runtime behind the
+# `actor` feature so non-actor builds (WASM, AOT) skip the tokio +
+# dashmap pull.
+cs-actor = { path = "crates/cs-actor" }
+cs-table = { path = "crates/cs-table" }
+cs-hotreload = { path = "crates/cs-hotreload" }
 
 # External crates
 logos = "0.14"

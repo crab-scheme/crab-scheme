@@ -1,5 +1,8 @@
 //! R6RS builtin procedures (foundation subset).
 
+#[cfg(feature = "actor")]
+pub mod beam;
+
 use cs_core::{
     eq, Hashtable, HtEqKind, Number, Pair, Port, Promise, PromiseState, SymbolTable, Value,
     WriteMode,
