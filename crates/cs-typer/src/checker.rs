@@ -1393,6 +1393,30 @@ mod tests {
     }
 
     #[test]
+    fn polymorphic_vector_ref_propagates_element_type() {
+        // `(make-vector 10 0.0)` → Vectorof Flonum.
+        // `(vector-ref v i)` instantiates T=Flonum → Flonum.
+        // The let-bound `e` is Flonum; calls to consume(e)
+        // record [Flonum] as the hint.
+        let src = "\
+            (define (consume x) (fl+ x 1.0))
+            (define (caller)
+              (let ((v (make-vector 10 0.0)))
+                (let ((e (vector-ref v 5)))
+                  (consume e))))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+        let hints = checker.inferred_hints_by_name();
+        let consume_sym = syms.intern("consume");
+        let v = hints
+            .get(&consume_sym)
+            .expect("consume should get Flonum hint from polymorphic vector-ref");
+        assert_eq!(v, &vec![cs_rir::Type::Flonum]);
+    }
+
+    #[test]
     fn polymorphic_call_sites_skip_inference() {
         // `f` is called twice with different arg types
         // (Fixnum and String) — no consistent specialization

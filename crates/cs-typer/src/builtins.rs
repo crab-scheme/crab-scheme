@@ -223,10 +223,13 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
         ("char->integer", p1(ch(), fx())),
         ("integer->char", p1(fx(), ch())),
         // ---- vectors ----
+        // `vector-length` stays monomorphic — the length is
+        // Fixnum regardless of element type. The Vectorof-
+        // polymorphic entries (`make-vector`, `vector-ref`,
+        // `vector-set!`) live in `polymorphic_primop_table`
+        // since they require a `Forall` wrapping that the
+        // monomorphic `ProcType`-typed table can't carry.
         ("vector-length", p1(vec_(), fx())),
-        ("vector-ref", p2(vec_(), fx(), any())),
-        ("vector-set!", p3(vec_(), fx(), any(), any())),
-        ("make-vector", p2(fx(), any(), vec_())),
         // ---- bytevectors ----
         ("bytevector-length", p1(bv(), fx())),
         ("bytevector-u8-ref", p2(bv(), fx(), fx())),
@@ -326,27 +329,97 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
     ]
 }
 
+/// Polymorphic primop entries — those whose signature requires
+/// `Forall(vs, …)` quantification so Phase 7's
+/// `monomorphize_for_call` can instantiate per-call.
+///
+/// Lives in a separate table (rather than the main one) because
+/// the main `primop_table` returns `ProcType`, and `Forall`
+/// can't be expressed in that shape.
+///
+/// Currently covers the container primops where element-type
+/// propagation matters most for downstream specialization:
+///   make-vector  : (All (T) (-> Fixnum T (Vectorof T)))
+///   vector-ref   : (All (T) (-> (Vectorof T) Fixnum T))
+///   vector-set!  : (All (T) (-> (Vectorof T) Fixnum T Any))
+///
+/// Each entry's tvar Symbol uses the `0x9001_xxxx` range —
+/// distinct from user-interned syms (low bits) and parser-
+/// synthesized tvars (high bit + hash).
+pub fn polymorphic_primop_table() -> Vec<(&'static str, Type)> {
+    let tvar = |n: u32| Type::Var(Symbol(0x90010000 | n));
+    let forall = |n: u32, params: Vec<Type>, ret: Type| {
+        Type::Forall(
+            vec![Symbol(0x90010000 | n)],
+            Box::new(Type::Procedure_(Box::new(ProcType {
+                params,
+                return_type: ret,
+                rest: None,
+                filter: None,
+            }))),
+        )
+    };
+    vec![
+        (
+            "make-vector",
+            forall(
+                1,
+                vec![Type::Fixnum, tvar(1)],
+                Type::Vectorof(Box::new(tvar(1))),
+            ),
+        ),
+        (
+            "vector-ref",
+            forall(
+                2,
+                vec![Type::Vectorof(Box::new(tvar(2))), Type::Fixnum],
+                tvar(2),
+            ),
+        ),
+        (
+            "vector-set!",
+            forall(
+                3,
+                vec![Type::Vectorof(Box::new(tvar(3))), Type::Fixnum, tvar(3)],
+                Type::Any,
+            ),
+        ),
+    ]
+}
+
 /// Install the primop table into `env` at the top-level frame.
 /// Intended to be called once after `TypeEnv::new()`, before any
-/// scopes are pushed.
+/// scopes are pushed. Seeds both the monomorphic entries from
+/// `primop_table` and the polymorphic ones from
+/// `polymorphic_primop_table`.
 pub fn install_primops(env: &mut TypeEnv, syms: &mut SymbolTable) {
     for (name, pt) in primop_table() {
         let sym = syms.intern(name);
         let ty = Type::Procedure_(Box::new(pt));
         env.define_top_level(sym, ty);
     }
+    for (name, ty) in polymorphic_primop_table() {
+        let sym = syms.intern(name);
+        env.define_top_level(sym, ty);
+    }
 }
 
 /// Just the (Symbol, Type) seeding step — exposed for tests that
 /// want to build their own env without the install side effect.
+/// Includes polymorphic entries.
 pub fn primop_pairs(syms: &mut SymbolTable) -> Vec<(Symbol, Type)> {
-    primop_table()
+    let mut out: Vec<(Symbol, Type)> = primop_table()
         .into_iter()
         .map(|(name, pt)| {
             let s = syms.intern(name);
             (s, Type::Procedure_(Box::new(pt)))
         })
-        .collect()
+        .collect();
+    out.extend(polymorphic_primop_table().into_iter().map(|(name, ty)| {
+        let s = syms.intern(name);
+        (s, ty)
+    }));
+    out
 }
 
 #[cfg(test)]
