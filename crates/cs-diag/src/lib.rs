@@ -34,10 +34,25 @@ impl Span {
     }
 
     pub fn merge(self, other: Span) -> Span {
-        debug_assert_eq!(
-            self.file, other.file,
-            "cannot merge spans from different files"
-        );
+        // Dummy on either side: prefer the non-dummy.
+        if self.is_dummy() {
+            return other;
+        }
+        if other.is_dummy() {
+            return self;
+        }
+        // Cross-file merge is legitimate during macro expansion:
+        // the template lives at its definition site (file A) but
+        // substituted args come from the use site (file B). The
+        // earlier strict `debug_assert_eq` caused a panic in
+        // `cs_expand::rebuild_list` when a macro defined in one
+        // eval_str unit was invoked from another. Fall back to
+        // `self` (the span being extended) — diagnostics still
+        // point at a meaningful location for the macro definition
+        // site, and the expansion succeeds.
+        if self.file != other.file {
+            return self;
+        }
         Span {
             file: self.file,
             start: self.start.min(other.start),

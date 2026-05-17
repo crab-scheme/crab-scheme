@@ -177,11 +177,44 @@ exercised in dedicated test files:
 | JIT-tier integration | `crates/cs-runtime/tests/beam_verification.rs` | ✓ beam builtins are callable through the VM tier inside a Runtime with the JIT installed; tier-up fires + correct results. Direct JIT-emitted dispatch into Syms-shape builtins is a cs-jit-cranelift extension, tracked with #107. |
 | Soak / load | `crates/cs-runtime/tests/beam_verification.rs` | ✓ 100 actors × 20 msgs = 2000 round-trips in 7ms (280k msg/s), p99 latency 77µs. Not the spec's 1000×10M acceptance (needs the scheduler swap) but confirms no deadlock and bounded latency at modest scale. |
 | Throughput bench | `crates/cs-runtime/tests/beam_verification.rs` | ✓ Records spawn 8.2µs/op, send 487ns/op, table-insert 1.06µs/op. Not statistically rigorous; a regression check. |
-| Scheme prelude macros | `crates/cs-runtime/tests/beam_prelude_macros.rs` | ⚠ Building blocks all work (case-lambda, define-record-type, simpler `(receive (pat action))`, helper procs). Loading the full `lib/beam/prelude.scm` FAILS — the prelude uses Racket-style `#:keyword` argument syntax that cs-lex doesn't recognize. Two other expander edges (cs-diag span-merge across eval_str units; ellipsis-in-cond producing empty application) were surfaced and documented as `#[ignore]`-tracked regressions. |
+| Scheme prelude macros | `crates/cs-runtime/tests/beam_prelude_macros.rs` | ✓ partial. 7 tests all pass (no `#[ignore]`): case-lambda, define-record-type, helper procs, single-clause `(receive)`, full prelude-shape `(receive ... (after ...))`, AND cross-eval_str-unit macro invocation. The two expander edges surfaced during verification (span-merge across files; ellipsis-in-cond producing `()`) shared a single root cause — see "Root-cause notes" below. ⚠ Loading the full `lib/beam/prelude.scm` still fails — that's a prelude-source issue (Racket-style `#:keyword` argument syntax that cs-lex doesn't recognize), tracked as #109. |
 
-The prelude finding is the load-bearing one: as written,
-`lib/beam/prelude.scm` is design-validated but not loadable.
-Closing that gap is one of:
+### Root-cause notes (macros)
+
+During verification two expander failures surfaced:
+
+1. **`cannot merge spans from different files`** — debug-assert
+   panic in `cs_diag::Span::merge` triggered by
+   `cs_expand::rebuild_list` during macro template instantiation.
+2. **"empty application '()'"** — eval-time error from
+   ellipsis-in-`cond` expansions like
+   `((match-and-bind msg pat action) ...)`.
+
+Both were the **same root cause**: `Span::merge` had a strict
+same-file `debug_assert_eq` that panicked on cross-file merges,
+but cross-file spans are *expected* during macro expansion
+(template carries its definition-site span, substituted args
+carry the call site's). The panic produced garbage spans that
+downstream code interpreted as empty pairs, surfacing as the
+`()` application error in `cond`.
+
+Fix in `crates/cs-diag/src/lib.rs::Span::merge`: tolerate
+cross-file merges by preferring `self`'s span (the location
+being extended). Five lines; resolves both symptoms. Diagnostic
+locations still point at the macro definition site, which is
+the more actionable location for a macro author.
+
+This fix is project-wide (not beam-specific) and is safe
+against the rest of the workspace test suite.
+
+### Prelude-source gap (separate)
+
+The prelude finding is the remaining load-bearing one: as
+written, `lib/beam/prelude.scm` is design-validated but not
+loadable because the source uses Racket-style `#:keyword`
+argument syntax (`#:strategy`, `#:init`, etc.) that cs-lex
+doesn't recognize and that R6RS doesn't include. Closing that
+gap is one of:
 
 1. Rewrite `make-supervisor` / `define-behavior` to use plain
    positional args or symbol-key args instead of `#:strategy`,

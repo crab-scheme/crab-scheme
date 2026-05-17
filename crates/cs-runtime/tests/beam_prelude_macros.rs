@@ -84,26 +84,18 @@ fn receive_macro_single_clause_compiles() {
     assert_eq!(rt.format_value(&result, cs_core::WriteMode::Display), "42");
 }
 
-/// Documents an expander edge surfaced during verification:
-/// the prelude's `(receive (pat action) ... (after ms ta))`
-/// uses `syntax-rules` with both ellipsis-templated clauses
-/// AND a trailing literal-keyword clause. Expanding it inside
-/// a `cond` form hits "empty application '()'" at the first
-/// clause position — possibly because the ellipsis-expansion
-/// of `((match-and-bind ...) ...)` produces `()` when no
-/// clauses are present, then cond receives an empty pair.
-///
-/// Not a beam-design bug — the macro is correct against the
-/// R6RS syntax-rules spec, and the prelude code matches the
-/// shape OTP-style `receive` would have. Tracked as ignored
-/// so the suite stays green; this is an expander follow-up.
+/// The full prelude-shape receive macro with both ellipsis
+/// clauses AND a trailing literal-keyword `after` clause.
+/// Originally failed with "empty application '()'" before the
+/// cs-diag span-merge fix; verifies expansion + dispatch end
+/// to end through the with-after form.
 #[test]
-#[ignore = "cs-expand edge: ellipsis-in-cond produces empty application"]
-fn receive_macro_with_after_clause_known_expander_edge() {
+fn receive_macro_with_after_clause_compiles_and_dispatches() {
     let mut rt = Runtime::new();
-    let _ = rt.eval_str(
-        "<t>",
-        r#"
+    let v = rt
+        .eval_str(
+            "<t>",
+            r#"
         (define raw-receive (lambda args 'm))
         (define-syntax match-and-bind
           (syntax-rules ()
@@ -122,23 +114,21 @@ fn receive_macro_with_after_clause_known_expander_edge() {
                      (else ta))))))
         (receive (m 1) (after 10 0))
     "#,
-    );
+        )
+        .expect("receive with after clause expands + dispatches");
+    assert_eq!(rt.format_value(&v, cs_core::WriteMode::Display), "1");
 }
 
-/// Document a real cs-diag bug surfaced by this verification
-/// effort, not a beam bug: when a macro defined in one
-/// eval_str unit is invoked from a later eval_str unit, cs-diag
-/// panics with `cannot merge spans from different files` on
-/// the syntax-rules expansion. The receive macro hits this
-/// because its template combines hygiene-marked sub-templates
-/// across the unit boundary.
-///
-/// Marked #[ignore] so the test suite stays green; the test
-/// body proves the bug is reproducible if anyone re-runs it
-/// after fixing cs-diag.
+/// Cross-eval_str macro invocation: define the macro in unit
+/// A, invoke it from unit B. Pre-fix this hit a debug-assert
+/// in `cs_diag::Span::merge` ("cannot merge spans from
+/// different files") because `cs_expand::rebuild_list` was
+/// merging the template's span (file A) with substituted user
+/// arg spans (file B). The fix in cs-diag tolerates cross-file
+/// merges by preferring `self`'s span (the location being
+/// extended). This test pins the fix in place.
 #[test]
-#[ignore = "cs-diag bug: span merge across eval_str units (orthogonal to beam work)"]
-fn receive_macro_cross_unit_known_bug() {
+fn receive_macro_cross_unit_invocation() {
     let mut rt = Runtime::new();
     rt.eval_str(
         "<unit-a>",
@@ -155,10 +145,12 @@ fn receive_macro_cross_unit_known_bug() {
                      (else ta))))))
     "#,
     )
-    .expect("macro defs load");
+    .expect("unit-a macro defs load");
 
-    // Cross-unit invocation triggers the bug:
-    let _ = rt.eval_str("<unit-b>", "(receive (msg 1) (after 10 0))");
+    let v = rt
+        .eval_str("<unit-b>", "(receive (msg 1) (after 10 0))")
+        .expect("unit-b invocation expands cleanly");
+    assert_eq!(rt.format_value(&v, cs_core::WriteMode::Display), "1");
 }
 
 /// define-record-type for `<child-spec>` from the prelude.
