@@ -58,9 +58,15 @@ done
 mkdir -p "$RESULTS_DIR"
 : > "$OUTPUT"  # truncate
 
-# Build crabscheme once.
-echo "==> building crabscheme (release + aot)..." >&2
-(cd "$ROOT" && cargo build --release -p cs-cli --features aot --bin crabscheme \
+# Build crabscheme once. Honors optional CS_FEATURES env
+# (e.g. CS_FEATURES=all-memory-layers to exercise layer-4
+# tracing plumbing alongside the always-on regions feature).
+CS_FEATURE_SPEC="aot"
+if [ -n "${CS_FEATURES:-}" ]; then
+  CS_FEATURE_SPEC="aot,$CS_FEATURES"
+fi
+echo "==> building crabscheme (release, features '$CS_FEATURE_SPEC')..." >&2
+(cd "$ROOT" && cargo build --release -p cs-cli --features "$CS_FEATURE_SPEC" --bin crabscheme \
    2>&1 | tail -3) >&2
 CS_BIN="$ROOT/target/release/crabscheme"
 if [ ! -x "$CS_BIN" ]; then
