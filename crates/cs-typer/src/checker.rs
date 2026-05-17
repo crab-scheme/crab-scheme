@@ -536,10 +536,13 @@ mod tests {
 
     #[test]
     fn typed_fib_typechecks() {
+        // Phase 3: generic `+ - <` now return `(U Fixnum Flonum)`,
+        // which doesn't subtype Fixnum. A Fixnum-precise fib uses
+        // the fx*-family primops.
         let src = "\
             (: fib (-> Fixnum Fixnum))
             (define (fib [n : Fixnum]) : Fixnum
-              (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+              (if (fx<? n 2) n (fx+ (fib (fx- n 1)) (fib (fx- n 2)))))
         ";
         let (core, table, mut syms) = parse_extract_expand(src);
         let mut checker = Checker::new(&table, &mut syms);
@@ -616,9 +619,11 @@ mod tests {
         // The untyped `helper` calls the typed `inc`. Since
         // `helper`'s args are Any (no annotation), Any flows
         // into inc's Fixnum-typed param via the gradual rule.
+        // `inc`'s body uses `fx+` to stay Fixnum-precise under
+        // Phase 3's union-widened generic arithmetic.
         let src = "\
             (: inc (-> Fixnum Fixnum))
-            (define (inc [n : Fixnum]) : Fixnum (+ n 1))
+            (define (inc [n : Fixnum]) : Fixnum (fx+ n 1))
             (define (helper x) (inc x))
         ";
         let (core, table, mut syms) = parse_extract_expand(src);
@@ -632,7 +637,7 @@ mod tests {
         // `inc` expects Fixnum but is called with a String literal.
         let src = "\
             (: inc (-> Fixnum Fixnum))
-            (define (inc [n : Fixnum]) : Fixnum (+ n 1))
+            (define (inc [n : Fixnum]) : Fixnum (fx+ n 1))
             (define (broken) (inc \"hi\"))
         ";
         let (core, table, mut syms) = parse_extract_expand(src);
@@ -724,10 +729,11 @@ mod tests {
         // doesn't expose typed-binding syntax yet — the
         // surface for that is a Phase 2/3 follow-up — but the
         // structural test confirms the env scoping is right.)
+        // Body uses `fx+` for Fixnum-precise arithmetic.
         let src = "\
             (: f (-> Fixnum Fixnum))
             (define (f [n : Fixnum]) : Fixnum
-              (let ((r n)) (+ r 1)))
+              (let ((r n)) (fx+ r 1)))
         ";
         let (core, table, mut syms) = parse_extract_expand(src);
         let mut checker = Checker::new(&table, &mut syms);

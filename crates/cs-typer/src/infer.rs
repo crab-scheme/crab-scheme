@@ -97,19 +97,16 @@ fn infer_begin(exprs: &[CoreExpr], env: &TypeEnv) -> Type {
 
 /// If: least-upper-bound (LUB) of the two branches.
 ///
-/// Phase 2 has no `Union` yet (Phase 3 introduces it), so LUB is
-/// limited to "same atom on both sides". Mixed branches → `Any`.
+/// Phase 3: mixed branches produce a real `Union` (e.g.,
+/// `(if #t 1 "hi") → (U Fixnum String)`). `Type::union`
+/// normalizes — Any absorbs, Never drops, duplicates dedupe.
 ///
 /// The condition itself is implicitly typed as anything (every
 /// non-`#f` value is truthy in Scheme), so we don't inspect it.
 fn infer_if(then: &CoreExpr, alt: &CoreExpr, env: &TypeEnv) -> Type {
     let t = infer(then, env);
     let a = infer(alt, env);
-    if t == a {
-        t
-    } else {
-        Type::Any
-    }
+    Type::union(vec![t, a])
 }
 
 #[cfg(test)]
@@ -202,8 +199,17 @@ mod tests {
     }
 
     #[test]
-    fn app_add_two_fixnums_returns_fixnum() {
+    fn app_add_two_fixnums_returns_number_union() {
+        // Phase 3: `+` widened to accept Fx|Fl and return the
+        // union. Code that needs Fx-precision should use `fx+`.
         let (ty, _) = infer_program("(+ 1 2)");
+        assert_eq!(ty, Type::union(vec![Type::Fixnum, Type::Flonum]));
+    }
+
+    #[test]
+    fn app_fx_add_returns_fixnum() {
+        // The narrow path: `fx+` is genuinely Fixnum-only.
+        let (ty, _) = infer_program("(fx+ 1 2)");
         assert_eq!(ty, Type::Fixnum);
     }
 
@@ -243,8 +249,16 @@ mod tests {
     }
 
     #[test]
-    fn if_with_mixed_branches_widens_to_any() {
+    fn if_with_mixed_branches_produces_union() {
+        // Phase 3: mixed branches LUB to a real Union, not Any.
         let (ty, _) = infer_program("(if #t 1 \"hi\")");
+        assert_eq!(ty, Type::union(vec![Type::Fixnum, Type::String]));
+    }
+
+    #[test]
+    fn if_with_one_branch_any_widens_to_any() {
+        // An unbound ref returns Any; union-with-Any collapses.
+        let (ty, _) = infer_program("(if #t 1 unbound)");
         assert_eq!(ty, Type::Any);
     }
 
@@ -266,9 +280,10 @@ mod tests {
             name: plus,
             span: cs_diag::Span::new(cs_diag::FileId(0), 0, 0),
         };
+        let num = Type::union(vec![Type::Fixnum, Type::Flonum]);
         let want = Type::Procedure_(Box::new(ProcType {
-            params: vec![Type::Fixnum, Type::Fixnum],
-            return_type: Type::Fixnum,
+            params: vec![num.clone(), num.clone()],
+            return_type: num,
             rest: None,
         }));
         assert_eq!(infer(&expr, &env), want);

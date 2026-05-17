@@ -46,6 +46,11 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
     let proc_ = || Type::Procedure;
     let null = || Type::Null;
     let any = || Type::Any;
+    // Phase 3: `Number = (U Fixnum Flonum)` — the shared
+    // numeric union generic arithmetic accepts. Rationals and
+    // BigInts are still subsumed by Fixnum for Phase 2/3; they
+    // get their own atoms when the lattice grows.
+    let num = || Type::union(vec![Type::Fixnum, Type::Flonum]);
 
     // Builder shortcuts.
     let p2 = |a, b, r| ProcType {
@@ -70,29 +75,36 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
     };
 
     vec![
-        // ---- generic arithmetic (Phase 3 will widen with unions) ----
-        ("+", p2(fx(), fx(), fx())),
-        ("-", p2(fx(), fx(), fx())),
-        ("*", p2(fx(), fx(), fx())),
-        ("/", p2(fx(), fx(), fx())),
-        ("=", p2(fx(), fx(), bool_())),
-        ("<", p2(fx(), fx(), bool_())),
-        (">", p2(fx(), fx(), bool_())),
-        ("<=", p2(fx(), fx(), bool_())),
-        (">=", p2(fx(), fx(), bool_())),
-        ("zero?", p1(fx(), bool_())),
-        ("positive?", p1(fx(), bool_())),
-        ("negative?", p1(fx(), bool_())),
-        ("odd?", p1(fx(), bool_())),
-        ("even?", p1(fx(), bool_())),
-        ("abs", p1(fx(), fx())),
-        ("min", p2(fx(), fx(), fx())),
-        ("max", p2(fx(), fx(), fx())),
+        // ---- generic arithmetic — Phase 3 widening ----
+        // These accept either Fixnum OR Flonum and (for
+        // arithmetic) return the union. Code that needs
+        // Fixnum-only precision should use fx+/fx-/etc.;
+        // Flonum-only should use fl+/fl-/etc.
+        ("+", p2(num(), num(), num())),
+        ("-", p2(num(), num(), num())),
+        ("*", p2(num(), num(), num())),
+        ("/", p2(num(), num(), num())),
+        ("=", p2(num(), num(), bool_())),
+        ("<", p2(num(), num(), bool_())),
+        (">", p2(num(), num(), bool_())),
+        ("<=", p2(num(), num(), bool_())),
+        (">=", p2(num(), num(), bool_())),
+        ("zero?", p1(num(), bool_())),
+        ("positive?", p1(num(), bool_())),
+        ("negative?", p1(num(), bool_())),
+        ("odd?", p1(num(), bool_())),
+        ("even?", p1(num(), bool_())),
+        ("abs", p1(num(), num())),
+        ("min", p2(num(), num(), num())),
+        ("max", p2(num(), num(), num())),
+        // Division-family: modulo/quotient/remainder/expt are
+        // R6RS-integer-typed. Kept Fixnum-narrow because they
+        // don't accept Flonum operands.
         ("modulo", p2(fx(), fx(), fx())),
         ("quotient", p2(fx(), fx(), fx())),
         ("remainder", p2(fx(), fx(), fx())),
-        ("expt", p2(fx(), fx(), fx())),
-        ("square", p1(fx(), fx())),
+        ("expt", p2(num(), num(), num())),
+        ("square", p1(num(), num())),
         // ---- R6RS fixnum-only ops ----
         ("fx+", p2(fx(), fx(), fx())),
         ("fx-", p2(fx(), fx(), fx())),
@@ -255,16 +267,20 @@ mod tests {
     }
 
     #[test]
-    fn plus_signature_is_fixnum_fixnum_fixnum() {
+    fn plus_signature_is_number_number_number() {
+        // Phase 3: `+` widened from `(-> Fx Fx Fx)` to
+        // `(-> (U Fx Fl) (U Fx Fl) (U Fx Fl))`. Code that
+        // needs Fixnum-only precision should switch to `fx+`.
         let mut syms = SymbolTable::new();
         let mut env = TypeEnv::new();
         install_primops(&mut env, &mut syms);
         let plus = syms.intern("+");
         let ty = env.lookup(plus).cloned().unwrap();
+        let num = Type::union(vec![Type::Fixnum, Type::Flonum]);
         match ty {
             Type::Procedure_(pt) => {
-                assert_eq!(pt.params, vec![Type::Fixnum, Type::Fixnum]);
-                assert_eq!(pt.return_type, Type::Fixnum);
+                assert_eq!(pt.params, vec![num.clone(), num.clone()]);
+                assert_eq!(pt.return_type, num);
                 assert!(pt.rest.is_none());
             }
             other => panic!("expected Procedure_, got {other:?}"),
