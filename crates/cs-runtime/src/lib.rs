@@ -41,6 +41,12 @@ pub struct Runtime {
     /// these roots transitively but the underlying allocations are
     /// still Rc-backed, so collect() has no observable side effect on
     /// existing programs — it's the seam Phase 2 swaps to a real arena.
+    ///
+    /// Under `feature = "countable-memory"` there is no Heap —
+    /// reclamation is purely refcount-driven and this field is
+    /// elided. `collect()` becomes a no-op shim and `heap()` is
+    /// unavailable.
+    #[cfg(not(feature = "countable-memory"))]
     heap: cs_gc::Heap,
     /// Slab of values rooted via `pin()`. Keyed by a monotonically-
     /// increasing PinId. The shared root closure registered at
@@ -1621,7 +1627,14 @@ impl Runtime {
         // Set up the GC root set: the walker's top frame chain and the
         // VM-tier root env. Cloning Rc<Frame> / Rc<Env> into the closure
         // gives the heap a stable handle to walk on every collect().
+        //
+        // Under countable-memory there is no Heap — the strong-ref
+        // chain from these same Rc<Frame>/Rc<Env> fields keeps the
+        // values alive on its own. The pinned slab below similarly
+        // holds strong Value references, no root closure needed.
+        #[cfg(not(feature = "countable-memory"))]
         let heap = cs_gc::Heap::new();
+        #[cfg(not(feature = "countable-memory"))]
         {
             let top_root = Rc::clone(&top);
             heap.add_root(move |marker| {
@@ -1629,6 +1642,7 @@ impl Runtime {
                 top_root.trace(marker);
             });
         }
+        #[cfg(not(feature = "countable-memory"))]
         {
             let vm_root = Rc::clone(&vm_env);
             heap.add_root(move |marker| {
@@ -1641,6 +1655,7 @@ impl Runtime {
         // the map on every collect, so anything passed to `pin()`
         // stays reachable until its Pinned guard drops.
         let pinned: Rc<RefCell<HashMap<PinId, Value>>> = Rc::new(RefCell::new(HashMap::new()));
+        #[cfg(not(feature = "countable-memory"))]
         {
             let pinned_clone = Rc::clone(&pinned);
             heap.add_root(move |marker| {
@@ -1657,6 +1672,7 @@ impl Runtime {
             top,
             macros: std::collections::HashMap::new(),
             vm_env,
+            #[cfg(not(feature = "countable-memory"))]
             heap,
             pinned,
             // Start at 1 so handle 0 can be reserved as the FFI
@@ -1753,11 +1769,20 @@ impl Runtime {
     /// `Heap`'s bookkeeping vec. Because Phase 1's `Gc<T>` is still
     /// Rc-backed, this has no observable behavioural effect on programs
     /// — it's the seam Phase 2 swaps to a real arena.
+    ///
+    /// Under `feature = "countable-memory"` there is no heap to
+    /// collect — reclamation runs at Rc::drop time — so this is
+    /// a no-op shim preserved for callers that still invoke it.
     pub fn collect(&self) {
+        #[cfg(not(feature = "countable-memory"))]
         self.heap.collect();
     }
 
     /// Read-only access to the GC heap (for tests and tooling).
+    ///
+    /// Unavailable under `feature = "countable-memory"` (there is
+    /// no heap).
+    #[cfg(not(feature = "countable-memory"))]
     pub fn heap(&self) -> &cs_gc::Heap {
         &self.heap
     }

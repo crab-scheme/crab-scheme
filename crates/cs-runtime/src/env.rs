@@ -55,6 +55,7 @@ impl Frame {
     }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_core::Trace for Frame {
     fn trace(&self, marker: &mut cs_core::Marker) {
         for (_, val) in self.bindings.borrow().iter() {
@@ -62,6 +63,30 @@ impl cs_core::Trace for Frame {
         }
         if let Some(p) = &self.parent {
             p.trace(marker);
+        }
+    }
+}
+
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::CycleVisit for Frame {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        for (_, val) in self.bindings.borrow().iter() {
+            if ctx.done() {
+                return;
+            }
+            val.visit_children(ctx);
+        }
+        if let Some(p) = &self.parent {
+            if ctx.done() {
+                return;
+            }
+            // Iter 6: parent is still strong here (Rc<Frame>); the
+            // iter-8 refactor converts it to Weak<Frame> and walks
+            // upward via upgrade(). For now, descend through the
+            // existing strong link — cycle detection works either
+            // way; structural prevention via Weak is the iter-8
+            // perf+correctness layer.
+            p.visit_children(ctx);
         }
     }
 }

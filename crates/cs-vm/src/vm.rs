@@ -580,6 +580,11 @@ fn value_to_any_i64(v: Value) -> i64 {
     Box::into_raw(Box::new(v)) as i64
 }
 
+// JIT_ACTIVE_HEAP + set/clear/current_jit_active_heap exist only
+// under the tracing representation. Under countable-memory the
+// JIT runtime helpers never consult a heap — every allocation
+// goes through plain `Gc::new` (= `Rc::new`).
+#[cfg(not(feature = "countable-memory"))]
 thread_local! {
     /// Pointer to the active `Heap` for the current thread, used by
     /// JIT runtime helpers when allocating Gc<Value> handles. Set by
@@ -600,11 +605,13 @@ thread_local! {
 /// `heap` must outlive the next call to `clear_jit_active_heap` and
 /// must point at a live `Heap`. Typical pattern: stash inside a
 /// guard struct whose Drop calls `clear_jit_active_heap`.
+#[cfg(not(feature = "countable-memory"))]
 pub unsafe fn set_jit_active_heap(heap: *const cs_gc::Heap) {
     JIT_ACTIVE_HEAP.with(|c| c.set(heap));
 }
 
 /// Clear the active Heap pointer.
+#[cfg(not(feature = "countable-memory"))]
 pub fn clear_jit_active_heap() {
     JIT_ACTIVE_HEAP.with(|c| c.set(std::ptr::null()));
 }
@@ -612,6 +619,7 @@ pub fn clear_jit_active_heap() {
 /// Read the current active Heap pointer. Returns null if no Heap
 /// is installed. Used by `with_active`-style guards that save the
 /// previous pointer before overwriting.
+#[cfg(not(feature = "countable-memory"))]
 pub fn current_jit_active_heap() -> *const cs_gc::Heap {
     JIT_ACTIVE_HEAP.with(|c| c.get())
 }
@@ -1050,6 +1058,7 @@ mod proc_table {
 /// in `NanboxValue::from_value` (Procedure + non-Fixnum/Flonum
 /// Number variants) to preserve the heap-tracking semantics the
 /// pre-NaN-box `value_to_gc_i64` had.
+#[cfg(not(feature = "countable-memory"))]
 fn nb_alloc_gc_value(v: Value) -> cs_gc::Gc<Value> {
     JIT_ACTIVE_HEAP.with(|c| {
         let ptr = c.get();
@@ -1061,6 +1070,15 @@ fn nb_alloc_gc_value(v: Value) -> cs_gc::Gc<Value> {
             unsafe { (*ptr).alloc(v) }
         }
     })
+}
+
+/// Countable-memory variant: no Heap to consult; always allocate
+/// via plain `Gc::new` (= `Rc::new`). The JIT runtime helpers
+/// produce live `Gc<Value>` handles whose reclamation is driven
+/// by the strong-count chain alone.
+#[cfg(feature = "countable-memory")]
+fn nb_alloc_gc_value(v: Value) -> cs_gc::Gc<Value> {
+    cs_gc::Gc::new(v)
 }
 
 /// NaN-boxed value carrier — the migration target for the bytecode
@@ -1617,6 +1635,7 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
         car: std::cell::RefCell::new(car_v),
         cdr: std::cell::RefCell::new(cdr_v),
     };
+    #[cfg(not(feature = "countable-memory"))]
     let g: cs_gc::Gc<cs_core::Pair> = JIT_ACTIVE_HEAP.with(|c| {
         let ptr = c.get();
         if ptr.is_null() {
@@ -1625,6 +1644,8 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
             unsafe { (*ptr).alloc(pair) }
         }
     });
+    #[cfg(feature = "countable-memory")]
+    let g: cs_gc::Gc<cs_core::Pair> = cs_gc::Gc::new(pair);
     let raw_ptr = cs_gc::Gc::into_raw_jit(g) as u64;
     debug_assert!(raw_ptr & !NB_PAYLOAD_MASK == 0);
     NanboxValue(nb_make(NB_TAG_PAIR, raw_ptr) as i64).into_raw()
@@ -10580,6 +10601,7 @@ impl Procedure for VmClosure {
     }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_gc::Trace for VmClosure {
     fn trace(&self, marker: &mut cs_gc::Marker) {
         // Trace the captured environment chain. Bytecode is immutable
@@ -10588,6 +10610,13 @@ impl cs_gc::Trace for VmClosure {
         // state (counters, raw pointers, stack maps) — no Values to
         // trace either.
         self.env.trace(marker);
+    }
+}
+
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::CycleVisit for VmClosure {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        self.env.visit_children(ctx);
     }
 }
 
@@ -10651,6 +10680,7 @@ impl Drop for Bindings {
     }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_gc::Trace for Bindings {
     fn trace(&self, marker: &mut cs_gc::Marker) {
         // Borrow each slot's Gc<T> handle without touching the
@@ -10751,11 +10781,129 @@ impl cs_gc::Trace for Bindings {
     }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_gc::Trace for Env {
     fn trace(&self, marker: &mut cs_gc::Marker) {
         self.bindings.borrow().trace(marker);
         if let Some(p) = &self.parent {
             p.trace(marker);
+        }
+    }
+}
+
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::CycleVisit for Bindings {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Mirrors the trace_nb dispatch above. Each NanboxValue slot
+        // decodes its tag, reconstructs a borrowed Gc<T> via
+        // ManuallyDrop (no refcount churn), and forwards to the
+        // cycle visitor.
+        let visit_nb = |nb: &NanboxValue, ctx: &mut cs_gc::cycle::CycleVisitor| {
+            let bits = nb.into_raw() as u64;
+            if !nb_is_tagged(bits) {
+                return; // Flonum leaf.
+            }
+            let tag = nb_tag_of(bits);
+            if tag < NB_TAG_PAIR {
+                return; // Inline immediate; no Gc payload.
+            }
+            let payload = nb_payload_of(bits);
+            let ptr = payload as *const ();
+            match tag {
+                t if t == NB_TAG_PAIR => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<cs_core::Pair>::from_raw_jit(ptr)
+                    });
+                    if ctx.visit(&g) {
+                        (**g).visit_children(ctx);
+                    }
+                }
+                t if t == NB_TAG_VECTOR => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<std::cell::RefCell<Vec<Value>>>::from_raw_jit(ptr)
+                    });
+                    if ctx.visit(&g) {
+                        (**g).visit_children(ctx);
+                    }
+                }
+                t if t == NB_TAG_STRING => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<std::cell::RefCell<String>>::from_raw_jit(ptr)
+                    });
+                    // String holds no Gc<...> children; register
+                    // identity for cycle target check, then stop.
+                    let _ = ctx.visit(&g);
+                }
+                t if t == NB_TAG_BYTEVECTOR => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<std::cell::RefCell<Vec<u8>>>::from_raw_jit(ptr)
+                    });
+                    let _ = ctx.visit(&g);
+                }
+                t if t == NB_TAG_HASHTABLE => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<cs_core::Hashtable>::from_raw_jit(ptr)
+                    });
+                    if ctx.visit(&g) {
+                        (**g).visit_children(ctx);
+                    }
+                }
+                t if t == NB_TAG_PORT => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<cs_core::Port>::from_raw_jit(ptr)
+                    });
+                    let _ = ctx.visit(&g);
+                }
+                t if t == NB_TAG_PROMISE => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<cs_core::Promise>::from_raw_jit(ptr)
+                    });
+                    if ctx.visit(&g) {
+                        (**g).visit_children(ctx);
+                    }
+                }
+                // Procedure is a ProcTable index, not a Gc pointer.
+                t if t == NB_TAG_PROCEDURE => {}
+                _ => {
+                    let g = std::mem::ManuallyDrop::new(unsafe {
+                        cs_gc::Gc::<Value>::from_raw_jit(ptr)
+                    });
+                    if ctx.visit(&g) {
+                        (**g).visit_children(ctx);
+                    }
+                }
+            }
+        };
+        match self {
+            Bindings::Small(v) => {
+                for (_, nb) in v {
+                    if ctx.done() {
+                        return;
+                    }
+                    visit_nb(nb, ctx);
+                }
+            }
+            Bindings::Large(m) => {
+                for (_, nb) in m {
+                    if ctx.done() {
+                        return;
+                    }
+                    visit_nb(nb, ctx);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "countable-memory")]
+impl cs_gc::cycle::CycleVisit for Env {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        self.bindings.borrow().visit_children(ctx);
+        if let Some(p) = &self.parent {
+            if ctx.done() {
+                return;
+            }
+            p.visit_children(ctx);
         }
     }
 }
@@ -14824,6 +14972,12 @@ fn sort_with_predicate(
 // (which carry only an i64 id) all carry no reachable Values inside.
 // VmClosure has its own non-empty Trace impl elsewhere because it
 // captures an Env; everything else listed here is a leaf.
+//
+// Under countable-memory the trait surface that needs Trace is gone:
+// these markers all implement Procedure, which provides an empty
+// default `visit_closure_children`. The macro emits nothing in that
+// configuration.
+#[cfg(not(feature = "countable-memory"))]
 macro_rules! trace_leaf_proc {
     ($($t:ty),* $(,)?) => {
         $(
@@ -14832,6 +14986,11 @@ macro_rules! trace_leaf_proc {
             }
         )*
     };
+}
+
+#[cfg(feature = "countable-memory")]
+macro_rules! trace_leaf_proc {
+    ($($t:ty),* $(,)?) => {};
 }
 
 trace_leaf_proc!(
@@ -15038,11 +15197,14 @@ impl cs_core::Procedure for VmAotClosure {
     }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_gc::Trace for VmAotClosure {
     fn trace(&self, _marker: &mut cs_gc::Marker) {
         // No Gc-tracked fields; the fn pointer is a static address.
     }
 }
+// Under countable-memory VmAotClosure inherits the empty default
+// `visit_closure_children` via its Procedure impl.
 
 /// RC3 iter 2.1 — allocate an AOT procedure and return its NB carrier.
 ///
@@ -15922,6 +16084,7 @@ mod gc_helper_tests_extra {
         assert_eq!(unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Null)) }, 1);
     }
 
+    #[cfg(not(feature = "countable-memory"))]
     #[test]
     fn value_to_gc_i64_uses_active_heap_when_set() {
         // K1 step 2b (NaN-box): Pairs encode by storing their raw
@@ -15954,6 +16117,7 @@ mod gc_helper_tests_extra {
         );
     }
 
+    #[cfg(not(feature = "countable-memory"))]
     #[test]
     fn value_to_gc_i64_inline_fixnum_skips_allocation() {
         // Small Fixnums encode inline (low-bit tag) — no Gc allocation
@@ -15984,6 +16148,7 @@ mod gc_helper_tests_extra {
         );
     }
 
+    #[cfg(not(feature = "countable-memory"))]
     #[test]
     fn value_to_gc_i64_inline_immediates_round_trip() {
         // Boolean, Character, Null, Unspecified, Eof all encode
@@ -16026,6 +16191,7 @@ mod gc_helper_tests_extra {
         );
     }
 
+    #[cfg(not(feature = "countable-memory"))]
     #[test]
     fn value_to_gc_i64_oversized_fixnum_falls_back_to_heap() {
         // A Fixnum past the 47-bit NaN-box inline range falls
@@ -16133,6 +16299,7 @@ mod gc_helper_tests_extra {
         }
     }
 
+    #[cfg(not(feature = "countable-memory"))]
     #[test]
     fn nanbox_round_trips_flonum_inline() {
         // Flonums travel as raw f64 bits. No allocation, no
@@ -16177,6 +16344,7 @@ mod gc_helper_tests_extra {
         );
     }
 
+    #[cfg(not(feature = "countable-memory"))]
     #[test]
     fn nanbox_round_trips_heap_pair_without_extra_wrap() {
         // The whole point of NaN-boxing: a heap-typed Value (here
@@ -16451,6 +16619,7 @@ mod nb_arith_tests {
         assert_bool(r, false);
     }
 
+    #[cfg(not(feature = "countable-memory"))]
     #[test]
     fn bindings_trace_skips_inline_immediates() {
         // Regression test for the Phase 4 keystone SIGSEGV in

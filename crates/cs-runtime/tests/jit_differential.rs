@@ -1672,6 +1672,7 @@ fn diff_jit_unbox_flonum_via_car() {
     }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 #[test]
 fn diff_jit_pair_alloc_then_collect_reclaims_when_unreachable() {
     // M6 Phase 4 iter BQ — companion to the survives-collect test.
@@ -1714,6 +1715,7 @@ fn diff_jit_pair_alloc_then_collect_reclaims_when_unreachable() {
     );
 }
 
+#[cfg(not(feature = "countable-memory"))]
 #[test]
 fn diff_jit_pair_survives_collect_when_walker_holds_it() {
     // M6 Phase 4 iter BQ — basic GC sanity for JIT-allocated
@@ -1753,6 +1755,7 @@ fn diff_jit_pair_survives_collect_when_walker_holds_it() {
     }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 #[test]
 fn diff_jit_alloc_count_grows_through_heap() {
     // M6 Phase 4 iter BP — when the JIT body allocates Gc<Value>
@@ -1844,6 +1847,7 @@ fn diff_jit_truthiness_on_any() {
     // branches are distinct.)
 }
 
+#[cfg(not(feature = "countable-memory"))]
 #[test]
 fn diff_jit_collect_during_jit_body_keeps_live_pairs() {
     // M6 Phase 4 iter BS — close ADR 0012 D-2's "Known limitation

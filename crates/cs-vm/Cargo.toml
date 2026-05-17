@@ -5,6 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Forward the countable-memory feature down to cs-core (which
+# forwards to cs-gc). Required so the cs-vm crate's CycleVisit
+# impls (VmClosure, Bindings, Env) compile against the
+# feature-gated trait.
+countable-memory = ["cs-core/countable-memory"]
+
 [dependencies]
 cs-core = { workspace = true }
 cs-diag = { workspace = true }

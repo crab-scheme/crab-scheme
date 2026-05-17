@@ -34,6 +34,10 @@ ffi-dynamic = ["ffi-trait", "dep:libloading"]
 # embedders that wrote `features = ["ffi"]` against the W1 API stay
 # building.
 ffi = ["ffi-dynamic"]
+# Forward the countable-memory feature down to cs-core (which
+# forwards to cs-gc). Enables the rc-only Gc<T> + cycle collector
+# path and the parallel CycleVisit impls landed in iters 5-6.
+countable-memory = ["cs-core/countable-memory", "cs-vm/countable-memory"]
 
 [dependencies]
 cs-core = { workspace = true }

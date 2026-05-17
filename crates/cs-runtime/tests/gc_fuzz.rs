@@ -1,3 +1,5 @@
+#![cfg(not(feature = "countable-memory"))]
+
 //! Deterministic fuzz tests for the M5 GC pipeline.
 //!
 //! Generates random heap shapes via Scheme programs, interleaves

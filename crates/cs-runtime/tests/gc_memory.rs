@@ -1,3 +1,5 @@
+#![cfg(not(feature = "countable-memory"))]
+
 //! Memory-usage baseline for the M5 exit gate.
 //!
 //! The M5 spec asserts: "Memory usage on representative programs no

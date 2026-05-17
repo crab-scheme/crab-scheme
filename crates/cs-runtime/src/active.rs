@@ -44,14 +44,26 @@ impl Runtime {
     /// scope exit.
     pub fn with_active<R>(&mut self, f: impl FnOnce(&mut Runtime) -> R) -> R {
         let prev = ACTIVE_RUNTIME.with(|c| c.replace(self as *mut Runtime));
-        // SAFETY: `self.heap` is owned by this Runtime and `self`
-        // outlives the closure call below.
-        let prev_heap = cs_vm::vm::current_jit_active_heap();
-        unsafe { cs_vm::vm::set_jit_active_heap(&self.heap as *const cs_gc::Heap) };
+        // Under default (tracing) the JIT helpers consult
+        // JIT_ACTIVE_HEAP to register allocations with the
+        // Runtime's tracing GC. Under countable-memory there is
+        // no Heap — allocations live by refcount alone — so the
+        // setup is a no-op.
+        #[cfg(not(feature = "countable-memory"))]
+        let prev_heap = {
+            // SAFETY: `self.heap` is owned by this Runtime and `self`
+            // outlives the closure call below.
+            let prev_heap = cs_vm::vm::current_jit_active_heap();
+            unsafe { cs_vm::vm::set_jit_active_heap(&self.heap as *const cs_gc::Heap) };
+            prev_heap
+        };
         let result = f(self);
-        // Restore previous heap pointer (typically null) so nested
-        // with_active calls work correctly.
-        unsafe { cs_vm::vm::set_jit_active_heap(prev_heap) };
+        #[cfg(not(feature = "countable-memory"))]
+        {
+            // Restore previous heap pointer (typically null) so nested
+            // with_active calls work correctly.
+            unsafe { cs_vm::vm::set_jit_active_heap(prev_heap) };
+        }
         ACTIVE_RUNTIME.with(|c| c.set(prev));
         result
     }

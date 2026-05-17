@@ -4,6 +4,8 @@ use std::any::Any;
 use std::rc::Rc;
 
 use cs_core::{Procedure, Symbol, SymbolTable, Value};
+#[cfg(feature = "countable-memory")]
+use cs_gc::cycle::CycleVisit as _;
 use cs_ir::{CoreExpr, Params};
 
 use crate::env::Frame;
@@ -39,8 +41,12 @@ impl Procedure for Builtin {
     fn name(&self) -> Option<&str> {
         Some(self.name)
     }
+    // Builtin is a leaf — inherits the empty default
+    // visit_closure_children from the Procedure trait under
+    // countable-memory.
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_core::Trace for Builtin {
     fn trace(&self, _marker: &mut cs_core::Marker) {
         // Leaf — Builtin holds only a fn pointer and a static name.
@@ -63,8 +69,15 @@ impl Procedure for Closure {
     fn name(&self) -> Option<&str> {
         self.display_name.as_deref()
     }
+    #[cfg(feature = "countable-memory")]
+    fn visit_closure_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Captured env chain. body is shared immutable IR
+        // (Rc<CoreExpr>) with no Scheme values.
+        self.env.visit_children(ctx);
+    }
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_core::Trace for Closure {
     fn trace(&self, marker: &mut cs_core::Marker) {
         // Trace the captured environment chain. The body is a shared
@@ -94,8 +107,10 @@ impl Procedure for Continuation {
     fn name(&self) -> Option<&str> {
         Some("continuation")
     }
+    // Leaf — empty default visit_closure_children suffices.
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_core::Trace for Continuation {
     fn trace(&self, _marker: &mut cs_core::Marker) {
         // Leaf — escape continuations carry only a u64 id.
@@ -141,8 +156,11 @@ impl Procedure for HostBuiltin {
     fn name(&self) -> Option<&str> {
         Some(self.name)
     }
+    // Empty default visit_closure_children — see Trace doc below
+    // for why the FFI surface holds no traceable Scheme values.
 }
 
+#[cfg(not(feature = "countable-memory"))]
 impl cs_core::Trace for HostBuiltin {
     fn trace(&self, _marker: &mut cs_core::Marker) {
         // The boxed closure may capture Values, but in the FFI use

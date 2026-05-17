@@ -1,3 +1,5 @@
+#![cfg(not(feature = "countable-memory"))]
+
 //! Stress test: run a non-trivial Scheme workload while interleaving
 //! `Runtime::collect()` calls. The goal isn't perf measurement (Phase 1
 //! is Rc-backed; the collect cycle is mostly bookkeeping) — it's a

@@ -1,3 +1,5 @@
+#![cfg(not(feature = "countable-memory"))]
+
 //! GC pause-time measurement harness for the M5 exit gate.
 //!
 //! The M5 spec calls for p99 GC pause < 1ms on stdlib load. Phase 1's

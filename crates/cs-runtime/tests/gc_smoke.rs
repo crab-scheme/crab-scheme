@@ -1,3 +1,5 @@
+#![cfg(not(feature = "countable-memory"))]
+
 //! Smoke tests for the M5 step 4.D wiring of Runtime roots into Heap.
 //!
 //! These tests don't exercise GC reclamation directly — Phase 1's

@@ -11560,16 +11560,28 @@ fn b_jit_stats(args: &[Value]) -> Result<Value, String> {
 /// Phase 6 Stage B analysis — expose GC alloc + collect counts so
 /// benches can report allocation pressure. Returns `(alloc-count
 /// collect-count)`.
+///
+/// Under `feature = "countable-memory"` there is no tracing heap
+/// to query — reclamation is refcount-driven, allocation count is
+/// not tracked, and `collect()` is a no-op shim. Returns
+/// `(0 0)` so callers don't crash.
 fn b_gc_stats(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats", "0", args.len()));
     }
-    let rt = unsafe { crate::Runtime::active() }
-        .ok_or_else(|| "gc-stats: no active runtime".to_string())?;
-    Ok(Value::list(vec![
-        Value::fixnum(rt.heap().alloc_count() as i64),
-        Value::fixnum(rt.heap().collect_count() as i64),
-    ]))
+    #[cfg(not(feature = "countable-memory"))]
+    {
+        let rt = unsafe { crate::Runtime::active() }
+            .ok_or_else(|| "gc-stats: no active runtime".to_string())?;
+        Ok(Value::list(vec![
+            Value::fixnum(rt.heap().alloc_count() as i64),
+            Value::fixnum(rt.heap().collect_count() as i64),
+        ]))
+    }
+    #[cfg(feature = "countable-memory")]
+    {
+        Ok(Value::list(vec![Value::fixnum(0), Value::fixnum(0)]))
+    }
 }
 
 fn b_jit_status(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
