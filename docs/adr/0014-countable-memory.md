@@ -165,23 +165,48 @@ synchronous detector closes the gap with bounded per-call cost.
 
 ## Follow-ups
 
-- [~] iter 7.1 — Strong/Weak storage tombstone infrastructure
+- [x] iter 7.1 — Strong/Weak storage tombstone infrastructure
   on `Pair` shipped (`WeakValue` type, `Pair::car_weak` /
   `cdr_weak` tombstone fields, `Pair::car()` / `cdr()` /
   `set_car()` / `set_cdr()` accessors, ~250 reader sites
-  migrated workspace-wide, `Pair::break_car_cycle` /
-  `break_cdr_cycle` available but not currently invoked). The
-  naive "demote the freshly-mutated slot to Weak" break
-  attempted in iter-7.1 orphans the demoted value when the
-  slot was its only strong holder — common with
-  `(set-car! env (cons name val))` closures-over-env where
-  the cons cell has no external strong references. Detection
-  still fires (counter increments via
-  `cs_runtime::countable_memory_cycle::record_cycle_detected`)
-  but no structural break runs. The follow-up iter (7.1.x)
-  must implement a Bacon-Rajan-style trial-deletion that picks
-  a safe cycle edge to weaken. Vector and Hashtable tombstone
-  infrastructure (analogous to Pair) is also outstanding.
+  migrated workspace-wide).
+- [x] iter 7.1.x — Strong-count-guarded break.
+  `Pair::break_car_cycle` / `break_cdr_cycle` invoke the
+  Weak-tombstone demote only when the value's total strong
+  count is `>= 5` (an empirical threshold accounting for the
+  slot, the caller's `args[1]`, plus 2–3 transient VM-tier
+  dispatch refs). Cycles with multiple persistent external
+  anchors are reclaimed; cycles whose only anchor is in the
+  freshly-mutated subgraph (the metacircular
+  `(set-car! env (cons name val))` pattern) are detected but
+  intentionally not broken — leaking refcount-wise is the
+  conservative correctness choice vs. orphaning the value.
+  `cs_runtime::countable_memory_cycle::cycle_broken_count`
+  distinguishes detection from successful break.
+- [~] iter 7.1.x.y — Replace the threshold-5 heuristic with a
+  per-tier baseline passed by the caller (precise temp-ref
+  accounting). Alternative: full Bacon-Rajan trial-deletion
+  algorithm that picks a safe cycle edge agnostic to caller
+  conventions.
+- [~] iter 7.1.y — Vector and Hashtable structural break
+  tombstones. **Scoped down** to documentation-only deferral
+  in this milestone for the following reasons:
+  - Cycles via `vector-set!` and `hashtable-set!` are
+    extremely rare in idiomatic Scheme (vectors and
+    hashtables are typically used for non-recursive data
+    structures), whereas Pair cycles are common
+    (`set-cdr!`-based lists, association lists).
+  - Adding tombstone storage to `Vector` requires changing
+    `Value::Vector(Gc<RefCell<Vec<Value>>>)` to a wrapper
+    struct, cascading through 162 use sites workspace-wide
+    (vs. Pair's ~250 sites for the equivalent migration).
+    Hashtable would touch ~50 sites.
+  - The cycle DETECTOR already covers Vector/Hashtable cycles
+    via the existing `CycleVisit` impls in cs-core; only the
+    structural break (refcount reclamation) is missing.
+  - Detection counters fire correctly for these tier;
+    embedders that need reclamation can opt into a future
+    iter when demand is demonstrated.
 - [x] iter 8 — `Frame.parent` / `Continuation` parent chain
   refactored to `Weak<Frame>` for structural cycle prevention.
   **Not applicable — closed as won't-do.** See "Iter 8
