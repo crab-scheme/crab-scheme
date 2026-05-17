@@ -386,9 +386,11 @@ opt-level = 3
 #[test]
 fn aot_sq_nb_runs_correctly() {
     // Same RIR as aot_sq_runs_correctly, but emitted under NB ABI.
-    // (* x x) lowers to nb_mul_inline(v0, v0); the helper inlines
-    // the Fixnum fast path and falls back to vm_value_mul_nb on a
-    // tag miss. Result is an NB Fixnum.
+    // (* x x) lowers to nb_mul_inline(v0, v0); when both operands
+    // are typed Fixnum the per-Value type analysis picks
+    // nb_mul_fixnum_inline (the skip-tag-check fast path), which
+    // is a strict subset name of nb_mul_inline. The substring
+    // assertion matches either.
     let mut f = Function::new("sq_nb");
     f.params.push((Value(0), Type::Fixnum));
     f.entry = BlockId(0);
@@ -401,8 +403,8 @@ fn aot_sq_nb_runs_correctly() {
 
     let src = emit_with(EmitMode::Nb, &f).unwrap();
     assert!(
-        src.contains("nb_mul_inline"),
-        "NB emit should call nb_mul_inline helper: {src}"
+        src.contains("nb_mul_inline") || src.contains("nb_mul_fixnum_inline"),
+        "NB emit should call nb_mul_inline or its fixnum fast path: {src}"
     );
     let bin = build_aot_binary_nb(&src, "sq_nb", 1);
 

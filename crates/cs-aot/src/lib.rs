@@ -600,6 +600,13 @@ pub struct LambdaInfo {
     /// or local defines) and passing them to
     /// `vm_alloc_aot_procedure_with_captures`.
     pub captures: Vec<u32>,
+    /// True if the lambda's body materially uses `__self_handle`
+    /// — currently the only such use is re-passing it as a
+    /// forward-self-reference capture to an inner MakeClosure.
+    /// When false, the direct-call elision can pass `0i64` for
+    /// the handle slot; when true, eliding the alloc would
+    /// leave inner closures with a bogus self pointer.
+    pub body_uses_self_handle: bool,
 }
 
 impl LambdaResolver {
@@ -607,6 +614,10 @@ impl LambdaResolver {
         Self::default()
     }
     pub fn from_funcs(funcs: &[Function]) -> Self {
+        // Pass 1: collect by_idx / by_name_sym with placeholder
+        // `body_uses_self_handle = false`. Pass 2 needs the
+        // captures map populated before it can check whether any
+        // MakeClosure'd lambda captures the outer's self_binding_sym.
         let mut by_idx = std::collections::HashMap::new();
         let mut by_name_sym = std::collections::HashMap::new();
         for f in funcs {
@@ -617,10 +628,42 @@ impl LambdaResolver {
                         fn_name: sanitize_ident(&f.name),
                         arity: f.params.len(),
                         captures: f.captures.clone(),
+                        body_uses_self_handle: false,
                     },
                 );
                 if let Some(sym) = f.name_sym {
                     by_name_sym.insert(sym, idx);
+                }
+            }
+        }
+        // Pass 2: for each fn whose self_binding_sym is Some(s),
+        // scan its body for any MakeClosure(_, idx) where the
+        // resolved lambda's captures contain s. That's exactly
+        // the codegen path that emits `__self_handle` as a
+        // capture expr.
+        for f in funcs {
+            let self_sym = match f.self_binding_sym {
+                Some(s) => s,
+                None => continue,
+            };
+            let mut uses = false;
+            'outer: for block in &f.blocks {
+                for inst in &block.insts {
+                    if let Inst::MakeClosure(_, lambda_idx) = inst {
+                        if let Some(info) = by_idx.get(&(*lambda_idx as usize)) {
+                            if info.captures.contains(&self_sym) {
+                                uses = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+            if uses {
+                if let Some(idx) = f.lambda_index {
+                    if let Some(info) = by_idx.get_mut(&idx) {
+                        info.body_uses_self_handle = true;
+                    }
                 }
             }
         }
@@ -757,7 +800,7 @@ fn emit_straight_line(
     mode: EmitMode,
     resolver: &LambdaResolver,
     types: &std::collections::HashMap<Value, Type>,
-    direct_callable: &std::collections::HashMap<Value, (String, usize)>,
+    direct_callable: &std::collections::HashMap<Value, DirectCallInfo>,
 ) -> Result<(), AotError> {
     let block = &func.blocks[0];
     let mut defined: HashSet<Value> = func.params.iter().map(|(v, _)| *v).collect();
@@ -807,7 +850,7 @@ fn emit_loop_match(
     mode: EmitMode,
     resolver: &LambdaResolver,
     types: &std::collections::HashMap<Value, Type>,
-    direct_callable: &std::collections::HashMap<Value, (String, usize)>,
+    direct_callable: &std::collections::HashMap<Value, DirectCallInfo>,
 ) -> Result<(), AotError> {
     // Pre-declare every Value that ISN'T already a function
     // parameter. Block params and Inst destinations all go here.
@@ -945,7 +988,7 @@ fn emit_inst_let(
     local_defs: &std::collections::HashMap<u32, Value>,
     self_binding_sym: Option<u32>,
     types: &std::collections::HashMap<Value, Type>,
-    direct_callable: &std::collections::HashMap<Value, (String, usize)>,
+    direct_callable: &std::collections::HashMap<Value, DirectCallInfo>,
 ) -> Result<(), AotError> {
     // RC3 iter 2.11 — EnvDefineLocal that survived demote (the
     // multi-block + multi-define case) lowers to a no-op: the
@@ -995,7 +1038,7 @@ fn emit_inst_assign(
     local_defs: &std::collections::HashMap<u32, Value>,
     self_binding_sym: Option<u32>,
     types: &std::collections::HashMap<Value, Type>,
-    direct_callable: &std::collections::HashMap<Value, (String, usize)>,
+    direct_callable: &std::collections::HashMap<Value, DirectCallInfo>,
 ) -> Result<(), AotError> {
     // Same no-op as emit_inst_let for surviving EnvDefineLocal.
     if matches!(inst, Inst::EnvDefineLocal(..)) {
@@ -1039,7 +1082,7 @@ fn inst_rhs(
     local_defs: &std::collections::HashMap<u32, Value>,
     self_binding_sym: Option<u32>,
     types: &std::collections::HashMap<Value, Type>,
-    direct_callable: &std::collections::HashMap<Value, (String, usize)>,
+    direct_callable: &std::collections::HashMap<Value, DirectCallInfo>,
 ) -> Result<(Value, String), AotError> {
     let check = |v: Value| -> Result<(), AotError> {
         match defined {
@@ -1789,6 +1832,12 @@ fn inst_rhs(
                     // the user.
                     AotError::UnsupportedInst("MakeClosure")
                 })?;
+            // Direct-call elision: the matching Call codegen will
+            // emit a direct fn call gathering captures from this
+            // scope. Skip the alloc entirely.
+            if direct_callable.contains_key(dst) {
+                return Ok((*dst, "0i64".to_string()));
+            }
             if info.captures.is_empty() {
                 (
                     *dst,
@@ -1873,13 +1922,51 @@ fn inst_rhs(
             // Arity is validated at the resolver-pass level; the
             // direct call would mis-type-check at compile if the
             // arg count is wrong.
-            if let Some((fn_name, _arity)) = direct_callable.get(callee) {
-                let args_csv = args
-                    .iter()
-                    .map(|a| format!("v{}", a.0))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Ok((*dst, format!("{fn_name}(0i64, {args_csv})")));
+            if let Some(info) = direct_callable.get(callee) {
+                // Gather capture exprs using the same resolution
+                // logic MakeClosure codegen uses (see line ~1807
+                // for the rationale on each branch).
+                let mut cap_exprs: Vec<String> = Vec::with_capacity(info.capture_syms.len());
+                let mut bail = false;
+                for sym in &info.capture_syms {
+                    if captures.contains(sym) {
+                        cap_exprs.push(format!("__cap{sym}"));
+                    } else if let Some(v) = local_defs.get(sym) {
+                        cap_exprs.push(format!("v{}", v.0));
+                    } else if self_binding_sym == Some(*sym) {
+                        cap_exprs.push("__self_handle".to_string());
+                    } else if let Some(other_idx) = resolver.by_name_sym.get(sym) {
+                        let other = &resolver.by_idx[other_idx];
+                        cap_exprs.push(format!(
+                            "unsafe {{ cs_vm::vm::vm_alloc_aot_procedure({}_aot_dispatch as usize, {}u32) }}",
+                            other.fn_name, other.arity
+                        ));
+                    } else {
+                        // Capture we can't resolve — fall back to
+                        // the indirect path; the alloc + dispatch
+                        // is correct, just slower.
+                        bail = true;
+                        break;
+                    }
+                }
+                if !bail {
+                    let args_csv = args
+                        .iter()
+                        .map(|a| format!("v{}", a.0))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let head = if cap_exprs.is_empty() {
+                        format!("{}(0i64", info.fn_name)
+                    } else {
+                        format!("{}(0i64, {}", info.fn_name, cap_exprs.join(", "))
+                    };
+                    let tail = if args.is_empty() {
+                        ")".to_string()
+                    } else {
+                        format!(", {args_csv})")
+                    };
+                    return Ok((*dst, format!("{head}{tail}")));
+                }
             }
             let args_csv = args
                 .iter()
@@ -2029,25 +2116,160 @@ fn emit_terminator(
 fn infer_direct_callables(
     func: &Function,
     resolver: &LambdaResolver,
-) -> std::collections::HashMap<Value, (String, usize)> {
+) -> std::collections::HashMap<Value, DirectCallInfo> {
+    // Step 1: count uses of each Value across all insts +
+    // terminators to detect "used exactly once as a Call's
+    // func." This is what makes the MakeClosure → Call elision
+    // safe: if the closure value escapes (passed as a non-func
+    // arg, stored in a Pair, etc), we can't elide the alloc.
+    let mut total_uses: std::collections::HashMap<Value, usize> = std::collections::HashMap::new();
+    let mut as_callee_uses: std::collections::HashMap<Value, usize> =
+        std::collections::HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            for v in inst_operands(inst) {
+                *total_uses.entry(v).or_insert(0) += 1;
+            }
+            if let Inst::Call(_, callee, _) | Inst::CallGeneral(_, callee, _) = inst {
+                *as_callee_uses.entry(*callee).or_insert(0) += 1;
+            }
+        }
+        // Terminators carry Values too (Return, Branch cond,
+        // Jump args). Any of those count as "escape" for
+        // closure-elision purposes since the value flows out
+        // of the alloc-site context.
+        for v in term_operands(&block.terminator) {
+            *total_uses.entry(v).or_insert(0) += 1;
+        }
+    }
+
     let mut out = std::collections::HashMap::new();
     for block in &func.blocks {
         for inst in &block.insts {
-            if let Inst::EnvLookup(dst, sym) | Inst::EnvLookupAny(dst, sym) = inst {
-                if let Some(idx) = resolver.by_name_sym.get(sym) {
-                    if let Some(info) = resolver.by_idx.get(idx) {
-                        // Only no-captures fns get the direct path —
-                        // capturing closures need a real Procedure
-                        // value with captures attached.
-                        if info.captures.is_empty() {
-                            out.insert(*dst, (info.fn_name.clone(), info.arity));
+            match inst {
+                // EnvLookup of a resolver-known no-captures
+                // top-level fn — always direct-callable (no
+                // alloc happens anyway; we're just eliding the
+                // vm_call_aot_procedure dispatch).
+                Inst::EnvLookup(dst, sym) | Inst::EnvLookupAny(dst, sym) => {
+                    if let Some(idx) = resolver.by_name_sym.get(sym) {
+                        if let Some(info) = resolver.by_idx.get(idx) {
+                            if info.captures.is_empty() {
+                                out.insert(
+                                    *dst,
+                                    DirectCallInfo {
+                                        fn_name: info.fn_name.clone(),
+                                        arity: info.arity,
+                                        capture_syms: vec![],
+                                    },
+                                );
+                            }
                         }
                     }
                 }
+                // MakeClosure followed by a single Call-as-func
+                // — also direct-callable. Eliding the alloc
+                // saves a real heap allocation (vs the
+                // EnvLookup case which only elides the
+                // dispatch). Big win for inner let-loop bodies
+                // where the closure is allocated per outer
+                // call.
+                Inst::MakeClosure(dst, lambda_idx) => {
+                    let total = total_uses.get(dst).copied().unwrap_or(0);
+                    let as_callee = as_callee_uses.get(dst).copied().unwrap_or(0);
+                    if total == 1 && as_callee == 1 {
+                        if let Some(info) = resolver.by_idx.get(&(*lambda_idx as usize)) {
+                            // Bail when the target fn materially
+                            // uses __self_handle — we'd pass 0
+                            // and break inner closure capture
+                            // resolution.
+                            if info.body_uses_self_handle {
+                                continue;
+                            }
+                            out.insert(
+                                *dst,
+                                DirectCallInfo {
+                                    fn_name: info.fn_name.clone(),
+                                    arity: info.arity,
+                                    capture_syms: info.captures.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
     out
+}
+
+/// What `infer_direct_callables` records per direct-callable
+/// Value. `capture_syms` is empty for the EnvLookup case
+/// (no-captures top-level fn) and populated for the
+/// MakeClosure case — the Call codegen uses it to resolve
+/// each capture sym in the caller's scope (via `__cap{sym}`,
+/// `local_defs`, etc.) when emitting the direct call.
+#[derive(Clone, Debug)]
+struct DirectCallInfo {
+    fn_name: String,
+    arity: usize,
+    capture_syms: Vec<u32>,
+}
+
+/// Return every Value the Inst reads (excluding its dst, if
+/// any). Robust against the IR adding new variants: parses the
+/// Inst's Debug representation for `Value(N)` substrings rather
+/// than enumerating every match arm by hand. Stable as long as
+/// `Value(pub u32)` keeps its derived Debug.
+fn inst_operands(inst: &Inst) -> Vec<Value> {
+    let s = format!("{:?}", inst);
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 6 <= bytes.len() {
+        if &bytes[i..i + 6] == b"Value(" {
+            let start = i + 6;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start && bytes.get(end) == Some(&b')') {
+                if let Ok(num) = std::str::from_utf8(&bytes[start..end])
+                    .unwrap_or("")
+                    .parse::<u32>()
+                {
+                    out.push(Value(num));
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // Drop the first occurrence matching the dst — that's
+    // the Inst's destination, not a use. Only one removal so
+    // a self-referential Inst (e.g., `x = f(x)`) still counts
+    // the read of x.
+    if let Some(dst) = inst_dst(inst) {
+        if let Some(pos) = out.iter().position(|v| *v == dst) {
+            out.remove(pos);
+        }
+    }
+    out
+}
+
+/// Walk a Term and return every Value it reads.
+fn term_operands(term: &Term) -> Vec<Value> {
+    match term {
+        Term::Return(v) => vec![*v],
+        Term::Jump(_, args) => args.clone(),
+        Term::Branch(cond, _, _, args) => {
+            let mut out = vec![*cond];
+            out.extend(args.iter().copied());
+            out
+        }
+    }
 }
 
 /// Pick the right `nb_<op>_inline` helper for a generic NB
