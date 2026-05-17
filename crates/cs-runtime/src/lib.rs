@@ -1,6 +1,8 @@
 //! CrabScheme runtime: tree-walking interpreter, environments, builtins.
 
 pub mod active;
+#[cfg(feature = "regions")]
+pub mod alloc_dispatch;
 pub mod builtins;
 #[cfg(feature = "countable-memory")]
 pub mod countable_memory_cycle;

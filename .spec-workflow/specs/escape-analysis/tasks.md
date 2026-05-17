@@ -216,7 +216,7 @@ shipped: `cs_gc::Region`, `Gc::new_in`, debug-mode validity).
 
 ## Iter 6 — Allocation dispatch wiring
 
-- [ ] 8. Lifetime-aware allocation dispatch in cs-runtime
+- [x] 8. Lifetime-aware allocation dispatch in cs-runtime
   - File: `crates/cs-runtime/src/builtins/mod.rs`
   - For each of `b_cons`, `b_make_vector`, `b_make_string`,
     `b_make_bytevector`, `b_make_hashtable`, `b_vector`,
