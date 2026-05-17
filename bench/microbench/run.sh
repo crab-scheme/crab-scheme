@@ -15,8 +15,18 @@ SCM_DIR="$ROOT/bench/microbench/scheme"
 BINS="$ROOT/target/release"
 
 # --- build crabscheme in release once ---
-echo "==> building crabscheme (release)..."
-(cd "$ROOT" && cargo build --release -p cs-cli >/dev/null 2>&1)
+# Optional: set CS_FEATURES=all-memory-layers (or any other
+# cs-cli feature spec) to enable layer-4 tracing + extra
+# memory-management plumbing. Default leaves the build at
+# the production feature set (regions on, tracing off).
+BUILD_FEATURE_ARG=""
+if [ -n "${CS_FEATURES:-}" ]; then
+  BUILD_FEATURE_ARG="--features $CS_FEATURES"
+  echo "==> building crabscheme (release) with features '$CS_FEATURES'..."
+else
+  echo "==> building crabscheme (release)..."
+fi
+(cd "$ROOT" && cargo build --release -p cs-cli $BUILD_FEATURE_ARG >/dev/null 2>&1)
 CS="$BINS/crabscheme"
 if [ ! -x "$CS" ]; then
   echo "expected $CS; got nothing — check 'cargo build --release -p cs-cli'"

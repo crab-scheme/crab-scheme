@@ -24,6 +24,15 @@ ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the
 # WASM build drops it (can't spawn cargo at WASI runtime).
 aot = ["dep:cs-aot", "dep:cs-vm", "dep:cs-rir", "dep:cs-parse", "dep:cs-expand", "dep:cs-typer"]
+# Layer-4 tracing cycle collector (tracing-revival spec).
+# Off by default; embedders and benchmarks that want to
+# exercise the layer-4 path enable it explicitly. Implies
+# countable-memory (already in cs-runtime's default).
+tracing-cycle-collector = ["cs-runtime/tracing-cycle-collector"]
+# Convenience feature: turns on every memory-management
+# layer so benchmarks can exercise the full architecture.
+# `regions` is already default-on; this adds layer 4.
+all-memory-layers = ["tracing-cycle-collector"]
 
 [dependencies]
 cs-core = { workspace = true }
