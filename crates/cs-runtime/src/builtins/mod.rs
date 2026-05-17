@@ -2450,7 +2450,7 @@ fn b_set_car(args: &[Value]) -> Result<Value, String> {
             }
             #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(p, |p| {
-                crate::countable_memory_cycle::record_cycle_detected();
+                crate::countable_memory_cycle::record_cycle_with_candidate(p);
                 // Iter 7.1.x.y: caller-supplied baseline=3
                 // (slot + args[0] + args[1] + VM transient).
                 // The in-walk back-edge demote that iter
@@ -2481,7 +2481,7 @@ fn b_set_cdr(args: &[Value]) -> Result<Value, String> {
             }
             #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(p, |p| {
-                crate::countable_memory_cycle::record_cycle_detected();
+                crate::countable_memory_cycle::record_cycle_with_candidate(p);
                 if p.break_cdr_cycle(3) {
                     crate::countable_memory_cycle::record_cycle_broken();
                 }
@@ -3685,8 +3685,8 @@ fn b_vector_set(args: &[Value]) -> Result<Value, String> {
                 return Ok(Value::Unspecified);
             }
             #[cfg(feature = "countable-memory")]
-            cs_gc::cycle::check_and_break(v, |_| {
-                crate::countable_memory_cycle::record_cycle_detected();
+            cs_gc::cycle::check_and_break(v, |v| {
+                crate::countable_memory_cycle::record_cycle_with_candidate(v);
             });
             Ok(Value::Unspecified)
         }
@@ -5824,8 +5824,8 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
                     return Ok(Value::Unspecified);
                 }
                 #[cfg(feature = "countable-memory")]
-                cs_gc::cycle::check_and_break(&h, |_| {
-                    crate::countable_memory_cycle::record_cycle_detected();
+                cs_gc::cycle::check_and_break(&h, |h| {
+                    crate::countable_memory_cycle::record_cycle_with_candidate(h);
                 });
                 return Ok(Value::Unspecified);
             }
@@ -5838,8 +5838,8 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             return Ok(Value::Unspecified);
         }
         #[cfg(feature = "countable-memory")]
-        cs_gc::cycle::check_and_break(&h, |_| {
-            crate::countable_memory_cycle::record_cycle_detected();
+        cs_gc::cycle::check_and_break(&h, |h| {
+            crate::countable_memory_cycle::record_cycle_with_candidate(h);
         });
         return Ok(Value::Unspecified);
     }
@@ -5858,8 +5858,8 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         return Ok(Value::Unspecified);
     }
     #[cfg(feature = "countable-memory")]
-    cs_gc::cycle::check_and_break(&h, |_| {
-        crate::countable_memory_cycle::record_cycle_detected();
+    cs_gc::cycle::check_and_break(&h, |h| {
+        crate::countable_memory_cycle::record_cycle_with_candidate(h);
     });
     Ok(Value::Unspecified)
 }

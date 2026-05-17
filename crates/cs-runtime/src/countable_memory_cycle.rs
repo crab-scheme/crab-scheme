@@ -60,3 +60,41 @@ pub fn reset_cycle_detection_count() {
     CYCLE_COUNT.with(|c| c.set(0));
     CYCLE_BROKEN_COUNT.with(|c| c.set(0));
 }
+
+/// Record a detected cycle and, when the
+/// `tracing-cycle-collector` feature is on, register the
+/// candidate with the layer-4 sweep registry so a future
+/// `(collect)` / auto-trigger pass can reclaim it if the
+/// synchronous detector's break-attempt didn't succeed.
+///
+/// Region-allocated values are excluded — their cycles
+/// reclaim via the region's bulk-free (layer 3).
+///
+/// When `tracing-cycle-collector` is OFF this is identical to
+/// [`record_cycle_detected`] — the registration call compiles
+/// to nothing. Mutation builtins (`set-car!`, `set-cdr!`,
+/// `vector-set!`, `hashtable-set!`) call this unconditionally
+/// from their cycle-break callbacks; the feature flag
+/// controls whether the candidate is also registered.
+pub fn record_cycle_with_candidate<T>(p: &cs_gc::Gc<T>)
+where
+    T: 'static + cs_gc::cycle::CycleVisit,
+{
+    record_cycle_detected();
+    #[cfg(feature = "tracing-cycle-collector")]
+    {
+        #[cfg(feature = "regions")]
+        if cs_gc::Gc::is_region(p) {
+            // Region cycle — bulk-free handles it; no
+            // need to register for the layer-4 sweep.
+            return;
+        }
+        let addr = cs_gc::Gc::as_addr(p);
+        let weak = cs_gc::Gc::downgrade(p);
+        cs_gc::cycle_registry::register_cycle_candidate(addr, weak);
+    }
+    // Suppress unused-var warning when the
+    // tracing-cycle-collector feature is off.
+    #[cfg(not(feature = "tracing-cycle-collector"))]
+    let _ = p;
+}

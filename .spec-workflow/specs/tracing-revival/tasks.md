@@ -90,7 +90,7 @@ region exclusion). Independent of the `escape-analysis` spec
 
 ## Iter 3 — Wire Layer 2 detector to populate the registry
 
-- [ ] 3. Modify countable-memory detector to register candidates
+- [x] 3. Modify countable-memory detector to register candidates
   - File: `crates/cs-runtime/src/countable_memory_cycle.rs`,
     `crates/cs-runtime/src/builtins/mod.rs`
   - Add a new function in `countable_memory_cycle.rs`:

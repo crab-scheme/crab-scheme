@@ -152,10 +152,10 @@ pub fn run_sweep() {
     SWEEP_PENDING.with(|f| f.set(false));
 }
 
-/// Test-only helper: clear the registry between tests so
-/// thread-local state doesn't leak. The `cfg(test)` gate
-/// keeps it out of release binaries.
-#[cfg(test)]
+/// Clear the per-thread registry, threshold, and pending
+/// flag. Useful between test runs to prevent state leaking
+/// between cases on the same thread, and as an embedder
+/// teardown hook before dropping a Runtime.
 pub fn reset_for_tests() {
     REGISTRY.with(|r| r.borrow_mut().clear());
     AUTO_TRIGGER_THRESHOLD.with(|t| t.set(10_000));
