@@ -76,14 +76,38 @@ pub enum TypeDatum {
 }
 
 /// Parse a `TypeDatum` as a type annotation, recursively.
+///
+/// Equivalent to [`parse_type_ann_with_aliases`] with an empty
+/// alias table. Use the aliases-aware form when callers have
+/// `define-type` aliases in scope.
 pub fn parse_type_ann(d: &TypeDatum) -> Result<TypeAnn, TypeAnnError> {
+    parse_type_ann_with_aliases(d, &[])
+}
+
+/// Parse a `TypeDatum` with an alias table in scope.
+///
+/// When an atom name doesn't match a built-in (Fixnum, …) the
+/// parser consults `aliases` (by name) and substitutes the
+/// alias's target type. This is how `define-type` references
+/// resolve at parse time — Phase 3.5.
+///
+/// `aliases` is a slice rather than a HashMap because: (a) the
+/// table is tiny in practice (a handful per program), (b) the
+/// caller (extract.rs) is already accumulating aliases as a
+/// `Vec<TypeAlias>` and prefers not to maintain a separate
+/// hash, and (c) ordering matters — a later `define-type` may
+/// reference an earlier one, so we look up from the end.
+pub fn parse_type_ann_with_aliases(
+    d: &TypeDatum,
+    aliases: &[(String, Type)],
+) -> Result<TypeAnn, TypeAnnError> {
     match d {
-        TypeDatum::Sym(name) => atom_from_name(name),
-        TypeDatum::List(elements) => parse_list(elements),
+        TypeDatum::Sym(name) => atom_from_name(name, aliases),
+        TypeDatum::List(elements) => parse_list(elements, aliases),
     }
 }
 
-fn atom_from_name(name: &str) -> Result<TypeAnn, TypeAnnError> {
+fn atom_from_name(name: &str, aliases: &[(String, Type)]) -> Result<TypeAnn, TypeAnnError> {
     match name {
         "Fixnum" => Ok(Type::Fixnum),
         "Flonum" => Ok(Type::Flonum),
@@ -98,11 +122,21 @@ fn atom_from_name(name: &str) -> Result<TypeAnn, TypeAnnError> {
         "Null" => Ok(Type::Null),
         "Any" => Ok(Type::Any),
         "Never" => Ok(Type::Never),
-        _ => Err(TypeAnnError::UnknownType(name.to_string())),
+        _ => {
+            // Try aliases (most recent first, so later defs
+            // shadow earlier ones with the same name — Scheme
+            // convention).
+            for (a_name, a_type) in aliases.iter().rev() {
+                if a_name == name {
+                    return Ok(a_type.clone());
+                }
+            }
+            Err(TypeAnnError::UnknownType(name.to_string()))
+        }
     }
 }
 
-fn parse_list(elements: &[TypeDatum]) -> Result<TypeAnn, TypeAnnError> {
+fn parse_list(elements: &[TypeDatum], aliases: &[(String, Type)]) -> Result<TypeAnn, TypeAnnError> {
     if elements.is_empty() {
         return Err(TypeAnnError::MalformedConstructor(
             "()",
@@ -119,22 +153,25 @@ fn parse_list(elements: &[TypeDatum]) -> Result<TypeAnn, TypeAnnError> {
     };
     let rest = &elements[1..];
     match head_name {
-        "U" => parse_union(rest),
-        "->" => parse_arrow(rest),
-        "Listof" => parse_unary("Listof", rest, Type::Listof),
-        "Vectorof" => parse_unary("Vectorof", rest, Type::Vectorof),
+        "U" => parse_union(rest, aliases),
+        "->" => parse_arrow(rest, aliases),
+        "Listof" => parse_unary("Listof", rest, Type::Listof, aliases),
+        "Vectorof" => parse_unary("Vectorof", rest, Type::Vectorof, aliases),
         _ => Err(TypeAnnError::UnknownType(format!(
             "unknown type constructor: {head_name}"
         ))),
     }
 }
 
-fn parse_union(args: &[TypeDatum]) -> Result<TypeAnn, TypeAnnError> {
-    let members: Result<Vec<Type>, _> = args.iter().map(parse_type_ann).collect();
+fn parse_union(args: &[TypeDatum], aliases: &[(String, Type)]) -> Result<TypeAnn, TypeAnnError> {
+    let members: Result<Vec<Type>, _> = args
+        .iter()
+        .map(|d| parse_type_ann_with_aliases(d, aliases))
+        .collect();
     Ok(Type::union(members?))
 }
 
-fn parse_arrow(args: &[TypeDatum]) -> Result<TypeAnn, TypeAnnError> {
+fn parse_arrow(args: &[TypeDatum], aliases: &[(String, Type)]) -> Result<TypeAnn, TypeAnnError> {
     // `(-> ret)` is a thunk → `(-> Never ret)` isn't right. We
     // require at least one element (the return type) — the
     // "params" of a 0-arg arrow are simply the empty params
@@ -184,9 +221,14 @@ fn parse_arrow(args: &[TypeDatum]) -> Result<TypeAnn, TypeAnnError> {
             (fixed, Some(rest_d), ret_d)
         }
     };
-    let parsed_params: Result<Vec<Type>, _> = params.iter().map(parse_type_ann).collect();
-    let parsed_rest = rest.map(parse_type_ann).transpose()?;
-    let return_type = parse_type_ann(return_d)?;
+    let parsed_params: Result<Vec<Type>, _> = params
+        .iter()
+        .map(|d| parse_type_ann_with_aliases(d, aliases))
+        .collect();
+    let parsed_rest = rest
+        .map(|d| parse_type_ann_with_aliases(d, aliases))
+        .transpose()?;
+    let return_type = parse_type_ann_with_aliases(return_d, aliases)?;
     Ok(Type::Procedure_(Box::new(ProcType {
         params: parsed_params?,
         return_type,
@@ -198,6 +240,7 @@ fn parse_unary(
     name: &'static str,
     args: &[TypeDatum],
     wrap: fn(Box<Type>) -> Type,
+    aliases: &[(String, Type)],
 ) -> Result<TypeAnn, TypeAnnError> {
     if args.len() != 1 {
         return Err(TypeAnnError::MalformedConstructor(
@@ -205,7 +248,9 @@ fn parse_unary(
             format!("expected 1 argument, got {}", args.len()),
         ));
     }
-    Ok(wrap(Box::new(parse_type_ann(&args[0])?)))
+    Ok(wrap(Box::new(parse_type_ann_with_aliases(
+        &args[0], aliases,
+    )?)))
 }
 
 #[cfg(test)]

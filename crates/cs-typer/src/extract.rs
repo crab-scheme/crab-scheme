@@ -31,7 +31,7 @@ use cs_diag::{Diagnostic, Severity, Span};
 use cs_parse::Datum;
 
 use crate::annotate::{AnnotationTable, LambdaAnnotation, TopLevelAnnotation, TypeAlias};
-use crate::parse_ann::{parse_type_ann, TypeAnnError, TypeDatum};
+use crate::parse_ann::{parse_type_ann_with_aliases, TypeAnnError, TypeDatum};
 use crate::types::Type;
 
 /// Pre-process a top-level program. Returns the stripped form
@@ -49,13 +49,20 @@ pub fn extract_annotations(
     let mut out_data: Vec<Datum> = Vec::with_capacity(data.len());
     let mut table = AnnotationTable::new();
     let mut diags: Vec<Diagnostic> = Vec::new();
+    // Phase 3.5: progressive alias scratch. Each `define-type`
+    // form's resolved target is appended; subsequent annotations
+    // (and define-types referencing earlier aliases) parse with
+    // this scratch in scope, so `Number` resolves to its target
+    // type instead of `UnknownType`.
+    let mut alias_scratch: Vec<(String, Type)> = Vec::new();
 
     for d in data {
-        match classify_top_level(d, syms, &kws, &mut diags) {
+        match classify_top_level(d, syms, &kws, &alias_scratch, &mut diags) {
             TopForm::Ascription(ann) => {
                 table.top_level.push(ann);
             }
             TopForm::DefineType(alias) => {
+                alias_scratch.push((syms.name(alias.name).to_string(), alias.target.clone()));
                 table.aliases.push(alias);
             }
             TopForm::TypedDefine {
@@ -109,6 +116,7 @@ fn classify_top_level(
     d: &Datum,
     syms: &SymbolTable,
     kws: &Keywords,
+    aliases: &[(String, Type)],
     diags: &mut Vec<Diagnostic>,
 ) -> TopForm {
     let elements = match flatten_proper_list(d) {
@@ -120,13 +128,13 @@ fn classify_top_level(
         _ => return TopForm::Passthrough,
     };
     if head_sym == kws.colon {
-        return classify_ascription(&elements, syms, diags);
+        return classify_ascription(&elements, syms, aliases, diags);
     }
     if head_sym == kws.define_type {
-        return classify_define_type(&elements, d.span(), syms, diags);
+        return classify_define_type(&elements, d.span(), syms, aliases, diags);
     }
     if head_sym == kws.define {
-        return classify_define(&elements, d.span(), syms, kws, diags);
+        return classify_define(&elements, d.span(), syms, kws, aliases, diags);
     }
     TopForm::Passthrough
 }
@@ -134,6 +142,7 @@ fn classify_top_level(
 fn classify_ascription(
     elements: &[Datum],
     syms: &SymbolTable,
+    aliases: &[(String, Type)],
     diags: &mut Vec<Diagnostic>,
 ) -> TopForm {
     if elements.len() != 3 {
@@ -144,7 +153,7 @@ fn classify_ascription(
         _ => return TopForm::Passthrough,
     };
     let type_datum = &elements[2];
-    match parse_datum_as_type(type_datum, syms) {
+    match parse_datum_as_type(type_datum, syms, aliases) {
         Ok(t) => TopForm::Ascription(TopLevelAnnotation {
             name,
             type_ann: t,
@@ -161,6 +170,7 @@ fn classify_define_type(
     elements: &[Datum],
     span: Span,
     syms: &SymbolTable,
+    aliases: &[(String, Type)],
     diags: &mut Vec<Diagnostic>,
 ) -> TopForm {
     if elements.len() != 3 {
@@ -171,7 +181,7 @@ fn classify_define_type(
         _ => return TopForm::Passthrough,
     };
     let type_datum = &elements[2];
-    match parse_datum_as_type(type_datum, syms) {
+    match parse_datum_as_type(type_datum, syms, aliases) {
         Ok(target) => TopForm::DefineType(TypeAlias {
             name,
             target,
@@ -193,6 +203,7 @@ fn classify_define(
     top_span: Span,
     syms: &SymbolTable,
     kws: &Keywords,
+    aliases: &[(String, Type)],
     diags: &mut Vec<Diagnostic>,
 ) -> TopForm {
     if elements.len() < 3 {
@@ -211,7 +222,7 @@ fn classify_define(
     let mut param_types: Vec<Option<Type>> = Vec::with_capacity(head_list.len() - 1);
     let mut any_param_annotated = false;
     for p in &head_list[1..] {
-        match strip_param_ann(p, syms, kws, diags) {
+        match strip_param_ann(p, syms, kws, aliases, diags) {
             Some((name_d, t_opt)) => {
                 stripped_params.push(name_d);
                 if t_opt.is_some() {
@@ -230,7 +241,7 @@ fn classify_define(
     if elements.len() >= 5 {
         if let Datum::Symbol(s, _) = &elements[2] {
             if *s == kws.colon {
-                match parse_datum_as_type(&elements[3], syms) {
+                match parse_datum_as_type(&elements[3], syms, aliases) {
                     Ok(t) => {
                         return_type = Some(t);
                         body_first_idx = 4;
@@ -289,6 +300,7 @@ fn strip_param_ann(
     d: &Datum,
     syms: &SymbolTable,
     kws: &Keywords,
+    aliases: &[(String, Type)],
     diags: &mut Vec<Diagnostic>,
 ) -> Option<(Datum, Option<Type>)> {
     if matches!(d, Datum::Symbol(_, _)) {
@@ -306,7 +318,7 @@ fn strip_param_ann(
     if !is_colon {
         return None;
     }
-    match parse_datum_as_type(&elements[2], syms) {
+    match parse_datum_as_type(&elements[2], syms, aliases) {
         Ok(t) => Some((name, Some(t))),
         Err(e) => {
             diags.push(type_ann_diag(e, elements[2].span()));
@@ -318,9 +330,14 @@ fn strip_param_ann(
 /// Convert a [`Datum`] into a [`TypeDatum`] then parse as a
 /// [`Type`]. Atomic type names (`Fixnum`, `Any`, etc.) match
 /// against canonical strings — symbol IDs go via `syms.name()`.
-fn parse_datum_as_type(d: &Datum, syms: &SymbolTable) -> Result<Type, TypeAnnError> {
+/// `aliases` holds in-scope `define-type` substitutions.
+fn parse_datum_as_type(
+    d: &Datum,
+    syms: &SymbolTable,
+    aliases: &[(String, Type)],
+) -> Result<Type, TypeAnnError> {
     let td = datum_to_type_datum(d, syms)?;
-    parse_type_ann(&td)
+    parse_type_ann_with_aliases(&td, aliases)
 }
 
 fn datum_to_type_datum(d: &Datum, syms: &SymbolTable) -> Result<TypeDatum, TypeAnnError> {
@@ -394,6 +411,7 @@ fn type_ann_diag(err: TypeAnnError, span: Span) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ProcType;
     use cs_diag::SourceMap;
     use cs_parse::read_all;
 
@@ -421,6 +439,68 @@ mod tests {
             }
             other => panic!("expected Procedure_, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn alias_substitutes_into_later_ascription() {
+        // Phase 3.5: define-type's target resolves in
+        // subsequent ascriptions.
+        let (data, mut syms) = read(
+            "(define-type Number (U Fixnum Flonum)) (: f (-> Number Number)) (define (f n) n)",
+        );
+        let (_, table, diags) = extract_annotations(&data, &mut syms);
+        assert!(diags.is_empty(), "diagnostics: {diags:?}");
+        assert_eq!(table.aliases.len(), 1);
+        assert_eq!(table.top_level.len(), 1);
+        let want_num = Type::union(vec![Type::Fixnum, Type::Flonum]);
+        let want = Type::Procedure_(Box::new(ProcType {
+            params: vec![want_num.clone()],
+            return_type: want_num,
+            rest: None,
+        }));
+        assert_eq!(table.top_level[0].type_ann, want);
+    }
+
+    #[test]
+    fn alias_substitutes_into_inline_param_annotation() {
+        let (data, mut syms) = read(
+            "(define-type Number (U Fixnum Flonum)) \
+             (define (f [n : Number]) : Number n)",
+        );
+        let (_, table, diags) = extract_annotations(&data, &mut syms);
+        assert!(diags.is_empty(), "diagnostics: {diags:?}");
+        assert_eq!(table.lambdas.len(), 1);
+        let want_num = Type::union(vec![Type::Fixnum, Type::Flonum]);
+        let ann = table.lambdas.values().next().unwrap();
+        assert_eq!(ann.param_types, vec![Some(want_num.clone())]);
+        assert_eq!(ann.return_type, Some(want_num));
+    }
+
+    #[test]
+    fn later_alias_can_reference_earlier_alias() {
+        // Define-types resolve against the alias table in scope
+        // at the point of definition; later defs can refer to
+        // earlier ones.
+        let (data, mut syms) = read(
+            "(define-type Number (U Fixnum Flonum)) \
+             (define-type NumOrStr (U Number String))",
+        );
+        let (_, table, diags) = extract_annotations(&data, &mut syms);
+        assert!(diags.is_empty(), "diagnostics: {diags:?}");
+        assert_eq!(table.aliases.len(), 2);
+        let want = Type::union(vec![Type::Fixnum, Type::Flonum, Type::String]);
+        assert_eq!(table.aliases[1].target, want);
+    }
+
+    #[test]
+    fn unknown_alias_still_errors() {
+        // No `define-type` for `Mystery` — should diagnostic.
+        let (data, mut syms) = read("(: f (-> Mystery Mystery))");
+        let (_, _, diags) = extract_annotations(&data, &mut syms);
+        assert!(
+            !diags.is_empty(),
+            "expected diag for unknown alias `Mystery`"
+        );
     }
 
     #[test]
