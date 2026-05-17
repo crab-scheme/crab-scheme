@@ -13,6 +13,9 @@
 #![deny(unsafe_code)]
 
 pub mod inline;
+pub mod lifetime;
+
+pub use lifetime::{Lifetime, RegionTag};
 
 /// SSA value identifier within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -51,5 +51,7 @@ pub use extract::extract_annotations;
 pub use infer::infer;
 pub use parse_ann::{parse_type_ann, TypeAnn, TypeAnnError, TypeDatum};
 pub use poly::{instantiate, subst, unify};
-pub use rir_bridge::{hints_by_name, lower as lower_to_rir, param_hints_from_table};
+pub use rir_bridge::{
+    hints_by_name, lifetime_from_effect, lower as lower_to_rir, param_hints_from_table,
+};
 pub use types::{ProcType, Type};

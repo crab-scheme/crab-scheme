@@ -141,7 +141,7 @@ shipped: `cs_gc::Region`, `Gc::new_in`, debug-mode validity).
 
 ## Iter 4 — `Lifetime` tag in cs-rir + `rir_bridge`
 
-- [ ] 5. Add `Lifetime` to `cs-rir::Type`
+- [x] 5. Add `Lifetime` to `cs-rir::Type`
   - File: `crates/cs-rir/src/types.rs`,
     `crates/cs-rir/src/lib.rs`
   - Add `Lifetime` enum per design.md §"Component 3".
@@ -163,7 +163,7 @@ shipped: `cs_gc::Region`, `Gc::new_in`, debug-mode validity).
     Vector, Hashtable, Closure) | Success: cargo build -p
     cs-rir green; cargo test -p cs-rir 0 failures._
 
-- [ ] 6. `rir_bridge` propagates effect → lifetime
+- [x] 6. `rir_bridge` propagates effect → lifetime
   - File: `crates/cs-typer/src/rir_bridge.rs`
   - At each cs-typer Type → cs-rir Type lowering point,
     consult the AnnotationTable for the corresponding
