@@ -357,8 +357,24 @@ fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> P
         Err("stub builtin called from AOT test driver".into())
     }
     for name in &[
-        "not", "display", "newline", "/", "quotient", "modulo", "abs", "cons", "car", "cdr",
-        "length", "null?", "pair?",
+        "not",
+        "display",
+        "newline",
+        "/",
+        "quotient",
+        "modulo",
+        "abs",
+        "cons",
+        "car",
+        "cdr",
+        "length",
+        "null?",
+        "pair?",
+        "make-vector",
+        "vector-ref",
+        "vector-set!",
+        "sqrt",
+        "arithmetic-shift",
     ] {
         let sym = syms.intern(name);
         let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
@@ -543,6 +559,27 @@ fn source_to_aot_forward_self_ref_capture() {
     assert_eq!(run_multi_with_args(&bin, "f", &[3]), 4);
     assert_eq!(run_multi_with_args(&bin, "f", &[5]), 6);
     assert_eq!(run_multi_with_args(&bin, "f", &[10]), 11);
+}
+
+#[test]
+fn source_to_aot_make_vector_with_any_length() {
+    // RC3 iter 2.18 — make-vector now accepts an Any-typed length
+    // (e.g. a parameter that the translator hasn't type-narrowed
+    // to Fixnum). cs-aot's VecAlloc lowering decodes the NB Fixnum
+    // payload via NanboxValue::as_fixnum before passing to
+    // vm_alloc_vector_gc. Spectral-norm hit this with
+    // `(make-vector n 1.0)` where n is the entry's param.
+    //
+    // The test wraps make-vector in a fn that returns (vector-ref v 0)
+    // so we can verify it actually allocated correctly.
+    let bin = aot_compile_multi_and_run(
+        "(define (test n) (let ((v (make-vector n 42))) (vector-ref v 0)))",
+        "test",
+        "make_vector_any",
+    );
+    assert_eq!(run_multi_with_args(&bin, "test", &[1]), 42);
+    assert_eq!(run_multi_with_args(&bin, "test", &[5]), 42);
+    assert_eq!(run_multi_with_args(&bin, "test", &[100]), 42);
 }
 
 #[test]

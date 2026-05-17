@@ -982,40 +982,64 @@ fn inst_rhs(
         // helpers operate on NB carriers regardless of the caller's
         // ABI choice.
         //
-        // VecAlloc: `dst = make-vector(n, fill)` — n is Fixnum, fill
-        // is Any (defaulting to Unspecified via the bytecode
-        // compiler's desugaring), dst is a vector Gc handle.
-        (Inst::VecAlloc(dst, n, fill), _) => {
+        // VecAlloc: `dst = make-vector(n, fill)`. vm_alloc_vector_gc
+        // takes raw i64 length + Any-tagged fill (per `gc_i64_to_value`
+        // decoder). RC3 iter 2.18 — n is an NB Fixnum carrier in NB
+        // mode; extract the payload before passing as raw length.
+        // The fill stays NB-encoded (vm_alloc_vector_gc decodes it
+        // via gc_i64_to_value which handles NB).
+        (Inst::VecAlloc(dst, n, fill), mode) => {
             check(*n)?;
             check(*fill)?;
+            let n_expr = match mode {
+                EmitMode::RawI64 => format!("v{}", n.0),
+                EmitMode::Nb => {
+                    format!("cs_vm::vm::NanboxValue(v{}).as_fixnum().unwrap_or(0)", n.0)
+                }
+            };
             (
                 *dst,
                 format!(
-                    "unsafe {{ cs_vm::vm::vm_alloc_vector_gc(v{}, v{}) }}",
-                    n.0, fill.0
+                    "unsafe {{ cs_vm::vm::vm_alloc_vector_gc({n_expr}, v{}) }}",
+                    fill.0
                 ),
             )
         }
-        (Inst::VecRef(dst, vec, idx), _) => {
+        (Inst::VecRef(dst, vec, idx), mode) => {
             check(*vec)?;
             check(*idx)?;
+            // vm_vector_ref_gc also takes raw i64 idx + NB-tagged vec.
+            let idx_expr = match mode {
+                EmitMode::RawI64 => format!("v{}", idx.0),
+                EmitMode::Nb => format!(
+                    "cs_vm::vm::NanboxValue(v{}).as_fixnum().unwrap_or(0)",
+                    idx.0
+                ),
+            };
             (
                 *dst,
                 format!(
-                    "unsafe {{ cs_vm::vm::vm_vector_ref_gc(v{}, v{}) }}",
-                    vec.0, idx.0
+                    "unsafe {{ cs_vm::vm::vm_vector_ref_gc(cs_vm::vm::vm_value_clone_gc(v{}), {idx_expr}) }}",
+                    vec.0
                 ),
             )
         }
-        (Inst::VecSet(dst, vec, idx, val), _) => {
+        (Inst::VecSet(dst, vec, idx, val), mode) => {
             check(*vec)?;
             check(*idx)?;
             check(*val)?;
+            let idx_expr = match mode {
+                EmitMode::RawI64 => format!("v{}", idx.0),
+                EmitMode::Nb => format!(
+                    "cs_vm::vm::NanboxValue(v{}).as_fixnum().unwrap_or(0)",
+                    idx.0
+                ),
+            };
             (
                 *dst,
                 format!(
-                    "unsafe {{ cs_vm::vm::vm_vector_set_gc(v{}, v{}, v{}) }}",
-                    vec.0, idx.0, val.0
+                    "unsafe {{ cs_vm::vm::vm_vector_set_gc(cs_vm::vm::vm_value_clone_gc(v{}), {idx_expr}, v{}) }}",
+                    vec.0, val.0
                 ),
             )
         }

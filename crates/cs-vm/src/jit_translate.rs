@@ -3783,9 +3783,12 @@ pub fn bytecode_to_rir_full(
                                     // immediate (e.g. Fixnum), box it via
                                     // BoxTyped first.
                                     // ADR 0012 D-2 (iter JE) — (make-vector n) 1-arg.
+                                    // RC3 iter 2.18 — accept Any-typed n too.
                                     ("make-vector", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Fixnum) =>
+                                        if matches!(
+                                            value_types.get(&args[0]).copied(),
+                                            Some(Type::Fixnum) | Some(Type::Any)
+                                        ) =>
                                     {
                                         insts.push(RirInst::MakeVectorUnspec(dst, args[0]));
                                         value_types.insert(dst, Type::Any);
@@ -3799,11 +3802,20 @@ pub fn bytecode_to_rir_full(
                                             .get(&args[1])
                                             .copied()
                                             .unwrap_or(Type::Fixnum);
-                                        if len_t != Type::Fixnum {
-                                            return Err(TranslateError::Unsupported(
-                                                "make-vector: length must be Fixnum-typed at JIT translate"
-                                                    .into(),
-                                            ));
+                                        // RC3 iter 2.18 — accept Any-typed
+                                        // length too. The cs-aot VecAlloc
+                                        // lowering decodes NB carriers
+                                        // (Fixnum payload extraction) so
+                                        // raw length works regardless of
+                                        // tracked type. Previously we
+                                        // bailed on non-Fixnum, blocking
+                                        // spectral-norm's
+                                        // (make-vector n 1.0) where n
+                                        // defaults to Any (iter 2.16).
+                                        if len_t != Type::Fixnum && len_t != Type::Any {
+                                            return Err(TranslateError::Unsupported(format!(
+                                                "make-vector: length must be Fixnum or Any (got {len_t:?})"
+                                            )));
                                         }
                                         let fill = if fill_t == Type::Any {
                                             args[1]
@@ -4248,6 +4260,21 @@ pub fn bytecode_to_rir_full(
                                         insts.push(RirInst::FixToFlo(promoted, args[0]));
                                         value_types.insert(promoted, Type::Flonum);
                                         insts.push(RirInst::FlonumSqrt(dst, promoted));
+                                        value_types.insert(dst, Type::Flonum);
+                                    }
+                                    // RC3 iter 2.18 — sqrt for Any-typed args.
+                                    // cs-aot's FlonumSqrt lowering is
+                                    // NB-Fixnum-aware (iter 2.17) so we can
+                                    // hand the Any operand directly to
+                                    // FlonumSqrt; the lowering will decode
+                                    // NB Fixnum payload to f64 or use the
+                                    // raw f64 bits for NB Flonum. Spectral-
+                                    // norm's `(sqrt (/ vBv vv))` hits this.
+                                    ("sqrt", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            == Some(Type::Any) =>
+                                    {
+                                        insts.push(RirInst::FlonumSqrt(dst, args[0]));
                                         value_types.insert(dst, Type::Flonum);
                                     }
                                     ("flabs", 1)

@@ -548,11 +548,17 @@ fn write_multi_procedure_main(
                 src.push_str("            println!(\"{}\", raw_result);\n");
             }
             EmitMode::Nb => {
+                // RC3 iter 2.18 — print Fixnum OR Flonum results.
+                // spectral-norm returns a Flonum norm; earlier the
+                // shim assumed Fixnum and panicked on Flonum output.
                 src.push_str("            let nb = cs_vm::vm::NanboxValue(raw_result);\n");
-                src.push_str(&format!(
-                    "            let decoded = nb.as_fixnum().expect(\"entry `{scheme_name}` returned a non-Fixnum NB value\");\n"
-                ));
-                src.push_str("            println!(\"{}\", decoded);\n");
+                src.push_str("            if let Some(n) = nb.as_fixnum() {\n");
+                src.push_str("                println!(\"{}\", n);\n");
+                src.push_str("            } else {\n");
+                src.push_str("                // NB Flonum carriers are raw f64 bit patterns.\n");
+                src.push_str("                let f = f64::from_bits(raw_result as u64);\n");
+                src.push_str("                println!(\"{}\", f);\n");
+                src.push_str("            }\n");
             }
         }
         src.push_str("        }\n");
