@@ -1132,14 +1132,21 @@ mod tests {
     fn stats_snapshot_reflects_state() {
         let h = Heap::new();
         h.set_stats_enabled(true);
-        let _g = h.alloc(Leaf { n: 42 });
+        // Allocate enough slots that the collect's mark+sweep does
+        // measurable work — a single Leaf collects in sub-nanosecond
+        // time on a 2026 laptop, which rounds to Duration::ZERO and
+        // flakes the pause assertion below.
+        let mut keep = Vec::with_capacity(1000);
+        for i in 0..1000 {
+            keep.push(h.alloc(Leaf { n: i }));
+        }
         h.collect();
         let s = h.stats();
         // Counters that we own are exact; byte / alloc-count
         // are shared with parallel tests so check >= rather
         // than ==.
         assert!(s.bytes_allocated_total > 0);
-        assert!(s.alloc_count_total >= 1);
+        assert!(s.alloc_count_total >= 1000);
         assert_eq!(s.collect_count, 1);
         assert!(s.stats_enabled);
         assert!(s.last_pause > Duration::ZERO);
