@@ -133,5 +133,18 @@ fn jit_conformance_cross_lambda_loop() {
     // in the uniform-NB tier so the loop body no longer falls back
     // to specialized with broken return-type inference. See
     // docs/research/jit_loop_cross_lambda_bug.md.
-    assert_three_tier_pass_count("jit_cross_lambda_loop.scm");
+    //
+    // Runs in a dedicated thread with a larger stack. The walker
+    // tier uses host-stack recursion, and at the N=50000 named-let
+    // counts this benchmark uses to exercise the JIT tier-up
+    // boundary the recursion depth exceeds Rust's default 2 MB
+    // test-thread stack. The standalone `crabscheme run` binary is
+    // unaffected because the main process gets the OS default
+    // (~8 MB on macOS).
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| assert_three_tier_pass_count("jit_cross_lambda_loop.scm"))
+        .expect("spawn deep-stack test thread")
+        .join()
+        .expect("test thread didn't panic");
 }
