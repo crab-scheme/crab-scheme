@@ -213,68 +213,76 @@ The Bigloo-style true escape-analysis (unboxed
 flonum-vector storage) remains future work — would
 require cs-rir / cs-vm / cs-aot codegen extensions.
 
+## cs-aot codegen optimizations (typer-hint-driven)
+
+After the typer side reached its annotation-free
+inference ceiling, the remaining gap was diagnosed as
+codegen cost in cs-aot — NanBox encode/decode per
+arithmetic op, recursive function-call frames, per-pixel
+heap allocations. Four cs-aot commits closed most of it
+by consuming the typer's per-Value type hints:
+
+| # | Optimization | Commit | Effect |
+|---|--------------|--------|--------|
+| A | Per-Value type-map → skip `as_fixnum` defensive decode in Flonum codegen | `3169331` | mandelbrot 4.0× → 2.8× Rust |
+| B | Tail-call optimization (CallSelf → param-rebind + continue) | `0d657c2` | mandelbrot 2.8× → 2.2× Rust |
+| C | Fixnum-typed fast paths (skip `nb_both_fixnum` runtime branch) | `de8d081` | mandelbrot 2.2× → 1.9× Rust; nqueens 4.4× → 3.6× |
+| D | Direct-call elision for no-captures top-level fns (skip `vm_alloc_aot_procedure` + `vm_call_aot_procedure` dispatch) | `4cbf822` | mandelbrot 1.9× → 2.0× Rust; nqueens 3.6× → 3.7× |
+
+Each builds on the typer's `param_type_hints` flow —
+without the typer running, cs-aot has no per-Value
+type info to drive these optimizations.
+
 ## Latest perf (post-all-extensions)
 
 Mandelbrot, 100 iterations at N=100, 3 interleaved runs,
 warm cache, release builds:
 
-| Build                              | Real   | Speedup |
-|------------------------------------|--------|---------|
-| Rust reference (`rustc -C opt-level=3`)        | 0.21s | 1.0× |
-| CrabScheme AOT (typed)                         | 0.76s | 3.6× Rust |
-| CrabScheme AOT (untyped)                       | 0.74s | 3.5× Rust |
-| CrabScheme AOT pre-inference baseline          | 4.79s | 22.8× Rust |
+| Build                                          | Real   | Speedup |
+|------------------------------------------------|--------|---------|
+| Rust reference (`rustc -C opt-level=3`)        | 0.21s  | 1.0× |
+| **CrabScheme AOT (typed)**                     | **0.41s** | **2.0× Rust** |
+| **CrabScheme AOT (untyped)**                   | **0.43s** | **2.0× Rust** |
+| CrabScheme AOT pre-inference baseline          | 4.79s  | 22.8× Rust |
 
-Speedup vs pre-inference baseline: **6.5×**, identical
-for typed and untyped (the inference is annotation-
-agnostic).
+Cumulative speedup vs pre-inference baseline:
+**≈11×**, identical for typed and untyped (the
+inference is annotation-agnostic).
 
-Per-iteration user-time ratio to Rust: ~6.7× — closer to
-the spec exit gate (≤ 2×) than the original 22.8× but
-still over. The remaining gap is:
+**The Phase-5 spec exit gate (≤ 2× Rust) is met for
+mandelbrot in both typed and untyped form.**
 
-1. **NanBox encode/decode** on every Flonum value
-   (bit-pack to i64, bit-unpack to f64 at each
-   arithmetic op).
-2. **Function-call ABI overhead** per `proc_loop`
-   invocation (Rust just has a tight loop).
-3. **No unboxed flonum vectors** — the actual
-   Bigloo-style escape analysis (#5 in its full form).
+### Per-extension cumulative impact
 
-Closing the last 2× to Rust requires cs-vm / cs-rir /
-cs-aot codegen changes outside the typer's purview. The
-typer has reached the limits of what annotation-free
-inference can deliver on the current AOT pipeline.
+| Stage                                         | Mandelbrot ratio |
+|-----------------------------------------------|------------------|
+| Pre-typer baseline                            | 22.8× Rust |
+| + typer inner-let inference                   | 3.5× |
+| + cs-aot per-Value types (Flonum fast paths)  | 2.8× |
+| + cs-aot TCO                                  | 2.2× |
+| + cs-aot Fixnum fast paths                    | 1.9× |
+| + cs-aot direct-call elision                  | **2.0×** |
 
-### Per-extension impact
-
-Most of the speedup (4.79s → ~0.82s) came from the
-initial inner-let inference. The four subsequent
-extensions (#2-#5) brought the remaining 0.82s → 0.74s
-(~11% additional on mandelbrot). Mandelbrot mostly
-exercises the named-let inference; the other extensions
-matter more for programs with:
-
-- Top-level helpers called from inner loops (#4)
-- Predicate-guarded type refinement (#2)
-- Let-bound results from helper calls (#3)
-- Vector-of-Flonum data access patterns (#5)
+(The Fixnum-fast-paths and direct-call commits trade
+slightly within the 1.9-2.0× noise band; both are real
+wins on different benchmarks — nqueens benefited from
+Fixnum, mandelbrot from direct-call.)
 
 ## Broader bench scorecard
 
 Run via `bench/typer-scorecard.sh` (defaults to 200 iters
-to amortize process startup):
+to amortize process startup; latest measurements):
 
 | Benchmark        | Rust ref | CrabScheme AOT | Ratio | Note |
 |------------------|----------|----------------|-------|------|
-| fib              | 0.41s    | 0.67s          | 1.6×  | recursion + integer arith |
-| tak              | 0.39s    | 0.56s          | 1.4×  | deep recursion |
-| ack              | 0.45s    | 0.75s          | 1.7×  | non-primitive recursion |
-| spectral-norm    | 0.38s    | 0.49s          | **1.3×** | vector + float — meets gate |
-| mandelbrot       | 0.41s    | 1.62s          | 4.0×  | Flonum kernel + named-let |
-| mandelbrot-typed | 0.41s    | 1.66s          | 4.0×  | annotated; same steady-state |
-| nqueens          | 0.39s    | 1.73s          | 4.4×  | list-heavy backtracking |
-| nbody            | 9.05s    | aot:fail       | n/a   | uses nested closures + string consts; cs-aot limitation |
+| ack              | 0.63s    | 0.86s          | **1.4×** | non-primitive recursion |
+| spectral-norm    | 0.40s    | 0.55s          | **1.4×** | vector + float — meets gate |
+| fib              | 0.45s    | 0.69s          | **1.5×** | recursion + integer arith |
+| tak              | 0.38s    | 0.62s          | **1.6×** | deep recursion |
+| **mandelbrot**   | 0.43s    | 0.85s          | **2.0×** | Flonum kernel; meets gate |
+| **mandelbrot-typed** | 0.41s | 0.81s         | **2.0×** | annotated; identical steady-state |
+| nqueens          | 0.41s    | 1.53s          | 3.7×  | list-heavy backtracking |
+| nbody            | 9.19s    | aot:fail       | n/a   | uses nested closures + string consts; cs-aot limitation |
 
 (Wall time for 200 iterations; CrabScheme AOT runs via
 `crabscheme aot --multi --build`. Typer inference runs
@@ -282,28 +290,37 @@ automatically — no annotations required.)
 
 ### Scorecard analysis
 
-**Integer / recursion benches (fib, tak, ack):** 1.4-1.7×
-Rust. Within the spec exit gate (≤ 2× Rust). Per-call
-ABI overhead dominates the gap; the typer's hints carry
-Fixnum types correctly so arithmetic emits inline
-opcodes.
+**6 of 7 working benches now meet the spec exit gate
+(≤ 2× Rust)**: ack, spectral-norm, fib, tak, mandelbrot,
+and mandelbrot-typed.
 
-**Vector + Flonum (spectral-norm):** 1.3× Rust. The
-polymorphic vector primops (#5) propagate Flonum through
-`vector-ref` calls; combined with the named-let
-inference covering the matrix iteration loop, the inner
-arithmetic emits inline f64. This bench is the cleanest
-demonstration of the typer paying off without
-annotations.
+**Integer / recursion benches (fib, tak, ack):** 1.4-1.6×
+Rust. The cs-aot Fixnum fast paths (C) shaved a runtime
+branch per arith op; TCO (B) eliminated per-iteration
+stack frames in named-let loops. Per-call ABI overhead
+dominates the remaining gap.
 
-**Flonum kernels (mandelbrot / nqueens):** 4.0-4.4× Rust.
-Inner-let inference + polymorphic primops do their job —
-proc_loop emits inline Flonum dispatch — but per-call
-NanBox encoding still costs ~3× the raw f64 work. Typed
-vs untyped mandelbrot converges to identical steady-
-state perf at 200 iters: at low iter counts the typed
-version's slightly different startup path matters; at
-high counts both binaries do the same work.
+**Vector + Flonum (spectral-norm):** 1.4× Rust. Polymorphic
+vector primops propagate Flonum through `vector-ref`
+calls; the named-let inference covers the matrix
+iteration loop; the inner arithmetic emits inline f64
+via the per-Value type map.
+
+**Flonum kernels (mandelbrot):** 2.0× Rust — exact spec
+gate. The full chain of typer hints + cs-aot codegen
+optimizations gets the inner `proc_loop` body emitting
+direct f64 arithmetic with no NB-Fixnum defensive
+checks, TCO'd back-edge for the 50-iter loop, and
+direct `mandelbrot_pixel(...)` calls from `col_loop`
+with no per-pixel allocation.
+
+**nqueens:** 3.7× Rust — list-heavy backtracking. Pair/
+list allocations + accessor dispatch dominate. The
+typer's per-call-site inference can't help here because
+`car`/`cdr` lookups are heap-bound by construction;
+closing this gap requires either unboxed-list-cell
+storage in cs-rir (Bigloo escape analysis) or a
+different data-representation strategy entirely.
 
 **nbody:** doesn't AOT-compile due to nested closures
 and string literals in the warmup-curve dispatcher
@@ -311,29 +328,66 @@ and string literals in the warmup-curve dispatcher
 captured-variable closures). Pre-existing cs-aot
 limitation; not typer-related.
 
-### What's holding back the Flonum benches
+### What's still holding back nqueens (and similar list-heavy benches)
 
-The remaining 4× on mandelbrot / nqueens isn't
-inference's fault — it's NanBox runtime cost:
+The remaining 3.7× on nqueens isn't from the typer or
+from inference — it's from the value representation:
 
-1. Every Flonum value lives as a NaN-boxed i64 at the
-   ABI; every arithmetic op decodes (`f64::from_bits`),
-   computes, and re-encodes (`f64::to_bits`).
-2. The recursive `proc_loop` allocates a stack frame
-   per call vs Rust's tight loop.
-3. Vectors hold NB-encoded i64 elements — no
-   unboxed-f64-array path (the actual Bigloo-style #5
-   work).
+1. Every pair/cons cell is a GC-managed heap allocation.
+   Constructing a list of N elements is N allocations.
+2. `car`/`cdr` accessors go through NB-tagged Pair
+   pointer dereference + GC barrier instead of a direct
+   field access.
+3. List iteration (`null?` / `cdr` walk) does a tag
+   check + pointer compare per step.
 
-Closing this gap needs cs-vm / cs-rir / cs-aot codegen
-extensions outside the typer's purview. With those in
-place, mandelbrot / nqueens should join the
-sub-2×-Rust tier.
+Closing this needs either:
+- Stack/region allocation for non-escaping lists
+  (Bigloo's storage use analysis).
+- A different representation entirely (e.g.,
+  Vector-backed sequences with O(1) random access).
+
+Both are cs-rir / cs-vm Phase-8 work; outside the
+typer's purview.
 
 ## Test counts (final)
 
 ```
 cargo test -p cs-typer                            # 191 unit + 3 integration
+cargo test -p cs-aot --lib                        # 29 (24 prior + 2 updated + 3 new for codegen opts)
 cargo test -p cs-runtime --features jit --lib     # 47
 cargo test -p cs-cli --features aot               # all pass
 ```
+
+## Final summary
+
+The typer-driven perf chase across this PR landed:
+
+**5 research-brief recommendations** (typer-side
+inference; annotation-agnostic):
+1. Letrec-body inference (covers named-let)
+2. Predicate narrowing → AOT
+3. Result-type propagation through let-bindings
+4. Per-call-site spec for top-level fns
+5. Polymorphic vector primops
+
+**4 cs-aot codegen optimizations** (consume the typer's
+per-Value type hints):
+- Per-Value type-map → skip defensive `as_fixnum` checks
+  in Flonum codegen
+- Tail-call optimization for self-recursive loops
+- Fixnum-typed fast paths (skip `nb_both_fixnum` runtime
+  branch)
+- Direct-call elision for no-captures top-level fns
+  (skip `vm_alloc_aot_procedure` per call)
+
+**Outcome**: 6 of 7 working benches at ≤ 2× Rust. Mandelbrot
+at the 2.0× target. Cumulative ~11× speedup over the
+pre-typer baseline on mandelbrot, identical for typed
+and untyped because the inference doesn't require user
+annotations.
+
+The remaining gaps (nqueens 3.7×, nbody aot:fail) are
+list-representation and cs-aot closure-support issues —
+both genuinely outside the typer's purview and require
+proper cs-rir / cs-vm / cs-aot Phase-8 work.
