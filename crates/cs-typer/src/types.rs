@@ -59,6 +59,20 @@ pub enum Type {
     /// Homogeneous vector `(Vectorof T)`. Invariant — mutable
     /// element types can't be sub/super-typed safely.
     Vectorof(Box<Type>),
+
+    /// Universal quantification (Phase 7). `(All (T1 T2 …) body)`
+    /// — `body` may contain `Type::Var(Ti)` references that bind
+    /// to the quantifier. Substitution `subst(body, mapping)`
+    /// replaces each `Var` with its mapping; capture-avoiding
+    /// under nested `Forall`s.
+    Forall(Vec<cs_core::Symbol>, Box<Type>),
+
+    /// Type variable reference (Phase 7). Carries the name (a
+    /// `Symbol`) — bound by an enclosing `Forall`. Free
+    /// variables (no enclosing binder) are treated as `Any` by
+    /// the checker; they may also appear transiently during
+    /// substitution if a `mapping` doesn't cover them.
+    Var(cs_core::Symbol),
 }
 
 /// Procedure signature with positional params, optional rest

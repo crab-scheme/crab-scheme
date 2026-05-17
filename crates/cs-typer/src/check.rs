@@ -60,6 +60,17 @@ pub fn render_type(t: &Type) -> String {
             parts.push(render_type(&pt.return_type));
             format!("(-> {})", parts.join(" "))
         }
+        // Phase 7: polymorphic types render as `(All (T1 T2 …)
+        // body)` — close to the surface syntax. Type variables
+        // print as their Symbol's u32 id since the Checker
+        // doesn't own a SymbolTable; downstream renderers
+        // (LSP, future error pretty-printer) can rewrap to the
+        // user's chosen name if needed.
+        Type::Forall(vars, body) => {
+            let var_names: Vec<String> = vars.iter().map(|v| format!("?{}", v.0)).collect();
+            format!("(All ({}) {})", var_names.join(" "), render_type(body))
+        }
+        Type::Var(s) => format!("?{}", s.0),
     }
 }
 

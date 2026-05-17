@@ -101,10 +101,43 @@ pub fn parse_type_ann_with_aliases(
     d: &TypeDatum,
     aliases: &[(String, Type)],
 ) -> Result<TypeAnn, TypeAnnError> {
+    parse_type_ann_with_context(d, aliases, &[])
+}
+
+/// Like [`parse_type_ann_with_aliases`] but also takes a slice
+/// of in-scope type-variable names (Phase 7). A bare atom
+/// matches a tvar before falling through to alias / built-in
+/// lookup — so `(All (T) (-> T T))` resolves `T` as a `Var`
+/// rather than `UnknownType`.
+///
+/// `tvars` is a slice of `(name, sym)` pairs because the parser
+/// itself doesn't know how to intern strings; the caller
+/// (extract.rs) holds the SymbolTable and supplies the bound
+/// Symbols when entering an `All` form.
+pub fn parse_type_ann_with_context(
+    d: &TypeDatum,
+    aliases: &[(String, Type)],
+    tvars: &[(String, cs_core::Symbol)],
+) -> Result<TypeAnn, TypeAnnError> {
     match d {
-        TypeDatum::Sym(name) => atom_from_name(name, aliases),
-        TypeDatum::List(elements) => parse_list(elements, aliases),
+        TypeDatum::Sym(name) => atom_from_name_in_ctx(name, aliases, tvars),
+        TypeDatum::List(elements) => parse_list_in_ctx(elements, aliases, tvars),
     }
+}
+
+fn atom_from_name_in_ctx(
+    name: &str,
+    aliases: &[(String, Type)],
+    tvars: &[(String, cs_core::Symbol)],
+) -> Result<TypeAnn, TypeAnnError> {
+    // Type variables shadow everything: bound vars win over
+    // user aliases and built-in atom names.
+    for (var_name, sym) in tvars.iter().rev() {
+        if var_name == name {
+            return Ok(Type::Var(*sym));
+        }
+    }
+    atom_from_name(name, aliases)
 }
 
 fn atom_from_name(name: &str, aliases: &[(String, Type)]) -> Result<TypeAnn, TypeAnnError> {
@@ -136,7 +169,11 @@ fn atom_from_name(name: &str, aliases: &[(String, Type)]) -> Result<TypeAnn, Typ
     }
 }
 
-fn parse_list(elements: &[TypeDatum], aliases: &[(String, Type)]) -> Result<TypeAnn, TypeAnnError> {
+fn parse_list_in_ctx(
+    elements: &[TypeDatum],
+    aliases: &[(String, Type)],
+    tvars: &[(String, cs_core::Symbol)],
+) -> Result<TypeAnn, TypeAnnError> {
     if elements.is_empty() {
         return Err(TypeAnnError::MalformedConstructor(
             "()",
@@ -152,26 +189,109 @@ fn parse_list(elements: &[TypeDatum], aliases: &[(String, Type)]) -> Result<Type
         }
     };
     let rest = &elements[1..];
+    parse_list_dispatch(head_name, rest, aliases, tvars)
+}
+
+fn parse_list_dispatch(
+    head_name: &str,
+    rest: &[TypeDatum],
+    aliases: &[(String, Type)],
+    tvars: &[(String, cs_core::Symbol)],
+) -> Result<TypeAnn, TypeAnnError> {
     match head_name {
-        "U" => parse_union(rest, aliases),
-        "->" => parse_arrow(rest, aliases),
-        "Listof" => parse_unary("Listof", rest, Type::Listof, aliases),
-        "Vectorof" => parse_unary("Vectorof", rest, Type::Vectorof, aliases),
+        "U" => parse_union(rest, aliases, tvars),
+        "->" => parse_arrow(rest, aliases, tvars),
+        "Listof" => parse_unary("Listof", rest, Type::Listof, aliases, tvars),
+        "Vectorof" => parse_unary("Vectorof", rest, Type::Vectorof, aliases, tvars),
+        // Phase 7: `(All (T1 T2 …) body)`.
+        "All" => parse_all(rest, aliases, tvars),
         _ => Err(TypeAnnError::UnknownType(format!(
             "unknown type constructor: {head_name}"
         ))),
     }
 }
 
-fn parse_union(args: &[TypeDatum], aliases: &[(String, Type)]) -> Result<TypeAnn, TypeAnnError> {
+fn parse_all(
+    args: &[TypeDatum],
+    aliases: &[(String, Type)],
+    tvars: &[(String, cs_core::Symbol)],
+) -> Result<TypeAnn, TypeAnnError> {
+    // Shape: ((T1 T2 …) body). Two elements; first is the
+    // variable list, second is the body.
+    if args.len() != 2 {
+        return Err(TypeAnnError::MalformedConstructor(
+            "All",
+            format!(
+                "expected `(All (var ...) body)`, got {} argument{}",
+                args.len(),
+                if args.len() == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    let var_list = match &args[0] {
+        TypeDatum::List(elems) => elems,
+        TypeDatum::Sym(_) => {
+            return Err(TypeAnnError::MalformedConstructor(
+                "All",
+                "first argument must be a list of type variables".into(),
+            ));
+        }
+    };
+    if var_list.is_empty() {
+        return Err(TypeAnnError::MalformedConstructor(
+            "All",
+            "variable list cannot be empty".into(),
+        ));
+    }
+    // Symbols would normally be interned via the SymbolTable;
+    // the parser doesn't own one, so we synthesize ids from a
+    // deterministic hash of the name + its position. The Var
+    // is opaque to substitution (keyed by Symbol equality), so
+    // a parse-time-only identity is fine. Use the high bit to
+    // partition tvar ids from user-interned syms — collisions
+    // with real Symbols (which start at 0 and grow up) become
+    // astronomically unlikely.
+    use std::hash::{Hash, Hasher};
+    let mut new_tvars: Vec<(String, cs_core::Symbol)> = tvars.to_vec();
+    let mut quant_syms: Vec<cs_core::Symbol> = Vec::with_capacity(var_list.len());
+    for (i, v) in var_list.iter().enumerate() {
+        let name = match v {
+            TypeDatum::Sym(s) => s.clone(),
+            TypeDatum::List(_) => {
+                return Err(TypeAnnError::MalformedConstructor(
+                    "All",
+                    "type variable names must be symbols".into(),
+                ));
+            }
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut h);
+        (i as u32).hash(&mut h);
+        let sym = cs_core::Symbol(0x8000_0000 | (h.finish() as u32 & 0x7fff_ffff));
+        new_tvars.push((name, sym));
+        quant_syms.push(sym);
+    }
+    let body = parse_type_ann_with_context(&args[1], aliases, &new_tvars)?;
+    Ok(Type::Forall(quant_syms, Box::new(body)))
+}
+
+fn parse_union(
+    args: &[TypeDatum],
+    aliases: &[(String, Type)],
+    tvars: &[(String, cs_core::Symbol)],
+) -> Result<TypeAnn, TypeAnnError> {
     let members: Result<Vec<Type>, _> = args
         .iter()
-        .map(|d| parse_type_ann_with_aliases(d, aliases))
+        .map(|d| parse_type_ann_with_context(d, aliases, tvars))
         .collect();
     Ok(Type::union(members?))
 }
 
-fn parse_arrow(args: &[TypeDatum], aliases: &[(String, Type)]) -> Result<TypeAnn, TypeAnnError> {
+fn parse_arrow(
+    args: &[TypeDatum],
+    aliases: &[(String, Type)],
+    tvars: &[(String, cs_core::Symbol)],
+) -> Result<TypeAnn, TypeAnnError> {
     // `(-> ret)` is a thunk → `(-> Never ret)` isn't right. We
     // require at least one element (the return type) — the
     // "params" of a 0-arg arrow are simply the empty params
@@ -223,12 +343,12 @@ fn parse_arrow(args: &[TypeDatum], aliases: &[(String, Type)]) -> Result<TypeAnn
     };
     let parsed_params: Result<Vec<Type>, _> = params
         .iter()
-        .map(|d| parse_type_ann_with_aliases(d, aliases))
+        .map(|d| parse_type_ann_with_context(d, aliases, tvars))
         .collect();
     let parsed_rest = rest
-        .map(|d| parse_type_ann_with_aliases(d, aliases))
+        .map(|d| parse_type_ann_with_context(d, aliases, tvars))
         .transpose()?;
-    let return_type = parse_type_ann_with_aliases(return_d, aliases)?;
+    let return_type = parse_type_ann_with_context(return_d, aliases, tvars)?;
     Ok(Type::Procedure_(Box::new(ProcType {
         params: parsed_params?,
         return_type,
@@ -242,6 +362,7 @@ fn parse_unary(
     args: &[TypeDatum],
     wrap: fn(Box<Type>) -> Type,
     aliases: &[(String, Type)],
+    tvars: &[(String, cs_core::Symbol)],
 ) -> Result<TypeAnn, TypeAnnError> {
     if args.len() != 1 {
         return Err(TypeAnnError::MalformedConstructor(
@@ -249,8 +370,8 @@ fn parse_unary(
             format!("expected 1 argument, got {}", args.len()),
         ));
     }
-    Ok(wrap(Box::new(parse_type_ann_with_aliases(
-        &args[0], aliases,
+    Ok(wrap(Box::new(parse_type_ann_with_context(
+        &args[0], aliases, tvars,
     )?)))
 }
 
@@ -426,6 +547,113 @@ mod tests {
             parse_type_ann(&d),
             Err(TypeAnnError::MalformedConstructor("Listof", _))
         ));
+    }
+
+    // ---- Phase 7: All / Var parsing ----
+
+    #[test]
+    fn all_with_simple_identity_body_parses() {
+        // (All (T) (-> T T)) — the polymorphic identity type.
+        let d = list(vec![
+            sym("All"),
+            list(vec![sym("T")]),
+            list(vec![sym("->"), sym("T"), sym("T")]),
+        ]);
+        let parsed = parse_type_ann(&d).unwrap();
+        match parsed {
+            Type::Forall(vars, body) => {
+                assert_eq!(vars.len(), 1, "one quantified var");
+                let tv = vars[0];
+                match *body {
+                    Type::Procedure_(pt) => {
+                        assert_eq!(pt.params, vec![Type::Var(tv)]);
+                        assert_eq!(pt.return_type, Type::Var(tv));
+                    }
+                    other => panic!("expected Procedure_ body, got {other:?}"),
+                }
+            }
+            other => panic!("expected Forall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_with_two_vars_parses() {
+        // (All (A B) (-> A B B))
+        let d = list(vec![
+            sym("All"),
+            list(vec![sym("A"), sym("B")]),
+            list(vec![sym("->"), sym("A"), sym("B"), sym("B")]),
+        ]);
+        let parsed = parse_type_ann(&d).unwrap();
+        match parsed {
+            Type::Forall(vars, body) => {
+                assert_eq!(vars.len(), 2);
+                let a = vars[0];
+                let b = vars[1];
+                assert_ne!(a, b, "distinct tvars must have distinct symbols");
+                match *body {
+                    Type::Procedure_(pt) => {
+                        assert_eq!(pt.params, vec![Type::Var(a), Type::Var(b)]);
+                        assert_eq!(pt.return_type, Type::Var(b));
+                    }
+                    other => panic!("expected Procedure_, got {other:?}"),
+                }
+            }
+            other => panic!("expected Forall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_empty_var_list_errors() {
+        let d = list(vec![sym("All"), list(vec![]), sym("Fixnum")]);
+        assert!(matches!(
+            parse_type_ann(&d),
+            Err(TypeAnnError::MalformedConstructor("All", _))
+        ));
+    }
+
+    #[test]
+    fn all_missing_body_errors() {
+        let d = list(vec![sym("All"), list(vec![sym("T")])]);
+        assert!(matches!(
+            parse_type_ann(&d),
+            Err(TypeAnnError::MalformedConstructor("All", _))
+        ));
+    }
+
+    #[test]
+    fn unbound_tvar_outside_all_is_unknown_atom() {
+        // `T` outside any `(All ...)` is just an unknown atom.
+        assert!(matches!(
+            parse_type_ann(&sym("T")),
+            Err(TypeAnnError::UnknownType(_))
+        ));
+    }
+
+    #[test]
+    fn all_shadows_built_in_atom_name() {
+        // (All (Fixnum) (-> Fixnum Fixnum)) — the var name
+        // shadows the built-in `Fixnum` atom inside the body.
+        let d = list(vec![
+            sym("All"),
+            list(vec![sym("Fixnum")]),
+            list(vec![sym("->"), sym("Fixnum"), sym("Fixnum")]),
+        ]);
+        let parsed = parse_type_ann(&d).unwrap();
+        match parsed {
+            Type::Forall(vars, body) => {
+                let v = vars[0];
+                match *body {
+                    Type::Procedure_(pt) => {
+                        // Both slots are Vars, NOT atomic Fixnum.
+                        assert_eq!(pt.params, vec![Type::Var(v)]);
+                        assert_eq!(pt.return_type, Type::Var(v));
+                    }
+                    other => panic!("expected Procedure_, got {other:?}"),
+                }
+            }
+            other => panic!("expected Forall, got {other:?}"),
+        }
     }
 
     #[test]

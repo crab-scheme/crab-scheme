@@ -75,6 +75,13 @@ pub fn lower(t: &Type) -> cs_rir::Type {
                 cs_rir::Type::Any
             }
         }
+        // Phase 7: polymorphic types collapse to Any at the
+        // runtime boundary — the JIT/AOT pipelines don't carry
+        // type variables. A fully-instantiated body (post-
+        // substitution) wouldn't reach this arm; bare Forall
+        // / Var here means the typer didn't (or couldn't)
+        // monomorphize.
+        Type::Forall(_, _) | Type::Var(_) => cs_rir::Type::Any,
     }
 }
 
