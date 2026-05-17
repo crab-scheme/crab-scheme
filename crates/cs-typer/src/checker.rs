@@ -1103,6 +1103,83 @@ mod tests {
         assert!(errors.is_empty(), "errors: {errors:?}");
     }
 
+    // -------- Phase 4 iter 4.4: union refinement --------
+
+    #[test]
+    fn three_way_union_narrows_to_each_member() {
+        // x : (U Fixnum String Symbol). Predicate-guarded
+        // calls in three different branches each operate on
+        // the narrowed type.
+        let src = "\
+            (define-type Three (U Fixnum String Symbol))
+            (: classify (-> Three Fixnum))
+            (define (classify [x : Three]) : Fixnum
+              (if (string? x)
+                  (string-length x)
+                  (if (fixnum? x)
+                      x
+                      0)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn when_form_narrows_body() {
+        // `(when (string? x) (string-length x))` — when desugars
+        // to `(if cond body unspecified)`. The body sees the
+        // positive proposition.
+        let src = "\
+            (define-type FxOrStr (U Fixnum String))
+            (: len-if-str (-> FxOrStr Any))
+            (define (len-if-str [x : FxOrStr]) : Any
+              (when (string? x) (string-length x)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn unless_form_narrows_to_negative() {
+        // `(unless (null? lst) (car lst))` — unless inverts;
+        // body sees the negative narrowing (lst : Pair).
+        let src = "\
+            (: maybe-head (-> (U Pair Null) Any))
+            (define (maybe-head [lst : (U Pair Null)]) : Any
+              (unless (null? lst) (car lst)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn narrowing_disjoint_filter_yields_never_branch() {
+        // x : Fixnum; `(if (string? x) … …)` — the filter
+        // (String) is disjoint from x's type (Fixnum), so the
+        // then-branch sees `Never`. The body should still
+        // typecheck against expected (Never subtypes everything),
+        // and ANY use of x in that branch type-passes since
+        // Never <: anything.
+        let src = "\
+            (: f (-> Fixnum Fixnum))
+            (define (f [x : Fixnum]) : Fixnum
+              (if (string? x) (string-length x) x))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        // The then-branch is dead (Never), but the rule
+        // `Never <: T` lets x flow through string-length's
+        // String param vacuously. So this should pass.
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
     #[test]
     fn narrowing_only_fires_when_arg_is_a_ref() {
         // Narrowing requires `(pred Ref(x))`. A complex
