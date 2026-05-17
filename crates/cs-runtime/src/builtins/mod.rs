@@ -11727,9 +11727,15 @@ fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     {
         let cycles_seen = crate::countable_memory_cycle::cycle_detection_count();
         let cycles_broken = crate::countable_memory_cycle::cycle_broken_count();
+        // Gap A-1: real bytes + alloc-count via the
+        // `cs_gc::alloc_telemetry` global atomics that
+        // `Gc::new` increments. Replaces the previous
+        // always-zero stub.
+        let bytes = cs_gc::alloc_telemetry::bytes_allocated_total();
+        let allocs = cs_gc::alloc_telemetry::alloc_count_total();
         Ok(Value::list(vec![
-            pair("bytes-allocated-total", Value::fixnum(0)),
-            pair("alloc-count-total", Value::fixnum(0)),
+            pair("bytes-allocated-total", fixnum_or_bigint(bytes)),
+            pair("alloc-count-total", fixnum_or_bigint(allocs)),
             pair("collect-count", Value::fixnum(cycles_broken as i64)),
             pair("live-slots", Value::fixnum(0)),
             pair("collect-time-ms", Value::flonum(0.0)),
@@ -11776,10 +11782,11 @@ fn b_gc_stats_reset(args: &[Value]) -> Result<Value, String> {
     }
     #[cfg(feature = "countable-memory")]
     {
-        // No tracing heap to reset. The cycle counter is per-
-        // thread and zeroed here so benchmarks can establish a
-        // clean baseline.
+        // No tracing heap to reset. Zero the cycle counter
+        // and the layer-2 alloc-telemetry atomics (Gap A-1)
+        // so benchmarks establish a clean baseline.
         crate::countable_memory_cycle::reset_cycle_detection_count();
+        cs_gc::alloc_telemetry::reset();
     }
     Ok(Value::Unspecified)
 }
@@ -12012,13 +12019,16 @@ fn b_current_memory_use(args: &[Value]) -> Result<Value, String> {
             .ok_or_else(|| "current-memory-use: no active runtime".to_string())?;
         Ok(fixnum_or_bigint(rt.heap().bytes_allocated_total()))
     }
-    // Under countable-memory the tracing heap is retired and
-    // no per-allocation byte counter exists. Fall back to RSS
-    // — same general "how much memory does this process hold"
-    // signal that benchmark deltas care about.
+    // Under countable-memory: Gap A-1 telemetry tracks
+    // cumulative bytes allocated since process start (or
+    // since the last `(gc-stats-reset!)`). Shape-compatible
+    // with the tracing variant's `bytes_allocated_total`.
+    // For RSS specifically, use `(current-rss-bytes)`.
     #[cfg(feature = "countable-memory")]
     {
-        Ok(fixnum_or_bigint(rss_bytes_platform()))
+        Ok(fixnum_or_bigint(
+            cs_gc::alloc_telemetry::bytes_allocated_total(),
+        ))
     }
 }
 

@@ -38,6 +38,9 @@ mod rc_only;
 pub use rc_only::{Gc, Weak};
 
 #[cfg(feature = "countable-memory")]
+pub mod alloc_telemetry;
+
+#[cfg(feature = "countable-memory")]
 pub mod cycle;
 
 #[cfg(feature = "tracing-cycle-collector")]

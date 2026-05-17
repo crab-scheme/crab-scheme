@@ -277,6 +277,10 @@ impl<T: 'static> Gc<T> {
         if crate::cycle_registry::take_sweep_pending() {
             crate::cycle_registry::run_sweep();
         }
+        // Gap A-1: alloc telemetry — one relaxed atomic
+        // increment per `Gc::new` so `b_gc_stats` can report
+        // real bytes/alloc-count instead of zeros.
+        crate::alloc_telemetry::record_alloc::<T>();
         Gc(GcRepr::Rc(Rc::new(value)))
     }
 
