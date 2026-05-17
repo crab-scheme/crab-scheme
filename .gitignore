@@ -33,3 +33,6 @@ Thumbs.db
 # by default. Ignore these tmp project directories so dev-loop
 # usage doesn't pollute the workspace.
 *-aot/
+
+# Real-world bench harness JSONL outputs.
+bench/realworld/results/

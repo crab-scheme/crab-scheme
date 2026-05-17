@@ -126,6 +126,16 @@ fn jit_conformance_call_cc() {
 }
 
 #[test]
+fn jit_conformance_gc_stats_primops() {
+    // Phase B of the real-world bench spec — Scheme-facing GC
+    // instrumentation primops (gc-stats, gc-stats-reset!,
+    // gc-stats-enable!, gc-stats-disable!, collect-garbage,
+    // current-memory-use, time-apply). Three-tier check
+    // ensures walker / VM / VM+JIT all agree on the shape.
+    assert_three_tier_pass_count("gc_stats_primops.scm");
+}
+
+#[test]
 fn jit_conformance_cross_lambda_loop() {
     // Regression test for the cross-lambda Fixnum-return loop bug.
     // Pre-iter3 this produced garbage on --tier vm-jit. Iter3

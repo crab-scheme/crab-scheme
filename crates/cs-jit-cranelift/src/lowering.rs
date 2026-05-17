@@ -828,6 +828,15 @@ impl Lowerer {
         flag_builder
             .set("is_pic", "false")
             .map_err(|e| JitError::Codegen(format!("flag is_pic: {e}")))?;
+        // cranelift's x86_64 backend asserts frame pointers are
+        // present when emitting tail calls (cranelift-codegen
+        // 0.131.1 / isa/x64/inst/emit.rs:1874). Our self-recursive
+        // arith paths (e.g., ack) can emit tail calls, so on x64
+        // we MUST keep frame pointers. aarch64 doesn't have this
+        // restriction but the flag is harmless there.
+        flag_builder
+            .set("preserve_frame_pointers", "true")
+            .map_err(|e| JitError::Codegen(format!("flag preserve_frame_pointers: {e}")))?;
         let isa_builder = cranelift_native::builder()
             .map_err(|e| JitError::Codegen(format!("native isa: {e}")))?;
         let isa = isa_builder
