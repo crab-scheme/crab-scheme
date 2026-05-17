@@ -11,4 +11,5 @@ description = "Optional/gradual type checker for CrabScheme (Typed Racket-inspir
 cs-core = { workspace = true }
 cs-diag = { workspace = true }
 cs-ir = { workspace = true }
+cs-parse = { workspace = true }
 cs-rir = { workspace = true }

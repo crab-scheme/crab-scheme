@@ -27,11 +27,13 @@
 //! - Phase 7 (optional): Polymorphism.
 
 pub mod annotate;
+pub mod extract;
 pub mod parse_ann;
 pub mod types;
 
 pub use annotate::{
     AnnotationTable, LambdaAnnotation, LetrecAnnotation, TopLevelAnnotation, TypeAlias,
 };
+pub use extract::extract_annotations;
 pub use parse_ann::{parse_type_ann, TypeAnn, TypeAnnError, TypeDatum};
 pub use types::{ProcType, Type};
