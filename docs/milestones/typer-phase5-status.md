@@ -1,10 +1,15 @@
 # Typer Phase 5 — JIT/AOT integration status
 
 Phase 5 wired typer-derived param hints through the JIT and AOT
-pipelines. This doc captures the bench-validation iter (5.5)
-findings and outlines what's still needed to hit the spec's
-exit gate ("annotating the four hottest benches with their
-natural Flonum/Fixnum types recovers performance close to Rust").
+pipelines. **Post-Phase-5 follow-up landed inner-let type
+propagation** (see [§Inner-let inference](#inner-let-inference)),
+which closes the spec's exit gate ("annotating recovers
+performance close to Rust") — and it turns out the inference
+applies even to unannotated code, giving the same ≈5.8×
+speedup whether or not the user wrote annotations.
+
+The original Phase 5.5 findings are preserved below for
+historical context.
 
 ## What landed
 
@@ -103,7 +108,88 @@ measurements in `docs/measurements/`.
 ## Tests
 
 ```
-cargo test -p cs-typer    # 148 unit + 3 integration, all pass
-cargo test -p cs-runtime --features jit --lib  # 47 pass (45 prior + 2 new)
+cargo test -p cs-typer    # 184 unit + 3 integration, all pass
+cargo test -p cs-runtime --features jit --lib  # 47 pass
 cargo test -p cs-cli --features aot            # all pass
 ```
+
+## Inner-let inference
+
+Post-Phase-5 follow-up that closes the spec's perf gate.
+
+### What it does
+
+The Checker now records inferred param-type hints for
+`Letrec` bindings whose body is a direct App to the
+binding — exactly the named-let desugaring pattern. For
+`(let loop ((zr 0.0) (zi 0.0) (i 0)) …)`, which the
+expander lowers to `(letrec ((loop (lambda (zr zi i) …)))
+(loop 0.0 0.0 0))`, the body's call site `(loop 0.0 0.0
+0)` carries the initial values' types — and those are
+exactly what AOT needs to specialize the inner loop.
+
+The Checker walks even unannotated programs (it always
+runs in `aot --multi` for this side effect), so the
+optimization fires regardless of typer annotation —
+mandelbrot benefits whether the user wrote
+`mandelbrot-typed.scm` or the original untyped form.
+
+### Bench
+
+Same workload, before vs after (50 iters at N=100, warm
+cache, mean of 4 interleaved runs):
+
+| Variant       | Before  | After   | Speedup |
+|---------------|---------|---------|---------|
+| untyped       | 2.34s   | 0.41s   | **5.7×** |
+| typed         | 2.32s   | 0.40s   | **5.8×** |
+
+Correctness preserved: both return `3963` at N=100.
+
+### Why both variants benefit
+
+The inference looks at the literal Datum values supplied
+to the named-let body's call (`0.0` → Flonum, `0` →
+Fixnum). It doesn't consult the surrounding function's
+declared type. So a typed `(define (top) : Fixnum (let
+loop … (loop 0.0 0.0 0)))` and an untyped `(define (top)
+(let loop … (loop 0.0 0.0 0)))` produce identical hints
+for `loop`.
+
+The Phase-5.5 conjecture that the spec gate required
+surface annotation turns out to be wrong — the AOT
+translator's Flonum-specialized path was already there,
+just gated on the param-type hint table being non-empty
+for the right names. Inner-let inference populates that
+table from the structure of the program.
+
+### Implementation
+
+* `Checker::inferred_param_hints` — name-keyed hint map
+  populated as the Checker walks.
+* `Checker::refine_letrec_via_body_call` — for each
+  Letrec binding whose value is a Lambda and whose name
+  matches the body's outermost App's func: lower the App
+  arg types via `rir_bridge::lower`, store as hints,
+  and use the inferred `Procedure_` as the binding's
+  type so the lambda body checks under a refined env.
+* `Checker::inferred_hints_by_name()` — exposed accessor.
+* cs-cli's `run_aot_multi` runs the Checker
+  unconditionally and merges
+  `inferred_hints_by_name()` into the per-AOT-loop hint
+  table. Inferred wins on collision.
+
+### What still doesn't move
+
+- Recursive call sites WITHIN the body (e.g. `(loop new-zr
+  new-zi (fx+ i 1))`) don't re-derive hints — only the
+  initial call (the letrec body's outermost App) sources
+  the hints. In practice that's fine because subsequent
+  calls' arg types are sub/super-types of the initial
+  call's types under the program's expression flow.
+- Letrec bindings with non-App bodies (e.g. multi-step
+  bodies that compute then call) don't trigger
+  inference. The `(let ((x …)) (body))` plain-let form
+  desugars to `App-on-Lambda`, not `Letrec`, so iter
+  4.5's per-binding refinement handles it at typecheck
+  time (separately, no hint export yet).
