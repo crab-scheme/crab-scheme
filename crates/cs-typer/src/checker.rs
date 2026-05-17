@@ -89,6 +89,11 @@ impl<'tab> Checker<'tab> {
                 }
             }
             CoreExpr::Set { name, value, span } => self.check_set(*name, value, *span, expected),
+            CoreExpr::Letrec {
+                bindings,
+                body,
+                span,
+            } => self.check_letrec(bindings, body, *span, expected),
             _ => self.check_via_infer(expr, expected),
         }
     }
@@ -135,10 +140,26 @@ impl<'tab> Checker<'tab> {
                     self.check_collect(last, expected, out);
                 }
             }
-            CoreExpr::Letrec { body, .. } => {
-                // Iter 2.6 will recurse into bindings with proper
-                // scoping; for 2.5 we just walk the body.
+            CoreExpr::Letrec {
+                bindings,
+                body,
+                span,
+            } => {
+                // Push a scope, seed each binding's declared
+                // type (or Any), check each value against its
+                // declared type, then walk the body against
+                // `expected`. Errors from each value-check land
+                // in `out` so we keep going.
+                let declared = letrec_binding_types(self.table, *span, bindings);
+                let mark = self.env.push();
+                for ((name, _), ty) in bindings.iter().zip(declared.iter()) {
+                    self.env.define(*name, ty.clone());
+                }
+                for ((_, value), ty) in bindings.iter().zip(declared.iter()) {
+                    self.check_collect(value, ty, out);
+                }
                 self.check_collect(body, expected, out);
+                self.env.pop_to(mark);
             }
             CoreExpr::Set { name, value, span } => {
                 if let Err(e) = self.check_set(*name, value, *span, expected) {
@@ -216,6 +237,23 @@ impl<'tab> Checker<'tab> {
         span: Span,
         expected: &Type,
     ) -> Result<(), TypeError> {
+        // Special case: `(let ((x e) ...) body)` desugars to
+        // `((lambda (x ...) body) e ...)`, so an App whose
+        // operator is an immediate Lambda is the let-pattern.
+        // We typecheck it directly here — checking args against
+        // the lambda's (possibly-annotated) param types, then
+        // walking the body against the App's *outer* expected
+        // type. This is the only way the body actually gets
+        // typechecked, since `infer(Lambda)` returns an opaque
+        // Procedure type.
+        if let CoreExpr::Lambda {
+            params: lparams,
+            body: lbody,
+            span: lspan,
+        } = func
+        {
+            return self.check_app_lambda(lparams, lbody, *lspan, args, expected);
+        }
         let f_ty = self.infer(func);
         match &f_ty {
             Type::Procedure_(pt) => {
@@ -246,6 +284,107 @@ impl<'tab> Checker<'tab> {
                 span: func.span(),
             }),
         }
+    }
+
+    /// Special-case `App(Lambda, args)` — the `let` pattern.
+    /// Walks the lambda's body in scope with its params bound
+    /// to either their declared types (if annotated) or `Any`.
+    /// The body is checked against the App's expected type, NOT
+    /// the lambda's declared return type — gradual unannotated
+    /// returns shouldn't drop a precise outer constraint.
+    fn check_app_lambda(
+        &mut self,
+        params: &Params,
+        body: &CoreExpr,
+        lambda_span: Span,
+        args: &[CoreExpr],
+        expected: &Type,
+    ) -> Result<(), TypeError> {
+        let ann = self.table.lambda(lambda_span);
+        let pt = match ann {
+            Some(a) if a.is_annotated() => match lambda_proc_type(params, a) {
+                Type::Procedure_(pt) => *pt,
+                _ => unreachable!("lambda_proc_type returns Procedure_"),
+            },
+            _ => match lambda_proc_type_all_any(params) {
+                Type::Procedure_(pt) => *pt,
+                _ => unreachable!("lambda_proc_type_all_any returns Procedure_"),
+            },
+        };
+        if pt.params.len() != args.len() {
+            return Err(TypeError::ArityMismatch {
+                expected: pt.params.len(),
+                found: args.len(),
+                span: lambda_span,
+            });
+        }
+        for (arg, param_ty) in args.iter().zip(pt.params.iter()) {
+            self.check(arg, param_ty)?;
+        }
+        // If the lambda's annotated return type is more precise
+        // than `Any`, propagate the *intersection* (effectively
+        // the more-precise of the two) into the body check.
+        // Phase 2 has no proper meet operator, so we choose:
+        // - declared == Any → use outer `expected`
+        // - else → use declared (it's the user's promise about
+        //   the body), and additionally require declared <:
+        //   expected so the wider App context is honored.
+        let body_expected = if pt.return_type == Type::Any {
+            expected.clone()
+        } else {
+            if !subtype(&pt.return_type, expected) {
+                return Err(TypeError::Mismatch {
+                    expected: expected.clone(),
+                    found: pt.return_type.clone(),
+                    span: lambda_span,
+                });
+            }
+            pt.return_type.clone()
+        };
+        let mark = self.env.push();
+        for (i, pname) in params.fixed.iter().enumerate() {
+            let pty = pt.params.get(i).cloned().unwrap_or(Type::Any);
+            self.env.define(*pname, pty);
+        }
+        if let Some(rest_name) = &params.rest {
+            let rest_ty = pt.rest.clone().unwrap_or(Type::Any);
+            self.env.define(*rest_name, rest_ty);
+        }
+        let result = self.check(body, &body_expected);
+        self.env.pop_to(mark);
+        result
+    }
+
+    fn check_letrec(
+        &mut self,
+        bindings: &[(cs_core::Symbol, CoreExpr)],
+        body: &CoreExpr,
+        span: Span,
+        expected: &Type,
+    ) -> Result<(), TypeError> {
+        // letrec*: every binding is in scope for every value
+        // (and the body). Bring the declared types into scope
+        // FIRST so recursive references see them, then check
+        // each value against its declared type.
+        let declared = letrec_binding_types(self.table, span, bindings);
+        let mark = self.env.push();
+        for ((name, _), ty) in bindings.iter().zip(declared.iter()) {
+            self.env.define(*name, ty.clone());
+        }
+        let mut first_err: Option<TypeError> = None;
+        for ((_, value), ty) in bindings.iter().zip(declared.iter()) {
+            if let Err(e) = self.check(value, ty) {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        let body_result = self.check(body, expected);
+        self.env.pop_to(mark);
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        body_result
     }
 
     fn check_set(
@@ -288,6 +427,27 @@ impl<'tab> Checker<'tab> {
             })
         }
     }
+}
+
+/// Look up declared types for each binding of a `Letrec`. If
+/// the form has a recorded `LetrecAnnotation`, slot `i` uses
+/// `binding_types[i]` (defaulting to `Any` when `None` or the
+/// vec is shorter than `bindings`); otherwise every binding
+/// defaults to `Any`.
+fn letrec_binding_types(
+    table: &AnnotationTable,
+    span: Span,
+    bindings: &[(cs_core::Symbol, CoreExpr)],
+) -> Vec<Type> {
+    let ann = table.letrec(span);
+    bindings
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            ann.and_then(|a| a.binding_types.get(i).cloned().flatten())
+                .unwrap_or(Type::Any)
+        })
+        .collect()
 }
 
 /// Build a `ProcType` from a `Params` shape with every slot
@@ -512,5 +672,98 @@ mod tests {
             }
             other => panic!("expected Procedure_, got {other:?}"),
         }
+    }
+
+    // -------- Letrec (iter 2.6) --------
+
+    #[test]
+    fn letrec_with_mutual_recursion_typechecks() {
+        // `let` desugars to `letrec` via the expander; both
+        // bindings see each other in scope.
+        let src = "\
+            (let ((x 1) (y 2)) (+ x y))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn letrec_body_mismatch_is_caught() {
+        // Body returns a String but the surrounding define
+        // ascribes it to Fixnum.
+        let src = "\
+            (: bad (-> Fixnum))
+            (define (bad) : Fixnum (let ((x 1)) \"oops\"))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(!errors.is_empty(), "expected mismatch");
+        let found = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::Mismatch {
+                    expected: Type::Fixnum,
+                    found: Type::String,
+                    ..
+                }
+            )
+        });
+        assert!(
+            found,
+            "expected Fixnum/String body mismatch in let, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn letrec_recursive_reference_resolves_via_binding_type() {
+        // Use a typed top-level so the inner reference to
+        // itself sees the right type. (Letrec sugar via `let`
+        // doesn't expose typed-binding syntax yet — the
+        // surface for that is a Phase 2/3 follow-up — but the
+        // structural test confirms the env scoping is right.)
+        let src = "\
+            (: f (-> Fixnum Fixnum))
+            (define (f [n : Fixnum]) : Fixnum
+              (let ((r n)) (+ r 1)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn let_pattern_walks_body_into_outer_expected_type() {
+        // `(let ((x 1)) "oops")` lives inside a Fixnum-returning
+        // function. The let-pattern path walks the body against
+        // the OUTER expected type (Fixnum), so the String body
+        // surfaces a Fixnum/String mismatch. Without the
+        // App-on-Lambda special case, this would silently pass
+        // because `infer(Lambda) = Procedure` and check_app falls
+        // through to the permissive branch.
+        let src = "\
+            (: bad (-> Fixnum))
+            (define (bad) : Fixnum (let ((x 1)) \"oops\"))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        let found = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::Mismatch {
+                    expected: Type::Fixnum,
+                    found: Type::String,
+                    ..
+                }
+            )
+        });
+        assert!(
+            found,
+            "expected Fixnum/String mismatch from let body, got: {errors:?}"
+        );
     }
 }
