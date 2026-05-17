@@ -12,7 +12,14 @@
 
 /// Source-level types as parsed from annotations and as
 /// inferred by the bidirectional checker.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// `Ord` / `PartialOrd` are derived so `Type::union` can sort
+/// its members canonically — this is what makes
+/// `(U Fixnum Flonum) == (U Flonum Fixnum)`. The derived order
+/// is by variant declaration order, then lexicographic on
+/// contents; it is **not** a semantic ordering (no relation to
+/// subtyping). Treat it as an opaque sort key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Type {
     // ---- Atomic (mirror cs_rir::Type) ----
     Fixnum,
@@ -57,7 +64,7 @@ pub enum Type {
 /// Procedure signature with positional params, optional rest
 /// parameter, and a return type. Procedure type arity is
 /// `params.len()` (or `>= params.len()` when rest is set).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProcType {
     pub params: Vec<Type>,
     pub return_type: Type,
@@ -73,14 +80,24 @@ impl Type {
 
     /// Smart constructor for unions: flattens nested unions,
     /// drops `Never`, collapses single-element to that element,
-    /// dedups via the derived `Eq`/`Hash` impl.
+    /// dedups, and sorts canonically so `(U A B) == (U B A)`.
+    ///
+    /// The sort uses the derived `Ord` on `Type` — by variant
+    /// declaration order with lexicographic content comparison.
+    /// It's an opaque canonical key, not a semantic ordering.
+    /// If `Any` is present, the union collapses to `Any` (the
+    /// gradual top absorbs).
     pub fn union(members: impl IntoIterator<Item = Type>) -> Type {
         let mut out: Vec<Type> = Vec::new();
         for t in members {
             match t {
                 Type::Never => continue,
+                Type::Any => return Type::Any,
                 Type::Union(inner) => {
                     for x in inner {
+                        if matches!(x, Type::Any) {
+                            return Type::Any;
+                        }
                         if !out.contains(&x) {
                             out.push(x);
                         }
@@ -93,11 +110,19 @@ impl Type {
                 }
             }
         }
+        out.sort();
         match out.len() {
             0 => Type::Never,
             1 => out.into_iter().next().unwrap(),
             _ => Type::Union(out),
         }
+    }
+
+    /// True iff this type is `Union(...)`. Convenience for the
+    /// subtyping rules and for downstream consumers (JIT
+    /// param-hint widening).
+    pub fn is_union(&self) -> bool {
+        matches!(self, Type::Union(_))
     }
 }
 
@@ -136,5 +161,32 @@ mod tests {
     fn empty_union_is_never() {
         let u = Type::union(std::iter::empty());
         assert_eq!(u, Type::Never);
+    }
+
+    #[test]
+    fn union_sorts_canonically() {
+        // Member order at the call site shouldn't matter for
+        // equality.
+        let a = Type::union(vec![Type::Fixnum, Type::Flonum, Type::String]);
+        let b = Type::union(vec![Type::String, Type::Fixnum, Type::Flonum]);
+        let c = Type::union(vec![Type::Flonum, Type::String, Type::Fixnum]);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn union_with_any_collapses_to_any() {
+        // Any absorbs — `(U Any Fixnum) == Any` because Any is
+        // the gradual top, and a union containing it can hold
+        // arbitrary values.
+        let u = Type::union(vec![Type::Fixnum, Type::Any, Type::String]);
+        assert_eq!(u, Type::Any);
+    }
+
+    #[test]
+    fn union_with_nested_any_collapses_to_any() {
+        let inner = Type::Union(vec![Type::Fixnum, Type::Any]);
+        let u = Type::union(vec![Type::String, inner]);
+        assert_eq!(u, Type::Any);
     }
 }
