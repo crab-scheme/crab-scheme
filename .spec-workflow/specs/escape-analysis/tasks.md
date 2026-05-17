@@ -191,7 +191,7 @@ shipped: `cs_gc::Region`, `Gc::new_in`, debug-mode validity).
 
 **Note**: depends on `region-memory` spec iters 1–3.
 
-- [ ] 7. Add `crates/cs-runtime/src/regions.rs`
+- [x] 7. Add `crates/cs-runtime/src/regions.rs`
   - File: `crates/cs-runtime/src/regions.rs` (new),
     `crates/cs-runtime/src/lib.rs`
   - Implement `REGION_STACK` thread-local + `RegionScope`

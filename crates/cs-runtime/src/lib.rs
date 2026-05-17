@@ -6,6 +6,8 @@ pub mod builtins;
 pub mod countable_memory_cycle;
 pub mod env;
 pub mod eval;
+#[cfg(feature = "regions")]
+pub mod regions;
 // The `ffi` module contains only the libloading-using dlopen path
 // (`load_shared_library`, `RuntimeFfiContext`, `CAbiProc`) — gated
 // on `ffi-dynamic`. The pure-Rust trait surface (HostProcedure,
