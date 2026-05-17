@@ -228,6 +228,8 @@ by consuming the typer's per-Value type hints:
 | B | Tail-call optimization (CallSelf → param-rebind + continue) | `0d657c2` | mandelbrot 2.8× → 2.2× Rust |
 | C | Fixnum-typed fast paths (skip `nb_both_fixnum` runtime branch) | `de8d081` | mandelbrot 2.2× → 1.9× Rust; nqueens 4.4× → 3.6× |
 | D | Direct-call elision for no-captures top-level fns (skip `vm_alloc_aot_procedure` + `vm_call_aot_procedure` dispatch) | `4cbf822` | mandelbrot 1.9× → 2.0× Rust; nqueens 3.6× → 3.7× |
+| E | MakeClosure→Call elision (per-iter inner-closure allocs in let-loop patterns) | `8043a43` | nqueens 3.7× → 2.8×; mandelbrot-typed 2.7× → 1.8× |
+| F | Self-recursive call-site filtering in typer + AnyClone/CallSelf type propagation in cs-aot (fixnum fast paths reach self-recursive arith helpers) | `fc2a3a8` | fib 2.2× → 1.4×; ack 1.8× → 1.4×; spectral-norm 1.4× → 1.1× |
 
 Each builds on the typer's `param_type_hints` flow —
 without the typer running, cs-aot has no per-Value
@@ -275,14 +277,14 @@ to amortize process startup; latest measurements):
 
 | Benchmark        | Rust ref | CrabScheme AOT | Ratio | Note |
 |------------------|----------|----------------|-------|------|
-| ack              | 0.63s    | 0.86s          | **1.4×** | non-primitive recursion |
-| spectral-norm    | 0.40s    | 0.55s          | **1.4×** | vector + float — meets gate |
-| fib              | 0.45s    | 0.69s          | **1.5×** | recursion + integer arith |
-| tak              | 0.38s    | 0.62s          | **1.6×** | deep recursion |
-| **mandelbrot**   | 0.43s    | 0.85s          | **2.0×** | Flonum kernel; meets gate |
-| **mandelbrot-typed** | 0.41s | 0.81s         | **2.0×** | annotated; identical steady-state |
-| nqueens          | 0.41s    | 1.53s          | 3.7×  | list-heavy backtracking |
-| nbody            | 9.19s    | aot:fail       | n/a   | uses nested closures + string consts; cs-aot limitation |
+| spectral-norm    | 0.55s    | 0.62s          | **1.1×** | vector + float — meets gate |
+| fib              | 0.39s    | 0.56s          | **1.4×** | recursion + integer arith |
+| tak              | 0.37s    | 0.50s          | **1.4×** | deep recursion |
+| ack              | 0.44s    | 0.63s          | **1.4×** | non-primitive recursion |
+| mandelbrot       | 0.40s    | 0.69s          | **1.7×** | Flonum kernel; meets gate |
+| mandelbrot-typed | 0.41s    | 0.71s          | **1.7×** | annotated; identical steady-state |
+| nqueens          | 0.38s    | 1.10s          | 2.9×  | list-heavy backtracking; per-`safe?` Procedure alloc remains (loop_3 captures self_handle to thread to inner lambda) |
+| nbody            | 9.99s    | aot:fail       | n/a   | uses nested closures + string consts; cs-aot limitation |
 
 (Wall time for 200 iterations; CrabScheme AOT runs via
 `crabscheme aot --multi --build`. Typer inference runs

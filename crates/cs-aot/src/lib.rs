@@ -658,7 +658,10 @@ impl LambdaResolver {
         // scan its body for any MakeClosure(_, idx) where the
         // resolved lambda's captures contain s. That's exactly
         // the codegen path that emits `__self_handle` as a
-        // capture expr.
+        // capture expr — regardless of whether the MakeClosure
+        // itself gets elided. (Direct-call elision still
+        // materializes captures at the call site, so the
+        // outer's __self_handle is still referenced.)
         for f in funcs {
             let self_sym = match f.self_binding_sym {
                 Some(s) => s,
@@ -2231,6 +2234,9 @@ fn infer_direct_callables(
 #[derive(Clone, Debug)]
 struct DirectCallInfo {
     fn_name: String,
+    /// Kept for diagnostics/symmetry with `LambdaInfo`; emit
+    /// validates arity earlier via the resolver pass.
+    #[allow(dead_code)]
     arity: usize,
     capture_syms: Vec<u32>,
 }
