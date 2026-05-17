@@ -731,10 +731,16 @@ pub fn emit_with_resolver(
     // so the defensive `as_fixnum()` discrimination can be
     // skipped when the operand's type is statically known.
     let types = infer_value_types(func);
+    // Pre-compute the per-Value "direct callable" map: values
+    // produced by EnvLookup of a resolver-known no-captures
+    // top-level AOT fn. Call codegen uses this to skip
+    // vm_alloc_aot_procedure + vm_call_aot_procedure when the
+    // callee is statically known.
+    let direct_callable = infer_direct_callables(func, resolver);
     if straight_line {
-        emit_straight_line(&mut out, func, mode, resolver, &types)?;
+        emit_straight_line(&mut out, func, mode, resolver, &types, &direct_callable)?;
     } else {
-        emit_loop_match(&mut out, func, mode, resolver, &types)?;
+        emit_loop_match(&mut out, func, mode, resolver, &types, &direct_callable)?;
     }
 
     out.push_str("}\n");
@@ -751,6 +757,7 @@ fn emit_straight_line(
     mode: EmitMode,
     resolver: &LambdaResolver,
     types: &std::collections::HashMap<Value, Type>,
+    direct_callable: &std::collections::HashMap<Value, (String, usize)>,
 ) -> Result<(), AotError> {
     let block = &func.blocks[0];
     let mut defined: HashSet<Value> = func.params.iter().map(|(v, _)| *v).collect();
@@ -769,6 +776,7 @@ fn emit_straight_line(
             &local_defs,
             func.self_binding_sym,
             types,
+            direct_callable,
         )?;
         if let Some(dst) = inst_dst(inst) {
             defined.insert(dst);
@@ -799,6 +807,7 @@ fn emit_loop_match(
     mode: EmitMode,
     resolver: &LambdaResolver,
     types: &std::collections::HashMap<Value, Type>,
+    direct_callable: &std::collections::HashMap<Value, (String, usize)>,
 ) -> Result<(), AotError> {
     // Pre-declare every Value that ISN'T already a function
     // parameter. Block params and Inst destinations all go here.
@@ -867,6 +876,7 @@ fn emit_loop_match(
                 &local_defs,
                 func.self_binding_sym,
                 types,
+                direct_callable,
             )?;
         }
         if let Some(args) = tco {
@@ -935,6 +945,7 @@ fn emit_inst_let(
     local_defs: &std::collections::HashMap<u32, Value>,
     self_binding_sym: Option<u32>,
     types: &std::collections::HashMap<Value, Type>,
+    direct_callable: &std::collections::HashMap<Value, (String, usize)>,
 ) -> Result<(), AotError> {
     // RC3 iter 2.11 — EnvDefineLocal that survived demote (the
     // multi-block + multi-define case) lowers to a no-op: the
@@ -966,6 +977,7 @@ fn emit_inst_let(
         local_defs,
         self_binding_sym,
         types,
+        direct_callable,
     )?;
     writeln!(out, "    let v{}: i64 = {};", dst.0, expr).unwrap();
     Ok(())
@@ -983,6 +995,7 @@ fn emit_inst_assign(
     local_defs: &std::collections::HashMap<u32, Value>,
     self_binding_sym: Option<u32>,
     types: &std::collections::HashMap<Value, Type>,
+    direct_callable: &std::collections::HashMap<Value, (String, usize)>,
 ) -> Result<(), AotError> {
     // Same no-op as emit_inst_let for surviving EnvDefineLocal.
     if matches!(inst, Inst::EnvDefineLocal(..)) {
@@ -1006,6 +1019,7 @@ fn emit_inst_assign(
         local_defs,
         self_binding_sym,
         types,
+        direct_callable,
     )?;
     writeln!(out, "                v{} = {};", dst.0, expr).unwrap();
     Ok(())
@@ -1025,6 +1039,7 @@ fn inst_rhs(
     local_defs: &std::collections::HashMap<u32, Value>,
     self_binding_sym: Option<u32>,
     types: &std::collections::HashMap<Value, Type>,
+    direct_callable: &std::collections::HashMap<Value, (String, usize)>,
 ) -> Result<(Value, String), AotError> {
     let check = |v: Value| -> Result<(), AotError> {
         match defined {
@@ -1722,13 +1737,22 @@ fn inst_rhs(
         {
             let idx = resolver.by_name_sym[sym];
             let info = &resolver.by_idx[&idx];
-            (
-                *dst,
-                format!(
-                    "unsafe {{ cs_vm::vm::vm_alloc_aot_procedure({}_aot_dispatch as usize, {}u32) }}",
-                    info.fn_name, info.arity
-                ),
-            )
+            // Direct-callable elision: if this Value is in
+            // `direct_callable`, the matching Call will go
+            // straight to the AOT fn — no Procedure alloc
+            // needed. Emit a dummy 0 placeholder. LLVM should
+            // dead-code-eliminate the unused store.
+            if direct_callable.contains_key(dst) {
+                (*dst, "0i64".to_string())
+            } else {
+                (
+                    *dst,
+                    format!(
+                        "unsafe {{ cs_vm::vm::vm_alloc_aot_procedure({}_aot_dispatch as usize, {}u32) }}",
+                        info.fn_name, info.arity
+                    ),
+                )
+            }
         }
         (Inst::EnvLookup(dst, sym), _) | (Inst::EnvLookupAny(dst, sym), _)
             if local_defs.contains_key(sym) =>
@@ -1838,6 +1862,24 @@ fn inst_rhs(
             check(*callee)?;
             for arg in args {
                 check(*arg)?;
+            }
+            // Direct-callable elision: if the callee is a Value
+            // sourced from EnvLookup of a no-captures top-level
+            // AOT fn, skip the `vm_alloc_aot_procedure` (already
+            // elided at the EnvLookup) and the
+            // `vm_call_aot_procedure` indirection. Emit a plain
+            // Rust call to the AOT fn with __self_handle=0
+            // (the fn body ignores it for no-captures cases).
+            // Arity is validated at the resolver-pass level; the
+            // direct call would mis-type-check at compile if the
+            // arg count is wrong.
+            if let Some((fn_name, _arity)) = direct_callable.get(callee) {
+                let args_csv = args
+                    .iter()
+                    .map(|a| format!("v{}", a.0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Ok((*dst, format!("{fn_name}(0i64, {args_csv})")));
             }
             let args_csv = args
                 .iter()
@@ -1970,6 +2012,44 @@ fn emit_terminator(
 /// payload to f64; if NB Flonum (or RawI64 mode with raw f64
 /// bits), use bit pattern directly. NanboxValue::as_fixnum
 /// handles the discrimination.
+/// Per-function analysis: identify Values produced by an
+/// `EnvLookup` of a resolver-known no-captures top-level AOT
+/// fn. Such values are "direct callable" — when used as a
+/// `Call`'s func, the codegen can skip the
+/// `vm_alloc_aot_procedure` + `vm_call_aot_procedure`
+/// indirection and emit a plain Rust fn call.
+///
+/// Returns a map `Value → (fn_name, arity)`. Values not in
+/// the map fall through to the standard dispatch path.
+///
+/// Closes the major per-iteration allocation hotspot for
+/// cross-procedure calls (mandelbrot's `col_loop` calls
+/// `mandelbrot-pixel` per pixel — 10K allocations per N=100
+/// invocation become zero with this pass).
+fn infer_direct_callables(
+    func: &Function,
+    resolver: &LambdaResolver,
+) -> std::collections::HashMap<Value, (String, usize)> {
+    let mut out = std::collections::HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let Inst::EnvLookup(dst, sym) | Inst::EnvLookupAny(dst, sym) = inst {
+                if let Some(idx) = resolver.by_name_sym.get(sym) {
+                    if let Some(info) = resolver.by_idx.get(idx) {
+                        // Only no-captures fns get the direct path —
+                        // capturing closures need a real Procedure
+                        // value with captures attached.
+                        if info.captures.is_empty() {
+                            out.insert(*dst, (info.fn_name.clone(), info.arity));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Pick the right `nb_<op>_inline` helper for a generic NB
 /// arithmetic op. When the per-Value type map proves BOTH
 /// operands are Fixnum-typed, route to the `nb_<op>_fixnum_inline`
