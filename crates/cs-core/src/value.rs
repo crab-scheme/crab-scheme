@@ -106,40 +106,76 @@ impl Pair {
     /// Cycle-break action for the car slot. Downgrades the
     /// current strong `Value` to a `WeakValue`, parks it in
     /// `car_weak`, and replaces the strong slot with
-    /// `Unspecified`. No-op if the current car is a leaf value
-    /// (no heap pointer to downgrade).
+    /// `Unspecified`. Returns `true` on demote, `false` on skip.
     ///
-    /// **Not currently called by the runtime.** The iter-7.1
-    /// naive demote orphans values when the freshly-mutated
-    /// slot is the only strong holder of the value being
-    /// demoted (the `(set-car! env (cons name val))`
-    /// closures-over-env pattern, where the cons cell has no
-    /// external strong references). A future iter wires a
-    /// Bacon-Rajan-style trial-deletion break that picks a safe
-    /// cycle edge to weaken; until then, cycles detected by
-    /// the iter-7.1 detector are recorded in
-    /// `cs_runtime::countable_memory_cycle` but not
-    /// structurally broken (refcount leak persists).
+    /// Skipped when:
+    /// - The current car is a leaf value (no heap pointer to
+    ///   downgrade).
+    /// - The strong-count guard fires: the value's only strong
+    ///   holders are this slot and the caller's mutation
+    ///   argument (which is about to drop). Demoting would
+    ///   orphan the value before any external reclaim could
+    ///   observe the cycle.
+    ///
+    /// Convention: call sites (`b_set_car` etc.) hold the
+    /// freshly-written value in their `args[1]` slot for the
+    /// duration of the mutation, which counts as +1 strong on
+    /// the allocation. The VM tier's dispatch can layer
+    /// additional temporaries (NB decode, arg-slot, frame
+    /// stack) — up to 3 transient strong refs in observed
+    /// failing cases. Combined with the +1 from the storage
+    /// slot, the conservative baseline is 4; a value with at
+    /// least one persistent external anchor reads as `>= 5`.
+    /// The guard therefore requires `>= 5` to demote.
+    ///
+    /// This is a coarse heuristic that may leak cycles whose
+    /// external anchor count is 1 (a single binding); future
+    /// iter 7.1.x.y can replace it with a per-tier baseline
+    /// passed by the caller.
+    ///
+    /// The strong-count guard handles the
+    /// `(set-car! env (cons name val))` closures-over-env
+    /// pattern from the metacircular by leaving the cycle
+    /// intact rather than orphaning the cons cell; ADR 0014
+    /// §"iter 7.1 follow-ups" tracks the long-tail closure-
+    /// tombstone work that would close more of these cases.
     #[cfg(feature = "countable-memory")]
-    #[allow(dead_code)]
-    pub fn break_car_cycle(&self) {
-        let val = self.car();
-        if let Some(weak) = WeakValue::from_value(&val) {
-            *self.car_weak.borrow_mut() = Some(weak);
-            *self.car.borrow_mut() = Value::Unspecified;
+    pub fn break_car_cycle(&self) -> bool {
+        // Read strong count WITHOUT cloning so the count
+        // reflects (slot + caller's args[1]) plus any external
+        // refs.
+        let car_borrow = self.car.borrow();
+        let total = car_borrow.heap_strong_count().unwrap_or(0);
+        drop(car_borrow);
+        if total < 5 {
+            return false;
         }
+        let val = self.car();
+        let Some(weak) = WeakValue::from_value(&val) else {
+            return false; // leaf (shouldn't reach: heap_strong_count returned Some)
+        };
+        *self.car_weak.borrow_mut() = Some(weak);
+        *self.car.borrow_mut() = Value::Unspecified;
+        true
     }
 
     /// Cycle-break action for the cdr slot. See
     /// [`break_car_cycle`].
     #[cfg(feature = "countable-memory")]
-    #[allow(dead_code)]
-    pub fn break_cdr_cycle(&self) {
-        let val = self.cdr();
-        if let Some(weak) = WeakValue::from_value(&val) {
-            *self.cdr_weak.borrow_mut() = Some(weak);
-            *self.cdr.borrow_mut() = Value::Unspecified;
+    pub fn break_cdr_cycle(&self) -> bool {
+        let cdr_borrow = self.cdr.borrow();
+        let total = cdr_borrow.heap_strong_count().unwrap_or(0);
+        drop(cdr_borrow);
+        if total < 5 {
+            return false;
         }
+        let val = self.cdr();
+        let Some(weak) = WeakValue::from_value(&val) else {
+            return false;
+        };
+        *self.cdr_weak.borrow_mut() = Some(weak);
+        *self.cdr.borrow_mut() = Value::Unspecified;
+        true
     }
 }
 
@@ -713,6 +749,31 @@ impl Value {
 
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
+    }
+
+    /// Total strong-reference count for this Value's underlying
+    /// heap allocation, if any. Returns `None` for leaf values
+    /// (no allocation to count). Used by `Pair::break_*_cycle`'s
+    /// strong-count guard.
+    #[cfg(feature = "countable-memory")]
+    pub fn heap_strong_count(&self) -> Option<usize> {
+        match self {
+            Value::String(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Pair(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Vector(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::ByteVector(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Hashtable(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Port(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Promise(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Procedure(rc) => Some(Rc::strong_count(rc)),
+            Value::Null
+            | Value::Unspecified
+            | Value::Eof
+            | Value::Boolean(_)
+            | Value::Character(_)
+            | Value::Symbol(_)
+            | Value::Number(_) => None,
+        }
     }
 
     pub fn type_name(&self) -> &'static str {

@@ -2438,17 +2438,17 @@ fn b_set_car(args: &[Value]) -> Result<Value, String> {
         Value::Pair(p) => {
             p.set_car(args[1].clone());
             #[cfg(feature = "countable-memory")]
-            cs_gc::cycle::check_and_break(p, |_| {
-                // Iter 7.1: cycle detector fires; record but do
-                // NOT call break_car_cycle. The naive "demote
-                // freshly-mutated slot to Weak" break orphans
-                // values when the slot is the only strong holder
-                // (common with `(set-car! env (cons name val))`
-                // closures-over-env). The infrastructure
-                // (WeakValue, Pair tombstone slots, accessors)
-                // is in place for a smarter Bacon-Rajan-style
-                // break — see iter 7.1.x follow-up.
+            cs_gc::cycle::check_and_break(p, |p| {
                 crate::countable_memory_cycle::record_cycle_detected();
+                // Iter 7.1.x: invoke the strong-count-guarded
+                // break. Skipped (no demote) when the slot is
+                // the only strong holder of the cycle target —
+                // see Pair::break_car_cycle doc for the
+                // metacircular counter-example that motivated
+                // the guard.
+                if p.break_car_cycle() {
+                    crate::countable_memory_cycle::record_cycle_broken();
+                }
             });
             Ok(Value::Unspecified)
         }
@@ -2464,8 +2464,11 @@ fn b_set_cdr(args: &[Value]) -> Result<Value, String> {
         Value::Pair(p) => {
             p.set_cdr(args[1].clone());
             #[cfg(feature = "countable-memory")]
-            cs_gc::cycle::check_and_break(p, |_| {
+            cs_gc::cycle::check_and_break(p, |p| {
                 crate::countable_memory_cycle::record_cycle_detected();
+                if p.break_cdr_cycle() {
+                    crate::countable_memory_cycle::record_cycle_broken();
+                }
             });
             Ok(Value::Unspecified)
         }

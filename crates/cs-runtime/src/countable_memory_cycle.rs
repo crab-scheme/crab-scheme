@@ -24,6 +24,7 @@ use std::cell::Cell;
 
 thread_local! {
     static CYCLE_COUNT: Cell<u64> = const { Cell::new(0) };
+    static CYCLE_BROKEN_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Increment the per-thread cycle-detection counter. Called from
@@ -33,12 +34,29 @@ pub fn record_cycle_detected() {
     CYCLE_COUNT.with(|c| c.set(c.get().saturating_add(1)));
 }
 
+/// Increment the per-thread cycle-broken counter. Called when
+/// `Pair::break_*_cycle` returns true (the strong-count guard
+/// permitted a safe demote and the slot was actually flipped to
+/// a Weak tombstone — see iter 7.1.x).
+pub fn record_cycle_broken() {
+    CYCLE_BROKEN_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+}
+
 /// Read the per-thread cycle-detection counter.
 pub fn cycle_detection_count() -> u64 {
     CYCLE_COUNT.with(|c| c.get())
 }
 
-/// Reset the per-thread cycle-detection counter to 0.
+/// Read the per-thread cycle-broken counter. Lower than the
+/// detection count for cycles the strong-count guard refused to
+/// break (the unsafe case where the slot was the only strong
+/// holder).
+pub fn cycle_broken_count() -> u64 {
+    CYCLE_BROKEN_COUNT.with(|c| c.get())
+}
+
+/// Reset both per-thread cycle counters to 0.
 pub fn reset_cycle_detection_count() {
     CYCLE_COUNT.with(|c| c.set(0));
+    CYCLE_BROKEN_COUNT.with(|c| c.set(0));
 }
