@@ -30,6 +30,7 @@ pub mod annotate;
 pub mod builtins;
 pub mod check;
 pub mod checker;
+pub mod effect;
 pub mod env;
 pub mod extract;
 pub mod infer;
@@ -44,6 +45,7 @@ pub use annotate::{
 pub use builtins::{install_primops, primop_pairs, primop_table};
 pub use check::{check, render_type, subtype, TypeError};
 pub use checker::Checker;
+pub use effect::{AllocEffect, EscapeKind};
 pub use env::{Frame, TypeEnv};
 pub use extract::extract_annotations;
 pub use infer::infer;

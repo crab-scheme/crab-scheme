@@ -12,7 +12,7 @@ shipped: `cs_gc::Region`, `Gc::new_in`, debug-mode validity).
 
 ## Iter 1 — `AllocEffect` + `EscapeKind` types
 
-- [ ] 1. Add `AllocEffect`, `EscapeKind` to cs-typer
+- [x] 1. Add `AllocEffect`, `EscapeKind` to cs-typer
   - File: `crates/cs-typer/src/effect.rs` (new),
     `crates/cs-typer/src/lib.rs`
   - Implement `AllocEffect { allocates, escapes, may_cycle }`
