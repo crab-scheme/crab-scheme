@@ -392,12 +392,16 @@ pub fn primop_spawn(name: &str, args: Vec<SendableValue>) -> Result<ActorPid, St
         // on this blocking thread, and the Guard clears it before
         // the closure returns (or unwinds), so a thread-pool
         // worker reused for a later actor never sees a stale ptr.
+        // The Guard also zeros REDUCTIONS so a reused worker
+        // doesn't inherit the prior actor's count.
         let ptr: *mut cs_actor::Actor = actor;
         ACTOR_CTX.with(|c| c.set(ptr));
+        REDUCTIONS.with(|c| c.set(0));
         struct Guard;
         impl Drop for Guard {
             fn drop(&mut self) {
                 ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
+                REDUCTIONS.with(|c| c.set(0));
             }
         }
         let _g = Guard;
@@ -416,6 +420,19 @@ pub fn primop_spawn(name: &str, args: Vec<SendableValue>) -> Result<ActorPid, St
 std::thread_local! {
     static ACTOR_CTX: std::cell::Cell<*mut cs_actor::Actor> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
+
+    /// Per-actor reduction counter (Erlang's "reductions" — a
+    /// proxy for work done). Bumped by `(bump-reductions! N)`
+    /// from Scheme; reset by `(yield)` after the cooperative
+    /// hand-off. Read with `(reductions)`.
+    ///
+    /// B3's scheduler-swap half (post-1.0) will wire this into
+    /// the bytecode dispatch loop's yield-check hook: when the
+    /// counter exceeds a threshold, the dispatch loop calls
+    /// `(yield)` automatically. For now the user opts in by
+    /// calling `(yield)` from Scheme — which keeps the seam in
+    /// place without changing dispatch-loop perf.
+    static REDUCTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Run `f` with a `&mut` reference to the currently-running
@@ -863,6 +880,76 @@ pub fn b_beam_self(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
     Ok(from_sendable(&SendableValue::Pid(pid), syms))
 }
 
+/// `(reductions)` — return the calling actor's current
+/// reduction count. Erlang-flavored: a proxy for "work done"
+/// the scheduler tracks per actor. B3's scheduler-swap half
+/// (post-1.0) will use this as a yield-check threshold.
+pub fn b_beam_reductions(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(format!(
+            "reductions: expected 0 arguments, got {}",
+            args.len()
+        ));
+    }
+    let n = REDUCTIONS.with(|c| c.get());
+    Ok(Value::Number(Number::Fixnum(n as i64)))
+}
+
+/// `(bump-reductions! n)` — add `n` to the calling actor's
+/// reduction counter. Returns the new value.
+///
+/// User code calls this between logical work units; eventually
+/// the bytecode dispatch loop's yield-check hook will do it
+/// automatically (B3 second half, post-1.0).
+pub fn b_beam_bump_reductions(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "bump-reductions!: expected 1 argument, got {}",
+            args.len()
+        ));
+    }
+    let n = match &args[0] {
+        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as u64,
+        other => {
+            return Err(format!(
+                "bump-reductions!: expected non-negative integer, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    let new = REDUCTIONS.with(|c| {
+        let v = c.get().saturating_add(n);
+        c.set(v);
+        v
+    });
+    Ok(Value::Number(Number::Fixnum(new as i64)))
+}
+
+/// `(yield)` — cooperative hand-off. Calls
+/// `std::thread::yield_now()` (asking the OS scheduler to give
+/// another thread a chance) and resets this actor's reduction
+/// counter to zero. Returns unspecified.
+///
+/// In the current spawn-blocking model, kernel preemption
+/// already keeps actors fair across cores; `(yield)` is the
+/// hook for opt-in cooperative behavior and for the post-1.0
+/// scheduler-swap where worker threads juggle many actors via
+/// reduction-counted slices.
+pub fn b_beam_yield(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(format!("yield: expected 0 arguments, got {}", args.len()));
+    }
+    // The reduction-count gate is conceptually per-actor; only
+    // make the reset meaningful when we're actually inside an
+    // actor body. Outside, `(yield)` is still legal (a no-op
+    // hand-off) so user code can call it unconditionally.
+    if ACTOR_CTX.with(|c| !c.get().is_null()) {
+        REDUCTIONS.with(|c| c.set(0));
+    }
+    std::thread::yield_now();
+    Ok(Value::Unspecified)
+}
+
 /// `(raw-receive)` blocks until a message arrives;
 /// `(raw-receive timeout-ms)` returns `#f` if the deadline
 /// passes without one. System messages (Exit/Down) surface as
@@ -1083,6 +1170,10 @@ pub fn beam_syms_builtins() -> Vec<(
         ("spawn", b_beam_spawn),
         ("self", b_beam_self),
         ("raw-receive", b_beam_raw_receive),
+        // reductions (B3 first half: cooperative-yield seam)
+        ("reductions", b_beam_reductions),
+        ("bump-reductions!", b_beam_bump_reductions),
+        ("yield", b_beam_yield),
         // table
         ("make-table", b_beam_make_table),
         ("table-insert!", b_beam_table_insert),

@@ -431,6 +431,93 @@ fn load_module_accepts_nested_sendable_values() {
     assert_eq!(disp(&rt, &p), "(alpha . beta)");
 }
 
+// ----------------------------------------------------------
+// Reductions / cooperative yield (B3 first half)
+// ----------------------------------------------------------
+
+#[test]
+fn yield_at_top_level_is_noop() {
+    let mut rt = Runtime::new();
+    let v = rt.eval_str("<t>", "(yield)").expect("yield outside actor");
+    assert_eq!(disp(&rt, &v), "#<unspecified>");
+}
+
+#[test]
+fn reductions_in_actor_increment_and_yield_resets() {
+    use cs_runtime::builtins::beam::beam_state;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    let snapshots: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+    let snapshots_clone = snapshots.clone();
+
+    beam_state().procs.register(
+        "test:reductions-actor",
+        Arc::new(move |_actor, _args| {
+            let mut rt = cs_runtime::Runtime::new();
+
+            // Initial count is zero.
+            let r0 = rt.eval_str("<t>", "(reductions)").unwrap();
+            snapshots_clone.lock().unwrap().push(disp_to_i64(&rt, &r0));
+
+            // Bump twice.
+            rt.eval_str("<t>", "(bump-reductions! 10)").unwrap();
+            rt.eval_str("<t>", "(bump-reductions! 7)").unwrap();
+            let r17 = rt.eval_str("<t>", "(reductions)").unwrap();
+            snapshots_clone.lock().unwrap().push(disp_to_i64(&rt, &r17));
+
+            // Yield resets to zero.
+            rt.eval_str("<t>", "(yield)").unwrap();
+            let r_after_yield = rt.eval_str("<t>", "(reductions)").unwrap();
+            snapshots_clone
+                .lock()
+                .unwrap()
+                .push(disp_to_i64(&rt, &r_after_yield));
+        }),
+    );
+
+    let _pid =
+        cs_runtime::builtins::beam::primop_spawn("test:reductions-actor", vec![]).expect("spawn");
+
+    // Wait for the actor to finish recording all three snapshots.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while snapshots.lock().unwrap().len() < 3 {
+        if std::time::Instant::now() >= deadline {
+            panic!("reductions actor never finished");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let snaps = snapshots.lock().unwrap().clone();
+    assert_eq!(snaps, vec![0, 17, 0]);
+}
+
+#[test]
+fn bump_reductions_rejects_negative() {
+    let mut rt = Runtime::new();
+    let err = rt
+        .eval_str("<t>", "(bump-reductions! -3)")
+        .expect_err("negative bump should fail");
+    let formatted = format!("{}", err);
+    assert!(formatted.contains("non-negative"), "got: {}", formatted);
+}
+
+#[test]
+fn reductions_at_top_level_is_zero() {
+    let mut rt = Runtime::new();
+    let v = rt.eval_str("<t>", "(reductions)").unwrap();
+    // At top level (no actor body), reductions is the
+    // thread-local default 0.
+    assert_eq!(disp(&rt, &v), "0");
+}
+
+/// Convert a Scheme value back to an i64 via the display path.
+/// The integration tests print integers as decimal text — this
+/// is the cheapest way to assert numeric equality without
+/// exposing more of the cs_core::Number API to the test crate.
+fn disp_to_i64(rt: &Runtime, v: &cs_core::Value) -> i64 {
+    disp(rt, v).parse::<i64>().expect("integer-printing value")
+}
+
 #[test]
 fn spawn_registered_proc_round_trip() {
     use cs_runtime::builtins::beam::{beam_state, primop_send, primop_spawn, SendableValue};
