@@ -215,6 +215,12 @@ impl<T: ?Sized> Clone for Weak<T> {
     }
 }
 
+impl<T: ?Sized> std::fmt::Debug for Weak<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Weak(<gc>)")
+    }
+}
+
 impl<T> Default for Weak<T> {
     fn default() -> Self {
         Self::new()

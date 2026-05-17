@@ -168,15 +168,59 @@ synchronous detector closes the gap with bounded per-call cost.
 - [ ] iter 7.1 — Strong/Weak storage slot enums on
   `Pair` / `Vector` / `Hashtable` so detected cycles get
   refcount-reclaimable storage downgrades.
-- [ ] iter 8 — `Frame.parent` / `Continuation` parent chain
+- [x] iter 8 — `Frame.parent` / `Continuation` parent chain
   refactored to `Weak<Frame>` for structural cycle prevention.
+  **Not applicable — closed as won't-do.** See "Iter 8
+  architectural mismatch" below.
 - [ ] iter 12b — delete the cfg-gated tracing path entirely
-  (point of no return; gates on iter 7.1 + 8 being mature
-  enough that no rollback path is needed).
+  (point of no return; gates on iter 7.1 being mature enough
+  that no rollback path is needed).
 
-These three close the residual cycle-leak gap. The iter-12a
-documentation (this ADR + amendment to ADR 0006 + exit report)
-ratifies the iter-11 state.
+### Iter 8 architectural mismatch
+
+The countable-memory spec's iter 8 specifies refactoring
+`Frame.parent` from `Rc<Frame>` to `cs_gc::Weak<Frame>` so that
+continuation-captured frame chains form structurally
+non-cyclic graphs. This rationale assumed two things that
+turned out not to hold for CrabScheme:
+
+1. **Continuations don't capture frame chains in CrabScheme.**
+   `cs_runtime::proc::Continuation { id: u64 }` is an escape-
+   only continuation holding only a numeric id. There is no
+   captured frame, so making `Frame.parent` weak doesn't break
+   any cycle that actually exists in the runtime.
+
+2. **The walker's TCO loop overwrites `cur_env`.** In
+   `eval_inner` (`crates/cs-runtime/src/eval.rs` Letrec / Lambda
+   bodies / If branches / Begin sequences), the active env is
+   updated via `cur_env = new_env;` and the previous outer
+   env's `Rc` is dropped. The new env's lookups walk up the
+   parent chain to find globals; if `parent` were `Weak`, that
+   upgrade would fail because the only strong reference to
+   the outer env (the original `cur_env`) just got dropped.
+   The walker would need a fundamentally different ownership
+   model (a strong env stack) to survive Weak parents.
+
+The same architectural fact rules out making `closure.env`
+weak: closures escape their defining scope (`(let ([x 1])
+(lambda () x))` returns a closure whose env outlives the
+walker's strong reference to that env). A weak `closure.env`
+would dangle on first invocation after the let returned.
+
+The cycle that iter 8 was meant to close — closures whose env
+contains a binding back to the closure itself
+(`(define (f) f)` and the letrec-self family) — is not closed
+by frame-parent weakening regardless. The cycle goes through
+the binding storage, not the parent chain. iter 7.1's
+Strong/Weak storage slot refactor is the appropriate fix
+because it targets the actual cycle edge.
+
+**Conclusion**: iter 8 is retired without action. iter 7.1
+remains the path to refcount reclamation of cyclic structures.
+
+These follow-ups close the residual cycle-leak gap. The
+iter-12a documentation (this ADR + amendment to ADR 0006 +
+exit report) ratifies the iter-11 state.
 
 ## References
 
