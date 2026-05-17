@@ -26,6 +26,8 @@
 //! - Phase 6: Polish + CLI surface.
 //! - Phase 7 (optional): Polymorphism.
 
+pub mod parse_ann;
 pub mod types;
 
+pub use parse_ann::{parse_type_ann, TypeAnn, TypeAnnError, TypeDatum};
 pub use types::{ProcType, Type};
