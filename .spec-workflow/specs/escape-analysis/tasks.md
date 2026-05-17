@@ -41,7 +41,7 @@ shipped: `cs_gc::Region`, `Gc::new_in`, debug-mode validity).
 
 ## Iter 2 — Per-primitive effect table
 
-- [ ] 2. Add `EFFECT_TABLE` for built-in procedures
+- [x] 2. Add `EFFECT_TABLE` for built-in procedures
   - File: `crates/cs-typer/src/effect.rs` (extend)
   - Add a static map `EFFECT_TABLE: HashMap<&str, AllocEffect>`
     covering the ~80 primitives in cs-runtime's builtins:

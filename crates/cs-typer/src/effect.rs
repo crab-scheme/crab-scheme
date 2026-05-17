@@ -157,6 +157,107 @@ impl fmt::Display for AllocEffect {
     }
 }
 
+/// Look up the [`AllocEffect`] of a primitive procedure by
+/// its R6RS name. Returns `AllocEffect::PURE` for unknown
+/// names — safe default since PURE means "the inferencer
+/// can't reason about this call site; treat the result as if
+/// nothing was allocated and let the caller's context tighten
+/// or loosen as needed."
+///
+/// Categories (see iter 2 of the escape-analysis spec):
+///
+/// - **PURE**: arithmetic, comparison, type predicates,
+///   equality predicates, leaf accessors (`car`, `cdr`,
+///   `vector-ref`, `hashtable-ref`, `string-ref`, `length`),
+///   `not`, `null`, `void`, leaf reflection.
+/// - **Allocates + escapes=Region**: `cons`, `list`, `vector`,
+///   `make-vector`, `make-string`, `make-bytevector`,
+///   `make-hashtable`, `reverse`, `append`, `list-copy`.
+///   Default escape is `Region` — the inferencer downgrades
+///   to `Heap` when the result is stored in a long-lived
+///   binding (iter 3).
+/// - **Heap + may_cycle**: mutation primitives that can
+///   introduce cycles (`set-car!`, `set-cdr!`, `vector-set!`,
+///   `hashtable-set!`). `set!` to a top-level binding is also
+///   may_cycle when the RHS captures the LHS (detected in
+///   iter 3 by free-var analysis).
+/// - **Unknown**: opaque higher-order or non-local-control
+///   primitives — `apply`, `call/cc`, `call-with-values`,
+///   `dynamic-wind`, `eval`, `with-exception-handler`. The
+///   inferencer can't trace where the value escapes; lowering
+///   conservatively treats Unknown as Heap.
+pub fn primitive_effect(name: &str) -> AllocEffect {
+    let alloc_region = AllocEffect {
+        allocates: true,
+        escapes: EscapeKind::Region,
+        may_cycle: false,
+    };
+    let mut_heap = AllocEffect {
+        allocates: false,
+        escapes: EscapeKind::Heap,
+        may_cycle: true,
+    };
+    let unknown = AllocEffect {
+        allocates: true,
+        escapes: EscapeKind::Unknown,
+        may_cycle: true,
+    };
+
+    match name {
+        // Allocators — fresh heap value, Region by default.
+        "cons" | "list" | "vector" | "make-vector" | "make-string" | "make-bytevector"
+        | "make-hashtable" | "make-eq-hashtable" | "make-eqv-hashtable" | "string"
+        | "string-copy" | "list-copy" | "reverse" | "append" | "list->vector" | "vector->list"
+        | "string->list" | "list->string" | "bytevector-copy" | "vector-map"
+        | "vector-for-each" | "map" | "for-each" | "values" | "call-with-values"
+        | "make-promise" | "delay" | "make-parameter" => alloc_region,
+
+        // Mutation — propagates Heap escape and flags may_cycle.
+        "set-car!" | "set-cdr!" | "vector-set!" | "vector-fill!" | "bytevector-u8-set!"
+        | "bytevector-set!" | "string-set!" | "hashtable-set!" | "hashtable-delete!"
+        | "hashtable-update!" | "hashtable-clear!" | "set!" => mut_heap,
+
+        // Opaque control / higher-order — Unknown escape.
+        "apply"
+        | "call-with-current-continuation"
+        | "call/cc"
+        | "dynamic-wind"
+        | "with-exception-handler"
+        | "raise"
+        | "raise-continuable"
+        | "guard"
+        | "eval"
+        | "load"
+        | "compile"
+        | "expand"
+        | "expand-once" => unknown,
+
+        // I/O — allocates (port handle) and escapes to global
+        // resources. Treat as Heap-escape so port objects don't
+        // get region-allocated (they're long-lived).
+        "open-input-string"
+        | "open-output-string"
+        | "open-input-bytevector"
+        | "open-output-bytevector"
+        | "open-input-file"
+        | "open-output-file"
+        | "current-input-port"
+        | "current-output-port"
+        | "current-error-port"
+        | "standard-input-port"
+        | "standard-output-port"
+        | "standard-error-port" => AllocEffect {
+            allocates: true,
+            escapes: EscapeKind::Heap,
+            may_cycle: false,
+        },
+
+        // Everything else (arithmetic, comparisons, predicates,
+        // pure accessors, …) is PURE.
+        _ => AllocEffect::PURE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +393,128 @@ mod tests {
         assert_eq!(
             format!("{}", AllocEffect::PURE),
             "[alloc=false escapes=local cycle=false]"
+        );
+    }
+
+    // === primitive_effect table tests ===
+
+    #[test]
+    fn primitive_arithmetic_is_pure() {
+        for op in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "fx+", "fl*"] {
+            assert_eq!(
+                primitive_effect(op),
+                AllocEffect::PURE,
+                "{op} should be PURE"
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_predicates_are_pure() {
+        for op in &[
+            "pair?", "null?", "fixnum?", "boolean?", "string?", "symbol?", "vector?",
+        ] {
+            assert_eq!(
+                primitive_effect(op),
+                AllocEffect::PURE,
+                "{op} should be PURE"
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_accessors_are_pure() {
+        for op in &[
+            "car",
+            "cdr",
+            "vector-ref",
+            "string-ref",
+            "length",
+            "list-ref",
+        ] {
+            assert_eq!(
+                primitive_effect(op),
+                AllocEffect::PURE,
+                "{op} should be PURE"
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_allocators_are_region_alloc() {
+        for op in &[
+            "cons",
+            "list",
+            "vector",
+            "make-vector",
+            "make-string",
+            "make-bytevector",
+            "make-hashtable",
+            "reverse",
+            "append",
+        ] {
+            let e = primitive_effect(op);
+            assert!(e.allocates, "{op} should allocate");
+            assert_eq!(e.escapes, EscapeKind::Region, "{op} should escape Region");
+            assert!(!e.may_cycle, "{op} should not flag may_cycle");
+        }
+    }
+
+    #[test]
+    fn primitive_mutators_are_heap_may_cycle() {
+        for op in &[
+            "set-car!",
+            "set-cdr!",
+            "vector-set!",
+            "hashtable-set!",
+            "hashtable-delete!",
+            "set!",
+        ] {
+            let e = primitive_effect(op);
+            assert_eq!(e.escapes, EscapeKind::Heap, "{op} should escape Heap");
+            assert!(e.may_cycle, "{op} should flag may_cycle");
+        }
+    }
+
+    #[test]
+    fn primitive_higher_order_is_unknown() {
+        for op in &[
+            "apply",
+            "call-with-current-continuation",
+            "call/cc",
+            "dynamic-wind",
+            "with-exception-handler",
+            "eval",
+        ] {
+            let e = primitive_effect(op);
+            assert_eq!(e.escapes, EscapeKind::Unknown, "{op} should be Unknown");
+        }
+    }
+
+    #[test]
+    fn primitive_ports_are_heap_escape() {
+        for op in &[
+            "open-input-string",
+            "open-output-string",
+            "open-input-file",
+            "current-input-port",
+        ] {
+            let e = primitive_effect(op);
+            assert!(e.allocates, "{op} should allocate");
+            assert_eq!(
+                e.escapes,
+                EscapeKind::Heap,
+                "{op} (port) should escape Heap"
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_unknown_name_defaults_pure() {
+        assert_eq!(
+            primitive_effect("totally-fake-name"),
+            AllocEffect::PURE,
+            "unknown names default to PURE (safe — inferencer's context tightens later)"
         );
     }
 }
