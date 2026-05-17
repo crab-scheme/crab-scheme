@@ -25,7 +25,7 @@ use cs_ir::{CoreExpr, Params};
 
 use crate::annotate::{AnnotationTable, LambdaAnnotation};
 use crate::builtins::install_primops;
-use crate::check::{subtype, TypeError};
+use crate::check::{narrow_negative, narrow_positive, subtype, TypeError};
 use crate::env::TypeEnv;
 use crate::infer::infer;
 use crate::types::{ProcType, Type};
@@ -72,10 +72,9 @@ impl<'tab> Checker<'tab> {
                 self.check_lambda(params, body, *span, expected)
             }
             CoreExpr::App { func, args, span } => self.check_app(func, args, *span, expected),
-            CoreExpr::If { then, alt, .. } => {
-                self.check(then, expected)?;
-                self.check(alt, expected)
-            }
+            CoreExpr::If {
+                cond, then, alt, ..
+            } => self.check_if(cond, then, alt, expected),
             CoreExpr::Begin { exprs, span } => {
                 if let Some((last, init)) = exprs.split_last() {
                     for e in init {
@@ -129,8 +128,23 @@ impl<'tab> Checker<'tab> {
                 cond, then, alt, ..
             } => {
                 self.check_collect(cond, &Type::Any, out);
-                self.check_collect(then, expected, out);
-                self.check_collect(alt, expected, out);
+                // Phase 4 iter 4.2: narrow operand types inside
+                // each branch based on a predicate filter.
+                let narrowing = self.detect_predicate_narrowing(cond);
+                if let Some((x, filter)) = narrowing {
+                    let x_ty = self.env.lookup(x).cloned().unwrap_or(Type::Any);
+                    let mark = self.env.push();
+                    self.env.define(x, narrow_positive(&x_ty, &filter));
+                    self.check_collect(then, expected, out);
+                    self.env.pop_to(mark);
+                    let mark = self.env.push();
+                    self.env.define(x, narrow_negative(&x_ty, &filter));
+                    self.check_collect(alt, expected, out);
+                    self.env.pop_to(mark);
+                } else {
+                    self.check_collect(then, expected, out);
+                    self.check_collect(alt, expected, out);
+                }
             }
             CoreExpr::Begin { exprs, .. } => {
                 if let Some((last, init)) = exprs.split_last() {
@@ -368,6 +382,70 @@ impl<'tab> Checker<'tab> {
         let result = self.check(body, &body_expected);
         self.env.pop_to(mark);
         result
+    }
+
+    /// `check` for `If` — narrows operand types in branches
+    /// based on a predicate filter (Phase 4 iter 4.2).
+    ///
+    /// Also typechecks the condition expression against `Any`
+    /// (every Scheme value is a valid condition — only `#f` is
+    /// falsy). Without this step, malformed conditions like
+    /// `(if (car not-a-pair) …)` would silently pass.
+    fn check_if(
+        &mut self,
+        cond: &CoreExpr,
+        then: &CoreExpr,
+        alt: &CoreExpr,
+        expected: &Type,
+    ) -> Result<(), TypeError> {
+        self.check(cond, &Type::Any)?;
+        let narrowing = self.detect_predicate_narrowing(cond);
+        if let Some((x, filter)) = narrowing {
+            let x_ty = self.env.lookup(x).cloned().unwrap_or(Type::Any);
+            // then-branch: x narrowed to the positive proposition.
+            let mark = self.env.push();
+            self.env.define(x, narrow_positive(&x_ty, &filter));
+            let then_res = self.check(then, expected);
+            self.env.pop_to(mark);
+            // else-branch: x narrowed to the negative.
+            let mark = self.env.push();
+            self.env.define(x, narrow_negative(&x_ty, &filter));
+            let alt_res = self.check(alt, expected);
+            self.env.pop_to(mark);
+            then_res?;
+            alt_res
+        } else {
+            self.check(then, expected)?;
+            self.check(alt, expected)
+        }
+    }
+
+    /// If `cond` is `(pred x)` where `pred` is a Ref to a
+    /// predicate-typed procedure (filter present) and `x` is a
+    /// Ref to a name in scope, return `(x, filter_type)` so the
+    /// caller can narrow `x` in the then/else branches.
+    fn detect_predicate_narrowing(&self, cond: &CoreExpr) -> Option<(cs_core::Symbol, Type)> {
+        let CoreExpr::App { func, args, .. } = cond else {
+            return None;
+        };
+        if args.len() != 1 {
+            return None;
+        }
+        let CoreExpr::Ref {
+            name: pred_name, ..
+        } = &**func
+        else {
+            return None;
+        };
+        let CoreExpr::Ref { name: x, .. } = &args[0] else {
+            return None;
+        };
+        let pred_ty = self.env.lookup(*pred_name)?;
+        let Type::Procedure_(pt) = pred_ty else {
+            return None;
+        };
+        let filter = pt.filter.as_ref()?.clone();
+        Some((*x, filter))
     }
 
     fn check_letrec(
@@ -756,6 +834,131 @@ mod tests {
         let mut checker = Checker::new(&table, &mut syms);
         let errors = checker.check_program(&core);
         assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    // -------- Phase 4 iter 4.2: branch narrowing --------
+
+    #[test]
+    fn null_check_narrows_else_branch_to_pair() {
+        // `lst : (U Pair Null)`; `(if (null? lst) … (car lst))`
+        // — in the else-branch `lst` is narrowed to Pair so
+        // `(car lst)` typechecks.
+        let src = "\
+            (define-type PairOrNull (U Pair Null))
+            (: head (-> PairOrNull Any))
+            (define (head [lst : PairOrNull]) : Any
+              (if (null? lst) #f (car lst)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn without_narrowing_pair_or_null_caller_to_car_fails() {
+        // Sanity: without the `null?` guard, `(car lst)` on a
+        // `(U Pair Null)` would fail because Null isn't a Pair.
+        let src = "\
+            (define-type PairOrNull (U Pair Null))
+            (: head (-> PairOrNull Any))
+            (define (head [lst : PairOrNull]) : Any (car lst))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        let found = errors
+            .iter()
+            .any(|e| matches!(e, TypeError::Mismatch { .. }));
+        assert!(
+            found,
+            "expected Mismatch without narrowing, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn string_check_narrows_then_branch() {
+        // x : (U Fixnum String); in `(if (string? x) (string-length x) 0)`
+        // the then-branch narrows x to String so `(string-length x)` typechecks.
+        let src = "\
+            (define-type FxOrStr (U Fixnum String))
+            (: len (-> FxOrStr Fixnum))
+            (define (len [x : FxOrStr]) : Fixnum
+              (if (string? x) (string-length x) 0))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn string_check_negative_narrows_else_to_other() {
+        // Conversely: `(if (string? x) ??? (string-length x))`
+        // — the else-branch narrows x to NOT-String → Fixnum;
+        // string-length on a Fixnum fails.
+        let src = "\
+            (define-type FxOrStr (U Fixnum String))
+            (: bad (-> FxOrStr Fixnum))
+            (define (bad [x : FxOrStr]) : Fixnum
+              (if (string? x) 0 (string-length x)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        let found = errors.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::Mismatch {
+                    expected: Type::String,
+                    found: Type::Fixnum,
+                    ..
+                }
+            )
+        });
+        assert!(
+            found,
+            "expected String/Fixnum mismatch in else-branch, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn fixnum_check_narrows_in_arithmetic() {
+        // x : Any; `(if (fixnum? x) (fx+ x 1) 0)` — fx+ requires
+        // Fixnum, and `fixnum?` narrows x to Fixnum in then.
+        let src = "\
+            (: inc (-> Any Fixnum))
+            (define (inc [x : Any]) : Fixnum
+              (if (fixnum? x) (fx+ x 1) 0))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn narrowing_only_fires_when_arg_is_a_ref() {
+        // Narrowing requires `(pred Ref(x))`. A complex
+        // expression as the arg shouldn't narrow anything (and
+        // shouldn't error either — gradual fallback).
+        let src = "\
+            (: head (-> (U Pair Null) Any))
+            (define (head [lst : (U Pair Null)]) : Any
+              (if (null? (car lst)) #f #t))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let errors = checker.check_program(&core);
+        // (car lst) fails because lst isn't narrowed to Pair —
+        // no `null?` on a bare `lst` to trigger narrowing.
+        let mismatch = errors
+            .iter()
+            .any(|e| matches!(e, TypeError::Mismatch { .. }));
+        assert!(
+            mismatch,
+            "expected Mismatch (car on non-narrowed lst), got: {errors:?}"
+        );
     }
 
     // -------- Phase 3 iter 3.4: variadic / rest args --------

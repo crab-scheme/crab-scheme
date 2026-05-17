@@ -177,6 +177,59 @@ pub fn check(expr: &CoreExpr, expected: &Type, env: &mut TypeEnv) -> Result<(), 
     }
 }
 
+/// Narrow `t` to the positive proposition of `filter` — the
+/// type the operand has if the predicate returned true.
+///
+/// Rules (Phase 4 iter 4.2):
+/// - If `t <: filter`, no change (already as narrow as possible).
+/// - If `t` is a `Union`, keep only members that are subtypes
+///   of `filter`. Members that are non-subtypes drop because
+///   the predicate ruled them out.
+/// - If `filter <: t`, narrow to `filter`.
+/// - Otherwise the operand's type and the filter are disjoint;
+///   the then-branch is unreachable, so narrow to `Never`.
+pub fn narrow_positive(t: &Type, filter: &Type) -> Type {
+    if subtype(t, filter) {
+        return t.clone();
+    }
+    if let Type::Union(members) = t {
+        let kept: Vec<Type> = members
+            .iter()
+            .filter(|m| subtype(m, filter))
+            .cloned()
+            .collect();
+        return Type::union(kept);
+    }
+    if subtype(filter, t) {
+        return filter.clone();
+    }
+    Type::Never
+}
+
+/// Narrow `t` to the negative proposition of `filter` — the
+/// type the operand has if the predicate returned false.
+///
+/// Rules:
+/// - If `t` is a `Union`, drop members that are subtypes of
+///   `filter`.
+/// - If `t <: filter`, narrow to `Never` (the else-branch is
+///   unreachable).
+/// - Otherwise return `t` unchanged — we can't subtract.
+pub fn narrow_negative(t: &Type, filter: &Type) -> Type {
+    if let Type::Union(members) = t {
+        let kept: Vec<Type> = members
+            .iter()
+            .filter(|m| !subtype(m, filter))
+            .cloned()
+            .collect();
+        return Type::union(kept);
+    }
+    if subtype(t, filter) {
+        return Type::Never;
+    }
+    t.clone()
+}
+
 /// `check`'s helper for `App`. When the operator infers to a
 /// `Procedure_(pt)`:
 /// 1. Arity mismatch → `ArityMismatch`.
