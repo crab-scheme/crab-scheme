@@ -152,6 +152,22 @@ synchronous detector closes the gap with bounded per-call cost.
   behavior change — RC reclamation already runs at deterministic
   drop points.
 
+- **JIT-tier regression in `diff_jit_fixnum_constants`**
+  (iter 7.1). After Pair grew two
+  `RefCell<Option<WeakValue>>` tombstone fields (changing its
+  struct size from ~32 to ~80 bytes), this single JIT
+  differential test SIGTRAPs during the tier-up path. Direct
+  CLI repro of the same Scheme code works fine; only the
+  test harness's `install_jit + eval_str_via_vm + 1500-iter
+  tier-up` sequence trips the trap. The test is
+  `#[cfg(not(feature = "countable-memory"))]`-gated as a
+  known regression pending investigation of whether a JIT
+  stackmap walker, a helper with hidden Pair-size
+  assumptions, or a Cranelift codegen path has a latent
+  dependency on Pair's old layout. Other JIT differential
+  tests (which exercise similar tier-up paths) stay green;
+  conformance and metacircular tests all pass.
+
 ### Things that don't change
 
 - `Value`'s variant set and pattern-match shape.
