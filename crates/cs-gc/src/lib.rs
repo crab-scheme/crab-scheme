@@ -36,3 +36,6 @@ pub use tracing::{Gc, Heap, Marker, Trace};
 mod rc_only;
 #[cfg(feature = "countable-memory")]
 pub use rc_only::{Gc, Weak};
+
+#[cfg(feature = "countable-memory")]
+pub mod cycle;
