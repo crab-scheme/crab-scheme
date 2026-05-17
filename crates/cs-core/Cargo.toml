@@ -12,6 +12,11 @@ license.workspace = true
 # under the same #[cfg].
 default = ["countable-memory"]
 countable-memory = ["cs-gc/countable-memory"]
+# Forwards the cs-gc `regions` feature so the layer-3 (region
+# memory) Promote trait + deep-promotion machinery becomes
+# available on Value. Off by default until region-memory spec
+# iter 6.
+regions = ["cs-gc/regions"]
 
 [dependencies]
 cs-diag = { workspace = true }

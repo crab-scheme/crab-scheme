@@ -271,6 +271,41 @@ impl<T: 'static> Gc<T> {
         Gc(GcRepr::Rc(Rc::new(value)))
     }
 
+    /// Promote a region-backed `Gc<T>` to Rc-backed (global
+    /// heap), severing the dependency on the owning region's
+    /// lifetime. No-op on already Rc-backed handles.
+    ///
+    /// Cloning happens through `T: Clone`. For values
+    /// containing inner `Gc<U>` handles (e.g., `Pair` with
+    /// region-allocated `car`/`cdr`), `T: Clone` is shallow —
+    /// the inner handles are duplicated as region handles, not
+    /// promoted. For deep promotion across a Value tree, use
+    /// `cs_core::Promote::promote_deep` (layer wraps this on a
+    /// per-variant basis).
+    ///
+    /// Called by layer 5 (escape analysis) at allocation
+    /// sites where the value provably escapes its region.
+    /// Manual region users invoke this directly when they
+    /// know a value needs to outlive its region.
+    #[cfg(feature = "regions")]
+    pub fn promote(this: &mut Self)
+    where
+        T: Clone,
+    {
+        // Only mutate if currently Region-backed.
+        if let GcRepr::Region { ptr, region_id } = &this.0 {
+            assert_region_live(*region_id);
+            // SAFETY: region is alive (just checked); the
+            // slot is in its arena and readable.
+            let cloned: T = unsafe { ptr.as_ref().value.clone() };
+            // Replacing the variant runs Drop on the old
+            // GcRepr (decrements the in-arena refcount; the
+            // region still owns the slot, so this is fine).
+            this.0 = GcRepr::Rc(Rc::new(cloned));
+        }
+        // Rc arm: nothing to do.
+    }
+
     /// Construct a new `Gc<T>` over `value` allocated in
     /// `region`'s bump arena (layer 3 of the unified memory
     /// management architecture, ADR 0015).
@@ -485,7 +520,7 @@ impl<T: ?Sized> Weak<T> {
 mod tests {
     use super::*;
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Clone)]
     struct Leaf {
         n: i64,
     }
@@ -581,5 +616,41 @@ mod tests {
     fn is_region_false_for_rc_backed() {
         let g = Gc::new(Leaf { n: 0 });
         assert!(!Gc::is_region(&g));
+    }
+
+    #[cfg(feature = "regions")]
+    #[test]
+    fn promote_rc_arm_is_noop() {
+        let mut g = Gc::new(Leaf { n: 5 });
+        let addr_before = Gc::as_addr(&g);
+        Gc::promote(&mut g);
+        assert!(!Gc::is_region(&g));
+        // Address stable — no replacement, no clone.
+        assert_eq!(Gc::as_addr(&g), addr_before);
+    }
+
+    #[cfg(feature = "regions")]
+    #[test]
+    fn promote_region_arm_switches_to_rc() {
+        use crate::region::Region;
+        let mut g = {
+            let region = Region::new();
+            let mut g = Gc::new_in(&region, Leaf { n: 99 });
+            assert!(Gc::is_region(&g));
+            Gc::promote(&mut g);
+            assert!(!Gc::is_region(&g));
+            // g now points into the global Rc heap; the region
+            // can drop while we hold g.
+            g
+            // region drops here.
+        };
+        // Touch g after region dropped — would have UB-panicked
+        // pre-promote; safe now because promote deep-cloned.
+        assert_eq!(g.n, 99);
+        assert_eq!(Gc::strong_count(&g), 1);
+        // And further promote is a no-op.
+        Gc::promote(&mut g);
+        assert!(!Gc::is_region(&g));
+        assert_eq!(g.n, 99);
     }
 }

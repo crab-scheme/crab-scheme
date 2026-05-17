@@ -56,6 +56,25 @@ impl Pair {
         })
     }
 
+    /// Construct a Pair allocated in `region`'s bump arena
+    /// (region-memory iter 4). Layer-5 escape analysis emits
+    /// this when it proves the Pair's lifetime is bounded by
+    /// some surrounding scope.
+    #[cfg(feature = "regions")]
+    pub fn new_in(region: &cs_gc::Region, car: Value, cdr: Value) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new_in(
+            region,
+            Pair {
+                car: RefCell::new(car),
+                cdr: RefCell::new(cdr),
+                #[cfg(feature = "countable-memory")]
+                car_weak: RefCell::new(None),
+                #[cfg(feature = "countable-memory")]
+                cdr_weak: RefCell::new(None),
+            },
+        )
+    }
+
     /// Read the car as a `Value`. Under countable-memory, an
     /// upgraded weak tombstone takes precedence over the strong
     /// slot — so broken cycles still produce the user-observable
@@ -404,20 +423,20 @@ pub enum Port {
     FileOutput(RefCell<FileOutputState>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileOutputState {
     pub path: String,
     pub buf: Vec<u8>,
     pub closed: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StringInputState {
     pub chars: Vec<char>,
     pub pos: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ByteVectorInputState {
     pub bytes: Vec<u8>,
     pub pos: usize,

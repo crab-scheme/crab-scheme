@@ -11,6 +11,11 @@ pub mod number;
 pub mod symbol;
 pub mod value;
 
+#[cfg(feature = "regions")]
+pub mod promote;
+#[cfg(feature = "regions")]
+pub use promote::Promote;
+
 pub use number::{NumError, Number};
 pub use symbol::{Symbol, SymbolTable};
 pub use value::{

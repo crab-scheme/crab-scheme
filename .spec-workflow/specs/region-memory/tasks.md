@@ -181,7 +181,7 @@ iter is a single commit per the per-iter commit policy.
 
 ## Iter 4 — `Gc::promote` for escape-to-Rc
 
-- [ ] 6. Implement `Gc::promote` for `T: Clone`
+- [x] 6. Implement `Gc::promote` for `T: Clone`
   - File: `crates/cs-gc/src/rc_only.rs`
   - Add `Gc::promote(this: &mut Self)` per design.md
     §"Component 7":
@@ -210,7 +210,7 @@ iter is a single commit per the per-iter commit policy.
     the value — should still return the original i64 (deep
     cloned into Rc heap)._
 
-- [ ] 7. `Promote` trait for deep promotion of cs-core types
+- [x] 7. `Promote` trait for deep promotion of cs-core types
   - File: `crates/cs-core/src/value.rs`
   - Add a `Promote` trait (also gated on `regions`):
     ```rust
@@ -248,7 +248,7 @@ iter is a single commit per the per-iter commit policy.
     drops the region — the resulting Pair tree is intact in
     Rc storage._
 
-- [ ] 8. Promote tests
+- [x] 8. Promote tests
   - File: `crates/cs-runtime/tests/region_promote.rs` (new)
   - Cover:
     - Single-level: region-allocated Pair → promote → drop

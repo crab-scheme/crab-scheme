@@ -42,6 +42,11 @@ ffi = ["ffi-dynamic"]
 # forwards to cs-gc). Enables the rc-only Gc<T> + cycle collector
 # path and the parallel CycleVisit impls landed in iters 5-6.
 countable-memory = ["cs-core/countable-memory", "cs-vm/countable-memory"]
+# Forwards the cs-gc `regions` feature so layer-3 (region memory)
+# APIs (`Region`, `Gc::new_in`, `Promote::promote_deep`) are
+# available in runtime contexts. Off by default until
+# region-memory spec iter 6.
+regions = ["cs-core/regions", "cs-gc/regions"]
 
 [dependencies]
 cs-core = { workspace = true }
