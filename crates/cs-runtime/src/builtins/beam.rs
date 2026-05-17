@@ -254,6 +254,315 @@ pub fn key_of(s: &SendableValue) -> Result<cs_table::Key, String> {
 }
 
 // ============================================================
+// BeamState — the global Actor/Table/HotReload state.
+// ============================================================
+//
+// Per the spec, the BEAM-style primops are process-global:
+// PIDs, tables, and module versions are identifiers that any
+// actor in the system can hand to any other actor. We hold the
+// three Rust subsystems in a single shared state and register
+// it once at runtime startup.
+//
+// Thread safety: ActorSystem owns a tokio Runtime that handles
+// its own internal locking; TableRegistry and VersionRegistry
+// are both Arc + DashMap internally. We expose them as
+// Arc-shared handles so any actor's body closure can clone +
+// capture them.
+
+use cs_actor::{ActorRef, ActorSystem, ExitReason, Message};
+use cs_hotreload::VersionRegistry;
+use cs_table::{TableRegistry, TableType};
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// Process-wide singleton holding the ActorSystem, TableRegistry,
+/// and VersionRegistry. Lazily initialised on first access.
+///
+/// Why a singleton instead of per-Runtime state? PIDs are
+/// globally meaningful — actor A in Runtime R1 should be able to
+/// send to actor B in Runtime R2. Stuffing the state into each
+/// Runtime would force cross-Runtime PID resolution. A single
+/// process-wide system matches BEAM's model (one VM, many
+/// processes).
+pub struct BeamState {
+    pub actors: ActorSystem,
+    pub tables: TableRegistry,
+    pub versions: VersionRegistry,
+    pub procs: ProcedureRegistry,
+}
+
+impl BeamState {
+    fn new() -> Self {
+        Self {
+            actors: ActorSystem::new(),
+            tables: TableRegistry::new(),
+            versions: VersionRegistry::new(),
+            procs: ProcedureRegistry::default(),
+        }
+    }
+}
+
+static BEAM_STATE: OnceLock<BeamState> = OnceLock::new();
+
+/// Access the process-wide BeamState, initialising on first call.
+pub fn beam_state() -> &'static BeamState {
+    BEAM_STATE.get_or_init(BeamState::new)
+}
+
+// ============================================================
+// ProcedureRegistry — the answer to "how do thunks cross threads?"
+// ============================================================
+//
+// BEAM solves this with `spawn(Mod, Fun, Args)`: the receiver
+// loads the named module fresh and calls the function. Our v1
+// equivalent: a process-wide registry mapping a Scheme-side
+// symbol-name to a Rust closure that runs inside the spawned
+// actor's blocking thread.
+//
+// The Scheme-side workflow:
+//   (register-procedure! 'my-mod:start <rust-defined entry>)
+//   (spawn 'my-mod:start arg1 arg2 ...)
+//
+// For now `register-procedure!` is only callable from Rust (tests,
+// FFI). The follow-up iter teaches the registrar to compile a
+// Scheme source-string into a thunk, opening up the registration
+// to Scheme code. Until then, integration tests register their
+// own procedures via [`ProcedureRegistry::register`] directly.
+
+/// A procedure that can run inside a spawned actor's body.
+///
+/// Signature: takes the actor's environment + the decoded
+/// arguments (already converted from SendableValue) and runs
+/// the actor's main loop. The closure is `Send + Sync` so it can
+/// be cloned into the spawned thread without lifetime gymnastics.
+pub type ActorEntry = Arc<dyn Fn(&mut cs_actor::Actor, Vec<SendableValue>) + Send + Sync + 'static>;
+
+#[derive(Default)]
+pub struct ProcedureRegistry {
+    entries: std::sync::Mutex<std::collections::HashMap<String, ActorEntry>>,
+}
+
+impl ProcedureRegistry {
+    /// Register a procedure under a canonical name. Overwrites
+    /// any prior registration (matches hot-reload semantics —
+    /// later registrations replace earlier ones).
+    pub fn register(&self, name: &str, entry: ActorEntry) {
+        self.entries
+            .lock()
+            .expect("procedure registry poisoned")
+            .insert(name.to_string(), entry);
+    }
+
+    /// Look up by name. Returns a clone of the Arc so the caller
+    /// can hand it to the spawned thread.
+    pub fn lookup(&self, name: &str) -> Option<ActorEntry> {
+        self.entries
+            .lock()
+            .expect("procedure registry poisoned")
+            .get(name)
+            .cloned()
+    }
+}
+
+// ============================================================
+// Primop implementations (Rust side).
+// ============================================================
+//
+// These functions are the Rust-callable shape of the BEAM
+// primops. The Scheme-builtin wrappers further down convert
+// Value <-> SendableValue at the boundary and call into these.
+
+/// `(spawn 'name args...)` — look up the named entry in the
+/// procedure registry and spawn an actor that runs it.
+pub fn primop_spawn(name: &str, args: Vec<SendableValue>) -> Result<ActorPid, String> {
+    let st = beam_state();
+    let entry = st
+        .procs
+        .lookup(name)
+        .ok_or_else(|| format!("spawn: no procedure registered under {:?}", name))?;
+    let actor_ref = st.actors.spawn(move |actor| entry(actor, args));
+    Ok(actor_ref.pid())
+}
+
+/// `(send pid v)` — deliver `v` to the actor identified by `pid`.
+/// Fails only if the actor has terminated.
+pub fn primop_send(pid: ActorPid, value: SendableValue) -> Result<(), String> {
+    let st = beam_state();
+    let actor_ref = st
+        .actors
+        .lookup(pid)
+        .ok_or_else(|| format!("send: actor {} not found (terminated?)", pid))?;
+    actor_ref
+        .send(payload_of(value))
+        .map_err(|e| format!("send to {}: {}", pid, e))
+}
+
+/// Look up an ActorRef given a PID. Returns None if the actor
+/// is dead. Useful for the supervisor / behavior plumbing that
+/// wants to construct fresh references.
+pub fn lookup_pid(pid: ActorPid) -> Option<ActorRef> {
+    beam_state().actors.lookup(pid)
+}
+
+/// `(raw-receive timeout-ms)` — receive the next message. Pass
+/// `None` for a blocking receive; `Some(0)` for try-once;
+/// `Some(N)` for up to N ms wait.
+///
+/// Returns:
+/// - `Ok(Some(sv))` — a user message
+/// - `Ok(None)` — timeout fired (only with `Some(ms)`)
+/// - `Err(reason)` — the actor's mailbox is closed (system
+///   shutting down)
+///
+/// System messages (Exit/Down) are converted to tagged lists
+/// the Scheme `(receive)` macro can pattern-match:
+///   `(*exit* <from-pid-symbol> <reason-string>)`
+///   `(*down* <ref-id> <pid-symbol> <reason-string>)`
+pub fn primop_raw_receive(
+    actor: &mut cs_actor::Actor,
+    timeout_ms: Option<u64>,
+) -> Result<Option<SendableValue>, String> {
+    let msg_opt = match timeout_ms {
+        None => actor.receive(),
+        Some(0) => match actor.try_receive() {
+            Ok(m) => Some(m),
+            Err(cs_actor::TryRecvError::Empty) => return Ok(None),
+            Err(cs_actor::TryRecvError::Disconnected) => {
+                return Err("raw-receive: mailbox closed".into())
+            }
+        },
+        Some(ms) => {
+            // Spin-poll with a short sleep until deadline. Crude
+            // but correct; B3's async-receive uses tokio's
+            // mailbox-with-timeout primitive directly. For v1
+            // this is fine since we're on a dedicated blocking
+            // thread per actor.
+            let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+            loop {
+                match actor.try_receive() {
+                    Ok(m) => break Some(m),
+                    Err(cs_actor::TryRecvError::Disconnected) => {
+                        return Err("raw-receive: mailbox closed".into())
+                    }
+                    Err(cs_actor::TryRecvError::Empty) => {
+                        if std::time::Instant::now() >= deadline {
+                            return Ok(None);
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+    };
+
+    let msg = match msg_opt {
+        Some(m) => m,
+        None => return Err("raw-receive: mailbox closed".into()),
+    };
+
+    Ok(Some(message_to_sendable(msg)))
+}
+
+fn message_to_sendable(msg: Message) -> SendableValue {
+    match msg {
+        Message::User(payload) => payload_to_sendable(&payload).unwrap_or_else(|| {
+            // Payloads from Rust-side test fixtures that don't
+            // use SendableValue come through as opaque-tagged
+            // values. Wrap as a placeholder symbol so Scheme
+            // pattern-match still has something to compare.
+            SendableValue::Symbol("*opaque-payload*".into())
+        }),
+        Message::Exit { from, reason } => sendable_list(vec![
+            SendableValue::Symbol("*exit*".into()),
+            SendableValue::Pid(from),
+            SendableValue::Symbol(exit_reason_str(&reason)),
+        ]),
+        Message::Down {
+            ref_id,
+            pid,
+            reason,
+        } => sendable_list(vec![
+            SendableValue::Symbol("*down*".into()),
+            SendableValue::Fixnum(ref_id as i64),
+            SendableValue::Pid(pid),
+            SendableValue::Symbol(exit_reason_str(&reason)),
+        ]),
+    }
+}
+
+fn exit_reason_str(r: &ExitReason) -> String {
+    match r {
+        ExitReason::Normal => "normal".into(),
+        ExitReason::Killed => "killed".into(),
+        ExitReason::User(s) => s.clone(),
+        ExitReason::Error(s) => format!("error:{}", s),
+    }
+}
+
+fn sendable_list(items: Vec<SendableValue>) -> SendableValue {
+    let mut acc = SendableValue::Null;
+    for item in items.into_iter().rev() {
+        acc = SendableValue::Pair(Box::new(item), Box::new(acc));
+    }
+    acc
+}
+
+// ============================================================
+// cs-table primop implementations.
+// ============================================================
+
+pub fn primop_make_table(name: &str, type_str: &str) -> Result<(), String> {
+    let ty = match type_str {
+        "set" => TableType::Set,
+        "ordered-set" | "ordered_set" => TableType::OrderedSet,
+        other => return Err(format!("make-table: unknown type {:?}", other)),
+    };
+    beam_state()
+        .tables
+        .create(name, ty)
+        .map_err(|e| format!("make-table: {}", e))
+}
+
+pub fn primop_table_insert(
+    name: &str,
+    key: SendableValue,
+    value: SendableValue,
+) -> Result<(), String> {
+    let k = key_of(&key)?;
+    beam_state()
+        .tables
+        .insert(name, k, payload_of(value))
+        .map_err(|e| format!("table-insert!: {}", e))
+}
+
+pub fn primop_table_lookup(
+    name: &str,
+    key: &SendableValue,
+) -> Result<Option<SendableValue>, String> {
+    let k = key_of(key)?;
+    let p = beam_state()
+        .tables
+        .lookup(name, &k)
+        .map_err(|e| format!("table-lookup: {}", e))?;
+    Ok(p.and_then(|payload| payload_to_sendable(&payload)))
+}
+
+pub fn primop_table_delete(name: &str, key: &SendableValue) -> Result<bool, String> {
+    let k = key_of(key)?;
+    beam_state()
+        .tables
+        .delete(name, &k)
+        .map_err(|e| format!("table-delete!: {}", e))
+}
+
+pub fn primop_table_size(name: &str) -> Result<usize, String> {
+    beam_state()
+        .tables
+        .size(name)
+        .map_err(|e| format!("table-size: {}", e))
+}
+
+// ============================================================
 // Tests.
 // ============================================================
 
@@ -445,5 +754,195 @@ mod tests {
         } else {
             panic!("expected Symbol for PID");
         }
+    }
+
+    // ----------------------------------------------------------
+    // Integration tests against the live BeamState singleton.
+    //
+    // Tests use unique procedure / table names so they don't
+    // collide despite cargo running them in parallel.
+    // ----------------------------------------------------------
+
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    #[test]
+    fn spawn_send_receive_round_trip() {
+        // Spawn an echo actor that receives one message and
+        // stores it where the test thread can read it.
+        let received: Arc<std::sync::Mutex<Option<SendableValue>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let received_clone = received.clone();
+
+        beam_state().procs.register(
+            "test:echo-once",
+            Arc::new(move |actor, _args| {
+                if let Ok(Some(msg)) = primop_raw_receive(actor, None) {
+                    *received_clone.lock().unwrap() = Some(msg);
+                }
+            }),
+        );
+
+        let pid = primop_spawn("test:echo-once", vec![]).expect("spawn");
+        primop_send(pid, SendableValue::Fixnum(42)).expect("send");
+
+        // Wait for the echo actor to wake + record. 1s is plenty.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if received.lock().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("echo actor never received");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(*received.lock().unwrap(), Some(SendableValue::Fixnum(42)));
+    }
+
+    #[test]
+    fn ping_pong_two_actors() {
+        // Pong: receive ('ping reply-to), send back ('pong)
+        // Ping: spawn pong, send ('ping self), receive, store.
+
+        let result: Arc<std::sync::Mutex<Option<SendableValue>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+
+        beam_state().procs.register(
+            "test:pong",
+            Arc::new(move |actor, _args| {
+                if let Ok(Some(msg)) = primop_raw_receive(actor, None) {
+                    // Expected: (cons 'ping reply-pid)
+                    if let SendableValue::Pair(head, tail) = msg {
+                        if matches!(*head, SendableValue::Symbol(ref s) if s == "ping") {
+                            if let SendableValue::Pid(reply) = *tail {
+                                let _ = primop_send(reply, SendableValue::Symbol("pong".into()));
+                            }
+                        }
+                    }
+                }
+            }),
+        );
+
+        beam_state().procs.register(
+            "test:ping",
+            Arc::new(move |actor, args| {
+                let pong_pid = match args.first() {
+                    Some(SendableValue::Pid(p)) => *p,
+                    _ => return,
+                };
+                let my_pid = actor.self_ref().pid();
+                let msg = SendableValue::Pair(
+                    Box::new(SendableValue::Symbol("ping".into())),
+                    Box::new(SendableValue::Pid(my_pid)),
+                );
+                let _ = primop_send(pong_pid, msg);
+                if let Ok(Some(reply)) = primop_raw_receive(actor, Some(1000)) {
+                    *result_clone.lock().unwrap() = Some(reply);
+                }
+            }),
+        );
+
+        let pong_pid = primop_spawn("test:pong", vec![]).expect("spawn pong");
+        let _ping_pid =
+            primop_spawn("test:ping", vec![SendableValue::Pid(pong_pid)]).expect("spawn ping");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if result.lock().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("ping/pong never completed");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(
+            *result.lock().unwrap(),
+            Some(SendableValue::Symbol("pong".into()))
+        );
+    }
+
+    #[test]
+    fn raw_receive_timeout_returns_none() {
+        // Actor that never gets a message; raw-receive with a
+        // short timeout returns Ok(None).
+        let outcome: Arc<AtomicI64> = Arc::new(AtomicI64::new(-1));
+        let outcome_clone = outcome.clone();
+
+        beam_state().procs.register(
+            "test:timeout-actor",
+            Arc::new(
+                move |actor, _args| match primop_raw_receive(actor, Some(50)) {
+                    Ok(None) => outcome_clone.store(0, Ordering::SeqCst),
+                    Ok(Some(_)) => outcome_clone.store(1, Ordering::SeqCst),
+                    Err(_) => outcome_clone.store(2, Ordering::SeqCst),
+                },
+            ),
+        );
+
+        let _pid = primop_spawn("test:timeout-actor", vec![]).expect("spawn");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if outcome.load(Ordering::SeqCst) >= 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("timeout actor never finished");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(outcome.load(Ordering::SeqCst), 0, "expected Ok(None)");
+    }
+
+    #[test]
+    fn table_crud_round_trip() {
+        let tn = "test:crud-table";
+        primop_make_table(tn, "set").expect("make-table");
+        primop_table_insert(
+            tn,
+            SendableValue::String("alice".into()),
+            SendableValue::Fixnum(1),
+        )
+        .expect("insert");
+        primop_table_insert(
+            tn,
+            SendableValue::String("bob".into()),
+            SendableValue::Fixnum(2),
+        )
+        .expect("insert");
+
+        assert_eq!(
+            primop_table_lookup(tn, &SendableValue::String("alice".into())).unwrap(),
+            Some(SendableValue::Fixnum(1))
+        );
+        assert_eq!(primop_table_size(tn).unwrap(), 2);
+
+        let removed =
+            primop_table_delete(tn, &SendableValue::String("alice".into())).expect("delete");
+        assert!(removed);
+        assert_eq!(primop_table_size(tn).unwrap(), 1);
+        assert_eq!(
+            primop_table_lookup(tn, &SendableValue::String("alice".into())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn make_table_twice_errors() {
+        let tn = "test:dup-table";
+        primop_make_table(tn, "set").expect("first create");
+        let err = primop_make_table(tn, "set").expect_err("second should fail");
+        assert!(err.contains("already exists"), "got: {}", err);
+    }
+
+    #[test]
+    fn table_unknown_type_errors() {
+        let err = primop_make_table("test:bad-type-table", "bag").expect_err("bag unsupported");
+        assert!(err.contains("unknown type"), "got: {}", err);
     }
 }

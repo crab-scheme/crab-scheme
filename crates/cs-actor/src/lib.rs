@@ -75,6 +75,11 @@ use rustc_hash::FxHashMap;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+// Re-export the tokio mpsc error type used in [`Actor::try_receive`]'s
+// signature so downstream crates can match on it without depending on
+// tokio themselves.
+pub use tokio::sync::mpsc::error::TryRecvError;
+
 // ---------- Identifiers ----------
 
 /// A process identifier. Equivalent of Erlang's pid.
