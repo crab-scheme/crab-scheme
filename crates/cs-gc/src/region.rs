@@ -57,7 +57,8 @@
 
 #![cfg(feature = "regions")]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
@@ -135,13 +136,72 @@ impl Default for Region {
     }
 }
 
+thread_local! {
+    /// Set of `RegionId`s for regions currently alive on this
+    /// thread. `Region::new` inserts; `Region::Drop` removes
+    /// **before** the underlying Bump arena frees, so debug-
+    /// mode region-validity checks in `Gc<T>` methods can
+    /// detect use-after-region-drop.
+    ///
+    /// Used only under `#[cfg(debug_assertions)]` for the
+    /// validity check; updated unconditionally so the test
+    /// suite can interrogate it.
+    static LIVE_REGION_IDS: RefCell<HashSet<RegionId>> = RefCell::new(HashSet::new());
+}
+
+/// Debug-mode check that `region_id` corresponds to a region
+/// currently alive on this thread. Panics with a clear
+/// diagnostic if not.
+///
+/// In release builds this compiles to nothing — correctness
+/// relies on layer-5 escape analysis (or manual region
+/// discipline) ensuring no `Gc<T>` outlives its region.
+#[inline]
+pub(crate) fn assert_region_live(region_id: RegionId) {
+    #[cfg(debug_assertions)]
+    LIVE_REGION_IDS.with(|s| {
+        if !s.borrow().contains(&region_id) {
+            panic!(
+                "cs_gc::Gc<T>: region {region_id:?} dropped while \
+                 a handle into it is still outstanding (use-after-region-drop)"
+            );
+        }
+    });
+    #[cfg(not(debug_assertions))]
+    let _ = region_id;
+}
+
+/// `true` if `region_id` is currently alive on this thread.
+/// Available in both debug and release; used by `Gc::Drop`
+/// to skip the slot decrement when the region has already
+/// freed (release-mode best-effort to avoid UB).
+#[inline]
+pub(crate) fn is_region_live(region_id: RegionId) -> bool {
+    LIVE_REGION_IDS.with(|s| s.borrow().contains(&region_id))
+}
+
+/// Test-only accessor for the live-region-id count. Used by
+/// region.rs's own unit tests to verify Region::new/Drop
+/// bookkeeping; not exposed beyond the crate.
+#[cfg(test)]
+pub(crate) fn live_region_count() -> usize {
+    LIVE_REGION_IDS.with(|s| s.borrow().len())
+}
+
 impl Region {
     /// Create a fresh region with a unique id and an empty
     /// bump arena. The arena grows on demand as allocations
-    /// arrive.
+    /// arrive. Registers the region's id with the per-thread
+    /// `LIVE_REGION_IDS` set so debug-mode `Gc<T>` operations
+    /// can validate that handles into this region are still
+    /// in scope.
     pub fn new() -> Self {
+        let id = RegionId::fresh();
+        LIVE_REGION_IDS.with(|s| {
+            s.borrow_mut().insert(id);
+        });
         Region {
-            id: RegionId::fresh(),
+            id,
             arena: Bump::new(),
             _not_send: PhantomData,
         }
@@ -191,12 +251,24 @@ impl Region {
     }
 }
 
-// Region intentionally does NOT implement Drop — the Bump
-// arena's own Drop frees the entire backing memory, which
-// is the bulk-free behaviour we want. Adding a custom Drop
-// here would risk double-free or interfere with iter-3's
-// debug-mode region-validity tracking (which needs to run
-// BEFORE the arena frees). Iter 3 wires that.
+impl Drop for Region {
+    fn drop(&mut self) {
+        // Unregister this region from the live-id set BEFORE
+        // the underlying Bump arena frees its memory. Debug-
+        // mode `Gc<T>` operations check this set; an
+        // outstanding handle accessed after region drop would
+        // panic if we'd missed this step (which is correct —
+        // the access would otherwise hit freed memory).
+        //
+        // Field-drop order: fields drop in declaration order
+        // after this Drop fn returns. `id` is Copy so it's
+        // unaffected; the Bump arena drops last (when this fn
+        // returns), freeing all allocations.
+        LIVE_REGION_IDS.with(|s| {
+            s.borrow_mut().remove(&self.id);
+        });
+    }
+}
 
 #[cfg(test)]
 mod tests {

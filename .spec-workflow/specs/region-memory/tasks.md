@@ -115,7 +115,7 @@ iter is a single commit per the per-iter commit policy.
 
 ## Iter 3 — `Gc::new_in` + debug-mode validity
 
-- [ ] 4. Implement `Gc::new_in(region, v)` + thread-local
+- [x] 4. Implement `Gc::new_in(region, v)` + thread-local
   region tracking
   - File: `crates/cs-gc/src/rc_only.rs`,
     `crates/cs-gc/src/region.rs`
@@ -145,7 +145,7 @@ iter is a single commit per the per-iter commit policy.
     allocates a Gc, drops the region, accesses the Gc → panics
     with the expected diagnostic in debug builds._
 
-- [ ] 5. Integration tests for region lifetime
+- [x] 5. Integration tests for region lifetime
   - File: `crates/cs-gc/tests/region.rs` (new)
   - Cover:
     - `region_alloc_basic_lifetime` — Region::new, alloc 10

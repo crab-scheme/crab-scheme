@@ -40,7 +40,7 @@ use std::rc::{Rc, Weak as RawWeak};
 use std::ptr::NonNull;
 
 #[cfg(feature = "regions")]
-use crate::region::{RegionId, RegionSlot};
+use crate::region::{assert_region_live, is_region_live, Region, RegionId, RegionSlot};
 
 /// Internal discriminated representation of a `Gc<T>`.
 ///
@@ -73,11 +73,14 @@ impl<T: ?Sized> Clone for GcRepr<T> {
             GcRepr::Rc(rc) => GcRepr::Rc(Rc::clone(rc)),
             #[cfg(feature = "regions")]
             GcRepr::Region { ptr, region_id } => {
+                // Iter 3: debug-mode use-after-region-drop
+                // check. In release this is a no-op; soundness
+                // relies on layer-5 escape analysis or manual
+                // region discipline.
+                assert_region_live(*region_id);
                 // SAFETY: while `self` (a `Gc<T>`) exists, the
-                // slot is alive (debug-mode region-validity
-                // check in iter 3 enforces; release relies on
-                // layer-5 escape analysis or manual region
-                // discipline).
+                // slot is alive (debug-mode check above
+                // enforces in dev builds).
                 unsafe {
                     let slot = ptr.as_ref();
                     slot.strong.set(
@@ -129,9 +132,12 @@ impl<T: ?Sized> Deref for Gc<T> {
         match &self.0 {
             GcRepr::Rc(rc) => rc,
             #[cfg(feature = "regions")]
-            GcRepr::Region { ptr, .. } => {
+            GcRepr::Region { ptr, region_id } => {
+                // Iter 3: validate the region still exists
+                // before dereferencing the in-arena pointer.
+                assert_region_live(*region_id);
                 // SAFETY: while `self` exists, the slot is
-                // alive (see GcRepr docs).
+                // alive (debug-mode check above enforces).
                 unsafe { &ptr.as_ref().value }
             }
         }
@@ -190,7 +196,8 @@ impl<T: ?Sized> Gc<T> {
         match &this.0 {
             GcRepr::Rc(rc) => Rc::strong_count(rc),
             #[cfg(feature = "regions")]
-            GcRepr::Region { ptr, .. } => {
+            GcRepr::Region { ptr, region_id } => {
+                assert_region_live(*region_id);
                 // SAFETY: while `this` exists, the slot is alive.
                 unsafe { ptr.as_ref().strong.get() as usize }
             }
@@ -262,6 +269,35 @@ impl<T: 'static> Gc<T> {
     /// [`Gc::new_in`](Self::new_in) (region-memory iter 3).
     pub fn new(value: T) -> Self {
         Gc(GcRepr::Rc(Rc::new(value)))
+    }
+
+    /// Construct a new `Gc<T>` over `value` allocated in
+    /// `region`'s bump arena (layer 3 of the unified memory
+    /// management architecture, ADR 0015).
+    ///
+    /// The returned handle's strong count starts at 1 (stored
+    /// in the in-line per-allocation header). Clones bump the
+    /// count; drops decrement. **The count does NOT drive
+    /// reclamation** — the value lives until `region` drops,
+    /// at which point all of the region's allocations free in
+    /// one operation.
+    ///
+    /// # Safety + lifetime contract
+    ///
+    /// The returned `Gc<T>` must not outlive `region`. Layer
+    /// 5 (escape analysis) statically enforces this for
+    /// compiled programs; manual region users are
+    /// responsible. In debug builds, accessing a `Gc<T>`
+    /// whose region has already dropped panics with a clear
+    /// diagnostic. In release, the access is undefined
+    /// behaviour.
+    #[cfg(feature = "regions")]
+    pub fn new_in(region: &Region, value: T) -> Self {
+        let ptr = region.alloc(value);
+        Gc(GcRepr::Region {
+            ptr,
+            region_id: region.id(),
+        })
     }
 }
 
@@ -357,10 +393,21 @@ impl<T: ?Sized> Drop for Gc<T> {
                 // for us to do here.
             }
             #[cfg(feature = "regions")]
-            GcRepr::Region { ptr, .. } => {
+            GcRepr::Region { ptr, region_id } => {
+                // Iter 3: skip the slot decrement entirely if
+                // the owning region already dropped. The slot
+                // memory is already freed by the bump arena;
+                // touching `slot.strong` would be UB. (In a
+                // well-disciplined program this branch is
+                // never taken — but if it is, this is the best
+                // we can do in release without panicking.)
+                if !is_region_live(*region_id) {
+                    return;
+                }
                 // Decrement the in-line refcount. The region's
                 // own Drop handles reclamation; we just bookkeep.
-                // SAFETY: while `self` exists, the slot is alive.
+                // SAFETY: region is alive (just checked); slot
+                // is in its arena.
                 unsafe {
                     let slot = ptr.as_ref();
                     let cur = slot.strong.get();
