@@ -13,3 +13,7 @@ cs-diag = { workspace = true }
 cs-ir = { workspace = true }
 cs-parse = { workspace = true }
 cs-rir = { workspace = true }
+
+[dev-dependencies]
+cs-expand = { workspace = true }
+cs-vm = { workspace = true }
