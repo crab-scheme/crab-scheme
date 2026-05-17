@@ -117,37 +117,40 @@ impl Pair {
     ///   orphan the value before any external reclaim could
     ///   observe the cycle.
     ///
-    /// Convention: call sites (`b_set_car` etc.) hold the
-    /// freshly-written value in their `args[1]` slot for the
-    /// duration of the mutation, which counts as +1 strong on
-    /// the allocation. The VM tier's dispatch can layer
-    /// additional temporaries (NB decode, arg-slot, frame
-    /// stack) — up to 3 transient strong refs in observed
-    /// failing cases. Combined with the +1 from the storage
-    /// slot, the conservative baseline is 4; a value with at
-    /// least one persistent external anchor reads as `>= 5`.
-    /// The guard therefore requires `>= 5` to demote.
+    /// `baseline` is the number of transient strong refs to
+    /// the value that the caller knows will drop right after
+    /// this mutation completes. The slot itself counts (+1),
+    /// plus any temporary references the caller holds
+    /// (e.g., `args[1]` in `b_set_car`). The guard demotes
+    /// only when total strong > baseline — i.e., there is at
+    /// least one EXTERNAL anchor that will outlive the
+    /// mutation. Without this gate the demote would orphan
+    /// the value as soon as the caller's temps drop.
     ///
-    /// This is a coarse heuristic that may leak cycles whose
-    /// external anchor count is 1 (a single binding); future
-    /// iter 7.1.x.y can replace it with a per-tier baseline
-    /// passed by the caller.
+    /// Typical baselines:
+    /// - Walker tier `b_set_car` / `b_set_cdr`: 2
+    ///   (slot + `args[1]`).
+    /// - VM tier helpers should pass their own baseline
+    ///   reflecting NB decode + arg-slot + frame-stack
+    ///   transient refs.
     ///
-    /// The strong-count guard handles the
-    /// `(set-car! env (cons name val))` closures-over-env
-    /// pattern from the metacircular by leaving the cycle
-    /// intact rather than orphaning the cons cell; ADR 0014
-    /// §"iter 7.1 follow-ups" tracks the long-tail closure-
-    /// tombstone work that would close more of these cases.
+    /// The guard preserves observability for cycles whose
+    /// only anchor is in the freshly-mutated subgraph (e.g.
+    /// `(set-car! env (cons name val))` closures-over-env in
+    /// the metacircular), at the cost of leaking those
+    /// cycles refcount-wise. ADR 0014 §"iter 7.1.x.y" tracks
+    /// the move from caller-supplied baselines to full
+    /// Bacon-Rajan trial deletion that picks safe cycle
+    /// edges without caller hints.
     #[cfg(feature = "countable-memory")]
-    pub fn break_car_cycle(&self) -> bool {
+    pub fn break_car_cycle(&self, baseline: usize) -> bool {
         // Read strong count WITHOUT cloning so the count
-        // reflects (slot + caller's args[1]) plus any external
-        // refs.
+        // reflects the slot's contribution plus the caller's
+        // declared transient refs and any external anchors.
         let car_borrow = self.car.borrow();
         let total = car_borrow.heap_strong_count().unwrap_or(0);
         drop(car_borrow);
-        if total < 5 {
+        if total <= baseline {
             return false;
         }
         let val = self.car();
@@ -160,13 +163,14 @@ impl Pair {
     }
 
     /// Cycle-break action for the cdr slot. See
-    /// [`break_car_cycle`].
+    /// [`break_car_cycle`] for the `baseline` parameter
+    /// convention.
     #[cfg(feature = "countable-memory")]
-    pub fn break_cdr_cycle(&self) -> bool {
+    pub fn break_cdr_cycle(&self, baseline: usize) -> bool {
         let cdr_borrow = self.cdr.borrow();
         let total = cdr_borrow.heap_strong_count().unwrap_or(0);
         drop(cdr_borrow);
-        if total < 5 {
+        if total <= baseline {
             return false;
         }
         let val = self.cdr();

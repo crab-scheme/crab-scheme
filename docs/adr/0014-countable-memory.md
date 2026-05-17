@@ -186,24 +186,30 @@ synchronous detector closes the gap with bounded per-call cost.
   `cdr_weak` tombstone fields, `Pair::car()` / `cdr()` /
   `set_car()` / `set_cdr()` accessors, ~250 reader sites
   migrated workspace-wide).
-- [x] iter 7.1.x — Strong-count-guarded break.
-  `Pair::break_car_cycle` / `break_cdr_cycle` invoke the
-  Weak-tombstone demote only when the value's total strong
-  count is `>= 5` (an empirical threshold accounting for the
-  slot, the caller's `args[1]`, plus 2–3 transient VM-tier
-  dispatch refs). Cycles with multiple persistent external
-  anchors are reclaimed; cycles whose only anchor is in the
-  freshly-mutated subgraph (the metacircular
-  `(set-car! env (cons name val))` pattern) are detected but
-  intentionally not broken — leaking refcount-wise is the
-  conservative correctness choice vs. orphaning the value.
-  `cs_runtime::countable_memory_cycle::cycle_broken_count`
-  distinguishes detection from successful break.
-- [~] iter 7.1.x.y — Replace the threshold-5 heuristic with a
-  per-tier baseline passed by the caller (precise temp-ref
-  accounting). Alternative: full Bacon-Rajan trial-deletion
-  algorithm that picks a safe cycle edge agnostic to caller
-  conventions.
+- [x] iter 7.1.x — Strong-count-guarded break, initial
+  threshold-5 heuristic (now superseded by 7.1.x.y).
+- [x] iter 7.1.x.y — Caller-supplied baseline.
+  `Pair::break_car_cycle` / `break_cdr_cycle` now take a
+  `baseline: usize` parameter representing the transient
+  strong refs the caller knows about (slot + caller's
+  `args[1]` etc.). The guard demotes when `total > baseline`,
+  i.e., when at least one persistent external anchor exists.
+  `b_set_car` / `b_set_cdr` pass `baseline = 3` (slot +
+  `args[0]` + `args[1]` + one extra transient accounting for
+  the VM tier's NB-stack transient; conservative upper bound
+  shared across walker and VM tiers). The threshold-5 heuristic from
+  iter 7.1.x leaked cycles with a single external anchor
+  (`(set-cdr! x x)` where `x` is top-level-bound — only
+  3 strong refs at break time); the caller-supplied baseline
+  correctly reclaims these. The metacircular
+  `(set-car! env (cons name val))` cycle still
+  correctly skips (total=2, no external beyond slot+args).
+  Verified by `iter_7_1_x_y_top_bound_self_cycle_actually_breaks`
+  in `crates/cs-runtime/tests/cycle_break.rs`.
+- [~] iter 7.1.x.z — Replace caller-supplied baselines with
+  full Bacon-Rajan trial-deletion that picks safe cycle
+  edges agnostic to caller conventions. Would automatically
+  handle VM-tier dispatch baselines that differ from walker.
 - [~] iter 7.1.y — Vector and Hashtable structural break
   tombstones. **Scoped down** to documentation-only deferral
   in this milestone for the following reasons:

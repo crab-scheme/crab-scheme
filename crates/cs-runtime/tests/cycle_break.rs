@@ -1,22 +1,26 @@
-//! Iter 7.1.x regression — verify the strong-count-guarded
-//! cycle break works correctly:
+//! Iter 7.1.x / 7.1.x.y regression — verify the strong-count-
+//! guarded cycle break works correctly:
 //!
 //! 1. Acyclic mutations don't fire the detector and don't
 //!    trigger the break.
 //! 2. Cycles whose only strong holder is the freshly-mutated
-//!    slot are detected but NOT broken (the strong-count guard
-//!    correctly refuses to orphan the value).
-//! 3. Programs that rely on the cyclic semantics (e.g., the
+//!    subgraph are detected but NOT broken (the strong-count
+//!    guard correctly refuses to orphan the value).
+//! 3. Cycles with persistent external anchors (e.g. a top-
+//!    level binding) DO trigger the break: the Weak tombstone
+//!    is set, the cycle stays observable while the anchor
+//!    lives, and reclaims when the anchor drops.
+//! 4. Programs that rely on the cyclic semantics (e.g., the
 //!    metacircular evaluator's env mutations) continue to work
 //!    because the guard preserves observability.
 //!
-//! Actually-breaking cycles requires multiple external anchors
-//! beyond the slot, the mutation argument, and dispatch
-//! temporaries — see Pair::break_car_cycle doc for the
-//! threshold-5 heuristic. This file's tests exercise the
-//! observability contract, not the reclamation contract; the
-//! latter requires a smarter Bacon-Rajan-style algorithm
-//! tracked as iter 7.1.x follow-up.
+//! Iter 7.1.x.y replaced the iter-7.1.x threshold-5 heuristic
+//! with a caller-supplied `baseline: usize` (see
+//! `Pair::break_car_cycle` doc). Walker's `b_set_car` /
+//! `b_set_cdr` pass `baseline = 2` (slot + args[1]). The
+//! `iter_7_1_x_y_top_bound_self_cycle_actually_breaks` test
+//! is the canonical example that iter 7.1.x's heuristic
+//! would have leaked but iter 7.1.x.y reclaims correctly.
 
 #![cfg(feature = "countable-memory")]
 
@@ -127,5 +131,50 @@ fn cycle_broken_count_distinguishes_detect_from_break() {
     assert!(
         broken <= detected,
         "broken count {broken} exceeds detected {detected}"
+    );
+}
+
+#[test]
+fn iter_7_1_x_y_top_bound_self_cycle_actually_breaks() {
+    // Iter 7.1.x.y regression: under the caller-supplied
+    // baseline (b_set_cdr passes 3 = slot + args[0] + args[1]
+    // + VM-tier transient = upper bound across tiers), a top-
+    // level-bound pair's self-cycle demotes to a Weak
+    // tombstone. Total strong at break time for walker:
+    // top env binding (1) + args[0] (1) + args[1] (1) +
+    // p.cdr slot (1) = 4 > baseline=3 → demote fires.
+    //
+    // Without iter 7.1.x.y's caller baseline (the previous
+    // threshold-5 heuristic), total=4 was below threshold
+    // and the break skipped — leaking the cycle.
+    let mut rt = Runtime::new();
+    reset_cycle_detection_count();
+    rt.eval_str(
+        "<top_self_cycle>",
+        r"
+        (define x (cons 1 2))
+        (set-cdr! x x)
+    ",
+    )
+    .expect("eval ok");
+    let detected = cycle_detection_count();
+    let broken = cycle_broken_count();
+    assert!(detected > 0, "detection should have fired");
+    assert!(
+        broken > 0,
+        "iter 7.1.x.y caller-baseline should have permitted the break (detected={detected}, broken={broken})"
+    );
+    // Observability: (car x) is still a fixnum; (cdr x)
+    // upgrades the weak tombstone and returns the cyclic
+    // pair x.
+    let car_val = rt.eval_str("<verify>", "(car x)").expect("car x");
+    assert!(
+        matches!(car_val, cs_core::Value::Number(_)),
+        "(car x) returned {car_val:?}, expected Number"
+    );
+    let cdr_eq_x = rt.eval_str("<verify>", "(eq? (cdr x) x)").expect("eq?");
+    assert!(
+        matches!(cdr_eq_x, cs_core::Value::Boolean(true)),
+        "(eq? (cdr x) x) returned {cdr_eq_x:?}, expected #t"
     );
 }
