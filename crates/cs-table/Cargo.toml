@@ -8,8 +8,11 @@ repository.workspace = true
 description = "CrabScheme in-memory tables, ETS-shaped (set + ordered_set). See docs/research/beam_runtime_spec.md."
 
 [dependencies]
-cs-core = { workspace = true }
+# cs-core is deliberately NOT a dep — payload is type-erased
+# Arc<dyn Any + Send + Sync> so the (still !Send) cs_core::Value
+# doesn't constrain the design. Real Value transport happens at
+# the Scheme primop boundary (post-B3), same pattern as cs-actor.
 thiserror = { workspace = true }
-# B4 picks the concurrent map impl; placeholder dep set.
+dashmap = { workspace = true }
 
 [dev-dependencies]
