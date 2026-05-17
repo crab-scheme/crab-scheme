@@ -870,6 +870,27 @@ impl<'tab> Checker<'tab> {
             self.top_level_lambda_names.borrow_mut().insert(name);
         }
         self.check(value, &target)?;
+        // Phase 5++ recommendation #3: seed env with the
+        // unannotated lambda's INFERRED ProcType so downstream
+        // callers' `infer(App(Ref(name), …))` returns the
+        // precise return type. iter 4.5's per-binding
+        // refinement chains on this — `(let ((v (helper …)))
+        // …)` then sees `v` bound to helper's actual return
+        // type instead of Any. We only seed when the user
+        // didn't ascribe (their declaration wins).
+        if let CoreExpr::Lambda {
+            params,
+            body,
+            span: lspan,
+        } = value
+        {
+            if self.table.ascription(name).is_none() {
+                if let Some(pt) = self.infer_lambda_proc_type(params, body, *lspan) {
+                    self.env
+                        .define_top_level(name, Type::Procedure_(Box::new(pt)));
+                }
+            }
+        }
         // Set itself returns the unspecified value; treat as Any.
         if subtype(&Type::Any, expected) {
             Ok(())
@@ -880,6 +901,46 @@ impl<'tab> Checker<'tab> {
                 span: value.span(),
             })
         }
+    }
+
+    /// Phase 5++ helper: push the lambda's params into a fresh
+    /// scope, infer the body's type, then pop. Returns a
+    /// `ProcType` whose `return_type` reflects what the body
+    /// would actually evaluate to. Used by `check_set` to seed
+    /// `env` with precise return-type info for unannotated
+    /// top-level helpers.
+    ///
+    /// Param types come from the lambda's annotation if any,
+    /// else default to `Any` — we don't try to infer them
+    /// here (that's the per-call-site spec's job).
+    fn infer_lambda_proc_type(
+        &mut self,
+        params: &Params,
+        body: &CoreExpr,
+        span: Span,
+    ) -> Option<ProcType> {
+        let ann = self.table.lambda(span);
+        let scaffold = match ann {
+            Some(a) if a.is_annotated() => lambda_proc_type(params, a),
+            _ => lambda_proc_type_all_any(params),
+        };
+        let Type::Procedure_(pt) = scaffold else {
+            return None;
+        };
+        let mut out = *pt;
+        let mark = self.env.push();
+        for (i, pname) in params.fixed.iter().enumerate() {
+            let pty = out.params.get(i).cloned().unwrap_or(Type::Any);
+            self.env.define(*pname, pty);
+        }
+        if let Some(rest_name) = &params.rest {
+            let rest_elem = out.rest.clone().unwrap_or(Type::Any);
+            self.env
+                .define(*rest_name, Type::Listof(Box::new(rest_elem)));
+        }
+        out.return_type = self.infer(body);
+        self.env.pop_to(mark);
+        Some(out)
     }
 
     fn check_via_infer(&self, expr: &CoreExpr, expected: &Type) -> Result<(), TypeError> {
@@ -1302,6 +1363,32 @@ mod tests {
         let v = hints.get(&helper_sym).expect(
             "helper's narrowed Fixnum hint should compose Phase-4 narrowing + Phase-5++ per-call",
         );
+        assert_eq!(v, &vec![cs_rir::Type::Fixnum]);
+    }
+
+    #[test]
+    fn let_binding_inherits_helper_return_type_for_inference() {
+        // `helper` is an unannotated top-level lambda whose
+        // body is `(fx+ x 1)` — return type infers to Fixnum.
+        // `(let ((v (helper 5))) (use v))` then sees v as
+        // Fixnum (via iter 4.5 per-binding refinement using
+        // helper's seeded return type), and the body's call
+        // `(use v)` records [Fixnum] as use's hint.
+        let src = "\
+            (define (helper x) (fx+ x 1))
+            (define (use n) (fx+ n 100))
+            (define (caller)
+              (let ((v (helper 5)))
+                (use v)))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+        let hints = checker.inferred_hints_by_name();
+        let use_sym = syms.intern("use");
+        let v = hints
+            .get(&use_sym)
+            .expect("use's hint should be Fixnum from helper's inferred return");
         assert_eq!(v, &vec![cs_rir::Type::Fixnum]);
     }
 
