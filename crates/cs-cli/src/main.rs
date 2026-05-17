@@ -1094,6 +1094,20 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Phase 5.3: extract user annotations BEFORE expansion so
+    // cs-expand never sees `[x : T]` markers, then later in
+    // this function consult the typer's hint table to seed
+    // per-lambda `param_type_hints`. Annotation diagnostics
+    // print as warnings but don't block AOT; full Checker
+    // validation is iter 6.2 territory.
+    let (data, typer_table, typer_diags) = cs_typer::extract_annotations(&data, &mut syms);
+    for d in &typer_diags {
+        eprintln!(
+            "crabscheme aot --multi: typer warning: {} ({:?})",
+            d.message, d.severity
+        );
+    }
+    let typer_hints = cs_typer::hints_by_name(&typer_table);
     let mut macros = HashMap::new();
     let mut expander = Expander::new(&mut syms, &mut macros);
     let core = match expander.expand_program(&data) {
@@ -1242,19 +1256,27 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
             Some(n) => (n.clone(), sym_by_idx.get(&idx).copied()),
             None => (format!("__aot_lambda_{idx}"), None),
         };
-        // RC3 iter 2.15 + 2.16 — default ALL params to Type::Any.
-        // The nb_*_inline helpers tag-dispatch correctly for both
-        // Fixnum and Flonum operands. Fixnum-default is UNSAFE for
-        // top-level fns called with non-Fixnum args (e.g.,
-        // mandelbrot-pixel's cr/ci come from Flonum arith) — Fixnum-
-        // typed params would emit AddFx2/MulFx2 that interpret NB
-        // Flonum bits as raw fixnums. Any-default routes through
-        // generic nb_add_inline etc. which dispatch on the runtime
-        // tag. Note: mandelbrot still produces wrong results
-        // independently of param type (separate iter 2.17 work on
-        // Flonum-NB arith correctness in the inner loop).
-        let any_hints: Vec<cs_rir::Type> = vec![cs_rir::Type::Any; lam.params.len()];
-        let hints: Option<&[cs_rir::Type]> = Some(&any_hints);
+        // Phase 5.3: consume typer-derived hints when the user
+        // annotated the function. Lookup by the lambda's bound
+        // symbol (which the MakeClosure+SetVar scan above
+        // populated). Annotated params override the safe Any
+        // default, recovering the JIT/AOT specialization the
+        // iter 2.15/2.16 generalization gave up.
+        //
+        // The typer's hint Vec length matches the user's
+        // declared `param_types.len()` from the annotation; we
+        // pad or truncate to `lam.params.len()` so call sites
+        // never get a mismatched-length slice. Padded slots use
+        // Any (same gradual default as the RC3 fallback).
+        let computed_hints: Vec<cs_rir::Type> = self_sym
+            .and_then(|s| typer_hints.get(&s))
+            .map(|h| {
+                let mut v: Vec<cs_rir::Type> = h.clone();
+                v.resize(lam.params.len(), cs_rir::Type::Any);
+                v
+            })
+            .unwrap_or_else(|| vec![cs_rir::Type::Any; lam.params.len()]);
+        let hints: Option<&[cs_rir::Type]> = Some(&computed_hints);
         match cs_vm::jit_translate::bytecode_to_rir_aot_with_param_types(
             lam,
             name.as_str(),

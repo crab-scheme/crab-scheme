@@ -409,6 +409,7 @@ dependencies = [
  "cs-parse",
  "cs-rir",
  "cs-runtime",
+ "cs-typer",
  "cs-vm",
 ]
 
