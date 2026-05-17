@@ -22,6 +22,11 @@ members = [
     "crates/cs-aot",
     "crates/cs-cli",
     "crates/cs-cli-sha2",
+    # BEAM-style runtime (scaffold; see docs/research/beam_runtime_spec.md).
+    "crates/cs-actor",
+    "crates/cs-table",
+    "crates/cs-supervisor",
+    "crates/cs-hotreload",
 ]
 
 [workspace.package]
@@ -77,6 +82,13 @@ rustc-hash = "2.1"
 # SmallVec is the same size as a Vec; ≤4 bindings stay inline,
 # eliminating the per-call frame heap allocation.
 smallvec = { version = "1", features = ["union"] }
+# B2 dep: tokio multi-thread runtime for the actor system. Pinned
+# at LTS minor for now; revisit if cs-actor needs newer features.
+tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "macros", "time"] }
+# B4 dep: concurrent hashmap for cs-table set tables. Lock-free
+# reads, fine-grained locks on writes. We may swap for a custom
+# lock-free B-tree later if the contention test demands it.
+dashmap = "6"
 
 [profile.release]
 lto = "thin"

@@ -385,6 +385,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-actor"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-gc",
+ "cs-runtime",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "cs-aot"
 version = "0.0.1"
 dependencies = [
@@ -496,6 +507,15 @@ name = "cs-gc"
 version = "0.0.1"
 
 [[package]]
+name = "cs-hotreload"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-vm",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "cs-ir"
 version = "0.0.1"
 dependencies = [
@@ -573,6 +593,23 @@ dependencies = [
  "cs-vm",
  "libloading",
  "num-traits",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cs-supervisor"
+version = "0.0.1"
+dependencies = [
+ "cs-actor",
+ "cs-core",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cs-table"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
  "thiserror 1.0.69",
 ]
 
@@ -1681,7 +1718,19 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "socket2",
+ "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

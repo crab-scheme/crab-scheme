@@ -1,0 +1,15 @@
+[package]
+name = "cs-table"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme in-memory tables, ETS-shaped (set + ordered_set). See docs/research/beam_runtime_spec.md."
+
+[dependencies]
+cs-core = { workspace = true }
+thiserror = { workspace = true }
+# B4 picks the concurrent map impl; placeholder dep set.
+
+[dev-dependencies]

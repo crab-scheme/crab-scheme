@@ -1,0 +1,15 @@
+[package]
+name = "cs-hotreload"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme two-version code dispatch + state migration. See docs/research/beam_runtime_spec.md."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-vm = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

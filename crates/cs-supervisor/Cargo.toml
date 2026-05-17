@@ -1,0 +1,15 @@
+[package]
+name = "cs-supervisor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme OTP-style supervision trees. See docs/research/beam_runtime_spec.md."
+
+[dependencies]
+cs-actor = { path = "../cs-actor" }
+cs-core = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
