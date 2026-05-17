@@ -217,6 +217,70 @@ fn nb_eq_inline(a: i64, b: i64) -> i64 {
     }
     unsafe { cs_vm::vm::vm_value_eq_nb(a, b) }
 }
+
+// --- Fixnum-typed fast paths (typer-hint-driven) -----------------
+//
+// Skip the `nb_both_fixnum` branch when the caller has proven
+// both operands are Fixnum-typed (Phase 5++++ per-Value type
+// inference in cs-aot). Still falls back to the runtime
+// `vm_value_*_nb` on 47-bit-overflow so the result promotes to
+// Bignum correctly — same semantics as the unspecialized inlines,
+// just one fewer branch per call.
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_add_fixnum_inline(a: i64, b: i64) -> i64 {
+    let pa = nb_extract_fixnum(a as u64);
+    let pb = nb_extract_fixnum(b as u64);
+    if let Some(r) = pa.checked_add(pb) {
+        if let Some(enc) = nb_encode_fixnum_if_fits(r) {
+            return enc;
+        }
+    }
+    unsafe { cs_vm::vm::vm_value_add_nb(a, b) }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_sub_fixnum_inline(a: i64, b: i64) -> i64 {
+    let pa = nb_extract_fixnum(a as u64);
+    let pb = nb_extract_fixnum(b as u64);
+    if let Some(r) = pa.checked_sub(pb) {
+        if let Some(enc) = nb_encode_fixnum_if_fits(r) {
+            return enc;
+        }
+    }
+    unsafe { cs_vm::vm::vm_value_sub_nb(a, b) }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_mul_fixnum_inline(a: i64, b: i64) -> i64 {
+    let pa = nb_extract_fixnum(a as u64);
+    let pb = nb_extract_fixnum(b as u64);
+    if let Some(r) = pa.checked_mul(pb) {
+        if let Some(enc) = nb_encode_fixnum_if_fits(r) {
+            return enc;
+        }
+    }
+    unsafe { cs_vm::vm::vm_value_mul_nb(a, b) }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_lt_fixnum_inline(a: i64, b: i64) -> i64 {
+    let pa = nb_extract_fixnum(a as u64);
+    let pb = nb_extract_fixnum(b as u64);
+    if pa < pb { NB_TRUE_BITS } else { NB_FALSE_BITS }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn nb_eq_fixnum_inline(a: i64, b: i64) -> i64 {
+    let pa = nb_extract_fixnum(a as u64);
+    let pb = nb_extract_fixnum(b as u64);
+    if pa == pb { NB_TRUE_BITS } else { NB_FALSE_BITS }
+}
 // --- end NB inline fast-path helpers ----------------------------
 
 "##;
@@ -1001,17 +1065,17 @@ fn inst_rhs(
         (Inst::Add(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, format!("nb_add_inline(v{}, v{})", lhs.0, rhs.0))
+            (*dst, nb_arith_call("add", lhs, rhs, types))
         }
         (Inst::Sub(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, format!("nb_sub_inline(v{}, v{})", lhs.0, rhs.0))
+            (*dst, nb_arith_call("sub", lhs, rhs, types))
         }
         (Inst::Mul(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, format!("nb_mul_inline(v{}, v{})", lhs.0, rhs.0))
+            (*dst, nb_arith_call("mul", lhs, rhs, types))
         }
 
         // ---- Comparisons ----
@@ -1038,12 +1102,12 @@ fn inst_rhs(
         (Inst::Lt(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, format!("nb_lt_inline(v{}, v{})", lhs.0, rhs.0))
+            (*dst, nb_arith_call("lt", lhs, rhs, types))
         }
         (Inst::Eq(dst, lhs, rhs), EmitMode::Nb) => {
             check(*lhs)?;
             check(*rhs)?;
-            (*dst, format!("nb_eq_inline(v{}, v{})", lhs.0, rhs.0))
+            (*dst, nb_arith_call("eq", lhs, rhs, types))
         }
 
         // ---- Move (alias) ----
@@ -1906,6 +1970,31 @@ fn emit_terminator(
 /// payload to f64; if NB Flonum (or RawI64 mode with raw f64
 /// bits), use bit pattern directly. NanboxValue::as_fixnum
 /// handles the discrimination.
+/// Pick the right `nb_<op>_inline` helper for a generic NB
+/// arithmetic op. When the per-Value type map proves BOTH
+/// operands are Fixnum-typed, route to the `nb_<op>_fixnum_inline`
+/// fast path which skips the `nb_both_fixnum` runtime branch.
+/// Otherwise use the defensive `nb_<op>_inline` that re-validates
+/// at runtime (correct for any combination of types).
+///
+/// `op` is one of "add", "sub", "mul", "lt", "eq" — matches the
+/// helper-name suffix in the AOT prologue (`NB_HELPERS_SOURCE`).
+fn nb_arith_call(
+    op: &str,
+    lhs: &Value,
+    rhs: &Value,
+    types: &std::collections::HashMap<Value, Type>,
+) -> String {
+    let both_fixnum = matches!(types.get(lhs), Some(Type::Fixnum))
+        && matches!(types.get(rhs), Some(Type::Fixnum));
+    let suffix = if both_fixnum {
+        "fixnum_inline"
+    } else {
+        "inline"
+    };
+    format!("nb_{op}_{suffix}(v{}, v{})", lhs.0, rhs.0)
+}
+
 /// Emit a Rust expression that converts the i64 NB carrier in
 /// `v{n}` to f64. When `ty == Some(Type::Flonum)`, skip the NB-
 /// Fixnum check and bitcast directly — this is the common path
