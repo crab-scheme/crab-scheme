@@ -69,7 +69,22 @@ pub fn extract_annotations(
                 stripped,
                 lambda_ann,
                 lambda_span,
+                name,
             } => {
+                // Phase 5.2: synthesize a top-level ascription
+                // from the typed-define annotation if the user
+                // didn't write one explicitly. This unifies
+                // `(define (f [x : T]) : R …)` with the
+                // separated form `(: f (-> T R)) (define (f x) …)`
+                // for downstream hints-by-name lookups.
+                if table.ascription(name).is_none() {
+                    let proc_ty = lambda_ann_to_proc_type(&lambda_ann);
+                    table.top_level.push(TopLevelAnnotation {
+                        name,
+                        type_ann: proc_ty,
+                        ascription_span: lambda_span,
+                    });
+                }
                 table.lambdas.insert(lambda_span, lambda_ann);
                 out_data.push(stripped);
             }
@@ -90,6 +105,13 @@ enum TopForm {
         stripped: Datum,
         lambda_ann: LambdaAnnotation,
         lambda_span: Span,
+        /// Bound name of the typed define, so the extractor
+        /// can synthesize a top-level ascription if the user
+        /// didn't write one explicitly. Phase 5.2: this makes
+        /// `(define (f [x : T]) : R …)` indistinguishable from
+        /// `(: f (-> T R)) (define (f x) …)` for downstream
+        /// hint-by-name lookups (AOT, JIT).
+        name: Symbol,
     },
     Passthrough,
 }
@@ -215,9 +237,10 @@ fn classify_define(
     };
     // Header element [0] is the fn name; [1..] are params.
     let name_datum = head_list[0].clone();
-    if !matches!(&name_datum, Datum::Symbol(_, _)) {
-        return TopForm::Passthrough;
-    }
+    let name_sym = match &name_datum {
+        Datum::Symbol(s, _) => *s,
+        _ => return TopForm::Passthrough,
+    };
     let mut stripped_params: Vec<Datum> = Vec::with_capacity(head_list.len() - 1);
     let mut param_types: Vec<Option<Type>> = Vec::with_capacity(head_list.len() - 1);
     let mut any_param_annotated = false;
@@ -288,6 +311,7 @@ fn classify_define(
         // the type checker matches by span on the resulting
         // CoreExpr::Lambda.
         lambda_span: top_span,
+        name: name_sym,
     }
 }
 
@@ -325,6 +349,27 @@ fn strip_param_ann(
             Some((name, None))
         }
     }
+}
+
+/// Build a `Procedure_` type from a `LambdaAnnotation`. Missing
+/// `param_types` slots, missing `return_type`, and missing
+/// `rest_type` (when the lambda has a rest formal but no rest
+/// annotation) default to `Any`. Used by `extract_annotations`
+/// to synthesize a top-level ascription from a typed-define
+/// form so downstream consumers (Phase 5 hints-by-name, the
+/// Checker's Set lookup) treat both surface forms identically.
+fn lambda_ann_to_proc_type(ann: &LambdaAnnotation) -> Type {
+    let params: Vec<Type> = ann
+        .param_types
+        .iter()
+        .map(|opt| opt.clone().unwrap_or(Type::Any))
+        .collect();
+    Type::Procedure_(Box::new(crate::types::ProcType {
+        params,
+        return_type: ann.return_type.clone().unwrap_or(Type::Any),
+        rest: None,
+        filter: None,
+    }))
 }
 
 /// Convert a [`Datum`] into a [`TypeDatum`] then parse as a
@@ -491,6 +536,42 @@ mod tests {
         assert_eq!(table.aliases.len(), 2);
         let want = Type::union(vec![Type::Fixnum, Type::Flonum, Type::String]);
         assert_eq!(table.aliases[1].target, want);
+    }
+
+    #[test]
+    fn typed_define_synthesizes_top_level_ascription() {
+        // Phase 5.2: a typed `(define (f [x : T]) : R …)` form
+        // should also populate `top_level` with a synthesized
+        // ascription `(: f (-> T R))` so downstream consumers
+        // (AOT hint lookup, the Checker's Set check) treat both
+        // surface forms identically.
+        let (data, mut syms) = read("(define (f [n : Fixnum]) : Fixnum n)");
+        let (_, table, diags) = extract_annotations(&data, &mut syms);
+        assert!(diags.is_empty(), "diagnostics: {diags:?}");
+        assert_eq!(table.lambdas.len(), 1);
+        assert_eq!(table.top_level.len(), 1, "synthesized ascription missing");
+        let ann = &table.top_level[0];
+        assert_eq!(syms.name(ann.name), "f");
+        let want = Type::Procedure_(Box::new(ProcType {
+            params: vec![Type::Fixnum],
+            return_type: Type::Fixnum,
+            rest: None,
+            filter: None,
+        }));
+        assert_eq!(ann.type_ann, want);
+    }
+
+    #[test]
+    fn typed_define_does_not_clobber_explicit_ascription() {
+        // If the user wrote BOTH the ascription AND the typed
+        // sugar, the explicit one wins (insertion order). We
+        // shouldn't push a duplicate.
+        let (data, mut syms) =
+            read("(: f (-> Fixnum Fixnum)) (define (f [n : Fixnum]) : Fixnum n)");
+        let (_, table, diags) = extract_annotations(&data, &mut syms);
+        assert!(diags.is_empty(), "diagnostics: {diags:?}");
+        assert_eq!(table.top_level.len(), 1, "duplicate ascription synthesized");
+        assert_eq!(syms.name(table.top_level[0].name), "f");
     }
 
     #[test]

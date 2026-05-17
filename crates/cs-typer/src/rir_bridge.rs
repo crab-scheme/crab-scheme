@@ -34,6 +34,7 @@
 
 use std::collections::HashMap;
 
+use cs_core::Symbol;
 use cs_diag::Span;
 
 use crate::annotate::AnnotationTable;
@@ -97,6 +98,36 @@ pub fn param_hints_from_table(table: &AnnotationTable) -> HashMap<Span, Vec<cs_r
                 .map(|opt| opt.as_ref().map(lower).unwrap_or(cs_rir::Type::Any))
                 .collect();
             (*span, v)
+        })
+        .collect()
+}
+
+/// Walk `AnnotationTable.top_level` and produce
+/// `param_type_hints` keyed by the bound name.
+///
+/// This is the form the AOT pipeline (cs-cli `aot --multi`)
+/// and the JIT tier-up hook can consume: at compile-time they
+/// know the lambda's bound symbol (via the surrounding `Set`
+/// form's name), but not the source `Span` of the inner
+/// Lambda CoreExpr.
+///
+/// Only ascriptions whose declared type is a `Procedure_` are
+/// included; non-procedure ascriptions (e.g., `(: x Fixnum)`)
+/// don't contribute hints. Each procedure's `params` are
+/// lowered via [`lower`]; the result's length equals
+/// `params.len()` and callers should pad with `Any` or
+/// truncate to match the `CompiledLambda`'s actual `params`
+/// count.
+pub fn hints_by_name(table: &AnnotationTable) -> HashMap<Symbol, Vec<cs_rir::Type>> {
+    table
+        .top_level
+        .iter()
+        .filter_map(|ta| match &ta.type_ann {
+            Type::Procedure_(pt) => {
+                let v: Vec<cs_rir::Type> = pt.params.iter().map(lower).collect();
+                Some((ta.name, v))
+            }
+            _ => None,
         })
         .collect()
 }
@@ -229,5 +260,41 @@ mod tests {
         let hints = param_hints_from_table(&table);
         let v = hints.get(&s).unwrap();
         assert_eq!(v, &vec![cs_rir::Type::Any]);
+    }
+
+    // ---- hints_by_name (Phase 5.2) ----
+
+    #[test]
+    fn hints_by_name_from_top_level_ascription() {
+        let mut table = AnnotationTable::new();
+        let name = cs_core::Symbol(7);
+        table.top_level.push(crate::annotate::TopLevelAnnotation {
+            name,
+            type_ann: Type::Procedure_(Box::new(crate::types::ProcType {
+                params: vec![Type::Fixnum, Type::Flonum],
+                return_type: Type::Fixnum,
+                rest: None,
+                filter: None,
+            })),
+            ascription_span: span(0, 5),
+        });
+        let h = hints_by_name(&table);
+        let v = h.get(&name).unwrap();
+        assert_eq!(v, &vec![cs_rir::Type::Fixnum, cs_rir::Type::Flonum]);
+    }
+
+    #[test]
+    fn hints_by_name_skips_non_procedure_ascriptions() {
+        // `(: PI Flonum)` doesn't carry param hints — it's a
+        // value ascription, not a procedure type.
+        let mut table = AnnotationTable::new();
+        let pi = cs_core::Symbol(42);
+        table.top_level.push(crate::annotate::TopLevelAnnotation {
+            name: pi,
+            type_ann: Type::Flonum,
+            ascription_span: span(0, 5),
+        });
+        let h = hints_by_name(&table);
+        assert!(h.is_empty(), "non-proc ascription should not appear: {h:?}");
     }
 }
