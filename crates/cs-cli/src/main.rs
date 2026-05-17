@@ -130,6 +130,14 @@ enum Cmd {
         /// match, non-zero with diagnostic on mismatch.
         #[arg(long = "verify", value_name = "ARGS")]
         verify: Option<String>,
+        /// Typer Phase 6.2: run the typer's checker before
+        /// AOT'ing. Surfaces type-mismatch / arity errors as
+        /// `cs_diag::Diagnostic`s and exits 1 before invoking
+        /// cs-aot. Default off (preserves the iter 5.3
+        /// warn-and-proceed behavior where syntactic
+        /// annotation errors print but don't block AOT).
+        #[arg(long = "typecheck")]
+        typecheck: bool,
         /// RC3 Phase 6 iter 6.4: cross-compile target triple. Passed
         /// verbatim to `cargo build --target=<TRIPLE>`. Requires the
         /// target to be installed via `rustup target add <TRIPLE>`.
@@ -195,11 +203,12 @@ fn main() -> ExitCode {
             multi,
             verify,
             target,
+            typecheck,
         }) => {
             if explain {
                 run_aot_explain(&file)
             } else if multi {
-                run_aot_multi(&file, output.as_deref(), build)
+                run_aot_multi(&file, output.as_deref(), build, typecheck, color)
             } else {
                 let code = run_aot(
                     &file,
@@ -1160,7 +1169,13 @@ fn run_check(file: &str, color: bool) -> ExitCode {
     }
 }
 
-fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
+fn run_aot_multi(
+    file: &str,
+    output: Option<&str>,
+    build: bool,
+    typecheck: bool,
+    color: bool,
+) -> ExitCode {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::process::Command;
@@ -1215,6 +1230,33 @@ fn run_aot_multi(file: &str, output: Option<&str>, build: bool) -> ExitCode {
         }
     };
     drop(expander);
+    // Phase 6.2: `--typecheck` runs the bidirectional checker
+    // after expansion (since the Checker operates on CoreExpr)
+    // and before compile. Type errors abort with exit 1; the
+    // earlier-printed annotation syntax errors also count.
+    // Default off — preserves the warn-and-proceed posture
+    // from iter 5.3.
+    if typecheck {
+        let ann_errors = typer_diags
+            .iter()
+            .filter(|d| matches!(d.severity, cs_diag::Severity::Error))
+            .count();
+        let mut checker = cs_typer::Checker::new(&typer_table, &mut syms);
+        let type_errors = checker.check_program(&core);
+        for err in &type_errors {
+            let diag = err.to_diagnostic();
+            eprintln!("{}", render_diag(&diag, &sources, color));
+        }
+        let total = ann_errors + type_errors.len();
+        if total > 0 {
+            eprintln!(
+                "crabscheme aot --multi: --typecheck failed: {} type error{} in {file}",
+                total,
+                if total == 1 { "" } else { "s" }
+            );
+            return ExitCode::from(1);
+        }
+    }
     // RC3 iter 2.14 — populate globals from the runtime's builtins so
     // the compiler folds (/ a b), (display x), (not p), etc. to
     // Const(Procedure). Without this they'd compile to LoadVar which
