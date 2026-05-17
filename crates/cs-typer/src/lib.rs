@@ -34,6 +34,7 @@ pub mod env;
 pub mod extract;
 pub mod infer;
 pub mod parse_ann;
+pub mod rir_bridge;
 pub mod types;
 
 pub use annotate::{
@@ -46,4 +47,5 @@ pub use env::{Frame, TypeEnv};
 pub use extract::extract_annotations;
 pub use infer::infer;
 pub use parse_ann::{parse_type_ann, TypeAnn, TypeAnnError, TypeDatum};
+pub use rir_bridge::{lower as lower_to_rir, param_hints_from_table};
 pub use types::{ProcType, Type};
