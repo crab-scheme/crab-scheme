@@ -1169,6 +1169,7 @@ fn run_check(file: &str, color: bool) -> ExitCode {
     }
 }
 
+#[cfg(feature = "aot")]
 fn run_aot_multi(
     file: &str,
     output: Option<&str>,

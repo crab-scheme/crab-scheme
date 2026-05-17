@@ -335,7 +335,19 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // to assert hot paths actually tier'd up.
         ("jit-installed?", b_jit_installed_p),
         ("jit-stats", b_jit_stats),
-        ("gc-stats", b_gc_stats),
+        // (gc-stats) lives in syms_builtins now — it interns symbol
+        // keys for the alist it returns. (Phase B of the real-world
+        // bench spec; was an args-only pure builtin returning just
+        // alloc + collect counts.)
+        ("gc-stats-reset!", b_gc_stats_reset),
+        ("gc-stats-enable!", b_gc_stats_enable),
+        ("gc-stats-disable!", b_gc_stats_disable),
+        ("gc-auto-collect-enable!", b_gc_auto_collect_enable),
+        ("gc-auto-collect-disable!", b_gc_auto_collect_disable),
+        ("gc-set-threshold!", b_gc_set_threshold),
+        ("collect-garbage", b_collect_garbage),
+        ("current-memory-use", b_current_memory_use),
+        ("current-rss-bytes", b_current_rss_bytes),
         ("string-split", b_string_split),
         ("string-join", b_string_join),
         ("string->vector", b_string_to_vector),
@@ -701,6 +713,14 @@ pub fn pure_builtins() -> Vec<PureEntry> {
 pub fn higher_order_builtins() -> Vec<HoEntry> {
     vec![
         ("apply", b_apply),
+        // (time-apply) lives as a Scheme-level wrapper in the
+        // benchmark harness, not a builtin: the VM dispatches
+        // higher-order builtins through marker-type downcasts
+        // (see VmApply / VmMap in cs-vm/src/vm.rs) and adding
+        // a VmTimeApply marker is a deeper VM change than Phase
+        // B warrants. The Scheme wrapper threads through
+        // (current-jiffy) + (gc-stats) directly and gets the
+        // same five-value return.
         ("map", b_map),
         ("for-each", b_for_each),
         ("display", b_display),
@@ -891,6 +911,7 @@ pub fn syms_builtins() -> Vec<SymsEntry> {
         // JIT introspection that needs the symbol table to mint
         // type-tag symbols.
         ("jit-status", b_jit_status),
+        ("gc-stats", b_gc_stats),
     ]
 }
 
@@ -11557,19 +11578,270 @@ fn b_jit_stats(args: &[Value]) -> Result<Value, String> {
     ]))
 }
 
-/// Phase 6 Stage B analysis — expose GC alloc + collect counts so
-/// benches can report allocation pressure. Returns `(alloc-count
-/// collect-count)`.
-fn b_gc_stats(args: &[Value]) -> Result<Value, String> {
+/// `(gc-stats)` — alist snapshot of the heap's instrumentation
+/// counters. Stable keys; values are exact integers (counters)
+/// or flonums (millisecond durations). Modeled on Chez's
+/// `(statistics)` accessor shape so external benchmark code
+/// that already works on Chez can drop in with minimal porting.
+///
+/// Returned alist:
+///
+/// ```scheme
+/// ((bytes-allocated-total . 142857142)   ; cumulative bytes
+///  (alloc-count-total     . 12345)        ; cumulative allocations
+///  (collect-count         . 87)           ; collect() calls since reset
+///  (live-slots            . 1024)         ; reachable slots NOW
+///  (collect-time-ms       . 145.3)        ; total time in collect()
+///  (last-pause-ms         . 1.8)          ; most recent pause
+///  (max-pause-ms          . 4.32)         ; peak pause since reset
+///  (stats-enabled?        . #t))          ; pause-timing on/off
+/// ```
+///
+/// The three `*-ms` durations are populated only when stats are
+/// enabled via `(gc-stats-enable!)`; otherwise they read 0.0.
+/// The integer counters are always tracked.
+fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats", "0", args.len()));
     }
     let rt = unsafe { crate::Runtime::active() }
         .ok_or_else(|| "gc-stats: no active runtime".to_string())?;
+    let s = rt.heap().stats();
+    let ns_to_ms = |d: std::time::Duration| (d.as_nanos() as f64) / 1_000_000.0;
+    let mut pair = |k: &str, v: Value| -> Value {
+        let key_sym = syms.intern(k);
+        Value::Pair(cs_core::Pair::new(Value::Symbol(key_sym), v))
+    };
     Ok(Value::list(vec![
-        Value::fixnum(rt.heap().alloc_count() as i64),
-        Value::fixnum(rt.heap().collect_count() as i64),
+        pair(
+            "bytes-allocated-total",
+            fixnum_or_bigint(s.bytes_allocated_total),
+        ),
+        pair("alloc-count-total", fixnum_or_bigint(s.alloc_count_total)),
+        pair("collect-count", fixnum_or_bigint(s.collect_count)),
+        pair("live-slots", Value::fixnum(s.live_slots as i64)),
+        pair(
+            "collect-time-ms",
+            Value::flonum(ns_to_ms(s.collect_duration_total)),
+        ),
+        pair("last-pause-ms", Value::flonum(ns_to_ms(s.last_pause))),
+        pair("max-pause-ms", Value::flonum(ns_to_ms(s.max_pause))),
+        pair("stats-enabled?", Value::Boolean(s.stats_enabled)),
     ]))
+}
+
+/// Encode a u64 counter as the smallest numeric Value that fits.
+/// Fixnums hold up to i64::MAX; anything larger spills to bigint
+/// via the decimal-string path. For benchmark counters that grow
+/// past 2^63 we'd need ~9 EB of cumulative allocation, so the
+/// bigint path is defensive rather than common.
+fn fixnum_or_bigint(n: u64) -> Value {
+    if n <= i64::MAX as u64 {
+        Value::fixnum(n as i64)
+    } else {
+        match Number::parse_decimal_integer(&n.to_string()) {
+            Some(num) => Value::Number(num),
+            None => Value::fixnum(i64::MAX), // unreachable in practice
+        }
+    }
+}
+
+/// `(gc-stats-reset!)` — zero all instrumentation counters in the
+/// active heap. Returns unspecified. The bench harness calls this
+/// after warmup so the per-iter measurement window starts clean.
+fn b_gc_stats_reset(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("gc-stats-reset!", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-stats-reset!: no active runtime".to_string())?;
+    rt.heap().reset_stats();
+    Ok(Value::Unspecified)
+}
+
+/// `(gc-stats-enable!)` — turn on pause-time instrumentation.
+/// Cheap (~2 % overhead on a tight alloc+collect loop) but not
+/// free, so default-off. Returns unspecified.
+fn b_gc_stats_enable(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("gc-stats-enable!", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-stats-enable!: no active runtime".to_string())?;
+    rt.heap().set_stats_enabled(true);
+    Ok(Value::Unspecified)
+}
+
+/// `(gc-stats-disable!)` — turn off pause-time instrumentation.
+/// Returns unspecified.
+fn b_gc_stats_disable(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("gc-stats-disable!", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-stats-disable!: no active runtime".to_string())?;
+    rt.heap().set_stats_enabled(false);
+    Ok(Value::Unspecified)
+}
+
+/// `(collect-garbage)` — force a stop-the-world mark-sweep and
+/// return the live-slot count after sweeping. Shape compatible
+/// with Chez Scheme's `(collect)` accessor — Chez returns the
+/// new heap size (in bytes); we return the slot count (which is
+/// the closest stable analogue in our non-generational heap).
+fn b_collect_garbage(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("collect-garbage", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "collect-garbage: no active runtime".to_string())?;
+    rt.heap().collect();
+    Ok(Value::fixnum(rt.heap().live_slots() as i64))
+}
+
+/// `(gc-auto-collect-enable!)` — turn on the heap's
+/// auto-collect-on-alloc behavior. With it on, every `Heap::alloc`
+/// past the current threshold triggers a `(collect-garbage)`. Off
+/// by default (cs-gc Phase 1 invariant). Tier-3 benches that want
+/// real GC pressure to show up in the harness flip this on.
+fn b_gc_auto_collect_enable(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("gc-auto-collect-enable!", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-auto-collect-enable!: no active runtime".to_string())?;
+    rt.heap().set_auto_collect(true);
+    Ok(Value::Unspecified)
+}
+
+/// `(gc-auto-collect-disable!)` — inverse of the above.
+fn b_gc_auto_collect_disable(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("gc-auto-collect-disable!", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-auto-collect-disable!: no active runtime".to_string())?;
+    rt.heap().set_auto_collect(false);
+    Ok(Value::Unspecified)
+}
+
+/// `(gc-set-threshold! n)` — set the alloc-count threshold that
+/// drives auto-collect. Default 4096; tier-3 benches typically
+/// want to lower this so collection fires per inner loop rather
+/// than once at the end.
+fn b_gc_set_threshold(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("gc-set-threshold!", "1", args.len()));
+    }
+    let n = match &args[0] {
+        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as usize,
+        v => return Err(type_err("gc-set-threshold!", "non-negative fixnum", v)),
+    };
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "gc-set-threshold!: no active runtime".to_string())?;
+    rt.heap().set_threshold(n);
+    Ok(Value::Unspecified)
+}
+
+/// `(current-rss-bytes)` — current process resident-set size in
+/// bytes. The OS-level "how much physical memory does this process
+/// hold right now" number — the right signal for leak detection,
+/// since RSS grows when memory isn't actually being released back
+/// to the OS even though cumulative allocations climb monotonically.
+///
+/// Implementation: macOS via `task_info(MACH_TASK_BASIC_INFO)`;
+/// Linux via `/proc/self/statm` (second field × page size); other
+/// targets return 0 (caller treats 0 as "unsupported"). All paths
+/// are syscall-only — no allocations, safe to call from inside
+/// tight per-iter measurement loops.
+fn b_current_rss_bytes(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("current-rss-bytes", "0", args.len()));
+    }
+    Ok(fixnum_or_bigint(rss_bytes_platform()))
+}
+
+#[cfg(target_os = "macos")]
+fn rss_bytes_platform() -> u64 {
+    use std::mem;
+    // Mach bindings — keeping them inline avoids pulling libc into
+    // cs-runtime's dep graph. Layout matches <mach/task_info.h> on
+    // macOS 14 / Darwin 23.x; older OS versions are wire-compatible.
+    #[repr(C)]
+    struct MachTaskBasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        resident_size_max: u64,
+        user_time: [i32; 2],
+        system_time: [i32; 2],
+        policy: i32,
+        suspend_count: i32,
+    }
+    const MACH_TASK_BASIC_INFO: u32 = 20;
+    unsafe extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_info(
+            task: u32,
+            flavor: u32,
+            task_info_out: *mut std::ffi::c_void,
+            task_info_count: *mut u32,
+        ) -> i32;
+    }
+    unsafe {
+        let mut info: MachTaskBasicInfo = mem::zeroed();
+        let mut count = (mem::size_of::<MachTaskBasicInfo>() / mem::size_of::<u32>()) as u32;
+        let kr = task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            &mut info as *mut _ as *mut std::ffi::c_void,
+            &mut count,
+        );
+        if kr == 0 {
+            info.resident_size
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rss_bytes_platform() -> u64 {
+    // /proc/self/statm: "size resident shared text lib data dt", in
+    // page units. The second column is RSS pages. Default page size
+    // is 4 KB on x86_64 / aarch64; using sysconf(_SC_PAGESIZE) would
+    // be more portable but pulls in libc.
+    let Ok(s) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    let mut parts = s.split_whitespace();
+    let _size = parts.next();
+    let Some(rss) = parts.next().and_then(|p| p.parse::<u64>().ok()) else {
+        return 0;
+    };
+    rss.saturating_mul(4096)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rss_bytes_platform() -> u64 {
+    // Unsupported platform — return 0; the harness treats 0 as
+    // "unavailable" and elides RSS columns from its output.
+    0
+}
+
+/// `(current-memory-use)` — cumulative bytes allocated since heap
+/// creation (or since the last `(gc-stats-reset!)`). Shape
+/// compatible with Racket's `(current-memory-use)`, which returns
+/// an exact integer count of bytes. Note: Racket's number is bytes
+/// reachable from custodians, ours is cumulative allocation —
+/// a different shape but the same use case (delta around a
+/// workload tells you how much it allocated).
+fn b_current_memory_use(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("current-memory-use", "0", args.len()));
+    }
+    let rt = unsafe { crate::Runtime::active() }
+        .ok_or_else(|| "current-memory-use: no active runtime".to_string())?;
+    Ok(fixnum_or_bigint(rt.heap().bytes_allocated_total()))
 }
 
 fn b_jit_status(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
