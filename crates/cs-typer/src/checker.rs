@@ -64,6 +64,20 @@ pub struct Checker<'tab> {
     /// loops without surface annotation. Empty by default.
     pub inferred_param_hints:
         std::cell::RefCell<std::collections::HashMap<cs_core::Symbol, Vec<cs_rir::Type>>>,
+    /// Top-level `Set` bindings whose value is a `Lambda` — the
+    /// set of names eligible for per-call-site specialization
+    /// (Phase 5++ extension, the AOT analogue of Truffle
+    /// splitting). Populated by `check_set` during the walk.
+    top_level_lambda_names: std::cell::RefCell<std::collections::HashSet<cs_core::Symbol>>,
+    /// Per-name arg-type vectors collected at every App call
+    /// site of a top-level lambda. After `check_program`
+    /// completes, names whose call sites agree on arg types
+    /// get monomorphized hints written into
+    /// `inferred_param_hints`. Each inner `Vec<Type>` is the
+    /// inferred types of one call's args; we accept the
+    /// specialization only when every inner Vec is equal.
+    top_level_call_arg_types:
+        std::cell::RefCell<std::collections::HashMap<cs_core::Symbol, Vec<Vec<Type>>>>,
 }
 
 impl<'tab> Checker<'tab> {
@@ -80,6 +94,8 @@ impl<'tab> Checker<'tab> {
             table,
             env,
             inferred_param_hints: std::cell::RefCell::new(std::collections::HashMap::new()),
+            top_level_lambda_names: std::cell::RefCell::new(std::collections::HashSet::new()),
+            top_level_call_arg_types: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -136,7 +152,46 @@ impl<'tab> Checker<'tab> {
     pub fn check_program(&mut self, program: &CoreExpr) -> Vec<TypeError> {
         let mut errors = Vec::new();
         self.check_collect(program, &Type::Any, &mut errors);
+        self.merge_monomorphic_call_hints();
         errors
+    }
+
+    /// Phase 5++: walk the per-name call-site arg-type lists
+    /// collected during `check_collect`, and for any top-level
+    /// Lambda binding whose call sites all agree on a non-`Any`
+    /// param-type vector, record a `Procedure_`-style hint in
+    /// `inferred_param_hints`.
+    ///
+    /// Conservative gates:
+    /// - Skip names with zero recorded calls (nothing to
+    ///   specialize from).
+    /// - Skip when the inner Vecs disagree (polymorphic callers
+    ///   — picking one would mis-specialize the others).
+    /// - Skip when ANY of the inferred arg types is `Any` (we
+    ///   have no information to act on, and a wrong specialization
+    ///   here defeats the point).
+    /// - Don't overwrite hints already set by
+    ///   `refine_letrec_via_body_call` — the letrec body call
+    ///   site is closer to the call-shape semantics than a
+    ///   top-level scan.
+    fn merge_monomorphic_call_hints(&self) {
+        let mut hints = self.inferred_param_hints.borrow_mut();
+        for (name, call_sites) in self.top_level_call_arg_types.borrow().iter() {
+            if hints.contains_key(name) {
+                continue;
+            }
+            let Some(first) = call_sites.first() else {
+                continue;
+            };
+            if !call_sites.iter().all(|c| c == first) {
+                continue;
+            }
+            if first.iter().any(|t| matches!(t, Type::Any)) {
+                continue;
+            }
+            let lowered: Vec<cs_rir::Type> = first.iter().map(crate::rir_bridge::lower).collect();
+            hints.insert(*name, lowered);
+        }
     }
 
     /// `check`, but collecting errors instead of bailing on the
@@ -270,10 +325,29 @@ impl<'tab> Checker<'tab> {
                 span,
             });
         }
-        // Push the params into a fresh scope and check the body.
+        // Push the params into a fresh scope and check the
+        // body. Per-param scope type uses the MORE PRECISE of
+        // the lambda's declared type (from annotation) and the
+        // expected type's param (if the expected is itself a
+        // Procedure_). This is what lets a refined Letrec
+        // binding type (e.g. `Procedure_(Fixnum Fixnum → Any)`
+        // from `refine_letrec_via_body_call`) flow into the
+        // body — without this, the lambda's all-Any default
+        // hides the caller-supplied refinement.
+        let expected_pt = match expected {
+            Type::Procedure_(epc) if epc.params.len() == params.fixed.len() => Some(epc.as_ref()),
+            _ => None,
+        };
         let mark = self.env.push();
         for (i, pname) in params.fixed.iter().enumerate() {
-            let pty = pt.params.get(i).cloned().unwrap_or(Type::Any);
+            let declared = pt.params.get(i).cloned().unwrap_or(Type::Any);
+            let pty = if declared == Type::Any {
+                expected_pt
+                    .and_then(|e| e.params.get(i).cloned())
+                    .unwrap_or(Type::Any)
+            } else {
+                declared
+            };
             self.env.define(*pname, pty);
         }
         if let Some(rest_name) = &params.rest {
@@ -312,6 +386,21 @@ impl<'tab> Checker<'tab> {
         } = func
         {
             return self.check_app_lambda(lparams, lbody, *lspan, args, expected);
+        }
+        // Phase 5++: per-call-site specialization. If the func
+        // is a Ref to a top-level lambda (no user ascription —
+        // we leave annotated ones alone), record this call's
+        // arg types so that after the walk we can detect names
+        // whose call sites all agree, and emit hints for them.
+        if let CoreExpr::Ref { name, .. } = func {
+            if self.top_level_lambda_names.borrow().contains(name) {
+                let arg_types: Vec<Type> = args.iter().map(|a| self.infer(a)).collect();
+                self.top_level_call_arg_types
+                    .borrow_mut()
+                    .entry(*name)
+                    .or_default()
+                    .push(arg_types);
+            }
         }
         let f_ty = self.infer(func);
         // Phase 7.4: if the operator's type is polymorphic,
@@ -769,6 +858,17 @@ impl<'tab> Checker<'tab> {
         // intent is "this binding's type is exactly what the
         // matching `(: NAME T)` declared, if any".
         let target = self.table.ascription(name).cloned().unwrap_or(Type::Any);
+        // Phase 5++: track top-level Lambda bindings for
+        // per-call-site specialization. We only consider Sets
+        // for which there's NO user ascription — names that
+        // already have an ascription get their hints via the
+        // canonical `hints_by_name(table)` path and don't need
+        // inferred hints. Same shape as
+        // `refine_letrec_via_body_call`'s gating: if the user
+        // told us the type, don't second-guess.
+        if matches!(value, CoreExpr::Lambda { .. }) && self.table.ascription(name).is_none() {
+            self.top_level_lambda_names.borrow_mut().insert(name);
+        }
         self.check(value, &target)?;
         // Set itself returns the unspecified value; treat as Any.
         if subtype(&Type::Any, expected) {
@@ -1158,6 +1258,91 @@ mod tests {
         let loop_sym = syms.intern("loop");
         let v = hints.get(&loop_sym).expect("loop's hints recorded");
         assert_eq!(v, &vec![cs_rir::Type::Flonum, cs_rir::Type::Fixnum]);
+    }
+
+    #[test]
+    fn monomorphic_call_site_seeds_top_level_hints() {
+        // `sq` is unannotated, called only with Fixnum args
+        // (`(sq i)` where `i` is inferred Fixnum via the
+        // outer named-let). Phase 5++ monomorphic-call
+        // inference should record [Fixnum] as sq's hints.
+        let src = "\
+            (define (sq x) (fx* x x))
+            (define (sum-sq n)
+              (let loop ((i 0) (acc 0))
+                (if (fx>? i n) acc
+                    (loop (fx+ i 1) (fx+ acc (sq i))))))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+        let hints = checker.inferred_hints_by_name();
+        let sq_sym = syms.intern("sq");
+        let v = hints.get(&sq_sym).expect("sq's hints recorded");
+        assert_eq!(v, &vec![cs_rir::Type::Fixnum]);
+    }
+
+    #[test]
+    fn polymorphic_call_sites_skip_inference() {
+        // `f` is called twice with different arg types
+        // (Fixnum and String) — no consistent specialization
+        // possible, so no hints emitted.
+        let src = "\
+            (define (f x) x)
+            (define (caller)
+              (f 1)
+              (f \"hi\"))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+        let hints = checker.inferred_hints_by_name();
+        let f_sym = syms.intern("f");
+        assert!(
+            hints.get(&f_sym).is_none(),
+            "polymorphic callers should defeat specialization"
+        );
+    }
+
+    #[test]
+    fn annotated_top_level_is_not_overridden_by_inference() {
+        // `inc` HAS a top-level ascription. Even if its call
+        // sites all use Fixnum, we shouldn't override the
+        // user's declaration with an inferred hint —
+        // hints_by_name(table) already provides the canonical
+        // entry. The check_set gating handles this by skipping
+        // ascribed names entirely from the inference set.
+        let src = "\
+            (: inc (-> Fixnum Fixnum))
+            (define (inc [n : Fixnum]) : Fixnum (fx+ n 1))
+            (define (caller) (inc 5))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+        let hints = checker.inferred_hints_by_name();
+        let inc_sym = syms.intern("inc");
+        assert!(hints.get(&inc_sym).is_none());
+    }
+
+    #[test]
+    fn call_with_any_arg_skips_inference() {
+        // If any arg infers to Any (e.g., from an
+        // unannotated caller param), we have no information
+        // to act on — skip the specialization.
+        let src = "\
+            (define (helper x) x)
+            (define (caller y) (helper y))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+        let hints = checker.inferred_hints_by_name();
+        let helper_sym = syms.intern("helper");
+        assert!(
+            hints.get(&helper_sym).is_none(),
+            "Any args don't seed specialization"
+        );
     }
 
     #[test]
