@@ -1219,7 +1219,7 @@ fn run_aot_multi(
             d.message, d.severity
         );
     }
-    let typer_hints = cs_typer::hints_by_name(&typer_table);
+    let mut typer_hints = cs_typer::hints_by_name(&typer_table);
     let mut macros = HashMap::new();
     let mut expander = Expander::new(&mut syms, &mut macros);
     let core = match expander.expand_program(&data) {
@@ -1230,19 +1230,28 @@ fn run_aot_multi(
         }
     };
     drop(expander);
-    // Phase 6.2: `--typecheck` runs the bidirectional checker
-    // after expansion (since the Checker operates on CoreExpr)
-    // and before compile. Type errors abort with exit 1; the
-    // earlier-printed annotation syntax errors also count.
-    // Default off — preserves the warn-and-proceed posture
-    // from iter 5.3.
+    // Always run the Checker so inner-let named-loop bodies
+    // pick up inferred Flonum/Fixnum hints from their body's
+    // initial call. `--typecheck` additionally surfaces the
+    // diagnostics and fail-fasts on any type error; without it,
+    // we run the Checker silently for its side effect on
+    // `inferred_param_hints`.
+    let mut checker = cs_typer::Checker::new(&typer_table, &mut syms);
+    let type_errors = checker.check_program(&core);
+    // Merge typer-inferred hints (from named-let bodies etc.)
+    // with the by-name ascription map. Inferred hints win on
+    // collision since they reflect actual call-site shapes
+    // (relevant when a binding name shadows a top-level
+    // ascription, which shouldn't normally happen but is
+    // harmless to handle).
+    for (name, hints) in checker.inferred_hints_by_name() {
+        typer_hints.insert(name, hints);
+    }
     if typecheck {
         let ann_errors = typer_diags
             .iter()
             .filter(|d| matches!(d.severity, cs_diag::Severity::Error))
             .count();
-        let mut checker = cs_typer::Checker::new(&typer_table, &mut syms);
-        let type_errors = checker.check_program(&core);
         for err in &type_errors {
             let diag = err.to_diagnostic();
             eprintln!("{}", render_diag(&diag, &sources, color));
