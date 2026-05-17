@@ -1,9 +1,22 @@
 # ADR 0014: Countable Memory — Refcount-Only Reclamation
 
-> Status: Accepted
+> Status: Accepted (as layer 2 of the unified memory
+> management architecture — see [ADR 0015](./0015-unified-memory-management.md))
 > Date: 2026-05-17
 > Supersedes (in part): [ADR 0006 — Garbage Collector Design](./0006-gc-design.md)
 > Spec: `.spec-workflow/specs/countable-memory/`
+>
+> **Architectural context**: this ADR ratifies *one* of five
+> memory-management mechanisms that CrabScheme combines per
+> ADR 0015 (unified memory management). The "refcount-only"
+> framing here is accurate for layer 2 in isolation; the
+> full architecture also uses ownership (layer 1), regions
+> (layer 3), tracing (layer 4, cfg-gated until escape
+> analysis triggers it), and compiler-driven allocation
+> dispatch (layer 5). The iter 7.1.x → 7.1.x.z investigation
+> in this ADR's spec demonstrated that no single-layer
+> solution to cycles is sufficient; that finding motivated
+> ADR 0015's layered approach.
 
 ## Context
 
