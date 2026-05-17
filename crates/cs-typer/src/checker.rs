@@ -1283,6 +1283,29 @@ mod tests {
     }
 
     #[test]
+    fn narrowed_arg_seeds_monomorphic_hint() {
+        // Phase 4 predicate narrowing + Phase 5++ per-call-site
+        // specialization should compose: helper is called only
+        // from inside `(if (fixnum? v) (helper v) ...)`, where
+        // v is narrowed to Fixnum. The recorded call should
+        // pick up the narrowed type.
+        let src = "\
+            (define (helper x) (fx+ x 1))
+            (define (caller v)
+              (if (fixnum? v) (helper v) 0))
+        ";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+        let hints = checker.inferred_hints_by_name();
+        let helper_sym = syms.intern("helper");
+        let v = hints.get(&helper_sym).expect(
+            "helper's narrowed Fixnum hint should compose Phase-4 narrowing + Phase-5++ per-call",
+        );
+        assert_eq!(v, &vec![cs_rir::Type::Fixnum]);
+    }
+
+    #[test]
     fn polymorphic_call_sites_skip_inference() {
         // `f` is called twice with different arg types
         // (Fixnum and String) — no consistent specialization

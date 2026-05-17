@@ -333,6 +333,15 @@ pub fn check(expr: &CoreExpr, expected: &Type, env: &mut TypeEnv) -> Result<(), 
 /// - Otherwise the operand's type and the filter are disjoint;
 ///   the then-branch is unreachable, so narrow to `Never`.
 pub fn narrow_positive(t: &Type, filter: &Type) -> Type {
+    // Gradual `Any`: in the predicate's then-branch, treat the
+    // operand AS the filter type. Without this special case the
+    // `subtype(Any, filter) == true` (gradual escape) below
+    // would short-circuit and return `Any`, which is correct
+    // for the typecheck but loses the refinement for downstream
+    // consumers (AOT hints, JIT specialization).
+    if matches!(t, Type::Any) {
+        return filter.clone();
+    }
     if subtype(t, filter) {
         return t.clone();
     }
@@ -360,6 +369,15 @@ pub fn narrow_positive(t: &Type, filter: &Type) -> Type {
 ///   unreachable).
 /// - Otherwise return `t` unchanged — we can't subtract.
 pub fn narrow_negative(t: &Type, filter: &Type) -> Type {
+    // Gradual `Any`: "not filter" still admits everything
+    // OTHER than the filter — we have no information about
+    // what specifically it might be, so the right answer is
+    // still `Any`, not `Never`. Without this special case,
+    // `subtype(Any, filter) == true` (gradual escape) would
+    // route to the `Never` branch below.
+    if matches!(t, Type::Any) {
+        return Type::Any;
+    }
     if let Type::Union(members) = t {
         let kept: Vec<Type> = members
             .iter()
