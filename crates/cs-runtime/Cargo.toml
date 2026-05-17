@@ -47,6 +47,15 @@ countable-memory = ["cs-core/countable-memory", "cs-vm/countable-memory"]
 # available in runtime contexts. Region-memory spec iter 6
 # flipped this default-on.
 regions = ["cs-core/regions", "cs-gc/regions", "cs-vm/regions"]
+# Forwards the cs-gc `tracing-cycle-collector` feature
+# (layer 4 of the unified memory architecture). Off by
+# default; opt in for embedders that want a residual-cycle
+# sweep on top of the layer-2 synchronous detector.
+tracing-cycle-collector = [
+    "cs-core/tracing-cycle-collector",
+    "cs-gc/tracing-cycle-collector",
+    "cs-vm/tracing-cycle-collector",
+]
 
 [dependencies]
 cs-core = { workspace = true }

@@ -13,7 +13,7 @@ region exclusion). Independent of the `escape-analysis` spec
 
 ## Iter 1 — `tracing-cycle-collector` feature
 
-- [ ] 1. Add feature flag + un-deprecate tracing.rs
+- [x] 1. Add feature flag + un-deprecate tracing.rs
   - File: `crates/cs-gc/Cargo.toml`,
     `crates/cs-core/Cargo.toml`,
     `crates/cs-runtime/Cargo.toml`,

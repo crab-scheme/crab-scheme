@@ -24,6 +24,13 @@ countable-memory = []
 # the region-memory spec flipped this default-on; opt out
 # with `--no-default-features --features countable-memory`.
 regions = ["dep:bumpalo"]
+# Layer 4 of the unified memory management architecture
+# (ADR 0015). Adds `cs_gc::cycle_registry` — a candidate-based
+# tracing sweep that complements the layer-2 synchronous
+# detector by reclaiming residual cycles the detector
+# couldn't break. Off by default; opt in for embedders that
+# need it. See `.spec-workflow/specs/tracing-revival/`.
+tracing-cycle-collector = ["countable-memory"]
 
 [dependencies]
 bumpalo = { workspace = true, optional = true }

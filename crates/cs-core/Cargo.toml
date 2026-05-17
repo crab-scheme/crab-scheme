@@ -17,6 +17,9 @@ countable-memory = ["cs-gc/countable-memory"]
 # available on Value. Region-memory spec iter 6 flipped this
 # default-on.
 regions = ["cs-gc/regions"]
+# Forwards the cs-gc `tracing-cycle-collector` feature so
+# embedders can opt in to the layer-4 sweep through cs-core.
+tracing-cycle-collector = ["cs-gc/tracing-cycle-collector"]
 
 [dependencies]
 cs-diag = { workspace = true }

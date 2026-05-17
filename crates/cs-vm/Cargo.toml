@@ -18,6 +18,7 @@ countable-memory = ["cs-core/countable-memory"]
 # polymorphically — so this is purely about feature
 # propagation.
 regions = ["cs-core/regions", "cs-gc/regions"]
+tracing-cycle-collector = ["cs-core/tracing-cycle-collector", "cs-gc/tracing-cycle-collector"]
 
 [dependencies]
 cs-core = { workspace = true }
