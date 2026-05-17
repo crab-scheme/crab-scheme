@@ -1,6 +1,8 @@
 # Escape Analysis — Design
 
-> Status: **Draft**.
+> Status: **CLOSED** (2026-05-17). See
+> `docs/milestones/escape-analysis-exit.md` and
+> `docs/adr/0017-escape-analysis.md`.
 > Companion: `requirements.md`, `tasks.md`.
 
 ## Overview

@@ -1,6 +1,8 @@
 # Escape Analysis — Requirements
 
-> Status: **Draft** (proposed post-region-memory).
+> Status: **CLOSED** (2026-05-17, with cs-vm + cs-aot codegen
+> deferred — see `docs/milestones/escape-analysis-exit.md`
+> and `docs/adr/0017-escape-analysis.md`).
 > Spec slug: `escape-analysis`
 > Roadmap slot: Layer 5 of the unified memory management
 > architecture (ADR 0015).

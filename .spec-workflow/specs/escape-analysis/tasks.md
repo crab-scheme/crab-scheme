@@ -1,5 +1,10 @@
 # Escape Analysis — Tasks
 
+> Status: **CLOSED** (2026-05-17). Iters 1-7 complete; tasks
+> #9 (cs-vm opcodes) and #10 (cs-aot emit) deferred as
+> additive forward-optimizations — see
+> `docs/milestones/escape-analysis-exit.md` and
+> `docs/adr/0017-escape-analysis.md` "Scope" sections.
 > Companion: `requirements.md`, `design.md`.
 > Format mirrors the countable-memory / region-memory specs.
 
@@ -292,7 +297,7 @@ shipped: `cs_gc::Region`, `Gc::new_in`, debug-mode validity).
 
 ## Iter 7 — ADR 0017 + exit report + spec close
 
-- [ ] 11. ADR 0017 + exit report + spec close
+- [x] 11. ADR 0017 + exit report + spec close
   - File: `docs/adr/0017-escape-analysis.md` (new),
     `docs/milestones/escape-analysis-exit.md` (new),
     spec files status update.
