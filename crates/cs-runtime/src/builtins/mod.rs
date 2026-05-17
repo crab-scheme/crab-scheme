@@ -2437,6 +2437,10 @@ fn b_set_car(args: &[Value]) -> Result<Value, String> {
     match &args[0] {
         Value::Pair(p) => {
             *p.car.borrow_mut() = args[1].clone();
+            #[cfg(feature = "countable-memory")]
+            cs_gc::cycle::check_and_break(p, |_| {
+                crate::countable_memory_cycle::record_cycle_detected();
+            });
             Ok(Value::Unspecified)
         }
         v => Err(type_err("set-car!", "pair", v)),
@@ -2450,6 +2454,10 @@ fn b_set_cdr(args: &[Value]) -> Result<Value, String> {
     match &args[0] {
         Value::Pair(p) => {
             *p.cdr.borrow_mut() = args[1].clone();
+            #[cfg(feature = "countable-memory")]
+            cs_gc::cycle::check_and_break(p, |_| {
+                crate::countable_memory_cycle::record_cycle_detected();
+            });
             Ok(Value::Unspecified)
         }
         v => Err(type_err("set-cdr!", "pair", v)),
@@ -3636,11 +3644,17 @@ fn b_vector_set(args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Vector(v) => {
-            let mut v = v.borrow_mut();
-            if (i as usize) >= v.len() {
-                return Err("vector-set!: index out of range".into());
+            {
+                let mut vw = v.borrow_mut();
+                if (i as usize) >= vw.len() {
+                    return Err("vector-set!: index out of range".into());
+                }
+                vw[i as usize] = args[2].clone();
             }
-            v[i as usize] = args[2].clone();
+            #[cfg(feature = "countable-memory")]
+            cs_gc::cycle::check_and_break(v, |_| {
+                crate::countable_memory_cycle::record_cycle_detected();
+            });
             Ok(Value::Unspecified)
         }
         v => Err(type_err("vector-set!", "vector", v)),
@@ -5771,21 +5785,35 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             let k = h.items.borrow()[i].0.clone();
             if ht_eq_ctx(&h, &k, &args[1], ctx)? {
                 h.items.borrow_mut()[i].1 = args[2].clone();
+                #[cfg(feature = "countable-memory")]
+                cs_gc::cycle::check_and_break(&h, |_| {
+                    crate::countable_memory_cycle::record_cycle_detected();
+                });
                 return Ok(Value::Unspecified);
             }
         }
         h.items
             .borrow_mut()
             .push((args[1].clone(), args[2].clone()));
+        #[cfg(feature = "countable-memory")]
+        cs_gc::cycle::check_and_break(&h, |_| {
+            crate::countable_memory_cycle::record_cycle_detected();
+        });
         return Ok(Value::Unspecified);
     }
     let kind = h.eq_kind;
-    let mut items = h.items.borrow_mut();
-    if let Some(slot) = items.iter_mut().find(|(k, _)| ht_eq(kind, k, &args[1])) {
-        slot.1 = args[2].clone();
-    } else {
-        items.push((args[1].clone(), args[2].clone()));
+    {
+        let mut items = h.items.borrow_mut();
+        if let Some(slot) = items.iter_mut().find(|(k, _)| ht_eq(kind, k, &args[1])) {
+            slot.1 = args[2].clone();
+        } else {
+            items.push((args[1].clone(), args[2].clone()));
+        }
     }
+    #[cfg(feature = "countable-memory")]
+    cs_gc::cycle::check_and_break(&h, |_| {
+        crate::countable_memory_cycle::record_cycle_detected();
+    });
     Ok(Value::Unspecified)
 }
 

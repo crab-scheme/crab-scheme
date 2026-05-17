@@ -2,6 +2,8 @@
 
 pub mod active;
 pub mod builtins;
+#[cfg(feature = "countable-memory")]
+pub mod countable_memory_cycle;
 pub mod env;
 pub mod eval;
 // The `ffi` module contains only the libloading-using dlopen path
