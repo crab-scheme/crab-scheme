@@ -81,6 +81,12 @@ pub struct CycleVisitor {
     over_limit: bool,
     root_addr: usize,
     limit: usize,
+    /// Iter 7.1.x.z — flips to true when a `CycleVisit` impl
+    /// uses [`root_addr`] to identify a back-edge and
+    /// successfully demotes its outgoing slot to a `Weak`
+    /// tombstone. Used by the runtime's break-action callback
+    /// to skip a redundant root-level demote attempt.
+    broken: bool,
 }
 
 impl CycleVisitor {
@@ -124,6 +130,41 @@ impl CycleVisitor {
     /// without further work.
     pub fn done(&self) -> bool {
         self.found || self.over_limit
+    }
+
+    /// Iter 7.1.x.z — the address of the root the detector
+    /// was started on. [`CycleVisit`] impls use this to
+    /// identify back-edges: when a child's address equals
+    /// `root_addr`, the calling node IS the back-edge source
+    /// and is in a position to demote its outgoing slot
+    /// (`car` or `cdr`) to a `Weak` tombstone.
+    pub fn root_addr(&self) -> usize {
+        self.root_addr
+    }
+
+    /// Iter 7.1.x.z — signal that a `CycleVisit` impl
+    /// successfully demoted a cycle edge to `Weak`. The
+    /// runtime's `check_and_break` invocation reads this via
+    /// [`is_broken`] to decide whether the explicit root-level
+    /// break is still needed.
+    pub fn mark_broken(&mut self) {
+        self.broken = true;
+    }
+
+    /// Iter 7.1.x.z — `true` if any in-walk demote attempt
+    /// succeeded.
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Iter 7.1.x.z — explicitly mark the cycle as found.
+    /// Used by `CycleVisit` impls that demote a back-edge
+    /// BEFORE descending into the child: the demote replaces
+    /// the slot with `Unspecified` so the normal `ctx.visit`
+    /// path can no longer set `found` via that child. This
+    /// method ensures the cycle is still reported.
+    pub fn set_found(&mut self) {
+        self.found = true;
     }
 
     /// Register a non-`Gc<T>` heap address (e.g. `Rc<T>` for
@@ -191,6 +232,7 @@ where
         over_limit: false,
         root_addr: Gc::as_addr(root),
         limit: get_limit(),
+        broken: false,
     };
     // Root's own slot is implicitly visited — encountering it
     // again during descent is the cycle signal.
@@ -210,12 +252,46 @@ where
 ///
 /// The break action runs at most once per call and only on
 /// positive detection; the no-cycle hot path skips the closure.
+///
+/// Note: under iter 7.1.x.z, the cycle walk itself may have
+/// already demoted a back-edge during descent (when a
+/// `CycleVisit` impl sees that a child's address equals
+/// `root_addr` and the target has sufficient external
+/// anchors). [`check_and_break_walk`] exposes the
+/// `already_broken` signal to callers that want to skip a
+/// redundant root demote.
 pub fn check_and_break<T>(root: &Gc<T>, break_at: impl FnOnce(&Gc<T>))
 where
     T: CycleVisit + 'static,
 {
-    if cycle_check(root).is_some() {
-        break_at(root);
+    let mut already_broken = false;
+    check_and_break_walk(root, |r, broken| {
+        already_broken = broken;
+        break_at(r);
+    });
+    let _ = already_broken;
+}
+
+/// Variant of [`check_and_break`] that exposes whether the
+/// cycle walk's inline back-edge demote already broke the
+/// cycle. The `break_at` callback receives `(root, broken)`
+/// — when `broken == true`, the runtime can skip a redundant
+/// root-level demote attempt.
+pub fn check_and_break_walk<T>(root: &Gc<T>, break_at: impl FnOnce(&Gc<T>, bool))
+where
+    T: CycleVisit + 'static,
+{
+    let mut ctx = CycleVisitor {
+        visited: HashSet::new(),
+        found: false,
+        over_limit: false,
+        root_addr: Gc::as_addr(root),
+        limit: get_limit(),
+        broken: false,
+    };
+    root.visit_children(&mut ctx);
+    if ctx.found {
+        break_at(root, ctx.broken);
     }
 }
 

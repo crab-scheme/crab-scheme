@@ -266,12 +266,28 @@ impl cs_gc::cycle::CycleVisit for Pair {
         // upgraded weak still represents the cycle from the
         // user's perspective; if a new mutation reconstructs
         // the cycle, the detector should still fire.
+        //
+        // Iter 7.1.x.z investigated an in-walk back-edge demote
+        // (when a Pair sees self.car/cdr targeting root, try
+        // to demote that slot directly) but reclaimed nested
+        // closure-env structures in deeply-recursive
+        // metacircular workloads — even with the
+        // strong-count guard, recursive go-closure traversal
+        // through env_su found enough demote candidates to
+        // make some env subtree unreachable mid-computation.
+        // The robust fix requires reconstructing the cycle
+        // path and applying full Bacon-Rajan trial deletion
+        // (counting internal vs external edges per cycle
+        // node, picking a safe-to-weaken edge). Deferred —
+        // see ADR 0014 §"iter 7.1.x.z note". The iter
+        // 7.1.x.y caller-supplied baseline at the root level
+        // remains the in-tree safe demote path.
         let car = self.car();
-        let cdr = self.cdr();
         car.visit_children(ctx);
         if ctx.done() {
             return;
         }
+        let cdr = self.cdr();
         cdr.visit_children(ctx);
     }
 }

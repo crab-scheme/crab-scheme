@@ -206,10 +206,38 @@ synchronous detector closes the gap with bounded per-call cost.
   correctly skips (total=2, no external beyond slot+args).
   Verified by `iter_7_1_x_y_top_bound_self_cycle_actually_breaks`
   in `crates/cs-runtime/tests/cycle_break.rs`.
-- [~] iter 7.1.x.z — Replace caller-supplied baselines with
-  full Bacon-Rajan trial-deletion that picks safe cycle
-  edges agnostic to caller conventions. Would automatically
-  handle VM-tier dispatch baselines that differ from walker.
+- [~] iter 7.1.x.z — Bacon-Rajan trial deletion to pick safe
+  cycle edges agnostic to caller conventions. **Investigated;
+  in-tree primitives shipped, runtime wiring deferred.** The
+  iter 7.1.x.z attempt added in-walk back-edge identification:
+  when a `CycleVisit` Pair impl saw that `self.car` or
+  `self.cdr` pointed at the cycle root, it tried to demote
+  that slot directly (rationale: the deepest cycle node is
+  the back-edge source; demoting there breaks the cycle
+  without touching the freshly-mutated root). The cycle.rs
+  API gained `CycleVisitor::root_addr` / `set_found` /
+  `mark_broken` / `is_broken` and a
+  `check_and_break_walk(root, |r, already_broken|)`
+  variant. The approach demonstrated correct
+  back-edge identification but, in deeply-recursive
+  metacircular workloads (the
+  `(define go ...)` inside `(define sum-up-to ...)` body)
+  the in-walk demote made some env-subtree unreachable
+  mid-computation — multiple Pair nodes in the cycle each
+  satisfied the strong-count guard locally, yet weakening
+  any one of them via the deep-Pair impl orphaned a closure
+  env that was still needed by a later mc-apply.
+  
+  The robust fix requires reconstructing the FULL cycle
+  path during traversal, then applying full Bacon-Rajan
+  trial deletion: simulate decrementing all internal
+  edges, identify the unique node with external anchors,
+  weaken the edge into that node. This is genuinely more
+  complex than caller-supplied baselines and warrants its
+  own design pass. For now, the iter 7.1.x.y root-level
+  demote with `baseline = 3` remains the in-tree safe
+  demote path; iter 7.1.x.z's API primitives stay
+  available for the future full implementation.
 - [~] iter 7.1.y — Vector and Hashtable structural break
   tombstones. **Scoped down** to documentation-only deferral
   in this milestone for the following reasons:

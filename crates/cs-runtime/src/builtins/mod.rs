@@ -2440,17 +2440,12 @@ fn b_set_car(args: &[Value]) -> Result<Value, String> {
             #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(p, |p| {
                 crate::countable_memory_cycle::record_cycle_detected();
-                // Iter 7.1.x.y: caller-supplied baseline.
-                // baseline = 3: slot (1) + args[1] (1) + an
-                // extra transient ref accounting for the VM
-                // tier's dispatch path (which keeps the
-                // NB-encoded version on the value stack while
-                // the decoded Value lives in args; the walker
-                // tier holds only args[1]). Conservative
-                // upper bound shared between both tiers.
-                // Cycles with 1 external anchor in the walker
-                // path skip; cycles with 2+ external anchors
-                // reclaim correctly.
+                // Iter 7.1.x.y: caller-supplied baseline=3
+                // (slot + args[0] + args[1] + VM transient).
+                // The in-walk back-edge demote that iter
+                // 7.1.x.z attempted is reverted pending a
+                // full Bacon-Rajan implementation; see ADR
+                // 0014 §"iter 7.1.x.z note".
                 if p.break_car_cycle(3) {
                     crate::countable_memory_cycle::record_cycle_broken();
                 }
@@ -2471,8 +2466,6 @@ fn b_set_cdr(args: &[Value]) -> Result<Value, String> {
             #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(p, |p| {
                 crate::countable_memory_cycle::record_cycle_detected();
-                // baseline = 3: slot + args[1] + VM-tier
-                // NB-stack transient. See b_set_car.
                 if p.break_cdr_cycle(3) {
                     crate::countable_memory_cycle::record_cycle_broken();
                 }
