@@ -55,25 +55,31 @@ pub enum TypeError {
     EmptyBegin { span: Span },
 }
 
-/// Phase-2 subtyping over atomic types.
+/// Subtyping over the full Phase-3 type lattice.
 ///
-/// Rules:
+/// Rules, checked in order:
 /// 1. **Reflexive** — `T <: T` for every `T`.
-/// 2. **Top** — `T <: Any` and `Any <: T` are both true. The
-///    second is gradual typing's escape hatch: an `Any`-typed
-///    value is allowed to flow into any expected position. This
-///    enables untyped code to call into typed functions without
-///    extra ceremony; the runtime is responsible for the
-///    failure-mode (no runtime contract yet — Phase 5 adds those).
+/// 2. **Gradual top** — `T <: Any` and `Any <: T` are both
+///    true. The second is gradual typing's escape hatch: an
+///    `Any`-typed value flows into any expected position so
+///    untyped code can call typed code without ceremony. The
+///    runtime is responsible for the failure-mode (no
+///    contracts yet — Phase 5).
 /// 3. **Bottom** — `Never <: T` for every `T`.
-/// 4. **Procedure_** — structural: `(-> P… R) <: (-> Q… S)` iff
-///    arities match, each `Qi <: Pi` (contravariant params), and
-///    `R <: S` (covariant return). Iter 2.4 only needs the
-///    same-shape case; the general rule is here for forward
-///    compatibility.
-///
-/// Phase 3 adds: `Union` (left distributes — every member must
-/// be a subtype), `Listof`, `Vectorof`.
+/// 4. **Union, left** — `(U A B …) <: T` iff every member is a
+///    subtype of `T`. Checked BEFORE the right-rule so a union
+///    on both sides recurses on each left member separately.
+/// 5. **Union, right** — `T <: (U A B …)` iff `T` is a subtype
+///    of some member.
+/// 6. **Procedure_** — structural: `(-> P… R) <: (-> Q… S)` iff
+///    arities match, each `Qi <: Pi` (contravariant params),
+///    and `R <: S` (covariant return). Iter 3.5 adds rest-arg
+///    handling.
+/// 7. **Listof** — covariant: `(Listof A) <: (Listof B)` iff
+///    `A <: B` (lists are read-mostly in idiomatic Scheme).
+/// 8. **Vectorof** — invariant: `(Vectorof A) <: (Vectorof B)`
+///    iff `A == B` (vectors are mutable, so subtype variance
+///    would be unsound).
 pub fn subtype(sub: &Type, sup: &Type) -> bool {
     if sub == sup {
         return true;
@@ -83,6 +89,18 @@ pub fn subtype(sub: &Type, sup: &Type) -> bool {
     }
     if matches!(sub, Type::Never) {
         return true;
+    }
+    // Union, left: every member of `sub` must subtype `sup`.
+    // Important: this comes before the right-rule so unions on
+    // both sides decompose member-by-member rather than
+    // accidentally matching `Union ≡ Union` only when both
+    // members lists are equal.
+    if let Type::Union(subs) = sub {
+        return subs.iter().all(|s| subtype(s, sup));
+    }
+    // Union, right: `sub` subtypes some member of `sup`.
+    if let Type::Union(sups) = sup {
+        return sups.iter().any(|s| subtype(sub, s));
     }
     match (sub, sup) {
         (Type::Procedure_(a), Type::Procedure_(b)) => {
@@ -94,8 +112,21 @@ pub fn subtype(sub: &Type, sup: &Type) -> bool {
                     return false;
                 }
             }
+            // Rest-arg subtyping is iter 3.5; for now require
+            // both absent or both present + contravariant.
+            match (&a.rest, &b.rest) {
+                (None, None) => {}
+                (Some(ar), Some(br)) => {
+                    if !subtype(br, ar) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
             subtype(&a.return_type, &b.return_type)
         }
+        (Type::Listof(a), Type::Listof(b)) => subtype(a, b),
+        (Type::Vectorof(a), Type::Vectorof(b)) => a == b,
         _ => false,
     }
 }
@@ -265,6 +296,97 @@ mod tests {
         assert!(!subtype(&Type::Fixnum, &Type::Flonum));
         assert!(!subtype(&Type::String, &Type::Fixnum));
         assert!(!subtype(&Type::Pair, &Type::Vector));
+    }
+
+    // ---- Phase 3 iter 3.2: Union subtyping ----
+
+    #[test]
+    fn subtype_member_into_union() {
+        // T <: (U A B) iff T <: A or T <: B
+        let u = Type::union(vec![Type::Fixnum, Type::Flonum]);
+        assert!(subtype(&Type::Fixnum, &u));
+        assert!(subtype(&Type::Flonum, &u));
+        assert!(!subtype(&Type::String, &u));
+    }
+
+    #[test]
+    fn subtype_union_distributes_left() {
+        // (U A B) <: T iff A <: T and B <: T
+        let u = Type::union(vec![Type::Fixnum, Type::Flonum]);
+        assert!(subtype(&u, &u));
+        assert!(subtype(&u, &Type::Any));
+        // Neither member is a subtype of just Fixnum, so the
+        // union isn't either.
+        assert!(!subtype(&u, &Type::Fixnum));
+    }
+
+    #[test]
+    fn subtype_union_to_wider_union() {
+        let narrow = Type::union(vec![Type::Fixnum, Type::Flonum]);
+        let wide = Type::union(vec![Type::Fixnum, Type::Flonum, Type::String]);
+        assert!(subtype(&narrow, &wide));
+        assert!(!subtype(&wide, &narrow));
+    }
+
+    #[test]
+    fn subtype_never_into_union() {
+        let u = Type::union(vec![Type::Fixnum, Type::Flonum]);
+        assert!(subtype(&Type::Never, &u));
+    }
+
+    #[test]
+    fn subtype_listof_is_covariant() {
+        let any_list = Type::Listof(Box::new(Type::Any));
+        let fx_list = Type::Listof(Box::new(Type::Fixnum));
+        // Listof Fixnum <: Listof Any
+        assert!(subtype(&fx_list, &any_list));
+        // and Listof Any <: Listof Fixnum (gradual escape hatch)
+        assert!(subtype(&any_list, &fx_list));
+        // But Listof Fixnum is NOT <: Listof String (distinct
+        // atoms; no gradual escape because element type is
+        // concrete on both sides).
+        let str_list = Type::Listof(Box::new(Type::String));
+        assert!(!subtype(&fx_list, &str_list));
+    }
+
+    #[test]
+    fn subtype_vectorof_is_invariant() {
+        let fx_vec = Type::Vectorof(Box::new(Type::Fixnum));
+        let any_vec = Type::Vectorof(Box::new(Type::Any));
+        // Invariant: Vectorof Fixnum is NOT a subtype of
+        // Vectorof Any, even though Fixnum <: Any. Mutability
+        // makes width subtyping unsound for vectors.
+        assert!(!subtype(&fx_vec, &any_vec));
+        assert!(!subtype(&any_vec, &fx_vec));
+        // Same-element vectors do subtype each other.
+        let fx_vec2 = Type::Vectorof(Box::new(Type::Fixnum));
+        assert!(subtype(&fx_vec, &fx_vec2));
+    }
+
+    #[test]
+    fn subtype_proc_with_union_args_via_distribution() {
+        // (-> (U Fixnum Flonum) Fixnum) accepts a value of
+        // declared type Fixnum (Fixnum <: (U Fixnum Flonum))
+        // contravariantly through Procedure_.
+        use crate::types::ProcType;
+        let union_arg = Type::union(vec![Type::Fixnum, Type::Flonum]);
+        let proc_union = Type::Procedure_(Box::new(ProcType {
+            params: vec![union_arg.clone()],
+            return_type: Type::Fixnum,
+            rest: None,
+        }));
+        let proc_fx = Type::Procedure_(Box::new(ProcType {
+            params: vec![Type::Fixnum],
+            return_type: Type::Fixnum,
+            rest: None,
+        }));
+        // (-> (U Fx Fl) Fx) is a subtype of (-> Fx Fx):
+        // contravariantly, Fx <: (U Fx Fl).
+        assert!(subtype(&proc_union, &proc_fx));
+        // The reverse fails: (-> Fx Fx) accepts only Fx, but
+        // its supertype (-> (U Fx Fl) Fx) would need to accept
+        // both, and the contravariant Fx <: Fl doesn't hold.
+        assert!(!subtype(&proc_fx, &proc_union));
     }
 
     // ---- check tests ----
