@@ -55,9 +55,41 @@ Several downstream items want this:
 | **B** | `syntax-case` form recognizer + matcher + single-template clause | **Done** | Yes — covers ~80% of real-world syntax-case use without fenders |
 | **C** | `with-syntax`, `quasisyntax`/`unsyntax`/`unsyntax-splicing`; pvar stack on Expander | **Done** | Yes — depends on B |
 | **C2** | Minimal ellipsis `…` (single-pvar form only) | **Done** | Yes — covers `(prefix… pvar …)` / `(prefix… pvar …)` splice |
-| **C3** | Compound + nested ellipsis (`((p ...) ...)`, multi-pvar zip) | pending | Larger logic — needs runtime mapping/zipping |
+| **C3** | Compound sub-patterns under `…`, multi-pvar zip-map templates | **Done** | Yes — unblocks `let`-style macros |
+| **C4** | Nested ellipsis `((p …) …)`, literals-inside-compound, dotted-tail sub-patterns | pending | Largest remaining grammar gap |
 | **D** | Fender expressions (expand-time Scheme eval) | pending | Largest iter; may slip to Phase 2 |
 | **E** | Proper hygiene tracking — mark-aware identifier comparison | pending | Replaces the Iter A symbol-eq stand-ins; needs SyntaxObject decision |
+
+## Iter C3 — Compound + zip-map ellipsis
+
+Patterns of shape `(prefix… (p1 p2 … pK) …)` where each `pi` is
+a bare-symbol pvar. The sub-pattern (a proper-list of pvars)
+binds each pvar at depth 1, capturing the per-element value of
+its slot across the whole ellipsis section. Test code generated:
+
+* `(every (lambda (e) (and (pair? e) (pair? (cdr e)) … (null? (cdr^K e)))) walking-key)`
+* `(list? walking-key)`
+
+Extraction: each `pi` binds to `(map (lambda (e) (car (cdr^i e))) walking-key)`.
+
+Templates of matching shape `(prefix… sub …)` where `sub`'s
+referenced pvars are all depth-1 zip-map: inner sub-template
+runs with those pvars re-bound at depth 0; outer call becomes
+`(map (lambda (p1 p2 … pK) <inner>) p1-list … pK-list)`.
+
+**Architectural change**: `syntax_pvars` upgraded from
+`Vec<Symbol>` to `Vec<(Symbol, u32)>` to track each pvar's
+ellipsis depth. `compile_sc_pattern` returns
+`Vec<(Symbol, u32, Datum)>`; `compile_syntax_template` takes
+`&[(Symbol, u32)]` to decide scalar-substitution vs. zip-map.
+
+**What lands**: `let`/`cond`/`case`-style macros that bind
+`((var val) …)` and emit `(lambda (var …) …) val …` etc.
+Probably 90% of real-world syntax-case usage when combined with
+Iter C2's single-pvar shape.
+
+**Deferred to Iter C4**: nested ellipsis (`((p …) …)`),
+literals inside compound sub-patterns, dotted-tail sub-patterns.
 
 ## Iter C2 — Minimal ellipsis
 

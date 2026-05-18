@@ -161,14 +161,20 @@ pub struct Expander<'a> {
     /// per-library scope frames that land in the next pre-M5 step.
     libraries: std::collections::HashMap<Vec<Symbol>, LibraryInfo>,
     /// Stack of currently-bound syntax-case pattern variables, used
-    /// by `(syntax X)` template instantiation. Each call to
-    /// `expand_syntax_case` / `expand_with_syntax` pushes its
-    /// clause-local pvars before expanding the clause body and
-    /// pops them after. Nested syntax-binding forms inherit the
-    /// outer pvars by reading the full stack at expansion time,
-    /// so `(syntax X)` resolves correctly when X is bound at any
-    /// surrounding scope.
-    syntax_pvars: Vec<Symbol>,
+    /// by `(syntax X)` template instantiation. Each entry is
+    /// `(name, depth)` -- depth is 0 for ordinary scalar pvars,
+    /// 1 for pvars bound under one ellipsis (`...`), 2 for two
+    /// nesting levels, etc. Iter C2 introduced depth-1 pvars
+    /// (single-pvar ellipsis); Iter C3 adds depth-1 for
+    /// compound-pattern ellipsis.
+    ///
+    /// Each call to `expand_syntax_case` / `expand_with_syntax`
+    /// pushes its clause-local pvars before expanding the clause
+    /// body and pops them after. Nested syntax-binding forms
+    /// inherit the outer pvars by reading the full stack at
+    /// expansion time, so `(syntax X)` resolves correctly when X
+    /// is bound at any surrounding scope.
+    syntax_pvars: Vec<(Symbol, u32)>,
 }
 
 /// Compile-time info recorded for each `(library ...)` declaration.
@@ -2324,7 +2330,7 @@ impl<'a> Expander<'a> {
             let pat = &clause_parts[0];
             let tmpl_body = &clause_parts[1];
 
-            let mut pvars: Vec<(Symbol, Datum)> = Vec::new();
+            let mut pvars: Vec<(Symbol, u32, Datum)> = Vec::new();
             let test = compile_sc_pattern(
                 pat,
                 key_ref.clone(),
@@ -2345,7 +2351,7 @@ impl<'a> Expander<'a> {
                 tmpl_body.clone()
             } else {
                 let mut binding_list = Datum::Null(clause_d.span());
-                for (pname, ext) in pvars.iter().rev() {
+                for (pname, _depth, ext) in pvars.iter().rev() {
                     let bind_pair = mk_list(
                         vec![Datum::Symbol(*pname, clause_d.span()), ext.clone()],
                         clause_d.span(),
@@ -2364,13 +2370,11 @@ impl<'a> Expander<'a> {
             };
 
             let cond_clause = mk_list(vec![test, body_with_lets], clause_d.span());
-            cond_clauses_dat.push(
-                (
-                    cond_clause,
-                    pvars.into_iter().map(|(s, _)| s).collect::<Vec<_>>(),
-                )
-                    .0,
-            );
+            // The per-clause pvar set is re-derived from the pattern
+            // in the body-expansion loop below; we only push the
+            // assembled clause datum here.
+            let _ = &pvars;
+            cond_clauses_dat.push(cond_clause);
             // Don't push pvars here; the per-clause push happens
             // around expansion of *this* clause's body below.
         }
@@ -2423,7 +2427,7 @@ impl<'a> Expander<'a> {
             // walk.)
             let orig_clause_parts =
                 collect_proper_list_strict(&items[2 + clause_i]).expect("orig clause");
-            let mut pvars_pairs: Vec<(Symbol, Datum)> = Vec::new();
+            let mut pvars_pairs: Vec<(Symbol, u32, Datum)> = Vec::new();
             let _ = compile_sc_pattern(
                 &orig_clause_parts[0],
                 key_ref.clone(),
@@ -2432,7 +2436,8 @@ impl<'a> Expander<'a> {
                 self.syms,
                 &self.keywords,
             )?;
-            let pvar_names: Vec<Symbol> = pvars_pairs.into_iter().map(|(s, _)| s).collect();
+            let pvar_entries: Vec<(Symbol, u32)> =
+                pvars_pairs.into_iter().map(|(s, d, _)| (s, d)).collect();
 
             // Push, expand body, pop. The body datum already
             // wraps in a `let` that binds the pvars as Scheme
@@ -2440,7 +2445,7 @@ impl<'a> Expander<'a> {
             // ensures any `(syntax X)` inside (or in nested
             // syntax-binding forms) treats X as a pvar.
             let saved = self.syntax_pvars.len();
-            self.syntax_pvars.extend(pvar_names.iter().copied());
+            self.syntax_pvars.extend(pvar_entries.iter().copied());
             let body_expr = self.expand(body_dat)?;
             self.syntax_pvars.truncate(saved);
 
@@ -2481,7 +2486,7 @@ impl<'a> Expander<'a> {
         // any syntax-binding scope therefore lowers to roughly
         // `(quote T)` -- but inside a syntax-case or with-syntax
         // body it transparently substitutes the bound pvars.
-        let pvars_snapshot: Vec<Symbol> = self.syntax_pvars.clone();
+        let pvars_snapshot: Vec<(Symbol, u32)> = self.syntax_pvars.clone();
         let compiled =
             compile_syntax_template(&items[0], &pvars_snapshot, self.syms, &self.keywords);
         self.expand(&compiled)
@@ -5734,7 +5739,7 @@ fn compile_sc_pattern(
     pat: &Datum,
     key: Datum,
     literals: &[Symbol],
-    pvars_out: &mut Vec<(Symbol, Datum)>,
+    pvars_out: &mut Vec<(Symbol, u32, Datum)>,
     syms: &mut SymbolTable,
     kw: &Keywords,
 ) -> Result<Datum, ExpandError> {
@@ -5742,12 +5747,8 @@ fn compile_sc_pattern(
     let mk_sym =
         |name: &str, syms: &mut SymbolTable| -> Datum { Datum::Symbol(syms.intern(name), span) };
     match pat {
-        Datum::Symbol(s, _) if *s == kw.underscore => {
-            // Wildcard: matches anything, binds nothing.
-            Ok(Datum::Boolean(true, span))
-        }
+        Datum::Symbol(s, _) if *s == kw.underscore => Ok(Datum::Boolean(true, span)),
         Datum::Symbol(s, _) if literals.contains(s) => {
-            // Literal identifier: matches `eq?` to itself.
             let eq_call = mk_list(
                 vec![
                     mk_sym("eq?", syms),
@@ -5762,59 +5763,33 @@ fn compile_sc_pattern(
             Ok(eq_call)
         }
         Datum::Symbol(s, _) => {
-            // Pattern variable: matches anything, binds `s` to `key`.
-            pvars_out.push((*s, key));
+            // Pattern variable at depth 0: binds `s` to `key`.
+            pvars_out.push((*s, 0, key));
             Ok(Datum::Boolean(true, span))
         }
-        Datum::Null(_) => {
-            // () matches null.
-            let test = mk_list(vec![mk_sym("null?", syms), key], span);
-            Ok(test)
-        }
+        Datum::Null(_) => Ok(mk_list(vec![mk_sym("null?", syms), key], span)),
         Datum::Boolean(_, _)
         | Datum::Number(_, _)
         | Datum::Character(_, _)
         | Datum::String(_, _) => {
-            // Self-quoting literal: matches `equal?`.
             let lit_quote = mk_list(vec![Datum::Symbol(kw.quote, span), pat.clone()], span);
-            let test = mk_list(vec![mk_sym("equal?", syms), key, lit_quote], span);
-            Ok(test)
+            Ok(mk_list(vec![mk_sym("equal?", syms), key, lit_quote], span))
         }
         Datum::Pair(_, _, _) => {
-            // Detect a trailing `(prefix... pvar ...)` form, which
-            // is Iter C2's minimal ellipsis case. We require:
-            //   * the pattern is a proper list (tail is Null)
-            //   * the `...` symbol appears exactly once, as the
-            //     last element of the spine
-            //   * the element immediately before `...` is a bare
-            //     symbol pvar (no compound sub-patterns)
-            // Such a pattern matches any list of length >= prefix
-            // length; the pvar binds to the remaining list.
+            // Detect a trailing `(prefix... sub ...)` form. `sub` may
+            // be either:
+            //   * a bare symbol pvar -- Iter C2's minimal case
+            //   * a proper list of bare-symbol pvars (Iter C3
+            //     compound sub-pattern)
+            // Anything more complex (nested ellipsis, dotted sub,
+            // literals inside sub) is rejected with a pointer.
             if let Some(items) = collect_proper_list_strict(pat) {
                 let n = items.len();
                 if n >= 2 {
                     if let Datum::Symbol(last, _) = &items[n - 1] {
                         if *last == kw.ellipsis {
-                            // Reject sub-pattern compound under ellipsis for now.
                             let sub = &items[n - 2];
-                            let sub_sym = match sub {
-                                Datum::Symbol(s, _)
-                                    if *s != kw.underscore && !literals.contains(s) =>
-                                {
-                                    Some(*s)
-                                }
-                                _ => None,
-                            };
-                            if sub_sym.is_none() {
-                                return Err(ExpandError::BadSyntax {
-                                    what: "Iter C2 ellipsis only supports a single pvar before `...`; compound sub-patterns and nested ellipsis land in a follow-up iter".into(),
-                                    span,
-                                });
-                            }
-                            let sub_sym = sub_sym.unwrap();
-                            // Walk the prefix (items[0..n-2]). Each
-                            // prefix element compiles as a sub-pattern
-                            // on (car key), then key becomes (cdr key).
+                            // Walk the prefix (items[0..n-2]).
                             let mut tests: Vec<Datum> = Vec::new();
                             let mut walking_key = key.clone();
                             for prefix_item in &items[..n - 2] {
@@ -5834,25 +5809,131 @@ fn compile_sc_pattern(
                                 tests.push(inner_test);
                                 walking_key = mk_list(vec![mk_sym("cdr", syms), walking_key], span);
                             }
-                            // Bind sub_sym to the remaining list (could be empty).
-                            pvars_out.push((sub_sym, walking_key.clone()));
-                            // The remainder must be a proper list
-                            // (any list, including empty). list? checks
-                            // proper-list shape -- avoids accepting
-                            // dotted-tail rests under ellipsis.
-                            let list_test = mk_list(vec![mk_sym("list?", syms), walking_key], span);
-                            tests.push(list_test);
-                            let mut all = vec![Datum::Symbol(kw.and, span)];
-                            all.extend(tests);
-                            return Ok(mk_list(all, span));
+
+                            // Bare-pvar sub: Iter C2 case.
+                            if let Datum::Symbol(s, _) = sub {
+                                if *s != kw.underscore && !literals.contains(s) {
+                                    pvars_out.push((*s, 1, walking_key.clone()));
+                                    let list_test =
+                                        mk_list(vec![mk_sym("list?", syms), walking_key], span);
+                                    tests.push(list_test);
+                                    let mut all = vec![Datum::Symbol(kw.and, span)];
+                                    all.extend(tests);
+                                    return Ok(mk_list(all, span));
+                                }
+                            }
+
+                            // Compound sub: must be a proper list of
+                            // bare-symbol pvars. Iter C3 case.
+                            if let Some(sub_items) = collect_proper_list_strict(sub) {
+                                let mut sub_pvars: Vec<Symbol> =
+                                    Vec::with_capacity(sub_items.len());
+                                let mut all_bare = !sub_items.is_empty();
+                                for si in &sub_items {
+                                    match si {
+                                        Datum::Symbol(s, _)
+                                            if *s != kw.underscore
+                                                && *s != kw.ellipsis
+                                                && !literals.contains(s) =>
+                                        {
+                                            sub_pvars.push(*s);
+                                        }
+                                        _ => {
+                                            all_bare = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if all_bare {
+                                    let arity = sub_pvars.len();
+                                    // Test: `(list? walking-key)` AND
+                                    // every element is a proper list of length `arity`.
+                                    // Build the per-element shape test
+                                    // as a lambda body: (and (pair? e)
+                                    // (pair? (cdr e)) ... (null? (cdr^N e))).
+                                    let elem_sym = syms.intern("__sc-elem__");
+                                    let mut shape_parts: Vec<Datum> =
+                                        vec![Datum::Symbol(kw.and, span)];
+                                    let mut cdr_chain = Datum::Symbol(elem_sym, span);
+                                    for _ in 0..arity {
+                                        let pair_check = mk_list(
+                                            vec![mk_sym("pair?", syms), cdr_chain.clone()],
+                                            span,
+                                        );
+                                        shape_parts.push(pair_check);
+                                        cdr_chain =
+                                            mk_list(vec![mk_sym("cdr", syms), cdr_chain], span);
+                                    }
+                                    shape_parts.push(mk_list(
+                                        vec![mk_sym("null?", syms), cdr_chain],
+                                        span,
+                                    ));
+                                    let shape_body = mk_list(shape_parts, span);
+                                    let shape_lambda = mk_list(
+                                        vec![
+                                            Datum::Symbol(kw.lambda, span),
+                                            mk_list(vec![Datum::Symbol(elem_sym, span)], span),
+                                            shape_body,
+                                        ],
+                                        span,
+                                    );
+                                    let list_test = mk_list(
+                                        vec![mk_sym("list?", syms), walking_key.clone()],
+                                        span,
+                                    );
+                                    let every_test = mk_list(
+                                        vec![
+                                            mk_sym("every", syms),
+                                            shape_lambda,
+                                            walking_key.clone(),
+                                        ],
+                                        span,
+                                    );
+                                    tests.push(list_test);
+                                    tests.push(every_test);
+
+                                    // Bind each sub-pvar: `pi = (map (lambda (e) <cadr^i e>) walking-key)`.
+                                    for (i, pv) in sub_pvars.iter().enumerate() {
+                                        let mut acc = Datum::Symbol(elem_sym, span);
+                                        // After i `cdr`s, `car` gives the i-th element.
+                                        for _ in 0..i {
+                                            acc = mk_list(vec![mk_sym("cdr", syms), acc], span);
+                                        }
+                                        let acc = mk_list(vec![mk_sym("car", syms), acc], span);
+                                        let extractor_lambda = mk_list(
+                                            vec![
+                                                Datum::Symbol(kw.lambda, span),
+                                                mk_list(vec![Datum::Symbol(elem_sym, span)], span),
+                                                acc,
+                                            ],
+                                            span,
+                                        );
+                                        let map_call = mk_list(
+                                            vec![
+                                                mk_sym("map", syms),
+                                                extractor_lambda,
+                                                walking_key.clone(),
+                                            ],
+                                            span,
+                                        );
+                                        pvars_out.push((*pv, 1, map_call));
+                                    }
+
+                                    let mut all = vec![Datum::Symbol(kw.and, span)];
+                                    all.extend(tests);
+                                    return Ok(mk_list(all, span));
+                                }
+                            }
+
+                            return Err(ExpandError::BadSyntax {
+                                what: "syntax-case ellipsis: sub-pattern must be a bare pvar or a proper list of bare pvars; nested ellipsis / dotted sub / literal-inside-sub patterns land in a future iter".into(),
+                                span,
+                            });
                         }
                     }
                 }
             }
-            // (p1 . p2) or (p1 p2 ... pn). Compile as the
-            // pair-spine traversal: test pair?, then sub-pattern
-            // on car (with key->car), then sub-pattern on cdr
-            // (with key->cdr). Combine with `and`.
+            // (p1 . p2) or fixed-arity list: pair-spine traversal.
             let car_pat = match pat {
                 Datum::Pair(c, _, _) => (**c).clone(),
                 _ => unreachable!(),
@@ -5872,7 +5953,7 @@ fn compile_sc_pattern(
             ))
         }
         Datum::Vector(_, _) | Datum::ByteVector(_, _) => Err(ExpandError::BadSyntax {
-            what: "syntax-case vector patterns land in Iter C (#118 Iter C)".into(),
+            what: "syntax-case vector patterns land in a future iter".into(),
             span,
         }),
     }
@@ -5907,22 +5988,58 @@ fn rewrite_qs_to_qq(d: &Datum, kw: &Keywords) -> Datum {
     }
 }
 
+/// Walk a template datum and collect every symbol that's a pvar
+/// at depth >= 1 in `pvars`. Used by the zip-map case of
+/// `compile_syntax_template` to figure out which lists to map
+/// over in parallel. Skips into `(quote X)` (literal datum).
+fn collect_depth1_pvars(t: &Datum, pvars: &[(Symbol, u32)], out: &mut Vec<Symbol>) {
+    match t {
+        Datum::Symbol(s, _) => {
+            if pvars.iter().any(|(p, d)| *p == *s && *d >= 1) && !out.contains(s) {
+                out.push(*s);
+            }
+        }
+        Datum::Pair(head, tail, _) => {
+            // Skip into (quote X) -- never substitutes.
+            if let Datum::Symbol(_, _) = &**head {
+                // Don't recognize quote keyword here without
+                // access to Keywords; the worst that happens is
+                // we collect a pvar reference that won't trip
+                // (quote forms quoting a pvar name aren't a
+                // meaningful template construct).
+            }
+            collect_depth1_pvars(head, pvars, out);
+            collect_depth1_pvars(tail, pvars, out);
+        }
+        Datum::Vector(items, _) => {
+            for i in items {
+                collect_depth1_pvars(i, pvars, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Compile a `(syntax T)` template into an expression that, when
 /// evaluated, reproduces T with pattern-variable substitutions.
+/// `pvars` carries `(name, depth)`: depth 0 is a scalar pvar that
+/// can be referenced anywhere; depth >= 1 must appear inside a
+/// matching number of `...` template positions or it's an error
+/// (today we just emit the variable reference and let the runtime
+/// trip; Iter C3+ formalizes this).
 fn compile_syntax_template(
     t: &Datum,
-    pvars: &[Symbol],
+    pvars: &[(Symbol, u32)],
     syms: &mut SymbolTable,
     kw: &Keywords,
 ) -> Datum {
     let span = t.span();
+    let is_pvar = |s: Symbol| pvars.iter().any(|(p, _)| *p == s);
     match t {
         Datum::Symbol(s, _) => {
-            if pvars.contains(s) {
-                // Pattern variable: reference the bound let-var.
+            if is_pvar(*s) {
                 Datum::Symbol(*s, span)
             } else {
-                // Non-pvar identifier: emit `(quote s)`.
                 mk_list(
                     vec![Datum::Symbol(kw.quote, span), Datum::Symbol(*s, span)],
                     span,
@@ -5931,68 +6048,120 @@ fn compile_syntax_template(
         }
         Datum::Null(_) => mk_list(vec![Datum::Symbol(kw.quote, span), t.clone()], span),
         Datum::Pair(_, _, _) => {
-            // Iter C2: detect ellipsis at the end of a proper-list
-            // template. Shape `(prefix... sub ...)` -- the `sub ...`
-            // splices the depth-1 pvar list into the prefix.
-            // Mirror of compile_sc_pattern's ellipsis branch.
+            // Detect a trailing `(prefix... sub ...)` template
+            // (matches the shape of the corresponding ellipsis
+            // pattern). Two cases for `sub`:
+            //   * a bare pvar at depth >= 1 -- splice its list
+            //     (Iter C2 minimal case)
+            //   * a compound template whose pvars are all
+            //     depth >= 1 -- zip-map (Iter C3)
             if let Some(items) = collect_proper_list_strict(t) {
                 let n = items.len();
                 if n >= 2 {
                     if let Datum::Symbol(last, _) = &items[n - 1] {
                         if *last == kw.ellipsis {
                             let sub = &items[n - 2];
-                            // For the minimal Iter C2 we only handle
-                            // `sub` being a single pvar symbol that
-                            // was bound as the depth-1 list by the
-                            // matching ellipsis pattern. Compound
-                            // sub-templates defer to a follow-up.
-                            let sub_sym = match sub {
-                                Datum::Symbol(s, _) if pvars.contains(s) => Some(*s),
-                                _ => None,
-                            };
-                            if let Some(sub_sym) = sub_sym {
-                                // Build `(cons 'p1 (cons 'p2 ... (cons 'pN sub-pvar)))`
-                                let mut acc: Datum = Datum::Symbol(sub_sym, span);
-                                for prefix in items[..n - 2].iter().rev() {
-                                    let car_expr = compile_syntax_template(prefix, pvars, syms, kw);
-                                    acc = mk_list(
-                                        vec![
-                                            Datum::Symbol(syms.intern("cons"), span),
-                                            car_expr,
-                                            acc,
-                                        ],
-                                        span,
-                                    );
+
+                            // Case 1: sub is a single pvar at depth>=1.
+                            if let Datum::Symbol(s, _) = sub {
+                                if is_pvar(*s) {
+                                    // Splice: (cons 'p1 (cons 'p2 ... (cons 'pK sub)))
+                                    let mut acc: Datum = Datum::Symbol(*s, span);
+                                    for prefix in items[..n - 2].iter().rev() {
+                                        let car_expr =
+                                            compile_syntax_template(prefix, pvars, syms, kw);
+                                        acc = mk_list(
+                                            vec![
+                                                Datum::Symbol(syms.intern("cons"), span),
+                                                car_expr,
+                                                acc,
+                                            ],
+                                            span,
+                                        );
+                                    }
+                                    return acc;
                                 }
-                                return acc;
                             }
-                            // Compound sub-template: not yet supported.
-                            // We could fall through to the recursive
-                            // `(cons car cdr)` walk, but the result
-                            // would interpret `...` as a literal
-                            // symbol -- silently producing the wrong
-                            // datum. Reject explicitly so the user
-                            // gets a clear pointer.
-                            return mk_list(
-                                vec![
-                                    Datum::Symbol(syms.intern("error"), span),
-                                    mk_list(
-                                        vec![
-                                            Datum::Symbol(kw.quote, span),
-                                            Datum::Symbol(syms.intern("syntax-template"), span),
-                                        ],
-                                        span,
-                                    ),
-                                    Datum::String(
-                                        Rc::new(
-                                            "compound sub-template under `...` not yet supported"
-                                                .to_string(),
+
+                            // Case 2: sub is a compound. Collect all
+                            // depth>=1 pvars referenced inside sub.
+                            // For each, the map call needs that pvar's
+                            // depth-1 list as one of its inputs. The
+                            // inner template re-binds them at depth 0
+                            // (since the lambda's params are scalars).
+                            let mut depth1_pvars: Vec<Symbol> = Vec::new();
+                            collect_depth1_pvars(sub, pvars, &mut depth1_pvars);
+                            if depth1_pvars.is_empty() {
+                                // No depth>=1 pvars inside sub means
+                                // there's nothing to zip over -- this
+                                // would loop forever / produce empty.
+                                // Reject explicitly.
+                                return mk_list(
+                                    vec![
+                                        Datum::Symbol(syms.intern("error"), span),
+                                        mk_list(
+                                            vec![
+                                                Datum::Symbol(kw.quote, span),
+                                                Datum::Symbol(
+                                                    syms.intern("syntax-template"),
+                                                    span,
+                                                ),
+                                            ],
+                                            span,
                                         ),
-                                        span,
-                                    ),
-                                ],
+                                        Datum::String(
+                                            Rc::new(
+                                                "no depth>=1 pattern variable inside `...` template"
+                                                    .to_string(),
+                                            ),
+                                            span,
+                                        ),
+                                    ],
+                                    span,
+                                );
+                            }
+                            // Inner template: re-bind those pvars at
+                            // depth 0 so the recursive compile treats
+                            // them as scalar references.
+                            let mut inner_pvars: Vec<(Symbol, u32)> = pvars
+                                .iter()
+                                .filter(|(p, _)| !depth1_pvars.contains(p))
+                                .copied()
+                                .collect();
+                            for p in &depth1_pvars {
+                                inner_pvars.push((*p, 0));
+                            }
+                            let inner_expr = compile_syntax_template(sub, &inner_pvars, syms, kw);
+                            // Build `(map (lambda (p1 p2 ... pK) <inner>) p1-list ... pK-list)`.
+                            let lambda_params = mk_list(
+                                depth1_pvars
+                                    .iter()
+                                    .map(|p| Datum::Symbol(*p, span))
+                                    .collect(),
                                 span,
                             );
+                            let lambda_form = mk_list(
+                                vec![Datum::Symbol(kw.lambda, span), lambda_params, inner_expr],
+                                span,
+                            );
+                            let mut map_call =
+                                vec![Datum::Symbol(syms.intern("map"), span), lambda_form];
+                            for p in &depth1_pvars {
+                                map_call.push(Datum::Symbol(*p, span));
+                            }
+                            let mapped = mk_list(map_call, span);
+
+                            // Splice mapped result into prefix:
+                            // (cons 'p1 (cons 'p2 ... (cons 'pK mapped)))
+                            let mut acc = mapped;
+                            for prefix in items[..n - 2].iter().rev() {
+                                let car_expr = compile_syntax_template(prefix, pvars, syms, kw);
+                                acc = mk_list(
+                                    vec![Datum::Symbol(syms.intern("cons"), span), car_expr, acc],
+                                    span,
+                                );
+                            }
+                            return acc;
                         }
                     }
                 }

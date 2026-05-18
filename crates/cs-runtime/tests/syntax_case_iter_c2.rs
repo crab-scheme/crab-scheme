@@ -199,17 +199,7 @@ fn ellipsis_inside_with_syntax() {
 }
 
 // ---- diagnostics ----
-
-#[test]
-fn compound_pvar_under_ellipsis_rejected() {
-    let mut rt = Runtime::new();
-    let err = rt
-        .eval_str(
-            "<t>",
-            "(syntax-case '((1 2) (3 4)) ()
-               (((a b) ...) (syntax 0)))",
-        )
-        .expect_err("compound sub-pattern under ... not supported in Iter C2");
-    let s = format!("{}", err);
-    assert!(s.contains("follow-up"), "got: {}", s);
-}
+//
+// (Iter C2 used to reject compound sub-patterns under `...` --
+// they're now handled by Iter C3. See syntax_case_iter_c3.rs for
+// the upgraded behavior tests.)
