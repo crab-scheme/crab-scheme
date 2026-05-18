@@ -171,6 +171,36 @@ fn conformance_crab_uuid() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-json")]
+fn conformance_crab_json() {
+    run_conformance_file("crab-json.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-csv")]
+fn conformance_crab_csv() {
+    run_conformance_file("crab-csv.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-toml")]
+fn conformance_crab_toml() {
+    run_conformance_file("crab-toml.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-base")]
+fn conformance_crab_base() {
+    run_conformance_file("crab-base.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-url")]
+fn conformance_crab_url() {
+    run_conformance_file("crab-url.scm");
+}
+
+#[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");
 }

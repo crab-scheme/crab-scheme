@@ -81,6 +81,11 @@ stdlib = [
     "stdlib-time",
     "stdlib-random",
     "stdlib-uuid",
+    "stdlib-json",
+    "stdlib-csv",
+    "stdlib-toml",
+    "stdlib-base",
+    "stdlib-url",
 ]
 stdlib-path = ["ffi-trait", "dep:cs-stdlib-path"]
 stdlib-fs = ["ffi-trait", "dep:cs-stdlib-fs"]
@@ -92,6 +97,11 @@ stdlib-regex = ["ffi-trait", "dep:cs-stdlib-regex"]
 stdlib-time = ["ffi-trait", "dep:cs-stdlib-time"]
 stdlib-random = ["ffi-trait", "dep:cs-stdlib-random"]
 stdlib-uuid = ["ffi-trait", "dep:cs-stdlib-uuid"]
+stdlib-json = ["ffi-trait", "dep:cs-stdlib-json"]
+stdlib-csv = ["ffi-trait", "dep:cs-stdlib-csv"]
+stdlib-toml = ["ffi-trait", "dep:cs-stdlib-toml"]
+stdlib-base = ["ffi-trait", "dep:cs-stdlib-base"]
+stdlib-url = ["ffi-trait", "dep:cs-stdlib-url"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -125,6 +135,11 @@ cs-stdlib-regex = { workspace = true, optional = true }
 cs-stdlib-time = { workspace = true, optional = true }
 cs-stdlib-random = { workspace = true, optional = true }
 cs-stdlib-uuid = { workspace = true, optional = true }
+cs-stdlib-json = { workspace = true, optional = true }
+cs-stdlib-csv = { workspace = true, optional = true }
+cs-stdlib-toml = { workspace = true, optional = true }
+cs-stdlib-base = { workspace = true, optional = true }
+cs-stdlib-url = { workspace = true, optional = true }
 
 [dev-dependencies]
 cs-ffi-example = { workspace = true }

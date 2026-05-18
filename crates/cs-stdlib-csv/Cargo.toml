@@ -1,0 +1,13 @@
+[package]
+name = "cs-stdlib-csv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab csv) — CSV read/write via the csv crate."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+csv = "1"

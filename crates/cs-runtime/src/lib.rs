@@ -1800,6 +1800,26 @@ impl Runtime {
         for p in cs_stdlib_uuid::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-json")]
+        for p in cs_stdlib_json::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-csv")]
+        for p in cs_stdlib_csv::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-toml")]
+        for p in cs_stdlib_toml::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-base")]
+        for p in cs_stdlib_base::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-url")]
+        for p in cs_stdlib_url::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call
