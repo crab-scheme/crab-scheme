@@ -308,6 +308,29 @@ pub enum Value {
     Number(Number),
     String(crate::Gc<RefCell<String>>),
     Symbol(Symbol),
+    /// Hygienic identifier: a name plus a per-macro-call mark.
+    /// Distinct from `Symbol` in R6RS terms (an identifier is a
+    /// syntax object wrapping a name with lexical context).
+    ///
+    /// * `mark == 0` is the "unmarked" identifier produced by
+    ///   `datum->syntax` when given a non-marked context, or by
+    ///   reader input that's been wrapped into a syntax object
+    ///   without flowing through a macro expansion.
+    /// * Each `syntax-case` template instantiation stamps the
+    ///   non-pvar identifiers in the template with a fresh
+    ///   mark unique to that expansion site; this is the
+    ///   mechanism that lets `bound-identifier=?` distinguish
+    ///   two `(mark-a x)` / `(mark-b x)` invocations.
+    ///
+    /// `Symbol` and `Identifier` interoperate at most
+    /// predicates (`identifier?` accepts either; `eq?` returns
+    /// false across the kinds even when the symbol/identifier
+    /// share a name). The migration that introduced this
+    /// variant is tracked in the R6RS++ plan as Phase 1.5.
+    Identifier {
+        name: Symbol,
+        mark: u64,
+    },
     Pair(crate::Gc<Pair>),
     Vector(crate::Gc<RefCell<Vec<Value>>>),
     ByteVector(crate::Gc<RefCell<Vec<u8>>>),
@@ -361,6 +384,7 @@ impl cs_gc::Trace for Value {
             | Value::Boolean(_)
             | Value::Character(_)
             | Value::Symbol(_)
+            | Value::Identifier { .. }
             | Value::Number(_) => {}
         }
     }
@@ -402,6 +426,7 @@ impl Value {
             Value::Number(_) => "number",
             Value::String(_) => "string",
             Value::Symbol(_) => "symbol",
+            Value::Identifier { .. } => "identifier",
             Value::Pair(_) => "pair",
             Value::Vector(_) => "vector",
             Value::ByteVector(_) => "bytevector",
@@ -454,6 +479,11 @@ impl Value {
                 WriteMode::Display => write!(out, "{}", s.borrow()),
             },
             Value::Symbol(s) => write!(out, "{}", syms.name(*s)),
+            // Identifier renders identically to a symbol with
+            // the same name in normal write/display output;
+            // the mark is observable only via R6RS hygiene
+            // predicates (`bound-identifier=?`).
+            Value::Identifier { name, .. } => write!(out, "{}", syms.name(*name)),
             Value::Pair(p) => write_pair(out, p, syms, mode, visited),
             Value::Vector(v) => {
                 let ptr = crate::Gc::as_addr(v);
@@ -594,6 +624,13 @@ impl fmt::Display for Value {
             Value::Number(n) => write!(f, "{}", n),
             Value::String(s) => write!(f, "\"{}\"", s.borrow()),
             Value::Symbol(s) => write!(f, "#<symbol#{}>", s.0),
+            // Debug-style Display for Identifier surfaces the
+            // mark so it's visible in debug dumps / Rust-side
+            // panics; user-facing write/display in
+            // `write_to_visited` hides it.
+            Value::Identifier { name, mark } => {
+                write!(f, "#<identifier#{}:{}>", name.0, mark)
+            }
             Value::Pair(p) => display_pair(f, p),
             Value::Vector(v) => {
                 write!(f, "#(")?;

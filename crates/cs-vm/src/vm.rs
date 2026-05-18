@@ -1209,10 +1209,14 @@ impl NanboxValue {
                 NanboxValue(nb_make(NB_TAG_PROMISE, ptr) as i64)
             }
             // Number variants outside Fixnum/Flonum (BigInt,
-            // Rational, Complex). Wrap in Gc<Value> via the active
-            // Heap for now — these are rare in performance-
-            // sensitive code.
-            other @ Value::Number(_) => {
+            // Rational, Complex), plus hygienic Identifier
+            // (a (Symbol, u64-mark) pair that doesn't fit in the
+            // 47-bit NB payload alongside its tag). All wrap in
+            // Gc<Value> via the active Heap for now -- these are
+            // rare in performance-sensitive code. A future iter
+            // could carve out a dedicated NB_TAG_IDENTIFIER if
+            // identifier-heavy code shows up in the hot path.
+            other @ (Value::Number(_) | Value::Identifier { .. }) => {
                 let g = nb_alloc_gc_value(other);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);

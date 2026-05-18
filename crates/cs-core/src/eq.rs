@@ -17,6 +17,15 @@ pub fn eq(a: &Value, b: &Value) -> bool {
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Character(x), Value::Character(y)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        // Identifiers compare by (name, mark) pair. Two
+        // identifiers with the same name but different marks
+        // (e.g., from two distinct macro-expansion sites)
+        // compare unequal -- this is the foundation of R6RS
+        // bound-identifier=?. Identifier vs Symbol mixed is
+        // false (the kinds are distinct types in R6RS).
+        (Value::Identifier { name: n1, mark: m1 }, Value::Identifier { name: n2, mark: m2 }) => {
+            n1 == n2 && m1 == m2
+        }
         (Value::Number(x), Value::Number(y)) => match (x, y) {
             (crate::Number::Fixnum(a), crate::Number::Fixnum(b)) => a == b,
             _ => false, // Other number types: eq? is implementation-defined; we say false unless identity.
