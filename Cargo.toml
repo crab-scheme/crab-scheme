@@ -22,6 +22,13 @@ members = [
     "crates/cs-aot",
     "crates/cs-cli",
     "crates/cs-cli-sha2",
+    # BEAM-style runtime (see docs/research/beam_runtime_spec.md).
+    # cs-supervisor was removed: per the Rust/Scheme split, supervision
+    # trees live in lib/beam/prelude.scm on top of the four cs-actor
+    # primops — pure dispatch logic, no system calls.
+    "crates/cs-actor",
+    "crates/cs-table",
+    "crates/cs-hotreload",
 ]
 
 [workspace.package]
@@ -56,6 +63,12 @@ cs-aot = { path = "crates/cs-aot" }
 cs-ffi = { path = "crates/cs-ffi" }
 cs-ffi-example = { path = "crates/cs-ffi-example" }
 cs-ffi-macros = { path = "crates/cs-ffi-macros" }
+# BEAM-style runtime crates. Optional deps of cs-runtime behind the
+# `actor` feature so non-actor builds (WASM, AOT) skip the tokio +
+# dashmap pull.
+cs-actor = { path = "crates/cs-actor" }
+cs-table = { path = "crates/cs-table" }
+cs-hotreload = { path = "crates/cs-hotreload" }
 
 # External crates
 logos = "0.14"
@@ -91,6 +104,13 @@ smallvec = { version = "1", features = ["union"] }
 # feature) to implement bounded-extent allocation as an
 # alternative to global `Rc<T>`.
 bumpalo = "3"
+# B2 dep: tokio multi-thread runtime for the actor system. Pinned
+# at LTS minor for now; revisit if cs-actor needs newer features.
+tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "macros", "time"] }
+# B4 dep: concurrent hashmap for cs-table set tables. Lock-free
+# reads, fine-grained locks on writes. We may swap for a custom
+# lock-free B-tree later if the contention test demands it.
+dashmap = "6"
 
 [profile.release]
 lto = "thin"

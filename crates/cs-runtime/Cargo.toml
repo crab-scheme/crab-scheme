@@ -56,6 +56,13 @@ tracing-cycle-collector = [
     "cs-gc/tracing-cycle-collector",
     "cs-vm/tracing-cycle-collector",
 ]
+# BEAM-style actor primops. Pulls in cs-actor + cs-table + cs-hotreload
+# (tokio, dashmap) and registers (spawn, send, raw-receive, self),
+# the cs-table CRUD, and the cs-hotreload version-table primops as
+# Scheme builtins. Disabled on WASM (tokio's rt-multi-thread needs
+# real threads) and on bare-AOT builds. The `lib/beam/prelude.scm`
+# library only loads when this feature is on.
+actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -76,6 +83,9 @@ cs-jit-cranelift = { workspace = true, optional = true }
 libloading = { workspace = true, optional = true }
 num-traits = { workspace = true }
 thiserror = { workspace = true }
+cs-actor = { workspace = true, optional = true }
+cs-table = { workspace = true, optional = true }
+cs-hotreload = { workspace = true, optional = true }
 
 [dev-dependencies]
 cs-ffi-example = { workspace = true }

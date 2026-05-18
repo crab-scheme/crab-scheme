@@ -227,6 +227,16 @@ impl Runtime {
             let sym = syms.intern(name);
             vm_env.define(sym, cs_vm::vm::make_vm_builtin_syms(name, f));
         }
+        // BEAM-style actor / table primops — same Syms shape, gated
+        // on the `actor` feature. See crates/cs-runtime/src/builtins/
+        // beam.rs and ADR 0013-equivalent (beam_runtime_spec.md).
+        #[cfg(feature = "actor")]
+        {
+            for (name, f) in builtins::beam::beam_syms_builtins() {
+                let sym = syms.intern(name);
+                vm_env.define(sym, cs_vm::vm::make_vm_builtin_syms(name, f));
+            }
+        }
         // Mirror the walker tier's record-parent registry so define-record-type
         // works the same on both tiers (predicates look it up at runtime).
         let registry_sym = syms.intern(builtins::RECORD_PARENTS_REGISTRY);

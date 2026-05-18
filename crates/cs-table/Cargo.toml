@@ -1,0 +1,18 @@
+[package]
+name = "cs-table"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme in-memory tables, ETS-shaped (set + ordered_set). See docs/research/beam_runtime_spec.md."
+
+[dependencies]
+# cs-core is deliberately NOT a dep — payload is type-erased
+# Arc<dyn Any + Send + Sync> so the (still !Send) cs_core::Value
+# doesn't constrain the design. Real Value transport happens at
+# the Scheme primop boundary (post-B3), same pattern as cs-actor.
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]

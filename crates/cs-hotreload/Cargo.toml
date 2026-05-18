@@ -1,0 +1,21 @@
+[package]
+name = "cs-hotreload"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme two-version code dispatch + state migration. See docs/research/beam_runtime_spec.md."
+
+[dependencies]
+# cs-core / cs-vm deliberately NOT deps — same pattern as cs-actor
+# and cs-table. Exports are type-erased Arc<dyn Any + Send + Sync>
+# so the version table doesn't constrain what kind of "function"
+# (VmClosure, AOT fn pointer, raw Rust closure, etc.) gets
+# registered. Real Scheme function transport lands at the primop
+# boundary (post-B3 / B7).
+thiserror = { workspace = true }
+rustc-hash = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]

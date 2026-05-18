@@ -297,7 +297,34 @@ impl Default for Heap {
     }
 }
 
+/// Merge stub for BEAM's `Heap::activate` API. The full
+/// implementation in main's lib.rs maintains a per-thread
+/// `ACTIVE_HEAP` pointer so `Gc::new` can attribute
+/// allocations to the right Heap. Under the countable-memory
+/// variant (this branch's default) that machinery lives in
+/// `cs_gc::alloc_telemetry` (Gap A-1) as process-global
+/// atomics — the tracing variant's per-Heap accounting
+/// hasn't been ported yet. Stub returns a no-op guard so
+/// `cs_runtime::active::Runtime::with_active`'s tracing-tier
+/// code path compiles; per-Heap stats reads still report 0
+/// until the port lands.
+pub struct ActiveHeapGuard {
+    _private: (),
+}
+impl Drop for ActiveHeapGuard {
+    fn drop(&mut self) {}
+}
+
 impl Heap {
+    /// Stub for BEAM's `Heap::activate` — see `ActiveHeapGuard`
+    /// docs. Tracing-variant integration is a follow-on port;
+    /// the countable-memory variant uses `cs_gc::alloc_telemetry`
+    /// (process-global) instead of per-Heap active-heap
+    /// thread-local.
+    pub fn activate(&self) -> ActiveHeapGuard {
+        ActiveHeapGuard { _private: () }
+    }
+
     /// New empty heap. Default auto-collect threshold: 4096 allocs.
     /// `auto_collect` defaults to `false` in Phase 1; set it via
     /// [`Heap::set_auto_collect`] when the embedding runtime is ready
