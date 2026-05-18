@@ -1,0 +1,13 @@
+[package]
+name = "cs-stdlib-regex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab regex) — regular expressions backed by the regex crate."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+regex = "1"

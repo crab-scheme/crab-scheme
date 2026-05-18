@@ -1776,6 +1776,18 @@ impl Runtime {
         for p in cs_stdlib_process::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-string")]
+        for p in cs_stdlib_string::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-format")]
+        for p in cs_stdlib_format::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-regex")]
+        for p in cs_stdlib_regex::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call

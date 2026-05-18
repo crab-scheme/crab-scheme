@@ -135,6 +135,24 @@ fn conformance_crab_process() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-string")]
+fn conformance_crab_string() {
+    run_conformance_file("crab-string.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-format")]
+fn conformance_crab_format() {
+    run_conformance_file("crab-format.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-regex")]
+fn conformance_crab_regex() {
+    run_conformance_file("crab-regex.scm");
+}
+
+#[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");
 }

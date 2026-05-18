@@ -70,11 +70,22 @@ actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload"]
 # crates so embedders can build subset distributions. Each per-module
 # flag implies `ffi-trait` because registration goes through
 # `register_host_procedure`.
-stdlib = ["stdlib-path", "stdlib-fs", "stdlib-os", "stdlib-process"]
+stdlib = [
+    "stdlib-path",
+    "stdlib-fs",
+    "stdlib-os",
+    "stdlib-process",
+    "stdlib-string",
+    "stdlib-format",
+    "stdlib-regex",
+]
 stdlib-path = ["ffi-trait", "dep:cs-stdlib-path"]
 stdlib-fs = ["ffi-trait", "dep:cs-stdlib-fs"]
 stdlib-os = ["ffi-trait", "dep:cs-stdlib-os"]
 stdlib-process = ["ffi-trait", "dep:cs-stdlib-process"]
+stdlib-string = ["ffi-trait", "dep:cs-stdlib-string"]
+stdlib-format = ["ffi-trait", "dep:cs-stdlib-format"]
+stdlib-regex = ["ffi-trait", "dep:cs-stdlib-regex"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -102,6 +113,9 @@ cs-stdlib-path = { workspace = true, optional = true }
 cs-stdlib-fs = { workspace = true, optional = true }
 cs-stdlib-os = { workspace = true, optional = true }
 cs-stdlib-process = { workspace = true, optional = true }
+cs-stdlib-string = { workspace = true, optional = true }
+cs-stdlib-format = { workspace = true, optional = true }
+cs-stdlib-regex = { workspace = true, optional = true }
 
 [dev-dependencies]
 cs-ffi-example = { workspace = true }

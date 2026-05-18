@@ -36,6 +36,9 @@ members = [
     "crates/cs-stdlib-fs",
     "crates/cs-stdlib-os",
     "crates/cs-stdlib-process",
+    "crates/cs-stdlib-string",
+    "crates/cs-stdlib-format",
+    "crates/cs-stdlib-regex",
 ]
 
 [workspace.package]
@@ -79,6 +82,9 @@ cs-stdlib-path = { path = "crates/cs-stdlib-path" }
 cs-stdlib-fs = { path = "crates/cs-stdlib-fs" }
 cs-stdlib-os = { path = "crates/cs-stdlib-os" }
 cs-stdlib-process = { path = "crates/cs-stdlib-process" }
+cs-stdlib-string = { path = "crates/cs-stdlib-string" }
+cs-stdlib-format = { path = "crates/cs-stdlib-format" }
+cs-stdlib-regex = { path = "crates/cs-stdlib-regex" }
 
 # External crates
 logos = "0.14"

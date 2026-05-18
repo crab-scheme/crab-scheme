@@ -31,11 +31,17 @@ stdlib = [
     "stdlib-fs",
     "stdlib-os",
     "stdlib-process",
+    "stdlib-string",
+    "stdlib-format",
+    "stdlib-regex",
 ]
 stdlib-path = ["cs-runtime/stdlib", "cs-runtime/stdlib-path"]
 stdlib-fs = ["cs-runtime/stdlib", "cs-runtime/stdlib-fs"]
 stdlib-os = ["cs-runtime/stdlib", "cs-runtime/stdlib-os"]
 stdlib-process = ["cs-runtime/stdlib", "cs-runtime/stdlib-process"]
+stdlib-string = ["cs-runtime/stdlib", "cs-runtime/stdlib-string"]
+stdlib-format = ["cs-runtime/stdlib", "cs-runtime/stdlib-format"]
+stdlib-regex = ["cs-runtime/stdlib", "cs-runtime/stdlib-regex"]
 # Backward-compat alias matching the W1 feature name.
 ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the
