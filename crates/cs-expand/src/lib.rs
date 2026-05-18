@@ -311,6 +311,7 @@ struct Keywords {
     immutable: Symbol,
     mutable: Symbol,
     define_syntax: Symbol,
+    define_syntax_parser: Symbol,
     let_syntax: Symbol,
     letrec_syntax: Symbol,
     syntax_rules: Symbol,
@@ -373,6 +374,7 @@ impl Keywords {
             immutable: syms.intern("immutable"),
             mutable: syms.intern("mutable"),
             define_syntax: syms.intern("define-syntax"),
+            define_syntax_parser: syms.intern("define-syntax-parser"),
             let_syntax: syms.intern("let-syntax"),
             letrec_syntax: syms.intern("letrec-syntax"),
             syntax_rules: syms.intern("syntax-rules"),
@@ -494,6 +496,9 @@ impl<'a> Expander<'a> {
                 }
                 if *s == self.keywords.define_syntax {
                     return self.expand_define_syntax(&tail, d.span());
+                }
+                if *s == self.keywords.define_syntax_parser {
+                    return self.expand_define_syntax_parser(&tail, d.span());
                 }
                 if *s == self.keywords.include {
                     return self.expand_include(&tail, d.span());
@@ -1290,6 +1295,176 @@ impl<'a> Expander<'a> {
     }
 
     /// `(define-syntax name (syntax-rules (literals...) (pattern template) ...))`
+    /// R6RS++ Phase 2A.1: `(define-syntax-parser name clause ...)`.
+    /// Each clause is `[(_ pat ...) body ...]` where pattern items
+    /// may be annotated `id:class` to constrain the matched value
+    /// to a specific syntax class.
+    ///
+    /// Implementation strategy: desugar to `(define-syntax name
+    /// (syntax-rules () (<stripped-pat> <class-checked-body>)
+    /// ...))` where `:class` annotations are stripped from the
+    /// pattern (leaving just the pvar name) and each annotated
+    /// pvar gains a runtime predicate check at the top of the
+    /// template body. If the check fails, an error is raised.
+    ///
+    /// Supported classes (resolved via builtin predicates):
+    ///   id       -> identifier?
+    ///   expr     -> (always #t)
+    ///   number   -> number?
+    ///   string   -> string?
+    ///
+    /// Limitation: the class check fires at RUNTIME of the
+    /// expanded code, not at expand time. Phase 2A.4 lifts this
+    /// to expand-time pinpointing.
+    fn expand_define_syntax_parser(
+        &mut self,
+        items: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        if items.len() < 2 {
+            return Err(ExpandError::BadSyntax {
+                what: "define-syntax-parser: (define-syntax-parser name clause ...)".into(),
+                span,
+            });
+        }
+        let name_datum = items[0].clone();
+        let clause_datums = &items[1..];
+        // Build the syntax-rules form: (syntax-rules () <translated-clauses>...)
+        // For each clause: walk the pattern, strip ":class" annotations,
+        // wrap body in class-check ifs.
+        let mut translated_clauses: Vec<Datum> = Vec::with_capacity(clause_datums.len());
+        for clause in clause_datums {
+            let parts = collect_proper_list_strict(clause).ok_or(ExpandError::BadSyntax {
+                what: "define-syntax-parser clause must be (pattern body ...)".into(),
+                span: clause.span(),
+            })?;
+            if parts.len() < 2 {
+                return Err(ExpandError::BadSyntax {
+                    what: "define-syntax-parser clause needs pattern + body".into(),
+                    span: clause.span(),
+                });
+            }
+            let pattern = &parts[0];
+            let body_datums = &parts[1..];
+            // Walk the pattern, collecting class checks.
+            // class_checks: each entry is (pvar-sym, class-name-str)
+            let mut class_checks: Vec<(Symbol, String)> = Vec::new();
+            let stripped_pattern = strip_class_annotations(pattern, &mut class_checks, self.syms);
+            // Wrap body in a (begin) and prepend class-check ifs from
+            // OUTSIDE in (deepest check innermost so first-failing
+            // check fires its error first).
+            let body_begin = if body_datums.len() == 1 {
+                body_datums[0].clone()
+            } else {
+                let mut all = vec![Datum::Symbol(self.keywords.begin, clause.span())];
+                all.extend(body_datums.iter().cloned());
+                mk_list(all, clause.span())
+            };
+            // Build the class-checked body bottom-up.
+            let mut checked_body = body_begin;
+            for (pvar, class_name) in class_checks.iter().rev() {
+                let pred = match class_name.as_str() {
+                    "id" => Some(self.syms.intern("identifier?")),
+                    "number" => Some(self.syms.intern("number?")),
+                    "string" => Some(self.syms.intern("string?")),
+                    "expr" => None, // matches anything
+                    _ => {
+                        return Err(ExpandError::BadSyntax {
+                            what: format!("define-syntax-parser: unknown syntax class `{}` (built-in classes: id, expr, number, string)", class_name),
+                            span: clause.span(),
+                        });
+                    }
+                };
+                if let Some(pred_sym) = pred {
+                    // For :id, the matched pvar is a literal
+                    // identifier -- evaluating it as a variable
+                    // ref would crash with undefined. Wrap in
+                    // (quote pvar) so the predicate sees the
+                    // symbol itself. For value-classes (:number,
+                    // :string), the bare pvar is fine: the
+                    // matched expression evaluates to a value
+                    // and the predicate checks it.
+                    let pvar_for_check = if class_name == "id" {
+                        mk_list(
+                            vec![
+                                Datum::Symbol(self.keywords.quote, clause.span()),
+                                Datum::Symbol(*pvar, clause.span()),
+                            ],
+                            clause.span(),
+                        )
+                    } else {
+                        Datum::Symbol(*pvar, clause.span())
+                    };
+                    // (if (pred pvar-for-check) checked_body
+                    //   (error 'name "expected <class>" pvar-for-check))
+                    let pred_call = mk_list(
+                        vec![
+                            Datum::Symbol(pred_sym, clause.span()),
+                            pvar_for_check.clone(),
+                        ],
+                        clause.span(),
+                    );
+                    let macro_name_sym = match &name_datum {
+                        Datum::Symbol(s, _) => *s,
+                        _ => self.syms.intern("define-syntax-parser"),
+                    };
+                    let error_call = mk_list(
+                        vec![
+                            Datum::Symbol(self.syms.intern("error"), clause.span()),
+                            mk_list(
+                                vec![
+                                    Datum::Symbol(self.keywords.quote, clause.span()),
+                                    Datum::Symbol(macro_name_sym, clause.span()),
+                                ],
+                                clause.span(),
+                            ),
+                            Datum::String(
+                                Rc::new(format!(
+                                    "expected {} for `{}`",
+                                    class_name,
+                                    self.syms.name(*pvar)
+                                )),
+                                clause.span(),
+                            ),
+                            pvar_for_check,
+                        ],
+                        clause.span(),
+                    );
+                    checked_body = mk_list(
+                        vec![
+                            Datum::Symbol(self.keywords.if_, clause.span()),
+                            pred_call,
+                            checked_body,
+                            error_call,
+                        ],
+                        clause.span(),
+                    );
+                }
+            }
+            translated_clauses.push(mk_list(vec![stripped_pattern, checked_body], clause.span()));
+        }
+        // Build (define-syntax <name> (syntax-rules () <clauses>...))
+        let mut sr_items = vec![
+            Datum::Symbol(self.keywords.syntax_rules, span),
+            Datum::Null(span), // empty literals list
+        ];
+        sr_items.extend(translated_clauses);
+        let syntax_rules_form = mk_list(sr_items, span);
+        let define_syntax_form = mk_list(
+            vec![
+                Datum::Symbol(self.keywords.define_syntax, span),
+                name_datum,
+                syntax_rules_form,
+            ],
+            span,
+        );
+        // define-syntax is a top-level form, not an expression --
+        // it lives in expand_top's dispatch table. Route there
+        // directly instead of via self.expand (which goes to
+        // expand_pair and wouldn't recognize the form).
+        self.expand_top(&define_syntax_form)
+    }
+
     fn expand_define_syntax(
         &mut self,
         items: &[Datum],
@@ -6026,6 +6201,60 @@ fn mk_list(items: Vec<Datum>, span: Span) -> Datum {
         acc = Datum::Pair(Rc::new(item), Rc::new(acc), span);
     }
     acc
+}
+
+/// Phase 2A.1 helper: walk a `define-syntax-parser` pattern,
+/// strip `:class` annotations from each symbol, and record the
+/// stripped symbol + class-name pairs into `class_checks` so
+/// the caller can wrap the template body in class-predicate
+/// `if`s.
+///
+/// A pattern symbol like `name:class` is split into:
+///   - stripped symbol `name`  (binds the pvar in the syntax-rules pattern)
+///   - class name `"class"`    (looked up against the built-in predicate map)
+///
+/// Plain symbols without a colon pass through untouched and
+/// aren't recorded. Compound datums (pairs, vectors) recurse;
+/// non-symbol atoms pass through.
+///
+/// Edge cases:
+///   * `_:class` and leading/trailing `:` patterns are left
+///     untouched (no annotation extracted)
+///   * Multiple colons: split at the first `:` only
+fn strip_class_annotations(
+    pat: &Datum,
+    class_checks: &mut Vec<(Symbol, String)>,
+    syms: &mut SymbolTable,
+) -> Datum {
+    match pat {
+        Datum::Symbol(s, span) => {
+            let name = syms.name(*s).to_string();
+            // Find the first colon NOT at position 0 (so `:class`
+            // alone or `_` alone passes through).
+            if let Some(colon_idx) = name.find(':').filter(|&i| i > 0 && i < name.len() - 1) {
+                let (pvar_name, _) = name.split_at(colon_idx);
+                let class_name = &name[colon_idx + 1..];
+                let pvar_sym = syms.intern(pvar_name);
+                class_checks.push((pvar_sym, class_name.to_string()));
+                Datum::Symbol(pvar_sym, *span)
+            } else {
+                pat.clone()
+            }
+        }
+        Datum::Pair(car, cdr, span) => {
+            let new_car = strip_class_annotations(car, class_checks, syms);
+            let new_cdr = strip_class_annotations(cdr, class_checks, syms);
+            Datum::Pair(Rc::new(new_car), Rc::new(new_cdr), *span)
+        }
+        Datum::Vector(items, span) => {
+            let new_items: Vec<Datum> = items
+                .iter()
+                .map(|i| strip_class_annotations(i, class_checks, syms))
+                .collect();
+            Datum::Vector(new_items, *span)
+        }
+        _ => pat.clone(),
+    }
 }
 
 /// Compile a syntax-case pattern into a boolean-valued test
