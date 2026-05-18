@@ -88,7 +88,7 @@ fn constant_fold_folds_add_of_two_consts() {
     ];
     f.blocks[0].terminator = Term::Return(Value(2));
     let stats = run_pass(&*const_fold(), &mut f);
-    assert_eq!(stats.mutations("constant-fold"), 1);
+    assert_eq!(stats.mutations_for("constant-fold"), 1);
     // The Add should now be a LoadConst of 5.
     match &f.blocks[0].insts[2] {
         Inst::LoadConst(Value(2), Const::Fixnum(5)) => (),
@@ -109,7 +109,7 @@ fn constant_fold_chains_through_added_consts() {
     ];
     f.blocks[0].terminator = Term::Return(Value(4));
     let stats = run_pass(&*const_fold(), &mut f);
-    assert_eq!(stats.mutations("constant-fold"), 2);
+    assert_eq!(stats.mutations_for("constant-fold"), 2);
     match &f.blocks[0].insts[4] {
         Inst::LoadConst(Value(4), Const::Fixnum(20)) => (),
         other => panic!("expected LoadConst 20, got {:?}", other),
@@ -127,7 +127,7 @@ fn constant_fold_skips_when_operand_is_not_const() {
     ];
     f.blocks[0].terminator = Term::Return(Value(2));
     let stats = run_pass(&*const_fold(), &mut f);
-    assert_eq!(stats.mutations("constant-fold"), 0);
+    assert_eq!(stats.mutations_for("constant-fold"), 0);
     // Add remains.
     assert!(matches!(f.blocks[0].insts[1], Inst::Add(_, _, _)));
 }
@@ -143,7 +143,7 @@ fn constant_fold_skips_on_overflow() {
     ];
     f.blocks[0].terminator = Term::Return(Value(2));
     let stats = run_pass(&*const_fold(), &mut f);
-    assert_eq!(stats.mutations("constant-fold"), 0);
+    assert_eq!(stats.mutations_for("constant-fold"), 0);
     assert!(matches!(f.blocks[0].insts[2], Inst::Add(_, _, _)));
 }
 
@@ -158,7 +158,7 @@ fn constant_fold_handles_sub_and_mul() {
     ];
     f.blocks[0].terminator = Term::Return(Value(3));
     let stats = run_pass(&*const_fold(), &mut f);
-    assert_eq!(stats.mutations("constant-fold"), 2);
+    assert_eq!(stats.mutations_for("constant-fold"), 2);
     assert!(matches!(
         f.blocks[0].insts[2],
         Inst::LoadConst(_, Const::Fixnum(7))
@@ -180,7 +180,7 @@ fn constant_fold_does_not_fold_div() {
     ];
     f.blocks[0].terminator = Term::Return(Value(2));
     let stats = run_pass(&*const_fold(), &mut f);
-    assert_eq!(stats.mutations("constant-fold"), 0);
+    assert_eq!(stats.mutations_for("constant-fold"), 0);
 }
 
 #[test]
@@ -199,7 +199,7 @@ fn constant_fold_stops_at_block_boundary() {
     });
     let stats = run_pass(&*const_fold(), &mut f);
     // v1 is a block-param; the pass doesn't track it.
-    assert_eq!(stats.mutations("constant-fold"), 0);
+    assert_eq!(stats.mutations_for("constant-fold"), 0);
 }
 
 // ---- dead-block-elim ----
@@ -214,7 +214,7 @@ fn dead_block() -> Arc<dyn Pass> {
 fn dead_block_elim_keeps_entry_only() {
     let mut f = empty_func("just-entry");
     let stats = run_pass(&*dead_block(), &mut f);
-    assert_eq!(stats.mutations("dead-block-elim"), 0);
+    assert_eq!(stats.mutations_for("dead-block-elim"), 0);
     assert_eq!(f.blocks.len(), 1);
 }
 
@@ -235,7 +235,7 @@ fn dead_block_elim_removes_unreachable() {
         terminator: Term::Return(Value(0)),
     });
     let stats = run_pass(&*dead_block(), &mut f);
-    assert_eq!(stats.mutations("dead-block-elim"), 2);
+    assert_eq!(stats.mutations_for("dead-block-elim"), 2);
     assert_eq!(f.blocks.len(), 1);
     assert_eq!(f.blocks[0].id, BlockId(0));
 }
@@ -251,7 +251,7 @@ fn dead_block_elim_follows_jump_to_keep_target() {
         terminator: Term::Return(Value(0)),
     });
     let stats = run_pass(&*dead_block(), &mut f);
-    assert_eq!(stats.mutations("dead-block-elim"), 0);
+    assert_eq!(stats.mutations_for("dead-block-elim"), 0);
     assert_eq!(f.blocks.len(), 2);
 }
 
@@ -270,7 +270,7 @@ fn dead_block_elim_follows_both_branch_arms() {
     }
     // Block 3 is unreachable; 1 and 2 stay.
     let stats = run_pass(&*dead_block(), &mut f);
-    assert_eq!(stats.mutations("dead-block-elim"), 1);
+    assert_eq!(stats.mutations_for("dead-block-elim"), 1);
     assert_eq!(f.blocks.len(), 3);
     assert!(f.blocks.iter().any(|b| b.id == BlockId(1)));
     assert!(f.blocks.iter().any(|b| b.id == BlockId(2)));
@@ -326,8 +326,8 @@ fn inst_stats_counts_total_insts_and_blocks() {
         terminator: Term::Return(Value(3)),
     });
     let stats = run_pass(&*inst_stats(), &mut f);
-    assert_eq!(stats.mutations("inst-stats"), 4);
-    assert_eq!(stats.mutations("inst-stats:blocks"), 2);
+    assert_eq!(stats.mutations_for("inst-stats"), 4);
+    assert_eq!(stats.mutations_for("inst-stats:blocks"), 2);
 }
 
 #[test]
@@ -380,20 +380,20 @@ fn full_builtin_pipeline_runs_in_bucket_order() {
     p.run(&mut f, &mut ctx);
 
     // constant-fold folded the Add.
-    assert_eq!(stats.mutations("constant-fold"), 1);
+    assert_eq!(stats.mutations_for("constant-fold"), 1);
     assert!(matches!(
         f.blocks[0].insts[2],
         Inst::LoadConst(_, Const::Fixnum(30))
     ));
     // dead-block-elim dropped the unreachable block.
-    assert_eq!(stats.mutations("dead-block-elim"), 1);
+    assert_eq!(stats.mutations_for("dead-block-elim"), 1);
     assert_eq!(f.blocks.len(), 1);
     // inst-stats saw the cleaned-up IR.
-    assert_eq!(stats.mutations("inst-stats"), 3);
-    assert_eq!(stats.mutations("inst-stats:blocks"), 1);
+    assert_eq!(stats.mutations_for("inst-stats"), 3);
+    assert_eq!(stats.mutations_for("inst-stats:blocks"), 1);
 
     // Every pass ran once.
-    assert_eq!(stats.runs("constant-fold"), 1);
-    assert_eq!(stats.runs("dead-block-elim"), 1);
-    assert_eq!(stats.runs("inst-stats"), 1);
+    assert_eq!(stats.runs_for("constant-fold"), 1);
+    assert_eq!(stats.runs_for("dead-block-elim"), 1);
+    assert_eq!(stats.runs_for("inst-stats"), 1);
 }

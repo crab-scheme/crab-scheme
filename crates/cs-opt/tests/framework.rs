@@ -39,7 +39,7 @@ struct MarkerPass {
 }
 
 impl Pass for MarkerPass {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         self.name
     }
     fn bucket(&self) -> Bucket {
@@ -283,13 +283,13 @@ fn pipeline_runs_passes_in_order() {
     };
     p.run(&mut func, &mut ctx);
     // Each pass recorded one run.
-    assert_eq!(stats.runs("p-early"), 1);
-    assert_eq!(stats.runs("p-default"), 1);
-    assert_eq!(stats.runs("p-late"), 1);
+    assert_eq!(stats.runs_for("p-early"), 1);
+    assert_eq!(stats.runs_for("p-default"), 1);
+    assert_eq!(stats.runs_for("p-late"), 1);
     // Each marker pass also recorded one mutation.
-    assert_eq!(stats.mutations("p-early"), 1);
-    assert_eq!(stats.mutations("p-default"), 1);
-    assert_eq!(stats.mutations("p-late"), 1);
+    assert_eq!(stats.mutations_for("p-early"), 1);
+    assert_eq!(stats.mutations_for("p-default"), 1);
+    assert_eq!(stats.mutations_for("p-late"), 1);
 }
 
 #[test]
@@ -327,8 +327,8 @@ fn pipeline_run_twice_accumulates_stats() {
     };
     p.run(&mut func, &mut ctx);
     p.run(&mut func, &mut ctx);
-    assert_eq!(stats.runs("p1"), 2);
-    assert_eq!(stats.mutations("p1"), 2);
+    assert_eq!(stats.runs_for("p1"), 2);
+    assert_eq!(stats.mutations_for("p1"), 2);
 }
 
 // ---- PassStats methods ----
@@ -336,8 +336,8 @@ fn pipeline_run_twice_accumulates_stats() {
 #[test]
 fn pass_stats_returns_zero_for_unknown_pass() {
     let stats = PassStats::default();
-    assert_eq!(stats.runs("never-ran"), 0);
-    assert_eq!(stats.mutations("never-ran"), 0);
+    assert_eq!(stats.runs_for("never-ran"), 0);
+    assert_eq!(stats.mutations_for("never-ran"), 0);
 }
 
 // ---- Verifier (iter 4) ----
@@ -356,7 +356,7 @@ mod verifier_attribution {
     /// pass's name attributed.
     struct BuggyPass;
     impl Pass for BuggyPass {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "buggy"
         }
         fn run(&self, func: &mut cs_rir::Function, _ctx: &mut PassContext) {
@@ -367,7 +367,7 @@ mod verifier_attribution {
     /// A pass that breaks RIR by making a Jump target dangle.
     struct DanglerPass;
     impl Pass for DanglerPass {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "dangler"
         }
         fn run(&self, func: &mut cs_rir::Function, _ctx: &mut PassContext) {

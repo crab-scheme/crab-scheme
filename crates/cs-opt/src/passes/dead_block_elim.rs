@@ -39,7 +39,7 @@ use crate::{Pass, PassContext};
 pub struct DeadBlockElim;
 
 impl Pass for DeadBlockElim {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "dead-block-elim"
     }
 

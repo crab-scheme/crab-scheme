@@ -47,7 +47,7 @@ use cs_rir::Function;
 pub struct NoOpCounter;
 
 impl Pass for NoOpCounter {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "no-op-counter"
     }
 

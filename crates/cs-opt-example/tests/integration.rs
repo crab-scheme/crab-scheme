@@ -52,9 +52,9 @@ fn example_plugin_runs_in_pipeline_with_builtins() {
     p.run(&mut f, &mut ctx);
 
     // constant-fold collapsed Add.
-    assert_eq!(stats.mutations("constant-fold"), 1);
+    assert_eq!(stats.mutations_for("constant-fold"), 1);
     // no-op-counter recorded the post-fold inst count.
-    assert_eq!(stats.mutations("no-op-counter"), 3);
+    assert_eq!(stats.mutations_for("no-op-counter"), 3);
 }
 
 #[test]

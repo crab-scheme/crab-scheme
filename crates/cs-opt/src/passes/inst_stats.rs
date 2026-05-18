@@ -30,7 +30,7 @@ use crate::{Bucket, Pass, PassContext};
 pub struct InstStats;
 
 impl Pass for InstStats {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "inst-stats"
     }
 

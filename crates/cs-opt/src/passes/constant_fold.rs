@@ -47,7 +47,7 @@ use crate::{Bucket, Pass, PassContext};
 pub struct ConstantFold;
 
 impl Pass for ConstantFold {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "constant-fold"
     }
 

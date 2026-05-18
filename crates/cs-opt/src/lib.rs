@@ -32,7 +32,7 @@
 //! ```ignore
 //! struct MyPass;
 //! impl cs_opt::Pass for MyPass {
-//!     fn name(&self) -> &str { "my-pass" }
+//!     fn name(&self) -> &'static str { "my-pass" }
 //!     fn bucket(&self) -> cs_opt::Bucket { cs_opt::Bucket::Default }
 //!     fn run(&self, func: &mut cs_rir::Function, _ctx: &mut cs_opt::PassContext) {
 //!         // ... mutate func ...
@@ -126,7 +126,12 @@ pub trait Pass: Send + Sync {
     /// MUST match `[a-z][a-z0-9-]*` (lowercase, ASCII letters,
     /// digits, hyphens; starts with a letter). The registry
     /// rejects names violating this.
-    fn name(&self) -> &str;
+    ///
+    /// Returns `&'static str` so `PassStats`'s per-call
+    /// bookkeeping can key `HashMap<&'static str, _>` without
+    /// any per-record allocation — every real pass returns a
+    /// literal anyway.
+    fn name(&self) -> &'static str;
 
     /// Pipeline-ordering bucket. Defaults to [`Bucket::Default`].
     fn bucket(&self) -> Bucket {
@@ -178,33 +183,44 @@ pub struct PassContext<'a> {
 /// Two `HashMap`s rather than a single `HashMap<name, struct>`
 /// because passes commonly want only one or the other; the split
 /// keeps the per-pass accessor cheap.
+///
+/// Keys are `&'static str` (matching `Pass::name`'s return type)
+/// so the per-call increments are pure HashMap operations — no
+/// String allocation on the hot path.
 #[derive(Debug, Default, Clone)]
 pub struct PassStats {
-    pub runs: HashMap<String, usize>,
-    pub mutations: HashMap<String, usize>,
+    pub runs: HashMap<&'static str, usize>,
+    pub mutations: HashMap<&'static str, usize>,
 }
 
 impl PassStats {
     /// Record a single execution of `pass_name`. Passes don't
     /// normally call this directly; the pipeline does it.
-    pub fn record_run(&mut self, pass_name: &str) {
-        *self.runs.entry(pass_name.to_string()).or_default() += 1;
+    pub fn record_run(&mut self, pass_name: &'static str) {
+        *self.runs.entry(pass_name).or_default() += 1;
     }
 
     /// Record `n` mutations made by `pass_name`. Called by the
     /// pass itself at the end of its `run` (the pipeline can't
     /// know what counts as a "mutation" generically).
-    pub fn record_mutations(&mut self, pass_name: &str, n: usize) {
-        *self.mutations.entry(pass_name.to_string()).or_default() += n;
+    pub fn record_mutations(&mut self, pass_name: &'static str, n: usize) {
+        *self.mutations.entry(pass_name).or_default() += n;
     }
 
-    /// How many times `pass_name` ran in this PassStats.
-    pub fn runs(&self, pass_name: &str) -> usize {
+    /// How many times `pass_name` ran in this `PassStats`.
+    ///
+    /// Renamed from a field-shadowing `runs(name)` method; the
+    /// `runs` HashMap field stays accessible directly for callers
+    /// that want to iterate. (`stats.runs.iter()` walks all
+    /// passes; `stats.runs_for("name")` looks up one.)
+    pub fn runs_for(&self, pass_name: &str) -> usize {
         self.runs.get(pass_name).copied().unwrap_or(0)
     }
 
-    /// How many mutations `pass_name` recorded in this PassStats.
-    pub fn mutations(&self, pass_name: &str) -> usize {
+    /// How many mutations `pass_name` recorded in this
+    /// `PassStats`. See [`PassStats::runs_for`] for the rename
+    /// rationale.
+    pub fn mutations_for(&self, pass_name: &str) -> usize {
         self.mutations.get(pass_name).copied().unwrap_or(0)
     }
 }
