@@ -209,3 +209,35 @@
                  ((null? ps) #t)
                  (((car ps) (car xs)) (loop (cdr ps) (cdr xs)))
                  (else #f))))))))
+
+; ============================================================
+; Phase 2B.6 — define/contract and provide/contract
+;
+; `define/contract` attaches a contract to a top-level binding in
+; one step. Because the bound name IS the wrapped procedure, an
+; ordinary `(export ...)` clause from any enclosing library re-
+; exports the wrapped version transparently — callers receive the
+; contract-protected closure, blame label included.
+;
+;   (define/contract name contract expr)
+;     -> (define name (apply-contract contract expr 'name))
+;
+; `provide/contract` is the Racket-style sugar for several at once.
+; It expands to a sequence of `define/contract` forms targeting an
+; already-defined function: each clause `(name contract)` is
+; rewritten as `(define name (apply-contract contract name 'name))`,
+; which rebinds `name` to the wrapped version in place. Putting
+; `provide/contract` AFTER the relevant defines (and before the
+; library boundary closes) is the intended call order.
+
+(define-syntax define/contract
+  (syntax-rules ()
+    ((_ name contract expr)
+     (define name (apply-contract contract expr (quote name))))))
+
+(define-syntax provide/contract
+  (syntax-rules ()
+    ((_ (name contract) ...)
+     (begin
+       (define name (apply-contract contract name (quote name)))
+       ...))))

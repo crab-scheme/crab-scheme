@@ -527,6 +527,31 @@ impl<'a> Expander<'a> {
                 if *s == self.keywords.import {
                     return self.expand_import(&tail, d.span());
                 }
+                // Top-level `begin` splices its children at the
+                // top level so that a `(begin (define ...) ...)`
+                // produced by a macro is treated the same as
+                // writing those defines directly. This matches
+                // R7RS top-level begin semantics.
+                if *s == self.keywords.begin {
+                    let mut exprs = Vec::with_capacity(tail.len());
+                    for child in &tail {
+                        exprs.push(self.expand_top(child)?);
+                    }
+                    return Ok(CoreExpr::Begin {
+                        exprs,
+                        span: d.span(),
+                    });
+                }
+                // Top-level macro use: expand once, then route the
+                // expansion back through expand_top so a macro that
+                // yields a `(define ...)` (or any other top-level-
+                // only form) is recognized as such. Without this,
+                // the expansion falls into expand_pair which only
+                // handles expression-position forms.
+                if self.macros.contains_key(s) {
+                    let expanded = self.try_expand_macro(*s, d)?;
+                    return self.expand_top(&expanded);
+                }
             }
         }
         self.expand(d)
