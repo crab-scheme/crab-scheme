@@ -124,10 +124,10 @@ output is what the spec gates on.
 ### WASM-subset build (iter 15)
 
 `cs-cli` now defines a `wasm-stdlib` convenience feature pulling
-in the 25 WASM-safe modules:
+in the 26 WASM-safe modules:
 
 ```
-path, fs, os, string, format, regex, time, random, uuid,
+path, fs, os, process, string, format, regex, time, random, uuid,
 json, csv, toml, base, url, hash, compress, deflate, archive,
 log, metrics, collection, math, signal, tty, meta
 ```
@@ -142,6 +142,10 @@ a `HOSTNAME`-env-var-falling-back-to-`"wasi"` stub; and
 WASM target so `cs-stdlib-compress` (zstd) ships there too —
 encoder uses `CompressionLevel::Fastest` only (ruzstd 0.8
 panics on Default/Better/Best), decoder is full-format.
+Iter 19 added `cs-stdlib-process` to the subset (no source
+change — wasi std returns `Err(Unsupported)` from
+`Command::spawn` which our existing error path surfaces as a
+Scheme exception; `(which …)` works as PATH search).
 
 Build:
 
@@ -155,15 +159,28 @@ debug, smaller in release).
 
 **Excluded** (and why):
 
-- `process` — `std::process::Command::spawn` is unimplemented in
-  both WASI preview 1 and preview 2 (WASI intentionally excludes
-  fork/exec — Component Model philosophy). Genuinely blocked
-  without forking to WASIX.
-- `net` / `http` / `websocket` — `std::net::TcpStream` is stubbed
-  on `wasm32-wasip1`. Unlocked by migrating to `wasm32-wasip2`,
-  which exposes `wasi:sockets` and `wasi:http`. Tracked as a
-  separate spec decision (drops wasip1 runtime compatibility,
-  requires replacing ureq/tiny_http with wasi-http bindings).
+- `net` / `http` / `websocket` — `std::net::TcpStream` (client)
+  works on `wasm32-wasip2` from Rust 1.83+, but TCP listener
+  semantics require runtime-provided pre-opened sockets and
+  `ureq` + `tiny_http` both fail to build on any wasm32 target
+  (ureq excludes wasm; tiny_http needs `std::thread::spawn`
+  which isn't on wasip2 std). A real fix requires migrating
+  to `wasm32-wasip2` AND replacing the HTTP client/server with
+  `wasi-http-client` + `wasi:http/incoming-handler` — different
+  APIs, not drop-in. Tracked as a separate `wasip2-networking`
+  spec; effective runtime support narrows to Wasmtime 16+.
+
+Iter-19 stub-via-Err work resolved the process exclusion:
+
+- `process` — `Command::spawn()` on WASI returns
+  `Err(io::ErrorKind::Unsupported)`, which our existing `?`
+  propagation converts to a Scheme-visible
+  `FfiError::HostFailure`. So `cs-stdlib-process` ships in
+  `wasm-stdlib` and `(run …)` raises at call time rather than
+  failing to build. `(which …)` works on WASI (pure PATH
+  search via `std::fs`). Chosen over WASIX (which would lock
+  to Wasmer runtime) and the proposed Component-Model dynamic
+  spawn (not standardized before 2027+).
 
 Iter-18 stub work resolved three earlier exclusions:
 
@@ -257,15 +274,15 @@ Resolved post-merge:
 
 ## Closing state
 
-- `stdlib-modules-spec` branch head: iter 18 (this commit) on
-  top of the merged iter-16 + iter-17 (PR #8).
+- `stdlib-modules-spec` branch head: iter 19 (this commit) on
+  top of iter 17 + iter 18 (PR #8).
 - 29 new crates + 30 conformance tests + 2 realworld benches +
   1 WASM build matrix entry.
 - All 147 conformance tests green on native.
-- WASM build green with `wasm-stdlib` feature; **25 of 28
-  modules portable** (only `net`/`http`/`websocket`/`process`
-  remain, blocked on WASI socket support / Component-Model
-  process model — see exclusion rationale above).
+- WASM build green with `wasm-stdlib` feature; **26 of 28
+  modules portable** (~93%). Only the 3 networking modules
+  (`net`/`http`/`websocket`) remain excluded, all gated on the
+  `wasm32-wasip2` migration tracked separately.
 - Default cs-cli build unchanged in behaviour — every module
   the umbrella was advertising before iter 15 is still
   enabled (with gzip/deflate now coming from `cs-stdlib-deflate`

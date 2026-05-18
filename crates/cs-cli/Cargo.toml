@@ -120,6 +120,7 @@ wasm-stdlib = [
     "stdlib-collection",
     "stdlib-math",
     "stdlib-os",
+    "stdlib-process",
     "stdlib-signal",
     "stdlib-tty",
     "stdlib-meta",
