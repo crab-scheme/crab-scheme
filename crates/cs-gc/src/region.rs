@@ -136,6 +136,17 @@ pub(crate) struct RegionSlot<T: ?Sized> {
 pub struct Region {
     id: RegionId,
     arena: Bump,
+    /// Gap E-7: callbacks to run when the region drops.
+    /// Lets non-POD payloads (file handles, FFI resources,
+    /// anything with cleanup logic) be safely allocated in
+    /// a region — the dtor releases the resource before
+    /// bumpalo bulk-frees the buffer underneath. Each dtor
+    /// runs once, in LIFO registration order.
+    ///
+    /// The vec is `RefCell`-wrapped so `register_dtor` can
+    /// take `&self` (matching the `Region::alloc` convention).
+    /// `!Send` already prevents cross-thread races.
+    dtors: std::cell::RefCell<Vec<Box<dyn FnOnce()>>>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -208,8 +219,31 @@ impl Region {
         Region {
             id,
             arena: Bump::new(),
+            dtors: std::cell::RefCell::new(Vec::new()),
             _not_send: PhantomData,
         }
+    }
+
+    /// Gap E-7: register a closure to run when this region
+    /// drops. Lets non-POD payloads (file handles, FFI
+    /// resources, anything with Drop-like cleanup) be
+    /// safely allocated in a region — the dtor releases the
+    /// resource before bumpalo bulk-frees the underlying
+    /// buffer. Dtors run in LIFO registration order (last
+    /// registered runs first).
+    ///
+    /// Use case: allocating a `Port::FileOutput` (which
+    /// holds a file path + buffer to flush on close) in a
+    /// region. Register a dtor that flushes + closes the
+    /// file when the region drops; otherwise the OS file
+    /// handle leaks and the buffered writes are silently
+    /// dropped.
+    ///
+    /// Takes `&self` not `&mut self` to match the `alloc`
+    /// convention — the dtor list lives in a RefCell. The
+    /// `!Send` constraint prevents cross-thread races.
+    pub fn register_dtor(&self, dtor: Box<dyn FnOnce()>) {
+        self.dtors.borrow_mut().push(dtor);
     }
 
     /// The region's per-process unique id.
@@ -258,12 +292,21 @@ impl Region {
 
 impl Drop for Region {
     fn drop(&mut self) {
+        // Gap E-7: run registered dtors BEFORE the Bump
+        // arena frees the slot memory. Dtors run in LIFO
+        // registration order — the last registered cleanup
+        // sees the most-recently-allocated state. Each dtor
+        // is `FnOnce` so we drain the vec by consuming it.
+        let dtors = std::mem::take(&mut *self.dtors.borrow_mut());
+        for dtor in dtors.into_iter().rev() {
+            dtor();
+        }
         // Unregister this region from the live-id set BEFORE
-        // the underlying Bump arena frees its memory. Debug-
-        // mode `Gc<T>` operations check this set; an
-        // outstanding handle accessed after region drop would
-        // panic if we'd missed this step (which is correct —
-        // the access would otherwise hit freed memory).
+        // the underlying Bump arena frees its memory.
+        // `Gc<T>` operations check this set; an outstanding
+        // handle accessed after region drop would panic if
+        // we'd missed this step (which is correct — the
+        // access would otherwise hit freed memory).
         //
         // Field-drop order: fields drop in declaration order
         // after this Drop fn returns. `id` is Copy so it's
@@ -361,5 +404,57 @@ mod tests {
             }
             // r drops at end of scope.
         }
+    }
+
+    // ---- Gap E-7: dtor registry ----
+
+    #[test]
+    fn dtor_runs_on_region_drop() {
+        use std::rc::Rc;
+        let counter = Rc::new(Cell::new(0_usize));
+        {
+            let r = Region::new();
+            let c = Rc::clone(&counter);
+            r.register_dtor(Box::new(move || c.set(c.get() + 1)));
+            // Counter still 0 — dtor hasn't run yet.
+            assert_eq!(counter.get(), 0);
+        }
+        // Region dropped — dtor ran.
+        assert_eq!(counter.get(), 1);
+    }
+
+    #[test]
+    fn dtors_run_in_lifo_order() {
+        use std::rc::Rc;
+        let order: Rc<std::cell::RefCell<Vec<u8>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let r = Region::new();
+            for i in 0..5_u8 {
+                let o = Rc::clone(&order);
+                r.register_dtor(Box::new(move || o.borrow_mut().push(i)));
+            }
+        }
+        // LIFO: last-registered ran first.
+        assert_eq!(*order.borrow(), vec![4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn multiple_dtors_all_run() {
+        use std::rc::Rc;
+        let count = Rc::new(Cell::new(0_usize));
+        {
+            let r = Region::new();
+            for _ in 0..10 {
+                let c = Rc::clone(&count);
+                r.register_dtor(Box::new(move || c.set(c.get() + 1)));
+            }
+        }
+        assert_eq!(count.get(), 10);
+    }
+
+    #[test]
+    fn no_dtors_registered_is_fine() {
+        // Region drop must not error when dtors vec is empty.
+        let _r = Region::new();
     }
 }
