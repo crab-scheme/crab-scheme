@@ -30,6 +30,32 @@ fn wildcard_matches_anything() {
 }
 
 #[test]
+fn syntax_rules_underscore_in_literals_is_literal_not_wildcard() {
+    // Regression for #112: previously, `_` was always a wildcard
+    // in match-pattern, even when listed as a syntax-rules
+    // literal. That broke any catch-all rule that came after a
+    // rule using `_` as a literal.
+    let mut rt = Runtime::new();
+    let v = rt
+        .eval_str(
+            "<t>",
+            r#"
+        (define-syntax kind
+          (syntax-rules (_)
+            ((_ _ body)     'literal-underscore)
+            ((_ var body)   'pattern-variable)))
+        (list (kind _ first)    ;; literal _ matches → rule 1
+              (kind x second))  ;; x ≠ literal _ → rule 2 binds var
+    "#,
+        )
+        .expect("literal `_` should match literal `_`");
+    assert_eq!(
+        rt.format_value(&v, cs_core::WriteMode::Display),
+        "(literal-underscore pattern-variable)"
+    );
+}
+
+#[test]
 fn identifier_binds_subject() {
     let mut rt = load_match();
     let v = rt.eval_str("<t>", "(match 42 (x (+ x 1)))").unwrap();

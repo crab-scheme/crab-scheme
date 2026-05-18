@@ -4601,11 +4601,24 @@ fn match_pattern(
     is_outer: bool,
     bindings: &mut std::collections::HashMap<cs_core::Symbol, MatchBinding>,
 ) -> bool {
+    // The outer macro-name placeholder slot matches anything —
+    // it's the macro keyword being invoked, not a real pattern.
+    if is_outer {
+        if let Datum::Symbol(_, _) = pattern {
+            return true;
+        }
+    }
     match (pattern, input) {
-        // Wildcards
-        (Datum::Symbol(s, _), _) if *s == underscore_sym => true,
-        // Literal keyword: must be the same symbol
+        // Literal keyword: must be the same symbol — checked before
+        // the `_` wildcard so a macro that explicitly puts `_` in
+        // its literals list (overriding the R7RS wildcard default)
+        // gets literal-match semantics. Otherwise `_` in the input
+        // would slip past as a wildcard and the user's catch-all
+        // identifier rule would never fire.
         (Datum::Symbol(s, _), Datum::Symbol(t, _)) if literals.contains(s) => *s == *t,
+        (Datum::Symbol(s, _), _) if literals.contains(s) => false,
+        // Wildcards (only when not declared as a literal above)
+        (Datum::Symbol(s, _), _) if *s == underscore_sym => true,
         // Pattern variable: bind it (unless it's the outer macro name)
         (Datum::Symbol(s, _), _) => {
             if is_outer {
