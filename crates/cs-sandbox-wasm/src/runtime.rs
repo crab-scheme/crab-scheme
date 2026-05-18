@@ -83,10 +83,13 @@ impl SandboxRuntime {
     pub fn new(config: &SandboxConfig) -> Result<Self, SandboxError> {
         let mut wasm_config = Config::new();
         wasm_config.consume_fuel(config.fuel.is_some());
-        // Epoch interruption is the mechanism for BOTH the
-        // optional `epoch_tick_interval` CPU bound AND the
-        // mandatory wall-clock timeout enforcement. Always-on;
-        // the per-call ticker is what differs.
+        // Epoch interruption is wired ONLY for the mandatory
+        // wall-clock timeout enforcement. The `epoch_tick_interval`
+        // field on SandboxConfig is currently a stub — held for
+        // forward compatibility but no separate CPU-bound ticker
+        // is spawned. Always-on so the per-call wall-clock ticker
+        // can bump it; every Store must call `set_epoch_deadline`
+        // (the inline-WAT smoke pushes its deadline to u64::MAX).
         wasm_config.epoch_interruption(true);
         let engine = Engine::new(&wasm_config)
             .map_err(|e| SandboxError::Internal(format!("wasmtime Engine::new failed: {}", e)))?;
@@ -271,9 +274,19 @@ impl SandboxRuntime {
             // CodeReached`, NOT `Trap::MemoryOutOfBounds`. The
             // proximate cause is still the memory cap, so
             // classify it as `MemoryExhausted` to give callers
-            // the actionable error. Backtrace check is the only
-            // signal — wasmtime doesn't propagate the limiter
-            // failure as a distinct error kind.
+            // the actionable error.
+            //
+            // NOTE: this is intentionally backtrace-string-matching,
+            // which violates the cluster-A principle that trap
+            // classification should use API-stable Trap discriminants.
+            // The exception is justified: wasmtime exposes no
+            // distinct error kind for "memory limiter denied the
+            // grow", so the only signal is the symbol names in the
+            // guest's panic backtrace. Revisit if wasmtime ever
+            // adds `Trap::MemoryLimiterDenied` or equivalent. The
+            // false-positive risk is acceptable: these identifiers
+            // appear in compiled-guest symbol names, not in arbitrary
+            // user text.
             let msg = format!("{}", e);
             if msg.contains("rust_oom")
                 || msg.contains("handle_alloc_error")

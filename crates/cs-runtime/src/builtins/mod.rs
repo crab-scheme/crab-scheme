@@ -10258,6 +10258,7 @@ pub(crate) const NULL_ENV_SENTINEL: &str = "__null-env__";
 /// Used by `is_environment_value`, `decode_environment`, and
 /// `namespace_update` to share one shape-check implementation
 /// instead of three near-identical inline matches.
+#[derive(Debug)]
 pub(crate) enum EnvShape {
     /// Well-formed; `mutable` is the value of slot[2].
     Valid { mutable: bool },

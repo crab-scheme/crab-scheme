@@ -84,12 +84,16 @@ pub struct SandboxConfig {
     /// same trap point regardless of host load.
     pub fuel: Option<u64>,
 
-    /// Cheaper alternative to fuel: epoch interruption. Host
-    /// ticks an epoch counter at this interval; guest traps when
-    /// its store's epoch deadline expires. Non-deterministic but
-    /// much lower per-instruction overhead. `None` = disabled.
-    /// Mutually exclusive with `fuel` in the default presets —
-    /// pick one.
+    /// Cheaper-than-fuel CPU bound via epoch interruption.
+    ///
+    /// **Currently a stub.** Cluster A made
+    /// `Config::epoch_interruption(true)` unconditional to wire
+    /// `wall_clock_timeout`, but the epoch ticker for a separate
+    /// CPU-bound is not yet implemented — this field is held for
+    /// forward compatibility and rejected only when combined with
+    /// `fuel` (so callers don't think they're getting both).
+    /// Wire-up tracked as a post-1.0 follow-up. `None` for now.
+    /// Mutually exclusive with `fuel`.
     pub epoch_tick_interval: Option<Duration>,
 
     /// Paths the guest can read/write. Empty = no filesystem.
