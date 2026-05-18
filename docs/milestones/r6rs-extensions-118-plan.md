@@ -60,8 +60,45 @@ Several downstream items want this:
 | **C5** | Nested compound sub `((a (b c)) …)` (recursive sub-pattern walker) | **Done** | Yes — handles arbitrarily deep nesting under one ellipsis level |
 | **C6** | Minimal nested ellipsis `((p …) …)` with bare-pvar inner | **Done** | Yes — covers the canonical "list of lists" shape |
 | **C7** | Nested ellipsis with compound/prefixed inner: `((kw p …) …)` / `(((a b) …) …)` | **Done** | Final ellipsis grammar piece — `compile_sc_pattern` recurses through nested-ellipsis layers with depth-bumping wrappers |
-| **D** | Fender expressions (expand-time Scheme eval) | pending | Largest iter; may slip to Phase 2 |
+| **D** | Fender expressions (runtime eval, shared next-clause thunk) | **Done** | Yes — pvars in scope; thunk avoids CoreExpr duplication |
 | **E** | Proper hygiene tracking — mark-aware identifier comparison | pending | Replaces the Iter A symbol-eq stand-ins; needs SyntaxObject decision |
+
+## Iter D — Fender expressions
+
+3-element clause shape `(pattern fender body)`. Because our
+syntax-case runs at runtime (not expand-time), the fender is just
+a regular Scheme expression — pvars are in scope as ordinary
+let-bound variables, so no expand-time evaluator is required.
+
+Implementation: clause body datum becomes
+`(let (<pvars>) (if <fender> <body> (__sc-try-next__)))`.
+In the CoreExpr-building loop, when a clause has a fender, we
+wrap the accumulated next-clause expression in a `Letrec`-bound
+0-arity thunk `__sc-try-next__`. Both the test-failure branch and
+the fender-failure branch call into that shared thunk:
+
+```
+(letrec ((__sc-try-next__ (lambda () <previous-acc>)))
+  (if <test>
+      (let (<pvars>)
+        (if <fender>
+            <body>
+            (__sc-try-next__)))
+      (__sc-try-next__)))
+```
+
+This avoids CoreExpr duplication that would otherwise be
+O(n^2) for n stacked fender clauses. Non-fender clauses keep
+the cheaper inline `If` shape.
+
+**What lands**: fender expressions with full access to bound
+pvars, ellipsis-bound depth-1 pvars, cascading fender chains,
+mixed fender/non-fender clauses.
+
+**Out of scope (Iter E)**: hygiene-aware identifier comparison.
+The fender expression today sees pvars as plain Scheme bindings;
+when Iter E introduces SyntaxObject wrapping, fenders may need
+to call `syntax->datum` on pvar references before comparing them.
 
 ## Iter C7 — Nested ellipsis: full grammar
 

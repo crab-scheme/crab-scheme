@@ -278,17 +278,9 @@ fn no_matching_clause_raises_error() {
     );
 }
 
-// ---- syntax error: fender form rejected with Iter D pointer ----
-
-#[test]
-fn three_element_clause_rejected_with_iter_d_pointer() {
-    let mut rt = Runtime::new();
-    let err = rt
-        .eval_str("<t>", "(syntax-case 42 () (x #t (syntax x)))")
-        .expect_err("fender form not yet supported");
-    let s = format!("{}", err);
-    assert!(s.contains("Iter D"), "got: {}", s);
-}
+// (Iter B used to reject 3-element clauses with an Iter D
+// pointer; Iter D now implements fenders. See
+// syntax_case_iter_d.rs for the success-side tests.)
 
 // ---- standalone (syntax X) outside syntax-case ----
 

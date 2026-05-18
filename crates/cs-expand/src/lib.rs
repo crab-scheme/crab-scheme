@@ -2315,20 +2315,23 @@ impl<'a> Expander<'a> {
                     what: "syntax-case clause must be (pattern template)".into(),
                     span: clause_d.span(),
                 })?;
-            if clause_parts.len() < 2 {
+            // Allow 2-element `(pattern template)` and 3-element
+            // `(pattern fender template)`. R6RS doesn't define a
+            // 4+ shape.
+            if clause_parts.len() != 2 && clause_parts.len() != 3 {
                 return Err(ExpandError::BadSyntax {
-                    what: "syntax-case clause must have at least pattern + template".into(),
-                    span: clause_d.span(),
-                });
-            }
-            if clause_parts.len() != 2 {
-                return Err(ExpandError::BadSyntax {
-                    what: "syntax-case fender expressions land in Iter D (#118 Iter D); for now use (pattern template)".into(),
+                    what:
+                        "syntax-case clause must be (pattern template) or (pattern fender template)"
+                            .into(),
                     span: clause_d.span(),
                 });
             }
             let pat = &clause_parts[0];
-            let tmpl_body = &clause_parts[1];
+            let (fender_opt, tmpl_body) = if clause_parts.len() == 3 {
+                (Some(clause_parts[1].clone()), &clause_parts[2])
+            } else {
+                (None, &clause_parts[1])
+            };
 
             let mut pvars: Vec<(Symbol, u32, Datum)> = Vec::new();
             let test = compile_sc_pattern(
@@ -2340,15 +2343,36 @@ impl<'a> Expander<'a> {
                 &self.keywords,
             )?;
 
-            // Wrap body in a let that binds pvars to their
-            // extractors against the key. The body itself stays
-            // as a Datum; `(syntax X)` inside is handled later
-            // when `expand_syntax_form` runs and consults
-            // `self.syntax_pvars`. We just ensure the binding
-            // names are introduced so the inner expansion can
-            // refer to them.
-            let body_with_lets = if pvars.is_empty() {
+            // Build the inner body datum: optionally wrap in
+            // (if <fender> <body> __sc-try-next__), and wrap in a
+            // `let` that binds pvars to their extractors. The
+            // `__sc-try-next__` placeholder is replaced with a
+            // 0-arity thunk call in the CoreExpr-building loop;
+            // for the datum representation we use a literal
+            // marker symbol to keep the per-clause shape uniform.
+            let inner_body = if let Some(fender_dat) = &fender_opt {
+                // (if <fender> <body> (__sc-try-next__))
+                let try_next_call = mk_list(
+                    vec![Datum::Symbol(
+                        self.syms.intern("__sc-try-next__"),
+                        clause_d.span(),
+                    )],
+                    clause_d.span(),
+                );
+                mk_list(
+                    vec![
+                        Datum::Symbol(self.keywords.if_, clause_d.span()),
+                        fender_dat.clone(),
+                        tmpl_body.clone(),
+                        try_next_call,
+                    ],
+                    clause_d.span(),
+                )
+            } else {
                 tmpl_body.clone()
+            };
+            let body_with_lets = if pvars.is_empty() {
+                inner_body
             } else {
                 let mut binding_list = Datum::Null(clause_d.span());
                 for (pname, _depth, ext) in pvars.iter().rev() {
@@ -2363,20 +2387,30 @@ impl<'a> Expander<'a> {
                     vec![
                         Datum::Symbol(self.keywords.let_, clause_d.span()),
                         binding_list,
-                        tmpl_body.clone(),
+                        inner_body,
                     ],
                     clause_d.span(),
                 )
             };
 
-            let cond_clause = mk_list(vec![test, body_with_lets], clause_d.span());
-            // The per-clause pvar set is re-derived from the pattern
-            // in the body-expansion loop below; we only push the
-            // assembled clause datum here.
+            // Tag fender presence into the clause datum so the
+            // CoreExpr-building loop knows whether to bind a thunk.
+            // 2-element clause -> (test body)
+            // 3-element clause -> (test body 'has-fender)
+            let cond_clause = if fender_opt.is_some() {
+                mk_list(
+                    vec![
+                        test,
+                        body_with_lets,
+                        Datum::Symbol(self.syms.intern("__has-fender__"), clause_d.span()),
+                    ],
+                    clause_d.span(),
+                )
+            } else {
+                mk_list(vec![test, body_with_lets], clause_d.span())
+            };
             let _ = &pvars;
             cond_clauses_dat.push(cond_clause);
-            // Don't push pvars here; the per-clause push happens
-            // around expansion of *this* clause's body below.
         }
 
         // Else clause: raise a syntax-case mismatch error.
@@ -2415,10 +2449,20 @@ impl<'a> Expander<'a> {
         let last_parts = collect_proper_list_strict(&last).expect("else clause is a list");
         let mut acc = self.expand(&last_parts[1])?;
 
+        let try_next_sym = self.syms.intern("__sc-try-next__");
         for (clause_i, clause_dat) in cond_clauses_dat.iter().enumerate().rev() {
             let parts = collect_proper_list_strict(clause_dat).expect("clause is a list");
             let test_dat = &parts[0];
             let body_dat = &parts[1];
+            // A 3rd element (the `__has-fender__` marker) flags a
+            // fender clause. Body already encodes
+            // `(if <fender> <body> __sc-try-next__)`; we just
+            // need to bind __sc-try-next__ to a 0-arity thunk
+            // whose body is the current acc (next-clause
+            // expression), so both the test-failure path and the
+            // fender-failure path call into the same shared
+            // continuation without duplicating the CoreExpr tree.
+            let has_fender = parts.len() >= 3;
 
             // Determine this clause's pvars from the original
             // pattern. (We already compiled it once and discarded
@@ -2451,12 +2495,45 @@ impl<'a> Expander<'a> {
 
             let test_expr = self.expand(test_dat)?;
 
-            acc = CoreExpr::If {
-                cond: Rc::new(test_expr),
-                then: Rc::new(body_expr),
-                alt: Rc::new(acc),
-                span,
-            };
+            if has_fender {
+                // Wrap so that __sc-try-next__ -> (next-clause).
+                // The clause body has already been expanded
+                // referencing __sc-try-next__ as a variable; we
+                // wire it through a Letrec binding to a 0-arity
+                // thunk whose body is `acc` (the previous
+                // cond's accumulated cascade).
+                let next_thunk = CoreExpr::Lambda {
+                    params: Params::fixed(vec![]),
+                    body: Rc::new(acc.clone()),
+                    span,
+                };
+                let next_call = CoreExpr::App {
+                    func: Rc::new(CoreExpr::Ref {
+                        name: try_next_sym,
+                        span,
+                    }),
+                    args: vec![],
+                    span,
+                };
+                let inner_if = CoreExpr::If {
+                    cond: Rc::new(test_expr),
+                    then: Rc::new(body_expr),
+                    alt: Rc::new(next_call),
+                    span,
+                };
+                acc = CoreExpr::Letrec {
+                    bindings: vec![(try_next_sym, next_thunk)],
+                    body: Rc::new(inner_if),
+                    span,
+                };
+            } else {
+                acc = CoreExpr::If {
+                    cond: Rc::new(test_expr),
+                    then: Rc::new(body_expr),
+                    alt: Rc::new(acc),
+                    span,
+                };
+            }
         }
 
         Ok(CoreExpr::Letrec {
