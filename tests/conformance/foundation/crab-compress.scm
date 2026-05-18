@@ -1,4 +1,5 @@
-; Conformance test for `(crab compress)` — stdlib-modules iter 7.
+; Conformance test for `(crab compress)` — stdlib-modules iter 7
+; (slimmed in iter 17 when gzip+deflate moved to crab-deflate.scm).
 
 (define (build-payload n)
   (let* ((bv (make-bytevector n 0)))
@@ -8,22 +9,6 @@
                   (loop (+ i 1)))))))
 
 (define __payload__ (build-payload 1024))
-
-(test-section "(crab compress) — gzip round-trip")
-
-(define __gz__ (gzip-compress __payload__))
-(test-true "gzip-compress shrinks repeating data"
-           (< (bytevector-length __gz__) (bytevector-length __payload__)))
-(test-equal "gzip round-trip preserves bytes"
-            __payload__
-            (gzip-decompress __gz__))
-
-(test-section "(crab compress) — deflate round-trip")
-
-(define __dfl__ (deflate-compress __payload__))
-(test-equal "deflate round-trip preserves bytes"
-            __payload__
-            (deflate-decompress __dfl__))
 
 (test-section "(crab compress) — zstd round-trip")
 
@@ -36,27 +21,11 @@
 
 (test-section "(crab compress) — explicit level")
 
-(test-equal "gzip level 9 still round-trips"
-            __payload__
-            (gzip-decompress (gzip-compress __payload__ 9)))
 (test-equal "zstd level 1 still round-trips"
             __payload__
             (zstd-decompress (zstd-compress __payload__ 1)))
 
 (test-section "(crab compress) — decompression-bomb cap")
 
-; Compress a 1 KB payload, then try to decompress with a 100-byte
-; cap — the decompressed output (1024 bytes) exceeds the cap, so
-; every decoder must raise.
-(test-true "gzip raises when output exceeds cap"
-           (guard (e (#t #t)) (gzip-decompress __gz__ 100) #f))
-(test-true "deflate raises when output exceeds cap"
-           (guard (e (#t #t)) (deflate-decompress __dfl__ 100) #f))
 (test-true "zstd raises when output exceeds cap"
            (guard (e (#t #t)) (zstd-decompress __zst__ 100) #f))
-
-; Explicit cap larger than actual output still succeeds — the cap
-; is "refuse oversized", not "truncate".
-(test-equal "gzip cap larger than output still decodes"
-            __payload__
-            (gzip-decompress __gz__ (* 1024 1024)))

@@ -728,6 +728,7 @@ dependencies = [
  "cs-stdlib-collection",
  "cs-stdlib-compress",
  "cs-stdlib-csv",
+ "cs-stdlib-deflate",
  "cs-stdlib-format",
  "cs-stdlib-fs",
  "cs-stdlib-hash",
@@ -793,7 +794,6 @@ version = "0.0.1"
 dependencies = [
  "cs-core",
  "cs-ffi",
- "flate2",
  "zstd",
 ]
 
@@ -804,6 +804,15 @@ dependencies = [
  "cs-core",
  "cs-ffi",
  "csv",
+]
+
+[[package]]
+name = "cs-stdlib-deflate"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
+ "flate2",
 ]
 
 [[package]]
@@ -882,6 +891,7 @@ dependencies = [
  "cs-stdlib-collection",
  "cs-stdlib-compress",
  "cs-stdlib-csv",
+ "cs-stdlib-deflate",
  "cs-stdlib-format",
  "cs-stdlib-fs",
  "cs-stdlib-hash",

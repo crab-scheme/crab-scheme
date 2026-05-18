@@ -46,6 +46,7 @@ stdlib = [
     "stdlib-url",
     "stdlib-hash",
     "stdlib-compress",
+    "stdlib-deflate",
     "stdlib-archive",
     "stdlib-log",
     "stdlib-metrics",
@@ -75,6 +76,7 @@ stdlib-base = ["cs-runtime/stdlib-base"]
 stdlib-url = ["cs-runtime/stdlib-url"]
 stdlib-hash = ["cs-runtime/stdlib-hash"]
 stdlib-compress = ["cs-runtime/stdlib-compress"]
+stdlib-deflate = ["cs-runtime/stdlib-deflate"]
 stdlib-archive = ["cs-runtime/stdlib-archive"]
 stdlib-log = ["cs-runtime/stdlib-log"]
 stdlib-metrics = ["cs-runtime/stdlib-metrics"]
@@ -86,11 +88,12 @@ stdlib-math = ["cs-runtime/stdlib-math"]
 stdlib-tty = ["cs-runtime/stdlib-tty"]
 stdlib-signal = ["cs-runtime/stdlib-signal"]
 stdlib-meta = ["cs-runtime/stdlib-meta"]
-# WASM-safe subset — 20 modules that build clean for
+# WASM-safe subset — 21 modules that build clean for
 # `wasm32-wasip1`. Excludes: os/process (no Unix syscalls),
 # net/http/websocket (no real sockets in WASI), signal/tty
 # (Unix-only deps), compress (zstd-sys won't cross-compile
-# under nix-wrapped clang). Use as:
+# under nix-wrapped clang). gzip+deflate live in stdlib-deflate
+# so they ship on WASM. Use as:
 #   cargo build --target wasm32-wasip1 -p cs-cli \
 #     --no-default-features --features wasm-stdlib
 # See docs/milestones/stdlib-modules-exit.md for the rationale.
@@ -109,6 +112,7 @@ wasm-stdlib = [
     "stdlib-base",
     "stdlib-url",
     "stdlib-hash",
+    "stdlib-deflate",
     "stdlib-archive",
     "stdlib-log",
     "stdlib-metrics",

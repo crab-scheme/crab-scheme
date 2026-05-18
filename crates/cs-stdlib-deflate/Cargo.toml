@@ -1,0 +1,18 @@
+[package]
+name = "cs-stdlib-deflate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab deflate) — gzip + raw deflate (flate2 only, WASM-portable)."
+
+# Split out of cs-stdlib-compress so the gzip/deflate procs ship
+# to wasm32-wasip1 without inheriting zstd-sys's C-toolchain
+# requirements (nix-wrapped clang rejects the flags zstd-sys'
+# build script passes for wasm). cs-stdlib-compress keeps zstd.
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+flate2 = "1"

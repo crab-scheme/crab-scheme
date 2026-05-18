@@ -1827,6 +1827,10 @@ impl Runtime {
         for p in cs_stdlib_compress::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-deflate")]
+        for p in cs_stdlib_deflate::procs() {
+            self.register_host_procedure(p);
+        }
         #[cfg(feature = "stdlib-archive")]
         for p in cs_stdlib_archive::procs() {
             self.register_host_procedure(p);

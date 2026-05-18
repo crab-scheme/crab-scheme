@@ -69,6 +69,7 @@ fn manifest() -> Vec<(&'static str, Vec<String>)> {
     add!("url", "meta-url", cs_stdlib_url);
     add!("hash", "meta-hash", cs_stdlib_hash);
     add!("compress", "meta-compress", cs_stdlib_compress);
+    add!("deflate", "meta-deflate", cs_stdlib_deflate);
     add!("archive", "meta-archive", cs_stdlib_archive);
     add!("log", "meta-log", cs_stdlib_log);
     add!("metrics", "meta-metrics", cs_stdlib_metrics);

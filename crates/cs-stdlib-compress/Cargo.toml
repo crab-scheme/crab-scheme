@@ -5,10 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-description = "CrabScheme stdlib module (crab compress) — gzip / deflate / zstd."
+description = "CrabScheme stdlib module (crab compress) — zstd. gzip/deflate live in cs-stdlib-deflate."
 
 [dependencies]
 cs-core = { workspace = true }
 cs-ffi = { workspace = true }
-flate2 = "1"
 zstd = "0.13"

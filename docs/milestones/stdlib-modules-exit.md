@@ -124,13 +124,17 @@ output is what the spec gates on.
 ### WASM-subset build (iter 15)
 
 `cs-cli` now defines a `wasm-stdlib` convenience feature pulling
-in the 20 WASM-safe modules:
+in the 21 WASM-safe modules:
 
 ```
 path, fs, string, format, regex, time, random, uuid,
-json, csv, toml, base, url, hash, archive,
+json, csv, toml, base, url, hash, deflate, archive,
 log, metrics, collection, math, meta
 ```
+
+(Iter 17 split flate2 into `cs-stdlib-deflate` so gzip + raw
+deflate ship on WASM; `cs-stdlib-compress` now contains only
+zstd, which still doesn't cross-compile.)
 
 Build:
 
@@ -155,9 +159,9 @@ debug, smaller in release).
 - `tty` — `terminal-size` reads IOCTLs.
 - `compress` — `zstd-sys` triggers `cc-rs` clang invocation with
   flags (`-fzero-call-used-regs`) that nix-wrapped clang rejects
-  for `wasm32-wasip1`. flate2 alone works, but it's bundled into
-  the compress crate alongside zstd; splitting them out is a
-  trivial follow-up (#TBD).
+  for `wasm32-wasip1`. Resolved partially in iter 17 by splitting
+  flate2 into `cs-stdlib-deflate`, which IS in the WASM subset.
+  WASM users get gzip + raw deflate; only zstd is unavailable.
 
 ### Cross-cutting cleanup landed in iter 15
 
@@ -212,27 +216,32 @@ the registered set, even for subset embeds.
 
 ## Follow-up (post-1.0)
 
-Three items deferred during the iter sequence; none block 1.0:
+Two items deferred during the iter sequence; none block 1.0:
 
 - **HTTP server E2E test** — iter 11 ships lifecycle + error
   shape tests but not a full request/response round-trip
   through a curl client. Sketched: a separate process to drive
   the client side (Scheme runtime is single-threaded).
-- **Split flate2 out of `cs-stdlib-compress`** — would let
-  WASM users get gzip without inheriting the zstd-sys
-  cross-compile issue. ~30-min fix.
 - **WASI stub for `(crab signal)`** — currently Unix-only with
   a Windows stub; same shape for WASI.
 
+Resolved post-merge:
+
+- **Split flate2 out of `cs-stdlib-compress`** — iter 17 lands
+  `cs-stdlib-deflate` (flate2 only) and trims `cs-stdlib-compress`
+  to zstd. gzip + raw deflate now ship on WASM.
+
 ## Closing state
 
-- `stdlib-modules-spec` branch head: this commit.
-- 28 new crates + 29 conformance tests + 2 realworld benches +
+- `stdlib-modules-spec` branch head: iter 17 (this commit) on
+  top of the merged iter-16 review-fixes.
+- 29 new crates + 30 conformance tests + 2 realworld benches +
   1 WASM build matrix entry.
-- All 146 conformance tests green on native.
-- WASM build green with `wasm-stdlib` feature; 20 of 27
+- All 147 conformance tests green on native.
+- WASM build green with `wasm-stdlib` feature; 21 of 28
   modules portable.
 - Default cs-cli build unchanged in behaviour — every module
   the umbrella was advertising before iter 15 is still
-  enabled; we just stopped enabling them transitively when an
-  embedder asked for a subset.
+  enabled (with gzip/deflate now coming from `cs-stdlib-deflate`
+  instead of `cs-stdlib-compress`); the user-facing Scheme
+  procedure names are unchanged.
