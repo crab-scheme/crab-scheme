@@ -49,6 +49,19 @@ impl Frame {
         })
     }
 
+    /// Build a MUTABLE root frame pre-populated with `bindings`.
+    /// Used by `(make-namespace ...)` (ADR 0015 L1.2). set! is
+    /// allowed; the frame itself can be mutated. Note: per-eval
+    /// frame; explicit `namespace-set-variable-value!` is the
+    /// primary write path back to the namespace storage.
+    pub fn mutable_root(bindings: HashMap<Symbol, Value>) -> Rc<Self> {
+        Rc::new(Self {
+            bindings: RefCell::new(bindings),
+            parent: None,
+            immutable: false,
+        })
+    }
+
     pub fn get(&self, name: Symbol) -> Option<Value> {
         if let Some(v) = self.bindings.borrow().get(&name) {
             return Some(v.clone());

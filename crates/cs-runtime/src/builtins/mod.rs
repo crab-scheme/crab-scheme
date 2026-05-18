@@ -759,6 +759,16 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("installed-optimizer-passes", b_installed_optimizer_passes),
         // ADR 0015 L1.1 — environment predicate.
         ("environment?", b_environment_p),
+        // ADR 0015 L1.2 — mutable namespace constructor + ops.
+        ("make-namespace", b_make_namespace),
+        (
+            "namespace-set-variable-value!",
+            b_namespace_set_variable_value,
+        ),
+        (
+            "namespace-undefine-variable!",
+            b_namespace_undefine_variable,
+        ),
         ("apply", b_apply),
         // (time-apply) lives as a Scheme-level wrapper in the
         // benchmark harness, not a builtin: the VM dispatches
@@ -10472,6 +10482,142 @@ pub(crate) fn decode_environment(
     Some((map, mutable))
 }
 
+/// `(make-namespace <import-spec> ...)` (ADR 0015 L1.2) — Racket-
+/// style mutable namespace constructor. Same record shape as
+/// `(environment ...)` but the third slot is `#t` (mutable).
+/// Mutations via `namespace-set-variable-value!` /
+/// `namespace-undefine-variable!` are visible to subsequent
+/// evals against the same namespace.
+///
+/// `eval` against a mutable namespace builds a NON-immutable
+/// Frame, so `set!` inside the eval'd expression no longer
+/// raises `&assertion`. Note: writes via `set!` only mutate
+/// the per-eval Frame and are NOT persisted back to the
+/// namespace — explicit `namespace-set-variable-value!` is
+/// the primary write path. (Eval-write-back is a future
+/// iter when a concrete REPL use case asks for it.)
+fn b_make_namespace(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    let mut visible: Vec<String> = Vec::new();
+    for spec in args {
+        let names = resolve_import_spec(spec, ctx.syms)?;
+        for n in names {
+            if !visible.iter().any(|x| x == n) {
+                visible.push((*n).to_string());
+            }
+        }
+    }
+    let mut bindings: Vec<Value> = Vec::with_capacity(visible.len());
+    for name in &visible {
+        let sym = ctx.syms.intern(name);
+        if let Some(v) = ctx.top.get(sym) {
+            bindings.push(Value::Pair(Pair::new(Value::Symbol(sym), v)));
+        }
+    }
+    let alist = Value::list(bindings);
+    let env = new_vector(vec![
+        Value::string(ENV_TAG),
+        alist,
+        Value::Boolean(true), // mutable for `make-namespace`
+    ]);
+    Ok(env)
+}
+
+/// `(namespace-set-variable-value! ns 'name value)` — install or
+/// overwrite a binding in `ns`. Errors if `ns` isn't a mutable
+/// namespace (snapshot environments from `(environment ...)` are
+/// rejected with a clear message).
+fn b_namespace_set_variable_value(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("namespace-set-variable-value!", "3", args.len()));
+    }
+    let sym = match &args[1] {
+        Value::Symbol(s) => *s,
+        v => return Err(type_err("namespace-set-variable-value!", "symbol", v)),
+    };
+    let new_val = args[2].clone();
+    namespace_update(&args[0], sym, Some(new_val), ctx)
+}
+
+/// `(namespace-undefine-variable! ns 'name)` — remove a binding
+/// from `ns`. No-op if the name wasn't bound. Errors if `ns`
+/// isn't a mutable namespace.
+fn b_namespace_undefine_variable(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("namespace-undefine-variable!", "2", args.len()));
+    }
+    let sym = match &args[1] {
+        Value::Symbol(s) => *s,
+        v => return Err(type_err("namespace-undefine-variable!", "symbol", v)),
+    };
+    namespace_update(&args[0], sym, None, ctx)
+}
+
+/// Shared helper for the two `namespace-*!` builtins. `new_val =
+/// Some(v)` means insert-or-overwrite; `None` means remove.
+/// Implementation: decode the alist to a Vec, apply the
+/// mutation, re-encode, swap slot[1]. O(n) per call; n is the
+/// binding count (~100 for (rnrs base)). In-place pair-splicing
+/// would be faster but the aliasing cases are subtle; the
+/// decode/re-encode path is obviously correct.
+fn namespace_update(
+    ns: &Value,
+    sym: cs_core::Symbol,
+    new_val: Option<Value>,
+    _ctx: &mut EvalCtx,
+) -> Result<Value, String> {
+    let Value::Vector(items) = ns else {
+        return Err("namespace mutation: argument is not a namespace".into());
+    };
+    {
+        let items_ro = items.borrow();
+        if items_ro.len() != 3 {
+            return Err("namespace mutation: argument is not a namespace".into());
+        }
+        if !matches!(&items_ro[0], Value::String(s) if s.borrow().as_str() == ENV_TAG) {
+            return Err("namespace mutation: argument is not a namespace".into());
+        }
+        if !matches!(&items_ro[2], Value::Boolean(true)) {
+            return Err(
+                "namespace mutation: argument is an immutable environment (from `environment`); \
+                 use `make-namespace` for a mutable namespace"
+                    .into(),
+            );
+        }
+    }
+    let mut entries: Vec<(cs_core::Symbol, Value)> = Vec::new();
+    let mut cur = items.borrow()[1].clone();
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let head = p.car.borrow().clone();
+                if let Value::Pair(kv) = head {
+                    if let Value::Symbol(s) = kv.car.borrow().clone() {
+                        entries.push((s, kv.cdr.borrow().clone()));
+                    }
+                }
+                cur = p.cdr.borrow().clone();
+            }
+            _ => break,
+        }
+    }
+    let existing = entries.iter().position(|(s, _)| *s == sym);
+    match (existing, new_val) {
+        (Some(idx), Some(v)) => entries[idx].1 = v,
+        (Some(idx), None) => {
+            entries.remove(idx);
+        }
+        (None, Some(v)) => entries.push((sym, v)),
+        (None, None) => {}
+    }
+    let pairs: Vec<Value> = entries
+        .into_iter()
+        .map(|(s, v)| Value::Pair(Pair::new(Value::Symbol(s), v)))
+        .collect();
+    let new_alist = Value::list(pairs);
+    items.borrow_mut()[1] = new_alist;
+    Ok(Value::Unspecified)
+}
+
 fn b_interaction_environment(_args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     // The interaction environment is the live top-level — not
     // restricted. Returning a sentinel here means eval recognizes
@@ -10560,16 +10706,14 @@ fn b_eval(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     // fall back to the live top-level frame (pre-L1.1 behavior).
     let restricted_env: Option<std::rc::Rc<crate::env::Frame>> = if args.len() == 2 {
         if let Some((bindings, mutable)) = decode_environment(&args[1]) {
-            if mutable {
-                // L1.2 `make-namespace` returns a vector with the
-                // same tag but `mutable?` = #t. L1.1 doesn't ship
-                // that constructor; if a future iter does and a
-                // user passes one here, fall through to the
-                // pre-L1.1 path by treating it as no restriction.
-                None
+            // L1.2: mutable namespaces use mutable_root so set!
+            // inside the eval'd expression no longer raises.
+            // Immutable envs from L1.1 still use immutable_root.
+            Some(if mutable {
+                crate::env::Frame::mutable_root(bindings)
             } else {
-                Some(crate::env::Frame::immutable_root(bindings))
-            }
+                crate::env::Frame::immutable_root(bindings)
+            })
         } else {
             None
         }
