@@ -2012,7 +2012,7 @@ pub fn bytecode_to_rir_full(
                                         // (square x) → x * x for Fixnum.
                                         insts.push(RirInst::Mul(dst, args[0], args[0]));
                                     }
-                                    ("cons", 2) => {
+                                    ("cons", 2) | ("cons-in-region", 2) => {
                                         // Heap-allocate a Pair via
                                         // vm_alloc_pair. Tags come from
                                         // value_types so the helper
@@ -2054,9 +2054,23 @@ pub fn bytecode_to_rir_full(
                                             .unwrap_or(Type::Fixnum);
                                         let car_tag = type_to_jit_rt_tag(car_t);
                                         let cdr_tag = type_to_jit_rt_tag(cdr_t);
-                                        insts.push(RirInst::Cons(
-                                            dst, args[0], car_tag, args[1], cdr_tag,
-                                        ));
+                                        // Layer 3 — when the typer's
+                                        // lifetime-lowering pass rewrote
+                                        // a (cons …) site to
+                                        // (cons-in-region …), the
+                                        // bytecode encodes a call by
+                                        // that name. Route it to
+                                        // ConsRegion so the JIT/AOT
+                                        // codegen emits vm_alloc_pair_region_gc.
+                                        if name == "cons-in-region" {
+                                            insts.push(RirInst::ConsRegion(
+                                                dst, args[0], car_tag, args[1], cdr_tag,
+                                            ));
+                                        } else {
+                                            insts.push(RirInst::Cons(
+                                                dst, args[0], car_tag, args[1], cdr_tag,
+                                            ));
+                                        }
                                         value_types.insert(dst, Type::Any);
                                     }
                                     // ADR 0012 D-2 (iter DO) — variadic vector.
