@@ -95,6 +95,20 @@ impl<'s> LoweringCtx<'s> {
         }
     }
 
+    /// Map an allocating primitive name to its `-in-region`
+    /// variant, or `None` for primitives without one.
+    fn region_variant(&self, name: Symbol) -> Option<Symbol> {
+        if name == self.cons_sym {
+            Some(self.cons_in_region_sym)
+        } else if name == self.make_vector_sym {
+            Some(self.make_vector_in_region_sym)
+        } else if name == self.make_string_sym {
+            Some(self.make_string_in_region_sym)
+        } else {
+            None
+        }
+    }
+
     fn lower(&mut self, expr: &CoreExpr, effects: &HashMap<Span, AllocEffect>) -> CoreExpr {
         match expr {
             CoreExpr::Const { .. } | CoreExpr::Ref { .. } => expr.clone(),
@@ -109,37 +123,29 @@ impl<'s> LoweringCtx<'s> {
                 span: *span,
             },
             CoreExpr::App { func, args, span } => {
-                // Rewrite the callee + each arg first.
                 let new_func = self.lower(func, effects);
                 let new_args: Vec<CoreExpr> = args.iter().map(|a| self.lower(a, effects)).collect();
-                // If the callee is a known allocating
-                // primitive AND the typer says this App's
-                // effect escapes Region, swap to the
-                // -in-region variant.
-                if let Some(eff) = effects.get(span) {
-                    if eff.allocates && eff.escapes == EscapeKind::Region {
-                        if let CoreExpr::Ref { name, span: rspan } = &new_func {
-                            let replacement_name = if *name == self.cons_sym {
-                                Some(self.cons_in_region_sym)
-                            } else if *name == self.make_vector_sym {
-                                Some(self.make_vector_in_region_sym)
-                            } else if *name == self.make_string_sym {
-                                Some(self.make_string_in_region_sym)
-                            } else {
-                                None
-                            };
-                            if let Some(rname) = replacement_name {
-                                return CoreExpr::App {
-                                    func: Rc::new(CoreExpr::Ref {
-                                        name: rname,
-                                        span: *rspan,
-                                    }),
-                                    args: new_args,
-                                    span: *span,
-                                };
-                            }
+                // Swap `cons` / `make-vector` / `make-string`
+                // for their -in-region variants when the typer
+                // proved this App escapes only to a region.
+                let region_replacement = effects
+                    .get(span)
+                    .filter(|eff| eff.allocates && eff.escapes == EscapeKind::Region)
+                    .and_then(|_| match &new_func {
+                        CoreExpr::Ref { name, span: rspan } => {
+                            self.region_variant(*name).map(|rname| (rname, *rspan))
                         }
-                    }
+                        _ => None,
+                    });
+                if let Some((rname, rspan)) = region_replacement {
+                    return CoreExpr::App {
+                        func: Rc::new(CoreExpr::Ref {
+                            name: rname,
+                            span: rspan,
+                        }),
+                        args: new_args,
+                        span: *span,
+                    };
                 }
                 CoreExpr::App {
                     func: Rc::new(new_func),

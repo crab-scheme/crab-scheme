@@ -144,11 +144,8 @@ impl Default for Runtime {
 }
 
 /// Embedder-facing configuration for the layer-4 tracing
-/// cycle collector (tracing-revival spec iter 5).
-///
-/// Only meaningful when the `tracing-cycle-collector` feature
-/// is on. With it off, `Runtime::set_tracing_policy` is a
-/// no-op and the policy is ignored.
+/// cycle collector (tracing-revival spec iter 5). Gated on
+/// the `tracing-cycle-collector` feature.
 #[cfg(feature = "tracing-cycle-collector")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TracingPolicy {
@@ -177,17 +174,10 @@ impl Runtime {
     /// `thread_local!` which doesn't compose with a foreign
     /// sweep thread without redesign — see ADR 0018's
     /// deferred-work list).
-    ///
-    /// No-op when `tracing-cycle-collector` is off.
     #[cfg(feature = "tracing-cycle-collector")]
     pub fn set_tracing_policy(&mut self, policy: TracingPolicy) {
         cs_gc::cycle_registry::set_auto_trigger_threshold(policy.auto_trigger_threshold);
     }
-
-    /// Compatibility no-op when `tracing-cycle-collector` is
-    /// off. Lets embedder code stay unconditional.
-    #[cfg(not(feature = "tracing-cycle-collector"))]
-    pub fn set_tracing_policy_noop(&mut self) {}
 
     pub fn new() -> Self {
         // Gap B-3: wire cs-vm's region-resolver function-
@@ -1712,18 +1702,9 @@ impl Runtime {
                 Ok(Value::list(list))
             }),
         );
-        // Set up the GC root set: the walker's top frame chain and the
-        // VM-tier root env. Cloning Rc<Frame> / Rc<Env> into the closure
-        // gives the heap a stable handle to walk on every collect().
-        //
-        // Under countable-memory there is no Heap — the strong-ref
-        // chain from these same Rc<Frame>/Rc<Env> fields keeps the
-        // values alive on its own. The pinned slab below similarly
-        // holds strong Value references, no root closure needed.
-
-        // Pinned-value slab. The root closure traces every value in
-        // the map on every collect, so anything passed to `pin()`
-        // stays reachable until its Pinned guard drops.
+        // Pinned-value slab. Anything passed to `pin()` stays
+        // reachable via this map's strong Value refs until its
+        // Pinned guard drops and removes the entry.
         let pinned: Rc<RefCell<HashMap<PinId, Value>>> = Rc::new(RefCell::new(HashMap::new()));
 
         Self {
@@ -1822,21 +1803,12 @@ impl Runtime {
         self.pinned.borrow().get(&PinId(handle)).cloned()
     }
 
-    /// Run a stop-the-world GC pass. Phase 1 walks the registered root
-    /// set (top frame + VM env) and prunes unreachable allocations from
-    /// `Heap`'s bookkeeping vec. Because Phase 1's `Gc<T>` is still
-    /// Rc-backed, this has no observable behavioural effect on programs
-    /// — it's the seam Phase 2 swaps to a real arena.
-    ///
-    /// Under `feature = "countable-memory"` there is no heap to
-    /// collect — reclamation runs at Rc::drop time — so this is
-    /// a no-op shim preserved for callers that still invoke it.
+    /// No-op shim preserved for callers that still invoke it.
+    /// Under countable-memory there is no heap to collect —
+    /// reclamation happens deterministically at `Rc::drop`.
+    /// Cycles are reclaimed by the synchronous cycle detector
+    /// (layer 2) and the optional layer-4 sweep registry.
     pub fn collect(&self) {}
-
-    /// Read-only access to the GC heap (for tests and tooling).
-    ///
-    /// Unavailable under `feature = "countable-memory"` (there is
-    /// no heap).
 
     pub fn symbols(&self) -> &SymbolTable {
         &self.syms

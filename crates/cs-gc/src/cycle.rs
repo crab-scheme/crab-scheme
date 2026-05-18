@@ -309,12 +309,7 @@ pub fn check_and_break<T>(root: &Gc<T>, break_at: impl FnOnce(&Gc<T>))
 where
     T: CycleVisit + 'static,
 {
-    let mut already_broken = false;
-    check_and_break_walk(root, |r, broken| {
-        already_broken = broken;
-        break_at(r);
-    });
-    let _ = already_broken;
+    check_and_break_walk(root, |r, _broken| break_at(r));
 }
 
 /// Variant of [`check_and_break`] that exposes whether the

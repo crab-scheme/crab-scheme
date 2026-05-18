@@ -60,7 +60,6 @@ use crate::region::{assert_region_live, is_region_live, Region, RegionId, Region
 enum GcRepr<T: ?Sized> {
     Rc(Rc<T>),
     #[cfg(feature = "regions")]
-    #[allow(dead_code)] // wired into Gc::new_in in iter 3 of the region-memory spec
     Region {
         ptr: NonNull<RegionSlot<T>>,
         region_id: RegionId,

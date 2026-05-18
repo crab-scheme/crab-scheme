@@ -294,7 +294,6 @@ impl Region {
     /// The returned pointer is valid for reads and writes
     /// until this region drops. Callers must not retain the
     /// pointer past the region's lifetime.
-    #[allow(dead_code)] // wired into Gc::new_in in iter 2 of the region-memory spec
     pub(crate) fn alloc<T: 'static>(&self, value: T) -> NonNull<RegionSlot<T>> {
         let slot = self.arena.alloc(RegionSlot {
             strong: Cell::new(1),

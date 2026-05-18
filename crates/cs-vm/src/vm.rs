@@ -580,11 +580,6 @@ fn value_to_any_i64(v: Value) -> i64 {
     Box::into_raw(Box::new(v)) as i64
 }
 
-// countable-memory iter 12b deleted JIT_ACTIVE_HEAP + the
-// set/clear/current_jit_active_heap helpers. JIT runtime helpers
-// never consult a heap — every allocation goes through plain
-// `Gc::new` (= `Rc::new`).
-
 // ---- Iter BW — deopt-instead-of-panic sentinel ----------------------
 //
 // When a JIT runtime helper (vm_unbox_*, vm_pair_car_gc, etc.)
@@ -939,14 +934,11 @@ pub fn nb_encode_flonum(f: f64) -> i64 {
     }
 }
 
-/// Allocate a `Gc<Value>` through the active heap if one is
-/// installed on this thread, falling back to unregistered
 /// Phase 6 Stage B2 — thread-local registry of `Rc<dyn Procedure>`
 /// values for the thin-procedure NB encoding. Each Procedure
 /// passed through the NB lane gets a u32 slot index encoded in
-/// the NB_TAG_PROCEDURE payload, replacing the previous
-/// `nb_alloc_gc_value(Value::Procedure(p))` heap allocation per
-/// encoding.
+/// the NB_TAG_PROCEDURE payload, replacing the previous direct
+/// `Gc::new(Value::Procedure(p))` heap allocation per encoding.
 ///
 /// Lifetime semantics mirror the Gc<Value> handle:
 /// - `alloc(p)` registers `p` with refcount 1, returns slot idx.
@@ -1085,19 +1077,6 @@ mod proc_table {
     }
 }
 
-/// `Gc::new` otherwise. Used by the `NB_TAG_GC_VALUE` wrap paths
-/// in `NanboxValue::from_value` (Procedure + non-Fixnum/Flonum
-/// Number variants) to preserve the heap-tracking semantics the
-/// pre-NaN-box `value_to_gc_i64` had.
-
-/// Countable-memory variant: no Heap to consult; always allocate
-/// via plain `Gc::new` (= `Rc::new`). The JIT runtime helpers
-/// produce live `Gc<Value>` handles whose reclamation is driven
-/// by the strong-count chain alone.
-fn nb_alloc_gc_value(v: Value) -> cs_gc::Gc<Value> {
-    cs_gc::Gc::new(v)
-}
-
 /// NaN-boxed value carrier — the migration target for the bytecode
 /// VM dispatch stack (K1 step 3). Layout-identical to `i64`. See
 /// the module-level NanboxValue encoding documentation above.
@@ -1128,9 +1107,9 @@ impl NanboxValue {
             NanboxValue(nb_make(NB_TAG_FIXNUM, (n as u64) & NB_PAYLOAD_MASK) as i64)
         } else {
             // Oversized: wrap in `Gc<Value>` directly via the
-            // active heap. (Calling back through `from_value`
+            // Wrap as Gc<Value>. (Calling back through `from_value`
             // would re-enter `fixnum` → infinite recursion.)
-            let g = nb_alloc_gc_value(Value::Number(cs_core::Number::Fixnum(n)));
+            let g = cs_gc::Gc::new(Value::Number(cs_core::Number::Fixnum(n)));
             let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
             debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
             NanboxValue(nb_make(NB_TAG_GC_VALUE, ptr) as i64)
@@ -1258,11 +1237,10 @@ impl NanboxValue {
                 NanboxValue(nb_make(NB_TAG_PROMISE, tagged) as i64)
             }
             // Number variants outside Fixnum/Flonum (BigInt,
-            // Rational, Complex). Wrap in Gc<Value> via the active
-            // Heap for now — these are rare in performance-
-            // sensitive code.
+            // Rational, Complex). Wrap in Gc<Value> — these are
+            // rare in performance-sensitive code.
             other @ Value::Number(_) => {
-                let g = nb_alloc_gc_value(other);
+                let g = cs_gc::Gc::new(other);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
                 NanboxValue(nb_make(NB_TAG_GC_VALUE, ptr) as i64)
@@ -11308,8 +11286,8 @@ fn run_dispatch(
                         // ManuallyDrop: borrow the wrap allocation,
                         // do NOT decref it. The slot still owns the
                         // strong ref. Kept for non-Procedure values
-                        // wrapped via `nb_alloc_gc_value` (BigInt /
-                        // Rational / etc.).
+                        // wrapped via Gc<Value> (BigInt / Rational /
+                        // etc.).
                         let g = std::mem::ManuallyDrop::new(unsafe {
                             cs_gc::Gc::<Value>::from_raw_jit(payload as *const ())
                         });
@@ -14961,10 +14939,6 @@ fn sort_with_predicate(
     Ok(())
 }
 
-// (countable-memory iter 12b deleted the per-leaf `impl Trace`
-// expansions that lived here. Every VM-tier marker type's
-// `visit_closure_children` is now the empty `Procedure` default.)
-
 // =========================================================================
 // RC3 Phase 2 iter 2.1 — AOT-procedure public API surface
 // =========================================================================
@@ -15114,9 +15088,6 @@ impl cs_core::Procedure for VmAotClosure {
         self.name.as_deref()
     }
 }
-
-// Under countable-memory VmAotClosure inherits the empty default
-// `visit_closure_children` via its Procedure impl.
 
 /// RC3 iter 2.1 — allocate an AOT procedure and return its NB carrier.
 ///
