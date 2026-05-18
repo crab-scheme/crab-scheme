@@ -384,6 +384,54 @@ impl Resolver {
     pub fn vendor_root(&self) -> &Path {
         &self.vendor_root
     }
+
+    /// Bridge from a Scheme import-spec datum to a filesystem path.
+    /// Recognises `(pkg <name> <module-segment> ...)` shape and
+    /// delegates to [`resolve`]. Returns `None` for any other shape
+    /// so callers can fall through to their own library-loading
+    /// logic.
+    ///
+    /// This is the integration seam between cs-pkg and the
+    /// expander's `IncludeResolver`. The expander itself stays
+    /// agnostic of cs-pkg; callers (cs-cli, REPL) install an
+    /// `IncludeResolver` that invokes this method on a synthesized
+    /// pkg-prefixed path string, or — once cs-expand grows real
+    /// library-loading — calls this directly on the import-spec
+    /// datum.
+    pub fn resolve_import_spec(
+        &self,
+        spec: &Datum,
+        syms: &SymbolTable,
+    ) -> Result<Option<PathBuf>, PkgError> {
+        let items = match expect_list(spec) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if items.is_empty() {
+            return Ok(None);
+        }
+        let head = symbol_name(items[0].as_ref(), syms);
+        if head.as_deref() != Some("pkg") {
+            return Ok(None);
+        }
+        if items.len() < 3 {
+            return Err(PkgError::BadShape(
+                "(pkg <name> <module-segment> ...) needs a name and at least one segment".into(),
+            ));
+        }
+        let name = symbol_name(items[1].as_ref(), syms)
+            .ok_or_else(|| PkgError::BadShape("(pkg …) package name must be a symbol".into()))?;
+        let segs: Vec<String> = items[2..]
+            .iter()
+            .map(|d| {
+                symbol_name(d.as_ref(), syms).ok_or_else(|| {
+                    PkgError::BadShape("(pkg …) module segments must be symbols".into())
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let segs_ref: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
+        self.resolve(&name, &segs_ref).map(Some)
+    }
 }
 
 // ============================================================
@@ -626,5 +674,48 @@ mod tests {
         r.set_version("explicit", Version::parse("3.0.0").unwrap());
         let p = r.resolve("explicit", &["lib"]).unwrap();
         assert_eq!(p, PathBuf::from("/tmp/vendor/explicit-3.0.0/lib.scm"));
+    }
+
+    // ---- Import-spec bridge ----
+
+    fn read_one(src: &str) -> (Datum, SymbolTable) {
+        let mut syms = SymbolTable::new();
+        let mut sm = SourceMap::new();
+        let id = sm.add("t", src);
+        let data = read_all(id, src, &mut syms).unwrap();
+        (data.into_iter().next().unwrap(), syms)
+    }
+
+    #[test]
+    fn resolve_import_spec_pkg_form() {
+        let mut r = Resolver::new("/tmp/v");
+        r.set_version("http", Version::parse("1.0.0").unwrap());
+        let (spec, syms) = read_one("(pkg http server)");
+        let p = r.resolve_import_spec(&spec, &syms).unwrap().unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/v/http-1.0.0/server.scm"));
+    }
+
+    #[test]
+    fn resolve_import_spec_pkg_form_multi_segment() {
+        let mut r = Resolver::new("/tmp/v");
+        r.set_version("http", Version::parse("1.0.0").unwrap());
+        let (spec, syms) = read_one("(pkg http server router)");
+        let p = r.resolve_import_spec(&spec, &syms).unwrap().unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/v/http-1.0.0/server/router.scm"));
+    }
+
+    #[test]
+    fn resolve_import_spec_non_pkg_returns_none() {
+        let r = Resolver::new("/tmp/v");
+        let (spec, syms) = read_one("(rnrs base)");
+        assert_eq!(r.resolve_import_spec(&spec, &syms).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_import_spec_pkg_form_errors_on_unknown_package() {
+        let r = Resolver::new("/tmp/v");
+        let (spec, syms) = read_one("(pkg unknown lib)");
+        let err = r.resolve_import_spec(&spec, &syms).unwrap_err();
+        assert!(matches!(err, PkgError::UnknownPackage(_)));
     }
 }
