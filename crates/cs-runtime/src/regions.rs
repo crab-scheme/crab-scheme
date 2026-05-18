@@ -80,6 +80,27 @@ pub fn region_stack_depth() -> usize {
     REGION_STACK.with(|s| s.borrow().len())
 }
 
+/// Gap B-3 cs-aot region resolver. Returns a raw pointer to
+/// the innermost in-scope `Region`, or null if none. Used by
+/// cs-vm's `vm_alloc_pair_region_gc` (and future AOT-emitted
+/// code) via the `register_region_resolver` function-pointer
+/// hook — avoids a cs-vm ↔ cs-runtime dep cycle.
+///
+/// # Safety
+///
+/// The returned pointer is valid only while the
+/// corresponding `RegionScope` is alive on this thread. The
+/// caller must use it before any `RegionScope::Drop` runs.
+/// In practice, JIT/AOT emitted code calls this immediately
+/// before `Pair::new_in` and discards the ptr — within a
+/// single function call, region drop can't happen.
+pub extern "C" fn region_resolver_for_cs_vm() -> *const () {
+    REGION_STACK.with(|s| match s.borrow().last() {
+        Some(rc) => std::rc::Rc::as_ptr(rc) as *const (),
+        None => std::ptr::null(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

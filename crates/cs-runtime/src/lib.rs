@@ -205,6 +205,16 @@ impl Runtime {
     pub fn set_tracing_policy_noop(&mut self) {}
 
     pub fn new() -> Self {
+        // Gap B-3: wire cs-vm's region-resolver function-
+        // pointer hook to cs-runtime's per-thread REGION_STACK
+        // accessor. This lets `vm_alloc_pair_region_gc` (the
+        // JIT/AOT entry point for region-allocated cons)
+        // reach our region stack without a cs-vm → cs-runtime
+        // dep cycle. Idempotent — overwrites the previous
+        // resolver, which is fine since both calls return the
+        // same function pointer.
+        #[cfg(feature = "regions")]
+        cs_vm::vm::register_region_resolver(regions::region_resolver_for_cs_vm);
         let mut syms = SymbolTable::new();
         let top = Frame::root();
         builtins::install_into(&top, &mut syms);

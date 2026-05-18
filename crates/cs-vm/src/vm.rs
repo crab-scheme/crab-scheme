@@ -1658,6 +1658,77 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
     NanboxValue(nb_make(NB_TAG_PAIR, raw_ptr) as i64).into_raw()
 }
 
+/// Gap B-3 cs-aot codegen: region-resolver init API.
+///
+/// cs-runtime registers a per-thread region-stack accessor
+/// here at Runtime startup. cs-vm's `vm_alloc_pair_region_gc`
+/// consults it to find the current region. Using a function-
+/// pointer hook (rather than `extern "C"` linkage) avoids a
+/// dep cycle: cs-vm doesn't depend on cs-runtime, but the
+/// pointer gets wired up at runtime.
+#[cfg(all(feature = "regions", feature = "countable-memory"))]
+static REGION_RESOLVER: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Register a region-resolver function pointer. cs-runtime
+/// calls this once per process from `Runtime::new`. The
+/// resolver returns a raw pointer to the innermost
+/// `cs_gc::Region` on the current thread's region stack, or
+/// null if none is in scope.
+#[cfg(all(feature = "regions", feature = "countable-memory"))]
+pub fn register_region_resolver(resolver: extern "C" fn() -> *const ()) {
+    REGION_RESOLVER.store(resolver as *mut (), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Gap B-3 cs-aot codegen: region-allocating counterpart to
+/// [`vm_alloc_pair_gc`]. Uses `Pair::new_in(&current_region,
+/// car_v, cdr_v)` where the region comes from the resolver
+/// registered via [`register_region_resolver`].
+///
+/// If no region is in scope (caller forgot `with-region`, or
+/// no resolver registered), falls back to `Pair::new` (Rc
+/// heap) with a debug-build warning. Better than panicking
+/// inside JIT-emitted code where unwinding is fragile.
+///
+/// Wired into cs-aot's emission for `Inst` variants marked
+/// with `Lifetime::Region` (future cs-rir extension).
+/// Today's `Inst::Cons` doesn't carry lifetime; emission
+/// stays on the Rc path until a lifetime-aware translator
+/// lands.
+#[no_mangle]
+#[cfg(all(feature = "regions", feature = "countable-memory"))]
+pub unsafe extern "C" fn vm_alloc_pair_region_gc(
+    car: i64,
+    car_tag: u8,
+    cdr: i64,
+    cdr_tag: u8,
+) -> i64 {
+    let car_v = unsafe { i64_to_value(car, car_tag) };
+    let cdr_v = unsafe { i64_to_value(cdr, cdr_tag) };
+    let resolver_raw = REGION_RESOLVER.load(std::sync::atomic::Ordering::Relaxed);
+    let region_ptr: *const () = if resolver_raw.is_null() {
+        std::ptr::null()
+    } else {
+        let resolver: extern "C" fn() -> *const () = unsafe { std::mem::transmute(resolver_raw) };
+        resolver()
+    };
+    let g: cs_gc::Gc<cs_core::Pair> = if region_ptr.is_null() {
+        #[cfg(debug_assertions)]
+        eprintln!("vm_alloc_pair_region_gc: no region in scope — falling back to Rc allocation");
+        cs_core::Pair::new(car_v, cdr_v)
+    } else {
+        // SAFETY: the resolver returns a ptr to a Region
+        // kept alive by cs-runtime's REGION_STACK. The ptr
+        // is valid for the duration of this call (the region
+        // can't drop while we're inside this fn).
+        let region: &cs_gc::Region = unsafe { &*(region_ptr as *const cs_gc::Region) };
+        cs_core::Pair::new_in(region, car_v, cdr_v)
+    };
+    let raw_ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+    debug_assert!(raw_ptr & !NB_PAYLOAD_MASK == 0);
+    NanboxValue(nb_make(NB_TAG_PAIR, raw_ptr) as i64).into_raw()
+}
+
 /// Gc-backed counterpart to `vm_pair_car`. Consumes the input Gc
 /// handle (one strong count) and returns a fresh Gc handle to the
 /// pair's car (cloned Value).
@@ -15783,6 +15854,32 @@ mod gc_helper_tests {
                 ) => {}
                 other => panic!("pair contents mismatch: {:?}", other),
             },
+            other => panic!("expected Pair, got {:?}", other),
+        }
+    }
+
+    /// Gap B-3: `vm_alloc_pair_region_gc` falls back to Rc
+    /// when no region is in scope. (Region-scope variant is
+    /// tested by `cs-runtime` integration tests since this
+    /// fn depends on cs-runtime's REGION_STACK.)
+    #[cfg(all(feature = "regions", feature = "countable-memory"))]
+    #[test]
+    fn vm_alloc_pair_region_gc_fallback_when_no_region() {
+        let car = 13i64;
+        let cdr = 17i64;
+        // No RegionScope entered → cs_runtime_current_region_ptr
+        // returns null → fallback to Rc allocation. The
+        // resulting Pair is still a valid Pair handle.
+        let i = unsafe { vm_alloc_pair_region_gc(car, JIT_RT_FIXNUM, cdr, JIT_RT_FIXNUM) };
+        assert_ne!(i, 0);
+        let v = unsafe { gc_i64_to_value(i) };
+        match v {
+            Value::Pair(p) => {
+                // Not region-backed (we fell back to Rc).
+                #[cfg(feature = "regions")]
+                assert!(!cs_gc::Gc::is_region(&p));
+                let _ = p;
+            }
             other => panic!("expected Pair, got {:?}", other),
         }
     }
