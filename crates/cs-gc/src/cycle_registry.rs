@@ -38,9 +38,90 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::cycle::{BreakCycle, CycleVisit};
 use crate::{Gc, Weak};
+
+// ---- parallel-runtime spec C4.1: Bacon-Rajan colors ----
+
+/// Bacon-Rajan trial-deletion color.
+///
+/// In the canonical algorithm every "Slot" (heap cell) carries
+/// a color. CrabScheme's `Gc<T>` wraps `std::rc::Rc<T>` whose
+/// allocation layout we don't control, so the color lives in a
+/// **side table** alongside the existing cycle-candidate
+/// registry. The semantics are equivalent:
+///
+/// - Any address **not** in the registry is implicitly
+///   [`Color::Black`] (in-use, not a cycle candidate).
+/// - Registering an address as a cycle candidate sets it to
+///   [`Color::Purple`] (the BR convention for "decremented but
+///   still alive — needs trial deletion").
+/// - The C4.3 sweep phases transition Purple → Gray → White
+///   (or back to Black via `scan_black`).
+///
+/// This side-table approach keeps the allocation hot path
+/// **unchanged**: only cycle candidates pay the cost of a
+/// color slot, which is just one byte per registered entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Color {
+    /// In-use; not a cycle candidate. Default for everything.
+    Black = 0,
+    /// Being tested for garbage (mark_gray walked through).
+    Gray = 1,
+    /// Candidate for collection (scan_gray confirmed garbage).
+    White = 2,
+    /// Buffered as cycle root — decremented but still alive,
+    /// awaiting the next sweep's mark_gray phase.
+    Purple = 3,
+}
+
+impl Color {
+    /// Decode a `u8` (e.g., read from `AtomicU8`) back to a
+    /// `Color`. Any unknown value collapses to `Black` — the
+    /// safe default. Used by the C4.3 sweep phases when
+    /// loading colors from the registry's `AtomicU8` slots.
+    #[inline]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Color::Gray,
+            2 => Color::White,
+            3 => Color::Purple,
+            _ => Color::Black,
+        }
+    }
+}
+
+/// Per-candidate registry entry: the existing `AnyWeak` handle
+/// plus a Bacon-Rajan color (C4.1).
+///
+/// `color` is an `AtomicU8` so the C4.3 phases can mutate it
+/// during the walk without needing `&mut` access to the
+/// whole entry — the registry is wrapped in a `RefCell` so a
+/// `&Entry` from a borrowed map is the natural shape.
+struct Entry {
+    weak: Box<dyn AnyWeak>,
+    color: AtomicU8,
+}
+
+impl Entry {
+    fn new(weak: Box<dyn AnyWeak>, initial: Color) -> Self {
+        Entry {
+            weak,
+            color: AtomicU8::new(initial as u8),
+        }
+    }
+
+    fn color(&self) -> Color {
+        Color::from_u8(self.color.load(Ordering::Relaxed))
+    }
+
+    fn set_color(&self, c: Color) {
+        self.color.store(c as u8, Ordering::Relaxed);
+    }
+}
 
 /// Erased Weak handle so the registry can hold mixed `T`
 /// types in one map. Only the upgradability check and the
@@ -98,7 +179,11 @@ thread_local! {
     /// allocation address. Multi-thread Scheme isn't in
     /// scope; if it ever lands the registry stays per-thread
     /// and each runtime instance gets its own.
-    static REGISTRY: RefCell<HashMap<usize, Box<dyn AnyWeak>>> = RefCell::new(HashMap::new());
+    ///
+    /// C4.1: values are `Entry` (Weak + Bacon-Rajan color),
+    /// not a bare `Box<dyn AnyWeak>` — the color participates
+    /// in the C4.3 trial-deletion walk.
+    static REGISTRY: RefCell<HashMap<usize, Entry>> = RefCell::new(HashMap::new());
 
     /// Auto-sweep threshold. Default 10_000 means the next
     /// `Gc::new` after registry crosses this size triggers a
@@ -129,9 +214,44 @@ thread_local! {
 pub fn register_cycle_candidate<T: 'static + CycleVisit + BreakCycle>(addr: usize, weak: Weak<T>) {
     REGISTRY.with(|r| {
         let mut r = r.borrow_mut();
-        r.entry(addr).or_insert_with(|| Box::new(weak));
+        // C4.1: newly-registered candidates start at PURPLE —
+        // "decremented but still alive, awaiting trial deletion."
+        r.entry(addr)
+            .or_insert_with(|| Entry::new(Box::new(weak), Color::Purple));
         if r.len() >= AUTO_TRIGGER_THRESHOLD.with(|t| t.get()) {
             SWEEP_PENDING.with(|f| f.set(true));
+        }
+    });
+}
+
+// ---- parallel-runtime spec C4.1: public color accessors ----
+
+/// Read the Bacon-Rajan color of a registered candidate.
+/// Returns [`Color::Black`] for any address not in the
+/// registry — that's the implicit default state.
+///
+/// Used by the C4.3 sweep phases (`mark_gray`, `scan_gray`,
+/// `collect_white`) to drive the trial-deletion walk.
+pub fn candidate_color(addr: usize) -> Color {
+    REGISTRY.with(|r| {
+        r.borrow()
+            .get(&addr)
+            .map(|e| e.color())
+            .unwrap_or(Color::Black)
+    })
+}
+
+/// Set the Bacon-Rajan color of a registered candidate.
+/// Silently no-ops if `addr` is not in the registry — the
+/// caller is presumed to have a live `Weak` for it via the
+/// sweep walk, and non-registered addresses don't have a
+/// color slot to mutate.
+///
+/// Used by the C4.3 sweep phases to transition colors.
+pub fn set_candidate_color(addr: usize, c: Color) {
+    REGISTRY.with(|r| {
+        if let Some(e) = r.borrow().get(&addr) {
+            e.set_color(c);
         }
     });
 }
@@ -219,7 +339,7 @@ pub fn run_sweep() {
     REGISTRY.with(|r| {
         let mut r = r.borrow_mut();
         // Phase 1: drop dead entries.
-        r.retain(|_, weak| weak.upgrade_addr().is_some());
+        r.retain(|_, entry| entry.weak.upgrade_addr().is_some());
         // Phase 2 (Gap C-3): attempt per-candidate break.
         // Iterate addresses separately so we can mutate the
         // map (drop succeeded entries) after each break. We
@@ -228,7 +348,7 @@ pub fn run_sweep() {
         for addr in addrs {
             let broke = r
                 .get(&addr)
-                .map(|w| w.upgrade_and_try_break())
+                .map(|e| e.weak.upgrade_and_try_break())
                 .unwrap_or(false);
             if broke {
                 SWEEP_BROKEN_COUNT.with(|c| c.set(c.get().saturating_add(1)));
@@ -369,5 +489,78 @@ mod tests {
         let _ = take_sweep_pending();
         // Test passes either way; this just documents the
         // contract.
+    }
+
+    // ---- parallel-runtime C4.1 — Bacon-Rajan color tests ----
+
+    #[test]
+    fn unregistered_addr_reads_black() {
+        reset_for_tests();
+        // Any address not in the registry is implicitly BLACK.
+        assert_eq!(candidate_color(0xdeadbeef), Color::Black);
+        assert_eq!(candidate_color(0), Color::Black);
+    }
+
+    #[test]
+    fn register_starts_purple() {
+        reset_for_tests();
+        let g = Gc::new(Leaf { n: 1 });
+        let addr = Gc::as_addr(&g);
+        register_cycle_candidate(addr, Gc::downgrade(&g));
+        assert_eq!(
+            candidate_color(addr),
+            Color::Purple,
+            "newly-registered candidates start at Purple per BR"
+        );
+    }
+
+    #[test]
+    fn set_color_round_trips() {
+        reset_for_tests();
+        let g = Gc::new(Leaf { n: 7 });
+        let addr = Gc::as_addr(&g);
+        register_cycle_candidate(addr, Gc::downgrade(&g));
+        for c in [Color::Black, Color::Gray, Color::White, Color::Purple] {
+            set_candidate_color(addr, c);
+            assert_eq!(candidate_color(addr), c);
+        }
+    }
+
+    #[test]
+    fn set_color_on_unregistered_is_no_op() {
+        reset_for_tests();
+        // Should not panic; just silently does nothing.
+        set_candidate_color(0xfeedface, Color::Gray);
+        assert_eq!(candidate_color(0xfeedface), Color::Black);
+    }
+
+    #[test]
+    fn color_from_u8_unknown_falls_to_black() {
+        assert_eq!(Color::from_u8(0), Color::Black);
+        assert_eq!(Color::from_u8(1), Color::Gray);
+        assert_eq!(Color::from_u8(2), Color::White);
+        assert_eq!(Color::from_u8(3), Color::Purple);
+        // Unknown / future values clamp to Black — safe default.
+        assert_eq!(Color::from_u8(4), Color::Black);
+        assert_eq!(Color::from_u8(255), Color::Black);
+    }
+
+    #[test]
+    fn register_idempotent_preserves_color() {
+        // Re-registering an address must not reset its color
+        // back to Purple — the sweep may have transitioned it
+        // to Gray/White mid-walk, and clobbering would corrupt
+        // the trial-deletion algorithm.
+        reset_for_tests();
+        let g = Gc::new(Leaf { n: 11 });
+        let addr = Gc::as_addr(&g);
+        register_cycle_candidate(addr, Gc::downgrade(&g));
+        set_candidate_color(addr, Color::Gray);
+        register_cycle_candidate(addr, Gc::downgrade(&g));
+        assert_eq!(
+            candidate_color(addr),
+            Color::Gray,
+            "re-register on existing addr must preserve color"
+        );
     }
 }
