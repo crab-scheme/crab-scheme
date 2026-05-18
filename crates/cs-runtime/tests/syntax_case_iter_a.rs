@@ -122,34 +122,34 @@ fn id_eq_predicates_reject_non_identifiers() {
 }
 
 #[test]
-#[ignore = "blocked on SyntaxObject Value variant (post-1.0 track)"]
 fn bound_id_eq_distinguishes_marked_identifiers() {
-    // Two identifiers with the same readable name but introduced
-    // via different macro call sites should compare unequal under
-    // R6RS bound-identifier=?. Today they collapse to symbol-eq
-    // because Value::Symbol doesn't carry per-call marks.
+    // Two identifiers with the same readable name introduced by
+    // different macro-form evaluations carry different marks
+    // (Phase 1.5 Iter C stamps per-form-invocation marks). They
+    // compare unequal under R6RS bound-identifier=? (Iter 1.5.D
+    // wires the mark-aware comparison).
     //
-    // The fix requires adding a `Value::Identifier { name, mark }`
-    // variant that the syntax-case template instantiator stamps
-    // with a fresh per-expansion mark; bound-identifier=? then
-    // compares both fields. The migration touches ~45 files that
-    // currently `match` on `Value::Symbol(_)` -- tracked as a
-    // post-1.0 task in the plan doc's Iter E status section.
+    // Note: this test was originally written using syntax-rules
+    // with `(quote id)` templates, which doesn't exercise the
+    // identifier hygiene path -- `quote` returns datum-stripped
+    // symbols, not marked identifiers. The rewritten version
+    // uses syntax-case `(syntax ...)` templates, where
+    // template-introduced non-pvar identifiers DO get the
+    // per-expansion mark.
     let mut rt = Runtime::new();
-    rt.eval_str(
-        "<t>",
-        r#"
-        (define-syntax mark-a
-          (syntax-rules () ((_ id) (quote id))))
-        (define-syntax mark-b
-          (syntax-rules () ((_ id) (quote id))))
-        "#,
-    )
-    .unwrap();
     let v = rt
-        .eval_str("<t>", "(bound-identifier=? (mark-a x) (mark-b x))")
+        .eval_str(
+            "<t>",
+            "(let ((a (syntax-case 'whatever () (_ (syntax intro))))
+                   (b (syntax-case 'whatever () (_ (syntax intro)))))
+               (bound-identifier=? a b))",
+        )
         .unwrap();
-    assert_eq!(disp(&rt, &v), "#f", "marks should distinguish");
+    assert_eq!(
+        disp(&rt, &v),
+        "#f",
+        "different mark sites -> not bound-id-eq"
+    );
 }
 
 // ---- generate-temporaries ----

@@ -2467,47 +2467,64 @@ fn b_datum_to_syntax(args: &[Value]) -> Result<Value, String> {
 /// `(bound-identifier=? a b)` — R6RS §12.6. True iff `a` and `b`
 /// would refer to the same binding if substituted into a template.
 ///
-/// Today's semantics: name-equality on the underlying interned
-/// `Symbol`. Symbols whose printable name differs (e.g., the
-/// `\u{E000}`-prefixed template-marker carried by syntax-rules
-/// expansion) compare unequal even if their "user-readable" name
-/// matches -- so the existing partial-hygiene mechanism in
-/// cs-expand's syntax-rules engine flows through correctly for
-/// the within-one-expansion case.
+/// Compares `(name, mark)` pairs. A bare `Value::Symbol(s)` is
+/// treated as an identifier with mark = 0 (reader-input
+/// identifier). So:
+///   - two Symbols equal iff same name
+///   - two Identifiers equal iff same name AND same mark
+///   - Symbol vs Identifier equal iff same name AND mark = 0
 ///
-/// What this DOESN'T capture: per-macro-call marks. Two
-/// `(mark-a x)` and `(mark-b x)` invocations both yield the
-/// user-visible symbol `x` with no per-call discriminator; full
-/// R6RS hygiene would distinguish them. That requires a
-/// `Value::Identifier { name, mark }` variant (the SyntaxObject
-/// migration tracked as a post-1.0 task) and isn't shipped here.
+/// This is the foundation of macro hygiene: two `(syntax foo)`
+/// from different macro expansions produce Identifier values
+/// with different marks (see Phase 1.5 Iter C), so they're
+/// distinguishable here.
 fn b_bound_identifier_eq(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("bound-identifier=?", "2", args.len()));
     }
-    match (&args[0], &args[1]) {
-        (Value::Symbol(a), Value::Symbol(b)) => Ok(Value::Boolean(a == b)),
-        _ => Err(type_err("bound-identifier=?", "identifier", &args[0])),
-    }
+    let (n1, m1) = match &args[0] {
+        Value::Symbol(s) => (*s, 0u64),
+        Value::Identifier { name, mark } => (*name, *mark),
+        v => return Err(type_err("bound-identifier=?", "identifier", v)),
+    };
+    let (n2, m2) = match &args[1] {
+        Value::Symbol(s) => (*s, 0u64),
+        Value::Identifier { name, mark } => (*name, *mark),
+        v => return Err(type_err("bound-identifier=?", "identifier", v)),
+    };
+    Ok(Value::Boolean(n1 == n2 && m1 == m2))
 }
 
 /// `(free-identifier=? a b)` — R6RS §12.6. True iff `a` and `b`
 /// resolve to the same binding in their respective scopes.
 ///
-/// Today's semantics: name-equality on the underlying `Symbol`.
-/// True R6RS semantics would walk each identifier's lexical
-/// environment, follow rename chains from the SyntaxObject
-/// marks, and compare the resolved binding identity. Without
-/// `Value::Identifier`, free-identifier=? reduces to
-/// bound-identifier=? -- both check name equality.
+/// Today's semantics: name-equality on the underlying `Symbol`
+/// or `Identifier` name (mark ignored). Two `(syntax foo)` from
+/// different macro expansions both refer to "the foo binding in
+/// scope", so they're free-identifier=? even though their marks
+/// differ. This is the intuition that bound-identifier=?
+/// distinguishes by *introduction site* whereas free-identifier=?
+/// distinguishes by *resolved binding*.
+///
+/// True R6RS semantics with full lexical-env resolution requires
+/// the Phase 2 SyntaxObject + binding-table track. The name-only
+/// approximation handles the most common case (identifiers
+/// referring to top-level / library bindings) correctly.
 fn b_free_identifier_eq(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("free-identifier=?", "2", args.len()));
     }
-    match (&args[0], &args[1]) {
-        (Value::Symbol(a), Value::Symbol(b)) => Ok(Value::Boolean(a == b)),
-        _ => Err(type_err("free-identifier=?", "identifier", &args[0])),
-    }
+    let n1 = match &args[0] {
+        Value::Symbol(s) => *s,
+        Value::Identifier { name, .. } => *name,
+        v => return Err(type_err("free-identifier=?", "identifier", v)),
+    };
+    let n2 = match &args[1] {
+        Value::Symbol(s) => *s,
+        Value::Identifier { name, .. } => *name,
+        v => return Err(type_err("free-identifier=?", "identifier", v)),
+    };
+    Ok(Value::Boolean(n1 == n2))
 }
 
 /// `(make-identifier name mark)` — Phase 1.5 Iter C primitive.
