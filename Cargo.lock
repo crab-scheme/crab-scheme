@@ -509,6 +509,9 @@ dependencies = [
 [[package]]
 name = "cs-gc"
 version = "0.0.1"
+dependencies = [
+ "bumpalo",
+]
 
 [[package]]
 name = "cs-hotreload"

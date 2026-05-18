@@ -13,6 +13,9 @@
 #![deny(unsafe_code)]
 
 pub mod inline;
+pub mod lifetime;
+
+pub use lifetime::{Lifetime, RegionTag};
 
 /// SSA value identifier within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1244,6 +1247,24 @@ pub enum Inst {
     /// per-Value type tables. dst is tagged as `Type::Any` (the i64
     /// carries `Box::into_raw(Box<Value::Pair(_)>)`).
     Cons(Value, Value, u8, Value, u8),
+
+    /// `dst = cons-in-region(car, cdr)` — Lifetime::Region
+    /// variant of [`Cons`]. Lowers to `vm_alloc_pair_region_gc`
+    /// instead of `vm_alloc_pair_gc`. The runtime helper
+    /// consults the per-thread region-resolver (registered
+    /// by `Runtime::new`) and allocates into the current
+    /// `cs_gc::Region` if one is in scope, falling back to
+    /// Rc allocation otherwise. The nanbox encoding tags
+    /// the low bit of the pointer payload so the VM decoder
+    /// can route region pointers through
+    /// `Gc::from_raw_jit_region` (see the cs-vm nanbox
+    /// region-tag work).
+    ///
+    /// Emitted by the cs-typer lifetime-lowering pass (Gap
+    /// B-2 full) when the bytecode translator sees a call
+    /// to the `cons-in-region` builtin AND the surrounding
+    /// scope has entered a `with-region` block.
+    ConsRegion(Value, Value, u8, Value, u8),
 
     /// `dst = car(pair)` — extract the first slot of an Any-tagged
     /// pair via the `vm_pair_car` runtime helper. Operand is

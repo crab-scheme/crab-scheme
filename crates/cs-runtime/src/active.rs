@@ -44,22 +44,19 @@ impl Runtime {
     /// scope exit.
     pub fn with_active<R>(&mut self, f: impl FnOnce(&mut Runtime) -> R) -> R {
         let prev = ACTIVE_RUNTIME.with(|c| c.replace(self as *mut Runtime));
-        // SAFETY: `self.heap` is owned by this Runtime and `self`
-        // outlives the closure call below.
-        let prev_heap = cs_vm::vm::current_jit_active_heap();
-        unsafe { cs_vm::vm::set_jit_active_heap(&self.heap as *const cs_gc::Heap) };
-        // B1 (BEAM runtime spec): install this Runtime's Heap as the
-        // thread's active gc-stats target. cs_gc::Gc::new now bumps
-        // the active Heap's counters instead of a process-global
-        // static; without this hookup every `(gc-stats)` reading
-        // would report zero. The guard pops the previous active
-        // Heap (typically None) on scope exit.
-        let _gc_stats_guard = self.heap.activate();
+        // Under default (tracing) the JIT helpers consult
+        // JIT_ACTIVE_HEAP to register allocations with the
+        // Runtime's tracing GC, and the BEAM B1 hook installs
+        // this Runtime's Heap as the thread's gc-stats target.
+        // Under countable-memory there is no Heap — allocations
+        // live by refcount alone, telemetry comes from the
+        // global cs_gc::alloc_telemetry atomics (Gap A-1) — so
+        // both setups are no-ops.
+        // B1 (BEAM runtime spec): install this Runtime's Heap as
+        // the thread's active gc-stats target. Only meaningful
+        // under tracing — countable-memory's telemetry path is
+        // independent of Heap.
         let result = f(self);
-        drop(_gc_stats_guard);
-        // Restore previous heap pointer (typically null) so nested
-        // with_active calls work correctly.
-        unsafe { cs_vm::vm::set_jit_active_heap(prev_heap) };
         ACTIVE_RUNTIME.with(|c| c.set(prev));
         result
     }

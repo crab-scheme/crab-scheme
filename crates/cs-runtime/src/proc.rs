@@ -4,6 +4,7 @@ use std::any::Any;
 use std::rc::Rc;
 
 use cs_core::{Procedure, Symbol, SymbolTable, Value};
+use cs_gc::cycle::CycleVisit as _;
 use cs_ir::{CoreExpr, Params};
 
 use crate::env::Frame;
@@ -39,12 +40,9 @@ impl Procedure for Builtin {
     fn name(&self) -> Option<&str> {
         Some(self.name)
     }
-}
-
-impl cs_core::Trace for Builtin {
-    fn trace(&self, _marker: &mut cs_core::Marker) {
-        // Leaf — Builtin holds only a fn pointer and a static name.
-    }
+    // Builtin is a leaf — inherits the empty default
+    // visit_closure_children from the Procedure trait under
+    // countable-memory.
 }
 
 #[derive(Debug)]
@@ -63,14 +61,16 @@ impl Procedure for Closure {
     fn name(&self) -> Option<&str> {
         self.display_name.as_deref()
     }
-}
-
-impl cs_core::Trace for Closure {
-    fn trace(&self, marker: &mut cs_core::Marker) {
-        // Trace the captured environment chain. The body is a shared
-        // immutable IR pointer (`Rc<CoreExpr>`) carrying only Symbols
-        // and span info — no Values to trace.
-        self.env.trace(marker);
+    fn visit_closure_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Dedup on the closure's own Rc identity AND descend
+        // into the env (which itself dedup-checks Frame). Body
+        // is shared immutable IR (Rc<CoreExpr>) with no Scheme
+        // values.
+        let addr = self as *const Self as usize;
+        if !ctx.visit_addr(addr) {
+            return;
+        }
+        self.env.visit_children(ctx);
     }
 }
 
@@ -94,12 +94,7 @@ impl Procedure for Continuation {
     fn name(&self) -> Option<&str> {
         Some("continuation")
     }
-}
-
-impl cs_core::Trace for Continuation {
-    fn trace(&self, _marker: &mut cs_core::Marker) {
-        // Leaf — escape continuations carry only a u64 id.
-    }
+    // Leaf — empty default visit_closure_children suffices.
 }
 
 pub fn make_continuation(id: u64) -> Value {
@@ -141,16 +136,8 @@ impl Procedure for HostBuiltin {
     fn name(&self) -> Option<&str> {
         Some(self.name)
     }
-}
-
-impl cs_core::Trace for HostBuiltin {
-    fn trace(&self, _marker: &mut cs_core::Marker) {
-        // The boxed closure may capture Values, but in the FFI use
-        // case the closure holds only an `Arc<dyn HostProcedure>`
-        // (Send+Sync, no Scheme-Value capture). User code that
-        // captures Values across the boundary is required to use
-        // Pinned<'rt> per ADR 0008-D-3.
-    }
+    // Empty default visit_closure_children — see Trace doc below
+    // for why the FFI surface holds no traceable Scheme values.
 }
 
 pub fn make_host_builtin(

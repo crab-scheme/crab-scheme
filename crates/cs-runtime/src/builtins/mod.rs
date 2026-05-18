@@ -710,12 +710,98 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // (hashtable-update! is higher-order — see below)
         // R7RS portability
         ("crabscheme-version", b_crabscheme_version),
+        // Layer-4 tracing-cycle-collector (tracing-revival
+        // iter 4). Triggers a sweep of the cycle-candidate
+        // registry. Under default features (no
+        // `tracing-cycle-collector`) it's a no-op.
+        ("collect", b_collect),
+        // Gap B-2-lite: Scheme-callable region primitives so
+        // user code can reach layer 3 today (without waiting
+        // for the cs-vm opcode emit work). These three are
+        // pure builtins; `with-region` is higher-order, see
+        // higher_order_builtins below.
+        #[cfg(feature = "regions")]
+        ("cons-in-region", b_cons_in_region),
+        #[cfg(feature = "regions")]
+        ("make-vector-in-region", b_make_vector_in_region),
+        #[cfg(feature = "regions")]
+        ("make-string-in-region", b_make_string_in_region),
     ]
+}
+
+fn b_collect(_args: &[Value]) -> Result<Value, String> {
+    #[cfg(feature = "tracing-cycle-collector")]
+    cs_gc::cycle_registry::run_sweep();
+    Ok(Value::Unspecified)
+}
+
+/// `(cons-in-region car cdr)` — region-allocated cons.
+/// Requires an enclosing `(with-region thunk)` scope. The
+/// returned Pair lives until that region drops, regardless
+/// of how many handles outlive it (release-mode access to a
+/// dangling handle panics per Gap E-6).
+///
+/// Use case: hot allocation loops that the typer can't yet
+/// prove bounded but the programmer knows are. The
+/// allocator cost drops from ~50 ns/Rc to ~3.75 ns/region.
+#[cfg(feature = "regions")]
+fn b_cons_in_region(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("cons-in-region", "2", args.len()));
+    }
+    crate::alloc_dispatch::cons_in(
+        cs_rir::Lifetime::Region(cs_rir::RegionTag(0)),
+        args[0].clone(),
+        args[1].clone(),
+    )
+}
+
+#[cfg(feature = "regions")]
+fn b_make_vector_in_region(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("make-vector-in-region", "2", args.len()));
+    }
+    let n = as_int_i64("make-vector-in-region", &args[0])?;
+    if n < 0 {
+        return Err("make-vector-in-region: negative length".into());
+    }
+    crate::alloc_dispatch::make_vector_in(
+        cs_rir::Lifetime::Region(cs_rir::RegionTag(0)),
+        n as usize,
+        args[1].clone(),
+    )
+}
+
+#[cfg(feature = "regions")]
+fn b_make_string_in_region(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("make-string-in-region", "2", args.len()));
+    }
+    let n = as_int_i64("make-string-in-region", &args[0])?;
+    if n < 0 {
+        return Err("make-string-in-region: negative length".into());
+    }
+    let fill = match &args[1] {
+        Value::Character(c) => *c,
+        v => return Err(type_err("make-string-in-region", "character", v)),
+    };
+    crate::alloc_dispatch::make_string_in(
+        cs_rir::Lifetime::Region(cs_rir::RegionTag(0)),
+        n as usize,
+        fill,
+    )
 }
 
 pub fn higher_order_builtins() -> Vec<HoEntry> {
     vec![
         ("apply", b_apply),
+        // Gap B-2-lite: open a region scope, call `thunk`,
+        // close the region. Allocations made inside `thunk`
+        // via `cons-in-region` / `make-vector-in-region` /
+        // `make-string-in-region` live in that scope and
+        // bulk-free on exit.
+        #[cfg(feature = "regions")]
+        ("with-region", b_with_region),
         // (time-apply) lives as a Scheme-level wrapper in the
         // benchmark harness, not a builtin: the VM dispatches
         // higher-order builtins through marker-type downcasts
@@ -2311,7 +2397,7 @@ fn b_list_p(args: &[Value]) -> Result<Value, String> {
     }
     fn step(v: &Value) -> Option<Value> {
         match v {
-            Value::Pair(p) => Some(p.cdr.borrow().clone()),
+            Value::Pair(p) => Some(p.cdr()),
             _ => None,
         }
     }
@@ -2388,7 +2474,7 @@ fn b_car(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("car", "1", args.len()));
     }
     match &args[0] {
-        Value::Pair(p) => Ok(p.car.borrow().clone()),
+        Value::Pair(p) => Ok(p.car()),
         v => Err(type_err("car", "pair", v)),
     }
 }
@@ -2398,7 +2484,7 @@ fn b_cdr(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("cdr", "1", args.len()));
     }
     match &args[0] {
-        Value::Pair(p) => Ok(p.cdr.borrow().clone()),
+        Value::Pair(p) => Ok(p.cdr()),
         v => Err(type_err("cdr", "pair", v)),
     }
 }
@@ -2414,8 +2500,8 @@ fn cxr_apply(name: &str, ops: &str, mut v: Value) -> Result<Value, String> {
     // Right-to-left: caXr means apply X first, then car at the end.
     for c in ops.chars().rev() {
         v = match (c, &v) {
-            ('a', Value::Pair(p)) => p.car.borrow().clone(),
-            ('d', Value::Pair(p)) => p.cdr.borrow().clone(),
+            ('a', Value::Pair(p)) => p.car(),
+            ('d', Value::Pair(p)) => p.cdr(),
             (_, other) => return Err(type_err(name, "pair", other)),
         };
     }
@@ -2471,7 +2557,30 @@ fn b_set_car(args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Pair(p) => {
-            *p.car.borrow_mut() = args[1].clone();
+            p.set_car(args[1].clone());
+            // Region-memory iter 5 (FR-8): skip cycle
+            // detection for region-allocated pairs. Cycles
+            // inside a region are fine — the region's bulk
+            // free handles them regardless of internal
+            // refs. Running the detector would just waste
+            // cycles and could falsely refuse to break a
+            // benign cycle.
+            #[cfg(feature = "regions")]
+            if cs_gc::Gc::is_region(p) {
+                return Ok(Value::Unspecified);
+            }
+            cs_gc::cycle::check_and_break(p, |p| {
+                crate::countable_memory_cycle::record_cycle_with_candidate(p);
+                // Iter 7.1.x.y: caller-supplied baseline=3
+                // (slot + args[0] + args[1] + VM transient).
+                // The in-walk back-edge demote that iter
+                // 7.1.x.z attempted is reverted pending a
+                // full Bacon-Rajan implementation; see ADR
+                // 0014 §"iter 7.1.x.z note".
+                if p.break_car_cycle(3) {
+                    crate::countable_memory_cycle::record_cycle_broken();
+                }
+            });
             Ok(Value::Unspecified)
         }
         v => Err(type_err("set-car!", "pair", v)),
@@ -2484,7 +2593,18 @@ fn b_set_cdr(args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Pair(p) => {
-            *p.cdr.borrow_mut() = args[1].clone();
+            p.set_cdr(args[1].clone());
+            // Region-memory iter 5 (FR-8): see b_set_car.
+            #[cfg(feature = "regions")]
+            if cs_gc::Gc::is_region(p) {
+                return Ok(Value::Unspecified);
+            }
+            cs_gc::cycle::check_and_break(p, |p| {
+                crate::countable_memory_cycle::record_cycle_with_candidate(p);
+                if p.break_cdr_cycle(3) {
+                    crate::countable_memory_cycle::record_cycle_broken();
+                }
+            });
             Ok(Value::Unspecified)
         }
         v => Err(type_err("set-cdr!", "pair", v)),
@@ -2506,7 +2626,7 @@ fn b_length(args: &[Value]) -> Result<Value, String> {
             Value::Null => return Ok(Value::fixnum(n)),
             Value::Pair(p) => {
                 n += 1;
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             v => return Err(type_err("length", "proper list", &v)),
         }
@@ -2523,8 +2643,8 @@ fn b_reverse(args: &[Value]) -> Result<Value, String> {
         match cur {
             Value::Null => return Ok(acc),
             Value::Pair(p) => {
-                acc = Value::Pair(Pair::new(p.car.borrow().clone(), acc));
-                cur = p.cdr.borrow().clone();
+                acc = Value::Pair(Pair::new(p.car(), acc));
+                cur = p.cdr();
             }
             v => return Err(type_err("reverse", "proper list", &v)),
         }
@@ -2545,8 +2665,8 @@ fn b_append(args: &[Value]) -> Result<Value, String> {
             match cur {
                 Value::Null => break,
                 Value::Pair(p) => {
-                    items.push(p.car.borrow().clone());
-                    cur = p.cdr.borrow().clone();
+                    items.push(p.car());
+                    cur = p.cdr();
                 }
                 v => return Err(type_err("append", "proper list", &v)),
             }
@@ -2572,7 +2692,7 @@ fn b_list_tail(args: &[Value]) -> Result<Value, String> {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
                 i += 1;
             }
             _ => return Err("list-tail: index out of range".into()),
@@ -2587,7 +2707,7 @@ fn b_list_ref(args: &[Value]) -> Result<Value, String> {
     }
     let tail = b_list_tail(args)?;
     match tail {
-        Value::Pair(p) => Ok(p.car.borrow().clone()),
+        Value::Pair(p) => Ok(p.car()),
         _ => Err("list-ref: index out of range".into()),
     }
 }
@@ -2601,7 +2721,7 @@ fn b_list_set_bang(args: &[Value]) -> Result<Value, String> {
     let tail = b_list_tail(&args[..2])?;
     match tail {
         Value::Pair(p) => {
-            *p.car.borrow_mut() = args[2].clone();
+            p.set_car(args[2].clone());
             Ok(Value::Unspecified)
         }
         _ => Err("list-set!: index out of range".into()),
@@ -2898,12 +3018,12 @@ fn b_list_to_string(args: &[Value]) -> Result<Value, String> {
         match cur {
             Value::Null => return Ok(Value::string(s)),
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
+                let head = p.car();
                 match head {
                     Value::Character(c) => s.push(c),
                     other => return Err(type_err("list->string", "character", &other)),
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             v => return Err(type_err("list->string", "list of characters", &v)),
         }
@@ -3212,6 +3332,55 @@ fn b_newline(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
 
 // ---- higher-order builtins ----
 
+/// `(with-region thunk)` — open a fresh region, invoke
+/// `(thunk)`, close the region. Allocations made inside the
+/// thunk via `cons-in-region` / `make-vector-in-region` /
+/// `make-string-in-region` live in this region's bump arena
+/// and bulk-free on exit. Region cycles are handled by the
+/// bulk free regardless of internal back-edges.
+///
+/// The result is automatically deep-copied to Rc storage
+/// via `cs_core::promote::to_rc_deep` so it survives the
+/// region drop — programmers don't have to call
+/// promote-deep explicitly.
+///
+/// # Tier support
+///
+/// Fully supported on walker, VM, and JIT tiers as of the
+/// nanbox region-tag fix in `cs_vm::vm` (low bit of the
+/// pointer-typed nanbox payload distinguishes Rc/Region
+/// origin; decode routes through `Gc::from_raw_jit_region`
+/// when set). `to_rc_deep` still runs on return to promote
+/// any handles in the result to Rc — once layer-5 lowering
+/// auto-emits `with-region` around bounded scopes, the
+/// promote can be elided where the return value is provably
+/// non-heap.
+#[cfg(feature = "regions")]
+fn b_with_region(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("with-region", "1", args.len()));
+    }
+    let region = std::rc::Rc::new(cs_gc::Region::new());
+    let _guard = crate::regions::RegionScope::enter(std::rc::Rc::clone(&region));
+    let result = apply_procedure(&args[0], &[], ctx).map_err(|e| e.message())?;
+    // Build a fresh Rc-backed Value tree from the result.
+    // `to_rc_deep` clones-by-value (it never mutates the
+    // source), so even if the VM has parallel handles to
+    // the same Region Gc, the returned Value is fully
+    // independent and survives the region drop below.
+    // `promote_deep` (in-place mutation) was the original
+    // approach but doesn't handle the parallel-handle case
+    // — see promote.rs's `to_rc_deep` docs for the
+    // rationale.
+    let safe = cs_core::promote::to_rc_deep(&result);
+    drop(result);
+    drop(_guard);
+    // `region` (Rc<Region>) drops at end of fn — bump arena
+    // bulk-frees. `safe` has no Region handles so nothing
+    // dangles.
+    Ok(safe)
+}
+
 fn b_apply(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() < 2 {
         return Err(arity_err("apply", "at least 2", args.len()));
@@ -3224,8 +3393,8 @@ fn b_apply(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         match cur {
             Value::Null => break,
             Value::Pair(p) => {
-                all.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                all.push(p.car());
+                cur = p.cdr();
             }
             v => return Err(type_err("apply", "proper list (last arg)", &v)),
         }
@@ -3280,8 +3449,8 @@ fn collect_proper_list(name: &str, v: &Value) -> Result<Vec<Value>, String> {
         match cur {
             Value::Null => return Ok(out),
             Value::Pair(p) => {
-                out.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                out.push(p.car());
+                cur = p.cdr();
             }
             other => return Err(type_err(name, "proper list", &other)),
         }
@@ -3671,11 +3840,21 @@ fn b_vector_set(args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Vector(v) => {
-            let mut v = v.borrow_mut();
-            if (i as usize) >= v.len() {
-                return Err("vector-set!: index out of range".into());
+            {
+                let mut vw = v.borrow_mut();
+                if (i as usize) >= vw.len() {
+                    return Err("vector-set!: index out of range".into());
+                }
+                vw[i as usize] = args[2].clone();
             }
-            v[i as usize] = args[2].clone();
+            // Region-memory iter 5 (FR-8): see b_set_car.
+            #[cfg(feature = "regions")]
+            if cs_gc::Gc::is_region(v) {
+                return Ok(Value::Unspecified);
+            }
+            cs_gc::cycle::check_and_break(v, |v| {
+                crate::countable_memory_cycle::record_cycle_with_candidate(v);
+            });
             Ok(Value::Unspecified)
         }
         v => Err(type_err("vector-set!", "vector", v)),
@@ -3790,10 +3969,10 @@ fn assoc_search_with(
         match cur {
             Value::Null => return Ok(Value::Boolean(false)),
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
+                let head = p.car();
                 match &head {
                     Value::Pair(pair) => {
-                        let car = pair.car.borrow().clone();
+                        let car = pair.car();
                         let r = apply_procedure(cmp, &[car, key.clone()], ctx)
                             .map_err(|d| format!("{:?}", d))?;
                         if r.is_truthy() {
@@ -3802,7 +3981,7 @@ fn assoc_search_with(
                     }
                     _ => return Err(type_err(name, "list of pairs", &head)),
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             other => return Err(type_err(name, "proper list", &other)),
         }
@@ -3834,16 +4013,16 @@ fn assoc_search(
         match cur {
             Value::Null => return Ok(Value::Boolean(false)),
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
+                let head = p.car();
                 match &head {
                     Value::Pair(pair) => {
-                        if pred(&pair.car.borrow(), key) {
+                        if pred(&pair.car(), key) {
                             return Ok(head.clone());
                         }
                     }
                     _ => return Err(type_err(name, "list of pairs", &head)),
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             other => return Err(type_err(name, "proper list", &other)),
         }
@@ -3875,13 +4054,13 @@ fn member_search_with(
         match cur {
             Value::Null => return Ok(Value::Boolean(false)),
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 let r = apply_procedure(cmp, &[car, obj.clone()], ctx)
                     .map_err(|d| format!("{:?}", d))?;
                 if r.is_truthy() {
                     return Ok(Value::Pair(p.clone()));
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             other => return Err(type_err(name, "proper list", &other)),
         }
@@ -3913,10 +4092,10 @@ fn member_search(
         match cur {
             Value::Null => return Ok(Value::Boolean(false)),
             Value::Pair(p) => {
-                if pred(&p.car.borrow(), obj) {
+                if pred(&p.car(), obj) {
                     return Ok(Value::Pair(p));
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             other => return Err(type_err(name, "proper list", &other)),
         }
@@ -5001,8 +5180,8 @@ pub fn render_condition(c: &Value, syms: &SymbolTable) -> String {
                             match cur {
                                 Value::Null => break,
                                 Value::Pair(p) => {
-                                    irritants.push(p.car.borrow().clone());
-                                    cur = p.cdr.borrow().clone();
+                                    irritants.push(p.car());
+                                    cur = p.cdr();
                                 }
                                 other => {
                                     irritants.push(other);
@@ -5718,8 +5897,8 @@ fn equal_hash_rec(v: &Value, acc: &mut u64) {
         }
         Value::Pair(p) => {
             mix(acc, 0x50);
-            equal_hash_rec(&p.car.borrow(), acc);
-            equal_hash_rec(&p.cdr.borrow(), acc);
+            equal_hash_rec(&p.car(), acc);
+            equal_hash_rec(&p.cdr(), acc);
         }
         Value::Vector(vc) => {
             mix(acc, 0x60);
@@ -5806,21 +5985,46 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             let k = h.items.borrow()[i].0.clone();
             if ht_eq_ctx(&h, &k, &args[1], ctx)? {
                 h.items.borrow_mut()[i].1 = args[2].clone();
+                // Region-memory iter 5 (FR-8): see b_set_car.
+                #[cfg(feature = "regions")]
+                if cs_gc::Gc::is_region(&h) {
+                    return Ok(Value::Unspecified);
+                }
+                cs_gc::cycle::check_and_break(&h, |h| {
+                    crate::countable_memory_cycle::record_cycle_with_candidate(h);
+                });
                 return Ok(Value::Unspecified);
             }
         }
         h.items
             .borrow_mut()
             .push((args[1].clone(), args[2].clone()));
+        #[cfg(feature = "regions")]
+        if cs_gc::Gc::is_region(&h) {
+            return Ok(Value::Unspecified);
+        }
+        cs_gc::cycle::check_and_break(&h, |h| {
+            crate::countable_memory_cycle::record_cycle_with_candidate(h);
+        });
         return Ok(Value::Unspecified);
     }
     let kind = h.eq_kind;
-    let mut items = h.items.borrow_mut();
-    if let Some(slot) = items.iter_mut().find(|(k, _)| ht_eq(kind, k, &args[1])) {
-        slot.1 = args[2].clone();
-    } else {
-        items.push((args[1].clone(), args[2].clone()));
+    {
+        let mut items = h.items.borrow_mut();
+        if let Some(slot) = items.iter_mut().find(|(k, _)| ht_eq(kind, k, &args[1])) {
+            slot.1 = args[2].clone();
+        } else {
+            items.push((args[1].clone(), args[2].clone()));
+        }
     }
+    // Region-memory iter 5 (FR-8): see b_set_car.
+    #[cfg(feature = "regions")]
+    if cs_gc::Gc::is_region(&h) {
+        return Ok(Value::Unspecified);
+    }
+    cs_gc::cycle::check_and_break(&h, |h| {
+        crate::countable_memory_cycle::record_cycle_with_candidate(h);
+    });
     Ok(Value::Unspecified)
 }
 
@@ -6194,9 +6398,9 @@ fn b_last(args: &[Value]) -> Result<Value, String> {
     loop {
         match cur {
             Value::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.cdr();
                 if matches!(cdr, Value::Null) {
-                    return Ok(p.car.borrow().clone());
+                    return Ok(p.car());
                 }
                 cur = cdr;
             }
@@ -6214,7 +6418,7 @@ fn b_last_pair(args: &[Value]) -> Result<Value, String> {
     loop {
         match cur {
             Value::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.cdr();
                 if !matches!(cdr, Value::Pair(_)) {
                     return Ok(Value::Pair(p));
                 }
@@ -6239,8 +6443,8 @@ fn b_take(args: &[Value]) -> Result<Value, String> {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                taken.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                taken.push(p.car());
+                cur = p.cdr();
                 i += 1;
             }
             _ => return Err("take: list shorter than n".into()),
@@ -6262,7 +6466,7 @@ fn b_drop(args: &[Value]) -> Result<Value, String> {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
                 i += 1;
             }
             _ => return Err("drop: list shorter than n".into()),
@@ -6562,12 +6766,12 @@ fn b_find_tail(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         match cur.clone() {
             Value::Null => return Ok(Value::Boolean(false)),
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 let r = apply_procedure(&pred, &[car], ctx).map_err(|e| e.message())?;
                 if r.is_truthy() {
                     return Ok(cur);
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             _ => return Err("find-tail: improper list".into()),
         }
@@ -6607,7 +6811,7 @@ fn b_pair_fold(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         match cur.clone() {
             Value::Null => return Ok(acc),
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 acc = apply_procedure(&kons, &[cur.clone(), acc], ctx).map_err(|e| e.message())?;
                 cur = next;
             }
@@ -6632,7 +6836,7 @@ fn b_pair_fold_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String>
             Value::Pair(_) => {
                 subs.push(cur.clone());
                 if let Value::Pair(p) = cur {
-                    cur = p.cdr.borrow().clone();
+                    cur = p.cdr();
                 }
             }
             _ => return Err("pair-fold-right: improper list".into()),
@@ -6657,7 +6861,7 @@ fn b_pair_for_each(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         match cur.clone() {
             Value::Null => return Ok(Value::Unspecified),
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 apply_procedure(&proc_val, &[cur.clone()], ctx).map_err(|e| e.message())?;
                 cur = next;
             }
@@ -9930,8 +10134,8 @@ fn b_alist_copy(args: &[Value]) -> Result<Value, String> {
     for e in entries {
         match &e {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 out.push(Value::Pair(cs_core::Pair::new(car, cdr)));
             }
             _ => return Err(type_err("alist-copy", "pair", &e)),
@@ -10033,14 +10237,14 @@ fn list_classify(v: &Value) -> Option<bool> {
         match fast {
             Value::Null => return Some(true),
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 match next {
                     Value::Null => return Some(true),
                     Value::Pair(p2) => {
-                        let next2 = p2.cdr.borrow().clone();
+                        let next2 = p2.cdr();
                         // advance slow once.
                         slow = match slow {
-                            Value::Pair(sp) => sp.cdr.borrow().clone(),
+                            Value::Pair(sp) => sp.cdr(),
                             _ => return Some(true),
                         };
                         fast = next2;
@@ -10145,12 +10349,12 @@ fn b_circular_list(args: &[Value]) -> Result<Value, String> {
     let mut cur = head.clone();
     loop {
         let next = match &cur {
-            Value::Pair(p) => p.cdr.borrow().clone(),
+            Value::Pair(p) => p.cdr(),
             _ => return Err("circular-list: internal error — not a pair".into()),
         };
         if matches!(next, Value::Null) {
             if let Value::Pair(p) = &cur {
-                *p.cdr.borrow_mut() = head.clone();
+                p.set_cdr(head.clone());
             }
             break;
         }
@@ -10232,8 +10436,8 @@ fn b_alist_to_hashtable(args: &[Value]) -> Result<Value, String> {
     for entry in items {
         match entry {
             Value::Pair(p) => {
-                let k = p.car.borrow().clone();
-                let v = p.cdr.borrow().clone();
+                let k = p.car();
+                let v = p.cdr();
                 h.items.borrow_mut().push((k, v));
             }
             other => {
@@ -11010,8 +11214,8 @@ fn b_list_copy(args: &[Value]) -> Result<Value, String> {
     let tail = loop {
         match cur {
             Value::Pair(p) => {
-                elems.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                elems.push(p.car());
+                cur = p.cdr();
             }
             other => break other,
         }
@@ -11601,47 +11805,58 @@ fn b_jit_stats(args: &[Value]) -> Result<Value, String> {
 /// Returned alist:
 ///
 /// ```scheme
-/// ((bytes-allocated-total . 142857142)   ; cumulative bytes
-///  (alloc-count-total     . 12345)        ; cumulative allocations
-///  (collect-count         . 87)           ; collect() calls since reset
-///  (live-slots            . 1024)         ; reachable slots NOW
-///  (collect-time-ms       . 145.3)        ; total time in collect()
-///  (last-pause-ms         . 1.8)          ; most recent pause
-///  (max-pause-ms          . 4.32)         ; peak pause since reset
-///  (stats-enabled?        . #t))          ; pause-timing on/off
+/// ((bytes-allocated-total . 142857142)
+///  (alloc-count-total     . 12345)
+///  (collect-count         . 87)
+///  (live-slots            . 1024)
+///  (collect-time-ms       . 145.3)
+///  (last-pause-ms         . 1.8)
+///  (max-pause-ms          . 4.32)
+///  (stats-enabled?        . #t))
 /// ```
 ///
-/// The three `*-ms` durations are populated only when stats are
-/// enabled via `(gc-stats-enable!)`; otherwise they read 0.0.
-/// The integer counters are always tracked.
+/// Under `feature = "countable-memory"` (default): the tracing
+/// heap is retired. The integer counters report cycle-detector
+/// activity from `countable_memory_cycle` (allocations aren't
+/// tracked at the GC layer — Rc::new doesn't have a hook —
+/// so bytes-allocated-total + alloc-count-total + live-slots
+/// stay 0). Timings stay 0.0. collect-count reports
+/// `cycle_broken_count()`. The alist shape is preserved so
+/// benchmark scripts portable across Chez/CrabScheme don't
+/// fail-fast on missing keys.
 fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats", "0", args.len()));
     }
-    let rt = unsafe { crate::Runtime::active() }
-        .ok_or_else(|| "gc-stats: no active runtime".to_string())?;
-    let s = rt.heap().stats();
-    let ns_to_ms = |d: std::time::Duration| (d.as_nanos() as f64) / 1_000_000.0;
     let mut pair = |k: &str, v: Value| -> Value {
         let key_sym = syms.intern(k);
         Value::Pair(cs_core::Pair::new(Value::Symbol(key_sym), v))
     };
-    Ok(Value::list(vec![
-        pair(
-            "bytes-allocated-total",
-            fixnum_or_bigint(s.bytes_allocated_total),
-        ),
-        pair("alloc-count-total", fixnum_or_bigint(s.alloc_count_total)),
-        pair("collect-count", fixnum_or_bigint(s.collect_count)),
-        pair("live-slots", Value::fixnum(s.live_slots as i64)),
-        pair(
-            "collect-time-ms",
-            Value::flonum(ns_to_ms(s.collect_duration_total)),
-        ),
-        pair("last-pause-ms", Value::flonum(ns_to_ms(s.last_pause))),
-        pair("max-pause-ms", Value::flonum(ns_to_ms(s.max_pause))),
-        pair("stats-enabled?", Value::Boolean(s.stats_enabled)),
-    ]))
+    {
+        let cycles_seen = crate::countable_memory_cycle::cycle_detection_count();
+        let cycles_broken = crate::countable_memory_cycle::cycle_broken_count();
+        // Gap A-1: real bytes + alloc-count via the
+        // `cs_gc::alloc_telemetry` global atomics that
+        // `Gc::new` increments. Replaces the previous
+        // always-zero stub.
+        let bytes = cs_gc::alloc_telemetry::bytes_allocated_total();
+        let allocs = cs_gc::alloc_telemetry::alloc_count_total();
+        Ok(Value::list(vec![
+            pair("bytes-allocated-total", fixnum_or_bigint(bytes)),
+            pair("alloc-count-total", fixnum_or_bigint(allocs)),
+            pair("collect-count", Value::fixnum(cycles_broken as i64)),
+            pair("live-slots", Value::fixnum(0)),
+            pair("collect-time-ms", Value::flonum(0.0)),
+            pair("last-pause-ms", Value::flonum(0.0)),
+            pair("max-pause-ms", Value::flonum(0.0)),
+            pair("stats-enabled?", Value::Boolean(false)),
+            // Extra key only present under countable-memory:
+            // the cycle-detector's running count of detected
+            // cycles (which is interesting independent of
+            // whether they were also broken).
+            pair("cycles-detected", Value::fixnum(cycles_seen as i64)),
+        ]))
+    }
 }
 
 /// Encode a u64 counter as the smallest numeric Value that fits.
@@ -11667,34 +11882,35 @@ fn b_gc_stats_reset(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats-reset!", "0", args.len()));
     }
-    let rt = unsafe { crate::Runtime::active() }
-        .ok_or_else(|| "gc-stats-reset!: no active runtime".to_string())?;
-    rt.heap().reset_stats();
+    {
+        // No tracing heap to reset. Zero the cycle counter
+        // and the layer-2 alloc-telemetry atomics (Gap A-1)
+        // so benchmarks establish a clean baseline.
+        crate::countable_memory_cycle::reset_cycle_detection_count();
+        cs_gc::alloc_telemetry::reset();
+    }
     Ok(Value::Unspecified)
 }
 
 /// `(gc-stats-enable!)` — turn on pause-time instrumentation.
 /// Cheap (~2 % overhead on a tight alloc+collect loop) but not
-/// free, so default-off. Returns unspecified.
+/// free, so default-off. Returns unspecified. Under countable-
+/// memory there is no pause to time — this is a documented
+/// no-op so benchmark scripts portable across feature
+/// configurations don't crash.
 fn b_gc_stats_enable(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats-enable!", "0", args.len()));
     }
-    let rt = unsafe { crate::Runtime::active() }
-        .ok_or_else(|| "gc-stats-enable!: no active runtime".to_string())?;
-    rt.heap().set_stats_enabled(true);
     Ok(Value::Unspecified)
 }
 
 /// `(gc-stats-disable!)` — turn off pause-time instrumentation.
-/// Returns unspecified.
+/// Returns unspecified. No-op under countable-memory.
 fn b_gc_stats_disable(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats-disable!", "0", args.len()));
     }
-    let rt = unsafe { crate::Runtime::active() }
-        .ok_or_else(|| "gc-stats-disable!: no active runtime".to_string())?;
-    rt.heap().set_stats_enabled(false);
     Ok(Value::Unspecified)
 }
 
@@ -11703,14 +11919,20 @@ fn b_gc_stats_disable(args: &[Value]) -> Result<Value, String> {
 /// with Chez Scheme's `(collect)` accessor — Chez returns the
 /// new heap size (in bytes); we return the slot count (which is
 /// the closest stable analogue in our non-generational heap).
+///
+/// Under countable-memory: there's no tracing collector to
+/// invoke. When `tracing-cycle-collector` is also on, runs
+/// the layer-4 candidate-registry sweep instead. Either way,
+/// returns 0 (no live-slot count to report).
 fn b_collect_garbage(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("collect-garbage", "0", args.len()));
     }
-    let rt = unsafe { crate::Runtime::active() }
-        .ok_or_else(|| "collect-garbage: no active runtime".to_string())?;
-    rt.heap().collect();
-    Ok(Value::fixnum(rt.heap().live_slots() as i64))
+    {
+        #[cfg(feature = "tracing-cycle-collector")]
+        cs_gc::cycle_registry::run_sweep();
+        Ok(Value::fixnum(0))
+    }
 }
 
 /// `(gc-auto-collect-enable!)` — turn on the heap's
@@ -11718,24 +11940,20 @@ fn b_collect_garbage(args: &[Value]) -> Result<Value, String> {
 /// past the current threshold triggers a `(collect-garbage)`. Off
 /// by default (cs-gc Phase 1 invariant). Tier-3 benches that want
 /// real GC pressure to show up in the harness flip this on.
+/// No-op under countable-memory (no tracing heap to drive).
 fn b_gc_auto_collect_enable(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-auto-collect-enable!", "0", args.len()));
     }
-    let rt = unsafe { crate::Runtime::active() }
-        .ok_or_else(|| "gc-auto-collect-enable!: no active runtime".to_string())?;
-    rt.heap().set_auto_collect(true);
     Ok(Value::Unspecified)
 }
 
-/// `(gc-auto-collect-disable!)` — inverse of the above.
+/// `(gc-auto-collect-disable!)` — inverse of the above. No-op
+/// under countable-memory.
 fn b_gc_auto_collect_disable(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-auto-collect-disable!", "0", args.len()));
     }
-    let rt = unsafe { crate::Runtime::active() }
-        .ok_or_else(|| "gc-auto-collect-disable!: no active runtime".to_string())?;
-    rt.heap().set_auto_collect(false);
     Ok(Value::Unspecified)
 }
 
@@ -11743,6 +11961,11 @@ fn b_gc_auto_collect_disable(args: &[Value]) -> Result<Value, String> {
 /// drives auto-collect. Default 4096; tier-3 benches typically
 /// want to lower this so collection fires per inner loop rather
 /// than once at the end.
+///
+/// Forwards to the layer-4 `tracing-cycle-collector` registry's
+/// auto-trigger threshold when that feature is on; otherwise a
+/// no-op (the layer-2 synchronous detector has no threshold knob —
+/// it always runs on the mutation site).
 fn b_gc_set_threshold(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("gc-set-threshold!", "1", args.len()));
@@ -11751,9 +11974,10 @@ fn b_gc_set_threshold(args: &[Value]) -> Result<Value, String> {
         Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as usize,
         v => return Err(type_err("gc-set-threshold!", "non-negative fixnum", v)),
     };
-    let rt = unsafe { crate::Runtime::active() }
-        .ok_or_else(|| "gc-set-threshold!: no active runtime".to_string())?;
-    rt.heap().set_threshold(n);
+    #[cfg(feature = "tracing-cycle-collector")]
+    cs_gc::cycle_registry::set_auto_trigger_threshold(n);
+    #[cfg(not(feature = "tracing-cycle-collector"))]
+    let _ = n;
     Ok(Value::Unspecified)
 }
 
@@ -11853,9 +12077,16 @@ fn b_current_memory_use(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("current-memory-use", "0", args.len()));
     }
-    let rt = unsafe { crate::Runtime::active() }
-        .ok_or_else(|| "current-memory-use: no active runtime".to_string())?;
-    Ok(fixnum_or_bigint(rt.heap().bytes_allocated_total()))
+    // Under countable-memory: Gap A-1 telemetry tracks
+    // cumulative bytes allocated since process start (or
+    // since the last `(gc-stats-reset!)`). Shape-compatible
+    // with the tracing variant's `bytes_allocated_total`.
+    // For RSS specifically, use `(current-rss-bytes)`.
+    {
+        Ok(fixnum_or_bigint(
+            cs_gc::alloc_telemetry::bytes_allocated_total(),
+        ))
+    }
 }
 
 fn b_jit_status(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
@@ -12224,7 +12455,7 @@ fn b_make_enumeration(args: &[Value]) -> Result<Value, String> {
         match cur {
             Value::Null => break,
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 match &car {
                     Value::Symbol(_) => universe.push(car.clone()),
                     other => {
@@ -12234,7 +12465,7 @@ fn b_make_enumeration(args: &[Value]) -> Result<Value, String> {
                         ));
                     }
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             v => {
                 return Err(type_err("make-enumeration", "list of symbols", &v));
@@ -12334,7 +12565,7 @@ fn b_enum_set_constructor(args: &[Value]) -> Result<Value, String> {
             match cur {
                 Value::Null => break,
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
+                    let car = p.car();
                     match &car {
                         Value::Symbol(s) => match symbols.iter().position(|p| p == s) {
                             Some(i) => bits |= 1i64 << i,
@@ -12344,7 +12575,7 @@ fn b_enum_set_constructor(args: &[Value]) -> Result<Value, String> {
                         },
                         v => return Err(type_err("constructor", "symbol", v)),
                     }
-                    cur = p.cdr.borrow().clone();
+                    cur = p.cdr();
                 }
                 v => return Err(type_err("constructor", "list of symbols", &v)),
             }
@@ -12739,8 +12970,8 @@ fn collect_field_spec(v: &Value) -> Option<Vec<Value>> {
         match cur {
             Value::Null => return Some(out),
             Value::Pair(p) => {
-                out.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                out.push(p.car());
+                cur = p.cdr();
             }
             _ => return None,
         }

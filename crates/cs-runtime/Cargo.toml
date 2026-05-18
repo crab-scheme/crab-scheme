@@ -13,7 +13,9 @@ license.workspace = true
 # `default` keeps the native build's surface identical to pre-M10.
 # `--no-default-features` produces a minimal runtime suitable for
 # wasm32-wasip1.
-default = ["jit", "ffi-dynamic"]
+# Layer 2 (Rc-backed Gc<T> + synchronous cycle detector) is
+# unconditional after countable-memory iter 12b — ADR 0014.
+default = ["jit", "ffi-dynamic", "regions"]
 # Enables `cs-jit*` deps and `Runtime::install_jit` / `jit_lowerer`.
 # Disabled in WASM and AOT-binary builds (which inline their codegen
 # at build time instead of at runtime).
@@ -34,6 +36,25 @@ ffi-dynamic = ["ffi-trait", "dep:libloading"]
 # embedders that wrote `features = ["ffi"]` against the W1 API stay
 # building.
 ffi = ["ffi-dynamic"]
+# Forwards the cs-gc `regions` feature so layer-3 (region memory)
+# APIs (`Region`, `Gc::new_in`, `Promote::promote_deep`) are
+# available in runtime contexts. Region-memory spec iter 6
+# flipped this default-on.
+regions = [
+    "cs-core/regions",
+    "cs-gc/regions",
+    "cs-vm/regions",
+    "cs-jit-cranelift?/regions",
+]
+# Forwards the cs-gc `tracing-cycle-collector` feature
+# (layer 4 of the unified memory architecture). Off by
+# default; opt in for embedders that want a residual-cycle
+# sweep on top of the layer-2 synchronous detector.
+tracing-cycle-collector = [
+    "cs-core/tracing-cycle-collector",
+    "cs-gc/tracing-cycle-collector",
+    "cs-vm/tracing-cycle-collector",
+]
 # BEAM-style actor primops. Pulls in cs-actor + cs-table + cs-hotreload
 # (tokio, dashmap) and registers (spawn, send, raw-receive, self),
 # the cs-table CRUD, and the cs-hotreload version-table primops as

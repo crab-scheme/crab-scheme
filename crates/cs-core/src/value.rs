@@ -8,11 +8,37 @@ use std::rc::Rc;
 use crate::number::Number;
 use crate::symbol::{Symbol, SymbolTable};
 
+// Bring the CycleVisit trait into scope so per-type
+// `visit_children` calls resolve under the feature.
+use cs_gc::cycle::CycleVisit as _;
+
 /// A pair (cons cell). Mutable per R6RS via `set-car!` / `set-cdr!`.
+///
+/// # Cycle-break tombstones (countable-memory iter 7.1)
+///
+/// Under `feature = "countable-memory"`, `car_weak` / `cdr_weak`
+/// are weak-reference tombstones. The mutation cycle detector
+/// in `cs-runtime` flips a slot from strong to weak via
+/// [`break_car_cycle`]/[`break_cdr_cycle`]: the strong `Value`
+/// gets replaced with `Unspecified` and a `WeakValue` referring
+/// to the same allocation is parked in the tombstone. Reads via
+/// the [`car`]/[`cdr`] accessors transparently `upgrade()` the
+/// tombstone, so the user-observable cyclic structure stays
+/// intact (R6RS requires `(set-cdr! x x)` to produce an
+/// observable cyclic list); but the strong-count chain is
+/// broken so refcount reclaims the cycle when no other strong
+/// reference remains.
+///
+/// Direct field access to `.car`/`.cdr` is preserved for
+/// backward compatibility with code paths that don't need to
+/// observe broken cycles (the strong slot is `Unspecified` for
+/// such cells). New code should prefer the accessors.
 #[derive(Debug)]
 pub struct Pair {
     pub car: RefCell<Value>,
     pub cdr: RefCell<Value>,
+    car_weak: RefCell<Option<WeakValue>>,
+    cdr_weak: RefCell<Option<WeakValue>>,
 }
 
 impl Pair {
@@ -20,14 +46,343 @@ impl Pair {
         cs_gc::Gc::new(Pair {
             car: RefCell::new(car),
             cdr: RefCell::new(cdr),
+            car_weak: RefCell::new(None),
+            cdr_weak: RefCell::new(None),
         })
+    }
+
+    /// Construct a Pair allocated in `region`'s bump arena
+    /// (region-memory iter 4). Layer-5 escape analysis emits
+    /// this when it proves the Pair's lifetime is bounded by
+    /// some surrounding scope.
+    #[cfg(feature = "regions")]
+    pub fn new_in(region: &cs_gc::Region, car: Value, cdr: Value) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new_in(
+            region,
+            Pair {
+                car: RefCell::new(car),
+                cdr: RefCell::new(cdr),
+                car_weak: RefCell::new(None),
+                cdr_weak: RefCell::new(None),
+            },
+        )
+    }
+
+    /// Read the car as a `Value`. An upgraded weak tombstone takes
+    /// precedence over the strong slot — so broken cycles still
+    /// produce the user-observable cyclic value as long as some
+    /// other strong reference holds the target alive. Returns
+    /// `Value::Unspecified` if the tombstone target has been fully
+    /// reclaimed.
+    pub fn car(&self) -> Value {
+        if let Some(w) = self.car_weak.borrow().as_ref() {
+            return w.upgrade().unwrap_or(Value::Unspecified);
+        }
+        self.car.borrow().clone()
+    }
+
+    /// Read the cdr as a `Value`. See [`car`] for the
+    /// tombstone semantics.
+    pub fn cdr(&self) -> Value {
+        if let Some(w) = self.cdr_weak.borrow().as_ref() {
+            return w.upgrade().unwrap_or(Value::Unspecified);
+        }
+        self.cdr.borrow().clone()
+    }
+
+    /// Replace the car slot with `v`. Clears any weak tombstone
+    /// (the new value is unambiguously strong).
+    pub fn set_car(&self, v: Value) {
+        self.car_weak.replace(None);
+        self.car.replace(v);
+    }
+
+    /// Replace the cdr slot with `v`. Clears any weak tombstone.
+    pub fn set_cdr(&self, v: Value) {
+        self.cdr_weak.replace(None);
+        self.cdr.replace(v);
+    }
+
+    /// Cycle-break action for the car slot. Downgrades the
+    /// current strong `Value` to a `WeakValue`, parks it in
+    /// `car_weak`, and replaces the strong slot with
+    /// `Unspecified`. Returns `true` on demote, `false` on skip.
+    ///
+    /// Skipped when:
+    /// - The current car is a leaf value (no heap pointer to
+    ///   downgrade).
+    /// - The strong-count guard fires: the value's only strong
+    ///   holders are this slot and the caller's mutation
+    ///   argument (which is about to drop). Demoting would
+    ///   orphan the value before any external reclaim could
+    ///   observe the cycle.
+    ///
+    /// `baseline` is the number of transient strong refs to
+    /// the value that the caller knows will drop right after
+    /// this mutation completes. The slot itself counts (+1),
+    /// plus any temporary references the caller holds
+    /// (e.g., `args[1]` in `b_set_car`). The guard demotes
+    /// only when total strong > baseline — i.e., there is at
+    /// least one EXTERNAL anchor that will outlive the
+    /// mutation. Without this gate the demote would orphan
+    /// the value as soon as the caller's temps drop.
+    ///
+    /// Typical baselines:
+    /// - Walker tier `b_set_car` / `b_set_cdr`: 2
+    ///   (slot + `args[1]`).
+    /// - VM tier helpers should pass their own baseline
+    ///   reflecting NB decode + arg-slot + frame-stack
+    ///   transient refs.
+    ///
+    /// The guard preserves observability for cycles whose
+    /// only anchor is in the freshly-mutated subgraph (e.g.
+    /// `(set-car! env (cons name val))` closures-over-env in
+    /// the metacircular), at the cost of leaking those
+    /// cycles refcount-wise. ADR 0014 §"iter 7.1.x.y" tracks
+    /// the move from caller-supplied baselines to full
+    /// Bacon-Rajan trial deletion that picks safe cycle
+    /// edges without caller hints.
+    pub fn break_car_cycle(&self, baseline: usize) -> bool {
+        // Read strong count WITHOUT cloning so the count
+        // reflects the slot's contribution plus the caller's
+        // declared transient refs and any external anchors.
+        let car_borrow = self.car.borrow();
+        let total = car_borrow.heap_strong_count().unwrap_or(0);
+        drop(car_borrow);
+        if total <= baseline {
+            return false;
+        }
+        let val = self.car();
+        let Some(weak) = WeakValue::from_value(&val) else {
+            return false; // leaf (shouldn't reach: heap_strong_count returned Some)
+        };
+        *self.car_weak.borrow_mut() = Some(weak);
+        *self.car.borrow_mut() = Value::Unspecified;
+        true
+    }
+
+    /// Cycle-break action for the cdr slot. See
+    /// [`break_car_cycle`] for the `baseline` parameter
+    /// convention.
+    pub fn break_cdr_cycle(&self, baseline: usize) -> bool {
+        let cdr_borrow = self.cdr.borrow();
+        let total = cdr_borrow.heap_strong_count().unwrap_or(0);
+        drop(cdr_borrow);
+        if total <= baseline {
+            return false;
+        }
+        let val = self.cdr();
+        let Some(weak) = WeakValue::from_value(&val) else {
+            return false;
+        };
+        *self.cdr_weak.borrow_mut() = Some(weak);
+        *self.cdr.borrow_mut() = Value::Unspecified;
+        true
     }
 }
 
-impl cs_gc::Trace for Pair {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        self.car.borrow().trace(marker);
-        self.cdr.borrow().trace(marker);
+impl Drop for Pair {
+    fn drop(&mut self) {
+        // Iteratively unlink the cdr chain. Without this,
+        // dropping a long list `(cons x1 (cons x2 …))` triggers
+        // recursive `Rc<Pair>::drop` calls — one stack frame per
+        // pair — and overflows the host stack at ~100k-500k
+        // elements (paraffins n=20 + macOS 8 MB default).
+        //
+        // The walk only descends when this Pair is the sole
+        // strong holder of the next cdr-Pair (`Gc::into_inner`
+        // returns `Some`). Shared pairs and region-backed pairs
+        // stop the walk — their other holders / the region drop
+        // is responsible for cleanup.
+        let mut cur = self.cdr.replace(Value::Null);
+        while let Value::Pair(gc) = cur {
+            match cs_gc::Gc::into_inner(gc) {
+                Some(mut pair) => {
+                    cur = std::mem::replace(pair.cdr.get_mut(), Value::Null);
+                    // `pair` drops at scope end: car drops
+                    // naturally (typically a leaf), cdr is
+                    // Null so no further recursion fires.
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// Gap C-3: layer-4 sweep dispatch for `Pair`. Called by
+/// `cs_gc::cycle_registry::run_sweep` on every candidate.
+/// Tries cdr-cycle first (more common back-edge from list
+/// construction), then car-cycle. `baseline = 0` because the
+/// sweep runs outside any mutation — no transient args[…]
+/// refs inflate the strong count, so any strong_count > 0
+/// reflects only persistent holders.
+impl cs_gc::cycle::BreakCycle for Pair {
+    fn try_break_cycle(&self) -> bool {
+        self.break_cdr_cycle(0) || self.break_car_cycle(0)
+    }
+}
+
+/// Gap C-3 ext: Hashtable layer-4 sweep dispatch. Scans the
+/// items vec for the first slot whose value is a heap-
+/// bearing `Value`; demotes it to `Unspecified`. Mirrors
+/// the conservative pattern from `Pair::break_cdr_cycle`:
+/// pick the first heap-bearing slot and break it.
+/// Returns `true` if a slot was demoted; `false` if the
+/// hashtable holds no heap-bearing values (no cycle to
+/// break).
+///
+/// Hashtable cycles in practice are rare — they form when a
+/// stored value transitively contains the hashtable itself
+/// (e.g., `(hashtable-set! h 'key h)`). The cycle detector
+/// (layer 2) flags these on the `hashtable-set!` site; this
+/// trait impl lets the layer-4 sweep also reclaim them.
+impl cs_gc::cycle::BreakCycle for Hashtable {
+    fn try_break_cycle(&self) -> bool {
+        // Take a borrow; iterate looking for the first
+        // value slot that's heap-bearing (could close a
+        // cycle). Replace it with Unspecified.
+        let Ok(mut items) = self.items.try_borrow_mut() else {
+            // Borrow failed (mutating elsewhere); skip this
+            // sweep round, the next one will retry.
+            return false;
+        };
+        for (_k, v) in items.iter_mut() {
+            // Heap-bearing variants are exactly the ones
+            // that could form a cycle through the hashtable.
+            let demote = matches!(
+                v,
+                Value::Pair(_)
+                    | Value::Vector(_)
+                    | Value::Hashtable(_)
+                    | Value::Promise(_)
+                    | Value::String(_)
+                    | Value::ByteVector(_)
+            );
+            if demote {
+                *v = Value::Unspecified;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Default no-op `BreakCycle` impls for Port + Promise. Port
+/// holds no Gc children (its variants are all leaf states),
+/// so the cycle counter would never fire for it anyway.
+/// Promise stores a single Value which can hold Gc handles
+/// — a future iter could give Promise a real break impl
+/// (demote the pending/forced Value to Unspecified) but for
+/// now Promise cycles are rare in practice and the layer-2
+/// detector handles the common case.
+///
+/// Vector and String / ByteVector are `Gc<RefCell<...>>`
+/// where `RefCell` is foreign — the orphan rule prevents a
+/// per-type impl from cs-core. cs-gc's blanket `impl<T>
+/// BreakCycle for RefCell<T>` covers them with the default
+/// no-op. Real break dispatch for these would need either:
+/// (a) Rust trait specialization (unstable), or (b) a
+/// `Vector` newtype wrapper to take ownership of the inner
+/// type. Tracked as a known limitation in the gap-closure
+/// follow-on.
+impl cs_gc::cycle::BreakCycle for Port {}
+impl cs_gc::cycle::BreakCycle for Promise {}
+
+/// Weak counterpart of [`Value`]'s heap-bearing variants, used by
+/// the cycle-break tombstone machinery on [`Pair`]. Each variant
+/// mirrors a `Value::*` heap variant with the underlying smart-
+/// pointer downgraded.
+///
+/// Only present under `feature = "countable-memory"`; the tracing
+/// path doesn't need this because the mark-sweep collector breaks
+/// cycles via slot-zeroing rather than weak-pointer storage.
+#[derive(Debug, Clone)]
+pub enum WeakValue {
+    String(cs_gc::Weak<RefCell<String>>),
+    Pair(cs_gc::Weak<Pair>),
+    Vector(cs_gc::Weak<RefCell<Vec<Value>>>),
+    ByteVector(cs_gc::Weak<RefCell<Vec<u8>>>),
+    Hashtable(cs_gc::Weak<Hashtable>),
+    Port(cs_gc::Weak<Port>),
+    Promise(cs_gc::Weak<Promise>),
+    Procedure(std::rc::Weak<dyn Procedure>),
+}
+
+impl WeakValue {
+    /// Construct a `WeakValue` from `v` if `v` carries a heap
+    /// pointer. Returns `None` for leaf values (Null, Boolean,
+    /// Fixnum, Character, Symbol, Eof, Unspecified, immediate
+    /// Numbers) — those don't need weak storage because they
+    /// have no allocation to leak.
+    pub fn from_value(v: &Value) -> Option<Self> {
+        match v {
+            Value::String(s) => Some(WeakValue::String(cs_gc::Gc::downgrade(s))),
+            Value::Pair(p) => Some(WeakValue::Pair(cs_gc::Gc::downgrade(p))),
+            Value::Vector(v) => Some(WeakValue::Vector(cs_gc::Gc::downgrade(v))),
+            Value::ByteVector(b) => Some(WeakValue::ByteVector(cs_gc::Gc::downgrade(b))),
+            Value::Hashtable(h) => Some(WeakValue::Hashtable(cs_gc::Gc::downgrade(h))),
+            Value::Port(p) => Some(WeakValue::Port(cs_gc::Gc::downgrade(p))),
+            Value::Promise(p) => Some(WeakValue::Promise(cs_gc::Gc::downgrade(p))),
+            Value::Procedure(p) => Some(WeakValue::Procedure(Rc::downgrade(p))),
+            // Leaf values — no heap allocation to weaken.
+            Value::Null
+            | Value::Unspecified
+            | Value::Eof
+            | Value::Boolean(_)
+            | Value::Character(_)
+            | Value::Symbol(_)
+            | Value::Number(_) => None,
+        }
+    }
+
+    /// Attempt to upgrade this weak handle back to a strong
+    /// `Value`. Returns `None` if the underlying allocation has
+    /// been reclaimed (the cycle has been fully broken).
+    pub fn upgrade(&self) -> Option<Value> {
+        match self {
+            WeakValue::String(w) => w.upgrade().map(Value::String),
+            WeakValue::Pair(w) => w.upgrade().map(Value::Pair),
+            WeakValue::Vector(w) => w.upgrade().map(Value::Vector),
+            WeakValue::ByteVector(w) => w.upgrade().map(Value::ByteVector),
+            WeakValue::Hashtable(w) => w.upgrade().map(Value::Hashtable),
+            WeakValue::Port(w) => w.upgrade().map(Value::Port),
+            WeakValue::Promise(w) => w.upgrade().map(Value::Promise),
+            WeakValue::Procedure(w) => w.upgrade().map(Value::Procedure),
+        }
+    }
+}
+
+impl cs_gc::cycle::CycleVisit for Pair {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Walk via the accessors so the detector observes the
+        // user-visible cyclic structure even after a previous
+        // break_*_cycle has tombstoned the strong slot. The
+        // upgraded weak still represents the cycle from the
+        // user's perspective; if a new mutation reconstructs
+        // the cycle, the detector should still fire.
+        //
+        // Iter 7.1.x.z investigated an in-walk back-edge demote
+        // (when a Pair sees self.car/cdr targeting root, try
+        // to demote that slot directly) but reclaimed nested
+        // closure-env structures in deeply-recursive
+        // metacircular workloads — even with the
+        // strong-count guard, recursive go-closure traversal
+        // through env_su found enough demote candidates to
+        // make some env subtree unreachable mid-computation.
+        // The robust fix requires reconstructing the cycle
+        // path and applying full Bacon-Rajan trial deletion
+        // (counting internal vs external edges per cycle
+        // node, picking a safe-to-weaken edge). Deferred —
+        // see ADR 0014 §"iter 7.1.x.z note". The iter
+        // 7.1.x.y caller-supplied baseline at the root level
+        // remains the in-tree safe demote path.
+        let car = self.car();
+        car.visit_children(ctx);
+        if ctx.done() {
+            return;
+        }
+        let cdr = self.cdr();
+        cdr.visit_children(ctx);
     }
 }
 
@@ -86,15 +441,27 @@ impl Hashtable {
     }
 }
 
-impl cs_gc::Trace for Hashtable {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
+impl cs_gc::cycle::CycleVisit for Hashtable {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         for (k, v) in self.items.borrow().iter() {
-            k.trace(marker);
-            v.trace(marker);
+            if ctx.done() {
+                return;
+            }
+            k.visit_children(ctx);
+            if ctx.done() {
+                return;
+            }
+            v.visit_children(ctx);
         }
         if let Some(c) = &self.custom {
-            c.hash.trace(marker);
-            c.equiv.trace(marker);
+            if ctx.done() {
+                return;
+            }
+            c.hash.visit_children(ctx);
+            if ctx.done() {
+                return;
+            }
+            c.equiv.visit_children(ctx);
         }
     }
 }
@@ -116,20 +483,20 @@ pub enum Port {
     FileOutput(RefCell<FileOutputState>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileOutputState {
     pub path: String,
     pub buf: Vec<u8>,
     pub closed: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StringInputState {
     pub chars: Vec<char>,
     pub pos: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ByteVectorInputState {
     pub bytes: Vec<u8>,
     pub pos: usize,
@@ -192,11 +559,9 @@ impl Port {
     }
 }
 
-impl cs_gc::Trace for Port {
-    fn trace(&self, _marker: &mut cs_gc::Marker) {
-        // Leaf: every Port variant holds either chars/bytes/Strings or a
-        // file-output buffer. None contain a Value or Gc<T>, so there's
-        // nothing to mark transitively.
+impl cs_gc::cycle::CycleVisit for Port {
+    fn visit_children(&self, _ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Leaf: Port variants hold no Gc<...> children.
     }
 }
 
@@ -222,10 +587,10 @@ impl Promise {
     }
 }
 
-impl cs_gc::Trace for Promise {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
+impl cs_gc::cycle::CycleVisit for Promise {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         match &*self.state.borrow() {
-            PromiseState::Pending(v) | PromiseState::Forced(v) => v.trace(marker),
+            PromiseState::Pending(v) | PromiseState::Forced(v) => v.visit_children(ctx),
         }
     }
 }
@@ -233,15 +598,26 @@ impl cs_gc::Trace for Promise {
 /// Type-erased procedure dispatch. Concrete builtin and closure types live in
 /// `cs-runtime`; eval downcasts via [`as_any`].
 ///
-/// Procedure has `cs_gc::Trace` as a supertrait so closure environments
-/// (and any `Value` fields stored inside concrete procedure types)
-/// participate in GC tracing. Most builtins are leaves (their `trace` is
-/// empty); closures and parameters mark their captured Values.
-pub trait Procedure: fmt::Debug + cs_gc::Trace + 'static {
+/// Under the default (tracing) representation, Procedure has
+/// `cs_gc::Trace` as a supertrait so closure environments and parameter
+/// cells participate in mark-sweep tracing. Under
+/// `feature = "countable-memory"` the supertrait is gone — reclamation
+/// runs by Rc refcount alone — and Procedure gains an optional
+/// `visit_closure_children` method that the synchronous cycle
+/// collector consults when walking a Value::Procedure. Most builtins
+/// hold no Scheme heap children and inherit the empty default impl;
+/// only closures and Parameter override it.
+
+pub trait Procedure: fmt::Debug + 'static {
     fn as_any(&self) -> &dyn Any;
     fn name(&self) -> Option<&str> {
         None
     }
+    /// Visit every `Gc<...>` child this procedure holds in its
+    /// closure environment. Default impl is empty — appropriate
+    /// for builtins and zero-payload procedure markers. Closures,
+    /// continuations, and Parameter override it.
+    fn visit_closure_children(&self, _ctx: &mut cs_gc::cycle::CycleVisitor) {}
 }
 
 /// A dynamic parameter procedure (R6RS `make-parameter`). Lives in cs-core
@@ -259,11 +635,14 @@ impl Procedure for Parameter {
     fn name(&self) -> Option<&str> {
         Some("parameter")
     }
+    fn visit_closure_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        self.cell.borrow().visit_children(ctx);
+    }
 }
 
-impl cs_gc::Trace for Parameter {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        self.cell.borrow().trace(marker);
+impl cs_gc::cycle::CycleVisit for Parameter {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        self.cell.borrow().visit_children(ctx);
     }
 }
 
@@ -318,20 +697,59 @@ pub enum WriteMode {
 /// walker top frame and the VM root env, both of which are root closures.
 /// True cycles that go *through* `Rc<dyn Procedure>` would leak in
 /// Phase 1; the M5 spec's exit gate calls this out explicitly.
-impl cs_gc::Trace for Value {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
+
+/// Under countable-memory, every heap-bearing Value variant
+/// (including Procedure) participates in cycle detection. Pair
+/// /Vector/etc. forward through the cs_gc blanket impl for Gc<T>;
+/// Procedure forwards through the trait's `visit_closure_children`
+/// hook so concrete closures and parameters can enumerate their
+/// captured values without each Value match-arm knowing the
+/// concrete type.
+impl cs_gc::cycle::CycleVisit for Value {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         match self {
-            // Gc<T>-backed heap variants.
-            Value::String(s) => s.trace(marker),
-            Value::ByteVector(v) => v.trace(marker),
-            Value::Vector(v) => v.trace(marker),
-            Value::Pair(p) => p.trace(marker),
-            Value::Hashtable(h) => h.trace(marker),
-            Value::Port(p) => p.trace(marker),
-            Value::Promise(p) => p.trace(marker),
-            // Rc-backed (Phase 1 limitation, see doc above).
-            Value::Procedure(_) => {}
-            // Leaf variants — no heap pointers.
+            Value::String(s) => {
+                if ctx.visit(s) {
+                    s.visit_children(ctx);
+                }
+            }
+            Value::ByteVector(v) => {
+                if ctx.visit(v) {
+                    v.visit_children(ctx);
+                }
+            }
+            Value::Vector(v) => {
+                if ctx.visit(v) {
+                    v.visit_children(ctx);
+                }
+            }
+            Value::Pair(p) => {
+                if ctx.visit(p) {
+                    p.visit_children(ctx);
+                }
+            }
+            Value::Hashtable(h) => {
+                if ctx.visit(h) {
+                    h.visit_children(ctx);
+                }
+            }
+            Value::Port(p) => {
+                if ctx.visit(p) {
+                    p.visit_children(ctx);
+                }
+            }
+            Value::Promise(p) => {
+                if ctx.visit(p) {
+                    p.visit_children(ctx);
+                }
+            }
+            Value::Procedure(p) => {
+                // Procedure is Rc<dyn Procedure>; we don't have a
+                // Gc<...> to register identity for. Forward to the
+                // trait's closure-child hook so concrete impls
+                // enumerate their captured Gc<...> children.
+                p.visit_closure_children(ctx);
+            }
             Value::Null
             | Value::Unspecified
             | Value::Eof
@@ -367,6 +785,30 @@ impl Value {
 
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
+    }
+
+    /// Total strong-reference count for this Value's underlying
+    /// heap allocation, if any. Returns `None` for leaf values
+    /// (no allocation to count). Used by `Pair::break_*_cycle`'s
+    /// strong-count guard.
+    pub fn heap_strong_count(&self) -> Option<usize> {
+        match self {
+            Value::String(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Pair(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Vector(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::ByteVector(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Hashtable(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Port(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Promise(g) => Some(cs_gc::Gc::strong_count(g)),
+            Value::Procedure(rc) => Some(Rc::strong_count(rc)),
+            Value::Null
+            | Value::Unspecified
+            | Value::Eof
+            | Value::Boolean(_)
+            | Value::Character(_)
+            | Value::Symbol(_)
+            | Value::Number(_) => None,
+        }
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -513,8 +955,8 @@ fn write_pair_inner(
 ) -> fmt::Result {
     write!(out, "(")?;
     let mut first = true;
-    let mut cur_car = p.car.borrow().clone();
-    let mut cur_cdr = p.cdr.borrow().clone();
+    let mut cur_car = p.car();
+    let mut cur_cdr = p.cdr();
     loop {
         if !first {
             write!(out, " ")?;
@@ -529,8 +971,8 @@ fn write_pair_inner(
                     write!(out, " . #<cycle>")?;
                     break;
                 }
-                cur_car = next.car.borrow().clone();
-                cur_cdr = next.cdr.borrow().clone();
+                cur_car = next.car();
+                cur_cdr = next.cdr();
             }
             other => {
                 write!(out, " . ")?;
@@ -616,8 +1058,8 @@ impl fmt::Display for Value {
 fn display_pair(f: &mut fmt::Formatter<'_>, p: &Pair) -> fmt::Result {
     write!(f, "(")?;
     let mut first = true;
-    let mut cur_car = p.car.borrow().clone();
-    let mut cur_cdr = p.cdr.borrow().clone();
+    let mut cur_car = p.car();
+    let mut cur_cdr = p.cdr();
     loop {
         if !first {
             write!(f, " ")?;
@@ -627,8 +1069,8 @@ fn display_pair(f: &mut fmt::Formatter<'_>, p: &Pair) -> fmt::Result {
         match cur_cdr {
             Value::Null => break,
             Value::Pair(next) => {
-                cur_car = next.car.borrow().clone();
-                cur_cdr = next.cdr.borrow().clone();
+                cur_car = next.car();
+                cur_cdr = next.cdr();
             }
             other => {
                 write!(f, " . {}", other)?;

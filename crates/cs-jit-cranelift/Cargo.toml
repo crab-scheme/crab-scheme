@@ -31,3 +31,7 @@ cs-vm = { workspace = true }
 # gate inside lowering.rs makes the `testing` module visible to both
 # our own unit tests and to integration crates that opt in.
 test-helpers = []
+# Layer 3 — Inst::ConsRegion lowering. Pulls in cs-vm's regions
+# feature so the JIT can reference `vm_alloc_pair_region_gc`.
+# Off by default; consumers (cs-runtime with `regions` on) opt in.
+regions = ["cs-vm/regions"]

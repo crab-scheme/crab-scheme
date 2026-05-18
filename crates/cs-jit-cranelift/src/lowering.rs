@@ -97,6 +97,14 @@ pub struct Lowerer {
     /// FuncId of `vm_alloc_pair(car, car_tag, cdr, cdr_tag) -> i64`.
     /// `Inst::Cons` lowers to a Cranelift call against this.
     alloc_pair_func: cranelift_module::FuncId,
+    /// FuncId of `vm_alloc_pair_region(car, car_tag, cdr, cdr_tag)
+    /// -> i64`. Layer-3 region-allocating counterpart;
+    /// `Inst::ConsRegion` lowers to a call against this. Only
+    /// declared when the `regions` feature is on (cs-vm's
+    /// `vm_alloc_pair_region_gc` is itself cfg-gated on
+    /// `regions + countable-memory`).
+    #[cfg(feature = "regions")]
+    alloc_pair_region_func: cranelift_module::FuncId,
     /// FuncId of `vm_pair_car(pair) -> i64`. Reserved for `car`
     /// lowering.
     #[allow(dead_code)]
@@ -878,6 +886,15 @@ impl Lowerer {
         // (vm_alloc_pair etc.) remain defined in cs-vm but become
         // unreachable from JIT'd code after this commit.
         builder.symbol("vm_alloc_pair", cs_vm::vm::vm_alloc_pair_gc as *const u8);
+        // Layer 3 — Inst::ConsRegion calls this region-allocating
+        // counterpart of vm_alloc_pair. The runtime helper resolves
+        // the current region via the cs-runtime resolver hook;
+        // falls back to Rc allocation if no region is in scope.
+        #[cfg(feature = "regions")]
+        builder.symbol(
+            "vm_alloc_pair_region",
+            cs_vm::vm::vm_alloc_pair_region_gc as *const u8,
+        );
         builder.symbol("vm_pair_car", cs_vm::vm::vm_pair_car_gc as *const u8);
         builder.symbol("vm_pair_cdr", cs_vm::vm::vm_pair_cdr_gc as *const u8);
         builder.symbol("vm_pair_p", cs_vm::vm::vm_pair_p_gc as *const u8);
@@ -1891,6 +1908,28 @@ impl Lowerer {
                 &alloc_pair_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_alloc_pair: {e}")))?;
+
+        // Layer 3 — region-allocating counterpart, same signature.
+        // The symbol resolves to cs-vm's `vm_alloc_pair_region_gc`
+        // (registered in the JIT builder above).
+        #[cfg(feature = "regions")]
+        let alloc_pair_region_func = {
+            let mut sig = module.make_signature();
+            sig.params.push(AbiParam::new(I64)); // car
+            sig.params.push(AbiParam::new(I64)); // car_tag
+            sig.params.push(AbiParam::new(I64)); // cdr
+            sig.params.push(AbiParam::new(I64)); // cdr_tag
+            sig.returns.push(AbiParam::new(I64));
+            module
+                .declare_function(
+                    "vm_alloc_pair_region",
+                    cranelift_module::Linkage::Import,
+                    &sig,
+                )
+                .map_err(|e| {
+                    JitError::Codegen(format!("declare_function vm_alloc_pair_region: {e}"))
+                })?
+        };
 
         // vm_pair_car(pair: i64) -> i64 and vm_pair_cdr same shape.
         let mut pair_accessor_sig = module.make_signature();
@@ -4481,6 +4520,8 @@ impl Lowerer {
             env_set_nb_func,
             env_define_local_nb_func,
             alloc_pair_func,
+            #[cfg(feature = "regions")]
+            alloc_pair_region_func,
             pair_car_func,
             pair_cdr_func,
             pair_p_func,
@@ -4922,6 +4963,7 @@ impl Lowerer {
                     | Inst::FlonumTrunc(_, _)
                     | Inst::FlonumRound(_, _)
                     | Inst::Cons(_, _, _, _, _)
+                    | Inst::ConsRegion(_, _, _, _, _)
                     | Inst::Car(_, _)
                     | Inst::Cdr(_, _)
                     | Inst::PairP(_, _)
@@ -5323,6 +5365,10 @@ impl Lowerer {
             let alloc_pair_fnref = self
                 .module
                 .declare_func_in_func(self.alloc_pair_func, builder.func);
+            #[cfg(feature = "regions")]
+            let alloc_pair_region_fnref = self
+                .module
+                .declare_func_in_func(self.alloc_pair_region_func, builder.func);
             let pair_car_fnref = self
                 .module
                 .declare_func_in_func(self.pair_car_func, builder.func);
@@ -6323,6 +6369,8 @@ impl Lowerer {
                         env_lookup_any_fnref,
                         env_set_fnref,
                         alloc_pair_fnref,
+                        #[cfg(feature = "regions")]
+                        alloc_pair_region_fnref,
                         pair_car_fnref,
                         pair_cdr_fnref,
                         pair_p_fnref,
@@ -7672,6 +7720,7 @@ fn lower_inst(
     env_lookup_any_fnref: cranelift_codegen::ir::FuncRef,
     env_set_fnref: cranelift_codegen::ir::FuncRef,
     alloc_pair_fnref: cranelift_codegen::ir::FuncRef,
+    #[cfg(feature = "regions")] alloc_pair_region_fnref: cranelift_codegen::ir::FuncRef,
     pair_car_fnref: cranelift_codegen::ir::FuncRef,
     pair_cdr_fnref: cranelift_codegen::ir::FuncRef,
     pair_p_fnref: cranelift_codegen::ir::FuncRef,
@@ -8152,6 +8201,43 @@ fn lower_inst(
             // discipline; M6 Phase 4 test suite is the canary.
             b.declare_value_needs_stack_map(result);
             map.insert(*dst, result);
+        }
+        #[cfg(feature = "regions")]
+        Inst::ConsRegion(dst, car, car_tag, cdr, cdr_tag) => {
+            // Layer 3 — region-allocating cons. Same shape as
+            // Inst::Cons but calls vm_alloc_pair_region (resolves
+            // to cs-vm's vm_alloc_pair_region_gc). The runtime
+            // helper consults the per-thread region-resolver to
+            // pick the current `cs_gc::Region`, falling back to
+            // Rc allocation if no region is in scope. The
+            // returned i64 carries the low-bit Region-tagged
+            // nanbox payload so the VM decoder can route through
+            // `Gc::from_raw_jit_region`.
+            let car_v = lookup(map, *car)?;
+            let cdr_v = lookup(map, *cdr)?;
+            let car_t = b.ins().iconst(I64, *car_tag as i64);
+            let cdr_t = b.ins().iconst(I64, *cdr_tag as i64);
+            let inst_ref = b
+                .ins()
+                .call(alloc_pair_region_fnref, &[car_v, car_t, cdr_v, cdr_t]);
+            let result = {
+                let results = b.inst_results(inst_ref);
+                if results.len() != 1 {
+                    return Err(JitError::Codegen(format!(
+                        "ConsRegion expected 1 result, got {}",
+                        results.len()
+                    )));
+                }
+                results[0]
+            };
+            b.declare_value_needs_stack_map(result);
+            map.insert(*dst, result);
+        }
+        #[cfg(not(feature = "regions"))]
+        Inst::ConsRegion(_, _, _, _, _) => {
+            return Err(JitError::Codegen(
+                "Inst::ConsRegion encountered but `regions` feature is disabled".into(),
+            ));
         }
         Inst::Car(dst, src) => {
             // Lowers to vm_pair_car_gc(pair_i64) -> i64. The runtime

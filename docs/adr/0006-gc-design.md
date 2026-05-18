@@ -1,7 +1,12 @@
 # ADR 0006: Garbage Collector Design (M5)
 
-> Status: Accepted
-> Date: 2026-05-09
+> **Status: Superseded by [ADR 0014 — Countable Memory](./0014-countable-memory.md)** as of 2026-05-17.
+> The Phase 1 → Phase 2 commitment recorded here is retired in
+> favor of refcount-only reclamation plus a synchronous local
+> cycle detector. The "hand-rolled vs `gc-arena`" decision and
+> the "precise vs conservative rooting" decision are unaffected.
+>
+> Originally Accepted: 2026-05-09
 > Roadmap milestone: M5 (Precise Tracing GC)
 > Spec: `.spec-workflow/specs/gc/`
 

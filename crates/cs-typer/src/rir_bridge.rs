@@ -38,7 +38,40 @@ use cs_core::Symbol;
 use cs_diag::Span;
 
 use crate::annotate::AnnotationTable;
+use crate::effect::{AllocEffect, EscapeKind};
 use crate::types::Type;
+
+/// Map an [`AllocEffect`] to a cs-rir [`Lifetime`] tag, given
+/// the surrounding region context (escape-analysis iter 4).
+///
+/// - `escapes = Local`: today routes to `Region(_)` if a
+///   region is in scope, else `Rc`. Stack allocation isn't
+///   wired yet.
+/// - `escapes = Region`: emits `Region(tag)` if a region is
+///   in scope; else falls back to `Rc` (the inferencer's
+///   region-only prediction can't be honoured without a
+///   region context).
+/// - `escapes = Heap` or `Unknown`: always `Rc` — the safe
+///   default that today's pipeline already does.
+/// - `may_cycle = true` with no `Traced` opt-in: stays on the
+///   Rc path (cycle detector handles it). Once the
+///   `tracing-revival` spec lands, may_cycle could promote
+///   to `Traced`; for iter 4 we don't make that leap.
+pub fn lifetime_from_effect(
+    effect: AllocEffect,
+    region: Option<cs_rir::RegionTag>,
+) -> cs_rir::Lifetime {
+    if !effect.allocates {
+        return cs_rir::Lifetime::Rc;
+    }
+    match effect.escapes {
+        EscapeKind::Heap | EscapeKind::Unknown => cs_rir::Lifetime::Rc,
+        EscapeKind::Region | EscapeKind::Local => match region {
+            Some(tag) => cs_rir::Lifetime::Region(tag),
+            None => cs_rir::Lifetime::Rc,
+        },
+    }
+}
 
 /// Lower a `cs_typer::Type` to the narrower `cs_rir::Type`.
 ///
@@ -303,5 +336,87 @@ mod tests {
         });
         let h = hints_by_name(&table);
         assert!(h.is_empty(), "non-proc ascription should not appear: {h:?}");
+    }
+
+    // ---- lifetime_from_effect (escape-analysis iter 4) ----
+
+    #[test]
+    fn lifetime_from_pure_effect_is_rc() {
+        // Non-allocating effects always lower to Rc — there's
+        // nothing to allocate, so the lifetime tag is moot.
+        assert_eq!(
+            lifetime_from_effect(AllocEffect::PURE, None),
+            cs_rir::Lifetime::Rc
+        );
+        assert_eq!(
+            lifetime_from_effect(AllocEffect::PURE, Some(cs_rir::RegionTag(1))),
+            cs_rir::Lifetime::Rc
+        );
+    }
+
+    #[test]
+    fn lifetime_from_heap_effect_is_rc_regardless_of_region() {
+        let heap = AllocEffect {
+            allocates: true,
+            escapes: EscapeKind::Heap,
+            may_cycle: false,
+        };
+        assert_eq!(
+            lifetime_from_effect(heap, Some(cs_rir::RegionTag(1))),
+            cs_rir::Lifetime::Rc
+        );
+    }
+
+    #[test]
+    fn lifetime_from_unknown_effect_is_rc() {
+        let unk = AllocEffect {
+            allocates: true,
+            escapes: EscapeKind::Unknown,
+            may_cycle: true,
+        };
+        assert_eq!(
+            lifetime_from_effect(unk, Some(cs_rir::RegionTag(1))),
+            cs_rir::Lifetime::Rc
+        );
+    }
+
+    #[test]
+    fn lifetime_from_region_effect_with_region_emits_region() {
+        let r = AllocEffect {
+            allocates: true,
+            escapes: EscapeKind::Region,
+            may_cycle: false,
+        };
+        let tag = cs_rir::RegionTag(7);
+        assert_eq!(
+            lifetime_from_effect(r, Some(tag)),
+            cs_rir::Lifetime::Region(tag)
+        );
+    }
+
+    #[test]
+    fn lifetime_from_region_effect_without_region_falls_back_to_rc() {
+        let r = AllocEffect {
+            allocates: true,
+            escapes: EscapeKind::Region,
+            may_cycle: false,
+        };
+        assert_eq!(lifetime_from_effect(r, None), cs_rir::Lifetime::Rc);
+    }
+
+    #[test]
+    fn lifetime_from_local_effect_with_region_emits_region() {
+        // Local routes the same as Region until stack-alloc
+        // dispatch lands.
+        let l = AllocEffect {
+            allocates: true,
+            escapes: EscapeKind::Local,
+            may_cycle: false,
+        };
+        let tag = cs_rir::RegionTag(3);
+        assert_eq!(
+            lifetime_from_effect(l, Some(tag)),
+            cs_rir::Lifetime::Region(tag)
+        );
     }
 }
