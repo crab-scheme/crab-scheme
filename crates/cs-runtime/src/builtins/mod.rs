@@ -712,6 +712,17 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // registry. Under default features (no
         // `tracing-cycle-collector`) it's a no-op.
         ("collect", b_collect),
+        // Gap B-2-lite: Scheme-callable region primitives so
+        // user code can reach layer 3 today (without waiting
+        // for the cs-vm opcode emit work). These three are
+        // pure builtins; `with-region` is higher-order, see
+        // higher_order_builtins below.
+        #[cfg(feature = "regions")]
+        ("cons-in-region", b_cons_in_region),
+        #[cfg(feature = "regions")]
+        ("make-vector-in-region", b_make_vector_in_region),
+        #[cfg(feature = "regions")]
+        ("make-string-in-region", b_make_string_in_region),
     ]
 }
 
@@ -721,9 +732,73 @@ fn b_collect(_args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unspecified)
 }
 
+/// `(cons-in-region car cdr)` — region-allocated cons.
+/// Requires an enclosing `(with-region thunk)` scope. The
+/// returned Pair lives until that region drops, regardless
+/// of how many handles outlive it (release-mode access to a
+/// dangling handle panics per Gap E-6).
+///
+/// Use case: hot allocation loops that the typer can't yet
+/// prove bounded but the programmer knows are. The
+/// allocator cost drops from ~50 ns/Rc to ~3.75 ns/region.
+#[cfg(feature = "regions")]
+fn b_cons_in_region(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("cons-in-region", "2", args.len()));
+    }
+    crate::alloc_dispatch::cons_in(
+        cs_rir::Lifetime::Region(cs_rir::RegionTag(0)),
+        args[0].clone(),
+        args[1].clone(),
+    )
+}
+
+#[cfg(feature = "regions")]
+fn b_make_vector_in_region(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("make-vector-in-region", "2", args.len()));
+    }
+    let n = as_int_i64("make-vector-in-region", &args[0])?;
+    if n < 0 {
+        return Err("make-vector-in-region: negative length".into());
+    }
+    crate::alloc_dispatch::make_vector_in(
+        cs_rir::Lifetime::Region(cs_rir::RegionTag(0)),
+        n as usize,
+        args[1].clone(),
+    )
+}
+
+#[cfg(feature = "regions")]
+fn b_make_string_in_region(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("make-string-in-region", "2", args.len()));
+    }
+    let n = as_int_i64("make-string-in-region", &args[0])?;
+    if n < 0 {
+        return Err("make-string-in-region: negative length".into());
+    }
+    let fill = match &args[1] {
+        Value::Character(c) => *c,
+        v => return Err(type_err("make-string-in-region", "character", v)),
+    };
+    crate::alloc_dispatch::make_string_in(
+        cs_rir::Lifetime::Region(cs_rir::RegionTag(0)),
+        n as usize,
+        fill,
+    )
+}
+
 pub fn higher_order_builtins() -> Vec<HoEntry> {
     vec![
         ("apply", b_apply),
+        // Gap B-2-lite: open a region scope, call `thunk`,
+        // close the region. Allocations made inside `thunk`
+        // via `cons-in-region` / `make-vector-in-region` /
+        // `make-string-in-region` live in that scope and
+        // bulk-free on exit.
+        #[cfg(feature = "regions")]
+        ("with-region", b_with_region),
         // (time-apply) lives as a Scheme-level wrapper in the
         // benchmark harness, not a builtin: the VM dispatches
         // higher-order builtins through marker-type downcasts
@@ -3244,6 +3319,56 @@ fn b_newline(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
 }
 
 // ---- higher-order builtins ----
+
+/// `(with-region thunk)` — open a fresh region, invoke
+/// `(thunk)`, close the region. Allocations made inside the
+/// thunk via `cons-in-region` / `make-vector-in-region` /
+/// `make-string-in-region` live in this region's bump arena
+/// and bulk-free on exit. Region cycles are handled by the
+/// bulk free regardless of internal back-edges.
+///
+/// The result is automatically deep-copied to Rc storage
+/// via `cs_core::promote::to_rc_deep` so it survives the
+/// region drop — programmers don't have to call
+/// promote-deep explicitly.
+///
+/// # Tier support
+///
+/// - **Walker tier**: fully supported (return any value
+///   shape; `to_rc_deep` handles the escape cleanly).
+/// - **VM/JIT tier**: works for non-heap return values
+///   (numbers, booleans, symbols). Heap returns from the
+///   VM dispatcher currently SIGSEGV after region drop —
+///   the VM's value-passing chain holds parallel handles
+///   the auto-promote doesn't reach. Tracked as a known
+///   limitation; for now, use the walker tier (`--tier
+///   walker`) when returning Pair/Vector from a
+///   with-region body.
+#[cfg(feature = "regions")]
+fn b_with_region(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("with-region", "1", args.len()));
+    }
+    let region = std::rc::Rc::new(cs_gc::Region::new());
+    let _guard = crate::regions::RegionScope::enter(std::rc::Rc::clone(&region));
+    let result = apply_procedure(&args[0], &[], ctx).map_err(|e| e.message())?;
+    // Build a fresh Rc-backed Value tree from the result.
+    // `to_rc_deep` clones-by-value (it never mutates the
+    // source), so even if the VM has parallel handles to
+    // the same Region Gc, the returned Value is fully
+    // independent and survives the region drop below.
+    // `promote_deep` (in-place mutation) was the original
+    // approach but doesn't handle the parallel-handle case
+    // — see promote.rs's `to_rc_deep` docs for the
+    // rationale.
+    let safe = cs_core::promote::to_rc_deep(&result);
+    drop(result);
+    drop(_guard);
+    // `region` (Rc<Region>) drops at end of fn — bump arena
+    // bulk-frees. `safe` has no Region handles so nothing
+    // dangles.
+    Ok(safe)
+}
 
 fn b_apply(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() < 2 {

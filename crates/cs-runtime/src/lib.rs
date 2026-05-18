@@ -456,6 +456,38 @@ impl Runtime {
                 }
             }),
         );
+        // Gap B-2-lite: VM-tier registration for
+        // `(with-region thunk)`. Mirrors the walker tier
+        // registration in `higher_order_builtins`. Calls
+        // the thunk inside a fresh RegionScope; allocations
+        // made via `cons-in-region` / `make-vector-in-region`
+        // / `make-string-in-region` inside the thunk live
+        // in that region's bump arena and bulk-free on exit.
+        #[cfg(feature = "regions")]
+        {
+            let wr_sym = syms.intern("with-region");
+            vm_env.define(
+                wr_sym,
+                cs_vm::vm::make_vm_builtin_syms("with-region", |args, st| {
+                    if args.len() != 1 {
+                        return Err("with-region: 1 arg".into());
+                    }
+                    let region = std::rc::Rc::new(cs_gc::Region::new());
+                    let _guard = regions::RegionScope::enter(std::rc::Rc::clone(&region));
+                    let res = cs_vm::vm::vm_call_sync(&args[0], &[], st)
+                        .map_err(|e| e.message.clone())?;
+                    // Deep-clone into Rc-backed Value so
+                    // parallel VM-side handles to region
+                    // allocations don't dangle after region
+                    // drop. See `to_rc_deep` in
+                    // cs-core/src/promote.rs.
+                    let safe = cs_core::promote::to_rc_deep(&res);
+                    drop(res);
+                    drop(_guard);
+                    Ok(safe)
+                }),
+            );
+        }
         let cip_sym = syms.intern("current-input-port");
         vm_env.define(cip_sym, cs_vm::vm::make_vm_current_input_port());
         let cop_sym = syms.intern("current-output-port");

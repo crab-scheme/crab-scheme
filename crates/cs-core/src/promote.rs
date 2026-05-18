@@ -44,6 +44,85 @@ pub trait Promote {
     fn promote_deep(&mut self);
 }
 
+/// Return a fresh, fully-Rc-backed copy of `v` — never
+/// mutates the source. Use this when you need the result
+/// to be safe across a region drop AND the caller might
+/// hold parallel references to the source value (e.g., the
+/// VM's value-passing chain).
+///
+/// `promote_deep` only mutates the handles it can reach
+/// from `self`. If the VM has independently cloned the same
+/// `Gc` elsewhere, that clone still dangles after region
+/// drop. `to_rc_deep` sidesteps this by building a brand-new
+/// value tree where every `Gc` is freshly Rc-allocated,
+/// regardless of what the source's handles look like.
+pub fn to_rc_deep(v: &Value) -> Value {
+    match v {
+        Value::Pair(p) => {
+            let car = to_rc_deep(&p.car());
+            let cdr = to_rc_deep(&p.cdr());
+            Value::Pair(Pair::new(car, cdr))
+        }
+        Value::Vector(g) => {
+            let cloned: Vec<Value> = g.borrow().iter().map(to_rc_deep).collect();
+            Value::Vector(cs_gc::Gc::new(RefCell::new(cloned)))
+        }
+        Value::String(g) => {
+            let cloned: String = g.borrow().clone();
+            Value::String(cs_gc::Gc::new(RefCell::new(cloned)))
+        }
+        Value::ByteVector(g) => {
+            let cloned: Vec<u8> = g.borrow().clone();
+            Value::ByteVector(cs_gc::Gc::new(RefCell::new(cloned)))
+        }
+        Value::Hashtable(h) => {
+            let items: Vec<(Value, Value)> = h
+                .items
+                .borrow()
+                .iter()
+                .map(|(k, val)| (to_rc_deep(k), to_rc_deep(val)))
+                .collect();
+            let new_ht = match (&h.eq_kind, &h.custom) {
+                (crate::HtEqKind::Custom, Some(cf)) => {
+                    Hashtable::new_custom(to_rc_deep(&cf.hash), to_rc_deep(&cf.equiv))
+                }
+                (kind, _) => Hashtable::new(*kind),
+            };
+            *new_ht.items.borrow_mut() = items;
+            Value::Hashtable(new_ht)
+        }
+        Value::Promise(p) => {
+            let new_state = match &*p.state.borrow() {
+                PromiseState::Pending(v) => PromiseState::Pending(to_rc_deep(v)),
+                PromiseState::Forced(v) => PromiseState::Forced(to_rc_deep(v)),
+            };
+            Value::Promise(cs_gc::Gc::new(Promise {
+                state: RefCell::new(new_state),
+            }))
+        }
+        Value::Port(_) => {
+            // Ports hold OS resources (file handles, etc.) —
+            // can't safely deep-clone. Caller must not
+            // return Ports from a region scope OR must
+            // ensure the port outlives the region (typically
+            // by allocating it via global Rc to start with,
+            // which is what `(open-input-file)` etc. already
+            // do — Port construction routes to Gc::new not
+            // Gc::new_in).
+            v.clone()
+        }
+        // Leaves and Procedure (already Rc<dyn>): just clone.
+        Value::Null
+        | Value::Unspecified
+        | Value::Eof
+        | Value::Boolean(_)
+        | Value::Character(_)
+        | Value::Symbol(_)
+        | Value::Number(_)
+        | Value::Procedure(_) => v.clone(),
+    }
+}
+
 impl Promote for Value {
     fn promote_deep(&mut self) {
         match self {
@@ -61,10 +140,19 @@ impl Promote for Value {
                 } else {
                     // Already Rc; still descend in case inner
                     // values contain Region handles.
-                    let mut car = p.car.borrow_mut();
-                    let mut cdr = p.cdr.borrow_mut();
+                    //
+                    // Use the safe accessors + setters (not
+                    // borrow_mut) so a concurrent borrow from
+                    // the VM's value-passing chain doesn't
+                    // RefCell-panic. Reads via car()/cdr() are
+                    // borrow-and-release; writes via set_car/
+                    // set_cdr re-borrow briefly.
+                    let mut car = p.car();
+                    let mut cdr = p.cdr();
                     car.promote_deep();
                     cdr.promote_deep();
+                    p.set_car(car);
+                    p.set_cdr(cdr);
                 }
             }
             Value::Vector(v) => {
@@ -75,10 +163,15 @@ impl Promote for Value {
                     }
                     *v = cs_gc::Gc::new(RefCell::new(cloned));
                 } else {
-                    let mut borrowed = v.borrow_mut();
-                    for elem in borrowed.iter_mut() {
+                    // Same borrow-discipline rationale as the
+                    // Pair Rc-arm above: snapshot then restore
+                    // via interior swap, so descent into inner
+                    // values doesn't re-enter the borrow.
+                    let mut snapshot: Vec<Value> = v.borrow().clone();
+                    for elem in snapshot.iter_mut() {
                         elem.promote_deep();
                     }
+                    *v.borrow_mut() = snapshot;
                 }
             }
             Value::String(s) => {
@@ -119,12 +212,16 @@ impl Promote for Value {
                     *h = new_ht;
                 } else {
                     // Rc-backed; descend in case items contain
-                    // region handles.
-                    let mut items = h.items.borrow_mut();
+                    // region handles. Snapshot-then-restore
+                    // pattern (same rationale as Pair/Vector
+                    // Rc-arms) to avoid borrow_mut held across
+                    // recursive promote_deep that may re-enter.
+                    let mut items: Vec<(Value, Value)> = h.items.borrow().clone();
                     for (k, val) in items.iter_mut() {
                         k.promote_deep();
                         val.promote_deep();
                     }
+                    *h.items.borrow_mut() = items;
                     // (custom fns are typically Rc Procedures
                     //  already; no work needed)
                 }
