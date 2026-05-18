@@ -61,7 +61,71 @@ Several downstream items want this:
 | **C6** | Minimal nested ellipsis `((p …) …)` with bare-pvar inner | **Done** | Yes — covers the canonical "list of lists" shape |
 | **C7** | Nested ellipsis with compound/prefixed inner: `((kw p …) …)` / `(((a b) …) …)` | **Done** | Final ellipsis grammar piece — `compile_sc_pattern` recurses through nested-ellipsis layers with depth-bumping wrappers |
 | **D** | Fender expressions (runtime eval, shared next-clause thunk) | **Done** | Yes — pvars in scope; thunk avoids CoreExpr duplication |
-| **E** | Proper hygiene tracking — mark-aware identifier comparison | pending | Replaces the Iter A symbol-eq stand-ins; needs SyntaxObject decision |
+| **E** | Hygiene-tracking surface + Iter A doc sharpening + `make-variable-transformer` stub | **Done** (doc-and-minor) | Yes — full SyntaxObject migration moved to post-1.0 track |
+| **post-1.0** | Full SyntaxObject migration: `Value::Identifier { name, mark }`, per-call marks, mark-aware bound/free-identifier=? | tracked | Touches ~45 files; needs its own ADR |
+
+## Iter E — Hygiene-tracking surface (doc-and-minor)
+
+Full R6RS hygiene with per-macro-call marks needs a
+`Value::Identifier { name, mark }` variant. Every site that
+currently matches `Value::Symbol(_)` (~45 files in
+cs-core/cs-runtime/cs-vm/cs-expand/test crates) would need to
+decide whether to accept Identifier as well. That migration is
+substantial and orthogonal to the grammar work in Iters A–D, so
+it's deferred to a post-1.0 SyntaxObject track.
+
+Iter E in this session lands the smaller items:
+
+* **`make-variable-transformer`** builtin (R6RS §12.3). Today's
+  stub returns the wrapped procedure unchanged. User code that
+  uses it for procedural-macro construction will at least
+  type-check; the variable-ref vs application distinction needs
+  the broader procedural-macro track to mean anything.
+* **Sharpened doc comments** on `bound-identifier=?` /
+  `free-identifier=?` / `datum->syntax` / `syntax->datum`
+  describing today-vs-future semantics. The big honesty: marks
+  encoded in symbol names (cs-expand's `\u{E000}` prefix
+  mechanism) DO flow through bound-identifier=? for the
+  within-one-expansion case, because distinct names intern to
+  distinct Symbols. Per-macro-call discrimination is the part
+  that needs SyntaxObject.
+* **Tests** pinning current behavior + documenting the gap:
+  see `crates/cs-runtime/tests/syntax_case_iter_e.rs` (9 tests
+  covering make-variable-transformer, bound-identifier=? on user
+  symbols, datum<->syntax round-trip). The Iter A
+  `bound_id_eq_distinguishes_marked_identifiers` test stays
+  `#[ignore]`d with an updated comment pointing at the post-1.0
+  SyntaxObject ADR.
+
+### Post-1.0 SyntaxObject migration sketch
+
+The path forward when the migration is undertaken:
+
+1. **Add `Value::Identifier { name: Symbol, mark: u64 }`** to
+   `cs_core::Value`. Symbol's mark is implicitly 0; Identifier
+   carries a per-expansion fresh `mark`.
+2. **`identifier?`** widens to `matches!(Value::Symbol|Identifier)`.
+3. **`bound-identifier=?`** compares `(name, mark)` pairs;
+   Symbol has mark=0.
+4. **`free-identifier=?`** resolves both identifiers in the
+   runtime environment, following mark-induced rename chains
+   (today this falls back to name-eq since no chains exist).
+5. **`syntax-case` template instantiator** stamps each
+   non-pvar identifier with a fresh `mark` (one per
+   macro-expansion). Pvar substitutions inherit their original
+   identifier (including any mark).
+6. **`(let ((x …)) …)` and other binding forms** alpha-rename
+   to handle mark-induced shadowing.
+7. **`eq?` / `eqv?`** on Identifier: by `(name, mark)` (so the
+   user can use eq? on identifiers as a hashable key).
+8. **`symbol?`** stays Symbol-only; `identifier?` is the
+   widening predicate.
+
+The ~45 files affected: every `match` on `Value::Symbol(_)`
+needs to decide between (a) accept Identifier transparently
+(extract `.name`), (b) reject Identifier with a TypeError, or
+(c) treat Identifier specially. (a) is the right default for
+most predicates.
 
 ## Iter D — Fender expressions
 

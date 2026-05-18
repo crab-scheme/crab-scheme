@@ -122,12 +122,19 @@ fn id_eq_predicates_reject_non_identifiers() {
 }
 
 #[test]
-#[ignore = "needs #118 Iter E (mark-aware comparison)"]
+#[ignore = "blocked on SyntaxObject Value variant (post-1.0 track)"]
 fn bound_id_eq_distinguishes_marked_identifiers() {
-    // Two identifiers with the same name but introduced via
-    // different macros should compare unequal under
-    // bound-identifier=?. Today they compare equal because marks
-    // aren't tracked.
+    // Two identifiers with the same readable name but introduced
+    // via different macro call sites should compare unequal under
+    // R6RS bound-identifier=?. Today they collapse to symbol-eq
+    // because Value::Symbol doesn't carry per-call marks.
+    //
+    // The fix requires adding a `Value::Identifier { name, mark }`
+    // variant that the syntax-case template instantiator stamps
+    // with a fresh per-expansion mark; bound-identifier=? then
+    // compares both fields. The migration touches ~45 files that
+    // currently `match` on `Value::Symbol(_)` -- tracked as a
+    // post-1.0 task in the plan doc's Iter E status section.
     let mut rt = Runtime::new();
     rt.eval_str(
         "<t>",

@@ -182,6 +182,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("datum->syntax", b_datum_to_syntax),
         ("bound-identifier=?", b_bound_identifier_eq),
         ("free-identifier=?", b_free_identifier_eq),
+        ("make-variable-transformer", b_make_variable_transformer),
         ("null?", b_null_p),
         ("list?", b_list_p),
         ("symbol?", b_symbol_p),
@@ -2431,9 +2432,21 @@ fn b_datum_to_syntax(args: &[Value]) -> Result<Value, String> {
 
 /// `(bound-identifier=? a b)` — R6RS §12.6. True iff `a` and `b`
 /// would refer to the same binding if substituted into a template.
-/// Today: name-equality on Symbols. Iter E refines this to compare
-/// names + accumulated marks; macros that introduce shadowing
-/// identifiers depend on the marks-aware version for correctness.
+///
+/// Today's semantics: name-equality on the underlying interned
+/// `Symbol`. Symbols whose printable name differs (e.g., the
+/// `\u{E000}`-prefixed template-marker carried by syntax-rules
+/// expansion) compare unequal even if their "user-readable" name
+/// matches -- so the existing partial-hygiene mechanism in
+/// cs-expand's syntax-rules engine flows through correctly for
+/// the within-one-expansion case.
+///
+/// What this DOESN'T capture: per-macro-call marks. Two
+/// `(mark-a x)` and `(mark-b x)` invocations both yield the
+/// user-visible symbol `x` with no per-call discriminator; full
+/// R6RS hygiene would distinguish them. That requires a
+/// `Value::Identifier { name, mark }` variant (the SyntaxObject
+/// migration tracked as a post-1.0 task) and isn't shipped here.
 fn b_bound_identifier_eq(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("bound-identifier=?", "2", args.len()));
@@ -2445,9 +2458,14 @@ fn b_bound_identifier_eq(args: &[Value]) -> Result<Value, String> {
 }
 
 /// `(free-identifier=? a b)` — R6RS §12.6. True iff `a` and `b`
-/// resolve to the same binding in their respective scopes. Today:
-/// name-equality on Symbols. Iter E walks both identifiers' lexical
-/// environments and compares binding identity.
+/// resolve to the same binding in their respective scopes.
+///
+/// Today's semantics: name-equality on the underlying `Symbol`.
+/// True R6RS semantics would walk each identifier's lexical
+/// environment, follow rename chains from the SyntaxObject
+/// marks, and compare the resolved binding identity. Without
+/// `Value::Identifier`, free-identifier=? reduces to
+/// bound-identifier=? -- both check name equality.
 fn b_free_identifier_eq(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("free-identifier=?", "2", args.len()));
@@ -2456,6 +2474,30 @@ fn b_free_identifier_eq(args: &[Value]) -> Result<Value, String> {
         (Value::Symbol(a), Value::Symbol(b)) => Ok(Value::Boolean(a == b)),
         _ => Err(type_err("free-identifier=?", "identifier", &args[0])),
     }
+}
+
+/// `(make-variable-transformer proc)` — R6RS §12.3. Wraps a
+/// transformer procedure so that it's invoked on *variable
+/// reference* occurrences as well as the usual application
+/// positions. R6RS-conformant macro systems use this to let
+/// `define-syntax` produce identifier macros.
+///
+/// Today's semantics: pass-through. We return the procedure
+/// unchanged; the macro architecture in cs-expand doesn't yet
+/// distinguish variable-ref from application transformer calls.
+/// Documenting the gap honestly here so user code that calls
+/// `make-variable-transformer` won't fail with "undefined" --
+/// it'll get the bare procedure back and only application-
+/// position substitution will work. Tracking ticket: post-1.0
+/// SyntaxObject + procedural-macro track.
+fn b_make_variable_transformer(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("make-variable-transformer", "1", args.len()));
+    }
+    if !matches!(args[0], Value::Procedure(_)) {
+        return Err(type_err("make-variable-transformer", "procedure", &args[0]));
+    }
+    Ok(args[0].clone())
 }
 
 /// `(generate-temporaries lst)` — R6RS §12.6. Returns a list of N
