@@ -757,6 +757,8 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("install-optimizer-pass!", b_install_optimizer_pass),
         ("remove-optimizer-pass!", b_remove_optimizer_pass),
         ("installed-optimizer-passes", b_installed_optimizer_passes),
+        // ADR 0015 L1.1 — environment predicate.
+        ("environment?", b_environment_p),
         ("apply", b_apply),
         // (time-apply) lives as a Scheme-level wrapper in the
         // benchmark harness, not a builtin: the VM dispatches
@@ -4607,15 +4609,15 @@ fn b_string_ge(args: &[Value]) -> Result<Value, String> {
 // expansion, so user types and standard types share one registry.
 
 const COND_COMPOUND_TAG: &str = "&compound-condition";
-const TAG_MESSAGE: &str = "&message";
+pub(crate) const TAG_MESSAGE: &str = "&message";
 const TAG_IRRITANTS: &str = "&irritants";
 const TAG_WARNING: &str = "&warning";
 const TAG_SERIOUS: &str = "&serious";
 const TAG_ERROR: &str = "&error";
 const TAG_VIOLATION: &str = "&violation";
-const TAG_ASSERTION: &str = "&assertion";
+pub(crate) const TAG_ASSERTION: &str = "&assertion";
 const TAG_NON_CONTINUABLE: &str = "&non-continuable";
-const TAG_WHO: &str = "&who";
+pub(crate) const TAG_WHO: &str = "&who";
 const TAG_CONDITION: &str = "&condition";
 const TAG_FILE_ERROR: &str = "&file-error";
 const TAG_READ_ERROR: &str = "&read-error";
@@ -4884,7 +4886,7 @@ fn find_simple_with_tag(cond: &Value, tag: &str) -> Option<Value> {
 }
 
 /// Build a simple condition: `#("&<tag>" field0 field1 ...)`.
-fn make_simple(tag: &str, fields: Vec<Value>) -> Value {
+pub(crate) fn make_simple(tag: &str, fields: Vec<Value>) -> Value {
     let mut v = Vec::with_capacity(1 + fields.len());
     v.push(Value::string(tag));
     v.extend(fields);
@@ -4893,7 +4895,7 @@ fn make_simple(tag: &str, fields: Vec<Value>) -> Value {
 
 /// Wrap a list of simples in a compound condition vector. Always wraps —
 /// even a single simple — so the data shape is uniform.
-fn make_compound(simples: Vec<Value>) -> Value {
+pub(crate) fn make_compound(simples: Vec<Value>) -> Value {
     let mut v = Vec::with_capacity(1 + simples.len());
     v.push(Value::string(COND_COMPOUND_TAG));
     v.extend(simples);
@@ -10185,17 +10187,296 @@ pub fn exact_integer_sqrt_num(x: &Value) -> Result<(Value, Value), String> {
 
 // ---- environments ----
 //
-// Foundation: every binding is global, so all `environment` /
-// `interaction-environment` calls return the same opaque sentinel.
-// `eval` accepts and ignores the env argument. Real per-import
-// environments will land alongside library namespace filtering.
+// ADR 0015 L1.1: `(environment <import-spec> ...)` builds a real
+// R6RS §15.2 immutable snapshot environment. The returned value
+// is a vector record:
+//
+//   #('__environment__ <bindings-alist> <mutable?>)
+//
+// where the alist captures (sym . value) pairs at construction
+// time. `eval` recognizes this shape and runs the expanded
+// program against a Frame::immutable_root built from the alist.
+//
+// Import-spec resolution is hardcoded for the (rnrs base) set
+// at this milestone. Library membership metadata at the builtin
+// level is a future iter (L1.3 composite construction); for now
+// passing any other import spec returns an "unknown library"
+// error so future-incompatible code doesn't silently work.
 
-fn b_environment(_args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
-    // R6RS allows any number of import-specs; we accept and ignore.
-    Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
+/// Sentinel marking a Vector value as an R6RS environment record.
+pub(crate) const ENV_TAG: &str = "__environment__";
+
+/// Hardcoded (rnrs base) export list — the R6RS §11 base library
+/// names that the runtime registers as global builtins. NOT the
+/// full R6RS surface; targets the names the L1.1 acceptance
+/// tests need + the obvious-to-include arithmetic / list / I/O
+/// procedures. L1.3 (composite construction) replaces this
+/// with library-membership metadata at builtin-registration
+/// time.
+const RNRS_BASE_EXPORTS: &[&str] = &[
+    // arithmetic
+    "+",
+    "-",
+    "*",
+    "/",
+    "=",
+    "<",
+    ">",
+    "<=",
+    ">=",
+    "abs",
+    "min",
+    "max",
+    "modulo",
+    "quotient",
+    "remainder",
+    "expt",
+    "gcd",
+    "lcm",
+    "floor",
+    "ceiling",
+    "truncate",
+    "round",
+    "zero?",
+    "positive?",
+    "negative?",
+    "odd?",
+    "even?",
+    "square",
+    // number predicates
+    "number?",
+    "integer?",
+    "rational?",
+    "real?",
+    "complex?",
+    "exact?",
+    "inexact?",
+    "exact-integer?",
+    "exact->inexact",
+    "inexact->exact",
+    "number->string",
+    "string->number",
+    // list ops
+    "pair?",
+    "cons",
+    "car",
+    "cdr",
+    "set-car!",
+    "set-cdr!",
+    "null?",
+    "list",
+    "list?",
+    "length",
+    "append",
+    "reverse",
+    "list-tail",
+    "list-ref",
+    "map",
+    "for-each",
+    "memq",
+    "memv",
+    "member",
+    "assq",
+    "assv",
+    "assoc",
+    // booleans + equality
+    "not",
+    "boolean?",
+    "eq?",
+    "eqv?",
+    "equal?",
+    // strings
+    "string?",
+    "string",
+    "string-length",
+    "string-ref",
+    "substring",
+    "string-append",
+    "string->list",
+    "list->string",
+    "string->symbol",
+    // chars
+    "char?",
+    "char->integer",
+    "integer->char",
+    // vectors
+    "vector?",
+    "make-vector",
+    "vector",
+    "vector-length",
+    "vector-ref",
+    "vector-set!",
+    "vector->list",
+    "list->vector",
+    // symbols
+    "symbol?",
+    "symbol->string",
+    // procedures
+    "procedure?",
+    "apply",
+    // exceptions
+    "error",
+    "raise",
+    "raise-continuable",
+    "with-exception-handler",
+    // I/O minimum
+    "display",
+    "write",
+    "newline",
+    // eval / environment (so guests can themselves construct envs)
+    "eval",
+    "environment",
+];
+
+/// Resolve an import-spec datum (a list like `'(rnrs base)`) into
+/// the set of names it exports. Returns `Err` for any spec we
+/// don't yet know about; user code gets a clear "unknown library"
+/// rather than a silent empty environment.
+fn resolve_import_spec(
+    spec: &Value,
+    syms: &SymbolTable,
+) -> Result<&'static [&'static str], String> {
+    // Per R6RS, an import-spec can carry a trailing version
+    // sublist (e.g. `(rnrs base (6))`). Strip it. L1.1 also
+    // aliases `(rnrs lists)` and `(rnrs)` to the same approved-
+    // base set — permissive but preserves R6RS conformance; L1.3
+    // splits them via per-library binding metadata.
+    let parts = collect_proper_list("environment", spec)?;
+    let symbol_parts: Vec<&Value> = parts
+        .iter()
+        .take_while(|v| matches!(v, Value::Symbol(_)))
+        .collect();
+    let tail_len = parts.len() - symbol_parts.len();
+    if tail_len > 0 {
+        // Only acceptable tail: a single trailing version
+        // sublist (which is a Pair or Null).
+        let tail = &parts[symbol_parts.len()..];
+        if tail_len != 1 || !matches!(&tail[0], Value::Pair(_) | Value::Null) {
+            return Err(format!(
+                "environment: import-spec part must be a symbol, got {:?}",
+                tail[0]
+            ));
+        }
+    }
+    let names: Vec<String> = symbol_parts
+        .iter()
+        .map(|v| match v {
+            Value::Symbol(s) => syms.name(*s).to_string(),
+            _ => unreachable!("take_while filter"),
+        })
+        .collect();
+    let joined = names.join(" ");
+    match joined.as_str() {
+        "rnrs base" | "scheme base" | "rnrs lists" | "rnrs" => Ok(RNRS_BASE_EXPORTS),
+        _ => Err(format!(
+            "environment: unknown library {:?} (only (rnrs base), (rnrs lists), \
+             (rnrs) supported at L1.1 — L1.3 follow-up adds per-library binding \
+             metadata)",
+            joined
+        )),
+    }
+}
+
+fn b_environment(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    // Collect the visible names across all requested import specs.
+    let mut visible: Vec<String> = Vec::new();
+    for spec in args {
+        let names = resolve_import_spec(spec, ctx.syms)?;
+        for n in names {
+            if !visible.iter().any(|x| x == n) {
+                visible.push((*n).to_string());
+            }
+        }
+    }
+    // Snapshot each name's value from the global top-level frame.
+    // Names registered as builtins (the vast majority of L1.1
+    // entries) are guaranteed present; missing names are silently
+    // dropped — they wouldn't be importable from a real library
+    // anyway.
+    let mut bindings: Vec<Value> = Vec::with_capacity(visible.len());
+    for name in &visible {
+        let sym = ctx.syms.intern(name);
+        if let Some(v) = ctx.top.get(sym) {
+            // Each binding is a Scheme pair (sym . value).
+            bindings.push(Value::Pair(Pair::new(Value::Symbol(sym), v)));
+        }
+    }
+    let alist = Value::list(bindings);
+    // Build the vector record: #('__environment__ <alist> #f).
+    let env = new_vector(vec![
+        Value::string(ENV_TAG),
+        alist,
+        Value::Boolean(false), // immutable for `environment`
+    ]);
+    Ok(env)
+}
+
+/// `(environment? v)` — true when `v` is an L1.1 environment record.
+fn b_environment_p(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("environment?", "1", args.len()));
+    }
+    Ok(Value::Boolean(is_environment_value(&args[0])))
+}
+
+/// Internal: check the L1.1 environment-record shape.
+pub(crate) fn is_environment_value(v: &Value) -> bool {
+    if let Value::Vector(items) = v {
+        let items = items.borrow();
+        if items.len() == 3 {
+            if let Value::String(s) = &items[0] {
+                return s.borrow().as_str() == ENV_TAG;
+            }
+        }
+    }
+    false
+}
+
+/// Internal: extract (bindings_map, mutable) from an environment
+/// value. Caller has already verified the shape via
+/// `is_environment_value`.
+pub(crate) fn decode_environment(
+    v: &Value,
+) -> Option<(std::collections::HashMap<cs_core::Symbol, Value>, bool)> {
+    let Value::Vector(items) = v else {
+        return None;
+    };
+    let items = items.borrow();
+    if items.len() != 3 {
+        return None;
+    }
+    if !matches!(&items[0], Value::String(s) if s.borrow().as_str() == ENV_TAG) {
+        return None;
+    }
+    let alist = &items[1];
+    let mutable = matches!(&items[2], Value::Boolean(true));
+    // Walk the alist; each element is a pair (sym . value).
+    let mut map = std::collections::HashMap::new();
+    let mut cur = alist.clone();
+    loop {
+        match cur {
+            Value::Null => break,
+            Value::Pair(p) => {
+                let head = p.car.borrow().clone();
+                let tail = p.cdr.borrow().clone();
+                if let Value::Pair(kv) = head {
+                    if let Value::Symbol(s) = kv.car.borrow().clone() {
+                        map.insert(s, kv.cdr.borrow().clone());
+                    }
+                }
+                cur = tail;
+            }
+            _ => break,
+        }
+    }
+    Some((map, mutable))
 }
 
 fn b_interaction_environment(_args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    // The interaction environment is the live top-level — not
+    // restricted. Returning a sentinel here means eval recognizes
+    // "no restriction" and uses ctx.top directly (preserving
+    // pre-L1.1 behavior).
     Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
 }
 
@@ -10272,7 +10553,30 @@ fn b_eval(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err(arity_err("eval", "1 or 2", args.len()));
     }
-    // We ignore the 2nd argument (environment) for foundation; always use top-level.
+    // ADR 0015 L1.1: when the 2nd arg is an environment record
+    // (Vector tagged `__environment__`), build an immutable root
+    // Frame from its snapshot bindings and run against that.
+    // Otherwise (sentinel symbol, missing, or unknown shape),
+    // fall back to the live top-level frame (pre-L1.1 behavior).
+    let restricted_env: Option<std::rc::Rc<crate::env::Frame>> = if args.len() == 2 {
+        if let Some((bindings, mutable)) = decode_environment(&args[1]) {
+            if mutable {
+                // L1.2 `make-namespace` returns a vector with the
+                // same tag but `mutable?` = #t. L1.1 doesn't ship
+                // that constructor; if a future iter does and a
+                // user passes one here, fall through to the
+                // pre-L1.1 path by treating it as no restriction.
+                None
+            } else {
+                Some(crate::env::Frame::immutable_root(bindings))
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let eval_frame = restricted_env.unwrap_or_else(|| ctx.top.clone());
     // Convert the Value back into a Datum-like form by serializing-then-parsing.
     let datum_str = args[0].format_with(ctx.syms, WriteMode::Write);
     // Parse datum_str into a Datum tree using a fresh file id.
@@ -10289,7 +10593,17 @@ fn b_eval(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         .expand_program(&data)
         .map_err(|e| format!("eval: expand error: {}", e.message()))?;
     drop(expander);
-    crate::eval::eval(&core, ctx.top.clone(), ctx).map_err(|e| e.message())
+    // If the eval raises a condition, propagate via the
+    // pending_raise side-channel so `guard` on the host side
+    // catches it as a real condition instead of a plain string
+    // error. Otherwise return the plain Err message.
+    crate::eval::eval(&core, eval_frame, ctx).map_err(|e| match e.kind {
+        crate::eval::EvalErrorKind::Raised(cond) => {
+            ctx.pending_raise = Some(cond);
+            "__raised__".to_string()
+        }
+        _ => e.message(),
+    })
 }
 
 // ---- load-shared-library ----

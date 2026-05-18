@@ -282,6 +282,26 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
             },
             CoreExpr::Set { name, value, span } => {
                 let v = eval(&value, cur_env.clone(), ctx)?;
+                // ADR 0015 L1.1: an `(environment ...)` snapshot
+                // builds an immutable root Frame. set! against a
+                // name defined in that frame raises &assertion
+                // rather than silently mutating or shadowing.
+                if cur_env.is_immutable_definition(name) {
+                    use crate::builtins::{
+                        make_compound, make_simple, TAG_ASSERTION, TAG_MESSAGE, TAG_WHO,
+                    };
+                    let cond = make_compound(vec![
+                        make_simple(TAG_ASSERTION, vec![]),
+                        make_simple(TAG_WHO, vec![Value::Symbol(ctx.syms.intern("set!"))]),
+                        make_simple(
+                            TAG_MESSAGE,
+                            vec![Value::string(
+                                "attempt to mutate immutable environment binding",
+                            )],
+                        ),
+                    ]);
+                    return Err(EvalError::raised(cond, span));
+                }
                 if !cur_env.set_existing(name, v.clone()) {
                     ctx.top.define(name, v);
                 }
