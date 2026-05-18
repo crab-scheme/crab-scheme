@@ -44,6 +44,22 @@ impl ExpandError {
 /// owned by a single layer.
 pub type IncludeResolver<'a> = dyn FnMut(&str) -> Option<(cs_diag::FileId, String)> + 'a;
 
+/// Callback the expander invokes when an `(import …)` form references a
+/// library that hasn't been declared in the current session. The
+/// resolver is given the library name spec (e.g., `(rnrs base)` or
+/// `(pkg http server)`) as a slice of interned symbols plus read-only
+/// access to the SymbolTable for printing, and returns
+/// `Some((file_id, source))` if it can locate the library file. The
+/// expander then parses + expands that source, expecting it to contain
+/// a matching `(library …)` declaration.
+///
+/// Architectural call: this is the integration seam for cs-pkg,
+/// `LIBRARY_PATH`-style search, or any other library-discovery
+/// mechanism. cs-expand stays agnostic — it never opens a file or
+/// names a package format.
+pub type LibraryResolver<'a> =
+    dyn FnMut(&[Symbol], &SymbolTable) -> Option<(cs_diag::FileId, String)> + 'a;
+
 pub struct Expander<'a> {
     pub syms: &'a mut SymbolTable,
     pub macros: &'a mut std::collections::HashMap<Symbol, Macro>,
@@ -55,6 +71,9 @@ pub struct Expander<'a> {
     gensym_counter: u32,
     /// Hook for `(include "path")` forms.
     include_resolver: Option<&'a mut IncludeResolver<'a>>,
+    /// Hook for `(import (name …))` forms whose library hasn't been
+    /// declared in this session. See [`LibraryResolver`].
+    library_resolver: Option<&'a mut LibraryResolver<'a>>,
     /// Per-Expander record-type registry. Populated each time
     /// `define-record-type` expands; consulted when a child names a
     /// `(parent <type-name>)` so we can resolve its tag chain and inherited
@@ -260,6 +279,7 @@ impl<'a> Expander<'a> {
             keywords,
             gensym_counter: 0,
             include_resolver: None,
+            library_resolver: None,
             record_types: std::collections::HashMap::new(),
             condition_types: std::collections::HashMap::new(),
             libraries: std::collections::HashMap::new(),
@@ -270,6 +290,16 @@ impl<'a> Expander<'a> {
     /// invoke this callback with the literal path string from the form.
     pub fn with_include_resolver(mut self, resolver: &'a mut IncludeResolver<'a>) -> Self {
         self.include_resolver = Some(resolver);
+        self
+    }
+
+    /// Install a library resolver. When `(import (name …))` references
+    /// a library not declared in this session, the expander calls
+    /// this with the symbol-list name; the resolver returns the
+    /// library file's source (or `None` to leave the import as a
+    /// no-op rename collector, matching the legacy behavior).
+    pub fn with_library_resolver(mut self, resolver: &'a mut LibraryResolver<'a>) -> Self {
+        self.library_resolver = Some(resolver);
         self
     }
 
@@ -668,20 +698,23 @@ impl<'a> Expander<'a> {
     /// library scope filters out non-imported names.
     fn expand_import(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
         let mut renames: Vec<(Symbol, Symbol)> = Vec::new();
+        let mut loaded_bodies: Vec<CoreExpr> = Vec::new();
         for spec in items {
-            self.collect_import_renames(spec, &mut renames)?;
+            self.collect_import_renames(spec, &mut renames, &mut loaded_bodies)?;
         }
-        if renames.is_empty() {
+        if renames.is_empty() && loaded_bodies.is_empty() {
             return Ok(CoreExpr::Const {
                 value: Value::Unspecified,
                 span,
             });
         }
+        // Splice the loaded library bodies FIRST so their top-level
+        // defines run before any subsequent renames refer to them.
+        let mut exprs: Vec<CoreExpr> = loaded_bodies;
         // Synthesize `(define <new> <old>)` for each rename. The
         // expander lowers top-level define to CoreExpr::Set, which the
         // runtime treats as a top-level binding (auto-defined on first
         // assignment), so the renamed name becomes a fresh global.
-        let mut exprs: Vec<CoreExpr> = Vec::with_capacity(renames.len());
         for (old, new) in renames {
             exprs.push(CoreExpr::Set {
                 name: new,
@@ -692,14 +725,76 @@ impl<'a> Expander<'a> {
         Ok(CoreExpr::Begin { exprs, span })
     }
 
+    /// Try to load a library that hasn't been declared in this
+    /// session. Returns the expanded library body's CoreExpr (a
+    /// Begin that includes the library's defines) if a resolver
+    /// was installed and produced a source. Returns `Ok(None)` if
+    /// no resolver was installed — the bare reference behaves as
+    /// before (no-op).
+    fn try_load_library(
+        &mut self,
+        name: &[Symbol],
+        span: Span,
+    ) -> Result<Option<CoreExpr>, ExpandError> {
+        // Already loaded in this session — nothing to do.
+        if self.libraries.contains_key(name) {
+            return Ok(None);
+        }
+        let (file_id, src) = match &mut self.library_resolver {
+            Some(r) => match r(name, self.syms) {
+                Some(loaded) => loaded,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        let data = cs_parse::read_all(file_id, &src, self.syms).map_err(|errs| {
+            let e = errs.into_iter().next().unwrap();
+            ExpandError::BadSyntax {
+                what: format!(
+                    "library {}: parse error: {}",
+                    format_library_name(name, self.syms),
+                    e.message()
+                ),
+                span,
+            }
+        })?;
+        // The loaded file should declare a `(library …)` form. Expand
+        // each top-level datum so the (library …) registration
+        // populates self.libraries and the body defines splice into
+        // the importer's scope.
+        let mut exprs: Vec<CoreExpr> = Vec::with_capacity(data.len());
+        for d in &data {
+            exprs.push(self.expand_top(d)?);
+        }
+        if !self.libraries.contains_key(name) {
+            return Err(ExpandError::BadSyntax {
+                what: format!(
+                    "library file did not declare library {}",
+                    format_library_name(name, self.syms)
+                ),
+                span,
+            });
+        }
+        Ok(Some(CoreExpr::Begin { exprs, span }))
+    }
+
     /// Walk an import-spec shape and accumulate any `rename` pairs into
     /// `out`. Other modifier shapes (`only`/`except`/`prefix`) are
     /// validated for syntactic well-formedness but contribute nothing —
     /// they become enforceable when we have per-library scopes.
+    ///
+    /// Bare library references — `(rnrs base)`, `(pkg http server)`,
+    /// etc. — additionally try to load the library file via
+    /// [`Self::try_load_library`] when a [`LibraryResolver`] is
+    /// installed and the library hasn't been declared in this
+    /// session. The expanded library body is pushed into
+    /// `loaded_bodies` so the caller can splice it into the
+    /// importer's compilation BEFORE the rename defines fire.
     fn collect_import_renames(
         &mut self,
         spec: &Datum,
         out: &mut Vec<(Symbol, Symbol)>,
+        loaded_bodies: &mut Vec<CoreExpr>,
     ) -> Result<(), ExpandError> {
         let parts = collect_proper_list_strict(spec).ok_or(ExpandError::BadSyntax {
             what: "import spec must be a list".into(),
@@ -727,7 +822,7 @@ impl<'a> Expander<'a> {
                         span: spec.span(),
                     });
                 }
-                self.collect_import_renames(&parts[1], out)?;
+                self.collect_import_renames(&parts[1], out, loaded_bodies)?;
                 for id in &parts[2..] {
                     if !matches!(id, Datum::Symbol(_, _)) {
                         return Err(ExpandError::BadSyntax {
@@ -745,7 +840,7 @@ impl<'a> Expander<'a> {
                         span: spec.span(),
                     });
                 }
-                self.collect_import_renames(&parts[1], out)?;
+                self.collect_import_renames(&parts[1], out, loaded_bodies)?;
                 if !matches!(&parts[2], Datum::Symbol(_, _)) {
                     return Err(ExpandError::BadSyntax {
                         what: "prefix: third element must be an identifier".into(),
@@ -761,7 +856,7 @@ impl<'a> Expander<'a> {
                         span: spec.span(),
                     });
                 }
-                self.collect_import_renames(&parts[1], out)?;
+                self.collect_import_renames(&parts[1], out, loaded_bodies)?;
                 for pair in &parts[2..] {
                     let pair_items =
                         collect_proper_list_strict(pair).ok_or(ExpandError::BadSyntax {
@@ -797,7 +892,17 @@ impl<'a> Expander<'a> {
                 return Ok(());
             }
         }
-        // Bare library reference — no rename effect.
+        // Bare library reference. Try to load the library via the
+        // installed LibraryResolver if it hasn't been declared in
+        // this session. Loading splices the library body's top-level
+        // forms (defines, macros, etc.) into the importer's scope —
+        // matching the legacy "library body splices into importer"
+        // semantics. No rename effect at this layer; per-library
+        // export filtering is its own milestone.
+        let name = self.parse_library_name(&parts, spec.span())?;
+        if let Some(body) = self.try_load_library(&name, spec.span())? {
+            loaded_bodies.push(body);
+        }
         Ok(())
     }
 
@@ -5067,6 +5172,12 @@ fn collect_proper_list_strict(d: &Datum) -> Option<Vec<Datum>> {
     }
 }
 
+/// Render a library name spec as `(seg seg seg)` for diagnostics.
+fn format_library_name(name: &[Symbol], syms: &SymbolTable) -> String {
+    let segs: Vec<&str> = name.iter().map(|s| syms.name(*s)).collect();
+    format!("({})", segs.join(" "))
+}
+
 /// Walks a Pair chain returning the spine of car-elements and the
 /// cdr of the last pair. For a proper list `(a b c)` the tail is
 /// `Datum::Null`. For an improper list `(a b . c)` the tail is the
@@ -5380,6 +5491,117 @@ mod tests {
             );
         } else {
             panic!("expected BadSyntax, got {:?}", r);
+        }
+    }
+
+    #[test]
+    fn library_resolver_loads_external_library() {
+        // The library declares (sample lib) and the importer pulls
+        // it in. The resolver must discriminate by name — the
+        // library's own (import) clause is empty here so we don't
+        // recurse, but a permissive resolver would loop on any
+        // nested import.
+        let importer_src = r#"
+            (import (sample lib))
+            (greeting)
+        "#;
+        let library_src = r#"
+            (library (sample lib)
+              (export greeting)
+              (import)
+              (define (greeting) 'hello))
+        "#;
+
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let importer_data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+
+        let library_src_owned = library_src.to_string();
+        let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+            let printed = format_library_name(name, syms);
+            if printed == "(sample lib)" {
+                Some((FileId(1), library_src_owned.clone()))
+            } else {
+                None
+            }
+        });
+        let mut exp = Expander::new(&mut syms, &mut macros).with_library_resolver(&mut *resolver);
+        exp.expand_program(&importer_data)
+            .expect("import + library load");
+    }
+
+    #[test]
+    fn library_resolver_not_installed_is_noop() {
+        // Without a resolver, an undeclared library import is a
+        // no-op (matches legacy behavior pre-#117).
+        let src = "(import (no-such lib))";
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let data = cs_parse::read_all(FileId(0), src, &mut syms).unwrap();
+        let mut exp = Expander::new(&mut syms, &mut macros);
+        exp.expand_program(&data)
+            .expect("no-resolver import is a no-op");
+    }
+
+    #[test]
+    fn library_resolver_called_only_once_for_same_lib() {
+        // Two imports of the same library in one Expander session
+        // should only resolve+load once. Use Rc<Cell> to observe.
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let library_src = "(library (single lib) (export x) (import) (define x 1))";
+        let importer_src = r#"
+            (import (single lib))
+            (import (single lib))
+        "#;
+
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_for_closure = calls.clone();
+        let library_src_owned = library_src.to_string();
+        let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+            let printed = format_library_name(name, syms);
+            if printed == "(single lib)" {
+                calls_for_closure.set(calls_for_closure.get() + 1);
+                Some((FileId(1), library_src_owned.clone()))
+            } else {
+                None
+            }
+        });
+        let mut exp = Expander::new(&mut syms, &mut macros).with_library_resolver(&mut *resolver);
+        exp.expand_program(&data)
+            .expect("two imports of one library");
+        drop(exp);
+
+        assert_eq!(calls.get(), 1, "library should be loaded exactly once");
+    }
+
+    #[test]
+    fn library_file_missing_declaration_errors() {
+        // Resolver returns source that does NOT declare the
+        // requested library. Should error.
+        let library_src = "(define oops 1)  ;; no (library …) declaration";
+        let importer_src = "(import (sample lib))";
+
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+
+        let library_src_owned = library_src.to_string();
+        let mut resolver: Box<LibraryResolver> =
+            Box::new(move |_name, _syms| Some((FileId(1), library_src_owned.clone())));
+        let mut exp = Expander::new(&mut syms, &mut macros).with_library_resolver(&mut *resolver);
+        let err = exp
+            .expand_program(&data)
+            .expect_err("missing library declaration should error");
+        if let ExpandError::BadSyntax { what, .. } = err {
+            assert!(what.contains("did not declare library"), "got: {}", what);
+        } else {
+            panic!("expected BadSyntax");
         }
     }
 }
