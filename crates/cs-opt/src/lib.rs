@@ -66,6 +66,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use cs_core::{Symbol, SymbolTable};
 use cs_rir::Function;
 
+pub mod passes;
+pub use passes::{register_builtins, BUILTIN_NAMES};
+
 // ---- Bucket: pass-ordering priority ----
 
 /// Pipeline-ordering bucket. Passes within the same bucket run in
