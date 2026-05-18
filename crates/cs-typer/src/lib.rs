@@ -34,6 +34,7 @@ pub mod effect;
 pub mod env;
 pub mod extract;
 pub mod infer;
+pub mod lifetime_lower;
 pub mod parse_ann;
 pub mod poly;
 pub mod rir_bridge;
@@ -49,6 +50,7 @@ pub use effect::{infer_effect, primitive_effect, AllocEffect, EscapeKind};
 pub use env::{Frame, TypeEnv};
 pub use extract::extract_annotations;
 pub use infer::infer;
+pub use lifetime_lower::lower_lifetimes;
 pub use parse_ann::{parse_type_ann, TypeAnn, TypeAnnError, TypeDatum};
 pub use poly::{instantiate, subst, unify};
 pub use rir_bridge::{
