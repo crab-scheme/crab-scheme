@@ -155,13 +155,6 @@ impl VersionRegistry {
         epoch
     }
 
-    /// Convenience for "this is the first time I'm registering
-    /// this module" — equivalent to `load()` when the module is
-    /// fresh.
-    pub fn register(&self, module: &str, exports: FxHashMap<String, Export>) -> u32 {
-        self.load(module, exports)
-    }
-
     /// Look up an export from the **current** version.
     pub fn lookup(&self, module: &str, name: &str) -> Option<Export> {
         let slot = self.modules.get(module)?;
