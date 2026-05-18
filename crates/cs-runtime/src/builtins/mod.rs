@@ -183,6 +183,13 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("bound-identifier=?", b_bound_identifier_eq),
         ("free-identifier=?", b_free_identifier_eq),
         ("make-variable-transformer", b_make_variable_transformer),
+        // Phase 1.5 Iter C internals: emitted by
+        // compile_syntax_template + expand_syntax_case to stamp
+        // template-introduced identifiers with per-expansion marks.
+        // Not part of the R6RS user surface; exposed as builtins
+        // so the generated code is a plain procedure call.
+        ("make-identifier", b_make_identifier),
+        ("fresh-mark!", b_fresh_mark),
         ("null?", b_null_p),
         ("list?", b_list_p),
         ("symbol?", b_symbol_p),
@@ -2501,6 +2508,53 @@ fn b_free_identifier_eq(args: &[Value]) -> Result<Value, String> {
         (Value::Symbol(a), Value::Symbol(b)) => Ok(Value::Boolean(a == b)),
         _ => Err(type_err("free-identifier=?", "identifier", &args[0])),
     }
+}
+
+/// `(make-identifier name mark)` — Phase 1.5 Iter C primitive.
+/// Constructs a `Value::Identifier { name, mark }`. Called by
+/// code emitted by `compile_syntax_template` for non-pvar
+/// identifiers in syntax-case templates; not part of the R6RS
+/// public surface, but exposed at the builtin layer so the
+/// generated code is a plain procedure call instead of needing
+/// a new CoreExpr variant.
+///
+/// `name` must be a Symbol (or Identifier, whose name is
+/// extracted); `mark` must be a non-negative fixnum.
+fn b_make_identifier(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("make-identifier", "2", args.len()));
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => *s,
+        Value::Identifier { name, .. } => *name,
+        v => return Err(type_err("make-identifier", "symbol or identifier", v)),
+    };
+    let mark = match &args[1] {
+        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as u64,
+        v => {
+            return Err(type_err("make-identifier", "non-negative fixnum mark", v));
+        }
+    };
+    Ok(Value::Identifier { name, mark })
+}
+
+/// `(fresh-mark!)` — Phase 1.5 Iter C primitive. Returns a
+/// globally-fresh `u64` value (as a fixnum) suitable for use as
+/// an identifier mark. Called once per syntax-case form
+/// evaluation; all introduced identifiers in that one
+/// macro-expansion share the resulting mark.
+///
+/// Counter is process-global via a thread-safe atomic. Starts
+/// at 1 so that mark=0 stays available as the "unmarked"
+/// (datum-introduced or reader-input) identifier marker.
+fn b_fresh_mark(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("fresh-mark!", "0", args.len()));
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MARK_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let mark = MARK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(Value::Number(Number::Fixnum(mark as i64)))
 }
 
 /// `(make-variable-transformer proc)` — R6RS §12.3. Wraps a

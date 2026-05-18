@@ -175,6 +175,14 @@ pub struct Expander<'a> {
     /// expansion time, so `(syntax X)` resolves correctly when X
     /// is bound at any surrounding scope.
     syntax_pvars: Vec<(Symbol, u32)>,
+    /// Stack of mark-expression Datums, one per enclosing
+    /// syntax-case form being expanded. The top-of-stack entry
+    /// is consumed by `compile_syntax_template` (Phase 1.5
+    /// Iter C) to stamp non-pvar identifiers in templates with
+    /// the right per-expansion mark. Standalone `(syntax T)`
+    /// outside any syntax-case body (empty stack) gets a
+    /// literal 0 (the "unmarked" identifier).
+    syntax_mark_exprs: Vec<Datum>,
 }
 
 /// Compile-time info recorded for each `(library ...)` declaration.
@@ -376,6 +384,7 @@ impl<'a> Expander<'a> {
             record_types: std::collections::HashMap::new(),
             condition_types: std::collections::HashMap::new(),
             syntax_pvars: Vec::new(),
+            syntax_mark_exprs: Vec::new(),
             libraries: std::collections::HashMap::new(),
         }
     }
@@ -2442,6 +2451,20 @@ impl<'a> Expander<'a> {
         // already-built Datum tree wraps body in `(let ((pv ext)
         // ...) body)`, but we still need to push pvars onto
         // `syntax_pvars` so nested `(syntax X)` sees them.
+        // Phase 1.5 Iter C: each syntax-case form gets one
+        // fresh mark, shared by every `(syntax T)` evaluation
+        // inside any clause body during this form's runtime
+        // invocation. Bound as `__sc-mark-N__` via the outer
+        // Letrec; pushed onto `syntax_mark_exprs` so
+        // `expand_syntax_form` can pick it up when compiling
+        // template-introduced identifiers.
+        self.gensym_counter += 1;
+        let mark_sym = self
+            .syms
+            .intern(&format!("__sc-mark-{}__", self.gensym_counter));
+        let mark_ref = Datum::Symbol(mark_sym, span);
+        self.syntax_mark_exprs.push(mark_ref);
+
         let key_expr = self.expand(&scrut)?;
         // Walk clauses in reverse so the final accumulator is the
         // else fallthrough (raises a no-match error).
@@ -2536,8 +2559,26 @@ impl<'a> Expander<'a> {
             }
         }
 
+        // Done with this syntax-case form's mark scope.
+        self.syntax_mark_exprs.pop();
+
+        // Outer Letrec binds both the scrutinee key AND the
+        // freshly-generated mark for the form. The mark binding
+        // calls `(fresh-mark!)` at form-eval time so every
+        // invocation of this syntax-case gets a distinct mark
+        // (the mechanism that makes two calls of the same
+        // macro-defining-syntax distinguishable under
+        // bound-identifier=?).
+        let fresh_mark_call = CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: self.syms.intern("fresh-mark!"),
+                span,
+            }),
+            args: vec![],
+            span,
+        };
         Ok(CoreExpr::Letrec {
-            bindings: vec![(key_sym, key_expr)],
+            bindings: vec![(key_sym, key_expr), (mark_sym, fresh_mark_call)],
             body: Rc::new(acc),
             span,
         })
@@ -2564,8 +2605,22 @@ impl<'a> Expander<'a> {
         // `(quote T)` -- but inside a syntax-case or with-syntax
         // body it transparently substitutes the bound pvars.
         let pvars_snapshot: Vec<(Symbol, u32)> = self.syntax_pvars.clone();
-        let compiled =
-            compile_syntax_template(&items[0], &pvars_snapshot, self.syms, &self.keywords);
+        // Top-of-stack mark expression for this `(syntax T)` form:
+        // when inside a syntax-case body, that's the body's
+        // `__sc-mark-N__` variable reference; standalone use
+        // gets the literal 0 (unmarked identifier).
+        let mark_expr = self
+            .syntax_mark_exprs
+            .last()
+            .cloned()
+            .unwrap_or_else(|| Datum::Number(cs_core::Number::Fixnum(0), span));
+        let compiled = compile_syntax_template(
+            &items[0],
+            &pvars_snapshot,
+            self.syms,
+            &self.keywords,
+            &mark_expr,
+        );
         self.expand(&compiled)
     }
 
@@ -6320,6 +6375,7 @@ fn compile_syntax_template(
     pvars: &[(Symbol, u32)],
     syms: &mut SymbolTable,
     kw: &Keywords,
+    mark_expr: &Datum,
 ) -> Datum {
     let span = t.span();
     let is_pvar = |s: Symbol| pvars.iter().any(|(p, _)| *p == s);
@@ -6328,8 +6384,24 @@ fn compile_syntax_template(
             if is_pvar(*s) {
                 Datum::Symbol(*s, span)
             } else {
+                // Phase 1.5 Iter C: template-introduced
+                // identifiers wrap as a hygienic Identifier
+                // carrying the surrounding (syntax-case ...)
+                // form's mark, so two macro call sites of the
+                // same template produce distinguishable values.
+                // For standalone `(syntax T)` outside any
+                // syntax-case body, `mark_expr` evaluates to 0
+                // (unmarked) -- see the caller in
+                // expand_syntax_form.
                 mk_list(
-                    vec![Datum::Symbol(kw.quote, span), Datum::Symbol(*s, span)],
+                    vec![
+                        Datum::Symbol(syms.intern("make-identifier"), span),
+                        mk_list(
+                            vec![Datum::Symbol(kw.quote, span), Datum::Symbol(*s, span)],
+                            span,
+                        ),
+                        mark_expr.clone(),
+                    ],
                     span,
                 )
             }
@@ -6356,8 +6428,9 @@ fn compile_syntax_template(
                                     // Splice: (cons 'p1 (cons 'p2 ... (cons 'pK sub)))
                                     let mut acc: Datum = Datum::Symbol(*s, span);
                                     for prefix in items[..n - 2].iter().rev() {
-                                        let car_expr =
-                                            compile_syntax_template(prefix, pvars, syms, kw);
+                                        let car_expr = compile_syntax_template(
+                                            prefix, pvars, syms, kw, mark_expr,
+                                        );
                                         acc = mk_list(
                                             vec![
                                                 Datum::Symbol(syms.intern("cons"), span),
@@ -6426,7 +6499,8 @@ fn compile_syntax_template(
                                     }
                                 })
                                 .collect();
-                            let inner_expr = compile_syntax_template(sub, &inner_pvars, syms, kw);
+                            let inner_expr =
+                                compile_syntax_template(sub, &inner_pvars, syms, kw, mark_expr);
                             // Build `(map (lambda (p1 p2 ... pK) <inner>) p1-list ... pK-list)`.
                             let lambda_params = mk_list(
                                 depth1_pvars
@@ -6450,7 +6524,8 @@ fn compile_syntax_template(
                             // (cons 'p1 (cons 'p2 ... (cons 'pK mapped)))
                             let mut acc = mapped;
                             for prefix in items[..n - 2].iter().rev() {
-                                let car_expr = compile_syntax_template(prefix, pvars, syms, kw);
+                                let car_expr =
+                                    compile_syntax_template(prefix, pvars, syms, kw, mark_expr);
                                 acc = mk_list(
                                     vec![Datum::Symbol(syms.intern("cons"), span), car_expr, acc],
                                     span,
@@ -6466,8 +6541,8 @@ fn compile_syntax_template(
                 Datum::Pair(a, b, _) => ((**a).clone(), (**b).clone()),
                 _ => unreachable!(),
             };
-            let car_expr = compile_syntax_template(&car, pvars, syms, kw);
-            let cdr_expr = compile_syntax_template(&cdr, pvars, syms, kw);
+            let car_expr = compile_syntax_template(&car, pvars, syms, kw, mark_expr);
+            let cdr_expr = compile_syntax_template(&cdr, pvars, syms, kw, mark_expr);
             mk_list(
                 vec![Datum::Symbol(syms.intern("cons"), span), car_expr, cdr_expr],
                 span,
