@@ -5080,19 +5080,72 @@ fn rename_binder_form(
 
     match kind {
         BinderFormKind::LetLike => {
-            // (let ((name val) ...) body ...)
+            // Two shapes for `let`:
+            //   (let ((name val) ...) body ...)         -- plain
+            //   (let LOOP ((name val) ...) body ...)    -- named (R7RS)
+            // letrec / letrec* / let* don't have a named form.
             if items.len() < 2 {
                 return rebuild_list(items.to_vec(), span);
             }
-            let bindings_datum = &items[1];
-            let body_datums = &items[2..];
+            // Detect named-let: head is `let` (after stripping
+            // marker) AND items[1] is a bare symbol (the loop
+            // name) AND items.len() >= 3.
+            let head_unmarked = match &items[0] {
+                Datum::Symbol(s, _) => {
+                    let n = syms.name(*s).to_string();
+                    if let Some(stripped) = n.strip_prefix(TEMPLATE_MARKER) {
+                        stripped.to_string()
+                    } else {
+                        n
+                    }
+                }
+                _ => String::new(),
+            };
+            let is_named_let = head_unmarked == "let"
+                && items.len() >= 3
+                && matches!(&items[1], Datum::Symbol(_, _));
+
+            let (loop_name_idx, bindings_idx, body_start_idx) = if is_named_let {
+                (Some(1usize), 2usize, 3usize)
+            } else {
+                (None, 1usize, 2usize)
+            };
+
+            // For named-let, the loop name is a binder visible
+            // throughout the body. Rename it (if marked) BEFORE
+            // processing bindings so any recursive references
+            // inside the body / step exprs see the fresh name.
+            if let Some(lni) = loop_name_idx {
+                let loop_datum = &items[lni];
+                let new_loop_datum = match loop_datum {
+                    Datum::Symbol(s, ns) if is_template_marked(*s, syms) => {
+                        let fresh = fresh_gensym(*s, counter, syms);
+                        local_renames.insert(*s, fresh);
+                        Datum::Symbol(fresh, *ns)
+                    }
+                    other => hygiene_pass(other, parent_renames, counter, syms),
+                };
+                // Stash for re-insertion in order: we'll push
+                // [head, loop_name, bindings, body...] below.
+                new_items.push(new_loop_datum);
+            }
+
+            let bindings_datum = &items[bindings_idx];
+            let body_datums = &items[body_start_idx..];
+
             // Process bindings: for each (name val), rename name if marked.
+            // Val evals in the outer scope (parent_renames + loop_name
+            // rename if named-let), not the binding-local scope.
             let bindings_items = collect_proper_list_strict(bindings_datum).unwrap_or_default();
             let mut new_bindings: Vec<Datum> = Vec::with_capacity(bindings_items.len());
+            // Snapshot of renames available for val expressions:
+            // includes the loop_name (for named-let) but NOT the
+            // about-to-be-introduced binding names.
+            let val_renames = local_renames.clone();
             for b in &bindings_items {
                 let parts = collect_proper_list_strict(b).unwrap_or_default();
                 if parts.len() != 2 {
-                    new_bindings.push(hygiene_pass(b, parent_renames, counter, syms));
+                    new_bindings.push(hygiene_pass(b, &val_renames, counter, syms));
                     continue;
                 }
                 let name_datum = &parts[0];
@@ -5105,8 +5158,7 @@ fn rename_binder_form(
                     }
                     other => hygiene_pass(other, parent_renames, counter, syms),
                 };
-                // val is evaluated in OUTER scope (parent_renames), not local.
-                let new_val = hygiene_pass(val_datum, parent_renames, counter, syms);
+                let new_val = hygiene_pass(val_datum, &val_renames, counter, syms);
                 new_bindings.push(rebuild_list(vec![new_name_datum, new_val], b.span()));
             }
             new_items.push(rebuild_list(new_bindings, bindings_datum.span()));
