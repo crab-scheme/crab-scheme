@@ -49,13 +49,38 @@ Several downstream items want this:
 
 ## Iter breakdown
 
-| Iter | Scope | Ships independently? |
-|------|-------|----------------------|
-| **A** | identifier?, syntax→datum, datum→syntax, generate-temporaries, bound-identifier=?, free-identifier=? as builtins | Yes — foundational surface, used by downstream Scheme code |
-| **B** | `syntax-case` form recognizer + matcher + single-template clause | Yes — covers ~80% of real-world syntax-case use without fenders |
-| **C** | `with-syntax`, `quasisyntax`/`unsyntax`/`unsyntax-splicing`, `(syntax X)` standalone | Yes — depends on B |
-| **D** | Fender expressions (expand-time Scheme eval) | Largest iter; may slip to Phase 2 |
-| **E** | Proper hygiene tracking — mark-aware identifier comparison | Replaces the Iter A symbol-eq stand-ins; needs SyntaxObject decision |
+| Iter | Scope | Status | Ships independently? |
+|------|-------|--------|----------------------|
+| **A** | identifier?, syntax→datum, datum→syntax, generate-temporaries, bound-identifier=?, free-identifier=? as builtins | **Done** (`08f0e0f`) | Yes — foundational surface, used by downstream Scheme code |
+| **B** | `syntax-case` form recognizer + matcher + single-template clause | **Done** | Yes — covers ~80% of real-world syntax-case use without fenders |
+| **C** | `with-syntax`, `quasisyntax`/`unsyntax`/`unsyntax-splicing`, ellipsis `…` in patterns/templates | pending | Yes — depends on B |
+| **D** | Fender expressions (expand-time Scheme eval) | pending | Largest iter; may slip to Phase 2 |
+| **E** | Proper hygiene tracking — mark-aware identifier comparison | pending | Replaces the Iter A symbol-eq stand-ins; needs SyntaxObject decision |
+
+## Iter B — `syntax-case` form
+
+Implemented in `cs-expand` as a desugaring to a `let` + `cond`
+chain over the scrutinee. For each clause:
+
+1. The pattern compiles to a boolean test (built up from
+   `pair?`/`null?`/`eq?`/`equal?` over `car`/`cdr` chains of the
+   key) plus a list of `(pvar, extractor)` bindings.
+2. The body is walked for `(syntax T)` forms which are rewritten
+   to template-instantiation expressions. Inside the rewrite:
+   * a bare symbol that's a pvar → reference the bound let-var
+   * a bare non-pvar symbol → `(quote T)`
+   * self-quoting atom → emit unchanged
+   * pair `(t1 . t2)` → `(cons <T t1> <T t2>)`
+3. Clauses chain into a `cond`; if none match, an `error` is
+   raised that names `syntax-case` and includes the key.
+
+Standalone `(syntax T)` (outside a syntax-case body) lowers to
+`(quote T)` — no pvars exist in that context until Iter C/D
+introduce them via `with-syntax` / fenders.
+
+**Deferred to Iter C**: ellipsis (`…`) in patterns or templates;
+vector patterns. A 3-element clause `(pat fender tmpl)` is
+rejected up front with a pointer to Iter D.
 
 ## Iter A — surface builtins
 

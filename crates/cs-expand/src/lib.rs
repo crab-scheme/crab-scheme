@@ -256,6 +256,8 @@ struct Keywords {
     let_syntax: Symbol,
     letrec_syntax: Symbol,
     syntax_rules: Symbol,
+    syntax_case: Symbol,
+    syntax_: Symbol,
     syntax_error: Symbol,
     ellipsis: Symbol,
     underscore: Symbol,
@@ -312,6 +314,8 @@ impl Keywords {
             let_syntax: syms.intern("let-syntax"),
             letrec_syntax: syms.intern("letrec-syntax"),
             syntax_rules: syms.intern("syntax-rules"),
+            syntax_case: syms.intern("syntax-case"),
+            syntax_: syms.intern("syntax"),
             syntax_error: syms.intern("syntax-error"),
             ellipsis: syms.intern("..."),
             underscore: syms.intern("_"),
@@ -1349,6 +1353,12 @@ impl<'a> Expander<'a> {
                 // malformed input pattern.
                 return self.expand_syntax_error(&tail_items, span);
             }
+            if s == self.keywords.syntax_case {
+                return self.expand_syntax_case(&tail_items, span);
+            }
+            if s == self.keywords.syntax_ {
+                return self.expand_syntax_form(&tail_items, span);
+            }
             if s == self.keywords.delay_force {
                 // R7RS delay-force: same expansion as delay (a thunk-wrapping
                 // promise). Force is the half that distinguishes them — it
@@ -2188,6 +2198,206 @@ impl<'a> Expander<'a> {
             body: Rc::new(acc),
             span,
         })
+    }
+
+    // ---- R6RS++ §12 (#118) Iter B: syntax-case form ----
+    //
+    // `(syntax-case <expr> (<literal>...) (<pattern> <template>) ...)`
+    //
+    // Iter B implements the runtime form: matches `<expr>` against
+    // each pattern in turn; on first match, evaluates the
+    // corresponding template with pattern variables in scope.
+    // The pattern grammar matches the syntax-rules subset (no
+    // ellipsis -- Iter C):
+    //   _                 wildcard, no binding
+    //   <literal-sym>     matches `eq?` to <literal-sym> (must
+    //                     appear in the literals list)
+    //   <pvar>            binds the matched value
+    //   <number|string|bool|char>  matches `equal?` to itself
+    //   ()                matches null
+    //   (<p> . <p>)       matches a pair
+    //   (<p1> <p2> ...)   matches a proper list of that length
+    //
+    // Template handling: scan the template body for `(syntax T)`
+    // forms and replace them with code that re-constructs T using
+    // the bound pattern variables. Outside `(syntax ...)` the body
+    // is ordinary Scheme code that can reference pvars by name.
+    //
+    // Desugars to:
+    //   (let ((__sc-key__ <expr>))
+    //     (cond [<test1> (let (<pvars1>) <body1>)]
+    //           [<test2> (let (<pvars2>) <body2>)]
+    //           ...
+    //           [else (error 'syntax-case "no matching pattern" __sc-key__)]))
+    //
+    // The desugared datum is fed back through `self.expand` so the
+    // existing `let`/`cond`/`error` handlers do the rest.
+    fn expand_syntax_case(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        if items.len() < 2 {
+            return Err(ExpandError::BadSyntax {
+                what: "syntax-case needs <expr> (<literal>...) <clause>...".into(),
+                span,
+            });
+        }
+        let scrut = items[0].clone();
+        let literals = collect_proper_list_strict(&items[1]).ok_or(ExpandError::BadSyntax {
+            what: "syntax-case literals must be a proper list".into(),
+            span: items[1].span(),
+        })?;
+        let mut literal_syms: Vec<Symbol> = Vec::with_capacity(literals.len());
+        for l in &literals {
+            match l {
+                Datum::Symbol(s, _) => literal_syms.push(*s),
+                _ => {
+                    return Err(ExpandError::BadSyntax {
+                        what: "syntax-case literal must be a symbol".into(),
+                        span: l.span(),
+                    });
+                }
+            }
+        }
+
+        let key_sym = self.syms.intern("__sc-key__");
+        let key_ref = Datum::Symbol(key_sym, span);
+
+        // Build cond clauses bottom-up so we can wrap with an else.
+        let cond_kw = Datum::Symbol(self.keywords.cond, span);
+        let else_kw = Datum::Symbol(self.keywords.else_, span);
+        let mut cond_clauses: Vec<Datum> = Vec::with_capacity(items.len() - 2 + 1);
+
+        for clause_d in &items[2..] {
+            let clause_parts =
+                collect_proper_list_strict(clause_d).ok_or(ExpandError::BadSyntax {
+                    what: "syntax-case clause must be (pattern template)".into(),
+                    span: clause_d.span(),
+                })?;
+            if clause_parts.len() < 2 {
+                return Err(ExpandError::BadSyntax {
+                    what: "syntax-case clause must have at least pattern + template".into(),
+                    span: clause_d.span(),
+                });
+            }
+            // Iter B: no fender support. (pattern template) only.
+            // A 3-element clause (pattern fender template) is rejected
+            // up front with a pointer to Iter D so users aren't
+            // confused by a silent misinterpretation.
+            if clause_parts.len() != 2 {
+                return Err(ExpandError::BadSyntax {
+                    what: "syntax-case fender expressions land in Iter D (#118 Iter D); for now use (pattern template)".into(),
+                    span: clause_d.span(),
+                });
+            }
+            let pat = &clause_parts[0];
+            let tmpl_body = &clause_parts[1];
+
+            let mut pvars: Vec<(Symbol, Datum)> = Vec::new();
+            let test = compile_sc_pattern(
+                pat,
+                key_ref.clone(),
+                &literal_syms,
+                &mut pvars,
+                self.syms,
+                &self.keywords,
+            )?;
+
+            // Translate the template: replace `(syntax T)` forms
+            // anywhere within the body with their compiled value.
+            let translated = rewrite_syntax_forms(
+                tmpl_body,
+                &pvars.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                self.syms,
+                &self.keywords,
+            )?;
+
+            // Wrap body in a let that binds pvars to their
+            // extractors against the key. Use plain `let` (parallel
+            // bindings on independent extractors are fine here).
+            let body_with_lets = if pvars.is_empty() {
+                translated
+            } else {
+                let mut binding_list = Datum::Null(clause_d.span());
+                for (pname, ext) in pvars.iter().rev() {
+                    let bind_pair = mk_list(
+                        vec![Datum::Symbol(*pname, clause_d.span()), ext.clone()],
+                        clause_d.span(),
+                    );
+                    binding_list =
+                        Datum::Pair(Rc::new(bind_pair), Rc::new(binding_list), clause_d.span());
+                }
+                mk_list(
+                    vec![
+                        Datum::Symbol(self.keywords.let_, clause_d.span()),
+                        binding_list,
+                        translated,
+                    ],
+                    clause_d.span(),
+                )
+            };
+
+            let cond_clause = mk_list(vec![test, body_with_lets], clause_d.span());
+            cond_clauses.push(cond_clause);
+        }
+
+        // Else clause: raise a syntax-case mismatch error. We use
+        // `error` (already a builtin) with a message + the key for
+        // diagnosis.
+        let error_call = mk_list(
+            vec![
+                Datum::Symbol(self.syms.intern("error"), span),
+                mk_list(
+                    vec![
+                        Datum::Symbol(self.keywords.quote, span),
+                        Datum::Symbol(self.syms.intern("syntax-case"), span),
+                    ],
+                    span,
+                ),
+                Datum::String(Rc::new("no matching pattern".to_string()), span),
+                key_ref.clone(),
+            ],
+            span,
+        );
+        cond_clauses.push(mk_list(vec![else_kw, error_call], span));
+
+        // (cond clause1 clause2 ... else-clause)
+        let cond_form = {
+            let mut all = vec![cond_kw];
+            all.extend(cond_clauses);
+            mk_list(all, span)
+        };
+
+        // (let ((__sc-key__ <scrut>)) <cond-form>)
+        let let_binding = mk_list(vec![Datum::Symbol(key_sym, span), scrut], span);
+        let bindings_list = mk_list(vec![let_binding], span);
+        let let_form = mk_list(
+            vec![
+                Datum::Symbol(self.keywords.let_, span),
+                bindings_list,
+                cond_form,
+            ],
+            span,
+        );
+
+        self.expand(&let_form)
+    }
+
+    /// Standalone `(syntax T)` outside of a syntax-case body. Iter
+    /// B treats this as `(quote T)` -- there are no pvars in scope
+    /// to substitute. Iter C extends this when used inside macro
+    /// transformers (with-syntax / quasisyntax) where pvars do
+    /// exist.
+    fn expand_syntax_form(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        if items.len() != 1 {
+            return Err(ExpandError::BadSyntax {
+                what: "syntax takes exactly 1 argument".into(),
+                span,
+            });
+        }
+        // (syntax T) at top level -> (quote T) for Iter B.
+        let quote_form = mk_list(
+            vec![Datum::Symbol(self.keywords.quote, span), items[0].clone()],
+            span,
+        );
+        self.expand(&quote_form)
     }
 
     /// `(do ((var init step) ...) (test result ...) body ...)`
@@ -5320,6 +5530,208 @@ fn rebuild_list_with_tail(items: Vec<Datum>, tail: Datum, _span: Span) -> Datum 
         acc = Datum::Pair(Rc::new(item), Rc::new(acc), s);
     }
     acc
+}
+
+/// Build a proper-list Datum from a vector of items at `span`.
+/// Used by the syntax-case desugarer to assemble synthesized
+/// forms before handing them back through `Expander::expand`.
+fn mk_list(items: Vec<Datum>, span: Span) -> Datum {
+    let mut acc = Datum::Null(span);
+    for item in items.into_iter().rev() {
+        acc = Datum::Pair(Rc::new(item), Rc::new(acc), span);
+    }
+    acc
+}
+
+/// Compile a syntax-case pattern into a boolean-valued test
+/// `Datum` over the key expression `key`, while collecting any
+/// pattern-variable bindings (each `(pvar, extractor-expr)`)
+/// into `pvars_out`.
+///
+/// Symbols in `literals` match by name (compiled to `eq?`).
+/// Other symbols become pattern variables that bind the matched
+/// sub-value. `_` is a wildcard (no binding, no constraint).
+///
+/// Returns the test-datum; the caller composes it into the
+/// outer `cond` clause and emits a `let` over `pvars_out` to
+/// bind the variables in the template body.
+fn compile_sc_pattern(
+    pat: &Datum,
+    key: Datum,
+    literals: &[Symbol],
+    pvars_out: &mut Vec<(Symbol, Datum)>,
+    syms: &mut SymbolTable,
+    kw: &Keywords,
+) -> Result<Datum, ExpandError> {
+    let span = pat.span();
+    let mk_sym =
+        |name: &str, syms: &mut SymbolTable| -> Datum { Datum::Symbol(syms.intern(name), span) };
+    match pat {
+        Datum::Symbol(s, _) if *s == kw.underscore => {
+            // Wildcard: matches anything, binds nothing.
+            Ok(Datum::Boolean(true, span))
+        }
+        Datum::Symbol(s, _) if literals.contains(s) => {
+            // Literal identifier: matches `eq?` to itself.
+            let eq_call = mk_list(
+                vec![
+                    mk_sym("eq?", syms),
+                    key,
+                    mk_list(
+                        vec![Datum::Symbol(kw.quote, span), Datum::Symbol(*s, span)],
+                        span,
+                    ),
+                ],
+                span,
+            );
+            Ok(eq_call)
+        }
+        Datum::Symbol(s, _) => {
+            // Pattern variable: matches anything, binds `s` to `key`.
+            pvars_out.push((*s, key));
+            Ok(Datum::Boolean(true, span))
+        }
+        Datum::Null(_) => {
+            // () matches null.
+            let test = mk_list(vec![mk_sym("null?", syms), key], span);
+            Ok(test)
+        }
+        Datum::Boolean(_, _)
+        | Datum::Number(_, _)
+        | Datum::Character(_, _)
+        | Datum::String(_, _) => {
+            // Self-quoting literal: matches `equal?`.
+            let lit_quote = mk_list(vec![Datum::Symbol(kw.quote, span), pat.clone()], span);
+            let test = mk_list(vec![mk_sym("equal?", syms), key, lit_quote], span);
+            Ok(test)
+        }
+        Datum::Pair(_, _, _) => {
+            // (p1 . p2) or (p1 p2 ... pn). Compile as the
+            // pair-spine traversal: test pair?, then sub-pattern
+            // on car (with key->car), then sub-pattern on cdr
+            // (with key->cdr). Combine with `and`.
+            let car_pat = match pat {
+                Datum::Pair(c, _, _) => (**c).clone(),
+                _ => unreachable!(),
+            };
+            let cdr_pat = match pat {
+                Datum::Pair(_, c, _) => (**c).clone(),
+                _ => unreachable!(),
+            };
+            let pair_test = mk_list(vec![mk_sym("pair?", syms), key.clone()], span);
+            let car_key = mk_list(vec![mk_sym("car", syms), key.clone()], span);
+            let cdr_key = mk_list(vec![mk_sym("cdr", syms), key], span);
+            let car_test = compile_sc_pattern(&car_pat, car_key, literals, pvars_out, syms, kw)?;
+            let cdr_test = compile_sc_pattern(&cdr_pat, cdr_key, literals, pvars_out, syms, kw)?;
+            Ok(mk_list(
+                vec![Datum::Symbol(kw.and, span), pair_test, car_test, cdr_test],
+                span,
+            ))
+        }
+        Datum::Vector(_, _) | Datum::ByteVector(_, _) => Err(ExpandError::BadSyntax {
+            what: "syntax-case vector patterns land in Iter C (#118 Iter C)".into(),
+            span,
+        }),
+    }
+}
+
+/// Walk a template body, replacing every `(syntax T)` form with
+/// the expression that reconstructs T using the bound pattern
+/// variables (`pvars`). Recursion stops at `(quote X)` forms --
+/// we never substitute inside a literal datum.
+///
+/// Translation rules for the `T` inside `(syntax T)`:
+///   - if T is a bare symbol that's in `pvars`: substitute the
+///     bound variable reference (so `(syntax foo)` -> `foo` when
+///     `foo` is a pvar)
+///   - else if T is a bare symbol: emit `(quote T)`
+///   - else if T is self-quoting: emit T directly
+///   - else if T is `()`: emit `(quote ())`
+///   - else if T is a pair `(t1 . t2)`: emit `(cons <T t1> <T t2>)`
+///
+/// Vectors are deferred to Iter C alongside ellipsis support.
+fn rewrite_syntax_forms(
+    body: &Datum,
+    pvars: &[Symbol],
+    syms: &mut SymbolTable,
+    kw: &Keywords,
+) -> Result<Datum, ExpandError> {
+    match body {
+        // Stop walking inside `(quote X)` -- literal datum.
+        Datum::Pair(head, _, _) => {
+            if let Datum::Symbol(s, _) = &**head {
+                if *s == kw.quote {
+                    return Ok(body.clone());
+                }
+                if *s == kw.syntax_ {
+                    // `(syntax T)` -> compiled template.
+                    let parts = collect_proper_list_strict(body).ok_or(ExpandError::BadSyntax {
+                        what: "syntax form must be (syntax T)".into(),
+                        span: body.span(),
+                    })?;
+                    if parts.len() != 2 {
+                        return Err(ExpandError::BadSyntax {
+                            what: "syntax takes exactly 1 argument".into(),
+                            span: body.span(),
+                        });
+                    }
+                    return Ok(compile_syntax_template(&parts[1], pvars, syms, kw));
+                }
+            }
+            // Otherwise: recurse into both car and cdr.
+            let (car, cdr, sp) = match body {
+                Datum::Pair(a, b, s) => (a, b, *s),
+                _ => unreachable!(),
+            };
+            let new_car = rewrite_syntax_forms(car, pvars, syms, kw)?;
+            let new_cdr = rewrite_syntax_forms(cdr, pvars, syms, kw)?;
+            Ok(Datum::Pair(Rc::new(new_car), Rc::new(new_cdr), sp))
+        }
+        // Atoms pass through.
+        _ => Ok(body.clone()),
+    }
+}
+
+/// Compile a `(syntax T)` template into an expression that, when
+/// evaluated, reproduces T with pattern-variable substitutions.
+fn compile_syntax_template(
+    t: &Datum,
+    pvars: &[Symbol],
+    syms: &mut SymbolTable,
+    kw: &Keywords,
+) -> Datum {
+    let span = t.span();
+    match t {
+        Datum::Symbol(s, _) => {
+            if pvars.contains(s) {
+                // Pattern variable: reference the bound let-var.
+                Datum::Symbol(*s, span)
+            } else {
+                // Non-pvar identifier: emit `(quote s)`.
+                mk_list(
+                    vec![Datum::Symbol(kw.quote, span), Datum::Symbol(*s, span)],
+                    span,
+                )
+            }
+        }
+        Datum::Null(_) => mk_list(vec![Datum::Symbol(kw.quote, span), t.clone()], span),
+        Datum::Pair(_, _, _) => {
+            // Compose `(cons <T car> <T cdr>)` recursively.
+            let (car, cdr) = match t {
+                Datum::Pair(a, b, _) => ((**a).clone(), (**b).clone()),
+                _ => unreachable!(),
+            };
+            let car_expr = compile_syntax_template(&car, pvars, syms, kw);
+            let cdr_expr = compile_syntax_template(&cdr, pvars, syms, kw);
+            mk_list(
+                vec![Datum::Symbol(syms.intern("cons"), span), car_expr, cdr_expr],
+                span,
+            )
+        }
+        // Self-quoting atoms (numbers, strings, chars, bools)
+        // already evaluate to themselves; emit unchanged.
+        _ => t.clone(),
+    }
 }
 
 /// Returns `(head, tail_items)` if `d` is a proper list of length ≥ 1.
