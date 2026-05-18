@@ -35,16 +35,14 @@
 //! | Forall(_, body)       | lowered body (vars become Any)            |
 //! | Var(_)                | `any/c`                                   |
 //!
-//! `list-of/c` and `vector-of/c` are NOT in the current contract
-//! library (Phase 2B.5 shipped `list/c` for fixed-length lists
-//! only). They're emitted here as the natural lowering and need a
-//! contract-lib addition before lowered code can actually run —
-//! that's a follow-up iter.
+//! `list-of/c` and `vector-of/c` ship in lib/contract as of Phase
+//! 4 iter 2 (variadic-element predicates).
 //!
-//! `Procedure_.rest` (variadic tail) is currently dropped — the
-//! arrow form doesn't express "variadic of type T". Encoded as a
-//! TODO; the only correct fully-general arrow needs an extension
-//! to the contract grammar (e.g., `(->* mandatory rest? rng)`).
+//! `Procedure_.rest` is honored as of Phase 4 iter 3: when present,
+//! the lowering emits `(->* (mandatory-doms ...) rest-pred rng)`
+//! which the contract library handles by checking each leading
+//! mandatory arg against its dom and every additional arg against
+//! rest-pred.
 
 use crate::types::{ProcType, Type};
 
@@ -99,15 +97,34 @@ pub fn type_to_contract(ty: &Type) -> String {
 }
 
 fn proc_type_to_arrow(proc: &ProcType) -> String {
-    let mut s = String::from("(->");
-    for p in &proc.params {
-        s.push(' ');
-        s.push_str(&type_to_contract(p));
+    match &proc.rest {
+        None => {
+            // Plain `(-> dom1 ... rng)` — fixed-arity case.
+            let mut s = String::from("(->");
+            for p in &proc.params {
+                s.push(' ');
+                s.push_str(&type_to_contract(p));
+            }
+            s.push(' ');
+            s.push_str(&type_to_contract(&proc.return_type));
+            s.push(')');
+            s
+        }
+        Some(rest_ty) => {
+            // Variadic-tail `(->* (mandatory-doms ...) rest-pred rng)`.
+            let mut s = String::from("(->* (");
+            for (i, p) in proc.params.iter().enumerate() {
+                if i > 0 {
+                    s.push(' ');
+                }
+                s.push_str(&type_to_contract(p));
+            }
+            s.push_str(") ");
+            s.push_str(&type_to_contract(rest_ty));
+            s.push(' ');
+            s.push_str(&type_to_contract(&proc.return_type));
+            s.push(')');
+            s
+        }
     }
-    // proc.rest is dropped — the contract grammar doesn't yet
-    // express variadic tails. Documented at module top.
-    s.push(' ');
-    s.push_str(&type_to_contract(&proc.return_type));
-    s.push(')');
-    s
 }

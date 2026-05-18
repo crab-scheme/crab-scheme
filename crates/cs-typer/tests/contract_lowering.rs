@@ -106,6 +106,47 @@ fn procedure_with_any_lowers_naturally() {
     assert_eq!(type_to_contract(&ty), "(-> any/c any/c)");
 }
 
+// ---- procedures with rest-arg (variadic tail) → (->* ...) ----
+
+#[test]
+fn procedure_with_rest_lowers_to_arrow_star() {
+    // (-> String Number ... Boolean) — one mandatory String,
+    // variadic Number tail, returns Boolean.
+    let ty = Type::Procedure_(Box::new(ProcType {
+        params: vec![Type::String],
+        return_type: Type::Boolean,
+        rest: Some(Type::Fixnum),
+        filter: None,
+    }));
+    assert_eq!(type_to_contract(&ty), "(->* (string?) integer? boolean?)");
+}
+
+#[test]
+fn nullary_mandatory_procedure_with_rest() {
+    // (-> Number ... Number) — no mandatories, all variadic.
+    let ty = Type::Procedure_(Box::new(ProcType {
+        params: vec![],
+        return_type: Type::Fixnum,
+        rest: Some(Type::Fixnum),
+        filter: None,
+    }));
+    assert_eq!(type_to_contract(&ty), "(->* () integer? integer?)");
+}
+
+#[test]
+fn procedure_with_multiple_mandatories_and_rest() {
+    let ty = Type::Procedure_(Box::new(ProcType {
+        params: vec![Type::String, Type::Boolean],
+        return_type: Type::Any,
+        rest: Some(Type::Any),
+        filter: None,
+    }));
+    assert_eq!(
+        type_to_contract(&ty),
+        "(->* (string? boolean?) any/c any/c)"
+    );
+}
+
 // ---- containers ----
 
 #[test]

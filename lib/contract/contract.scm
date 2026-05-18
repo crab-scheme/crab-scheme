@@ -109,11 +109,20 @@
 
 ; Wrap proc with the contract c. `name` identifies the wrapped
 ; procedure in blame messages.
+;
+; If the contract has a rest-pred slot (set by `->*`), dispatch
+; to the variadic-tail wrapper; otherwise use the standard arrow
+; semantics (single-domain variadic OR multi-domain fixed-arity).
 (define (apply-contract c proc name)
   (if (not (contract? c))
       (error 'apply-contract "not a contract" c))
   (if (not (procedure? proc))
       (error 'apply-contract "not a procedure" proc))
+  (if (contract-rest c)
+      (apply-contract-rest c proc name)
+      (apply-contract-arrow c proc name)))
+
+(define (apply-contract-arrow c proc name)
   (let* ((doms (contract-domains c))
          (rng (contract-range c))
          (desc (list '-> doms rng)))
@@ -155,6 +164,77 @@
                                    acc)))))))
              (result (apply proc checked-args)))
         (__apply-range rng result name desc)))))
+
+; (->* (dom1 dom2 ... domN) rest-pred rng)
+;
+; Mandatory-arity-N arrow with a variadic tail. The wrapped proc
+; must accept AT LEAST N args; the leading N are checked against
+; the per-position domain specs, every additional arg is checked
+; against rest-pred, and the result is checked against rng.
+;
+; Used by the cs-typer contract lowering for procedure types
+; whose ProcType.rest is set (Phase 4 iter 3). Racket spells it
+; `(->* mandatories optionals rest range)`; we drop the optionals
+; tier — Scheme has no optional-args concept at the procedure
+; level. The non-tail-rest case (no rest, just mandatories) is
+; what plain `(->)` already covers.
+(define (->* mandatory-doms rest-pred rng)
+  (cond
+    ((not (list? mandatory-doms))
+     (error '->* "mandatory-doms must be a list" mandatory-doms))
+    ((not (or (procedure? rest-pred) (contract? rest-pred)))
+     (error '->* "rest-pred must be a predicate or contract" rest-pred))
+    (else
+     ; Encode as a contract record with mandatory-doms as the
+     ; per-position domain list, rng as range, and rest-pred
+     ; stashed in a 4th slot. apply-contract is extended below to
+     ; honor the rest slot.
+     (vector '__contract__ mandatory-doms rng rest-pred))))
+
+(define (contract-rest c)
+  (if (>= (vector-length c) 4)
+      (vector-ref c 3)
+      #f))
+
+; Extend apply-contract: if the contract has a rest-pred (4-elt
+; vector), it's a variadic-tail arrow. We override the dispatch
+; below to handle that shape rather than rewriting the existing
+; apply-contract; the wrapper here is a thin specialization.
+;
+; Note: this could be folded into apply-contract by widening its
+; cond. Kept separate for now so iter 3's diff is local.
+(define (apply-contract-rest c proc name)
+  (let ((doms (contract-domains c))
+        (rng (contract-range c))
+        (rest-pred (contract-rest c)))
+    (let ((desc (list '->* doms rest-pred rng))
+          (n-doms (length doms)))
+      (lambda args
+        (let ((n-args (length args)))
+          (if (< n-args n-doms)
+              (raise (make-contract-violation
+                       'caller name desc
+                       (list 'arity-mismatch
+                             'expected (string->symbol ">=")
+                             n-doms 'got n-args))))
+          ; Check leading n-doms positions.
+          (let loop ((ds doms) (as args) (acc '()))
+            (if (null? ds)
+                ; Then check every remaining arg against rest-pred.
+                (let rloop ((rest as) (acc acc))
+                  (if (null? rest)
+                      (__apply-range
+                        rng
+                        (apply proc (reverse acc))
+                        name
+                        desc)
+                      (rloop (cdr rest)
+                             (cons (__apply-domain rest-pred (car rest) name desc)
+                                   acc))))
+                (loop (cdr ds)
+                      (cdr as)
+                      (cons (__apply-domain (car ds) (car as) name desc)
+                            acc)))))))))
 
 ; ============================================================
 ; Phase 2B.5 — combinators
