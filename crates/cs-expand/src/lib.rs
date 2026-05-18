@@ -347,6 +347,7 @@ struct Keywords {
     cond_expand: Symbol,
     include: Symbol,
     endianness: Symbol,
+    submodule: Symbol,
 }
 
 impl Keywords {
@@ -411,6 +412,7 @@ impl Keywords {
             cond_expand: syms.intern("cond-expand"),
             include: syms.intern("include"),
             endianness: syms.intern("endianness"),
+            submodule: syms.intern("submodule"),
         }
     }
 }
@@ -649,15 +651,109 @@ impl<'a> Expander<'a> {
         // is the next pre-M5 step. The export list is now validated
         // and tracked, so future scope work has the manifest to filter
         // against.
+        //
+        // Phase 3B: `(submodule NAME body...)` clauses inside the
+        // body are lifted into sibling library declarations named
+        // `(parent... NAME)` and expanded after the parent body so
+        // they can see the parent's defines (the global-namespace
+        // milestone means parent bindings are visible).
         let body = &items[3..];
         let mut exprs: Vec<CoreExpr> = Vec::with_capacity(body.len() + 1);
         // Run the import effects first so library bodies have access
         // to renamed bindings before their `define`s run.
         exprs.push(import_expr);
+        let mut deferred_submodules: Vec<CoreExpr> = Vec::new();
         for d in body {
+            if let Some((head, sub_tail)) = list_head(d) {
+                if let Datum::Symbol(s, _) = &*head {
+                    if *s == self.keywords.submodule {
+                        let lifted = self.lift_submodule(&name_syms, &sub_tail, d.span())?;
+                        deferred_submodules.push(lifted);
+                        continue;
+                    }
+                }
+            }
             exprs.push(self.expand_top(d)?);
         }
+        exprs.extend(deferred_submodules);
         Ok(CoreExpr::Begin { exprs, span })
+    }
+
+    /// Phase 3B: lift a `(submodule NAME body...)` into a sibling
+    /// library declaration named `(parent... NAME)` and expand it.
+    /// Submodules can optionally provide leading `(export ...)`
+    /// and/or `(import ...)` clauses; missing clauses default to
+    /// empty `(export)` / `(import)` respectively. Body expressions
+    /// see the parent's bindings because the library system is
+    /// still global at this milestone.
+    fn lift_submodule(
+        &mut self,
+        parent_name: &[Symbol],
+        tail: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        if tail.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "submodule needs a name".into(),
+                span,
+            });
+        }
+        let sub_name_sym = match &tail[0] {
+            Datum::Symbol(s, _) => *s,
+            _ => {
+                return Err(ExpandError::BadSyntax {
+                    what: "submodule name must be a single identifier".into(),
+                    span: tail[0].span(),
+                })
+            }
+        };
+        // Build the sibling library name list as datum form
+        // ((parent...) sub_name).
+        let mut full_name_parts: Vec<Datum> = parent_name
+            .iter()
+            .map(|s| Datum::Symbol(*s, span))
+            .collect();
+        full_name_parts.push(Datum::Symbol(sub_name_sym, span));
+        let name_datum = Self::datum_list(full_name_parts, span);
+
+        // Walk the rest of the submodule's body, extracting any
+        // leading `(export ...)` and `(import ...)` clauses, then
+        // the body expressions.
+        let mut export_clause: Option<Datum> = None;
+        let mut import_clause: Option<Datum> = None;
+        let mut body_items: Vec<Datum> = Vec::new();
+        for d in &tail[1..] {
+            if let Some((head, _)) = list_head(d) {
+                if let Datum::Symbol(s, _) = &*head {
+                    if *s == self.keywords.export && export_clause.is_none() {
+                        export_clause = Some(d.clone());
+                        continue;
+                    }
+                    if *s == self.keywords.import && import_clause.is_none() {
+                        import_clause = Some(d.clone());
+                        continue;
+                    }
+                }
+            }
+            body_items.push(d.clone());
+        }
+        let export_kw = self.keywords.export;
+        let import_kw = self.keywords.import;
+        let export_datum = export_clause
+            .unwrap_or_else(|| Self::datum_list(vec![Datum::Symbol(export_kw, span)], span));
+        let import_datum = import_clause
+            .unwrap_or_else(|| Self::datum_list(vec![Datum::Symbol(import_kw, span)], span));
+
+        // Synthesize (library (parent... sub) (export ...) (import ...) body...).
+        let mut library_parts: Vec<Datum> = vec![
+            Datum::Symbol(self.keywords.library, span),
+            name_datum,
+            export_datum,
+            import_datum,
+        ];
+        library_parts.extend(body_items);
+        let library_form = Self::datum_list(library_parts, span);
+        self.expand_top(&library_form)
     }
 
     /// Parse a library name datum list into the canonical symbol list,
