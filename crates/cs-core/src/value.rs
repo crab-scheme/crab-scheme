@@ -216,16 +216,70 @@ impl cs_gc::cycle::BreakCycle for Pair {
     }
 }
 
-/// Default no-op `BreakCycle` impls for cs-core's own heap-
-/// bearing types. Vector / String / ByteVector are
-/// `RefCell<…>`-wrapped (foreign types) — their no-op impls
-/// live in cs-gc to satisfy the orphan rule. The cycle
-/// counter still fires for these types; the sweep just
-/// can't reclaim — Vector / Hashtable would need their own
-/// per-slot break-cycle dispatch (a future iter). Documented
-/// limitation in ADR 0018 §"Scope".
+/// Gap C-3 ext: Hashtable layer-4 sweep dispatch. Scans the
+/// items vec for the first slot whose value is a heap-
+/// bearing `Value`; demotes it to `Unspecified`. Mirrors
+/// the conservative pattern from `Pair::break_cdr_cycle`:
+/// pick the first heap-bearing slot and break it.
+/// Returns `true` if a slot was demoted; `false` if the
+/// hashtable holds no heap-bearing values (no cycle to
+/// break).
+///
+/// Hashtable cycles in practice are rare — they form when a
+/// stored value transitively contains the hashtable itself
+/// (e.g., `(hashtable-set! h 'key h)`). The cycle detector
+/// (layer 2) flags these on the `hashtable-set!` site; this
+/// trait impl lets the layer-4 sweep also reclaim them.
 #[cfg(feature = "countable-memory")]
-impl cs_gc::cycle::BreakCycle for Hashtable {}
+impl cs_gc::cycle::BreakCycle for Hashtable {
+    fn try_break_cycle(&self) -> bool {
+        // Take a borrow; iterate looking for the first
+        // value slot that's heap-bearing (could close a
+        // cycle). Replace it with Unspecified.
+        let Ok(mut items) = self.items.try_borrow_mut() else {
+            // Borrow failed (mutating elsewhere); skip this
+            // sweep round, the next one will retry.
+            return false;
+        };
+        for (_k, v) in items.iter_mut() {
+            // Heap-bearing variants are exactly the ones
+            // that could form a cycle through the hashtable.
+            let demote = matches!(
+                v,
+                Value::Pair(_)
+                    | Value::Vector(_)
+                    | Value::Hashtable(_)
+                    | Value::Promise(_)
+                    | Value::String(_)
+                    | Value::ByteVector(_)
+            );
+            if demote {
+                *v = Value::Unspecified;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Default no-op `BreakCycle` impls for Port + Promise. Port
+/// holds no Gc children (its variants are all leaf states),
+/// so the cycle counter would never fire for it anyway.
+/// Promise stores a single Value which can hold Gc handles
+/// — a future iter could give Promise a real break impl
+/// (demote the pending/forced Value to Unspecified) but for
+/// now Promise cycles are rare in practice and the layer-2
+/// detector handles the common case.
+///
+/// Vector and String / ByteVector are `Gc<RefCell<...>>`
+/// where `RefCell` is foreign — the orphan rule prevents a
+/// per-type impl from cs-core. cs-gc's blanket `impl<T>
+/// BreakCycle for RefCell<T>` covers them with the default
+/// no-op. Real break dispatch for these would need either:
+/// (a) Rust trait specialization (unstable), or (b) a
+/// `Vector` newtype wrapper to take ownership of the inner
+/// type. Tracked as a known limitation in the gap-closure
+/// follow-on.
 #[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::BreakCycle for Port {}
 #[cfg(feature = "countable-memory")]

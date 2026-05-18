@@ -152,6 +152,32 @@ fn sweep_breaks_pair_self_cycle() {
 }
 
 #[test]
+fn sweep_breaks_hashtable_self_cycle() {
+    // Gap C-3 ext: hashtable self-cycle via (hashtable-set!
+    // h 'key h). Layer-4 sweep should find the heap-bearing
+    // value slot and demote it.
+    use cs_core::{Hashtable, HtEqKind};
+    use cs_gc::Gc;
+    cycle_registry::reset_for_tests();
+    let broken_baseline = cs_gc::cycle_registry::sweep_broken_count();
+    let h: Gc<Hashtable> = Hashtable::new(HtEqKind::Eq);
+    // Set up the cycle: items[0] = (key, h).
+    h.items
+        .borrow_mut()
+        .push((Value::Boolean(true), Value::Hashtable(h.clone())));
+    cycle_registry::register_cycle_candidate(Gc::as_addr(&h), Gc::downgrade(&h));
+    assert_eq!(cycle_registry::candidate_count(), 1);
+    cycle_registry::run_sweep();
+    assert!(
+        cs_gc::cycle_registry::sweep_broken_count() > broken_baseline,
+        "sweep should have broken the hashtable cycle"
+    );
+    // The value slot is now Unspecified.
+    let items = h.items.borrow();
+    assert!(matches!(items[0].1, Value::Unspecified));
+}
+
+#[test]
 fn many_cycles_populate_registry() {
     cycle_registry::reset_for_tests();
     let mut pairs = Vec::with_capacity(20);
