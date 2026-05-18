@@ -260,8 +260,26 @@ impl SandboxRuntime {
                     Trap::OutOfFuel => return Err(SandboxError::FuelExhausted),
                     Trap::MemoryOutOfBounds => return Err(SandboxError::MemoryExhausted),
                     Trap::Interrupt => return Err(SandboxError::Timeout),
-                    _ => { /* fall through to generic Internal */ }
+                    _ => { /* fall through to abort/Rust-OOM heuristic + generic Internal */ }
                 }
+            }
+            // Rust-allocator OOM path: when wasmtime's StoreLimits
+            // memory_limiter rejects a grow, the guest's Rust
+            // allocator returns NULL, hits `handle_alloc_error`
+            // and calls `abort()` — which compiles to wasm
+            // `unreachable` and surfaces as `Trap::Unreachable
+            // CodeReached`, NOT `Trap::MemoryOutOfBounds`. The
+            // proximate cause is still the memory cap, so
+            // classify it as `MemoryExhausted` to give callers
+            // the actionable error. Backtrace check is the only
+            // signal — wasmtime doesn't propagate the limiter
+            // failure as a distinct error kind.
+            let msg = format!("{}", e);
+            if msg.contains("rust_oom")
+                || msg.contains("handle_alloc_error")
+                || msg.contains("rust_alloc_error_handler")
+            {
+                return Err(SandboxError::MemoryExhausted);
             }
             // WASI exit(0) is normal — return captured stdout.
             // Non-zero exit means the guest raised; surface the
