@@ -10,14 +10,21 @@
 //!
 //! ## Registered procedures
 //!
+//! All decompress procedures take an optional `max-output-bytes`
+//! argument (default: 64 MB) and raise if the decompressed output
+//! would exceed it. This is a decompression-bomb mitigation —
+//! caller-controlled compressed input can otherwise expand 1 KB →
+//! several GB with no warning. Pass a larger cap explicitly when
+//! processing trusted archives.
+//!
 //! | Scheme name | Args | Returns | Notes |
 //! |---|---|---|---|
-//! | `gzip-compress`      | bv [level] | bytevector | level 0–9; default 6 |
-//! | `gzip-decompress`    | bv         | bytevector |
-//! | `deflate-compress`   | bv [level] | bytevector | raw deflate (no gzip header) |
-//! | `deflate-decompress` | bv         | bytevector |
-//! | `zstd-compress`      | bv [level] | bytevector | level 1–22; default 3 |
-//! | `zstd-decompress`    | bv         | bytevector |
+//! | `gzip-compress`      | bv [level]   | bytevector | level 0–9; default 6 |
+//! | `gzip-decompress`    | bv [max]     | bytevector | max default 64 MB |
+//! | `deflate-compress`   | bv [level]   | bytevector | raw deflate (no gzip header) |
+//! | `deflate-decompress` | bv [max]     | bytevector | max default 64 MB |
+//! | `zstd-compress`      | bv [level]   | bytevector | level 1–22; default 3 |
+//! | `zstd-decompress`    | bv [max]     | bytevector | max default 64 MB |
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -64,15 +71,14 @@ fn expect_bv(name: &str, args: &[Value], idx: usize) -> Result<Vec<u8>, FfiError
 fn opt_level(args: &[Value], idx: usize, default: u32, max: u32) -> Result<u32, FfiError> {
     match args.get(idx) {
         None => Ok(default),
-        Some(Value::Number(n)) => {
-            let v = n.to_f64() as i64;
-            if v < 0 || (v as u32) > max {
+        Some(Value::Number(cs_core::Number::Fixnum(v))) => {
+            if *v < 0 || (*v as u32) > max {
                 Err(FfiError::HostFailure(format!(
                     "compress level must be 0..={}; got {}",
                     max, v
                 )))
             } else {
-                Ok(v as u32)
+                Ok(*v as u32)
             }
         }
         Some(other) => Err(FfiError::TypeMismatch {
@@ -84,6 +90,47 @@ fn opt_level(args: &[Value], idx: usize, default: u32, max: u32) -> Result<u32, 
 
 fn bv_value(b: Vec<u8>) -> Value {
     Value::ByteVector(cs_core::Gc::new(std::cell::RefCell::new(b)))
+}
+
+// Decompression-bomb cap. 64 MB is large enough for most genuine
+// payloads (gzipped logs, JSON fixtures) but small enough to refuse
+// runaway expansion. Callers processing trusted bulk data can pass
+// a larger explicit limit.
+const DEFAULT_MAX_DECOMPRESSED: u64 = 64 * 1024 * 1024;
+
+fn opt_max_bytes(args: &[Value], idx: usize) -> Result<u64, FfiError> {
+    match args.get(idx) {
+        None => Ok(DEFAULT_MAX_DECOMPRESSED),
+        Some(Value::Number(cs_core::Number::Fixnum(v))) if *v >= 0 => Ok(*v as u64),
+        Some(Value::Number(cs_core::Number::Fixnum(v))) => Err(FfiError::HostFailure(format!(
+            "max-output-bytes must be non-negative; got {}",
+            v
+        ))),
+        Some(other) => Err(FfiError::TypeMismatch {
+            expected: "fixnum or no arg",
+            got: other.type_name().to_string(),
+        }),
+    }
+}
+
+// Decompress a Read stream into a Vec capped at `max_bytes`. Returns
+// an error rather than truncating — the caller asked us to refuse,
+// not to silently lose data. `name` is used for the error message.
+fn read_capped<R: Read>(name: &str, mut r: R, max_bytes: u64) -> Result<Vec<u8>, FfiError> {
+    let mut out = Vec::new();
+    // `take` is the only safe way: `read_to_end` allocates without
+    // bound and OOMs before any cap check we could do post-hoc.
+    let n = (&mut r)
+        .take(max_bytes + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| FfiError::HostFailure(format!("{}: {}", name, e)))?;
+    if (n as u64) > max_bytes {
+        return Err(FfiError::HostFailure(format!(
+            "{}: decompressed output exceeds {} bytes (decompression-bomb guard); pass a larger max-output-bytes if expected",
+            name, max_bytes
+        )));
+    }
+    Ok(out)
 }
 
 // ----- gzip -----
@@ -101,10 +148,8 @@ fn gzip_compress(args: &[Value]) -> Result<Value, FfiError> {
 
 fn gzip_decompress(args: &[Value]) -> Result<Value, FfiError> {
     let input = expect_bv("gzip-decompress", args, 0)?;
-    let mut out = Vec::new();
-    GzDecoder::new(&input[..])
-        .read_to_end(&mut out)
-        .map_err(|e| FfiError::HostFailure(format!("gzip-decompress: {}", e)))?;
+    let max = opt_max_bytes(args, 1)?;
+    let out = read_capped("gzip-decompress", GzDecoder::new(&input[..]), max)?;
     Ok(bv_value(out))
 }
 
@@ -123,10 +168,8 @@ fn deflate_compress(args: &[Value]) -> Result<Value, FfiError> {
 
 fn deflate_decompress(args: &[Value]) -> Result<Value, FfiError> {
     let input = expect_bv("deflate-decompress", args, 0)?;
-    let mut out = Vec::new();
-    DeflateDecoder::new(&input[..])
-        .read_to_end(&mut out)
-        .map_err(|e| FfiError::HostFailure(format!("deflate-decompress: {}", e)))?;
+    let max = opt_max_bytes(args, 1)?;
+    let out = read_capped("deflate-decompress", DeflateDecoder::new(&input[..]), max)?;
     Ok(bv_value(out))
 }
 
@@ -142,7 +185,9 @@ fn zstd_compress(args: &[Value]) -> Result<Value, FfiError> {
 
 fn zstd_decompress(args: &[Value]) -> Result<Value, FfiError> {
     let input = expect_bv("zstd-decompress", args, 0)?;
-    zstd::decode_all(std::io::Cursor::new(input))
-        .map(bv_value)
-        .map_err(|e| FfiError::HostFailure(format!("zstd-decompress: {}", e)))
+    let max = opt_max_bytes(args, 1)?;
+    let decoder = zstd::Decoder::new(std::io::Cursor::new(input))
+        .map_err(|e| FfiError::HostFailure(format!("zstd-decompress: {}", e)))?;
+    let out = read_capped("zstd-decompress", decoder, max)?;
+    Ok(bv_value(out))
 }

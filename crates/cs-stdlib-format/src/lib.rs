@@ -118,15 +118,23 @@ fn render(directive: char, v: &Value, out: &mut String) -> Result<(), FfiError> 
         }
         ('a' | 's', Value::Character(c)) => out.push(*c),
         ('a' | 's' | 'd', Value::Number(n)) => {
-            // Both display and write of a number look the same in
-            // CrabScheme's textual form; for ~d render as i64 floor.
-            let _ = write!(out, "{}", n.to_f64() as i64);
+            // ~a/~s/~d all defer to Number's Display impl, which
+            // preserves precision across Fixnum/Big/Rat/Flonum.
+            // ~d on a Flonum or Rat formats it as-is rather than
+            // truncating to i64 (which silently corrupts ≥ 2^53).
+            let _ = write!(out, "{}", n);
         }
-        ('x', Value::Number(n)) => {
-            let _ = write!(out, "{:x}", n.to_f64() as i64);
+        ('x', Value::Number(cs_core::Number::Fixnum(v))) => {
+            let _ = write!(out, "{:x}", v);
         }
-        ('X', Value::Number(n)) => {
-            let _ = write!(out, "{:X}", n.to_f64() as i64);
+        ('X', Value::Number(cs_core::Number::Fixnum(v))) => {
+            let _ = write!(out, "{:X}", v);
+        }
+        ('x' | 'X', Value::Number(_)) => {
+            return Err(FfiError::HostFailure(
+                "format-string: ~x/~X only formats fixnums (bignum/rational/flonum not supported)"
+                    .into(),
+            ));
         }
         ('a' | 's', Value::Boolean(true)) => out.push_str("#t"),
         ('a' | 's', Value::Boolean(false)) => out.push_str("#f"),

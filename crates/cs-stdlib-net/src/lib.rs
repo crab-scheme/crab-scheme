@@ -88,13 +88,6 @@ fn insert(slot: Slot) -> Result<i64, FfiError> {
     Ok(id)
 }
 
-fn remove(id: i64) -> Result<Slot, FfiError> {
-    let mut r = lock()?;
-    r.slots
-        .remove(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("net: handle {} not registered", id)))
-}
-
 pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
     vec![
         UntypedProc::new("dns-resolve", dns_resolve),
@@ -103,11 +96,11 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("tcp-accept", tcp_accept),
         UntypedProc::new("tcp-send", tcp_send),
         UntypedProc::new("tcp-recv", tcp_recv),
-        UntypedProc::new("tcp-close", net_close),
+        UntypedProc::new("tcp-close", tcp_close),
         UntypedProc::new("udp-bind", udp_bind),
         UntypedProc::new("udp-send-to", udp_send_to),
         UntypedProc::new("udp-recv-from", udp_recv_from),
-        UntypedProc::new("udp-close", net_close),
+        UntypedProc::new("udp-close", udp_close),
     ]
 }
 
@@ -134,7 +127,7 @@ fn expect_string(name: &str, args: &[Value], idx: usize) -> Result<String, FfiEr
 
 fn expect_fixnum(name: &str, args: &[Value], idx: usize) -> Result<i64, FfiError> {
     match args.get(idx) {
-        Some(Value::Number(n)) => Ok(n.to_f64() as i64),
+        Some(Value::Number(cs_core::Number::Fixnum(v))) => Ok(*v),
         Some(other) => Err(FfiError::TypeMismatch {
             expected: "fixnum",
             got: other.type_name().to_string(),
@@ -291,10 +284,51 @@ fn tcp_recv(args: &[Value]) -> Result<Value, FfiError> {
     Ok(bv_value(buf))
 }
 
-fn net_close(args: &[Value]) -> Result<Value, FfiError> {
-    let id = expect_fixnum("close", args, 0)?;
-    let _ = remove(id)?; // Drop runs here, closes the underlying socket.
-    Ok(Value::Unspecified)
+// Close a TCP handle (stream or listener). Refuses to close UDP
+// handles so a typo like `(tcp-close udp-handle)` doesn't silently
+// drop the wrong socket.
+fn tcp_close(args: &[Value]) -> Result<Value, FfiError> {
+    close_kind(
+        "tcp-close",
+        args,
+        |s| matches!(s, Slot::Tcp(_) | Slot::TcpListener(_)),
+        "tcp socket or listener",
+    )
+}
+
+// Close a UDP handle. Refuses TCP/listener handles for the same
+// reason as tcp_close.
+fn udp_close(args: &[Value]) -> Result<Value, FfiError> {
+    close_kind(
+        "udp-close",
+        args,
+        |s| matches!(s, Slot::Udp(_)),
+        "udp socket",
+    )
+}
+
+fn close_kind(
+    name: &str,
+    args: &[Value],
+    matches_kind: impl Fn(&Slot) -> bool,
+    expected: &str,
+) -> Result<Value, FfiError> {
+    let id = expect_fixnum(name, args, 0)?;
+    let mut r = lock()?;
+    match r.slots.get(&id) {
+        Some(s) if matches_kind(s) => {
+            r.slots.remove(&id); // Drop here closes the underlying socket.
+            Ok(Value::Unspecified)
+        }
+        Some(_) => Err(FfiError::HostFailure(format!(
+            "{}: handle {} is not a {}",
+            name, id, expected
+        ))),
+        None => Err(FfiError::HostFailure(format!(
+            "{}: handle {} not registered",
+            name, id
+        ))),
+    }
 }
 
 // ----- UDP -----

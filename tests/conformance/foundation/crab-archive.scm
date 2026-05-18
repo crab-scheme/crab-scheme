@@ -56,5 +56,51 @@
             "1\n2\n3\n"
             (read-file-string (string-append __extract__ "/numbers.txt")))
 
+(test-section "(crab archive) — safety")
+
+;; tar-slip: an entry with an absolute path or `..` component must
+;; be refused. Build a hostile tarball with an entry named
+;; `../escape.txt` and confirm extraction raises.
+(define __evil-src__ (string-append __tmp__ "/evil-src"))
+(define __evil-tar__ (string-append __tmp__ "/evil.tar"))
+(rm-rf __evil-src__)
+(directory-create-all __evil-src__)
+(write-file-string (string-append __evil-src__ "/payload") "owned\n")
+(run "sh" (list "-c"
+                (string-append "cd " __tmp__
+                               " && tar -cf " __evil-tar__
+                               " -C " __evil-src__
+                               " --transform='s,payload,../escape.txt,'"
+                               " payload")))
+
+(rm-rf __extract__)
+(directory-create-all __extract__)
+(test-true "tar-extract refuses ../ entries"
+           (guard (e (#t #t)) (tar-extract __evil-tar__ __extract__) #f))
+(test-true "no file escaped the dest dir"
+           (not (file-exists? (string-append __tmp__ "/escape.txt"))))
+
+;; Symlink rejection: build a tarball containing a symlink entry.
+;; Most tar binaries store symlinks verbatim; we verify extraction
+;; refuses to materialize them.
+(define __sym-src__ (string-append __tmp__ "/sym-src"))
+(define __sym-tar__ (string-append __tmp__ "/sym.tar"))
+(rm-rf __sym-src__)
+(directory-create-all __sym-src__)
+(run "sh" (list "-c" (string-append "ln -sf /etc/passwd " __sym-src__ "/link")))
+(run "sh" (list "-c" (string-append "cd " __sym-src__ " && tar -cf " __sym-tar__ " .")))
+
+(rm-rf __extract__)
+(directory-create-all __extract__)
+(test-true "tar-extract refuses symlink entries"
+           (guard (e (#t #t)) (tar-extract __sym-tar__ __extract__) #f))
+
+;; Size cap: extract with a tiny cap (1 byte). The hello.txt entry
+;; (6 bytes) exceeds it, so extraction raises.
+(rm-rf __extract__)
+(directory-create-all __extract__)
+(test-true "tar-extract refuses output exceeding max-bytes cap"
+           (guard (e (#t #t)) (tar-extract __tar__ __extract__ 1) #f))
+
 ;; ---- cleanup ----
 (rm-rf __tmp__)

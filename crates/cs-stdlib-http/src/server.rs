@@ -98,7 +98,7 @@ fn expect_string(name: &str, args: &[Value], idx: usize) -> Result<String, FfiEr
 
 fn expect_fixnum(name: &str, args: &[Value], idx: usize) -> Result<i64, FfiError> {
     match args.get(idx) {
-        Some(Value::Number(n)) => Ok(n.to_f64() as i64),
+        Some(Value::Number(cs_core::Number::Fixnum(v))) => Ok(*v),
         Some(other) => Err(FfiError::TypeMismatch {
             expected: "fixnum",
             got: other.type_name().to_string(),
@@ -315,30 +315,43 @@ fn http_request_headers(args: &[Value]) -> Result<Value, FfiError> {
 
 fn http_request_body(args: &[Value]) -> Result<Value, FfiError> {
     let id = expect_fixnum("http-request-body", args, 0)?;
-    // Body read needs &mut Request — pop the slot, read, reinsert.
+    // Validate kind BEFORE remove so a wrong-kind handle stays in the
+    // slab. tiny_http's request reader is a single-shot stream, so the
+    // first successful read drains it; subsequent calls return an
+    // empty bytevector. The handle stays valid for http-respond.
     let mut r = lock()?;
-    let mut slot = r
-        .slots
-        .remove(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("http-request-body: bad handle {}", id)))?;
-    let bytes = match &mut slot {
-        Slot::Request(req) => {
-            let mut buf = Vec::new();
-            req.as_reader()
-                .read_to_end(&mut buf)
-                .map_err(|e| FfiError::HostFailure(format!("http-request-body: {}", e)))?;
-            buf
-        }
-        Slot::Server(_) => {
-            r.slots.insert(id, slot);
-            return Err(FfiError::HostFailure(format!(
-                "http-request-body: handle {} is not a request",
-                id
-            )));
-        }
+    if !matches!(r.slots.get(&id), Some(Slot::Request(_))) {
+        return Err(FfiError::HostFailure(match r.slots.get(&id) {
+            Some(_) => format!("http-request-body: handle {} is not a request", id),
+            None => format!("http-request-body: bad handle {}", id),
+        }));
+    }
+    let mut slot = r.slots.remove(&id).expect("just matched above");
+    drop(r); // release the registry lock before blocking IO
+
+    let read_result = if let Slot::Request(req) = &mut slot {
+        let mut buf = Vec::new();
+        req.as_reader()
+            .read_to_end(&mut buf)
+            .map(|_| buf)
+            .map_err(|e| FfiError::HostFailure(format!("http-request-body: {}", e)))
+    } else {
+        unreachable!("slot kind validated above")
     };
-    r.slots.insert(id, slot);
-    Ok(bv_value(bytes))
+
+    // Always reinsert the slot on success so http-respond stays valid.
+    // On IO error the request is in an inconsistent state — drop it.
+    match read_result {
+        Ok(bytes) => {
+            let mut r = lock()?;
+            r.slots.insert(id, slot);
+            Ok(bv_value(bytes))
+        }
+        Err(e) => {
+            drop(slot);
+            Err(e)
+        }
+    }
 }
 
 // ----- respond (consumes request) -----
@@ -353,35 +366,41 @@ fn http_respond(args: &[Value]) -> Result<Value, FfiError> {
     let body = expect_bv("http-respond", args, 3)?;
     let headers = parse_headers(&headers_val)?;
 
+    // Validate kind BEFORE remove so a wrong-kind handle (e.g. a
+    // server handle accidentally passed instead of a request) stays
+    // in the slab. Removing it would drop the Arc<Server> and
+    // permanently break the server.
     let mut r = lock()?;
-    let slot = r
-        .slots
-        .remove(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("http-respond: bad handle {}", id)))?;
-    drop(r);
-    let req = match slot {
-        Slot::Request(req) => req,
-        Slot::Server(_) => {
+    match r.slots.get(&id) {
+        Some(Slot::Request(_)) => {}
+        Some(Slot::Server(_)) => {
             return Err(FfiError::HostFailure(format!(
                 "http-respond: handle {} is not a request",
                 id
             )));
         }
+        None => {
+            return Err(FfiError::HostFailure(format!(
+                "http-respond: bad handle {}",
+                id
+            )));
+        }
+    }
+    let slot = r.slots.remove(&id).expect("just matched above");
+    drop(r);
+    let req = match slot {
+        Slot::Request(req) => req,
+        Slot::Server(_) => unreachable!("slot kind validated above"),
     };
 
-    let body_len = body.len() as u64;
-    let mut resp = Response::new(
+    let body_len = body.len();
+    let resp = Response::new(
         tiny_http::StatusCode(status as u16),
         headers,
         std::io::Cursor::new(body),
-        Some(body_len as usize),
+        Some(body_len),
         None,
     );
-    // tiny_http::Response wants `Read + Send + 'static`; Cursor
-    // satisfies that. Set Content-Length explicitly via the
-    // `data_length` field above; tiny_http handles the rest.
-    let _ = body_len;
-    let _ = resp.headers();
     req.respond(resp)
         .map_err(|e| FfiError::HostFailure(format!("http-respond: write: {}", e)))?;
     Ok(Value::Unspecified)

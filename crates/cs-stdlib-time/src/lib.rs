@@ -52,7 +52,7 @@ fn arity(name: &str, want: &str, got: usize) -> FfiError {
 
 fn expect_fixnum(name: &str, args: &[Value], idx: usize) -> Result<i64, FfiError> {
     match args.get(idx) {
-        Some(Value::Number(n)) => Ok(n.to_f64() as i64),
+        Some(Value::Number(cs_core::Number::Fixnum(v))) => Ok(*v),
         Some(other) => Err(FfiError::TypeMismatch {
             expected: "fixnum".into(),
             got: other.type_name().to_string(),

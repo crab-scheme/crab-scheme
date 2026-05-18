@@ -42,3 +42,21 @@
 (test-equal "zstd level 1 still round-trips"
             __payload__
             (zstd-decompress (zstd-compress __payload__ 1)))
+
+(test-section "(crab compress) — decompression-bomb cap")
+
+; Compress a 1 KB payload, then try to decompress with a 100-byte
+; cap — the decompressed output (1024 bytes) exceeds the cap, so
+; every decoder must raise.
+(test-true "gzip raises when output exceeds cap"
+           (guard (e (#t #t)) (gzip-decompress __gz__ 100) #f))
+(test-true "deflate raises when output exceeds cap"
+           (guard (e (#t #t)) (deflate-decompress __dfl__ 100) #f))
+(test-true "zstd raises when output exceeds cap"
+           (guard (e (#t #t)) (zstd-decompress __zst__ 100) #f))
+
+; Explicit cap larger than actual output still succeeds — the cap
+; is "refuse oversized", not "truncate".
+(test-equal "gzip cap larger than output still decodes"
+            __payload__
+            (gzip-decompress __gz__ (* 1024 1024)))

@@ -84,7 +84,7 @@ fn expect_string(name: &str, args: &[Value], idx: usize) -> Result<String, FfiEr
 fn expect_fixnum_opt(args: &[Value], idx: usize, default: i64) -> Result<i64, FfiError> {
     match args.get(idx) {
         None => Ok(default),
-        Some(Value::Number(n)) => Ok(n.to_f64() as i64),
+        Some(Value::Number(cs_core::Number::Fixnum(v))) => Ok(*v),
         Some(other) => Err(FfiError::TypeMismatch {
             expected: "fixnum or no arg",
             got: other.type_name().to_string(),
@@ -94,7 +94,7 @@ fn expect_fixnum_opt(args: &[Value], idx: usize, default: i64) -> Result<i64, Ff
 
 fn expect_fixnum(name: &str, args: &[Value], idx: usize) -> Result<i64, FfiError> {
     match args.get(idx) {
-        Some(Value::Number(n)) => Ok(n.to_f64() as i64),
+        Some(Value::Number(cs_core::Number::Fixnum(v))) => Ok(*v),
         Some(other) => Err(FfiError::TypeMismatch {
             expected: "fixnum",
             got: other.type_name().to_string(),
