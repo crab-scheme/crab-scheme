@@ -42,6 +42,9 @@ stdlib = [
     "stdlib-toml",
     "stdlib-base",
     "stdlib-url",
+    "stdlib-hash",
+    "stdlib-compress",
+    "stdlib-archive",
 ]
 stdlib-path = ["cs-runtime/stdlib", "cs-runtime/stdlib-path"]
 stdlib-fs = ["cs-runtime/stdlib", "cs-runtime/stdlib-fs"]
@@ -58,6 +61,9 @@ stdlib-csv = ["cs-runtime/stdlib", "cs-runtime/stdlib-csv"]
 stdlib-toml = ["cs-runtime/stdlib", "cs-runtime/stdlib-toml"]
 stdlib-base = ["cs-runtime/stdlib", "cs-runtime/stdlib-base"]
 stdlib-url = ["cs-runtime/stdlib", "cs-runtime/stdlib-url"]
+stdlib-hash = ["cs-runtime/stdlib", "cs-runtime/stdlib-hash"]
+stdlib-compress = ["cs-runtime/stdlib", "cs-runtime/stdlib-compress"]
+stdlib-archive = ["cs-runtime/stdlib", "cs-runtime/stdlib-archive"]
 # Backward-compat alias matching the W1 feature name.
 ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the

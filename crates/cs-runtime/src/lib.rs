@@ -1820,6 +1820,18 @@ impl Runtime {
         for p in cs_stdlib_url::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-hash")]
+        for p in cs_stdlib_hash::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-compress")]
+        for p in cs_stdlib_compress::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-archive")]
+        for p in cs_stdlib_archive::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call

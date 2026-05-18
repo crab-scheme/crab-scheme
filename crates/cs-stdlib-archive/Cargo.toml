@@ -1,0 +1,15 @@
+[package]
+name = "cs-stdlib-archive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab archive) — tar + zip read/extract."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"

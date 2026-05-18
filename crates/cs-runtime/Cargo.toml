@@ -86,6 +86,9 @@ stdlib = [
     "stdlib-toml",
     "stdlib-base",
     "stdlib-url",
+    "stdlib-hash",
+    "stdlib-compress",
+    "stdlib-archive",
 ]
 stdlib-path = ["ffi-trait", "dep:cs-stdlib-path"]
 stdlib-fs = ["ffi-trait", "dep:cs-stdlib-fs"]
@@ -102,6 +105,9 @@ stdlib-csv = ["ffi-trait", "dep:cs-stdlib-csv"]
 stdlib-toml = ["ffi-trait", "dep:cs-stdlib-toml"]
 stdlib-base = ["ffi-trait", "dep:cs-stdlib-base"]
 stdlib-url = ["ffi-trait", "dep:cs-stdlib-url"]
+stdlib-hash = ["ffi-trait", "dep:cs-stdlib-hash"]
+stdlib-compress = ["ffi-trait", "dep:cs-stdlib-compress"]
+stdlib-archive = ["ffi-trait", "dep:cs-stdlib-archive"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -140,6 +146,9 @@ cs-stdlib-csv = { workspace = true, optional = true }
 cs-stdlib-toml = { workspace = true, optional = true }
 cs-stdlib-base = { workspace = true, optional = true }
 cs-stdlib-url = { workspace = true, optional = true }
+cs-stdlib-hash = { workspace = true, optional = true }
+cs-stdlib-compress = { workspace = true, optional = true }
+cs-stdlib-archive = { workspace = true, optional = true }
 
 [dev-dependencies]
 cs-ffi-example = { workspace = true }

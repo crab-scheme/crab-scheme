@@ -201,6 +201,28 @@ fn conformance_crab_url() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-hash")]
+fn conformance_crab_hash() {
+    run_conformance_file("crab-hash.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-compress")]
+fn conformance_crab_compress() {
+    run_conformance_file("crab-compress.scm");
+}
+
+#[test]
+#[cfg(all(
+    feature = "stdlib-archive",
+    feature = "stdlib-fs",
+    feature = "stdlib-process"
+))]
+fn conformance_crab_archive() {
+    run_conformance_file("crab-archive.scm");
+}
+
+#[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");
 }

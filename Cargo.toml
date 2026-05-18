@@ -47,6 +47,9 @@ members = [
     "crates/cs-stdlib-toml",
     "crates/cs-stdlib-base",
     "crates/cs-stdlib-url",
+    "crates/cs-stdlib-hash",
+    "crates/cs-stdlib-compress",
+    "crates/cs-stdlib-archive",
 ]
 
 [workspace.package]
@@ -101,6 +104,9 @@ cs-stdlib-csv = { path = "crates/cs-stdlib-csv" }
 cs-stdlib-toml = { path = "crates/cs-stdlib-toml" }
 cs-stdlib-base = { path = "crates/cs-stdlib-base" }
 cs-stdlib-url = { path = "crates/cs-stdlib-url" }
+cs-stdlib-hash = { path = "crates/cs-stdlib-hash" }
+cs-stdlib-compress = { path = "crates/cs-stdlib-compress" }
+cs-stdlib-archive = { path = "crates/cs-stdlib-archive" }
 
 # External crates
 logos = "0.14"
