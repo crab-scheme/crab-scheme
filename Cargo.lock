@@ -735,6 +735,7 @@ dependencies = [
  "cs-stdlib-json",
  "cs-stdlib-log",
  "cs-stdlib-math",
+ "cs-stdlib-meta",
  "cs-stdlib-metrics",
  "cs-stdlib-net",
  "cs-stdlib-os",
@@ -868,6 +869,41 @@ dependencies = [
  "cs-core",
  "cs-ffi",
  "libm",
+]
+
+[[package]]
+name = "cs-stdlib-meta"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
+ "cs-stdlib-archive",
+ "cs-stdlib-base",
+ "cs-stdlib-collection",
+ "cs-stdlib-compress",
+ "cs-stdlib-csv",
+ "cs-stdlib-format",
+ "cs-stdlib-fs",
+ "cs-stdlib-hash",
+ "cs-stdlib-http",
+ "cs-stdlib-json",
+ "cs-stdlib-log",
+ "cs-stdlib-math",
+ "cs-stdlib-metrics",
+ "cs-stdlib-net",
+ "cs-stdlib-os",
+ "cs-stdlib-path",
+ "cs-stdlib-process",
+ "cs-stdlib-random",
+ "cs-stdlib-regex",
+ "cs-stdlib-signal",
+ "cs-stdlib-string",
+ "cs-stdlib-time",
+ "cs-stdlib-toml",
+ "cs-stdlib-tty",
+ "cs-stdlib-url",
+ "cs-stdlib-uuid",
+ "cs-stdlib-websocket",
 ]
 
 [[package]]

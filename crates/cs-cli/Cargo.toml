@@ -54,6 +54,7 @@ stdlib = [
     "stdlib-math",
     "stdlib-tty",
     "stdlib-signal",
+    "stdlib-meta",
 ]
 stdlib-path = ["cs-runtime/stdlib", "cs-runtime/stdlib-path"]
 stdlib-fs = ["cs-runtime/stdlib", "cs-runtime/stdlib-fs"]
@@ -82,6 +83,7 @@ stdlib-collection = ["cs-runtime/stdlib", "cs-runtime/stdlib-collection"]
 stdlib-math = ["cs-runtime/stdlib", "cs-runtime/stdlib-math"]
 stdlib-tty = ["cs-runtime/stdlib", "cs-runtime/stdlib-tty"]
 stdlib-signal = ["cs-runtime/stdlib", "cs-runtime/stdlib-signal"]
+stdlib-meta = ["cs-runtime/stdlib", "cs-runtime/stdlib-meta"]
 # Backward-compat alias matching the W1 feature name.
 ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the

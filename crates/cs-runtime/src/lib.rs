@@ -1868,6 +1868,10 @@ impl Runtime {
         for p in cs_stdlib_signal::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-meta")]
+        for p in cs_stdlib_meta::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call

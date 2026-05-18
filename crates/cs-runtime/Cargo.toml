@@ -98,34 +98,41 @@ stdlib = [
     "stdlib-math",
     "stdlib-tty",
     "stdlib-signal",
+    "stdlib-meta",
 ]
-stdlib-path = ["ffi-trait", "dep:cs-stdlib-path"]
-stdlib-fs = ["ffi-trait", "dep:cs-stdlib-fs"]
-stdlib-os = ["ffi-trait", "dep:cs-stdlib-os"]
-stdlib-process = ["ffi-trait", "dep:cs-stdlib-process"]
-stdlib-string = ["ffi-trait", "dep:cs-stdlib-string"]
-stdlib-format = ["ffi-trait", "dep:cs-stdlib-format"]
-stdlib-regex = ["ffi-trait", "dep:cs-stdlib-regex"]
-stdlib-time = ["ffi-trait", "dep:cs-stdlib-time"]
-stdlib-random = ["ffi-trait", "dep:cs-stdlib-random"]
-stdlib-uuid = ["ffi-trait", "dep:cs-stdlib-uuid"]
-stdlib-json = ["ffi-trait", "dep:cs-stdlib-json"]
-stdlib-csv = ["ffi-trait", "dep:cs-stdlib-csv"]
-stdlib-toml = ["ffi-trait", "dep:cs-stdlib-toml"]
-stdlib-base = ["ffi-trait", "dep:cs-stdlib-base"]
-stdlib-url = ["ffi-trait", "dep:cs-stdlib-url"]
-stdlib-hash = ["ffi-trait", "dep:cs-stdlib-hash"]
-stdlib-compress = ["ffi-trait", "dep:cs-stdlib-compress"]
-stdlib-archive = ["ffi-trait", "dep:cs-stdlib-archive"]
-stdlib-log = ["ffi-trait", "dep:cs-stdlib-log"]
-stdlib-metrics = ["ffi-trait", "dep:cs-stdlib-metrics"]
-stdlib-net = ["ffi-trait", "dep:cs-stdlib-net"]
-stdlib-http = ["ffi-trait", "dep:cs-stdlib-http"]
-stdlib-websocket = ["ffi-trait", "dep:cs-stdlib-websocket"]
-stdlib-collection = ["ffi-trait", "dep:cs-stdlib-collection"]
-stdlib-math = ["ffi-trait", "dep:cs-stdlib-math"]
-stdlib-tty = ["ffi-trait", "dep:cs-stdlib-tty"]
-stdlib-signal = ["ffi-trait", "dep:cs-stdlib-signal"]
+# Each `stdlib-<name>` feature also enables the matching
+# `cs-stdlib-meta?/meta-<name>` flag (via the `?` optional-dep
+# syntax) so `(crab-list-modules)` reflects whatever's compiled
+# in, even on subset builds. cs-stdlib-meta itself is optional;
+# the `stdlib` umbrella turns it on by default.
+stdlib-meta = ["ffi-trait", "dep:cs-stdlib-meta"]
+stdlib-path = ["ffi-trait", "dep:cs-stdlib-path", "cs-stdlib-meta?/meta-path"]
+stdlib-fs = ["ffi-trait", "dep:cs-stdlib-fs", "cs-stdlib-meta?/meta-fs"]
+stdlib-os = ["ffi-trait", "dep:cs-stdlib-os", "cs-stdlib-meta?/meta-os"]
+stdlib-process = ["ffi-trait", "dep:cs-stdlib-process", "cs-stdlib-meta?/meta-process"]
+stdlib-string = ["ffi-trait", "dep:cs-stdlib-string", "cs-stdlib-meta?/meta-string"]
+stdlib-format = ["ffi-trait", "dep:cs-stdlib-format", "cs-stdlib-meta?/meta-format"]
+stdlib-regex = ["ffi-trait", "dep:cs-stdlib-regex", "cs-stdlib-meta?/meta-regex"]
+stdlib-time = ["ffi-trait", "dep:cs-stdlib-time", "cs-stdlib-meta?/meta-time"]
+stdlib-random = ["ffi-trait", "dep:cs-stdlib-random", "cs-stdlib-meta?/meta-random"]
+stdlib-uuid = ["ffi-trait", "dep:cs-stdlib-uuid", "cs-stdlib-meta?/meta-uuid"]
+stdlib-json = ["ffi-trait", "dep:cs-stdlib-json", "cs-stdlib-meta?/meta-json"]
+stdlib-csv = ["ffi-trait", "dep:cs-stdlib-csv", "cs-stdlib-meta?/meta-csv"]
+stdlib-toml = ["ffi-trait", "dep:cs-stdlib-toml", "cs-stdlib-meta?/meta-toml"]
+stdlib-base = ["ffi-trait", "dep:cs-stdlib-base", "cs-stdlib-meta?/meta-base"]
+stdlib-url = ["ffi-trait", "dep:cs-stdlib-url", "cs-stdlib-meta?/meta-url"]
+stdlib-hash = ["ffi-trait", "dep:cs-stdlib-hash", "cs-stdlib-meta?/meta-hash"]
+stdlib-compress = ["ffi-trait", "dep:cs-stdlib-compress", "cs-stdlib-meta?/meta-compress"]
+stdlib-archive = ["ffi-trait", "dep:cs-stdlib-archive", "cs-stdlib-meta?/meta-archive"]
+stdlib-log = ["ffi-trait", "dep:cs-stdlib-log", "cs-stdlib-meta?/meta-log"]
+stdlib-metrics = ["ffi-trait", "dep:cs-stdlib-metrics", "cs-stdlib-meta?/meta-metrics"]
+stdlib-net = ["ffi-trait", "dep:cs-stdlib-net", "cs-stdlib-meta?/meta-net"]
+stdlib-http = ["ffi-trait", "dep:cs-stdlib-http", "cs-stdlib-meta?/meta-http"]
+stdlib-websocket = ["ffi-trait", "dep:cs-stdlib-websocket", "cs-stdlib-meta?/meta-websocket"]
+stdlib-collection = ["ffi-trait", "dep:cs-stdlib-collection", "cs-stdlib-meta?/meta-collection"]
+stdlib-math = ["ffi-trait", "dep:cs-stdlib-math", "cs-stdlib-meta?/meta-math"]
+stdlib-tty = ["ffi-trait", "dep:cs-stdlib-tty", "cs-stdlib-meta?/meta-tty"]
+stdlib-signal = ["ffi-trait", "dep:cs-stdlib-signal", "cs-stdlib-meta?/meta-signal"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -176,6 +183,7 @@ cs-stdlib-collection = { workspace = true, optional = true }
 cs-stdlib-math = { workspace = true, optional = true }
 cs-stdlib-tty = { workspace = true, optional = true }
 cs-stdlib-signal = { workspace = true, optional = true }
+cs-stdlib-meta = { workspace = true, optional = true }
 
 [dev-dependencies]
 cs-ffi-example = { workspace = true }

@@ -59,6 +59,7 @@ members = [
     "crates/cs-stdlib-math",
     "crates/cs-stdlib-tty",
     "crates/cs-stdlib-signal",
+    "crates/cs-stdlib-meta",
 ]
 
 [workspace.package]
@@ -125,6 +126,7 @@ cs-stdlib-collection = { path = "crates/cs-stdlib-collection" }
 cs-stdlib-math = { path = "crates/cs-stdlib-math" }
 cs-stdlib-tty = { path = "crates/cs-stdlib-tty" }
 cs-stdlib-signal = { path = "crates/cs-stdlib-signal" }
+cs-stdlib-meta = { path = "crates/cs-stdlib-meta" }
 
 # External crates
 logos = "0.14"

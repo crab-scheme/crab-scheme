@@ -287,6 +287,26 @@ fn conformance_crab_signal() {
     run_conformance_file("crab-signal.scm");
 }
 
+// `(crab)` meta needs the umbrella `stdlib` feature on so the
+// manifest actually has the modules the test spot-checks for
+// (path, fs, json, hash, http, collection, signal). Subset
+// embeds that only enable a few cs-stdlib-* crates won't see
+// those names and the test would (correctly) fail.
+#[test]
+#[cfg(all(
+    feature = "stdlib-meta",
+    feature = "stdlib-path",
+    feature = "stdlib-fs",
+    feature = "stdlib-json",
+    feature = "stdlib-hash",
+    feature = "stdlib-http",
+    feature = "stdlib-collection",
+    feature = "stdlib-signal"
+))]
+fn conformance_crab_meta() {
+    run_conformance_file("crab-meta.scm");
+}
+
 #[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");
