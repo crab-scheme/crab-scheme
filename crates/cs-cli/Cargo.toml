@@ -22,9 +22,11 @@ ffi-dynamic = ["cs-runtime/ffi-dynamic"]
 # (crab …) stdlib modules. See .spec-workflow/specs/stdlib-modules.
 # `stdlib` is the umbrella — turns on every shipped module. Per-module
 # flags compose so subset embeds work (`--no-default-features --features
-# stdlib-path` ships only path manipulation). Each per-module flag
-# enables the cs-runtime umbrella so `Runtime::register_stdlib` (gated
-# on `cs-runtime/stdlib`) actually compiles in.
+# stdlib-path,stdlib-fs` ships only those two crates and nothing else —
+# critical for WASM, which can't link tokio/rustls/zstd-sys). Each
+# per-module flag forwards only to the matching `cs-runtime/stdlib-X`
+# flag; `Runtime::register_stdlib` itself is always compiled (the body
+# is no-ops when no module is selected).
 stdlib = [
     "cs-runtime/stdlib",
     "stdlib-path",
@@ -56,34 +58,64 @@ stdlib = [
     "stdlib-signal",
     "stdlib-meta",
 ]
-stdlib-path = ["cs-runtime/stdlib", "cs-runtime/stdlib-path"]
-stdlib-fs = ["cs-runtime/stdlib", "cs-runtime/stdlib-fs"]
-stdlib-os = ["cs-runtime/stdlib", "cs-runtime/stdlib-os"]
-stdlib-process = ["cs-runtime/stdlib", "cs-runtime/stdlib-process"]
-stdlib-string = ["cs-runtime/stdlib", "cs-runtime/stdlib-string"]
-stdlib-format = ["cs-runtime/stdlib", "cs-runtime/stdlib-format"]
-stdlib-regex = ["cs-runtime/stdlib", "cs-runtime/stdlib-regex"]
-stdlib-time = ["cs-runtime/stdlib", "cs-runtime/stdlib-time"]
-stdlib-random = ["cs-runtime/stdlib", "cs-runtime/stdlib-random"]
-stdlib-uuid = ["cs-runtime/stdlib", "cs-runtime/stdlib-uuid"]
-stdlib-json = ["cs-runtime/stdlib", "cs-runtime/stdlib-json"]
-stdlib-csv = ["cs-runtime/stdlib", "cs-runtime/stdlib-csv"]
-stdlib-toml = ["cs-runtime/stdlib", "cs-runtime/stdlib-toml"]
-stdlib-base = ["cs-runtime/stdlib", "cs-runtime/stdlib-base"]
-stdlib-url = ["cs-runtime/stdlib", "cs-runtime/stdlib-url"]
-stdlib-hash = ["cs-runtime/stdlib", "cs-runtime/stdlib-hash"]
-stdlib-compress = ["cs-runtime/stdlib", "cs-runtime/stdlib-compress"]
-stdlib-archive = ["cs-runtime/stdlib", "cs-runtime/stdlib-archive"]
-stdlib-log = ["cs-runtime/stdlib", "cs-runtime/stdlib-log"]
-stdlib-metrics = ["cs-runtime/stdlib", "cs-runtime/stdlib-metrics"]
-stdlib-net = ["cs-runtime/stdlib", "cs-runtime/stdlib-net"]
-stdlib-http = ["cs-runtime/stdlib", "cs-runtime/stdlib-http"]
-stdlib-websocket = ["cs-runtime/stdlib", "cs-runtime/stdlib-websocket"]
-stdlib-collection = ["cs-runtime/stdlib", "cs-runtime/stdlib-collection"]
-stdlib-math = ["cs-runtime/stdlib", "cs-runtime/stdlib-math"]
-stdlib-tty = ["cs-runtime/stdlib", "cs-runtime/stdlib-tty"]
-stdlib-signal = ["cs-runtime/stdlib", "cs-runtime/stdlib-signal"]
-stdlib-meta = ["cs-runtime/stdlib", "cs-runtime/stdlib-meta"]
+stdlib-path = ["cs-runtime/stdlib-path"]
+stdlib-fs = ["cs-runtime/stdlib-fs"]
+stdlib-os = ["cs-runtime/stdlib-os"]
+stdlib-process = ["cs-runtime/stdlib-process"]
+stdlib-string = ["cs-runtime/stdlib-string"]
+stdlib-format = ["cs-runtime/stdlib-format"]
+stdlib-regex = ["cs-runtime/stdlib-regex"]
+stdlib-time = ["cs-runtime/stdlib-time"]
+stdlib-random = ["cs-runtime/stdlib-random"]
+stdlib-uuid = ["cs-runtime/stdlib-uuid"]
+stdlib-json = ["cs-runtime/stdlib-json"]
+stdlib-csv = ["cs-runtime/stdlib-csv"]
+stdlib-toml = ["cs-runtime/stdlib-toml"]
+stdlib-base = ["cs-runtime/stdlib-base"]
+stdlib-url = ["cs-runtime/stdlib-url"]
+stdlib-hash = ["cs-runtime/stdlib-hash"]
+stdlib-compress = ["cs-runtime/stdlib-compress"]
+stdlib-archive = ["cs-runtime/stdlib-archive"]
+stdlib-log = ["cs-runtime/stdlib-log"]
+stdlib-metrics = ["cs-runtime/stdlib-metrics"]
+stdlib-net = ["cs-runtime/stdlib-net"]
+stdlib-http = ["cs-runtime/stdlib-http"]
+stdlib-websocket = ["cs-runtime/stdlib-websocket"]
+stdlib-collection = ["cs-runtime/stdlib-collection"]
+stdlib-math = ["cs-runtime/stdlib-math"]
+stdlib-tty = ["cs-runtime/stdlib-tty"]
+stdlib-signal = ["cs-runtime/stdlib-signal"]
+stdlib-meta = ["cs-runtime/stdlib-meta"]
+# WASM-safe subset — 20 modules that build clean for
+# `wasm32-wasip1`. Excludes: os/process (no Unix syscalls),
+# net/http/websocket (no real sockets in WASI), signal/tty
+# (Unix-only deps), compress (zstd-sys won't cross-compile
+# under nix-wrapped clang). Use as:
+#   cargo build --target wasm32-wasip1 -p cs-cli \
+#     --no-default-features --features wasm-stdlib
+# See docs/milestones/stdlib-modules-exit.md for the rationale.
+wasm-stdlib = [
+    "stdlib-path",
+    "stdlib-fs",
+    "stdlib-string",
+    "stdlib-format",
+    "stdlib-regex",
+    "stdlib-time",
+    "stdlib-random",
+    "stdlib-uuid",
+    "stdlib-json",
+    "stdlib-csv",
+    "stdlib-toml",
+    "stdlib-base",
+    "stdlib-url",
+    "stdlib-hash",
+    "stdlib-archive",
+    "stdlib-log",
+    "stdlib-metrics",
+    "stdlib-collection",
+    "stdlib-math",
+    "stdlib-meta",
+]
 # Backward-compat alias matching the W1 feature name.
 ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the

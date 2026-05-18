@@ -181,7 +181,6 @@ impl Runtime {
 
     pub fn new() -> Self {
         let mut rt = Self::new_inner();
-        #[cfg(feature = "stdlib")]
         rt.register_stdlib();
         rt
     }
@@ -1755,10 +1754,10 @@ impl Runtime {
     /// function returning `Vec<Arc<dyn HostProcedure>>`; this method
     /// iterates the enabled crates and registers each procedure.
     ///
-    /// Gated on the `stdlib` umbrella feature; per-module features
-    /// (`stdlib-path`, `stdlib-fs`, …) toggle individual modules.
-    /// Called automatically from `Runtime::new` when `stdlib` is on.
-    #[cfg(feature = "stdlib")]
+    /// Per-module features (`stdlib-path`, `stdlib-fs`, …) toggle
+    /// individual modules. When no `stdlib-X` feature is enabled
+    /// the body compiles to a no-op. Called automatically from
+    /// `Runtime::new`.
     pub fn register_stdlib(&mut self) {
         #[cfg(feature = "stdlib-path")]
         for p in cs_stdlib_path::procs() {
