@@ -405,10 +405,25 @@ impl PassPipeline {
     /// counted in `ctx.stats`. Passes are responsible for
     /// recording their own mutation counts via
     /// `ctx.stats.record_mutations`.
+    ///
+    /// **With `pass_verify` feature:** runs `cs_rir::verify_function`
+    /// after each pass and PANICS with the offending pass name +
+    /// the verify error if the pass produced malformed RIR. Dev-
+    /// only: production builds skip the check.
     pub fn run(&self, func: &mut Function, ctx: &mut PassContext) {
         for pass in &self.selected {
             ctx.stats.record_run(pass.name());
             pass.run(func, ctx);
+            #[cfg(feature = "pass_verify")]
+            {
+                if let Err(e) = cs_rir::verify_function(func) {
+                    panic!(
+                        "cs-opt: pass {:?} produced malformed RIR: {}",
+                        pass.name(),
+                        e
+                    );
+                }
+            }
         }
     }
 }

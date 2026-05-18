@@ -11,7 +11,23 @@ use cs_opt::{
     is_valid_pass_name, Bucket, Pass, PassContext, PassPipeline, PassRegistry, PassStats,
     PipelineError, RegisterError,
 };
-use cs_rir::Function;
+use cs_rir::{Block, BlockId, Function, Term, Value};
+
+/// Construct a minimal but well-formed Function: an entry block
+/// with a trivial Return terminator. The `pass_verify` feature
+/// (when enabled) checks that the entry block exists in
+/// `func.blocks`, so the `Function::new(...)` default (empty
+/// blocks vec) trips the verifier — this helper avoids that.
+fn skeleton_func(name: &str) -> Function {
+    let mut f = Function::new(name);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: Vec::new(),
+        insts: Vec::new(),
+        terminator: Term::Return(Value(0)),
+    });
+    f
+}
 
 // ---- Test passes (minimal impls used across the file) ----
 
@@ -257,7 +273,7 @@ fn pipeline_runs_passes_in_order() {
     }))
     .unwrap();
     let p = PassPipeline::from_names(&r, &["p-late", "p-default", "p-early"]).unwrap();
-    let mut func = Function::new("test");
+    let mut func = skeleton_func("test");
     let syms = SymbolTable::new();
     let mut stats = PassStats::default();
     let mut ctx = PassContext {
@@ -279,7 +295,7 @@ fn pipeline_runs_passes_in_order() {
 #[test]
 fn empty_pipeline_run_is_a_noop() {
     let p = PassPipeline::empty();
-    let mut func = Function::new("noop");
+    let mut func = skeleton_func("noop");
     let syms = SymbolTable::new();
     let mut stats = PassStats::default();
     let mut ctx = PassContext {
@@ -301,7 +317,7 @@ fn pipeline_run_twice_accumulates_stats() {
     }))
     .unwrap();
     let p = PassPipeline::from_names(&r, &["p1"]).unwrap();
-    let mut func = Function::new("t");
+    let mut func = skeleton_func("t");
     let syms = SymbolTable::new();
     let mut stats = PassStats::default();
     let mut ctx = PassContext {
@@ -322,4 +338,74 @@ fn pass_stats_returns_zero_for_unknown_pass() {
     let stats = PassStats::default();
     assert_eq!(stats.runs("never-ran"), 0);
     assert_eq!(stats.mutations("never-ran"), 0);
+}
+
+// ---- Verifier (iter 4) ----
+//
+// These two tests only run under the `pass_verify` feature.
+// `cargo test -p cs-opt --features pass_verify` exercises them;
+// the default test run skips them via cfg.
+
+#[cfg(feature = "pass_verify")]
+mod verifier_attribution {
+    use super::*;
+    use cs_rir::Term;
+
+    /// A buggy pass that breaks RIR by clobbering func.entry to a
+    /// non-existent BlockId. The verifier should panic with the
+    /// pass's name attributed.
+    struct BuggyPass;
+    impl Pass for BuggyPass {
+        fn name(&self) -> &str {
+            "buggy"
+        }
+        fn run(&self, func: &mut cs_rir::Function, _ctx: &mut PassContext) {
+            func.entry = BlockId(9999);
+        }
+    }
+
+    /// A pass that breaks RIR by making a Jump target dangle.
+    struct DanglerPass;
+    impl Pass for DanglerPass {
+        fn name(&self) -> &str {
+            "dangler"
+        }
+        fn run(&self, func: &mut cs_rir::Function, _ctx: &mut PassContext) {
+            func.blocks[0].terminator = Term::Jump(BlockId(9999), vec![]);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "buggy")]
+    fn verifier_attributes_missing_entry_to_pass_name() {
+        let mut r = PassRegistry::new();
+        r.register(Arc::new(BuggyPass)).unwrap();
+        let p = PassPipeline::from_names(&r, &["buggy"]).unwrap();
+        let mut func = skeleton_func("t");
+        let syms = SymbolTable::new();
+        let mut stats = PassStats::default();
+        let mut ctx = PassContext {
+            syms: &syms,
+            typer_hints: None,
+            stats: &mut stats,
+        };
+        p.run(&mut func, &mut ctx);
+    }
+
+    #[test]
+    #[should_panic(expected = "dangler")]
+    fn verifier_attributes_dangling_target_to_pass_name() {
+        let mut r = PassRegistry::new();
+        r.register(Arc::new(DanglerPass)).unwrap();
+        let p = PassPipeline::from_names(&r, &["dangler"]).unwrap();
+        let mut func = skeleton_func("t");
+        let syms = SymbolTable::new();
+        let mut stats = PassStats::default();
+        let mut ctx = PassContext {
+            syms: &syms,
+            typer_hints: None,
+            stats: &mut stats,
+        };
+        p.run(&mut func, &mut ctx);
+    }
 }

@@ -18,6 +18,9 @@ pub mod inline;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Value(pub u32);
 
+pub mod verify;
+pub use verify::{verify as verify_function, VerifyError};
+
 /// Basic-block identifier within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockId(pub u32);
