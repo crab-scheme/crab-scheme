@@ -10237,6 +10237,53 @@ pub fn exact_integer_sqrt_num(x: &Value) -> Result<(Value, Value), String> {
 /// Sentinel marking a Vector value as an R6RS environment record.
 pub(crate) const ENV_TAG: &str = "__environment__";
 
+/// Sentinel symbol returned by `(interaction-environment)` and
+/// `(scheme-report-environment N)`. Pure marker — `eval`'s 2nd-arg
+/// handler recognizes it as "no L1.1 restriction; use ctx.top".
+/// Not user-visible and not matched by string anywhere; the name
+/// is intentionally non-Scheme-valid so it can't be reproduced by
+/// `(intern ...)` from user code.
+pub(crate) const TOP_LEVEL_ENV_SENTINEL: &str = "__top-level-env__";
+
+/// Sentinel symbol returned by `(null-environment 5)`. Same role
+/// as [`TOP_LEVEL_ENV_SENTINEL`] — opaque marker for an unrestricted
+/// (in our impl) eval environment.
+pub(crate) const NULL_ENV_SENTINEL: &str = "__null-env__";
+
+/// Classification of a candidate R6RS environment-record Value.
+/// Used by `is_environment_value`, `decode_environment`, and
+/// `namespace_update` to share one shape-check implementation
+/// instead of three near-identical inline matches.
+pub(crate) enum EnvShape {
+    /// Well-formed; `mutable` is the value of slot[2].
+    Valid { mutable: bool },
+    /// Not a Vector at all.
+    NotVector,
+    /// Vector with len != 3.
+    WrongArity,
+    /// Slot[0] isn't the `ENV_TAG` string sentinel.
+    MissingTag,
+}
+
+/// Single source of truth for the env-record shape predicate.
+/// Caller is responsible for translating the failure variants
+/// into user-facing error text or a boolean answer.
+pub(crate) fn classify_env_record(v: &Value) -> EnvShape {
+    let Value::Vector(items) = v else {
+        return EnvShape::NotVector;
+    };
+    let items = items.borrow();
+    if items.len() != 3 {
+        return EnvShape::WrongArity;
+    }
+    let tag_ok = matches!(&items[0], Value::String(s) if s.borrow().as_str() == ENV_TAG);
+    if !tag_ok {
+        return EnvShape::MissingTag;
+    }
+    let mutable = matches!(&items[2], Value::Boolean(true));
+    EnvShape::Valid { mutable }
+}
+
 /// Hardcoded (rnrs base) export list — the R6RS §11 base library
 /// names registered as global builtins. NOT the full R6RS surface;
 /// targets the names common Scheme programs use. L1.3 split this
@@ -10470,36 +10517,26 @@ fn b_environment_p(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> 
 
 /// Internal: check the L1.1 environment-record shape.
 pub(crate) fn is_environment_value(v: &Value) -> bool {
-    if let Value::Vector(items) = v {
-        let items = items.borrow();
-        if items.len() == 3 {
-            if let Value::String(s) = &items[0] {
-                return s.borrow().as_str() == ENV_TAG;
-            }
-        }
-    }
-    false
+    matches!(classify_env_record(v), EnvShape::Valid { .. })
 }
 
 /// Internal: extract (bindings_map, mutable) from an environment
-/// value. Caller has already verified the shape via
-/// `is_environment_value`.
+/// value. Returns `None` for any malformed shape — caller can use
+/// `is_environment_value` first if they want a separate boolean.
 pub(crate) fn decode_environment(
     v: &Value,
 ) -> Option<(std::collections::HashMap<cs_core::Symbol, Value>, bool)> {
+    let EnvShape::Valid { mutable } = classify_env_record(v) else {
+        return None;
+    };
+    // Shape validated; pull out the alist (slot 1) and walk it.
     let Value::Vector(items) = v else {
+        // Unreachable: classify_env_record only returns Valid for
+        // Vector values. Keep the destructure here for borrow scope.
         return None;
     };
     let items = items.borrow();
-    if items.len() != 3 {
-        return None;
-    }
-    if !matches!(&items[0], Value::String(s) if s.borrow().as_str() == ENV_TAG) {
-        return None;
-    }
     let alist = &items[1];
-    let mutable = matches!(&items[2], Value::Boolean(true));
-    // Walk the alist; each element is a pair (sym . value).
     let mut map = std::collections::HashMap::new();
     let mut cur = alist.clone();
     loop {
@@ -10604,25 +10641,45 @@ fn namespace_update(
     new_val: Option<Value>,
     _ctx: &mut EvalCtx,
 ) -> Result<Value, String> {
-    let Value::Vector(items) = ns else {
-        return Err("namespace mutation: argument is not a namespace".into());
-    };
-    {
-        let items_ro = items.borrow();
-        if items_ro.len() != 3 {
-            return Err("namespace mutation: argument is not a namespace".into());
+    // Distinguish the failure modes so users can diagnose without
+    // staring at the same generic message three times — passing a
+    // pair vs. a 4-vector vs. a tagged-but-not-namespace vector
+    // each gets its own diagnostic.
+    match classify_env_record(ns) {
+        EnvShape::NotVector => {
+            return Err(format!(
+                "namespace mutation: argument is not a namespace (got {})",
+                ns.type_name()
+            ));
         }
-        if !matches!(&items_ro[0], Value::String(s) if s.borrow().as_str() == ENV_TAG) {
-            return Err("namespace mutation: argument is not a namespace".into());
+        EnvShape::WrongArity => {
+            return Err(
+                "namespace mutation: argument is a vector but not a namespace record \
+                 (expected 3-element [tag, bindings, mutable] shape)"
+                    .into(),
+            );
         }
-        if !matches!(&items_ro[2], Value::Boolean(true)) {
+        EnvShape::MissingTag => {
+            return Err(
+                "namespace mutation: argument is a vector but not a namespace record \
+                 (slot 0 is not the namespace-tag sentinel)"
+                    .into(),
+            );
+        }
+        EnvShape::Valid { mutable: false } => {
             return Err(
                 "namespace mutation: argument is an immutable environment (from `environment`); \
                  use `make-namespace` for a mutable namespace"
                     .into(),
             );
         }
+        EnvShape::Valid { mutable: true } => { /* fall through */ }
     }
+    let Value::Vector(items) = ns else {
+        // Unreachable: classify_env_record returned Valid which
+        // implies Vector. Mirror decode_environment's pattern.
+        return Err("namespace mutation: unreachable shape".into());
+    };
     let mut entries: Vec<(cs_core::Symbol, Value)> = Vec::new();
     let mut cur = items.borrow()[1].clone();
     loop {
@@ -10662,7 +10719,7 @@ fn b_interaction_environment(_args: &[Value], ctx: &mut EvalCtx) -> Result<Value
     // restricted. Returning a sentinel here means eval recognizes
     // "no restriction" and uses ctx.top directly (preserving
     // pre-L1.1 behavior).
-    Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
+    Ok(Value::Symbol(ctx.syms.intern(TOP_LEVEL_ENV_SENTINEL)))
 }
 
 /// R5RS / R7RS legacy: `(null-environment version)`. Returns the
@@ -10678,7 +10735,7 @@ fn b_null_environment(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String
     if v != 5 {
         return Err(format!("null-environment: unsupported version: {}", v));
     }
-    Ok(Value::Symbol(ctx.syms.intern("__null-env__")))
+    Ok(Value::Symbol(ctx.syms.intern(NULL_ENV_SENTINEL)))
 }
 
 /// R5RS / R7RS legacy: `(scheme-report-environment version)`. Returns
@@ -10695,7 +10752,7 @@ fn b_scheme_report_environment(args: &[Value], ctx: &mut EvalCtx) -> Result<Valu
             v
         ));
     }
-    Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
+    Ok(Value::Symbol(ctx.syms.intern(TOP_LEVEL_ENV_SENTINEL)))
 }
 
 /// R7RS `(load filename [environment])`. Reads filename as a sequence

@@ -109,17 +109,26 @@ impl SandboxRuntime {
         })
     }
 
-    pub fn engine(&self) -> &Engine {
+    /// Wasmtime Engine for internal crate use (smoke helper +
+    /// per-call Store construction). Not part of the public API
+    /// — embedders should construct `SandboxInstance` instead of
+    /// poking at the engine directly. `pub(crate)` keeps tests
+    /// honest about the supported surface.
+    pub(crate) fn engine(&self) -> &Engine {
         &self.engine
     }
 
-    pub fn store_limits(&self) -> StoreLimits {
+    /// Build a fresh per-Store resource limiter from the runtime's
+    /// configured memory cap. Internal — see [`engine`].
+    pub(crate) fn store_limits(&self) -> StoreLimits {
         StoreLimitsBuilder::new()
             .memory_size(self.memory_limit)
             .build()
     }
 
-    pub fn fuel(&self) -> Option<u64> {
+    /// Configured per-call wasm fuel, if any. Internal — see
+    /// [`engine`].
+    pub(crate) fn fuel(&self) -> Option<u64> {
         self.fuel
     }
 

@@ -24,6 +24,7 @@ use cs_diag::{Diagnostic, FileId, SourceMap};
 use cs_expand::Expander;
 use cs_parse::read_all;
 
+use crate::builtins::{NULL_ENV_SENTINEL, TOP_LEVEL_ENV_SENTINEL};
 use crate::env::Frame;
 use crate::eval::{eval, EvalCtx, EvalError};
 
@@ -478,7 +479,7 @@ impl Runtime {
         vm_env.define(
             env_sym,
             cs_vm::vm::make_vm_builtin_syms("environment", |_args, st| {
-                Ok(Value::Symbol(st.intern("__top-level-env__")))
+                Ok(Value::Symbol(st.intern(TOP_LEVEL_ENV_SENTINEL)))
             }),
         );
         // R6RS multi-value division ops. Both stash the (d, m) pair via
@@ -864,7 +865,7 @@ impl Runtime {
                 if !args.is_empty() {
                     return Err("interaction-environment: 0 args".into());
                 }
-                Ok(Value::Symbol(st.intern("__top-level-env__")))
+                Ok(Value::Symbol(st.intern(TOP_LEVEL_ENV_SENTINEL)))
             }),
         );
         // R5RS/R7RS legacy environment-introspection procedures.
@@ -882,7 +883,7 @@ impl Runtime {
                 if v != 5 {
                     return Err(format!("null-environment: unsupported version: {}", v));
                 }
-                Ok(Value::Symbol(st.intern("__null-env__")))
+                Ok(Value::Symbol(st.intern(NULL_ENV_SENTINEL)))
             }),
         );
         let srenv_sym = syms.intern("scheme-report-environment");
@@ -902,7 +903,7 @@ impl Runtime {
                         v
                     ));
                 }
-                Ok(Value::Symbol(st.intern("__top-level-env__")))
+                Ok(Value::Symbol(st.intern(TOP_LEVEL_ENV_SENTINEL)))
             }),
         );
         // get-string-all does not need ctx; install as pure VM builtin.
