@@ -88,6 +88,7 @@ stdlib = [
     "stdlib-url",
     "stdlib-hash",
     "stdlib-compress",
+    "stdlib-deflate",
     "stdlib-archive",
     "stdlib-log",
     "stdlib-metrics",
@@ -123,6 +124,7 @@ stdlib-base = ["ffi-trait", "dep:cs-stdlib-base", "cs-stdlib-meta?/meta-base"]
 stdlib-url = ["ffi-trait", "dep:cs-stdlib-url", "cs-stdlib-meta?/meta-url"]
 stdlib-hash = ["ffi-trait", "dep:cs-stdlib-hash", "cs-stdlib-meta?/meta-hash"]
 stdlib-compress = ["ffi-trait", "dep:cs-stdlib-compress", "cs-stdlib-meta?/meta-compress"]
+stdlib-deflate = ["ffi-trait", "dep:cs-stdlib-deflate", "cs-stdlib-meta?/meta-deflate"]
 stdlib-archive = ["ffi-trait", "dep:cs-stdlib-archive", "cs-stdlib-meta?/meta-archive"]
 stdlib-log = ["ffi-trait", "dep:cs-stdlib-log", "cs-stdlib-meta?/meta-log"]
 stdlib-metrics = ["ffi-trait", "dep:cs-stdlib-metrics", "cs-stdlib-meta?/meta-metrics"]
@@ -173,6 +175,7 @@ cs-stdlib-base = { workspace = true, optional = true }
 cs-stdlib-url = { workspace = true, optional = true }
 cs-stdlib-hash = { workspace = true, optional = true }
 cs-stdlib-compress = { workspace = true, optional = true }
+cs-stdlib-deflate = { workspace = true, optional = true }
 cs-stdlib-archive = { workspace = true, optional = true }
 cs-stdlib-log = { workspace = true, optional = true }
 cs-stdlib-metrics = { workspace = true, optional = true }

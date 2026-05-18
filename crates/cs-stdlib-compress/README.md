@@ -1,22 +1,23 @@
-# `(crab compress)` — gzip / deflate / zstd
+# `(crab compress)` — zstd
 
-CrabScheme stdlib module wrapping `flate2` (gzip, deflate) and
-`zstd`. Iter 7 of the stdlib-modules spec.
+CrabScheme stdlib module wrapping `zstd`. After the iter-17 split,
+gzip + raw deflate live in `cs-stdlib-deflate` so the WASM build
+can ship those without needing the zstd C toolchain.
 
-## Procedures
+Native default builds keep enabling both crates so the surface
+`(gzip-compress …)`, `(deflate-compress …)`, `(zstd-compress …)`
+keeps working without Scheme-side changes.
+
+## Procedures (this crate)
 
 ```
-(gzip-compress bv [level])      ;-> bytevector   ; level 0–9, default 6
-(gzip-decompress bv)            ;-> bytevector
-(deflate-compress bv [level])   ;-> bytevector   ; raw deflate (no gzip header)
-(deflate-decompress bv)         ;-> bytevector
-(zstd-compress bv [level])      ;-> bytevector   ; level 1–22, default 3
-(zstd-decompress bv)            ;-> bytevector
+(zstd-compress bv [level])           ;-> bytevector  ; level 1–22, default 3
+(zstd-decompress bv [max-output])    ;-> bytevector  ; max default 64 MB
 ```
 
-All procedures slurp the full input into memory and emit a single
-output bytevector. Port-wrapping streaming variants land with
-`Value::Opaque`.
+`max-output` is a decompression-bomb mitigation — caller-supplied
+compressed input can expand 1 KB → several GB. Pass a larger cap
+explicitly when processing trusted bulk data.
 
 ## Example
 
@@ -25,11 +26,19 @@ output bytevector. Port-wrapping streaming variants land with
 (import (crab fs))
 
 (define raw (read-file-bytes "log.txt"))
-(define gz (gzip-compress raw 9))
-(write-file-bytes "log.txt.gz" gz)
+(define zst (zstd-compress raw 9))
+(write-file-bytes "log.txt.zst" zst)
 
 (display "ratio: ")
-(display (* 100.0 (/ (bytevector-length gz)
+(display (* 100.0 (/ (bytevector-length zst)
                      (bytevector-length raw))))
 (display "%") (newline)
 ```
+
+## WASM
+
+This crate **does not build for `wasm32-wasip1`** in the default
+dev env because `zstd-sys`' build script passes
+`-fzero-call-used-regs` to clang which the nix-wrapped clang
+rejects for the wasm target. For WASM use
+`cs-stdlib-deflate` (gzip + raw deflate) instead.

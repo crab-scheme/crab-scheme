@@ -33,6 +33,7 @@ cs-stdlib-base = { workspace = true, optional = true }
 cs-stdlib-url = { workspace = true, optional = true }
 cs-stdlib-hash = { workspace = true, optional = true }
 cs-stdlib-compress = { workspace = true, optional = true }
+cs-stdlib-deflate = { workspace = true, optional = true }
 cs-stdlib-archive = { workspace = true, optional = true }
 cs-stdlib-log = { workspace = true, optional = true }
 cs-stdlib-metrics = { workspace = true, optional = true }
@@ -62,6 +63,7 @@ meta-base = ["dep:cs-stdlib-base"]
 meta-url = ["dep:cs-stdlib-url"]
 meta-hash = ["dep:cs-stdlib-hash"]
 meta-compress = ["dep:cs-stdlib-compress"]
+meta-deflate = ["dep:cs-stdlib-deflate"]
 meta-archive = ["dep:cs-stdlib-archive"]
 meta-log = ["dep:cs-stdlib-log"]
 meta-metrics = ["dep:cs-stdlib-metrics"]

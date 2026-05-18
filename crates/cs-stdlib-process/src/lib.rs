@@ -9,6 +9,24 @@
 //! they're tracked for a follow-up iter once `Value::Opaque`
 //! lands. This iter ships the synchronous convenience:
 //!
+//! ## WASM behavior
+//!
+//! On `wasm32-wasip1` and `wasm32-wasip2`, WASI intentionally
+//! excludes fork/exec (Component Model sandboxing). The crate
+//! compiles for those targets and is included in `wasm-stdlib`,
+//! but `(run …)` and `(run/status …)` raise
+//! `FfiError::HostFailure` at call time — `Command::spawn()`
+//! returns `Err(io::ErrorKind::Unsupported)` from the wasi std
+//! layer, which our existing `?` propagation converts to a
+//! Scheme-visible error. `(which …)` works on WASI (pure PATH
+//! search via `std::fs`, no spawn needed).
+//!
+//! Callers that want to gracefully degrade can wrap the call in
+//! `guard` and fall back to a Scheme-only path. See the spec's
+//! "WASM gap analysis" research for why this is the chosen
+//! behavior rather than excluding the module entirely or
+//! adopting WASIX (which would lock-in the Wasmer runtime).
+//!
 //! ## Registered procedures
 //!
 //! | Scheme name | Args | Returns | Notes |

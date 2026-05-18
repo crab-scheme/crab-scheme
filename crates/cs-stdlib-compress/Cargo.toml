@@ -5,10 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-description = "CrabScheme stdlib module (crab compress) — gzip / deflate / zstd."
+description = "CrabScheme stdlib module (crab compress) — zstd. gzip/deflate live in cs-stdlib-deflate."
 
 [dependencies]
 cs-core = { workspace = true }
 cs-ffi = { workspace = true }
-flate2 = "1"
+
+# Native gets the C zstd via the official Rust binding — fast,
+# full encoder/decoder.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = "0.13"
+
+# WASM gets the pure-Rust port (no C toolchain → no nix-clang
+# `-fzero-call-used-regs` issue). 2-3× slower but functional.
+# Decoder-focused; encoder support is also present in 0.8.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ruzstd = "0.8"

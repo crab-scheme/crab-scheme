@@ -213,6 +213,12 @@ fn conformance_crab_compress() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-deflate")]
+fn conformance_crab_deflate() {
+    run_conformance_file("crab-deflate.scm");
+}
+
+#[test]
 #[cfg(all(
     feature = "stdlib-archive",
     feature = "stdlib-fs",

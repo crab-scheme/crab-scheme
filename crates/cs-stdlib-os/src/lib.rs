@@ -151,10 +151,22 @@ fn parent_process_id(args: &[Value]) -> Result<Value, FfiError> {
 
 // ----- host identity -----
 
+#[cfg(not(target_family = "wasm"))]
 fn hostname(args: &[Value]) -> Result<Value, FfiError> {
     expect_no_args("hostname", args)?;
     let os = gethostname::gethostname();
     Ok(string_value(os.to_string_lossy().into_owned()))
+}
+
+// WASI preview 1 has no hostname syscall. Fall back to the
+// HOSTNAME env var (which the runtime may have injected) and
+// otherwise return the literal "wasi" so callers always get a
+// non-empty answer.
+#[cfg(target_family = "wasm")]
+fn hostname(args: &[Value]) -> Result<Value, FfiError> {
+    expect_no_args("hostname", args)?;
+    let name = std::env::var("HOSTNAME").unwrap_or_else(|_| "wasi".to_string());
+    Ok(string_value(name))
 }
 
 fn username(args: &[Value]) -> Result<Value, FfiError> {

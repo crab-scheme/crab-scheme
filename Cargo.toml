@@ -49,6 +49,7 @@ members = [
     "crates/cs-stdlib-url",
     "crates/cs-stdlib-hash",
     "crates/cs-stdlib-compress",
+    "crates/cs-stdlib-deflate",
     "crates/cs-stdlib-archive",
     "crates/cs-stdlib-log",
     "crates/cs-stdlib-metrics",
@@ -116,6 +117,7 @@ cs-stdlib-base = { path = "crates/cs-stdlib-base" }
 cs-stdlib-url = { path = "crates/cs-stdlib-url" }
 cs-stdlib-hash = { path = "crates/cs-stdlib-hash" }
 cs-stdlib-compress = { path = "crates/cs-stdlib-compress" }
+cs-stdlib-deflate = { path = "crates/cs-stdlib-deflate" }
 cs-stdlib-archive = { path = "crates/cs-stdlib-archive" }
 cs-stdlib-log = { path = "crates/cs-stdlib-log" }
 cs-stdlib-metrics = { path = "crates/cs-stdlib-metrics" }
