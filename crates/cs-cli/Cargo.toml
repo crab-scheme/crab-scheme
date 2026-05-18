@@ -10,12 +10,23 @@ name = "crabscheme"
 path = "src/main.rs"
 
 [features]
-# M10 Track W iter 1 + closeout — mirror cs-runtime's feature flags.
-# `default` keeps the full native build (jit + ffi-dynamic + aot).
-# A WASM build uses `--no-default-features`; an in-process Rust
-# embedder that wants custom builtins without dlopen uses
-# `--features ffi-trait` (e.g. for compile-into-WASM plugins).
-default = ["jit", "ffi-dynamic", "aot", "stdlib"]
+# `default` is the "kitchen sink" native build — everything an
+# end-user downloading a prebuilt binary or building locally
+# without flags should get. Includes all four execution tiers
+# (walker / vm / jit / aot), full stdlib (`crab …` modules),
+# dynamic FFI loading, the BEAM-style actor primops, and the
+# L2 WASM sandbox. Heavy on first build (~30s for wasmtime),
+# but produces the binary that documentation assumes.
+#
+# Three opt-outs:
+# - WASM target: use `--no-default-features` (tokio + wasmtime
+#   don't compile to wasm32-wasip1; tracing-revival might).
+# - Minimal embedder: `--no-default-features --features
+#   stdlib-path,stdlib-fs` etc. for a tighter dep closure.
+# - Bleeding-edge memory layers: layer-4 tracing GC is OFF by
+#   default; enable via `--features all-memory-layers` (or
+#   `tracing-cycle-collector` for just that one).
+default = ["jit", "ffi-dynamic", "aot", "stdlib", "actor", "sandbox"]
 jit = ["cs-runtime/jit"]
 ffi-trait = ["cs-runtime/ffi-trait"]
 ffi-dynamic = ["cs-runtime/ffi-dynamic"]
