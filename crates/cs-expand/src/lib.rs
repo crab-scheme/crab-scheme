@@ -210,6 +210,15 @@ pub struct Expander<'a> {
     /// of this stack so it gets attached to A's cache entry on
     /// completion. Empty when no library is being loaded.
     library_dep_stack: Vec<Vec<(Vec<String>, u64)>>,
+    /// Phase 2A.2 user-defined syntax class registry. Each
+    /// `(define-syntax-class name predicate)` form binds
+    /// `name -> predicate-symbol`. The `define-syntax-parser`
+    /// dispatcher consults this map (after the four built-in
+    /// classes id/expr/number/string) when resolving `name:class`
+    /// annotations in user macro patterns. Cleared per Expander
+    /// session; user classes don't persist across sessions
+    /// unless registered before the session begins.
+    syntax_classes: std::collections::HashMap<Symbol, Symbol>,
     /// Stack of mark-expression Datums, one per enclosing
     /// syntax-case form being expanded. The top-of-stack entry
     /// is consumed by `compile_syntax_template` (Phase 1.5
@@ -312,6 +321,7 @@ struct Keywords {
     mutable: Symbol,
     define_syntax: Symbol,
     define_syntax_parser: Symbol,
+    define_syntax_class: Symbol,
     let_syntax: Symbol,
     letrec_syntax: Symbol,
     syntax_rules: Symbol,
@@ -375,6 +385,7 @@ impl Keywords {
             mutable: syms.intern("mutable"),
             define_syntax: syms.intern("define-syntax"),
             define_syntax_parser: syms.intern("define-syntax-parser"),
+            define_syntax_class: syms.intern("define-syntax-class"),
             let_syntax: syms.intern("let-syntax"),
             letrec_syntax: syms.intern("letrec-syntax"),
             syntax_rules: syms.intern("syntax-rules"),
@@ -422,6 +433,7 @@ impl<'a> Expander<'a> {
             condition_types: std::collections::HashMap::new(),
             syntax_pvars: Vec::new(),
             library_dep_stack: Vec::new(),
+            syntax_classes: std::collections::HashMap::new(),
             syntax_mark_exprs: Vec::new(),
             libraries: std::collections::HashMap::new(),
         }
@@ -499,6 +511,9 @@ impl<'a> Expander<'a> {
                 }
                 if *s == self.keywords.define_syntax_parser {
                     return self.expand_define_syntax_parser(&tail, d.span());
+                }
+                if *s == self.keywords.define_syntax_class {
+                    return self.expand_define_syntax_class(&tail, d.span());
                 }
                 if *s == self.keywords.include {
                     return self.expand_include(&tail, d.span());
@@ -1295,6 +1310,55 @@ impl<'a> Expander<'a> {
     }
 
     /// `(define-syntax name (syntax-rules (literals...) (pattern template) ...))`
+    /// R6RS++ Phase 2A.2: `(define-syntax-class name predicate)`.
+    /// Binds `name` as a user-defined syntax class. After
+    /// definition, patterns like `pat:name` inside
+    /// `define-syntax-parser` clauses consult the registered
+    /// predicate to constrain matched values.
+    ///
+    /// Simple predicate form only; Racket's compound class
+    /// definitions (`(pattern ... #:when ...)`) defer to a later
+    /// iter.
+    ///
+    /// Lowers to a no-op CoreExpr (Unspecified). The registry
+    /// update is the side effect.
+    fn expand_define_syntax_class(
+        &mut self,
+        items: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        if items.len() != 2 {
+            return Err(ExpandError::BadSyntax {
+                what: "define-syntax-class: (define-syntax-class name predicate)".into(),
+                span,
+            });
+        }
+        let name = match &items[0] {
+            Datum::Symbol(s, _) => *s,
+            other => {
+                return Err(ExpandError::BadSyntax {
+                    what: "define-syntax-class: name must be a symbol".into(),
+                    span: other.span(),
+                });
+            }
+        };
+        let pred = match &items[1] {
+            Datum::Symbol(s, _) => *s,
+            other => {
+                return Err(ExpandError::BadSyntax {
+                    what: "define-syntax-class: predicate must be a bare symbol naming a procedure"
+                        .into(),
+                    span: other.span(),
+                });
+            }
+        };
+        self.syntax_classes.insert(name, pred);
+        Ok(CoreExpr::Const {
+            value: Value::Unspecified,
+            span,
+        })
+    }
+
     /// R6RS++ Phase 2A.1: `(define-syntax-parser name clause ...)`.
     /// Each clause is `[(_ pat ...) body ...]` where pattern items
     /// may be annotated `id:class` to constrain the matched value
@@ -1368,11 +1432,23 @@ impl<'a> Expander<'a> {
                     "number" => Some(self.syms.intern("number?")),
                     "string" => Some(self.syms.intern("string?")),
                     "expr" => None, // matches anything
-                    _ => {
-                        return Err(ExpandError::BadSyntax {
-                            what: format!("define-syntax-parser: unknown syntax class `{}` (built-in classes: id, expr, number, string)", class_name),
-                            span: clause.span(),
-                        });
+                    other => {
+                        // Phase 2A.2: consult user-defined
+                        // syntax-class registry. Intern the
+                        // class-name symbol and look up.
+                        let name_sym = self.syms.intern(other);
+                        match self.syntax_classes.get(&name_sym) {
+                            Some(p) => Some(*p),
+                            None => {
+                                return Err(ExpandError::BadSyntax {
+                                    what: format!(
+                                        "define-syntax-parser: unknown syntax class `{}` (built-in: id, expr, number, string; user classes registered via define-syntax-class)",
+                                        class_name
+                                    ),
+                                    span: clause.span(),
+                                });
+                            }
+                        }
                     }
                 };
                 if let Some(pred_sym) = pred {
