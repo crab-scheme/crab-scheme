@@ -748,6 +748,25 @@ fn value_to_pid(v: &Value, syms: &SymbolTable, who: &str) -> Result<ActorPid, St
     }
 }
 
+fn check_arity(who: &str, args: &[Value], expected: usize) -> Result<(), String> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        let noun = if expected == 1 {
+            "argument"
+        } else {
+            "arguments"
+        };
+        Err(format!(
+            "{}: expected {} {}, got {}",
+            who,
+            expected,
+            noun,
+            args.len()
+        ))
+    }
+}
+
 fn value_to_str<'a>(v: &'a Value, syms: &'a SymbolTable, who: &str) -> Result<String, String> {
     match v {
         Value::Symbol(s) => Ok(syms.name(*s).to_string()),
@@ -762,9 +781,7 @@ fn value_to_str<'a>(v: &'a Value, syms: &'a SymbolTable, who: &str) -> Result<St
 
 /// `(send pid value)` — fire-and-forget cast.
 pub fn b_beam_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(format!("send: expected 2 arguments, got {}", args.len()));
-    }
+    check_arity("send", args, 2)?;
     let pid = value_to_pid(&args[0], syms, "send")?;
     let sv = to_sendable_in(&args[1], syms)?;
     primop_send(pid, sv)?;
@@ -774,12 +791,7 @@ pub fn b_beam_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
 /// `(make-table name type)` — create a named table. `type` is
 /// either the symbol `set` or `ordered-set`.
 pub fn b_beam_make_table(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(format!(
-            "make-table: expected 2 arguments, got {}",
-            args.len()
-        ));
-    }
+    check_arity("make-table", args, 2)?;
     let name = value_to_str(&args[0], syms, "make-table")?;
     let ty = value_to_str(&args[1], syms, "make-table")?;
     primop_make_table(&name, &ty)?;
@@ -790,12 +802,7 @@ pub fn b_beam_make_table(args: &[Value], syms: &mut SymbolTable) -> Result<Value
 /// `value`. Overwrites any prior value (set / ordered_set
 /// semantics).
 pub fn b_beam_table_insert(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 3 {
-        return Err(format!(
-            "table-insert!: expected 3 arguments, got {}",
-            args.len()
-        ));
-    }
+    check_arity("table-insert!", args, 3)?;
     let name = value_to_str(&args[0], syms, "table-insert!")?;
     let key = to_sendable_in(&args[1], syms)?;
     let value = to_sendable_in(&args[2], syms)?;
@@ -805,12 +812,7 @@ pub fn b_beam_table_insert(args: &[Value], syms: &mut SymbolTable) -> Result<Val
 
 /// `(table-lookup name key)` — returns the value or `#f`.
 pub fn b_beam_table_lookup(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(format!(
-            "table-lookup: expected 2 arguments, got {}",
-            args.len()
-        ));
-    }
+    check_arity("table-lookup", args, 2)?;
     let name = value_to_str(&args[0], syms, "table-lookup")?;
     let key = to_sendable_in(&args[1], syms)?;
     match primop_table_lookup(&name, &key)? {
@@ -822,12 +824,7 @@ pub fn b_beam_table_lookup(args: &[Value], syms: &mut SymbolTable) -> Result<Val
 /// `(table-delete! name key)` — returns `#t` if the key was
 /// present (and is now removed), `#f` otherwise.
 pub fn b_beam_table_delete(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(format!(
-            "table-delete!: expected 2 arguments, got {}",
-            args.len()
-        ));
-    }
+    check_arity("table-delete!", args, 2)?;
     let name = value_to_str(&args[0], syms, "table-delete!")?;
     let key = to_sendable_in(&args[1], syms)?;
     let removed = primop_table_delete(&name, &key)?;
@@ -836,12 +833,7 @@ pub fn b_beam_table_delete(args: &[Value], syms: &mut SymbolTable) -> Result<Val
 
 /// `(table-size name)` — returns the current cell count.
 pub fn b_beam_table_size(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(format!(
-            "table-size: expected 1 argument, got {}",
-            args.len()
-        ));
-    }
+    check_arity("table-size", args, 1)?;
     let name = value_to_str(&args[0], syms, "table-size")?;
     let n = primop_table_size(&name)?;
     Ok(Value::Number(Number::Fixnum(n as i64)))
@@ -872,9 +864,7 @@ pub fn b_beam_spawn(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Str
 /// `(self)` — return the calling actor's PID as a symbol.
 /// Errors if called from outside an actor body.
 pub fn b_beam_self(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if !args.is_empty() {
-        return Err(format!("self: expected 0 arguments, got {}", args.len()));
-    }
+    check_arity("self", args, 0)?;
     let pid = with_current_actor(|a| a.self_ref().pid())
         .ok_or_else(|| "self: not inside an actor body".to_string())?;
     Ok(from_sendable(&SendableValue::Pid(pid), syms))
@@ -885,12 +875,7 @@ pub fn b_beam_self(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
 /// the scheduler tracks per actor. B3's scheduler-swap half
 /// (post-1.0) will use this as a yield-check threshold.
 pub fn b_beam_reductions(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
-    if !args.is_empty() {
-        return Err(format!(
-            "reductions: expected 0 arguments, got {}",
-            args.len()
-        ));
-    }
+    check_arity("reductions", args, 0)?;
     let n = REDUCTIONS.with(|c| c.get());
     Ok(Value::Number(Number::Fixnum(n as i64)))
 }
@@ -902,12 +887,7 @@ pub fn b_beam_reductions(args: &[Value], _syms: &mut SymbolTable) -> Result<Valu
 /// the bytecode dispatch loop's yield-check hook will do it
 /// automatically (B3 second half, post-1.0).
 pub fn b_beam_bump_reductions(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(format!(
-            "bump-reductions!: expected 1 argument, got {}",
-            args.len()
-        ));
-    }
+    check_arity("bump-reductions!", args, 1)?;
     let n = match &args[0] {
         Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as u64,
         other => {
@@ -936,9 +916,7 @@ pub fn b_beam_bump_reductions(args: &[Value], _syms: &mut SymbolTable) -> Result
 /// scheduler-swap where worker threads juggle many actors via
 /// reduction-counted slices.
 pub fn b_beam_yield(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
-    if !args.is_empty() {
-        return Err(format!("yield: expected 0 arguments, got {}", args.len()));
-    }
+    check_arity("yield", args, 0)?;
     // The reduction-count gate is conceptually per-actor; only
     // make the reset meaningful when we're actually inside an
     // actor body. Outside, `(yield)` is still legal (a no-op
@@ -1000,12 +978,7 @@ fn proper_list(v: &Value) -> Option<Vec<Value>> {
 /// (or re-register) a module's exports. Returns the new
 /// current version's epoch as a fixnum.
 pub fn b_beam_load_module(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(format!(
-            "load-module!: expected 2 arguments, got {}",
-            args.len()
-        ));
-    }
+    check_arity("load-module!", args, 2)?;
     let module = value_to_str(&args[0], syms, "load-module!")?;
     let pairs = proper_list(&args[1])
         .ok_or_else(|| "load-module!: second arg must be an alist of (name . value)".to_string())?;
@@ -1032,12 +1005,7 @@ pub fn b_beam_load_module(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
 /// `(lookup-code 'module "export")` — current version. Returns
 /// the export value or `#f` if missing.
 pub fn b_beam_lookup_code(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(format!(
-            "lookup-code: expected 2 arguments, got {}",
-            args.len()
-        ));
-    }
+    check_arity("lookup-code", args, 2)?;
     let module = value_to_str(&args[0], syms, "lookup-code")?;
     let name = value_to_str(&args[1], syms, "lookup-code")?;
     match primop_lookup_code(&module, &name) {
@@ -1049,12 +1017,7 @@ pub fn b_beam_lookup_code(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
 /// `(lookup-code-old 'module "export")` — pre-reload version.
 /// Returns `#f` for modules without a prior version.
 pub fn b_beam_lookup_code_old(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(format!(
-            "lookup-code-old: expected 2 arguments, got {}",
-            args.len()
-        ));
-    }
+    check_arity("lookup-code-old", args, 2)?;
     let module = value_to_str(&args[0], syms, "lookup-code-old")?;
     let name = value_to_str(&args[1], syms, "lookup-code-old")?;
     match primop_lookup_code_old(&module, &name) {
@@ -1067,12 +1030,7 @@ pub fn b_beam_lookup_code_old(args: &[Value], syms: &mut SymbolTable) -> Result<
 /// version if no actor is pinned to it. Raises with a clear
 /// error if the count is non-zero.
 pub fn b_beam_code_soft_purge(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(format!(
-            "code-soft-purge!: expected 2 arguments, got {}",
-            args.len()
-        ));
-    }
+    check_arity("code-soft-purge!", args, 2)?;
     let module = value_to_str(&args[0], syms, "code-soft-purge!")?;
     let count = match &args[1] {
         Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as usize,
@@ -1089,12 +1047,7 @@ pub fn b_beam_code_soft_purge(args: &[Value], syms: &mut SymbolTable) -> Result<
 
 /// `(code-purge! 'module)` — force-drop the old version.
 pub fn b_beam_code_purge(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(format!(
-            "code-purge!: expected 1 argument, got {}",
-            args.len()
-        ));
-    }
+    check_arity("code-purge!", args, 1)?;
     let module = value_to_str(&args[0], syms, "code-purge!")?;
     primop_code_purge(&module)?;
     Ok(Value::Unspecified)
@@ -1104,12 +1057,7 @@ pub fn b_beam_code_purge(args: &[Value], syms: &mut SymbolTable) -> Result<Value
 /// where each side is a fixnum or `#f`. Returns `#f` if the
 /// module isn't loaded.
 pub fn b_beam_code_versions(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(format!(
-            "code-versions: expected 1 argument, got {}",
-            args.len()
-        ));
-    }
+    check_arity("code-versions", args, 1)?;
     let module = value_to_str(&args[0], syms, "code-versions")?;
     match primop_code_versions(&module) {
         Some((old, cur)) => {
@@ -1127,12 +1075,7 @@ pub fn b_beam_code_versions(args: &[Value], syms: &mut SymbolTable) -> Result<Va
 /// `(code-modules)` — proper list of loaded module names as
 /// symbols.
 pub fn b_beam_code_modules(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if !args.is_empty() {
-        return Err(format!(
-            "code-modules: expected 0 arguments, got {}",
-            args.len()
-        ));
-    }
+    check_arity("code-modules", args, 0)?;
     let mods = primop_code_modules();
     let mut acc = Value::Null;
     for name in mods.into_iter().rev() {
@@ -1145,12 +1088,7 @@ pub fn b_beam_code_modules(args: &[Value], syms: &mut SymbolTable) -> Result<Val
 /// `(code-unload! 'module)` — drop both versions. Idempotent
 /// for missing modules.
 pub fn b_beam_code_unload(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(format!(
-            "code-unload!: expected 1 argument, got {}",
-            args.len()
-        ));
-    }
+    check_arity("code-unload!", args, 1)?;
     let module = value_to_str(&args[0], syms, "code-unload!")?;
     primop_code_unload(&module);
     Ok(Value::Unspecified)
