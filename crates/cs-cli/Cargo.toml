@@ -138,6 +138,17 @@ tracing-cycle-collector = ["cs-runtime/tracing-cycle-collector"]
 # layer so benchmarks can exercise the full architecture.
 # `regions` is already default-on; this adds layer 4.
 all-memory-layers = ["tracing-cycle-collector"]
+# BEAM-style actor / table / hot-reload primops
+# (`spawn`, `send`, `self`, `make-table`, `load-module!`, …).
+# Off by default — the tokio + dashmap dep tree is heavy and
+# WASM builds can't link it. Enable for native CLI builds that
+# need actor-style concurrency.
+actor = ["cs-runtime/actor"]
+# L2 WASM-instance sandbox (`make-wasm-sandbox`, `sandbox-eval`,
+# `sandbox?`, `reset-sandbox!`). Pulls wasmtime 36.x LTS plus
+# cs-sandbox-wasm. Off by default — host wasmtime is a large
+# dep (~30s clean build); enable for embedders that need L2.
+sandbox = ["cs-runtime/sandbox"]
 
 [dependencies]
 cs-core = { workspace = true }

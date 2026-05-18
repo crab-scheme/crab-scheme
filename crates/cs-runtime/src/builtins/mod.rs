@@ -837,9 +837,11 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
     #[allow(unused_mut)]
     let mut v: Vec<HoEntry> = vec![
         // ADR 0014 — optimizer-pass installation.
-        ("install-optimizer-pass!", b_install_optimizer_pass),
-        ("remove-optimizer-pass!", b_remove_optimizer_pass),
-        ("installed-optimizer-passes", b_installed_optimizer_passes),
+        // The three simple primops (install/remove/installed) are now
+        // SymsBuiltins and registered via `syms_builtins()` so they
+        // work in both walker and VM tiers. Only the higher-order
+        // `with-active-optimizer-passes` (which invokes a Scheme thunk
+        // via `apply_procedure`) needs full EvalCtx and stays here.
         (
             "with-active-optimizer-passes",
             b_with_active_optimizer_passes,
@@ -1020,18 +1022,10 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("hashtable-fold", b_hashtable_fold),
         ("hashtable-for-each", b_hashtable_for_each),
     ];
-    // ADR 0015 L2 — sandbox builtins live in their own module
-    // and are appended (rather than spread inline with #cfg) to
-    // keep the main vec literal clean.
-    #[cfg(feature = "sandbox")]
-    {
-        for entry in sandbox::builtins() {
-            v.push(entry);
-        }
-    }
-    #[cfg(feature = "sandbox")]
-    return v;
-    #[cfg(not(feature = "sandbox"))]
+    // ADR 0015 L2 sandbox builtins migrated from here into
+    // `syms_builtins()` so they reach both walker and VM tiers
+    // (the higher-order vec is walker-only). See the
+    // sandbox-feature block at the bottom of `syms_builtins()`.
     v
 }
 
@@ -1044,7 +1038,8 @@ type SymsEntry = (
 /// full EvalCtx (no application of user procedures, no port I/O). Both
 /// the walker (`install_into`) and the VM tier register from this list.
 pub fn syms_builtins() -> Vec<SymsEntry> {
-    vec![
+    #[allow(unused_mut)]
+    let mut v: Vec<SymsEntry> = vec![
         // R6RS bytevector typed accessors with explicit endianness — need
         // to inspect a Symbol arg ('big | 'little) via the symbol table.
         ("bytevector-u16-ref", b_bytevector_u16_ref),
@@ -1083,7 +1078,24 @@ pub fn syms_builtins() -> Vec<SymsEntry> {
         // type-tag symbols.
         ("jit-status", b_jit_status),
         ("gc-stats", b_gc_stats),
-    ]
+        // ADR 0014 — optimizer-pass installation (simple primops
+        // that only need the symbol table for name lookup; the
+        // higher-order `with-active-optimizer-passes` lives in
+        // `higher_order_builtins` since it invokes a Scheme thunk).
+        ("install-optimizer-pass!", b_install_optimizer_pass),
+        ("remove-optimizer-pass!", b_remove_optimizer_pass),
+        ("installed-optimizer-passes", b_installed_optimizer_passes),
+    ];
+    // ADR 0015 L2 sandbox builtins. Gated on the `sandbox`
+    // feature; folded into the Syms list (not HoBuiltins) so
+    // both walker and VM tiers see them. Promoted from
+    // HoBuiltin in the integration-fixes pass — see commit
+    // for the cross-tier-bridge rationale.
+    #[cfg(feature = "sandbox")]
+    for entry in sandbox::builtins() {
+        v.push(entry);
+    }
+    v
 }
 
 pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
@@ -11224,7 +11236,15 @@ fn b_parameter_p(args: &[Value]) -> Result<Value, String> {
 // These are higher-order builtins because they need `ctx.syms` to
 // resolve / intern Symbol names.
 
-fn b_install_optimizer_pass(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+// install-/remove-/installed-optimizer-passes only need the
+// SymbolTable for name <-> Symbol round-tripping; no EvalCtx
+// machinery is invoked. Promoted from HoBuiltin to SymsBuiltin
+// so the VM tier registers them too — see install_into +
+// Runtime::new's vm_env loop. Pre-promotion, `--tier vm` users
+// got "undefined variable: install-optimizer-pass!" for what
+// is supposed to be a tier-agnostic ADR-0014 surface.
+
+fn b_install_optimizer_pass(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("install-optimizer-pass!", "1", args.len()));
     }
@@ -11238,7 +11258,7 @@ fn b_install_optimizer_pass(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, 
             ));
         }
     };
-    let name = ctx.syms.name(sym).to_string();
+    let name = syms.name(sym).to_string();
     let registry = cs_opt::PassRegistry::global()
         .lock()
         .map_err(|_| "install-optimizer-pass!: registry mutex poisoned".to_string())?;
@@ -11250,7 +11270,7 @@ fn b_install_optimizer_pass(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, 
     Ok(Value::Unspecified)
 }
 
-fn b_remove_optimizer_pass(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+fn b_remove_optimizer_pass(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("remove-optimizer-pass!", "1", args.len()));
     }
@@ -11264,21 +11284,21 @@ fn b_remove_optimizer_pass(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, S
             ));
         }
     };
-    let name = ctx.syms.name(sym).to_string();
+    let name = syms.name(sym).to_string();
     cs_opt::remove_active_pass(&name);
     Ok(Value::Unspecified)
 }
 
-fn b_installed_optimizer_passes(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+fn b_installed_optimizer_passes(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("installed-optimizer-passes", "0", args.len()));
     }
     let names = cs_opt::active_passes();
-    let syms: Vec<Value> = names
+    let result: Vec<Value> = names
         .into_iter()
-        .map(|s| Value::Symbol(ctx.syms.intern(&s)))
+        .map(|s| Value::Symbol(syms.intern(&s)))
         .collect();
-    Ok(Value::list(syms))
+    Ok(Value::list(result))
 }
 
 /// `(with-active-optimizer-passes '(name ...) thunk)` —
