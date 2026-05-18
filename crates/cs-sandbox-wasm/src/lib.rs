@@ -292,13 +292,21 @@ impl SandboxInstance {
         Ok(Self { config, runtime })
     }
 
-    /// Evaluate a Scheme expression inside the sandbox. Iter 1
-    /// stub: returns `NotImplementedYet`. Iter 1.5 wires the
-    /// text-protocol exchange.
-    pub fn eval(&mut self, _expr_source: &str) -> Result<String, SandboxError> {
-        Err(SandboxError::NotImplementedYet(
-            "sandbox-eval text-protocol exchange lands in iter 1.5",
-        ))
+    /// Evaluate a Scheme expression inside the sandbox. Returns
+    /// the printed result string from the guest's stdout.
+    ///
+    /// Iter 1.5 wired: instantiates the cached crabscheme.wasm
+    /// module against a fresh WasiCtx whose argv is
+    /// `["crabscheme", "--eval", expr_source]`; runs `_start`;
+    /// captures stdout. Resource limits (fuel, memory) are
+    /// enforced by wasmtime; guest trap kinds map to specific
+    /// `SandboxError` variants.
+    ///
+    /// Requires `config.binary_path` to be set. Iter 1 callers
+    /// without a binary still get the surface but receive a
+    /// clear "no binary path" error here.
+    pub fn eval(&mut self, expr_source: &str) -> Result<String, SandboxError> {
+        self.runtime.eval_via_protocol(expr_source)
     }
 
     /// Return the active config (read-only view).
