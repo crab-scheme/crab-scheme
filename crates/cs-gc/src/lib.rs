@@ -44,18 +44,91 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Process-global cumulative byte counter, bumped by every
-/// `Gc::new` and `Heap::alloc`. CrabScheme is single-threaded
-/// today and runs one `Heap` per process; a static counter is
-/// simpler than thread-local plumbing while still giving the
-/// benchmark harness the numbers it needs.
+// Per-thread "currently active Heap" pointer. `Gc::new` bumps the
+// active Heap's byte/alloc counters; `Heap::alloc` bumps its own
+// directly. When no Heap is registered as active on this thread,
+// `Gc::new` allocations are uncounted (legitimate for tests and
+// embedders that don't care about per-Heap stats).
+//
+// Per the BEAM-style runtime spec (docs/research/beam_runtime_spec.md
+// section "Crate breakdown → cs-actor → Integration with cs-gc"):
+// each actor runs with its own Heap, set as active for the duration
+// of its tokio task. Pre-spec, the runtime ran a single Heap and
+// the cs-gc counters lived in process-global statics — that worked
+// for one-Heap workloads but mingled accounting across actors.
+//
+// Use `Heap::with_active` to scope a Heap as active for a closure.
+thread_local! {
+    static ACTIVE_HEAP: Cell<Option<*const HeapStats>> = const { Cell::new(None) };
+}
+
+/// The atomic counters that travel with each Heap. Split out so the
+/// active-heap thread-local can carry a raw pointer at minimal cost
+/// (the pointer's lifetime is bounded by the `with_active` scope, so
+/// the raw `*const` is sound — see `Heap::with_active` for the
+/// lifetime argument).
+#[derive(Default)]
+pub struct HeapStats {
+    bytes_allocated_total: AtomicU64,
+    alloc_count_total: AtomicU64,
+}
+
+impl HeapStats {
+    fn record_alloc(&self, slot_bytes: u64) {
+        self.bytes_allocated_total
+            .fetch_add(slot_bytes, Ordering::Relaxed);
+        self.alloc_count_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes_allocated_total.load(Ordering::Relaxed)
+    }
+    fn allocs(&self) -> u64 {
+        self.alloc_count_total.load(Ordering::Relaxed)
+    }
+    fn reset(&self) {
+        self.bytes_allocated_total.store(0, Ordering::Relaxed);
+        self.alloc_count_total.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Fast helper for `Gc::new`: bump the active Heap's stats if one
+/// is set on this thread, otherwise no-op. Inlined into Gc::new's
+/// hot path; the thread-local read is one TLS slot fetch.
+/// RAII guard restoring the previously-active Heap on drop.
 ///
-/// The Heap's `bytes_allocated_total()` accessor returns this
-/// value (offset by a per-Heap reset baseline). Future work
-/// could split this into per-Heap counters if multi-tenant
-/// embedding becomes a real use case.
-static GLOBAL_BYTES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Returned by [`Heap::activate`]. Does NOT carry a lifetime —
+/// the caller is responsible for ensuring the guard is dropped
+/// before the associated `Heap` is dropped (otherwise the
+/// thread-local would hold a dangling pointer to freed stats).
+///
+/// The safety contract is met automatically when the guard's
+/// lifetime is bracketed by the Heap's owning scope (the typical
+/// case: `Runtime::with_active` creates a guard, runs Scheme code,
+/// drops the guard before the Runtime returns).
+pub struct ActiveHeapGuard {
+    prev: Option<*const HeapStats>,
+}
+
+impl Drop for ActiveHeapGuard {
+    fn drop(&mut self) {
+        ACTIVE_HEAP.with(|p| p.set(self.prev));
+    }
+}
+
+#[inline]
+fn record_active_alloc(slot_bytes: u64) {
+    ACTIVE_HEAP.with(|p| {
+        if let Some(stats_ptr) = p.get() {
+            // SAFETY: `with_active` keeps `stats_ptr` valid for the
+            // duration of the closure that set it. `Gc::new` runs
+            // synchronously within that scope. No racing thread can
+            // free the Heap (Heap is !Send today; the scope owner is
+            // pinned to this thread).
+            unsafe { (*stats_ptr).record_alloc(slot_bytes) };
+        }
+    });
+}
 
 /// A heap-allocated, GC-managed value.
 ///
@@ -181,15 +254,13 @@ impl<T: Trace + 'static> Gc<T> {
     /// `Heap::alloc(value)` so the slot participates in tracing and
     /// can be reclaimed across cycles.
     pub fn new(value: T) -> Self {
-        // Track the cumulative byte cost even for unregistered
-        // Gc::new — most of the runtime currently allocates via
-        // this path (Pair::new, Hashtable::new, etc.). Relaxed
-        // atomic add: monotonic, no synchronization needed since
-        // we're single-threaded today, and Acquire/Release would
-        // pessimize the per-alloc cost.
+        // Record the alloc against the thread-local "active Heap"
+        // if any embedder set one (cs-runtime always sets one
+        // for the duration of Scheme execution). Embedders that
+        // don't care about per-Heap stats (e.g., bare cs-gc tests)
+        // leave the active-heap unset and the alloc is uncounted.
         let slot_bytes = std::mem::size_of::<Slot<T>>() as u64;
-        GLOBAL_BYTES_ALLOCATED.fetch_add(slot_bytes, Ordering::Relaxed);
-        GLOBAL_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        record_active_alloc(slot_bytes);
         Gc {
             inner: Rc::new(Slot {
                 mark: Cell::new(false),
@@ -466,13 +537,15 @@ pub struct Heap {
     /// telemetry for tooling and test assertions.
     collect_count: Cell<usize>,
 
-    /// Baseline byte counter captured at `reset_stats` time. The
-    /// reported `bytes_allocated_total` is `GLOBAL_BYTES_ALLOCATED
-    /// - baseline_bytes`. This lets the benchmark harness ask for
-    /// "bytes allocated since I called reset" without coordinating
-    /// with other Heap instances or the static counter.
-    baseline_bytes: Cell<u64>,
-    baseline_allocs: Cell<u64>,
+    /// Per-Heap byte / alloc counters. Bumped by `Heap::alloc`
+    /// directly and by `Gc::new` via the thread-local active-heap
+    /// pointer set in `Heap::with_active`. Each actor owns its
+    /// own Heap (per the BEAM runtime spec); these counters
+    /// give independent per-actor accounting.
+    ///
+    /// `Box`'d so the address stays stable across `Heap` moves
+    /// (the thread-local stores a raw pointer to this HeapStats).
+    stats: Box<HeapStats>,
 
     /// Pause-time instrumentation. Gated by `stats_enabled` so the
     /// `Instant::now()` cost around `collect()` is paid only when
@@ -506,13 +579,7 @@ impl Heap {
             threshold: Cell::new(4096),
             auto_collect: Cell::new(false),
             collect_count: Cell::new(0),
-            // Initialize baselines to current process-global
-            // values so the first read of `bytes_allocated_total`
-            // returns 0 for a fresh Heap, rather than the
-            // accumulated total from prior runtimes in the
-            // process.
-            baseline_bytes: Cell::new(GLOBAL_BYTES_ALLOCATED.load(Ordering::Relaxed)),
-            baseline_allocs: Cell::new(GLOBAL_ALLOC_COUNT.load(Ordering::Relaxed)),
+            stats: Box::new(HeapStats::default()),
             stats_enabled: Cell::new(false),
             collect_duration_total: Cell::new(Duration::ZERO),
             last_pause: Cell::new(Duration::ZERO),
@@ -520,6 +587,34 @@ impl Heap {
             pause_hist: RefCell::new(PauseHist::new()),
             roots: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Make `self` the active Heap for this thread while `f` runs.
+    /// Restores any previously-active Heap on return (LIFO nesting).
+    ///
+    /// Used by cs-runtime to scope Scheme execution to the right
+    /// Heap's stats. Each cs-actor task wraps its inner loop in
+    /// `runtime.heap().with_active(|| run_actor_body())` so
+    /// `Gc::new` calls inside the actor count against this actor's
+    /// Heap rather than mingling with sibling actors' allocations.
+    pub fn with_active<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _g = self.activate();
+        f()
+    }
+
+    /// Lower-level variant of [`with_active`]: install `self` as
+    /// the thread's active Heap and return a guard that restores
+    /// the previous active Heap on drop.
+    ///
+    /// Use when the with-closure shape doesn't fit (e.g., the
+    /// caller holds the Heap across multiple statements, or wants
+    /// to install it once for the lifetime of a Runtime). The
+    /// guard's lifetime is tied to `self` — drop the guard before
+    /// dropping the Heap.
+    pub fn activate(&self) -> ActiveHeapGuard {
+        let stats_ptr: *const HeapStats = &*self.stats;
+        let prev = ACTIVE_HEAP.with(|p| p.replace(Some(stats_ptr)));
+        ActiveHeapGuard { prev }
     }
 
     /// Allocate `value` on the heap and return a `Gc<T>` to it.
@@ -539,14 +634,13 @@ impl Heap {
         let weak: Weak<dyn Marked> = Rc::downgrade(&(slot.clone() as Rc<dyn Marked>));
         self.slots.borrow_mut().push(weak);
         self.alloc_count.set(self.alloc_count.get() + 1);
-        // Byte counting routes through the same global counter
-        // Gc::new updates, so Heap::alloc and Gc::new converge
-        // on a single source of truth. (Heap-allocated values
-        // become the dominant path once the migration step 4.E
-        // in cs-gc lands; today Gc::new dominates.)
+        // Counter goes against our own HeapStats, not the active
+        // thread-local. Heap::alloc has direct access to its
+        // owning Heap, so we don't need the indirection — and
+        // Heap::alloc may be called outside a `with_active` scope
+        // (e.g., test code) and we still want it counted.
         let slot_bytes = std::mem::size_of::<Slot<T>>() as u64;
-        GLOBAL_BYTES_ALLOCATED.fetch_add(slot_bytes, Ordering::Relaxed);
-        GLOBAL_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        self.stats.record_alloc(slot_bytes);
         Gc { inner: slot }
     }
 
@@ -670,28 +764,25 @@ impl Heap {
         self.stats_enabled.get()
     }
 
-    /// Cumulative bytes allocated since heap creation (or last
-    /// `reset_stats`). Approximate — counts `size_of::<Slot<T>>`
-    /// per allocation, excluding Rc bookkeeping.
+    /// Cumulative bytes allocated against THIS Heap since creation
+    /// (or last `reset_stats`). Approximate — counts
+    /// `size_of::<Slot<T>>` per allocation, excluding Rc bookkeeping.
     ///
-    /// Tracked across both `Heap::alloc` and the unregistered
-    /// `Gc::new` constructor (today the dominant path: cs-core's
-    /// Pair / Hashtable / Port / Promise / String all use
-    /// `Gc::new` directly while the heap-rooting migration is in
-    /// progress).
+    /// Tracked across both `Heap::alloc` (always counts) and the
+    /// unregistered `Gc::new` constructor (counts only when this
+    /// Heap is active per `with_active`). Today the dominant path
+    /// is `Gc::new` via cs-core's Pair / Hashtable / etc.; the
+    /// heap-rooting migration moves these to `Heap::alloc`.
     pub fn bytes_allocated_total(&self) -> u64 {
-        GLOBAL_BYTES_ALLOCATED
-            .load(Ordering::Relaxed)
-            .saturating_sub(self.baseline_bytes.get())
+        self.stats.bytes()
     }
 
-    /// Cumulative count of allocations since heap creation (or last
-    /// `reset_stats`). Different from `alloc_count`, which resets
-    /// every collect to drive the auto-collect threshold.
+    /// Cumulative count of allocations against THIS Heap since
+    /// creation (or last reset). Different from `alloc_count`,
+    /// which resets every collect to drive the auto-collect
+    /// threshold.
     pub fn alloc_count_total(&self) -> u64 {
-        GLOBAL_ALLOC_COUNT
-            .load(Ordering::Relaxed)
-            .saturating_sub(self.baseline_allocs.get())
+        self.stats.allocs()
     }
 
     /// Cumulative time spent inside `collect()`. Only meaningful
@@ -723,12 +814,9 @@ impl Heap {
     /// auto-collect threshold persist. Used by the benchmark harness
     /// to split warmup iterations from measurement iterations.
     pub fn reset_stats(&self) {
-        // Re-baseline against the current process-global counters
-        // so subsequent reads return deltas since this reset.
-        self.baseline_bytes
-            .set(GLOBAL_BYTES_ALLOCATED.load(Ordering::Relaxed));
-        self.baseline_allocs
-            .set(GLOBAL_ALLOC_COUNT.load(Ordering::Relaxed));
+        // Zero our own counters; no cross-Heap coordination needed
+        // now that each Heap owns its bytes / alloc counts.
+        self.stats.reset();
         self.collect_count.set(0);
         self.collect_duration_total.set(Duration::ZERO);
         self.last_pause.set(Duration::ZERO);
@@ -1056,22 +1144,14 @@ mod tests {
         let _g2 = h.alloc(Leaf { n: 2 });
         h.collect();
         assert!(h.bytes_allocated_total() > 0);
-        assert!(h.alloc_count_total() > 0);
+        assert!(h.alloc_count_total() >= 2);
         assert!(h.collect_count() > 0);
         let live_before = h.live_slots();
-        let bytes_at_reset = GLOBAL_BYTES_ALLOCATED.load(Ordering::Relaxed);
         h.reset_stats();
-        // Counters that we own are zeroed. Byte-counter delta is
-        // computed against the post-reset baseline; if concurrent
-        // tests bumped the global between reset and the read it
-        // may be > 0, but it should be small (≤ bytes added by
-        // those tests, which are short).
-        let bytes_after = h.bytes_allocated_total();
-        let bytes_drift = GLOBAL_BYTES_ALLOCATED.load(Ordering::Relaxed) - bytes_at_reset;
-        assert_eq!(
-            bytes_after, bytes_drift,
-            "post-reset reading should equal global - new baseline"
-        );
+        // All our counters are zeroed; no cross-Heap drift to
+        // worry about now that bytes/allocs live on this Heap.
+        assert_eq!(h.bytes_allocated_total(), 0);
+        assert_eq!(h.alloc_count_total(), 0);
         assert_eq!(h.collect_count(), 0);
         assert_eq!(h.last_pause(), Duration::ZERO);
         assert_eq!(h.max_pause(), Duration::ZERO);
@@ -1081,6 +1161,53 @@ mod tests {
         assert_eq!(h.live_slots(), live_before);
         // Auto-collect / threshold / stats-enabled also persist.
         assert!(h.stats_enabled());
+    }
+
+    #[test]
+    fn two_heaps_have_independent_byte_counters() {
+        // The whole point of B1: each Heap's bytes_allocated_total
+        // reflects only its own allocations, not its siblings'.
+        let h1 = Heap::new();
+        let h2 = Heap::new();
+        // h1's alloc must not move h2's counter, and vice versa.
+        let before_h2 = h2.bytes_allocated_total();
+        let _g = h1.alloc(Leaf { n: 1 });
+        assert!(h1.bytes_allocated_total() > 0);
+        assert_eq!(h2.bytes_allocated_total(), before_h2);
+        let before_h1 = h1.bytes_allocated_total();
+        let _g2 = h2.alloc(Leaf { n: 2 });
+        assert!(h2.bytes_allocated_total() > before_h2);
+        assert_eq!(h1.bytes_allocated_total(), before_h1);
+    }
+
+    #[test]
+    fn with_active_routes_gc_new_to_active_heap() {
+        // Gc::new only counts when an active Heap is set. Confirms
+        // the thread-local plumbing in record_active_alloc.
+        let h1 = Heap::new();
+        let h2 = Heap::new();
+        // No active scope: Gc::new is uncounted.
+        let _g0 = Gc::new(Leaf { n: 0 });
+        assert_eq!(h1.bytes_allocated_total(), 0);
+        assert_eq!(h2.bytes_allocated_total(), 0);
+        // h1 active: bumps h1, not h2.
+        h1.with_active(|| {
+            let _g = Gc::new(Leaf { n: 1 });
+            let _g2 = Gc::new(Leaf { n: 2 });
+        });
+        assert!(h1.bytes_allocated_total() > 0);
+        assert_eq!(h2.bytes_allocated_total(), 0);
+        // h2 active in a nested scope: bumps h2, not h1.
+        let h1_before = h1.bytes_allocated_total();
+        h1.with_active(|| {
+            h2.with_active(|| {
+                let _g = Gc::new(Leaf { n: 3 });
+            });
+            // Back inside h1's scope after h2 popped.
+            let _g = Gc::new(Leaf { n: 4 });
+        });
+        assert!(h2.bytes_allocated_total() > 0);
+        assert!(h1.bytes_allocated_total() > h1_before);
     }
 
     #[test]

@@ -1,5 +1,8 @@
 //! R6RS builtin procedures (foundation subset).
 
+#[cfg(feature = "actor")]
+pub mod beam;
+
 use cs_core::{
     eq, Hashtable, HtEqKind, Number, Pair, Port, Promise, PromiseState, SymbolTable, Value,
     WriteMode,
@@ -931,6 +934,17 @@ pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
     for (name, f) in syms_builtins() {
         let sym = syms.intern(name);
         env.define(sym, crate::proc::make_builtin_syms(name, f));
+    }
+    // BEAM-style actor / table primops, gated on the `actor` feature.
+    // Same Syms shape (read-write SymbolTable for arg unpacking and
+    // SendableValue conversion), so they ride the same registration
+    // loop as syms_builtins.
+    #[cfg(feature = "actor")]
+    {
+        for (name, f) in beam::beam_syms_builtins() {
+            let sym = syms.intern(name);
+            env.define(sym, crate::proc::make_builtin_syms(name, f));
+        }
     }
     // hashtable-equivalence-function returns a *tier-specific* procedure
     // (a walker Builtin here, a VmBuiltin on the VM tier in lib.rs), so
