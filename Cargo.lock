@@ -899,6 +899,7 @@ dependencies = [
  "cs-opt",
  "cs-parse",
  "cs-rir",
+ "cs-sandbox-wasm",
  "cs-table",
  "cs-vm",
  "libloading",
