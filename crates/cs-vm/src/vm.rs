@@ -12848,6 +12848,26 @@ fn run_dispatch(
                                     });
                                 }
                             }
+                        } else if let Some(h) = any.downcast_ref::<VmHostBuiltin>() {
+                            // FFI HostProcedure (cs-stdlib-* crates):
+                            // mirrors the Call-opcode dispatch site
+                            // at line ~11441 so dynamic dispatch via
+                            // `(apply host-proc args)` (and the
+                            // contract library's `(apply proc
+                            // checked-args)` indirection) works
+                            // from VM-compiled code, not just from
+                            // statically-resolved Call-opcode sites.
+                            let r = (h.f)(&args)
+                                .map_err(|e| VmError::new(format!("{}: {}", h.name, e)))?;
+                            stack.push(r);
+                            if is_tail {
+                                frames.pop();
+                                if frames.is_empty() {
+                                    return stack.pop().ok_or_else(|| {
+                                        VmError::new("empty stack at tail-host-builtin")
+                                    });
+                                }
+                            }
                         } else {
                             return Err(VmError::new(
                                 "vm: unsupported procedure type (no cross-tier bridge)",

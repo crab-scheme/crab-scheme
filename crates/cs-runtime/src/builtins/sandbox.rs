@@ -27,11 +27,7 @@ use std::cell::RefCell;
 use cs_core::Value;
 use cs_sandbox_wasm::{SandboxConfig, SandboxInstance};
 
-use crate::eval::EvalCtx;
-
 use super::{arity_err, new_vector, type_err};
-
-type HoFn = fn(&[Value], &mut EvalCtx) -> Result<Value, String>;
 
 pub(crate) const SANDBOX_TAG: &str = "__sandbox__";
 
@@ -117,7 +113,7 @@ fn preset_from_symbol(name: &str) -> Result<SandboxConfig, String> {
 /// sandbox. `preset` must be a symbol; `binary-path`, when
 /// supplied, must be a string. When omitted, the runtime falls
 /// back to the `CRABSCHEME_WASM_PATH` env var.
-fn b_make_wasm_sandbox(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+fn b_make_wasm_sandbox(args: &[Value], syms: &mut cs_core::SymbolTable) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err(arity_err("make-wasm-sandbox", "1 or 2", args.len()));
     }
@@ -125,7 +121,7 @@ fn b_make_wasm_sandbox(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Strin
         Value::Symbol(s) => *s,
         v => return Err(type_err("make-wasm-sandbox", "symbol (preset)", v)),
     };
-    let preset_name = ctx.syms.name(sym).to_string();
+    let preset_name = syms.name(sym).to_string();
     let mut config = preset_from_symbol(&preset_name)?;
     if args.len() == 2 {
         let path = match &args[1] {
@@ -144,14 +140,14 @@ fn b_make_wasm_sandbox(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Strin
     ]))
 }
 
-fn b_sandbox_p(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> {
+fn b_sandbox_p(args: &[Value], _syms: &mut cs_core::SymbolTable) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("sandbox?", "1", args.len()));
     }
     Ok(Value::Boolean(is_sandbox_value(&args[0])))
 }
 
-fn b_sandbox_eval(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> {
+fn b_sandbox_eval(args: &[Value], _syms: &mut cs_core::SymbolTable) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("sandbox-eval", "2", args.len()));
     }
@@ -167,7 +163,7 @@ fn b_sandbox_eval(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> {
     Ok(Value::string(result))
 }
 
-fn b_reset_sandbox(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> {
+fn b_reset_sandbox(args: &[Value], _syms: &mut cs_core::SymbolTable) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("reset-sandbox!", "1", args.len()));
     }
@@ -179,14 +175,19 @@ fn b_reset_sandbox(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> 
     Ok(Value::Unspecified)
 }
 
-/// Entries to fold into `higher_order_builtins()`. Gated by the
-/// `sandbox` feature; the main builtins table calls
-/// `sandbox::builtins()` under cfg.
-pub fn builtins() -> Vec<(&'static str, HoFn)> {
+type SandboxSymsFn = fn(&[Value], &mut cs_core::SymbolTable) -> Result<Value, String>;
+
+/// Entries to fold into `syms_builtins()`. Gated by the `sandbox`
+/// feature; the main builtins table calls `sandbox::builtins()`
+/// under cfg. Promoted from HoBuiltin to SymsBuiltin so both
+/// walker AND VM tiers can dispatch to them — without this the
+/// `make-wasm-sandbox` Scheme surface was walker-only and
+/// `--tier vm` users saw "undefined variable: make-wasm-sandbox".
+pub fn builtins() -> Vec<(&'static str, SandboxSymsFn)> {
     vec![
-        ("make-wasm-sandbox", b_make_wasm_sandbox as HoFn),
-        ("sandbox?", b_sandbox_p as HoFn),
-        ("sandbox-eval", b_sandbox_eval as HoFn),
-        ("reset-sandbox!", b_reset_sandbox as HoFn),
+        ("make-wasm-sandbox", b_make_wasm_sandbox as SandboxSymsFn),
+        ("sandbox?", b_sandbox_p as SandboxSymsFn),
+        ("sandbox-eval", b_sandbox_eval as SandboxSymsFn),
+        ("reset-sandbox!", b_reset_sandbox as SandboxSymsFn),
     ]
 }
