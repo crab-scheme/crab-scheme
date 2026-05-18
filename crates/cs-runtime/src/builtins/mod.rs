@@ -2435,33 +2435,70 @@ fn b_syntax_to_datum(args: &[Value]) -> Result<Value, String> {
 /// Recursive helper for `syntax->datum`. Walks the value
 /// converting each `Identifier { name, .. }` leaf to
 /// `Symbol(name)`. Pair / Vector recurse; other variants pass
-/// through. Currently used for the leaf case only.
+/// through. Inverts `stamp_datum_with_mark` (used by
+/// `datum->syntax`) so round-trips compose correctly.
 fn strip_identifier_marks(v: &Value) -> Value {
     match v {
         Value::Identifier { name, .. } => Value::Symbol(*name),
-        // Pair / Vector recursion deferred until the C-iter
-        // creates compound structures containing identifiers;
-        // for the Iter 1.5.B surface, leaf identifiers are the
-        // observable case.
+        Value::Pair(p) => {
+            let car_new = strip_identifier_marks(&p.car.borrow());
+            let cdr_new = strip_identifier_marks(&p.cdr.borrow());
+            Value::Pair(Pair::new(car_new, cdr_new))
+        }
+        Value::Vector(vec_) => {
+            let items: Vec<Value> = vec_.borrow().iter().map(strip_identifier_marks).collect();
+            Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(items)))
+        }
         _ => v.clone(),
     }
 }
 
 /// `(datum->syntax template-id datum)` — R6RS §12.6. Stamp
-/// `datum` with the lexical context of `template-id` so introduced
-/// identifiers resolve correctly. Accepts either a bare `Symbol`
-/// (treated as having mark 0) or an `Identifier` as `template-id`.
-/// Returns `datum` unchanged today; Iter 1.5.F wires the
-/// recursive context-stamping that converts bare symbols inside
-/// `datum` to Identifier values carrying the template's mark.
+/// `datum` with the lexical context of `template-id` so
+/// introduced identifiers resolve correctly. Accepts either a
+/// bare `Symbol` (treated as mark = 0) or an `Identifier` as
+/// `template-id`.
+///
+/// Iter 1.5.F: recursively walks `datum`, converting every
+/// bare `Symbol` leaf to a `Value::Identifier` carrying the
+/// template's mark. Existing `Identifier` leaves are left
+/// alone (the user explicitly built them with a chosen mark).
+/// Non-identifier atoms (numbers, strings, chars, booleans)
+/// pass through unchanged. Pairs and vectors recurse.
 fn b_datum_to_syntax(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("datum->syntax", "2", args.len()));
     }
-    if !matches!(args[0], Value::Symbol(_) | Value::Identifier { .. }) {
-        return Err(type_err("datum->syntax", "identifier", &args[0]));
+    let ctx_mark = match &args[0] {
+        Value::Symbol(_) => 0u64,
+        Value::Identifier { mark, .. } => *mark,
+        v => return Err(type_err("datum->syntax", "identifier", v)),
+    };
+    Ok(stamp_datum_with_mark(&args[1], ctx_mark))
+}
+
+/// Recursive helper for `datum->syntax`. Walks `v` rewriting
+/// bare `Symbol` leaves as `Identifier { name, mark }` and
+/// rebuilding pair / vector structures. Leaves existing
+/// `Identifier`s and non-identifier atoms alone.
+fn stamp_datum_with_mark(v: &Value, mark: u64) -> Value {
+    match v {
+        Value::Symbol(name) => Value::Identifier { name: *name, mark },
+        Value::Pair(p) => {
+            let car_new = stamp_datum_with_mark(&p.car.borrow(), mark);
+            let cdr_new = stamp_datum_with_mark(&p.cdr.borrow(), mark);
+            Value::Pair(Pair::new(car_new, cdr_new))
+        }
+        Value::Vector(vec_) => {
+            let items: Vec<Value> = vec_
+                .borrow()
+                .iter()
+                .map(|e| stamp_datum_with_mark(e, mark))
+                .collect();
+            Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(items)))
+        }
+        _ => v.clone(),
     }
-    Ok(args[1].clone())
 }
 
 /// `(bound-identifier=? a b)` — R6RS §12.6. True iff `a` and `b`
