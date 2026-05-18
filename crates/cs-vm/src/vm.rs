@@ -140,12 +140,42 @@ pub type VmEvalHook = fn(&Value, &mut SymbolTable) -> Result<Value, String>;
 /// fires so the hook isn't re-invoked on the very next call.
 pub type VmTierUpHook = fn(closure: &VmClosure, args: &[Value]);
 
+/// Reduction-yield hook (parallel-runtime spec C2.1). Fired by the
+/// dispatch loop every `REDUCTION_BUDGET` instructions. Signature
+/// intentionally minimal — the cs-runtime side wraps a call to
+/// `tokio::task::yield_now` and doesn't need access to VM state.
+/// The hook MUST NOT call back into the VM (would re-enter the
+/// dispatch loop). MUST be safe to call when no tokio runtime is
+/// active (cs-runtime's installation checks
+/// `Handle::try_current().is_ok()` and no-ops otherwise).
+pub type VmYieldHook = fn();
+
 thread_local! {
     static VM_EVAL_HOOK: RefCell<Option<VmEvalHook>> = const { RefCell::new(None) };
     static VM_EVAL_ROOT_ENV: RefCell<Option<Rc<Env>>> = const { RefCell::new(None) };
     /// Optional tier-up hook fired by the closure-call dispatch when
     /// `VmClosure::tier.bump()` returns true.
     static VM_TIER_UP_HOOK: RefCell<Option<VmTierUpHook>> = const { RefCell::new(None) };
+    /// Reduction-yield hook (parallel-runtime spec C2.1). Fired by
+    /// the dispatch loop after every `REDUCTION_BUDGET` bytecode
+    /// instructions. Installed by cs-runtime when an actor body
+    /// starts running; the cs-runtime side wraps a call to
+    /// `tokio::task::yield_now` so a CPU-bound actor releases its
+    /// worker thread back to the runtime. `None` (the default)
+    /// makes the budget check a no-op — non-actor contexts pay only
+    /// the per-N-op counter decrement.
+    static VM_YIELD_HOOK: Cell<Option<VmYieldHook>> = const { Cell::new(None) };
+    /// Counter of bytecode ops since the last yield (per-thread).
+    /// Counts UP toward `REDUCTION_BUDGET` then triggers the hook
+    /// and resets to 0. Tests can read this via `reductions_used`.
+    static VM_REDUCTIONS_USED: Cell<u32> = const { Cell::new(0) };
+    /// Per-thread reduction budget. Default 2000 (matches BEAM's
+    /// reduction unit). Adjustable via [`set_reduction_budget`] for
+    /// tests that want to force preemption sooner.
+    static VM_REDUCTION_BUDGET: Cell<u32> = const { Cell::new(2000) };
+    /// Diagnostic: total number of times the yield hook fired on
+    /// this thread. Read by tests via [`yield_count`].
+    static VM_YIELD_COUNT: Cell<u64> = const { Cell::new(0) };
     /// Diagnostic counter: incremented each time a deopt event is
     /// recorded via [`record_deopt`]. Tests reset this to 0 with
     /// [`reset_deopt_count`].
@@ -10033,6 +10063,67 @@ pub fn install_tier_up_hook(hook: Option<VmTierUpHook>) -> Option<VmTierUpHook> 
     })
 }
 
+/// Install the reduction-yield hook (parallel-runtime spec C2.1)
+/// for the current thread. Returns the previous hook. Pass `None`
+/// to clear (the default).
+///
+/// When set, the dispatch loop calls this every `REDUCTION_BUDGET`
+/// bytecode instructions, then resets the counter. cs-runtime
+/// installs a hook that calls `tokio::task::yield_now` so the
+/// current actor yields its worker thread back to the runtime.
+pub fn install_yield_hook(hook: Option<VmYieldHook>) -> Option<VmYieldHook> {
+    VM_YIELD_HOOK.with(|cell| {
+        let prev = cell.get();
+        cell.set(hook);
+        prev
+    })
+}
+
+/// Override the per-thread reduction budget. Default is 2000 ops.
+/// Tests that want to force preemption shrink to small values
+/// (e.g. 10) so a tight loop trips the yield within a few
+/// instructions.
+pub fn set_reduction_budget(n: u32) {
+    VM_REDUCTION_BUDGET.with(|c| c.set(n));
+}
+
+/// Read the current thread's reduction-budget setting.
+pub fn reduction_budget() -> u32 {
+    VM_REDUCTION_BUDGET.with(|c| c.get())
+}
+
+/// Diagnostic: how many times the yield hook has fired on this
+/// thread since the last [`reset_yield_count`]. Useful for asserting
+/// preemption in tests.
+pub fn yield_count() -> u64 {
+    VM_YIELD_COUNT.with(|c| c.get())
+}
+
+/// Reset the yield-fire counter to 0.
+pub fn reset_yield_count() {
+    VM_YIELD_COUNT.with(|c| c.set(0));
+}
+
+/// Bump the reduction counter and fire the yield hook if the
+/// budget is exhausted. Called from the dispatch loop. Hot path —
+/// keep small.
+#[inline]
+fn vm_tick_reductions() {
+    VM_REDUCTIONS_USED.with(|used| {
+        let new = used.get().saturating_add(1);
+        let budget = VM_REDUCTION_BUDGET.with(|b| b.get());
+        if new >= budget {
+            used.set(0);
+            if let Some(hook) = VM_YIELD_HOOK.with(|h| h.get()) {
+                VM_YIELD_COUNT.with(|c| c.set(c.get() + 1));
+                hook();
+            }
+        } else {
+            used.set(new);
+        }
+    });
+}
+
 /// Fire the tier-up hook for the given closure if one is installed.
 /// Independent of whether the threshold actually crossed — callers
 /// should only invoke this after [`cs_jit::Tier::bump`] returned
@@ -11142,6 +11233,15 @@ fn run_dispatch(
     syms: &mut SymbolTable,
 ) -> Result<Value, VmError> {
     loop {
+        // parallel-runtime spec C2.1: reduction-based preemption.
+        // Counts every dispatch-loop iteration toward the per-thread
+        // budget; when exhausted, fires the yield hook (no-op when
+        // none installed). cs-runtime installs a hook that calls
+        // `tokio::task::yield_now` so an actor body releases its
+        // worker back to the tokio runtime cooperatively. Hot path
+        // — `vm_tick_reductions` is inline + branch-only on the
+        // common path.
+        vm_tick_reductions();
         let Some(frame) = frames.last_mut() else {
             return Err(VmError::new("vm stack underflow"));
         };
@@ -16317,5 +16417,68 @@ mod nb_arith_tests {
         let r = unsafe { vm_value_lt_nb(nb_bool(true), nb_fixnum(1)) };
         assert_eq!(jit_take_deopt(), DEOPT_REASON_ARITH_MISS);
         assert_bool(r, false);
+    }
+}
+
+// ====================================================================
+// parallel-runtime spec C2.1 — reduction-yield hook tests.
+
+#[cfg(test)]
+mod yield_hook_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Direct tick test: with a hook installed and budget = 3, hammer
+    /// `vm_tick_reductions` 10 times; verify the hook fired 3 times
+    /// (at iterations 3, 6, 9).
+    #[test]
+    fn yield_hook_fires_at_budget_boundary() {
+        // Test-thread state. Reset everything so a prior test on the
+        // same thread doesn't leak state in.
+        install_yield_hook(None);
+        set_reduction_budget(3);
+        reset_yield_count();
+
+        static FIRES: AtomicU32 = AtomicU32::new(0);
+        FIRES.store(0, Ordering::SeqCst);
+        fn hook() {
+            FIRES.fetch_add(1, Ordering::SeqCst);
+        }
+        let prev = install_yield_hook(Some(hook));
+        assert!(prev.is_none(), "test thread had a stale yield hook");
+
+        for _ in 0..10 {
+            vm_tick_reductions();
+        }
+
+        assert_eq!(
+            FIRES.load(Ordering::SeqCst),
+            3,
+            "expected 3 fires (10 ticks / 3 budget)"
+        );
+        assert_eq!(yield_count(), 3);
+
+        // Clean up so later tests don't see our hook.
+        install_yield_hook(None);
+        set_reduction_budget(2000);
+    }
+
+    /// With no hook installed, tick is a pure counter — `yield_count`
+    /// stays 0 even past the budget. Verifies the no-actor-context
+    /// no-op semantics (the common case for `crabscheme run` without
+    /// `(spawn ...)`).
+    #[test]
+    fn yield_hook_no_op_when_unset() {
+        install_yield_hook(None);
+        set_reduction_budget(3);
+        reset_yield_count();
+
+        for _ in 0..50 {
+            vm_tick_reductions();
+        }
+
+        assert_eq!(yield_count(), 0, "no hook → no fires recorded");
+
+        set_reduction_budget(2000);
     }
 }
