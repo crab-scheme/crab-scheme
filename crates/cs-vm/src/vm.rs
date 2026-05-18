@@ -580,42 +580,6 @@ fn value_to_any_i64(v: Value) -> i64 {
     Box::into_raw(Box::new(v)) as i64
 }
 
-thread_local! {
-    /// Pointer to the active `Heap` for the current thread, used by
-    /// JIT runtime helpers when allocating Gc<Value> handles. Set by
-    /// `cs_runtime::Runtime::with_active` (iter BP) so JIT-allocated
-    /// Pairs etc. participate in tracing GC. Null when no Heap is
-    /// installed — helpers fall back to unregistered `Gc::new`.
-    /// ADR 0012 D-2 (iter BO).
-    static JIT_ACTIVE_HEAP: Cell<*const cs_gc::Heap> = const { Cell::new(std::ptr::null()) };
-}
-
-/// Install a `Heap` pointer for use by JIT runtime helpers on the
-/// current thread. Pair with `clear_jit_active_heap` (or another
-/// `set_jit_active_heap`) to restore. Pointer must remain valid
-/// until cleared.
-///
-/// # Safety
-///
-/// `heap` must outlive the next call to `clear_jit_active_heap` and
-/// must point at a live `Heap`. Typical pattern: stash inside a
-/// guard struct whose Drop calls `clear_jit_active_heap`.
-pub unsafe fn set_jit_active_heap(heap: *const cs_gc::Heap) {
-    JIT_ACTIVE_HEAP.with(|c| c.set(heap));
-}
-
-/// Clear the active Heap pointer.
-pub fn clear_jit_active_heap() {
-    JIT_ACTIVE_HEAP.with(|c| c.set(std::ptr::null()));
-}
-
-/// Read the current active Heap pointer. Returns null if no Heap
-/// is installed. Used by `with_active`-style guards that save the
-/// previous pointer before overwriting.
-pub fn current_jit_active_heap() -> *const cs_gc::Heap {
-    JIT_ACTIVE_HEAP.with(|c| c.get())
-}
-
 // ---- Iter BW — deopt-instead-of-panic sentinel ----------------------
 //
 // When a JIT runtime helper (vm_unbox_*, vm_pair_car_gc, etc.)
@@ -878,12 +842,82 @@ pub fn nb_make(tag: u64, payload: u64) -> u64 {
     NB_SIGNATURE_BITS | ((tag & 0xF) << NB_TAG_SHIFT) | (payload & NB_PAYLOAD_MASK)
 }
 
+/// Bit 0 of pointer-typed nanbox payloads: 0 = Rc-allocated,
+/// 1 = Region-allocated. The pointer-typed tags (NB_TAG_PAIR..
+/// NB_TAG_PROMISE, NB_TAG_GC_VALUE) carry an 8-byte-aligned
+/// pointer in the upper 46 bits; bit 0 is always zero in the
+/// raw pointer, so we repurpose it to distinguish the GcRepr
+/// arm.
+///
+/// Set by [`nb_encode_gc_ptr`] on encode; tested by
+/// [`nb_decode_gc_ptr`] on decode to route to
+/// `Gc::from_raw_jit` (Rc) or `Gc::from_raw_jit_region`
+/// (Region). Closes the SIGSEGV-on-with-region root cause —
+/// previously `from_raw_jit` always interpreted region
+/// pointers as Rc allocations, hitting allocator UB on drop.
+pub const NB_REGION_FLAG: u64 = 1;
+
+/// Encode a `Gc<T>` raw-jit pointer into the low 47 bits of a
+/// pointer-typed nanbox payload, tagging bit 0 with the
+/// Rc/Region origin flag.
+///
+/// Caller must invoke before `Gc::into_raw_jit` consumes the
+/// handle. `is_region` is `Gc::is_region(&g)`.
+///
+/// Safety: the returned u64 is suitable for `nb_make(tag, ...)`.
+/// The decoder must invert via [`nb_decode_gc_ptr`].
+#[inline]
+pub fn nb_encode_gc_ptr(raw_ptr: u64, is_region: bool) -> u64 {
+    debug_assert_eq!(
+        raw_ptr & NB_REGION_FLAG,
+        0,
+        "Gc raw pointer must be 8-byte aligned; low bit reserved for region flag"
+    );
+    raw_ptr | (is_region as u64)
+}
+
+/// Decode a pointer-typed nanbox payload into `(raw_ptr,
+/// is_region)`. Strips the region flag from bit 0.
+#[inline]
+pub fn nb_decode_gc_ptr(payload: u64) -> (*const (), bool) {
+    let is_region = (payload & NB_REGION_FLAG) != 0;
+    let ptr = (payload & !NB_REGION_FLAG) as *const ();
+    (ptr, is_region)
+}
+
 /// Sign-extend the low 47 bits of `payload` to a full i64. Used to
 /// decode the Fixnum tag (47-bit signed → i64).
 #[inline]
 pub fn nb_sign_extend_47(payload: u64) -> i64 {
     let shifted = (payload as i64) << 17;
     shifted >> 17
+}
+
+/// Dispatch a raw nanbox pointer + region flag to the right
+/// `Gc::from_raw_jit` variant. Pulled out so every pointer-
+/// typed decode arm in [`NanboxValue::to_value`],
+/// [`vm_value_drop_gc`], etc. shares one impl.
+///
+/// # Safety
+///
+/// `ptr` must be a live raw handle for `T` previously
+/// produced by `Gc::into_raw_jit`; `is_region` must reflect
+/// whether the originating `Gc<T>` was Region-backed.
+#[inline]
+pub(crate) unsafe fn decode_gc_handle<T: 'static + Sized>(
+    ptr: *const (),
+    is_region: bool,
+) -> cs_gc::Gc<T> {
+    #[cfg(feature = "regions")]
+    if is_region {
+        return unsafe { cs_gc::Gc::<T>::from_raw_jit_region(ptr) };
+    }
+    // Either Rc-backed, or the regions feature is off (then
+    // the encoder never sets the flag — debug-asserted in
+    // `nb_encode_gc_ptr` for the Rc path).
+    #[cfg(not(feature = "regions"))]
+    let _ = is_region;
+    unsafe { cs_gc::Gc::<T>::from_raw_jit(ptr) }
 }
 
 /// Encode an `f64` as a NaN-boxed `i64`. Real flonums map to their
@@ -900,14 +934,11 @@ pub fn nb_encode_flonum(f: f64) -> i64 {
     }
 }
 
-/// Allocate a `Gc<Value>` through the active heap if one is
-/// installed on this thread, falling back to unregistered
 /// Phase 6 Stage B2 — thread-local registry of `Rc<dyn Procedure>`
 /// values for the thin-procedure NB encoding. Each Procedure
 /// passed through the NB lane gets a u32 slot index encoded in
-/// the NB_TAG_PROCEDURE payload, replacing the previous
-/// `nb_alloc_gc_value(Value::Procedure(p))` heap allocation per
-/// encoding.
+/// the NB_TAG_PROCEDURE payload, replacing the previous direct
+/// `Gc::new(Value::Procedure(p))` heap allocation per encoding.
 ///
 /// Lifetime semantics mirror the Gc<Value> handle:
 /// - `alloc(p)` registers `p` with refcount 1, returns slot idx.
@@ -1046,23 +1077,6 @@ mod proc_table {
     }
 }
 
-/// `Gc::new` otherwise. Used by the `NB_TAG_GC_VALUE` wrap paths
-/// in `NanboxValue::from_value` (Procedure + non-Fixnum/Flonum
-/// Number variants) to preserve the heap-tracking semantics the
-/// pre-NaN-box `value_to_gc_i64` had.
-fn nb_alloc_gc_value(v: Value) -> cs_gc::Gc<Value> {
-    JIT_ACTIVE_HEAP.with(|c| {
-        let ptr = c.get();
-        if ptr.is_null() {
-            cs_gc::Gc::new(v)
-        } else {
-            // SAFETY: caller of set_jit_active_heap guaranteed the
-            // pointer is live until clear/replace.
-            unsafe { (*ptr).alloc(v) }
-        }
-    })
-}
-
 /// NaN-boxed value carrier — the migration target for the bytecode
 /// VM dispatch stack (K1 step 3). Layout-identical to `i64`. See
 /// the module-level NanboxValue encoding documentation above.
@@ -1093,9 +1107,9 @@ impl NanboxValue {
             NanboxValue(nb_make(NB_TAG_FIXNUM, (n as u64) & NB_PAYLOAD_MASK) as i64)
         } else {
             // Oversized: wrap in `Gc<Value>` directly via the
-            // active heap. (Calling back through `from_value`
+            // Wrap as Gc<Value>. (Calling back through `from_value`
             // would re-enter `fixnum` → infinite recursion.)
-            let g = nb_alloc_gc_value(Value::Number(cs_core::Number::Fixnum(n)));
+            let g = cs_gc::Gc::new(Value::Number(cs_core::Number::Fixnum(n)));
             let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
             debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
             NanboxValue(nb_make(NB_TAG_GC_VALUE, ptr) as i64)
@@ -1148,27 +1162,35 @@ impl NanboxValue {
             // so they fit in 47-bit signed canonical addresses
             // (and our 47-bit payload).
             Value::Pair(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(
                     ptr & !NB_PAYLOAD_MASK == 0,
                     "Pair ptr exceeds 47-bit payload"
                 );
-                NanboxValue(nb_make(NB_TAG_PAIR, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_PAIR, tagged) as i64)
             }
             Value::Vector(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_VECTOR, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_VECTOR, tagged) as i64)
             }
             Value::String(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_STRING, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_STRING, tagged) as i64)
             }
             Value::ByteVector(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_BYTEVECTOR, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_BYTEVECTOR, tagged) as i64)
             }
             // Phase 6 Stage B2 — thin-procedure NB encoding.
             // `Rc<dyn Procedure>` is a fat pointer (data + vtable,
@@ -1194,30 +1216,36 @@ impl NanboxValue {
                 NanboxValue(nb_make(NB_TAG_PROCEDURE, idx as u64) as i64)
             }
             Value::Hashtable(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_HASHTABLE, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_HASHTABLE, tagged) as i64)
             }
             Value::Port(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_PORT, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_PORT, tagged) as i64)
             }
             Value::Promise(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_PROMISE, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_PROMISE, tagged) as i64)
             }
             // Number variants outside Fixnum/Flonum (BigInt,
-            // Rational, Complex), plus hygienic Identifier
-            // (a (Symbol, u64-mark) pair that doesn't fit in the
+            // Rational, Complex), plus hygienic Identifier (a
+            // (Symbol, u64-mark) pair that doesn't fit in the
             // 47-bit NB payload alongside its tag). All wrap in
-            // Gc<Value> via the active Heap for now -- these are
-            // rare in performance-sensitive code. A future iter
-            // could carve out a dedicated NB_TAG_IDENTIFIER if
-            // identifier-heavy code shows up in the hot path.
+            // Gc<Value> — these are rare in performance-
+            // sensitive code. A future iter could carve out a
+            // dedicated NB_TAG_IDENTIFIER if identifier-heavy
+            // code shows up in the hot path.
             other @ (Value::Number(_) | Value::Identifier { .. }) => {
-                let g = nb_alloc_gc_value(other);
+                let g = cs_gc::Gc::new(other);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
                 NanboxValue(nb_make(NB_TAG_GC_VALUE, ptr) as i64)
@@ -1270,23 +1298,26 @@ impl NanboxValue {
             // even if the caller clones the resulting Value, no deep
             // copy happens.)
             t if t == NB_TAG_PAIR => {
-                let g: cs_gc::Gc<cs_core::Pair> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
+                let g: cs_gc::Gc<cs_core::Pair> = decode_gc_handle(ptr, is_region);
                 Value::Pair(g)
             }
             t if t == NB_TAG_VECTOR => {
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
                 let g: cs_gc::Gc<std::cell::RefCell<Vec<Value>>> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                    decode_gc_handle(ptr, is_region);
                 Value::Vector(g)
             }
             t if t == NB_TAG_STRING => {
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
                 let g: cs_gc::Gc<std::cell::RefCell<String>> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                    decode_gc_handle(ptr, is_region);
                 Value::String(g)
             }
             t if t == NB_TAG_BYTEVECTOR => {
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
                 let g: cs_gc::Gc<std::cell::RefCell<Vec<u8>>> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                    decode_gc_handle(ptr, is_region);
                 Value::ByteVector(g)
             }
             // Phase 6 Stage B2 — thin-procedure decode. Symmetric
@@ -1301,18 +1332,18 @@ impl NanboxValue {
                 Value::Procedure(proc_table::take(idx))
             }
             t if t == NB_TAG_HASHTABLE => {
-                let g: cs_gc::Gc<cs_core::Hashtable> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
+                let g: cs_gc::Gc<cs_core::Hashtable> = decode_gc_handle(ptr, is_region);
                 Value::Hashtable(g)
             }
             t if t == NB_TAG_PORT => {
-                let g: cs_gc::Gc<cs_core::Port> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
+                let g: cs_gc::Gc<cs_core::Port> = decode_gc_handle(ptr, is_region);
                 Value::Port(g)
             }
             t if t == NB_TAG_PROMISE => {
-                let g: cs_gc::Gc<cs_core::Promise> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
+                let g: cs_gc::Gc<cs_core::Promise> = decode_gc_handle(ptr, is_region);
                 Value::Promise(g)
             }
             _t /* NB_TAG_GC_VALUE or unknown */ => {
@@ -1617,22 +1648,89 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
     // build Pairs still use `cs_core::Pair::new` (unregistered),
     // mirroring the pre-NaN-box split where only JIT wrap allocs
     // were heap-tracked.
-    let pair = cs_core::Pair {
-        car: std::cell::RefCell::new(car_v),
-        cdr: std::cell::RefCell::new(cdr_v),
-        source: std::cell::Cell::new(None),
-    };
-    let g: cs_gc::Gc<cs_core::Pair> = JIT_ACTIVE_HEAP.with(|c| {
-        let ptr = c.get();
-        if ptr.is_null() {
-            cs_gc::Gc::new(pair)
-        } else {
-            unsafe { (*ptr).alloc(pair) }
-        }
-    });
+    // Pair has private cycle-tombstone fields (countable-memory)
+    // plus our `source: Cell<Option<Span>>` field; use the public
+    // constructor which returns an already-allocated Gc<Pair>
+    // with all fields initialized. The JIT_ACTIVE_HEAP tracked-
+    // allocation path is sacrificed here; see follow-up for
+    // re-adding it once Pair gets a heap-aware constructor.
+    let g: cs_gc::Gc<cs_core::Pair> = cs_core::Pair::new(car_v, cdr_v);
     let raw_ptr = cs_gc::Gc::into_raw_jit(g) as u64;
     debug_assert!(raw_ptr & !NB_PAYLOAD_MASK == 0);
-    NanboxValue(nb_make(NB_TAG_PAIR, raw_ptr) as i64).into_raw()
+    // Rc allocation — region flag (bit 0) stays clear.
+    NanboxValue(nb_make(NB_TAG_PAIR, nb_encode_gc_ptr(raw_ptr, false)) as i64).into_raw()
+}
+
+/// Gap B-3 cs-aot codegen: region-resolver init API.
+///
+/// cs-runtime registers a per-thread region-stack accessor
+/// here at Runtime startup. cs-vm's `vm_alloc_pair_region_gc`
+/// consults it to find the current region. Using a function-
+/// pointer hook (rather than `extern "C"` linkage) avoids a
+/// dep cycle: cs-vm doesn't depend on cs-runtime, but the
+/// pointer gets wired up at runtime.
+#[cfg(feature = "regions")]
+static REGION_RESOLVER: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Register a region-resolver function pointer. cs-runtime
+/// calls this once per process from `Runtime::new`. The
+/// resolver returns a raw pointer to the innermost
+/// `cs_gc::Region` on the current thread's region stack, or
+/// null if none is in scope.
+#[cfg(feature = "regions")]
+pub fn register_region_resolver(resolver: extern "C" fn() -> *const ()) {
+    REGION_RESOLVER.store(resolver as *mut (), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Gap B-3 cs-aot codegen: region-allocating counterpart to
+/// [`vm_alloc_pair_gc`]. Uses `Pair::new_in(&current_region,
+/// car_v, cdr_v)` where the region comes from the resolver
+/// registered via [`register_region_resolver`].
+///
+/// If no region is in scope (caller forgot `with-region`, or
+/// no resolver registered), falls back to `Pair::new` (Rc
+/// heap) with a debug-build warning. Better than panicking
+/// inside JIT-emitted code where unwinding is fragile.
+///
+/// Wired into cs-aot's emission for `Inst` variants marked
+/// with `Lifetime::Region` (future cs-rir extension).
+/// Today's `Inst::Cons` doesn't carry lifetime; emission
+/// stays on the Rc path until a lifetime-aware translator
+/// lands.
+#[no_mangle]
+#[cfg(feature = "regions")]
+pub unsafe extern "C" fn vm_alloc_pair_region_gc(
+    car: i64,
+    car_tag: u8,
+    cdr: i64,
+    cdr_tag: u8,
+) -> i64 {
+    let car_v = unsafe { i64_to_value(car, car_tag) };
+    let cdr_v = unsafe { i64_to_value(cdr, cdr_tag) };
+    let resolver_raw = REGION_RESOLVER.load(std::sync::atomic::Ordering::Relaxed);
+    let region_ptr: *const () = if resolver_raw.is_null() {
+        std::ptr::null()
+    } else {
+        let resolver: extern "C" fn() -> *const () = unsafe { std::mem::transmute(resolver_raw) };
+        resolver()
+    };
+    let (g, allocated_in_region): (cs_gc::Gc<cs_core::Pair>, bool) = if region_ptr.is_null() {
+        #[cfg(debug_assertions)]
+        eprintln!("vm_alloc_pair_region_gc: no region in scope — falling back to Rc allocation");
+        (cs_core::Pair::new(car_v, cdr_v), false)
+    } else {
+        // SAFETY: the resolver returns a ptr to a Region
+        // kept alive by cs-runtime's REGION_STACK. The ptr
+        // is valid for the duration of this call (the region
+        // can't drop while we're inside this fn).
+        let region: &cs_gc::Region = unsafe { &*(region_ptr as *const cs_gc::Region) };
+        (cs_core::Pair::new_in(region, car_v, cdr_v), true)
+    };
+    let raw_ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+    debug_assert!(raw_ptr & !NB_PAYLOAD_MASK == 0);
+    NanboxValue(nb_make(NB_TAG_PAIR, nb_encode_gc_ptr(raw_ptr, allocated_in_region)) as i64)
+        .into_raw()
 }
 
 /// Gc-backed counterpart to `vm_pair_car`. Consumes the input Gc
@@ -1642,7 +1740,7 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
 pub unsafe extern "C" fn vm_pair_car_gc(pair: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(pair) };
     match v {
-        Value::Pair(p) => value_to_gc_i64(p.car.borrow().clone()),
+        Value::Pair(p) => value_to_gc_i64(p.car()),
         _ => {
             // Iter BW — type miss. Set sentinel + return a safe
             // placeholder (Gc-wrapped Unspecified). Dispatcher sees
@@ -1659,7 +1757,7 @@ pub unsafe extern "C" fn vm_pair_car_gc(pair: i64) -> i64 {
 pub unsafe extern "C" fn vm_pair_cdr_gc(pair: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(pair) };
     match v {
-        Value::Pair(p) => value_to_gc_i64(p.cdr.borrow().clone()),
+        Value::Pair(p) => value_to_gc_i64(p.cdr()),
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::Unspecified)
@@ -2135,8 +2233,8 @@ fn equal_hash_rec(v: &Value, acc: &mut u64) {
         }
         Value::Pair(p) => {
             mix(acc, 0x50);
-            equal_hash_rec(&p.car.borrow(), acc);
-            equal_hash_rec(&p.cdr.borrow(), acc);
+            equal_hash_rec(&p.car(), acc);
+            equal_hash_rec(&p.cdr(), acc);
         }
         Value::Vector(vc) => {
             mix(acc, 0x60);
@@ -2476,8 +2574,8 @@ pub unsafe extern "C" fn vm_delete_gc(target: i64, lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 if !cs_core::eq::equal(&car, &target_v) {
                     out.push(car);
                 }
@@ -2506,8 +2604,8 @@ pub unsafe extern "C" fn vm_delete_duplicates_gc(lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 if !seen.iter().any(|s| cs_core::eq::equal(s, &car)) {
                     seen.push(car);
                 }
@@ -2537,11 +2635,11 @@ pub unsafe extern "C" fn vm_alist_copy_gc(lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let entry = p.car.borrow().clone();
+                let entry = p.car();
                 match entry {
                     Value::Pair(pe) => {
-                        let car = pe.car.borrow().clone();
-                        let cdr = pe.cdr.borrow().clone();
+                        let car = pe.car();
+                        let cdr = pe.cdr();
                         out.push(Value::Pair(cs_core::Pair::new(car, cdr)));
                     }
                     _ => {
@@ -2549,7 +2647,7 @@ pub unsafe extern "C" fn vm_alist_copy_gc(lst: i64) -> i64 {
                         return value_to_gc_i64(Value::Null);
                     }
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             Value::Null => return value_to_gc_i64(Value::list(out)),
             _ => {
@@ -2575,8 +2673,8 @@ pub unsafe extern "C" fn vm_append_reverse_gc(rev: i64, tail: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 acc = Value::Pair(cs_core::Pair::new(car, acc));
                 cur = cdr;
             }
@@ -2835,7 +2933,7 @@ pub unsafe extern "C" fn vm_length_gc(r: i64) -> i64 {
         match cur {
             Value::Pair(p) => {
                 count += 1;
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             Value::Null => return count,
@@ -2862,7 +2960,7 @@ pub unsafe extern "C" fn vm_list_p_gc(r: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             Value::Null => return 1,
@@ -2892,9 +2990,9 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let entry = p.car.borrow().clone();
+                let entry = p.car();
                 if let Value::Pair(ep) = &entry {
-                    let entry_key = ep.car.borrow().clone();
+                    let entry_key = ep.car();
                     if cs_core::eq::eq(&needle, &entry_key) {
                         return value_to_gc_i64(entry);
                     }
@@ -2903,7 +3001,7 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
                 // typical Scheme convention for assq on improper
                 // shapes. The bytecode VM signals R6RS errors when
                 // strictness matters.
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -4256,7 +4354,7 @@ pub unsafe extern "C" fn vm_list_to_string_gc(r: i64) -> i64 {
                 return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))));
             }
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
+                let head = p.car();
                 match head {
                     Value::Character(c) => s.push(c),
                     _ => {
@@ -4264,7 +4362,7 @@ pub unsafe extern "C" fn vm_list_to_string_gc(r: i64) -> i64 {
                         return value_to_gc_i64(Value::Null);
                     }
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => {
@@ -4377,8 +4475,8 @@ pub unsafe extern "C" fn vm_list_to_vector_gc(r: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                items.push(p.car.borrow().clone());
-                let next = p.cdr.borrow().clone();
+                items.push(p.car());
+                let next = p.cdr();
                 cur = next;
             }
             Value::Null => {
@@ -4430,7 +4528,7 @@ pub unsafe extern "C" fn vm_u8_list_to_bytevector_gc(lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 let n = match car {
                     Value::Number(cs_core::Number::Fixnum(n)) => n,
                     _ => {
@@ -4447,7 +4545,7 @@ pub unsafe extern "C" fn vm_u8_list_to_bytevector_gc(lst: i64) -> i64 {
                     )));
                 }
                 out.push(n as u8);
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             Value::Null => {
                 return value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(
@@ -4536,8 +4634,8 @@ pub unsafe extern "C" fn vm_list_copy_gc(lst: i64) -> i64 {
     let tail = loop {
         match cur {
             Value::Pair(p) => {
-                elems.push(p.car.borrow().clone());
-                let next = p.cdr.borrow().clone();
+                elems.push(p.car());
+                let next = p.cdr();
                 cur = next;
             }
             other => break other,
@@ -4718,8 +4816,8 @@ pub unsafe extern "C" fn vm_append_buf(buf: *const i64, n: usize) -> i64 {
             match cur {
                 Value::Null => break,
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
-                    let cdr = p.cdr.borrow().clone();
+                    let car = p.car();
+                    let cdr = p.cdr();
                     items.push(car);
                     cur = cdr;
                 }
@@ -5606,7 +5704,7 @@ pub unsafe extern "C" fn vm_list_set_gc(lst: i64, n: i64, val: i64) -> i64 {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
                 i += 1;
             }
@@ -5618,7 +5716,7 @@ pub unsafe extern "C" fn vm_list_set_gc(lst: i64, n: i64, val: i64) -> i64 {
     }
     match cur {
         Value::Pair(p) => {
-            *p.car.borrow_mut() = new_v;
+            p.set_car(new_v);
             value_to_gc_i64(Value::Unspecified)
         }
         _ => {
@@ -5650,7 +5748,7 @@ pub unsafe extern "C" fn vm_list_tail_gc(lst: i64, n: i64) -> i64 {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
                 i += 1;
             }
@@ -5683,7 +5781,7 @@ pub unsafe extern "C" fn vm_list_ref_gc(lst: i64, n: i64) -> i64 {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
                 i += 1;
             }
@@ -5694,7 +5792,7 @@ pub unsafe extern "C" fn vm_list_ref_gc(lst: i64, n: i64) -> i64 {
         }
     }
     match cur {
-        Value::Pair(p) => value_to_gc_i64(p.car.borrow().clone()),
+        Value::Pair(p) => value_to_gc_i64(p.car()),
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::Null)
@@ -5719,11 +5817,11 @@ pub unsafe extern "C" fn vm_member_gc(item: i64, lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 if cs_core::eq::equal(&needle, &car) {
                     return value_to_gc_i64(Value::Pair(p.clone()));
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -5745,14 +5843,14 @@ pub unsafe extern "C" fn vm_assoc_gc(key: i64, alist: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let entry = p.car.borrow().clone();
+                let entry = p.car();
                 if let Value::Pair(ep) = &entry {
-                    let entry_key = ep.car.borrow().clone();
+                    let entry_key = ep.car();
                     if cs_core::eq::equal(&needle, &entry_key) {
                         return value_to_gc_i64(entry);
                     }
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -5777,11 +5875,11 @@ pub unsafe extern "C" fn vm_memv_gc(item: i64, lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 if cs_core::eq::eqv(&needle, &car) {
                     return value_to_gc_i64(Value::Pair(p.clone()));
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -5804,14 +5902,14 @@ pub unsafe extern "C" fn vm_assv_gc(key: i64, alist: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let entry = p.car.borrow().clone();
+                let entry = p.car();
                 if let Value::Pair(ep) = &entry {
-                    let entry_key = ep.car.borrow().clone();
+                    let entry_key = ep.car();
                     if cs_core::eq::eqv(&needle, &entry_key) {
                         return value_to_gc_i64(entry);
                     }
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -5836,7 +5934,7 @@ pub unsafe extern "C" fn vm_set_car_gc(p: i64, v: i64) -> i64 {
     let new_v = unsafe { gc_i64_to_value(v) };
     match pair {
         Value::Pair(pp) => {
-            *pp.car.borrow_mut() = new_v;
+            pp.set_car(new_v);
             value_to_gc_i64(Value::Unspecified)
         }
         _ => {
@@ -5858,7 +5956,7 @@ pub unsafe extern "C" fn vm_set_cdr_gc(p: i64, v: i64) -> i64 {
     let new_v = unsafe { gc_i64_to_value(v) };
     match pair {
         Value::Pair(pp) => {
-            *pp.cdr.borrow_mut() = new_v;
+            pp.set_cdr(new_v);
             value_to_gc_i64(Value::Unspecified)
         }
         _ => {
@@ -5888,11 +5986,11 @@ pub unsafe extern "C" fn vm_memq_gc(item: i64, lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 if cs_core::eq::eq(&needle, &car) {
                     return value_to_gc_i64(Value::Pair(p.clone()));
                 }
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             _ => return value_to_gc_i64(Value::Boolean(false)),
@@ -5919,9 +6017,9 @@ pub unsafe extern "C" fn vm_reverse_gc(r: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 acc = Value::Pair(cs_core::Pair::new(car, acc));
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 cur = next;
             }
             Value::Null => return value_to_gc_i64(acc),
@@ -5960,11 +6058,24 @@ pub unsafe extern "C" fn vm_value_clone_gc(r: i64) -> i64 {
     }
     // Pointer-typed (NB_TAG_PAIR..NB_TAG_GC_VALUE): bump the
     // strong refcount on the underlying `Gc<T>` allocation.
+    // Region pointers carry the `NB_REGION_FLAG` in payload
+    // bit 0 — route those through the Region-arm helper
+    // instead of `Rc::increment_strong_count` (which would
+    // corrupt the `RegionSlot`'s u32 header by interpreting
+    // it as an `RcInner.strong: usize`).
+    let (ptr, is_region) = nb_decode_gc_ptr(payload);
+    #[cfg(feature = "regions")]
+    if is_region {
+        unsafe { cs_gc::Gc::<Value>::raw_incref_region(ptr) };
+        return r;
+    }
+    #[cfg(not(feature = "regions"))]
+    let _ = is_region;
     // `Gc::<_>::raw_incref` is T-agnostic — it only touches the
     // strong-count header which lives at a fixed offset in the
     // `RcInner` regardless of T — so passing `Gc::<Value>` works
     // even when the actual T is `Pair` / `Vector` / etc.
-    unsafe { cs_gc::Gc::<Value>::raw_incref(payload as *const ()) };
+    unsafe { cs_gc::Gc::<Value>::raw_incref(ptr) };
     r
 }
 
@@ -5992,28 +6103,29 @@ pub unsafe extern "C" fn vm_value_drop_gc(r: i64) {
         proc_table::decref(payload as u32);
         return;
     }
-    let ptr = payload as *const ();
+    let (ptr, is_region) = nb_decode_gc_ptr(payload);
     match tag {
-        t if t == NB_TAG_PAIR => drop(unsafe { cs_gc::Gc::<cs_core::Pair>::from_raw_jit(ptr) }),
+        t if t == NB_TAG_PAIR => drop(unsafe { decode_gc_handle::<cs_core::Pair>(ptr, is_region) }),
         t if t == NB_TAG_VECTOR => {
-            drop(unsafe { cs_gc::Gc::<std::cell::RefCell<Vec<Value>>>::from_raw_jit(ptr) })
+            drop(unsafe { decode_gc_handle::<std::cell::RefCell<Vec<Value>>>(ptr, is_region) })
         }
         t if t == NB_TAG_STRING => {
-            drop(unsafe { cs_gc::Gc::<std::cell::RefCell<String>>::from_raw_jit(ptr) })
+            drop(unsafe { decode_gc_handle::<std::cell::RefCell<String>>(ptr, is_region) })
         }
         t if t == NB_TAG_BYTEVECTOR => {
-            drop(unsafe { cs_gc::Gc::<std::cell::RefCell<Vec<u8>>>::from_raw_jit(ptr) })
+            drop(unsafe { decode_gc_handle::<std::cell::RefCell<Vec<u8>>>(ptr, is_region) })
         }
         t if t == NB_TAG_HASHTABLE => {
-            drop(unsafe { cs_gc::Gc::<cs_core::Hashtable>::from_raw_jit(ptr) })
+            drop(unsafe { decode_gc_handle::<cs_core::Hashtable>(ptr, is_region) })
         }
-        t if t == NB_TAG_PORT => drop(unsafe { cs_gc::Gc::<cs_core::Port>::from_raw_jit(ptr) }),
+        t if t == NB_TAG_PORT => drop(unsafe { decode_gc_handle::<cs_core::Port>(ptr, is_region) }),
         t if t == NB_TAG_PROMISE => {
-            drop(unsafe { cs_gc::Gc::<cs_core::Promise>::from_raw_jit(ptr) })
+            drop(unsafe { decode_gc_handle::<cs_core::Promise>(ptr, is_region) })
         }
         // NB_TAG_GC_VALUE (and the reserved-but-routed-here
         // NB_TAG_PROCEDURE) — Gc<Value> wrap. Also the defensive
-        // default for any other pointer-typed tag.
+        // default for any other pointer-typed tag. GC_VALUE is
+        // always Rc (no region path constructs it).
         _ => drop(unsafe { cs_gc::Gc::<Value>::from_raw_jit(ptr) }),
     }
 }
@@ -7370,7 +7482,7 @@ pub unsafe extern "C" fn vm_last_pair_gc(lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.cdr();
                 if !matches!(cdr, Value::Pair(_)) {
                     return value_to_gc_i64(Value::Pair(p));
                 }
@@ -7399,9 +7511,9 @@ pub unsafe extern "C" fn vm_last_gc(lst: i64) -> i64 {
     loop {
         match cur {
             Value::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.cdr();
                 if matches!(cdr, Value::Null) {
-                    return value_to_gc_i64(p.car.borrow().clone());
+                    return value_to_gc_i64(p.car());
                 }
                 if !matches!(cdr, Value::Pair(_)) {
                     // Improper tail — deopt and let the VM raise.
@@ -7435,15 +7547,15 @@ pub unsafe extern "C" fn vm_concatenate_gc(lists: i64) -> i64 {
         match outer {
             Value::Null => break,
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 let mut inner = car;
                 loop {
                     match inner {
                         Value::Null => break,
                         Value::Pair(ip) => {
-                            items.push(ip.car.borrow().clone());
-                            inner = ip.cdr.borrow().clone();
+                            items.push(ip.car());
+                            inner = ip.cdr();
                         }
                         _ => {
                             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
@@ -7491,13 +7603,13 @@ fn jit_list_classify(v: &Value) -> Option<bool> {
         match fast {
             Value::Null => return Some(true),
             Value::Pair(p) => {
-                let next = p.cdr.borrow().clone();
+                let next = p.cdr();
                 match next {
                     Value::Null => return Some(true),
                     Value::Pair(p2) => {
-                        let next2 = p2.cdr.borrow().clone();
+                        let next2 = p2.cdr();
                         slow = match slow {
-                            Value::Pair(sp) => sp.cdr.borrow().clone(),
+                            Value::Pair(sp) => sp.cdr(),
                             _ => return Some(true),
                         };
                         fast = next2;
@@ -7602,8 +7714,8 @@ pub unsafe extern "C" fn vm_take_gc(lst: i64, n: i64) -> i64 {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 taken.push(car);
                 cur = cdr;
                 i += 1;
@@ -7643,7 +7755,7 @@ pub unsafe extern "C" fn vm_drop_gc(lst: i64, n: i64) -> i64 {
     while i < n {
         match cur {
             Value::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.cdr();
                 cur = cdr;
                 i += 1;
             }
@@ -8171,8 +8283,8 @@ pub unsafe extern "C" fn vm_string_join_gc(parts: i64, sep: i64) -> i64 {
         match cur {
             Value::Null => break,
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 match car {
                     Value::String(s) => strs.push(s.borrow().clone()),
                     _ => {
@@ -8705,7 +8817,7 @@ pub unsafe extern "C" fn vm_vector_to_string_slice_gc(v: i64, start: i64, end: i
 pub unsafe extern "C" fn vm_pair_car(pair: i64) -> i64 {
     let v = unsafe { i64_to_value(pair, JIT_RT_ANY) };
     match v {
-        Value::Pair(p) => value_to_any_i64(p.car.borrow().clone()),
+        Value::Pair(p) => value_to_any_i64(p.car()),
         other => panic!("vm_pair_car: not a pair ({})", other.type_name()),
     }
 }
@@ -8716,7 +8828,7 @@ pub unsafe extern "C" fn vm_pair_car(pair: i64) -> i64 {
 pub unsafe extern "C" fn vm_pair_cdr(pair: i64) -> i64 {
     let v = unsafe { i64_to_value(pair, JIT_RT_ANY) };
     match v {
-        Value::Pair(p) => value_to_any_i64(p.cdr.borrow().clone()),
+        Value::Pair(p) => value_to_any_i64(p.cdr()),
         other => panic!("vm_pair_cdr: not a pair ({})", other.type_name()),
     }
 }
@@ -10585,14 +10697,15 @@ impl Procedure for VmClosure {
     }
 }
 
-impl cs_gc::Trace for VmClosure {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        // Trace the captured environment chain. Bytecode is immutable
-        // shared `Rc<Bytecode>` containing only Symbols and opcodes —
-        // no Values to trace. The shared `LambdaProfile` is leaf JIT
-        // state (counters, raw pointers, stack maps) — no Values to
-        // trace either.
-        self.env.trace(marker);
+impl cs_gc::cycle::CycleVisit for VmClosure {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Dedup on VmClosure's Rc identity; descend into env
+        // (which itself dedups Env identity).
+        let addr = self as *const Self as usize;
+        if !ctx.visit_addr(addr) {
+            return;
+        }
+        self.env.visit_children(ctx);
     }
 }
 
@@ -10656,25 +10769,20 @@ impl Drop for Bindings {
     }
 }
 
-impl cs_gc::Trace for Bindings {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        // Borrow each slot's Gc<T> handle without touching the
-        // refcount (ManuallyDrop pattern), trace it, then let the
-        // ManuallyDrop wrapper forget the temporary handle. The
-        // slot still owns the strong ref.
-        let trace_nb = |nb: &NanboxValue, marker: &mut cs_gc::Marker| {
+impl cs_gc::cycle::CycleVisit for Bindings {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Mirrors the trace_nb dispatch above. Each NanboxValue slot
+        // decodes its tag, reconstructs a borrowed Gc<T> via
+        // ManuallyDrop (no refcount churn), and forwards to the
+        // cycle visitor.
+        let visit_nb = |nb: &NanboxValue, ctx: &mut cs_gc::cycle::CycleVisitor| {
             let bits = nb.into_raw() as u64;
             if !nb_is_tagged(bits) {
-                return; // Flonum — leaf (raw f64 bit pattern, no payload to trace).
+                return; // Flonum leaf.
             }
             let tag = nb_tag_of(bits);
-            // Inline immediates (Fixnum / Boolean / Character / Symbol /
-            // Null / Unspecified / Eof) carry no GC payload — skip.
-            // Without this guard, tracing a Fixnum-bound `p` after
-            // `(set! p 0)` would reinterpret the payload as a
-            // `Gc<Value>` raw pointer and segfault.
             if tag < NB_TAG_PAIR {
-                return;
+                return; // Inline immediate; no Gc payload.
             }
             let payload = nb_payload_of(bits);
             let ptr = payload as *const ();
@@ -10683,85 +10791,98 @@ impl cs_gc::Trace for Bindings {
                     let g = std::mem::ManuallyDrop::new(unsafe {
                         cs_gc::Gc::<cs_core::Pair>::from_raw_jit(ptr)
                     });
-                    (*g).trace(marker);
+                    if ctx.visit(&g) {
+                        (**g).visit_children(ctx);
+                    }
                 }
                 t if t == NB_TAG_VECTOR => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
                         cs_gc::Gc::<std::cell::RefCell<Vec<Value>>>::from_raw_jit(ptr)
                     });
-                    (*g).trace(marker);
+                    if ctx.visit(&g) {
+                        (**g).visit_children(ctx);
+                    }
                 }
                 t if t == NB_TAG_STRING => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
                         cs_gc::Gc::<std::cell::RefCell<String>>::from_raw_jit(ptr)
                     });
-                    (*g).trace(marker);
+                    // String holds no Gc<...> children; register
+                    // identity for cycle target check, then stop.
+                    let _ = ctx.visit(&g);
                 }
                 t if t == NB_TAG_BYTEVECTOR => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
                         cs_gc::Gc::<std::cell::RefCell<Vec<u8>>>::from_raw_jit(ptr)
                     });
-                    (*g).trace(marker);
+                    let _ = ctx.visit(&g);
                 }
                 t if t == NB_TAG_HASHTABLE => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
                         cs_gc::Gc::<cs_core::Hashtable>::from_raw_jit(ptr)
                     });
-                    (*g).trace(marker);
+                    if ctx.visit(&g) {
+                        (**g).visit_children(ctx);
+                    }
                 }
                 t if t == NB_TAG_PORT => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
                         cs_gc::Gc::<cs_core::Port>::from_raw_jit(ptr)
                     });
-                    (*g).trace(marker);
+                    let _ = ctx.visit(&g);
                 }
                 t if t == NB_TAG_PROMISE => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
                         cs_gc::Gc::<cs_core::Promise>::from_raw_jit(ptr)
                     });
-                    (*g).trace(marker);
+                    if ctx.visit(&g) {
+                        (**g).visit_children(ctx);
+                    }
                 }
-                // Phase 6 Stage B2 — NB_TAG_PROCEDURE payload is a
-                // u32 ProcTable slot index, NOT a Gc pointer.
-                // Reinterpreting it as a pointer (via the catch-all
-                // arm) would segfault. The trace is a no-op:
-                // `Value::Procedure`'s `Trace` impl is also no-op
-                // (cs-core/value.rs ~line 321) — captures are rooted
-                // through the VM stack / caller env, not via this
-                // carrier.
+                // Procedure is a ProcTable index, not a Gc pointer.
                 t if t == NB_TAG_PROCEDURE => {}
                 _ => {
-                    // NB_TAG_GC_VALUE (or any other pointer tag routed
-                    // through the Gc<Value> wrap fallback). Trace the
-                    // wrap, which in turn traces the inner Value.
                     let g = std::mem::ManuallyDrop::new(unsafe {
                         cs_gc::Gc::<Value>::from_raw_jit(ptr)
                     });
-                    (*g).trace(marker);
+                    if ctx.visit(&g) {
+                        (**g).visit_children(ctx);
+                    }
                 }
             }
         };
         match self {
             Bindings::Small(v) => {
                 for (_, nb) in v {
-                    trace_nb(nb, marker);
+                    if ctx.done() {
+                        return;
+                    }
+                    visit_nb(nb, ctx);
                 }
             }
             Bindings::Large(m) => {
                 for (_, nb) in m {
-                    trace_nb(nb, marker);
+                    if ctx.done() {
+                        return;
+                    }
+                    visit_nb(nb, ctx);
                 }
             }
         }
     }
 }
 
-impl cs_gc::Trace for Env {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        self.bindings.borrow().trace(marker);
-        if let Some(p) = &self.parent {
-            p.trace(marker);
+impl cs_gc::cycle::CycleVisit for Env {
+    fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Dedup on this Env's Rc identity so the detector
+        // doesn't re-enter via a binding that closes back
+        // over this env. Same parent-skip rationale as Frame
+        // in cs-runtime.
+        let addr = self as *const Self as usize;
+        if !ctx.visit_addr(addr) {
+            return;
         }
+        self.bindings.borrow().visit_children(ctx);
     }
 }
 
@@ -11171,8 +11292,8 @@ fn run_dispatch(
                         // ManuallyDrop: borrow the wrap allocation,
                         // do NOT decref it. The slot still owns the
                         // strong ref. Kept for non-Procedure values
-                        // wrapped via `nb_alloc_gc_value` (BigInt /
-                        // Rational / etc.).
+                        // wrapped via Gc<Value> (BigInt / Rational /
+                        // etc.).
                         let g = std::mem::ManuallyDrop::new(unsafe {
                             cs_gc::Gc::<Value>::from_raw_jit(payload as *const ())
                         });
@@ -12525,8 +12646,8 @@ fn run_dispatch(
                             match cur {
                                 Value::Null => break,
                                 Value::Pair(pair) => {
-                                    spread.push(pair.car.borrow().clone());
-                                    cur = pair.cdr.borrow().clone();
+                                    spread.push(pair.car());
+                                    cur = pair.cdr();
                                 }
                                 other => {
                                     return Err(VmError::new(format!(
@@ -13970,8 +14091,8 @@ pub fn vm_call_sync(
                         match cur {
                             Value::Null => break,
                             Value::Pair(p) => {
-                                spread.push(p.car.borrow().clone());
-                                cur = p.cdr.borrow().clone();
+                                spread.push(p.car());
+                                cur = p.cdr();
                             }
                             other => {
                                 return Err(VmError::new(format!(
@@ -14722,8 +14843,8 @@ fn collect_proper_list(v: &Value) -> Result<Vec<Value>, VmError> {
         match cur {
             Value::Null => return Ok(out),
             Value::Pair(p) => {
-                out.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                out.push(p.car());
+                cur = p.cdr();
             }
             other => {
                 return Err(VmError::new(format!(
@@ -14823,75 +14944,6 @@ fn sort_with_predicate(
     }
     Ok(())
 }
-
-// Empty `Trace` impl for VM-tier procedure types that hold no Values.
-// Builtins, marker types like VmApply/VmMap, and continuation handles
-// (which carry only an i64 id) all carry no reachable Values inside.
-// VmClosure has its own non-empty Trace impl elsewhere because it
-// captures an Env; everything else listed here is a leaf.
-macro_rules! trace_leaf_proc {
-    ($($t:ty),* $(,)?) => {
-        $(
-            impl cs_gc::Trace for $t {
-                fn trace(&self, _marker: &mut cs_gc::Marker) {}
-            }
-        )*
-    };
-}
-
-trace_leaf_proc!(
-    VmBuiltin,
-    VmBuiltinSyms,
-    VmHostBuiltin,
-    VmApply,
-    VmMap,
-    VmForEach,
-    VmFilter,
-    VmFind,
-    VmAny,
-    VmEvery,
-    VmFoldLeft,
-    VmFoldRight,
-    VmReduce,
-    VmCount,
-    VmPartition,
-    VmValues,
-    VmCallWithValues,
-    VmVectorMap,
-    VmVectorForEach,
-    VmVectorFold,
-    VmVectorFilter,
-    VmStringMap,
-    VmStringForEach,
-    VmHashtableWalk,
-    VmHashtableForEach,
-    VmHashtableFold,
-    VmHashtableUpdate,
-    VmUnfold,
-    VmListSort,
-    VmVectorSort,
-    VmVectorSortBang,
-    VmTabulate,
-    VmRemove,
-    VmForce,
-    VmEval,
-    VmDisplay,
-    VmWrite,
-    VmNewline,
-    VmWithOutputToString,
-    VmWithInputFromString,
-    VmWithOutputToFile,
-    VmWithInputFromFile,
-    VmCurrentInputPort,
-    VmCurrentOutputPort,
-    VmRaise,
-    VmErrorFn,
-    VmAssertionViolation,
-    VmWithExceptionHandler,
-    VmCallCc,
-    VmDynamicWind,
-    VmContinuation,
-);
 
 // =========================================================================
 // RC3 Phase 2 iter 2.1 — AOT-procedure public API surface
@@ -15040,12 +15092,6 @@ impl cs_core::Procedure for VmAotClosure {
     }
     fn name(&self) -> Option<&str> {
         self.name.as_deref()
-    }
-}
-
-impl cs_gc::Trace for VmAotClosure {
-    fn trace(&self, _marker: &mut cs_gc::Marker) {
-        // No Gc-tracked fields; the fn pointer is a static address.
     }
 }
 
@@ -15615,6 +15661,32 @@ mod gc_helper_tests {
         }
     }
 
+    /// Gap B-3: `vm_alloc_pair_region_gc` falls back to Rc
+    /// when no region is in scope. (Region-scope variant is
+    /// tested by `cs-runtime` integration tests since this
+    /// fn depends on cs-runtime's REGION_STACK.)
+    #[cfg(feature = "regions")]
+    #[test]
+    fn vm_alloc_pair_region_gc_fallback_when_no_region() {
+        let car = 13i64;
+        let cdr = 17i64;
+        // No RegionScope entered → cs_runtime_current_region_ptr
+        // returns null → fallback to Rc allocation. The
+        // resulting Pair is still a valid Pair handle.
+        let i = unsafe { vm_alloc_pair_region_gc(car, JIT_RT_FIXNUM, cdr, JIT_RT_FIXNUM) };
+        assert_ne!(i, 0);
+        let v = unsafe { gc_i64_to_value(i) };
+        match v {
+            Value::Pair(p) => {
+                // Not region-backed (we fell back to Rc).
+                #[cfg(feature = "regions")]
+                assert!(!cs_gc::Gc::is_region(&p));
+                let _ = p;
+            }
+            other => panic!("expected Pair, got {:?}", other),
+        }
+    }
+
     #[test]
     fn value_to_gc_i64_and_back_preserves_value() {
         let v = Value::Number(cs_core::Number::Fixnum(42));
@@ -15927,134 +15999,6 @@ mod gc_helper_tests_extra {
         assert_eq!(unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Null)) }, 1);
     }
 
-    #[test]
-    fn value_to_gc_i64_uses_active_heap_when_set() {
-        // K1 step 2b (NaN-box): Pairs encode by storing their raw
-        // `Gc<Pair>` ptr directly with `NB_TAG_PAIR` — they do NOT
-        // route through the Gc<Value> wrap allocation that the
-        // active heap tracks. To exercise the active-heap routing,
-        // we need a value that DOES wrap in `Gc<Value>` — the
-        // catchall `NB_TAG_GC_VALUE` path. Oversized Fixnums
-        // (beyond `NB_FIXNUM_MAX`) take exactly that path.
-        let h = cs_gc::Heap::new();
-        let before = h.alloc_count();
-        let mk_big = || Value::Number(cs_core::Number::Fixnum(NB_FIXNUM_MAX + 1));
-        let _ = value_to_gc_i64(mk_big());
-        assert_eq!(
-            h.alloc_count(),
-            before,
-            "no Heap installed; alloc_count should not move"
-        );
-
-        // Install the Heap; subsequent Gc<Value>-wrap allocations
-        // are tracked.
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let _ = value_to_gc_i64(mk_big());
-        let _ = value_to_gc_i64(mk_big());
-        clear_jit_active_heap();
-        assert_eq!(
-            h.alloc_count(),
-            before + 2,
-            "two GC_VALUE-wrap allocations through the Heap should bump alloc_count by 2"
-        );
-    }
-
-    #[test]
-    fn value_to_gc_i64_inline_fixnum_skips_allocation() {
-        // Small Fixnums encode inline (low-bit tag) — no Gc allocation
-        // is made at all, even with an active Heap. Round-trip
-        // through `gc_i64_to_value` recovers the original value.
-        let h = cs_gc::Heap::new();
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let before = h.alloc_count();
-        for n in [0i64, 1, -1, 42, -42, NB_FIXNUM_MAX, NB_FIXNUM_MIN] {
-            let i = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(n)));
-            assert!(
-                any_i64_is_inline(i),
-                "Fixnum({}) should encode inline, got i64={:#x}",
-                n,
-                i
-            );
-            let back = unsafe { gc_i64_to_value(i) };
-            match back {
-                Value::Number(cs_core::Number::Fixnum(m)) => assert_eq!(m, n),
-                other => panic!("expected Fixnum({}), got {:?}", n, other),
-            }
-        }
-        clear_jit_active_heap();
-        assert_eq!(
-            h.alloc_count(),
-            before,
-            "inline encoding must not touch the Heap"
-        );
-    }
-
-    #[test]
-    fn value_to_gc_i64_inline_immediates_round_trip() {
-        // Boolean, Character, Null, Unspecified, Eof all encode
-        // inline (no Gc allocation) and round-trip through
-        // `gc_i64_to_value` without touching the Heap.
-        let h = cs_gc::Heap::new();
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let before = h.alloc_count();
-
-        let cases: Vec<(Value, &str)> = vec![
-            (Value::Boolean(false), "Boolean(false)"),
-            (Value::Boolean(true), "Boolean(true)"),
-            (Value::Character('a'), "Character('a')"),
-            (Value::Character('\u{1F4A9}'), "Character('💩')"),
-            (Value::Character('\0'), "Character('\\0')"),
-            (Value::Null, "Null"),
-            (Value::Unspecified, "Unspecified"),
-            (Value::Eof, "Eof"),
-        ];
-        for (v, label) in cases {
-            let i = value_to_gc_i64(v.clone());
-            assert!(any_i64_is_inline(i), "{} should encode inline", label);
-            let back = unsafe { gc_i64_to_value(i) };
-            let same = match (&v, &back) {
-                (Value::Boolean(a), Value::Boolean(b)) => a == b,
-                (Value::Character(a), Value::Character(b)) => a == b,
-                (Value::Null, Value::Null) => true,
-                (Value::Unspecified, Value::Unspecified) => true,
-                (Value::Eof, Value::Eof) => true,
-                _ => false,
-            };
-            assert!(same, "{} round-trip mismatch: {:?} -> {:?}", label, v, back);
-        }
-
-        clear_jit_active_heap();
-        assert_eq!(
-            h.alloc_count(),
-            before,
-            "inline immediates must not touch the Heap"
-        );
-    }
-
-    #[test]
-    fn value_to_gc_i64_oversized_fixnum_falls_back_to_heap() {
-        // A Fixnum past the 47-bit NaN-box inline range falls
-        // through to the `NB_TAG_GC_VALUE` Gc<Value>-wrap path.
-        // Encode + decode still round-trips — only the carrier
-        // changes.
-        let h = cs_gc::Heap::new();
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let before = h.alloc_count();
-        let big = NB_FIXNUM_MAX + 1;
-        let i = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(big)));
-        assert!(
-            !any_i64_is_inline(i),
-            "Fixnum past inline range should fall back to Gc handle"
-        );
-        let back = unsafe { gc_i64_to_value(i) };
-        clear_jit_active_heap();
-        match back {
-            Value::Number(cs_core::Number::Fixnum(m)) => assert_eq!(m, big),
-            other => panic!("expected Fixnum({}), got {:?}", big, other),
-        }
-        assert_eq!(h.alloc_count(), before + 1);
-    }
-
     // ===== NanboxValue (K1 step 2) — NaN-box encoding tests =====
 
     #[test]
@@ -16136,107 +16080,6 @@ mod gc_helper_tests_extra {
             };
             assert!(matches, "{}: round-trip mismatch: {:?}", label, back);
         }
-    }
-
-    #[test]
-    fn nanbox_round_trips_flonum_inline() {
-        // Flonums travel as raw f64 bits. No allocation, no
-        // signature collision (verified by encode).
-        let h = cs_gc::Heap::new();
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let before = h.alloc_count();
-
-        for f in [0.0_f64, 1.0, -1.0, 3.14, 1e100, -1e-100, f64::EPSILON] {
-            let nb = NanboxValue::flonum(f);
-            assert!(nb.is_flonum(), "Flonum({}) should encode as f64 lane", f);
-            assert_eq!(nb.as_flonum(), Some(f));
-            let back = unsafe { nb.to_value() };
-            match back {
-                Value::Number(cs_core::Number::Flonum(g)) => assert_eq!(f.to_bits(), g.to_bits()),
-                other => panic!("expected Flonum({}), got {:?}", f, other),
-            }
-        }
-
-        // Special f64s: infinities round-trip, NaN canonicalizes.
-        let pos_inf = NanboxValue::flonum(f64::INFINITY);
-        assert_eq!(pos_inf.as_flonum(), Some(f64::INFINITY));
-        let neg_inf = NanboxValue::flonum(f64::NEG_INFINITY);
-        assert_eq!(neg_inf.as_flonum(), Some(f64::NEG_INFINITY));
-
-        // A sign=1 NaN bit pattern would collide with the tagged
-        // range; `nb_encode_flonum` canonicalizes it. Use a sign=0
-        // NaN to test the non-collision path.
-        let nan = NanboxValue::flonum(f64::NAN);
-        assert!(nan.is_flonum());
-        let nan_back = unsafe { nan.to_value() };
-        match nan_back {
-            Value::Number(cs_core::Number::Flonum(g)) => assert!(g.is_nan()),
-            other => panic!("expected NaN, got {:?}", other),
-        }
-
-        clear_jit_active_heap();
-        assert_eq!(
-            h.alloc_count(),
-            before,
-            "inline Flonum encoding must not touch the Heap"
-        );
-    }
-
-    #[test]
-    fn nanbox_round_trips_heap_pair_without_extra_wrap() {
-        // The whole point of NaN-boxing: a heap-typed Value (here
-        // a Pair) encodes by stashing its `Gc<Pair>` raw pointer
-        // **directly** in the 47-bit payload — no extra
-        // `Gc<Value>` wrap. Round-trip must preserve the Pair's
-        // identity and contents.
-        let h = cs_gc::Heap::new();
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let before = h.alloc_count();
-
-        // `Pair::new` already returns a `Gc<Pair>` (matches the
-        // construction sites elsewhere in vm.rs).
-        let v = Value::Pair(cs_core::Pair::new(
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(2)),
-        ));
-        // alloc_count: 0 here (Gc::new is unregistered when no
-        // heap is set yet… but I set the heap above. Let me
-        // recount.) Actually the Pair allocation here used
-        // unregistered Gc::new, not the heap. So heap count
-        // didn't move.
-        let after_construct = h.alloc_count();
-
-        let nb = NanboxValue::from_value(v);
-        // The encoding should NOT trigger an additional heap
-        // allocation — the `Gc<Pair>` ptr is stored directly.
-        assert_eq!(
-            h.alloc_count(),
-            after_construct,
-            "NaN-box encode of Pair must not allocate a Gc<Value> wrap"
-        );
-        assert!(nb.is_tagged());
-        assert_eq!(nb.tag(), NB_TAG_PAIR);
-
-        let back = unsafe { nb.to_value() };
-        match back {
-            Value::Pair(g) => {
-                let car = g.car.borrow().clone();
-                let cdr = g.cdr.borrow().clone();
-                match (&car, &cdr) {
-                    (
-                        Value::Number(cs_core::Number::Fixnum(a)),
-                        Value::Number(cs_core::Number::Fixnum(b)),
-                    ) => {
-                        assert_eq!(*a, 1);
-                        assert_eq!(*b, 2);
-                    }
-                    _ => panic!("Pair contents wrong: car={:?}, cdr={:?}", car, cdr),
-                }
-            }
-            other => panic!("expected Pair, got {:?}", other),
-        }
-
-        clear_jit_active_heap();
     }
 
     #[test]
@@ -16454,35 +16297,5 @@ mod nb_arith_tests {
         let r = unsafe { vm_value_lt_nb(nb_bool(true), nb_fixnum(1)) };
         assert_eq!(jit_take_deopt(), DEOPT_REASON_ARITH_MISS);
         assert_bool(r, false);
-    }
-
-    #[test]
-    fn bindings_trace_skips_inline_immediates() {
-        // Regression test for the Phase 4 keystone SIGSEGV in
-        // diff_jit_pair_alloc_then_collect_reclaims_when_unreachable.
-        // Bindings::trace's trace_nb only skipped Flonum (untagged); inline
-        // TAGGED immediates (Fixnum/Boolean/Character/Symbol/Null/
-        // Unspecified/Eof) fell into the Gc<Value> default arm and
-        // dereferenced the payload as a heap pointer, crashing for any
-        // non-pointer-typed binding (e.g., `(set! p 0)` then `collect()`).
-        use cs_gc::Trace;
-        let mut syms = SymbolTable::new();
-        let mut b = Bindings::default();
-        // One entry per inline-immediate tag.
-        b.insert_nb(syms.intern("fx"), NanboxValue::fixnum(0));
-        b.insert_nb(syms.intern("bt"), NanboxValue::boolean(true));
-        b.insert_nb(syms.intern("bf"), NanboxValue::boolean(false));
-        b.insert_nb(syms.intern("ch"), NanboxValue::character('x'));
-        b.insert_nb(syms.intern("sy"), NanboxValue::symbol(syms.intern("hi")));
-        b.insert_nb(syms.intern("nl"), NanboxValue::NULL);
-        b.insert_nb(syms.intern("us"), NanboxValue::UNSPECIFIED);
-        b.insert_nb(syms.intern("eo"), NanboxValue::EOF);
-        b.insert_nb(syms.intern("fl"), NanboxValue::flonum(3.14));
-        // Tracing must complete without segfault. The trace is a no-op
-        // for these (no GC payload), but the dispatch must not deref
-        // the payload as a pointer.
-        let heap = cs_gc::Heap::new();
-        heap.add_root(move |marker| b.trace(marker));
-        heap.collect();
     }
 }

@@ -5,6 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Layer 2 (Rc-backed Gc<T> + CycleVisit) is unconditional after
+# countable-memory iter 12b — ADR 0014. Remaining flags forward
+# the *optional* layers of the unified memory architecture
+# (ADR 0015) through to cs-core/cs-gc.
+default = ["regions"]
+# Forwards cs-gc/regions. The VM has no region-specific code
+# paths — it sees Gc<T> polymorphically — so this is purely
+# feature propagation.
+regions = ["cs-core/regions", "cs-gc/regions"]
+tracing-cycle-collector = ["cs-core/tracing-cycle-collector", "cs-gc/tracing-cycle-collector"]
+
 [dependencies]
 cs-core = { workspace = true }
 cs-diag = { workspace = true }

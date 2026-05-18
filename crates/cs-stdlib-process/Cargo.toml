@@ -1,0 +1,15 @@
+[package]
+name = "cs-stdlib-process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab process) — subprocess spawn + run + which."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+# `which` provides PATH-searching plus AbsoluteName resolution and is
+# the de-facto Rust ecosystem crate for that operation.
+which = "6"

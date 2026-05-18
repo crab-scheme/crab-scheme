@@ -34,6 +34,38 @@ members = [
     "crates/cs-hotreload",
     # R6RS++ (see docs/research/r6rs_extensions_spec.md).
     "crates/cs-pkg",
+    # stdlib-modules (see .spec-workflow/specs/stdlib-modules/).
+    # Each is an optional dep of cs-runtime behind a per-module
+    # cargo feature; default-on for native, opt-out for WASM.
+    "crates/cs-stdlib-path",
+    "crates/cs-stdlib-fs",
+    "crates/cs-stdlib-os",
+    "crates/cs-stdlib-process",
+    "crates/cs-stdlib-string",
+    "crates/cs-stdlib-format",
+    "crates/cs-stdlib-regex",
+    "crates/cs-stdlib-time",
+    "crates/cs-stdlib-random",
+    "crates/cs-stdlib-uuid",
+    "crates/cs-stdlib-json",
+    "crates/cs-stdlib-csv",
+    "crates/cs-stdlib-toml",
+    "crates/cs-stdlib-base",
+    "crates/cs-stdlib-url",
+    "crates/cs-stdlib-hash",
+    "crates/cs-stdlib-compress",
+    "crates/cs-stdlib-deflate",
+    "crates/cs-stdlib-archive",
+    "crates/cs-stdlib-log",
+    "crates/cs-stdlib-metrics",
+    "crates/cs-stdlib-net",
+    "crates/cs-stdlib-http",
+    "crates/cs-stdlib-websocket",
+    "crates/cs-stdlib-collection",
+    "crates/cs-stdlib-math",
+    "crates/cs-stdlib-tty",
+    "crates/cs-stdlib-signal",
+    "crates/cs-stdlib-meta",
 ]
 
 [workspace.package]
@@ -51,7 +83,12 @@ cs-lex = { path = "crates/cs-lex" }
 cs-parse = { path = "crates/cs-parse" }
 cs-ir = { path = "crates/cs-ir" }
 cs-expand = { path = "crates/cs-expand" }
-cs-runtime = { path = "crates/cs-runtime", default-features = false }
+# cs-runtime default features stay off here so downstream callers
+# opt in/out of `jit` / `ffi-dynamic` / `tracing-cycle-collector`
+# independently. Layer 2 (Rc-backed Gc<T> + synchronous cycle
+# detector) is unconditional after countable-memory iter 12b —
+# ADR 0014.
+cs-runtime = { path = "crates/cs-runtime", default-features = false, features = ["regions"] }
 cs-vm = { path = "crates/cs-vm" }
 cs-gc = { path = "crates/cs-gc" }
 cs-rir = { path = "crates/cs-rir" }
@@ -73,6 +110,35 @@ cs-table = { path = "crates/cs-table" }
 cs-hotreload = { path = "crates/cs-hotreload" }
 # R6RS++ package manager. Spec §10.
 cs-pkg = { path = "crates/cs-pkg" }
+cs-stdlib-path = { path = "crates/cs-stdlib-path" }
+cs-stdlib-fs = { path = "crates/cs-stdlib-fs" }
+cs-stdlib-os = { path = "crates/cs-stdlib-os" }
+cs-stdlib-process = { path = "crates/cs-stdlib-process" }
+cs-stdlib-string = { path = "crates/cs-stdlib-string" }
+cs-stdlib-format = { path = "crates/cs-stdlib-format" }
+cs-stdlib-regex = { path = "crates/cs-stdlib-regex" }
+cs-stdlib-time = { path = "crates/cs-stdlib-time" }
+cs-stdlib-random = { path = "crates/cs-stdlib-random" }
+cs-stdlib-uuid = { path = "crates/cs-stdlib-uuid" }
+cs-stdlib-json = { path = "crates/cs-stdlib-json" }
+cs-stdlib-csv = { path = "crates/cs-stdlib-csv" }
+cs-stdlib-toml = { path = "crates/cs-stdlib-toml" }
+cs-stdlib-base = { path = "crates/cs-stdlib-base" }
+cs-stdlib-url = { path = "crates/cs-stdlib-url" }
+cs-stdlib-hash = { path = "crates/cs-stdlib-hash" }
+cs-stdlib-compress = { path = "crates/cs-stdlib-compress" }
+cs-stdlib-deflate = { path = "crates/cs-stdlib-deflate" }
+cs-stdlib-archive = { path = "crates/cs-stdlib-archive" }
+cs-stdlib-log = { path = "crates/cs-stdlib-log" }
+cs-stdlib-metrics = { path = "crates/cs-stdlib-metrics" }
+cs-stdlib-net = { path = "crates/cs-stdlib-net" }
+cs-stdlib-http = { path = "crates/cs-stdlib-http" }
+cs-stdlib-websocket = { path = "crates/cs-stdlib-websocket" }
+cs-stdlib-collection = { path = "crates/cs-stdlib-collection" }
+cs-stdlib-math = { path = "crates/cs-stdlib-math" }
+cs-stdlib-tty = { path = "crates/cs-stdlib-tty" }
+cs-stdlib-signal = { path = "crates/cs-stdlib-signal" }
+cs-stdlib-meta = { path = "crates/cs-stdlib-meta" }
 
 # External crates
 logos = "0.14"
@@ -100,6 +166,14 @@ rustc-hash = "2.1"
 # SmallVec is the same size as a Vec; ≤4 bindings stay inline,
 # eliminating the per-call frame heap allocation.
 smallvec = { version = "1", features = ["union"] }
+# Region-memory spec iter 1 — bump arena allocator for layer 3
+# of the unified memory management architecture (ADR 0015).
+# Allocations made through a Region's arena live until the
+# region drops, at which point all of them free in one
+# operation. Used by `cs_gc::Region` (gated on the `regions`
+# feature) to implement bounded-extent allocation as an
+# alternative to global `Rc<T>`.
+bumpalo = "3"
 # B2 dep: tokio multi-thread runtime for the actor system. Pinned
 # at LTS minor for now; revisit if cs-actor needs newer features.
 tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "macros", "time"] }

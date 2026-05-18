@@ -1,9 +1,14 @@
 //! CrabScheme runtime: tree-walking interpreter, environments, builtins.
 
 pub mod active;
+#[cfg(feature = "regions")]
+pub mod alloc_dispatch;
 pub mod builtins;
+pub mod countable_memory_cycle;
 pub mod env;
 pub mod eval;
+#[cfg(feature = "regions")]
+pub mod regions;
 // The `ffi` module contains only the libloading-using dlopen path
 // (`load_shared_library`, `RuntimeFfiContext`, `CAbiProc`) — gated
 // on `ffi-dynamic`. The pure-Rust trait surface (HostProcedure,
@@ -37,34 +42,26 @@ pub struct Runtime {
     macros: std::collections::HashMap<cs_core::Symbol, cs_expand::Macro>,
     /// VM-tier persistent root env (lazily populated with pure builtins at construction).
     vm_env: Rc<cs_vm::vm::Env>,
-    /// GC heap. M5 milestone: pre-registered with the walker top frame
-    /// and the VM root env as persistent roots. Phase 1 collect() walks
-    /// these roots transitively but the underlying allocations are
-    /// still Rc-backed, so collect() has no observable side effect on
-    /// existing programs — it's the seam Phase 2 swaps to a real arena.
-    heap: cs_gc::Heap,
-    /// Slab of values rooted via `pin()`. Keyed by a monotonically-
-    /// increasing PinId. The shared root closure registered at
-    /// construction marks every value in here on every collect.
-    /// `Pinned<'rt>::Drop` removes its entry by id. (M5b iter 4.)
+    /// Slab of pinned values that survive intervening collects.
+    /// Populated by [`Runtime::pin`]; cleared on the returned
+    /// [`Pinned`] guard's drop. Cloned (Rc-shared) into the Pinned
+    /// guard so drop can remove the slot without holding the
+    /// Runtime.
     pinned: Rc<RefCell<HashMap<PinId, Value>>>,
-    /// Next PinId — never reused. u64 is enough for any conceivable
-    /// program lifetime (~5×10^14 pins/sec for 1000 years).
+    /// Monotonic counter producing fresh [`PinId`]s. Starts at 1
+    /// so handle 0 can be reserved by FFI as the null
+    /// [`crate::ffi::ValueRef`].
     next_pin_id: Rc<Cell<u64>>,
-    /// Shared libraries loaded via [`Runtime::load_shared_library`].
-    /// Held here only so the plugin's text segment stays mapped for
-    /// the runtime's lifetime; we never inspect them after register.
-    /// (M10 W1: gated on `ffi-dynamic` — WASM has no `dlopen`.
-    /// Plugins compiled-in via the `ffi-trait` API don't need this.)
+    /// Dynamically loaded shared libraries kept alive for the
+    /// runtime's lifetime so dlopen'd host procedures' captured
+    /// back-pointers stay valid.
     #[cfg(feature = "ffi-dynamic")]
     loaded_libs: Vec<libloading::Library>,
-    /// Cached C-ABI context. Lazily initialized on first dlopen use;
-    /// kept alive for the runtime's lifetime so registered host
-    /// procedures' captured back-pointers stay valid. Boxed so the
-    /// runtime back-pointer (which equals `self`) stays valid even
-    /// if Runtime fields are reordered. Only the dlopen path
-    /// constructs this — `ffi-trait`-only embedders register their
-    /// procedures via `register_host_procedure` directly.
+    /// Dlopen-time C-ABI context. Boxed so the runtime
+    /// back-pointer (which equals `self`) stays valid even if
+    /// Runtime fields are reordered. Only the dlopen path
+    /// constructs this — `ffi-trait`-only embedders register
+    /// their procedures via `register_host_procedure` directly.
     #[cfg(feature = "ffi-dynamic")]
     ffi_ctx: Option<Box<crate::ffi::RuntimeFfiContext>>,
     /// JIT lowerer; populated by [`Runtime::install_jit`]. None
@@ -147,8 +144,53 @@ impl Default for Runtime {
     }
 }
 
+/// Embedder-facing configuration for the layer-4 tracing
+/// cycle collector (tracing-revival spec iter 5). Gated on
+/// the `tracing-cycle-collector` feature.
+#[cfg(feature = "tracing-cycle-collector")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TracingPolicy {
+    /// Registry-size at which the next allocation
+    /// auto-triggers a sweep. Defaults to 10_000 — embedders
+    /// running short workloads with many transient cycles
+    /// can raise it; tight loops with long-lived cycles can
+    /// lower it.
+    pub auto_trigger_threshold: usize,
+}
+
+#[cfg(feature = "tracing-cycle-collector")]
+impl Default for TracingPolicy {
+    fn default() -> Self {
+        TracingPolicy {
+            auto_trigger_threshold: 10_000,
+        }
+    }
+}
+
 impl Runtime {
+    /// Apply a [`TracingPolicy`] to this thread's cycle-
+    /// candidate registry. Today only sets the
+    /// auto-trigger threshold; background-sweep wiring is
+    /// future work (the registry is per-thread via
+    /// `thread_local!` which doesn't compose with a foreign
+    /// sweep thread without redesign — see ADR 0018's
+    /// deferred-work list).
+    #[cfg(feature = "tracing-cycle-collector")]
+    pub fn set_tracing_policy(&mut self, policy: TracingPolicy) {
+        cs_gc::cycle_registry::set_auto_trigger_threshold(policy.auto_trigger_threshold);
+    }
+
     pub fn new() -> Self {
+        let mut rt = Self::new_inner();
+        rt.register_stdlib();
+        rt
+    }
+
+    /// Body of `Runtime::new` minus the post-construction stdlib
+    /// registration step. Kept private so callers that want a
+    /// minimal runtime without the `(crab …)` modules can build
+    /// against `--no-default-features` and skip the stdlib hookup.
+    fn new_inner() -> Self {
         // ADR 0014 — register the shipped builtin optimizer passes
         // into the process-wide registry exactly once. Subsequent
         // Runtime::new() calls hit the duplicate-name path on every
@@ -160,6 +202,16 @@ impl Runtime {
                 .expect("pass registry poisoned"),
         );
 
+        // Gap B-3: wire cs-vm's region-resolver function-
+        // pointer hook to cs-runtime's per-thread REGION_STACK
+        // accessor. This lets `vm_alloc_pair_region_gc` (the
+        // JIT/AOT entry point for region-allocated cons)
+        // reach our region stack without a cs-vm → cs-runtime
+        // dep cycle. Idempotent — overwrites the previous
+        // resolver, which is fine since both calls return the
+        // same function pointer.
+        #[cfg(feature = "regions")]
+        cs_vm::vm::register_region_resolver(regions::region_resolver_for_cs_vm);
         let mut syms = SymbolTable::new();
         let top = Frame::root();
         builtins::install_into(&top, &mut syms);
@@ -421,6 +473,38 @@ impl Runtime {
                 }
             }),
         );
+        // Gap B-2-lite: VM-tier registration for
+        // `(with-region thunk)`. Mirrors the walker tier
+        // registration in `higher_order_builtins`. Calls
+        // the thunk inside a fresh RegionScope; allocations
+        // made via `cons-in-region` / `make-vector-in-region`
+        // / `make-string-in-region` inside the thunk live
+        // in that region's bump arena and bulk-free on exit.
+        #[cfg(feature = "regions")]
+        {
+            let wr_sym = syms.intern("with-region");
+            vm_env.define(
+                wr_sym,
+                cs_vm::vm::make_vm_builtin_syms("with-region", |args, st| {
+                    if args.len() != 1 {
+                        return Err("with-region: 1 arg".into());
+                    }
+                    let region = std::rc::Rc::new(cs_gc::Region::new());
+                    let _guard = regions::RegionScope::enter(std::rc::Rc::clone(&region));
+                    let res = cs_vm::vm::vm_call_sync(&args[0], &[], st)
+                        .map_err(|e| e.message.clone())?;
+                    // Deep-clone into Rc-backed Value so
+                    // parallel VM-side handles to region
+                    // allocations don't dangle after region
+                    // drop. See `to_rc_deep` in
+                    // cs-core/src/promote.rs.
+                    let safe = cs_core::promote::to_rc_deep(&res);
+                    drop(res);
+                    drop(_guard);
+                    Ok(safe)
+                }),
+            );
+        }
         let cip_sym = syms.intern("current-input-port");
         vm_env.define(cip_sym, cs_vm::vm::make_vm_current_input_port());
         let cop_sym = syms.intern("current-output-port");
@@ -547,16 +631,16 @@ impl Runtime {
                 match cur {
                     Value::Null => return Ok(Value::Boolean(false)),
                     Value::Pair(p) => {
-                        let head = p.car.borrow().clone();
+                        let head = p.car();
                         match &head {
                             Value::Pair(pair) => {
-                                if pred(&pair.car.borrow(), key) {
+                                if pred(&pair.car(), key) {
                                     return Ok(head.clone());
                                 }
                             }
                             _ => return Err("assoc: list of pairs".into()),
                         }
-                        cur = p.cdr.borrow().clone();
+                        cur = p.cdr();
                     }
                     _ => return Err("assoc: proper list".into()),
                 }
@@ -573,10 +657,10 @@ impl Runtime {
                 match cur {
                     Value::Null => return Ok(Value::Boolean(false)),
                     Value::Pair(p) => {
-                        let head = p.car.borrow().clone();
+                        let head = p.car();
                         match &head {
                             Value::Pair(pair) => {
-                                let car = pair.car.borrow().clone();
+                                let car = pair.car();
                                 let r = cs_vm::vm::vm_call_sync(cmp, &[car, key.clone()], st)
                                     .map_err(|e| format!("{:?}", e))?;
                                 if r.is_truthy() {
@@ -585,7 +669,7 @@ impl Runtime {
                             }
                             _ => return Err("assoc: list of pairs".into()),
                         }
-                        cur = p.cdr.borrow().clone();
+                        cur = p.cdr();
                     }
                     _ => return Err("assoc: proper list".into()),
                 }
@@ -614,10 +698,10 @@ impl Runtime {
                 match cur.clone() {
                     Value::Null => return Ok(Value::Boolean(false)),
                     Value::Pair(p) => {
-                        if pred(&p.car.borrow(), obj) {
+                        if pred(&p.car(), obj) {
                             return Ok(cur);
                         }
-                        cur = p.cdr.borrow().clone();
+                        cur = p.cdr();
                     }
                     _ => return Err("member: proper list".into()),
                 }
@@ -634,13 +718,13 @@ impl Runtime {
                 match cur.clone() {
                     Value::Null => return Ok(Value::Boolean(false)),
                     Value::Pair(p) => {
-                        let car = p.car.borrow().clone();
+                        let car = p.car();
                         let r = cs_vm::vm::vm_call_sync(cmp, &[car, obj.clone()], st)
                             .map_err(|e| format!("{:?}", e))?;
                         if r.is_truthy() {
                             return Ok(cur);
                         }
-                        cur = p.cdr.borrow().clone();
+                        cur = p.cdr();
                     }
                     _ => return Err("member: proper list".into()),
                 }
@@ -1640,38 +1724,10 @@ impl Runtime {
                 Ok(Value::list(list))
             }),
         );
-        // Set up the GC root set: the walker's top frame chain and the
-        // VM-tier root env. Cloning Rc<Frame> / Rc<Env> into the closure
-        // gives the heap a stable handle to walk on every collect().
-        let heap = cs_gc::Heap::new();
-        {
-            let top_root = Rc::clone(&top);
-            heap.add_root(move |marker| {
-                use cs_gc::Trace;
-                top_root.trace(marker);
-            });
-        }
-        {
-            let vm_root = Rc::clone(&vm_env);
-            heap.add_root(move |marker| {
-                use cs_gc::Trace;
-                vm_root.trace(marker);
-            });
-        }
-
-        // Pinned-value slab. The root closure traces every value in
-        // the map on every collect, so anything passed to `pin()`
-        // stays reachable until its Pinned guard drops.
+        // Pinned-value slab. Anything passed to `pin()` stays
+        // reachable via this map's strong Value refs until its
+        // Pinned guard drops and removes the entry.
         let pinned: Rc<RefCell<HashMap<PinId, Value>>> = Rc::new(RefCell::new(HashMap::new()));
-        {
-            let pinned_clone = Rc::clone(&pinned);
-            heap.add_root(move |marker| {
-                use cs_gc::Trace;
-                for v in pinned_clone.borrow().values() {
-                    v.trace(marker);
-                }
-            });
-        }
 
         Self {
             syms,
@@ -1679,7 +1735,6 @@ impl Runtime {
             top,
             macros: std::collections::HashMap::new(),
             vm_env,
-            heap,
             pinned,
             // Start at 1 so handle 0 can be reserved as the FFI
             // "null" ValueRef. Internal Pinned guards never use 0
@@ -1704,6 +1759,134 @@ impl Runtime {
     /// before the lambda first crosses the tier-up threshold.
     pub fn install_typer_hints(&self, hints: std::collections::HashMap<u32, Vec<cs_rir::Type>>) {
         *self.typer_hints_by_lambda_id.borrow_mut() = hints;
+    }
+
+    /// Register every compiled-in `(crab …)` stdlib module on this
+    /// runtime. Each `cs-stdlib-<name>` crate exposes a `procs()`
+    /// function returning `Vec<Arc<dyn HostProcedure>>`; this method
+    /// iterates the enabled crates and registers each procedure.
+    ///
+    /// Per-module features (`stdlib-path`, `stdlib-fs`, …) toggle
+    /// individual modules. When no `stdlib-X` feature is enabled
+    /// the body compiles to a no-op. Called automatically from
+    /// `Runtime::new`.
+    pub fn register_stdlib(&mut self) {
+        #[cfg(feature = "stdlib-path")]
+        for p in cs_stdlib_path::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-fs")]
+        for p in cs_stdlib_fs::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-os")]
+        for p in cs_stdlib_os::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-process")]
+        for p in cs_stdlib_process::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-string")]
+        for p in cs_stdlib_string::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-format")]
+        for p in cs_stdlib_format::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-regex")]
+        for p in cs_stdlib_regex::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-time")]
+        for p in cs_stdlib_time::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-random")]
+        for p in cs_stdlib_random::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-uuid")]
+        for p in cs_stdlib_uuid::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-json")]
+        for p in cs_stdlib_json::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-csv")]
+        for p in cs_stdlib_csv::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-toml")]
+        for p in cs_stdlib_toml::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-base")]
+        for p in cs_stdlib_base::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-url")]
+        for p in cs_stdlib_url::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-hash")]
+        for p in cs_stdlib_hash::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-compress")]
+        for p in cs_stdlib_compress::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-deflate")]
+        for p in cs_stdlib_deflate::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-archive")]
+        for p in cs_stdlib_archive::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-log")]
+        for p in cs_stdlib_log::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-metrics")]
+        for p in cs_stdlib_metrics::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-net")]
+        for p in cs_stdlib_net::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-http")]
+        for p in cs_stdlib_http::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-websocket")]
+        for p in cs_stdlib_websocket::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-collection")]
+        for p in cs_stdlib_collection::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-math")]
+        for p in cs_stdlib_math::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-tty")]
+        for p in cs_stdlib_tty::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-signal")]
+        for p in cs_stdlib_signal::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-meta")]
+        for p in cs_stdlib_meta::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call
@@ -1770,19 +1953,12 @@ impl Runtime {
         self.pinned.borrow().get(&PinId(handle)).cloned()
     }
 
-    /// Run a stop-the-world GC pass. Phase 1 walks the registered root
-    /// set (top frame + VM env) and prunes unreachable allocations from
-    /// `Heap`'s bookkeeping vec. Because Phase 1's `Gc<T>` is still
-    /// Rc-backed, this has no observable behavioural effect on programs
-    /// — it's the seam Phase 2 swaps to a real arena.
-    pub fn collect(&self) {
-        self.heap.collect();
-    }
-
-    /// Read-only access to the GC heap (for tests and tooling).
-    pub fn heap(&self) -> &cs_gc::Heap {
-        &self.heap
-    }
+    /// No-op shim preserved for callers that still invoke it.
+    /// Under countable-memory there is no heap to collect —
+    /// reclamation happens deterministically at `Rc::drop`.
+    /// Cycles are reclaimed by the synchronous cycle detector
+    /// (layer 2) and the optional layer-4 sweep registry.
+    pub fn collect(&self) {}
 
     pub fn symbols(&self) -> &SymbolTable {
         &self.syms
@@ -2262,8 +2438,8 @@ fn collect_list(v: &Value) -> Vec<Value> {
         match cur {
             Value::Null => return out,
             Value::Pair(p) => {
-                out.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                out.push(p.car());
+                cur = p.cdr();
             }
             other => {
                 out.push(other);

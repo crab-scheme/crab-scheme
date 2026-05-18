@@ -86,6 +86,13 @@ pub struct Checker<'tab> {
     /// `(fib (- n 1))` with n: Any infers as `[Number]`, which
     /// disagrees with the outer `(fib 25): [Fixnum]`).
     current_lambda_stack: std::cell::RefCell<Vec<cs_core::Symbol>>,
+    /// Gap B-1: per-expression [`AllocEffect`] table populated
+    /// by `populate_effects` during `check_program`. Downstream
+    /// consumers (rir_bridge's lifetime_from_effect, future
+    /// cs-vm/cs-aot lifetime-aware allocation dispatch) fetch
+    /// per-Span via `effect_for`.
+    effects:
+        std::cell::RefCell<std::collections::HashMap<cs_diag::Span, crate::effect::AllocEffect>>,
 }
 
 impl<'tab> Checker<'tab> {
@@ -105,6 +112,7 @@ impl<'tab> Checker<'tab> {
             top_level_lambda_names: std::cell::RefCell::new(std::collections::HashSet::new()),
             top_level_call_arg_types: std::cell::RefCell::new(std::collections::HashMap::new()),
             current_lambda_stack: std::cell::RefCell::new(Vec::new()),
+            effects: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -162,7 +170,65 @@ impl<'tab> Checker<'tab> {
         let mut errors = Vec::new();
         self.check_collect(program, &Type::Any, &mut errors);
         self.merge_monomorphic_call_hints();
+        // Gap B-1: populate per-expression AllocEffect table
+        // for downstream consumers (rir_bridge's
+        // lifetime_from_effect; future cs-vm/cs-aot
+        // lifetime-aware allocation dispatch).
+        self.populate_effects(program);
         errors
+    }
+
+    /// Gap B-1: walk `program` and stash an [`AllocEffect`]
+    /// for every expression keyed by its `Span`. Consumers
+    /// fetch via [`Self::effect_for`].
+    ///
+    /// Recurses into Lambda/App/If/Begin/Letrec/Set so the
+    /// resulting table covers every sub-expression — handy
+    /// for the AOT codegen to emit lifetime-aware allocations
+    /// at every site, not just the program root.
+    pub fn populate_effects(&self, expr: &CoreExpr) {
+        use crate::effect::infer_effect;
+        let eff = infer_effect(expr, &self.env);
+        self.effects.borrow_mut().insert(expr.span(), eff);
+        // Recurse into compound shapes so every sub-expression
+        // gets an entry.
+        match expr {
+            CoreExpr::Const { .. } | CoreExpr::Ref { .. } => {}
+            CoreExpr::Set { value, .. } => self.populate_effects(value),
+            CoreExpr::Lambda { body, .. } => self.populate_effects(body),
+            CoreExpr::App { func, args, .. } => {
+                self.populate_effects(func);
+                for arg in args {
+                    self.populate_effects(arg);
+                }
+            }
+            CoreExpr::If {
+                cond, then, alt, ..
+            } => {
+                self.populate_effects(cond);
+                self.populate_effects(then);
+                self.populate_effects(alt);
+            }
+            CoreExpr::Begin { exprs, .. } => {
+                for e in exprs {
+                    self.populate_effects(e);
+                }
+            }
+            CoreExpr::Letrec { bindings, body, .. } => {
+                for (_, rhs) in bindings {
+                    self.populate_effects(rhs);
+                }
+                self.populate_effects(body);
+            }
+        }
+    }
+
+    /// Gap B-1: fetch the [`AllocEffect`] previously
+    /// recorded for `span` by `populate_effects`. Returns
+    /// `None` if the span wasn't covered (e.g., the checker
+    /// hasn't run yet, or the span was synthesized).
+    pub fn effect_for(&self, span: cs_diag::Span) -> Option<crate::effect::AllocEffect> {
+        self.effects.borrow().get(&span).copied()
     }
 
     /// Phase 5++: walk the per-name call-site arg-type lists
@@ -2264,6 +2330,67 @@ mod tests {
         assert!(
             found,
             "expected Fixnum/String mismatch from let body, got: {errors:?}"
+        );
+    }
+
+    // ---- Gap B-1: effect-table population ----
+
+    #[test]
+    fn effects_populated_after_check_program() {
+        // A program that allocates (cons) should have a
+        // non-PURE effect recorded for the cons App. The
+        // expander wraps the program in a Begin, so we walk
+        // through that to find the App.
+        let src = "(cons 1 2)";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+
+        // Find the App somewhere in the tree (walk through
+        // Begin/Letrec/etc.).
+        fn find_app(e: &CoreExpr) -> Option<&CoreExpr> {
+            match e {
+                CoreExpr::App { .. } => Some(e),
+                CoreExpr::Begin { exprs, .. } => exprs.iter().find_map(find_app),
+                CoreExpr::Letrec { body, .. } => find_app(body),
+                CoreExpr::If {
+                    cond, then, alt, ..
+                } => find_app(cond)
+                    .or_else(|| find_app(then))
+                    .or_else(|| find_app(alt)),
+                _ => None,
+            }
+        }
+        let app = find_app(&core).expect("expected an App in the tree");
+        let app_eff = checker.effect_for(app.span()).expect("app effect");
+        assert!(
+            app_eff.allocates || matches!(app_eff.escapes, crate::effect::EscapeKind::Unknown),
+            "expected (cons …) to allocate or be Unknown; got {app_eff}"
+        );
+
+        // Sub-expressions: the leaf constants must be PURE.
+        if let CoreExpr::App { args, .. } = app {
+            for arg in args {
+                let e = checker.effect_for(arg.span()).expect("arg effect");
+                assert_eq!(e, crate::effect::AllocEffect::PURE, "leaf should be PURE");
+            }
+        }
+    }
+
+    #[test]
+    fn effects_table_covers_nested_letrec() {
+        // Letrec with a mutually-recursive lambda — the
+        // effect for the binding RHS should flag may_cycle.
+        let src = "(letrec ((f (lambda () (f)))) (f))";
+        let (core, table, mut syms) = parse_extract_expand(src);
+        let mut checker = Checker::new(&table, &mut syms);
+        let _ = checker.check_program(&core);
+        // Root is the Letrec; its effect should flag may_cycle
+        // because `f` captures itself in its lambda body.
+        let root = checker.effect_for(core.span()).expect("root effect");
+        assert!(
+            root.may_cycle,
+            "letrec self-recursive lambda should flag may_cycle; got {root}"
         );
     }
 }

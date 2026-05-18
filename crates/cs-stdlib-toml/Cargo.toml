@@ -1,0 +1,13 @@
+[package]
+name = "cs-stdlib-toml"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab toml) — TOML read/write via the toml crate."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+toml = "0.8"

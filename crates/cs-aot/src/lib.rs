@@ -1393,6 +1393,27 @@ fn inst_rhs(
                 ),
             )
         }
+        // Layer 3 — Inst::ConsRegion. Emits a call to
+        // `vm_alloc_pair_region_gc` instead. The runtime helper
+        // resolves the current region via cs-runtime's resolver
+        // hook; falls back to Rc allocation if no region is in
+        // scope. The returned i64 nanbox carries the low-bit
+        // Region flag so VM-side decoders dispatch correctly.
+        (Inst::ConsRegion(dst, car_v, car_tag, cdr_v, cdr_tag), mode) => {
+            check(*car_v)?;
+            check(*cdr_v)?;
+            let (car_t, cdr_t) = match mode {
+                EmitMode::RawI64 => (*car_tag, *cdr_tag),
+                EmitMode::Nb => (15u8, 15u8),
+            };
+            (
+                *dst,
+                format!(
+                    "unsafe {{ cs_vm::vm::vm_alloc_pair_region_gc(v{}, {}u8, v{}, {}u8) }}",
+                    car_v.0, car_t, cdr_v.0, cdr_t
+                ),
+            )
+        }
         // RC3 iter 2.16 follow-up: vm_pair_car_gc / vm_pair_cdr_gc /
         // vm_length_gc CONSUME their input handle (linear ownership).
         // The demote pass aliases EnvLookupAny so multiple Scheme-
@@ -2523,7 +2544,10 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         | Inst::VecSet(v, _, _, _)
         | Inst::VecLength(v, _) => Some(*v),
         // RC2 iter N — pair primitives.
-        Inst::Cons(v, _, _, _, _) | Inst::Car(v, _) | Inst::Cdr(v, _) => Some(*v),
+        Inst::Cons(v, _, _, _, _)
+        | Inst::ConsRegion(v, _, _, _, _)
+        | Inst::Car(v, _)
+        | Inst::Cdr(v, _) => Some(*v),
         // RC3 iter 2.15 — list length.
         Inst::Length(v, _) => Some(*v),
         // RC3 iter 2.16 — arithmetic shift.

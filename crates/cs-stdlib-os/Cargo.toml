@@ -1,0 +1,19 @@
+[package]
+name = "cs-stdlib-os"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab os) — environment, process identity, platform info."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+
+# gethostname uses libc/Win32 calls that don't exist on
+# wasm32-wasip1 (the crate itself fails to compile for that
+# target). Gate to non-WASM; the WASM path falls back to the
+# HOSTNAME env var with "wasi" as default.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+gethostname = "0.5"

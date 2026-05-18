@@ -15,15 +15,129 @@ path = "src/main.rs"
 # A WASM build uses `--no-default-features`; an in-process Rust
 # embedder that wants custom builtins without dlopen uses
 # `--features ffi-trait` (e.g. for compile-into-WASM plugins).
-default = ["jit", "ffi-dynamic", "aot"]
+default = ["jit", "ffi-dynamic", "aot", "stdlib"]
 jit = ["cs-runtime/jit"]
 ffi-trait = ["cs-runtime/ffi-trait"]
 ffi-dynamic = ["cs-runtime/ffi-dynamic"]
+# (crab …) stdlib modules. See .spec-workflow/specs/stdlib-modules.
+# `stdlib` is the umbrella — turns on every shipped module. Per-module
+# flags compose so subset embeds work (`--no-default-features --features
+# stdlib-path,stdlib-fs` ships only those two crates and nothing else —
+# critical for WASM, which can't link tokio/rustls/zstd-sys). Each
+# per-module flag forwards only to the matching `cs-runtime/stdlib-X`
+# flag; `Runtime::register_stdlib` itself is always compiled (the body
+# is no-ops when no module is selected).
+stdlib = [
+    "cs-runtime/stdlib",
+    "stdlib-path",
+    "stdlib-fs",
+    "stdlib-os",
+    "stdlib-process",
+    "stdlib-string",
+    "stdlib-format",
+    "stdlib-regex",
+    "stdlib-time",
+    "stdlib-random",
+    "stdlib-uuid",
+    "stdlib-json",
+    "stdlib-csv",
+    "stdlib-toml",
+    "stdlib-base",
+    "stdlib-url",
+    "stdlib-hash",
+    "stdlib-compress",
+    "stdlib-deflate",
+    "stdlib-archive",
+    "stdlib-log",
+    "stdlib-metrics",
+    "stdlib-net",
+    "stdlib-http",
+    "stdlib-websocket",
+    "stdlib-collection",
+    "stdlib-math",
+    "stdlib-tty",
+    "stdlib-signal",
+    "stdlib-meta",
+]
+stdlib-path = ["cs-runtime/stdlib-path"]
+stdlib-fs = ["cs-runtime/stdlib-fs"]
+stdlib-os = ["cs-runtime/stdlib-os"]
+stdlib-process = ["cs-runtime/stdlib-process"]
+stdlib-string = ["cs-runtime/stdlib-string"]
+stdlib-format = ["cs-runtime/stdlib-format"]
+stdlib-regex = ["cs-runtime/stdlib-regex"]
+stdlib-time = ["cs-runtime/stdlib-time"]
+stdlib-random = ["cs-runtime/stdlib-random"]
+stdlib-uuid = ["cs-runtime/stdlib-uuid"]
+stdlib-json = ["cs-runtime/stdlib-json"]
+stdlib-csv = ["cs-runtime/stdlib-csv"]
+stdlib-toml = ["cs-runtime/stdlib-toml"]
+stdlib-base = ["cs-runtime/stdlib-base"]
+stdlib-url = ["cs-runtime/stdlib-url"]
+stdlib-hash = ["cs-runtime/stdlib-hash"]
+stdlib-compress = ["cs-runtime/stdlib-compress"]
+stdlib-deflate = ["cs-runtime/stdlib-deflate"]
+stdlib-archive = ["cs-runtime/stdlib-archive"]
+stdlib-log = ["cs-runtime/stdlib-log"]
+stdlib-metrics = ["cs-runtime/stdlib-metrics"]
+stdlib-net = ["cs-runtime/stdlib-net"]
+stdlib-http = ["cs-runtime/stdlib-http"]
+stdlib-websocket = ["cs-runtime/stdlib-websocket"]
+stdlib-collection = ["cs-runtime/stdlib-collection"]
+stdlib-math = ["cs-runtime/stdlib-math"]
+stdlib-tty = ["cs-runtime/stdlib-tty"]
+stdlib-signal = ["cs-runtime/stdlib-signal"]
+stdlib-meta = ["cs-runtime/stdlib-meta"]
+# WASM-safe subset — 21 modules that build clean for
+# `wasm32-wasip1`. Excludes: os/process (no Unix syscalls),
+# net/http/websocket (no real sockets in WASI), signal/tty
+# (Unix-only deps), compress (zstd-sys won't cross-compile
+# under nix-wrapped clang). gzip+deflate live in stdlib-deflate
+# so they ship on WASM. Use as:
+#   cargo build --target wasm32-wasip1 -p cs-cli \
+#     --no-default-features --features wasm-stdlib
+# See docs/milestones/stdlib-modules-exit.md for the rationale.
+wasm-stdlib = [
+    "stdlib-path",
+    "stdlib-fs",
+    "stdlib-string",
+    "stdlib-format",
+    "stdlib-regex",
+    "stdlib-time",
+    "stdlib-random",
+    "stdlib-uuid",
+    "stdlib-json",
+    "stdlib-csv",
+    "stdlib-toml",
+    "stdlib-base",
+    "stdlib-url",
+    "stdlib-hash",
+    "stdlib-compress",
+    "stdlib-deflate",
+    "stdlib-archive",
+    "stdlib-log",
+    "stdlib-metrics",
+    "stdlib-collection",
+    "stdlib-math",
+    "stdlib-os",
+    "stdlib-process",
+    "stdlib-signal",
+    "stdlib-tty",
+    "stdlib-meta",
+]
 # Backward-compat alias matching the W1 feature name.
 ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the
 # WASM build drops it (can't spawn cargo at WASI runtime).
 aot = ["dep:cs-aot", "dep:cs-vm", "dep:cs-rir", "dep:cs-parse", "dep:cs-expand", "dep:cs-typer"]
+# Layer-4 tracing cycle collector (tracing-revival spec).
+# Off by default; embedders and benchmarks that want to
+# exercise the layer-4 path enable it explicitly.
+tracing-cycle-collector = ["cs-runtime/tracing-cycle-collector"]
+# Convenience feature: turns on every memory-management
+# layer so benchmarks can exercise the full architecture.
+# `regions` is already default-on; this adds layer 4.
+all-memory-layers = ["tracing-cycle-collector"]
 
 [dependencies]
 cs-core = { workspace = true }

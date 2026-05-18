@@ -1,0 +1,12 @@
+[package]
+name = "cs-stdlib-log"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab log) — leveled stderr logging."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "cs-stdlib-math"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab math + crab math stats) — extras beyond R6RS arithmetic."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+# libm gives us erf/gamma/cbrt/hypot from the C math library
+# without pulling in num-traits' heavier surface.
+libm = "0.2"

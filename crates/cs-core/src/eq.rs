@@ -127,7 +127,7 @@ mod tests {
     fn equal_handles_self_cycle() {
         // Build (define x (cons 1 2)) ; (set-cdr! x x)
         let x = Pair::new(Value::fixnum(1), Value::fixnum(2));
-        *x.cdr.borrow_mut() = Value::Pair(x.clone());
+        x.set_cdr(Value::Pair(x.clone()));
         let v = Value::Pair(x);
         // equal? on the same cyclic value must terminate and return true.
         assert!(equal(&v, &v));
@@ -137,9 +137,9 @@ mod tests {
     fn equal_handles_distinct_cycles_same_shape() {
         // Two independently constructed self-cycles with the same car.
         let a = Pair::new(Value::fixnum(7), Value::fixnum(0));
-        *a.cdr.borrow_mut() = Value::Pair(a.clone());
+        a.set_cdr(Value::Pair(a.clone()));
         let b = Pair::new(Value::fixnum(7), Value::fixnum(0));
-        *b.cdr.borrow_mut() = Value::Pair(b.clone());
+        b.set_cdr(Value::Pair(b.clone()));
         let va = Value::Pair(a);
         let vb = Value::Pair(b);
         assert!(equal(&va, &vb));
@@ -156,7 +156,7 @@ mod write_cycle_tests {
     fn write_does_not_loop_on_self_cycle() {
         let syms = SymbolTable::new();
         let x = Pair::new(Value::fixnum(1), Value::fixnum(2));
-        *x.cdr.borrow_mut() = Value::Pair(x.clone());
+        x.set_cdr(Value::Pair(x.clone()));
         let v = Value::Pair(x);
         let s = v.format_with(&syms, WriteMode::Write);
         // Output should mention #<cycle>; just verify it terminates and is

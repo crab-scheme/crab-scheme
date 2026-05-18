@@ -58,9 +58,17 @@ done
 mkdir -p "$RESULTS_DIR"
 : > "$OUTPUT"  # truncate
 
-# Build crabscheme once.
-echo "==> building crabscheme (release + aot + jit)..." >&2
-(cd "$ROOT" && cargo build --release -p cs-cli --features "aot jit" --bin crabscheme \
+# Build crabscheme once. Default features include `aot` + `jit`
+# so the `vm-jit` tier in the matrix below has a JIT-enabled
+# binary to drive. Honors optional CS_FEATURES env (e.g.
+# CS_FEATURES=all-memory-layers to exercise layer-4 tracing
+# plumbing alongside the always-on regions feature).
+CS_FEATURE_SPEC="aot,jit"
+if [ -n "${CS_FEATURES:-}" ]; then
+  CS_FEATURE_SPEC="$CS_FEATURE_SPEC,$CS_FEATURES"
+fi
+echo "==> building crabscheme (release, features '$CS_FEATURE_SPEC')..." >&2
+(cd "$ROOT" && cargo build --release -p cs-cli --features "$CS_FEATURE_SPEC" --bin crabscheme \
    2>&1 | tail -3) >&2
 CS_BIN="$ROOT/target/release/crabscheme"
 if [ ! -x "$CS_BIN" ]; then
@@ -74,7 +82,7 @@ fi
 declare -a ENGINES=(
   "crabscheme:walker"   # tree-walker tier
   "crabscheme:vm"       # bytecode VM tier
-  "crabscheme:vm-jit"   # Cranelift JIT (requires --features jit at build)
+  "crabscheme:vm-jit"   # bytecode VM + Cranelift JIT tier-up (requires `jit` feature at build)
 )
 # AOT tier is more involved (each bench needs --multi build + run);
 # wire when Tier-2 benches need AOT comparison.
@@ -113,6 +121,11 @@ run_one() {
   tmpfile=$(mktemp -t "rw-$bench-$tier-XXXXXX.scm")
   cat "$HARNESS" "$bench_file" > "$tmpfile"
   # Set env vars so the harness picks up the right config.
+  # Capture the bench's real exit code without letting `set -e` kill
+  # the runner. `|| rc=$?` preserves the non-zero status while
+  # absorbing the failure; the previous `|| true` collapsed the
+  # exit code into 0, silently dropping the error JSON below.
+  local rc=0
   REALWORLD_ENGINE="$engine" \
   REALWORLD_ENGINE_TIER="$tier" \
   REALWORLD_ENGINE_VERSION="$CS_VERSION" \
@@ -121,8 +134,7 @@ run_one() {
   REALWORLD_TIME_BUDGET_SEC="$BUDGET" \
     "$CS_BIN" --tier "$tier" run "$tmpfile" \
       2> "$tmpfile.stderr" \
-      || true  # never let set -e kill the loop on a failing bench
-  local rc=${PIPESTATUS[0]:-$?}
+      || rc=$?
   if [ $rc -ne 0 ]; then
     # Emit a failure record so render.py can show "fail" cells
     # instead of dropping rows silently.

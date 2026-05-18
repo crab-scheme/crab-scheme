@@ -1,0 +1,14 @@
+[package]
+name = "cs-stdlib-url"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab url) — URL parse / build / encode / decode."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+url = "2"
+percent-encoding = "2"

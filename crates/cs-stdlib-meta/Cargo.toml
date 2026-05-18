@@ -1,0 +1,76 @@
+[package]
+name = "cs-stdlib-meta"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib meta module (crab) — introspect which (crab …) modules are compiled in."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+
+# Optional deps — one per sibling stdlib module. The meta module's
+# `crab-list-modules` enumerates whichever ones are enabled at
+# compile time. cs-runtime's `stdlib-<name>` feature pulls each
+# module in alongside its corresponding `meta-<name>` flag here so
+# the meta procedures stay in sync with what's registered.
+cs-stdlib-path = { workspace = true, optional = true }
+cs-stdlib-fs = { workspace = true, optional = true }
+cs-stdlib-os = { workspace = true, optional = true }
+cs-stdlib-process = { workspace = true, optional = true }
+cs-stdlib-string = { workspace = true, optional = true }
+cs-stdlib-format = { workspace = true, optional = true }
+cs-stdlib-regex = { workspace = true, optional = true }
+cs-stdlib-time = { workspace = true, optional = true }
+cs-stdlib-random = { workspace = true, optional = true }
+cs-stdlib-uuid = { workspace = true, optional = true }
+cs-stdlib-json = { workspace = true, optional = true }
+cs-stdlib-csv = { workspace = true, optional = true }
+cs-stdlib-toml = { workspace = true, optional = true }
+cs-stdlib-base = { workspace = true, optional = true }
+cs-stdlib-url = { workspace = true, optional = true }
+cs-stdlib-hash = { workspace = true, optional = true }
+cs-stdlib-compress = { workspace = true, optional = true }
+cs-stdlib-deflate = { workspace = true, optional = true }
+cs-stdlib-archive = { workspace = true, optional = true }
+cs-stdlib-log = { workspace = true, optional = true }
+cs-stdlib-metrics = { workspace = true, optional = true }
+cs-stdlib-net = { workspace = true, optional = true }
+cs-stdlib-http = { workspace = true, optional = true }
+cs-stdlib-websocket = { workspace = true, optional = true }
+cs-stdlib-collection = { workspace = true, optional = true }
+cs-stdlib-math = { workspace = true, optional = true }
+cs-stdlib-tty = { workspace = true, optional = true }
+cs-stdlib-signal = { workspace = true, optional = true }
+
+[features]
+meta-path = ["dep:cs-stdlib-path"]
+meta-fs = ["dep:cs-stdlib-fs"]
+meta-os = ["dep:cs-stdlib-os"]
+meta-process = ["dep:cs-stdlib-process"]
+meta-string = ["dep:cs-stdlib-string"]
+meta-format = ["dep:cs-stdlib-format"]
+meta-regex = ["dep:cs-stdlib-regex"]
+meta-time = ["dep:cs-stdlib-time"]
+meta-random = ["dep:cs-stdlib-random"]
+meta-uuid = ["dep:cs-stdlib-uuid"]
+meta-json = ["dep:cs-stdlib-json"]
+meta-csv = ["dep:cs-stdlib-csv"]
+meta-toml = ["dep:cs-stdlib-toml"]
+meta-base = ["dep:cs-stdlib-base"]
+meta-url = ["dep:cs-stdlib-url"]
+meta-hash = ["dep:cs-stdlib-hash"]
+meta-compress = ["dep:cs-stdlib-compress"]
+meta-deflate = ["dep:cs-stdlib-deflate"]
+meta-archive = ["dep:cs-stdlib-archive"]
+meta-log = ["dep:cs-stdlib-log"]
+meta-metrics = ["dep:cs-stdlib-metrics"]
+meta-net = ["dep:cs-stdlib-net"]
+meta-http = ["dep:cs-stdlib-http"]
+meta-websocket = ["dep:cs-stdlib-websocket"]
+meta-collection = ["dep:cs-stdlib-collection"]
+meta-math = ["dep:cs-stdlib-math"]
+meta-tty = ["dep:cs-stdlib-tty"]
+meta-signal = ["dep:cs-stdlib-signal"]

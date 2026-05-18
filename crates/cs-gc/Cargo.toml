@@ -5,4 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "CrabScheme precise tracing garbage collector"
+description = "CrabScheme heap-pointer crate — Rc-backed Gc<T> + cycle detector"
+
+[features]
+# Layer 2 (the Rc-backed Gc<T> + synchronous cycle detector) is
+# unconditional after countable-memory iter 12b — see ADR 0014. The
+# remaining feature flags toggle the *optional* layers of the unified
+# memory architecture (ADR 0015).
+default = ["regions"]
+# Layer 3 (ADR 0016): `cs_gc::Region` bump arena. Default-on since
+# region-memory iter 6.
+regions = ["dep:bumpalo"]
+# Layer 4 (ADR 0018): `cs_gc::cycle_registry` candidate-based
+# tracing sweep that complements the layer-2 synchronous detector
+# by reclaiming residual cycles. Off by default; opt in for
+# embedders that want it.
+tracing-cycle-collector = []
+
+[dependencies]
+bumpalo = { workspace = true, optional = true }
