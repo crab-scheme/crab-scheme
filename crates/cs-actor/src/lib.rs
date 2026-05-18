@@ -387,6 +387,30 @@ impl ActorSystem {
         ActorRef { pid, inbox: tx }
     }
 
+    /// Spawn an actor whose body is a sync closure, but run that
+    /// closure as a tokio task (not via `spawn_blocking`).
+    /// Internally wraps the body in `block_in_place` so synchronous
+    /// blocking calls (like the bytecode interpreter's
+    /// `actor.receive()`) work correctly without parking the
+    /// underlying tokio worker thread permanently.
+    ///
+    /// This is the bridge between the existing sync-body world and
+    /// the async-task scheduler. Callers that already have an
+    /// async body should use [`spawn_async`] directly.
+    ///
+    /// Embedders without tokio-specific knowledge call this from
+    /// cs-runtime — no `tokio::*` types appear in their code.
+    pub fn spawn_sync_body_on_task<F>(&self, body: F) -> ActorRef
+    where
+        F: FnOnce(&mut Actor) + Send + 'static,
+    {
+        self.spawn_async(move |mut actor| async move {
+            tokio::task::block_in_place(move || {
+                body(&mut actor);
+            });
+        })
+    }
+
     /// Async-body counterpart of [`spawn`] (parallel-runtime spec
     /// C1.1). `body` is an async closure that takes an owned
     /// `Actor` and returns a `Future`; the future runs as a tokio

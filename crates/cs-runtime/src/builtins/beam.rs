@@ -304,15 +304,23 @@ pub fn primop_spawn(name: &str, args: Vec<SendableValue>) -> Result<ActorPid, St
         .procs
         .lookup(name)
         .ok_or_else(|| format!("spawn: no procedure registered under {:?}", name))?;
-    let actor_ref = st.actors.spawn(move |actor| {
+    // parallel-runtime C1.2: use spawn_sync_body_on_task so the
+    // actor runs as a tokio task (not a parked OS thread via
+    // spawn_blocking). The body inside is still synchronous
+    // bytecode interpretation; cs-actor wraps it in
+    // `block_in_place` so the worker thread stays available to
+    // the runtime. Until C2 wires the yield hook into the
+    // dispatch loop, an actor that blocks on receive still
+    // ties up one worker — so the 4096-task practical ceiling
+    // isn't fully collapsed yet. Moving to the task scheduler
+    // now means C2 can drop in without touching this site.
+    let actor_ref = st.actors.spawn_sync_body_on_task(move |actor| {
         // Hold a raw pointer to `actor` for the duration of the
-        // body so the (self) / (raw-receive) Scheme builtins can
-        // reach it via ACTOR_CTX. Safety: the pointer lives only
-        // on this blocking thread, and the Guard clears it before
-        // the closure returns (or unwinds), so a thread-pool
-        // worker reused for a later actor never sees a stale ptr.
-        // The Guard also zeros REDUCTIONS so a reused worker
-        // doesn't inherit the prior actor's count.
+        // body so the (self) / (raw-receive) Scheme builtins
+        // can reach it via ACTOR_CTX. Safety: the pointer lives
+        // only on the worker thread for the block_in_place
+        // duration (managed inside spawn_sync_body_on_task);
+        // the Guard clears it before the closure returns.
         let ptr: *mut cs_actor::Actor = actor;
         ACTOR_CTX.with(|c| c.set(ptr));
         REDUCTIONS.with(|c| c.set(0));
