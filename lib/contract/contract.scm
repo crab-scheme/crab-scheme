@@ -210,6 +210,33 @@
                  (((car ps) (car xs)) (loop (cdr ps) (cdr xs)))
                  (else #f))))))))
 
+; (list-of/c pred) — accepts a proper list (of any length) where
+; EVERY element satisfies pred. The variadic-element counterpart
+; to list/c, used by the cs-typer contract lowering for
+; `(Listof T)` types.
+(define (list-of/c pred)
+  (lambda (v)
+    (and (list? v)
+         (let loop ((xs v))
+           (cond
+             ((null? xs) #t)
+             ((pred (car xs)) (loop (cdr xs)))
+             (else #f))))))
+
+; (vector-of/c pred) — accepts a vector (of any length) where
+; EVERY element satisfies pred. Counterpart to list-of/c for
+; vectors; used by the cs-typer contract lowering for
+; `(Vectorof T)` types.
+(define (vector-of/c pred)
+  (lambda (v)
+    (and (vector? v)
+         (let ((n (vector-length v)))
+           (let loop ((i 0))
+             (cond
+               ((= i n) #t)
+               ((pred (vector-ref v i)) (loop (+ i 1)))
+               (else #f)))))))
+
 ; ============================================================
 ; Phase 2B.6 — define/contract and provide/contract
 ;
