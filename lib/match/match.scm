@@ -1,40 +1,32 @@
 ; (match SUBJECT clause ...) — Racket-style pattern matching.
-; First-priority deliverable from docs/research/r6rs_extensions_spec.md
-; §1. Implemented as a library on top of `syntax-rules`; no
-; expander or VM changes.
+; Spec: docs/research/r6rs_extensions_spec.md §1.
+; Implemented as a library on top of `syntax-rules`; no expander
+; or VM changes beyond the cs-expand fixes for #111 + #112.
 ;
 ; A clause is one of:
 ;   (PATTERN BODY)
 ;   (PATTERN (when GUARD) BODY)
 ;
-; Supported pattern forms (v1):
-;   _                       wildcard, conventional unused binding
+; Supported pattern forms:
+;   _                       wildcard
 ;   identifier              binds the subject to identifier
 ;   'datum                  literal compared via equal?
 ;   (quote datum)           same
 ;   ()                      empty list (null?)
-;   (cons P1 P2)            pair pattern (car matches P1, cdr P2)
-;   (list)                  empty list (same as ())
-;   (list P)                1-element list
-;   (list P P)              2-element list
-;   ... up to (list P P P P P P P P) (8 elements)
+;   (P1 . P2)               pair pattern (car matches P1, cdr P2)
+;   (P1 P2 ... Pn)          list pattern (sugar for nested pair)
+;   (cons P1 P2)            explicit pair-pattern (Racket-style)
+;   (list P ...)            explicit list pattern (Racket-style)
 ;   (? PRED)                predicate test, no binding
 ;   (? PRED NAME)           predicate test, binds NAME on success
 ;   (vector P1 ... Pn)      vector of exact length n
 ;
-; v1 deviations from Racket and tracked follow-ups:
-;
-;   - Bare numeric / string / boolean / character literals
-;     require explicit quoting today. cs-expand's syntax-rules
-;     can't dispatch on atom shape; fix needs syntax-case.
-;   - Dotted-pair patterns `(a . b)` and bare list patterns
-;     `(a b c)` aren't supported because cs-expand's syntax-rules
-;     doesn't accept dotted-pair patterns in macro templates.
-;     Use `(cons a b)` and `(list a b c)` instead. Spec
-;     follow-up: extend cs-expand syntax-rules to handle dotted
-;     pair patterns, then add the bare forms back.
-;   - Ellipsis patterns `(p ...)` and quasi-quote patterns
-;     deferred to a follow-up iter (need syntax-case).
+; Deferred:
+;   - bare numeric / string / boolean / character literals
+;     (require explicit quoting today)
+;   - ellipsis patterns (P ...) inside list / vector
+;   - quasi-quote patterns
+;   - record patterns (depend on the record-shorthand from §8)
 
 (define-syntax match
   (syntax-rules ()
@@ -55,13 +47,10 @@
                     body
                     (match-clauses subj rest ...)))))
 
-; The pair / list / vector patterns are spelled with explicit
-; head keywords (cons / list / vector) so the syntax-rules
-; engine can dispatch on shape without needing dotted-pair
-; pattern support.
-
 (define-syntax match-pattern
-  (syntax-rules (? quote cons list vector)
+  (syntax-rules (_ ? quote cons list vector)
+    ((_ subj _ success fail) success)
+
     ((_ subj 'lit success fail)
      (if (equal? subj 'lit) success fail))
 
@@ -79,54 +68,32 @@
     ((_ subj (? pred) success fail)
      (if (pred subj) success fail))
 
+    ((_ subj (vector p ...) success fail)
+     (if (and (vector? subj)
+              (= (vector-length subj) (match-pattern-vector-length p ...)))
+         (match-vector-elems subj 0 (p ...) success fail)
+         fail))
+
+    ; Racket-style explicit (cons p1 p2). Kept as an alias for
+    ; (p1 . p2) so existing code keeps working.
     ((_ subj (cons car-pat cdr-pat) success fail)
+     (match-pattern subj (car-pat . cdr-pat) success fail))
+
+    ; Racket-style explicit (list p ...). Walked as the equivalent
+    ; nested-pair pattern via the dotted-tail form.
+    ((_ subj (list) success fail)
+     (match-pattern subj () success fail))
+    ((_ subj (list p rest ...) success fail)
+     (match-pattern subj (p . (list rest ...)) success fail))
+
+    ; Native dotted pair pattern — now supported by cs-expand.
+    ((_ subj (car-pat . cdr-pat) success fail)
      (if (pair? subj)
          (let ((car-v (car subj))
                (cdr-v (cdr subj)))
            (match-pattern car-v car-pat
                           (match-pattern cdr-v cdr-pat success fail)
                           fail))
-         fail))
-
-    ((_ subj (list) success fail)
-     (if (null? subj) success fail))
-
-    ((_ subj (list p1) success fail)
-     (match-pattern subj (cons p1 ()) success fail))
-
-    ((_ subj (list p1 p2) success fail)
-     (match-pattern subj (cons p1 (cons p2 ())) success fail))
-
-    ((_ subj (list p1 p2 p3) success fail)
-     (match-pattern subj (cons p1 (cons p2 (cons p3 ()))) success fail))
-
-    ((_ subj (list p1 p2 p3 p4) success fail)
-     (match-pattern subj (cons p1 (cons p2 (cons p3 (cons p4 ())))) success fail))
-
-    ((_ subj (list p1 p2 p3 p4 p5) success fail)
-     (match-pattern subj
-                    (cons p1 (cons p2 (cons p3 (cons p4 (cons p5 ())))))
-                    success fail))
-
-    ((_ subj (list p1 p2 p3 p4 p5 p6) success fail)
-     (match-pattern subj
-                    (cons p1 (cons p2 (cons p3 (cons p4 (cons p5 (cons p6 ()))))))
-                    success fail))
-
-    ((_ subj (list p1 p2 p3 p4 p5 p6 p7) success fail)
-     (match-pattern subj
-                    (cons p1 (cons p2 (cons p3 (cons p4 (cons p5 (cons p6 (cons p7 ())))))))
-                    success fail))
-
-    ((_ subj (list p1 p2 p3 p4 p5 p6 p7 p8) success fail)
-     (match-pattern subj
-                    (cons p1 (cons p2 (cons p3 (cons p4 (cons p5 (cons p6 (cons p7 (cons p8 ()))))))))
-                    success fail))
-
-    ((_ subj (vector p ...) success fail)
-     (if (and (vector? subj)
-              (= (vector-length subj) (match-pattern-vector-length p ...)))
-         (match-vector-elems subj 0 (p ...) success fail)
          fail))
 
     ((_ subj var success fail)

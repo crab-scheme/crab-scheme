@@ -4661,6 +4661,25 @@ fn match_list_pattern(
     is_outer: bool,
     bindings: &mut std::collections::HashMap<cs_core::Symbol, MatchBinding>,
 ) -> bool {
+    // Detect dotted patterns: (p1 p2 . tail-pat) matches a list of
+    // any length ≥ #spine, binding tail-pat to the remainder.
+    // Ellipsis-in-spine + dotted-tail combinations are not supported
+    // here; either-or, not both. The ellipsis branch below stays on
+    // the proper-list code path.
+    if let Some((pspine, ptail)) = collect_pair_chain(pattern) {
+        if !matches!(ptail, Datum::Null(_)) {
+            return match_dotted_list_pattern(
+                &pspine,
+                &ptail,
+                input,
+                literals,
+                ellipsis_sym,
+                underscore_sym,
+                is_outer,
+                bindings,
+            );
+        }
+    }
     let pattern_items = match collect_proper_list_strict(pattern) {
         Some(v) => v,
         None => return false,
@@ -4773,6 +4792,57 @@ fn match_list_pattern(
     true
 }
 
+/// Match `(p1 p2 ... pn . tail-pat)` against an input list.
+///
+/// Semantics: spine elements match positionally; the tail
+/// pattern binds the remainder of the input (which may itself be
+/// a list or any atom).
+fn match_dotted_list_pattern(
+    pspine: &[Datum],
+    ptail: &Datum,
+    input: &Datum,
+    literals: &[cs_core::Symbol],
+    ellipsis_sym: cs_core::Symbol,
+    underscore_sym: cs_core::Symbol,
+    is_outer: bool,
+    bindings: &mut std::collections::HashMap<cs_core::Symbol, MatchBinding>,
+) -> bool {
+    let (ispine, itail) = match collect_pair_chain(input) {
+        Some(p) => p,
+        None => return false,
+    };
+    if ispine.len() < pspine.len() {
+        return false;
+    }
+    // Spine match.
+    for (i, (p, inp)) in pspine.iter().zip(ispine.iter()).enumerate() {
+        let outer = is_outer && i == 0;
+        if !match_pattern(
+            p,
+            inp,
+            literals,
+            ellipsis_sym,
+            underscore_sym,
+            outer,
+            bindings,
+        ) {
+            return false;
+        }
+    }
+    // Tail: bundle the remaining input spine + input tail back into
+    // a single Datum and recurse on the tail pattern.
+    let remaining = rebuild_list_with_tail(ispine[pspine.len()..].to_vec(), itail, ptail.span());
+    match_pattern(
+        ptail,
+        &remaining,
+        literals,
+        ellipsis_sym,
+        underscore_sym,
+        false,
+        bindings,
+    )
+}
+
 fn collect_pattern_vars(
     pattern: &Datum,
     literals: &[cs_core::Symbol],
@@ -4801,9 +4871,12 @@ fn collect_pattern_vars_into(
             }
         }
         Datum::Pair(_, _, _) => {
-            if let Some(items) = collect_proper_list_strict(pattern) {
-                for it in items {
+            if let Some((spine, tail)) = collect_pair_chain(pattern) {
+                for it in spine {
                     collect_pattern_vars_into(&it, literals, ellipsis_sym, underscore_sym, out);
+                }
+                if !matches!(tail, Datum::Null(_)) {
+                    collect_pattern_vars_into(&tail, literals, ellipsis_sym, underscore_sym, out);
                 }
             }
         }
@@ -4867,11 +4940,16 @@ fn instantiate(
             }
         }
         Datum::Pair(_, _, span) => {
-            let items = collect_proper_list_strict(template).ok_or(ExpandError::BadSyntax {
-                what: "template must be proper list".into(),
-                span: *span,
-            })?;
-            // Process items, expanding ellipses.
+            // Templates may be proper OR dotted: support both. The
+            // ellipsis expansion logic operates over the spine; a
+            // non-Null tail is instantiated separately and reattached
+            // via rebuild_list_with_tail.
+            let (items, tail_template) =
+                collect_pair_chain(template).ok_or_else(|| ExpandError::BadSyntax {
+                    what: "template must be a pair".into(),
+                    span: *span,
+                })?;
+            // Process spine, expanding ellipses.
             let mut out: Vec<Datum> = Vec::new();
             let mut i = 0;
             while i < items.len() {
@@ -4920,7 +4998,11 @@ fn instantiate(
                     i += 1;
                 }
             }
-            Ok(rebuild_list(out, *span))
+            let tail = match &tail_template {
+                Datum::Null(_) => tail_template,
+                other => instantiate(other, bindings, ellipsis_sym, _gensym_counter, syms)?,
+            };
+            Ok(rebuild_list_with_tail(out, tail, *span))
         }
         _ => Ok(template.clone()),
     }
@@ -4983,6 +5065,41 @@ fn collect_proper_list_strict(d: &Datum) -> Option<Vec<Datum>> {
             _ => return None,
         }
     }
+}
+
+/// Walks a Pair chain returning the spine of car-elements and the
+/// cdr of the last pair. For a proper list `(a b c)` the tail is
+/// `Datum::Null`. For an improper list `(a b . c)` the tail is the
+/// atom `c`. Returns None if `d` is not a Pair at all.
+fn collect_pair_chain(d: &Datum) -> Option<(Vec<Datum>, Datum)> {
+    let mut out = Vec::new();
+    let mut cur = d.clone();
+    loop {
+        match cur {
+            Datum::Pair(car, cdr, _) => {
+                out.push((*car).clone());
+                cur = (*cdr).clone();
+            }
+            other => {
+                if out.is_empty() {
+                    return None;
+                }
+                return Some((out, other));
+            }
+        }
+    }
+}
+
+/// Rebuild a list from a spine + optional dotted tail. With
+/// `tail = Datum::Null(_)` this produces a proper list; with any
+/// other tail it produces a dotted-pair chain ending in `tail`.
+fn rebuild_list_with_tail(items: Vec<Datum>, tail: Datum, _span: Span) -> Datum {
+    let mut acc = tail;
+    for item in items.into_iter().rev() {
+        let s = item.span().merge(acc.span());
+        acc = Datum::Pair(Rc::new(item), Rc::new(acc), s);
+    }
+    acc
 }
 
 /// Returns `(head, tail_items)` if `d` is a proper list of length ≥ 1.

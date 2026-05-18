@@ -30,6 +30,64 @@ fn wildcard_matches_anything() {
 }
 
 #[test]
+fn syntax_rules_dotted_pair_pattern() {
+    // Regression for #111 (pattern side): cs-expand's syntax-rules
+    // now accepts dotted-pair patterns `(x . y)`. The pattern walks
+    // via collect_pair_chain instead of bailing on
+    // collect_proper_list_strict.
+    //
+    // Note: the macros emit `(quote ...)` to keep the test focused
+    // on expansion correctness rather than on what evaluating an
+    // unquoted list does.
+    let mut rt = Runtime::new();
+    let v = rt
+        .eval_str(
+            "<t>",
+            r#"
+        (define-syntax car-of
+          (syntax-rules ()
+            ((_ (x . y)) (quote x))))
+        (define-syntax tail-of
+          (syntax-rules ()
+            ((_ (x . y)) (quote y))))
+        (list (car-of  (1 2 3))
+              (tail-of (1 2 3)))
+    "#,
+        )
+        .expect("dotted pattern should match proper lists");
+    assert_eq!(
+        rt.format_value(&v, cs_core::WriteMode::Display),
+        "(1 (2 3))"
+    );
+}
+
+#[test]
+fn syntax_rules_dotted_template() {
+    // Regression for #111 (template side): templates can now
+    // contain dotted-pair forms, e.g. (quote a . b) — though this
+    // particular shape is unusual because the dotted tail must
+    // itself be a quoted list. Use a simpler form: a template
+    // that produces a dotted pair via a pattern variable in the
+    // tail position.
+    let mut rt = Runtime::new();
+    let v = rt
+        .eval_str(
+            "<t>",
+            r#"
+        (define-syntax dotted-quote
+          (syntax-rules ()
+            ((_ a b) '(a . b))))
+        (dotted-quote head tail)
+    "#,
+        )
+        .expect("dotted template should instantiate");
+    assert_eq!(
+        rt.format_value(&v, cs_core::WriteMode::Display),
+        "(head . tail)"
+    );
+}
+
+#[test]
 fn syntax_rules_underscore_in_literals_is_literal_not_wildcard() {
     // Regression for #112: previously, `_` was always a wildcard
     // in match-pattern, even when listed as a syntax-rules
@@ -116,10 +174,42 @@ fn predicate_with_binding() {
 #[test]
 fn pair_pattern_destructures() {
     let mut rt = load_match();
+    // Both the Racket-style (cons …) and the native (a . b) forms
+    // work — the former is sugar for the latter.
     let v = rt
         .eval_str("<t>", "(match '(1 . 2) ((cons a b) (+ a b)))")
         .unwrap();
     assert_eq!(disp(&rt, &v), "3");
+
+    let v = rt
+        .eval_str("<t>", "(match '(1 . 2) ((a . b) (+ a b)))")
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "3");
+}
+
+#[test]
+fn bare_list_pattern_native_form() {
+    // With the #111 fix, bare (a b c) list patterns work directly
+    // (no need for (list a b c) wrapping).
+    let mut rt = load_match();
+    let v = rt
+        .eval_str("<t>", "(match '(1 2 3) ((a b c) (+ a b c)))")
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "6");
+}
+
+#[test]
+fn bare_list_pattern_with_dotted_tail() {
+    // Native (head . rest) form binds rest to the remainder.
+    let mut rt = load_match();
+    let v = rt
+        .eval_str(
+            "<t>",
+            "(match '(1 2 3 4)
+               ((head . rest) (cons head (length rest))))",
+        )
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "(1 . 3)");
 }
 
 #[test]
