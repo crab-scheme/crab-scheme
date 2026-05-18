@@ -381,6 +381,65 @@ impl WeakValue {
     }
 }
 
+// ---- parallel-runtime spec C4.2: CycleChildren impls ----
+//
+// These are used by the Bacon-Rajan trial-deletion walk to
+// enumerate direct heap-cell children for refcount adjustment.
+// Distinct from CycleVisit, which dedups via a visitor and
+// includes leaves. CycleChildren emits only heap addresses
+// (Pair / Vector / Hashtable / Promise / Procedure /
+// String / ByteVector / Port) — exactly what BR's mark_gray
+// and scan_gray phases need to decrement/restore.
+//
+// Architecture: impls forward through `Value::cycle_children`
+// which emits the heap_addr if any. Vector's storage
+// (`RefCell<Vec<Value>>`) rides cs-gc's blanket impls for
+// `RefCell<T: CycleChildren>` + `Vec<T: CycleChildren>` so
+// there's no orphan-rule clash here.
+
+#[cfg(feature = "tracing-cycle-collector")]
+impl cs_gc::cycle_registry::CycleChildren for Value {
+    fn cycle_children(&self, visit: &mut dyn FnMut(usize)) {
+        if let Some(a) = self.heap_addr() {
+            visit(a);
+        }
+    }
+}
+
+#[cfg(feature = "tracing-cycle-collector")]
+impl cs_gc::cycle_registry::CycleChildren for Pair {
+    fn cycle_children(&self, visit: &mut dyn FnMut(usize)) {
+        // Read through the accessors so a previous
+        // break_*_cycle's tombstoned weak still surfaces the
+        // cyclic edge for BR's walk — matches CycleVisit.
+        self.car().cycle_children(visit);
+        self.cdr().cycle_children(visit);
+    }
+}
+
+#[cfg(feature = "tracing-cycle-collector")]
+impl cs_gc::cycle_registry::CycleChildren for Hashtable {
+    fn cycle_children(&self, visit: &mut dyn FnMut(usize)) {
+        for (k, v) in self.items.borrow().iter() {
+            k.cycle_children(visit);
+            v.cycle_children(visit);
+        }
+        if let Some(c) = &self.custom {
+            c.hash.cycle_children(visit);
+            c.equiv.cycle_children(visit);
+        }
+    }
+}
+
+#[cfg(feature = "tracing-cycle-collector")]
+impl cs_gc::cycle_registry::CycleChildren for Promise {
+    fn cycle_children(&self, visit: &mut dyn FnMut(usize)) {
+        match &*self.state.borrow() {
+            PromiseState::Pending(v) | PromiseState::Forced(v) => v.cycle_children(visit),
+        }
+    }
+}
+
 impl cs_gc::cycle::CycleVisit for Pair {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         // Walk via the accessors so the detector observes the
@@ -838,6 +897,38 @@ impl Value {
 
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
+    }
+
+    /// Allocation address for this Value's underlying heap
+    /// allocation, if any. Returns `None` for leaf values
+    /// (no allocation, no address).
+    ///
+    /// Used by the parallel-runtime C4.2 `CycleChildren` walk
+    /// to enumerate child container addresses for Bacon-Rajan
+    /// trial deletion. Mirrors the receiver shape of
+    /// [`heap_strong_count`].
+    #[cfg(feature = "tracing-cycle-collector")]
+    pub fn heap_addr(&self) -> Option<usize> {
+        match self {
+            Value::String(g) => Some(cs_gc::Gc::as_addr(g)),
+            Value::Pair(g) => Some(cs_gc::Gc::as_addr(g)),
+            Value::Vector(g) => Some(cs_gc::Gc::as_addr(g)),
+            Value::ByteVector(g) => Some(cs_gc::Gc::as_addr(g)),
+            Value::Hashtable(g) => Some(cs_gc::Gc::as_addr(g)),
+            Value::Port(g) => Some(cs_gc::Gc::as_addr(g)),
+            Value::Promise(g) => Some(cs_gc::Gc::as_addr(g)),
+            // Procedure is std::rc::Rc, not cs_gc::Gc — exposes
+            // its addr via Rc::as_ptr cast.
+            Value::Procedure(rc) => Some(std::rc::Rc::as_ptr(rc) as *const () as usize),
+            Value::Null
+            | Value::Unspecified
+            | Value::Eof
+            | Value::Boolean(_)
+            | Value::Character(_)
+            | Value::Symbol(_)
+            | Value::Identifier { .. }
+            | Value::Number(_) => None,
+        }
     }
 
     /// Total strong-reference count for this Value's underlying

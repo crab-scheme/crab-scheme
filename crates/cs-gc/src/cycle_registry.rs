@@ -94,6 +94,61 @@ impl Color {
     }
 }
 
+// ---- parallel-runtime spec C4.2: CycleChildren trait ----
+
+/// Enumerate the direct heap-cell children of `self` by
+/// allocation address, for the Bacon-Rajan trial-deletion
+/// walk (C4.3).
+///
+/// Distinct from [`crate::cycle::CycleVisit`] in two ways:
+///
+/// 1. **Scope.** `CycleVisit` is for cycle *detection* and
+///    walks via a stateful [`CycleVisitor`] that dedups
+///    visited nodes. `CycleChildren` is for the BR trial-
+///    deletion walk which needs raw child addresses so it
+///    can transition colors and adjust refcounts in the
+///    side-table registry.
+/// 2. **Granularity.** `CycleVisit` descends *through* leaf
+///    values (numbers, symbols) without visiting them.
+///    `CycleChildren` emits only addresses of heap-allocated
+///    container slots that could themselves be cycle
+///    candidates (Pair, Vector, Hashtable, Promise,
+///    Procedure). Leaves yield no addresses.
+///
+/// The visitor is `&mut dyn FnMut(usize)` rather than a
+/// concrete type so the BR walker can carry whatever state
+/// it wants (worklist, refcount delta map) on the heap-free
+/// closure path.
+pub trait CycleChildren {
+    /// Call `visit(addr)` for each direct heap-container
+    /// child of `self`. Implementations should walk every
+    /// reachable Pair/Vector/Hashtable/Promise/Procedure
+    /// slot and emit its `Gc::as_addr` once. Leaves
+    /// (numbers, symbols, strings) are skipped.
+    fn cycle_children(&self, visit: &mut dyn FnMut(usize));
+}
+
+// Blanket impls that let cs-core's `Vec<Value>` /
+// `RefCell<Vec<Value>>` storage participate without
+// running into orphan-rule violations: those wrappers are
+// not local to cs-core, but the trait lives here in cs-gc,
+// so we can hang the forwarding impls off the trait's home
+// crate.
+
+impl<T: CycleChildren + ?Sized> CycleChildren for std::cell::RefCell<T> {
+    fn cycle_children(&self, visit: &mut dyn FnMut(usize)) {
+        self.borrow().cycle_children(visit);
+    }
+}
+
+impl<T: CycleChildren> CycleChildren for Vec<T> {
+    fn cycle_children(&self, visit: &mut dyn FnMut(usize)) {
+        for item in self {
+            item.cycle_children(visit);
+        }
+    }
+}
+
 /// Per-candidate registry entry: the existing `AnyWeak` handle
 /// plus a Bacon-Rajan color (C4.1).
 ///
