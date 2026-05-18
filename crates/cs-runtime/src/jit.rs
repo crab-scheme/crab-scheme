@@ -62,14 +62,40 @@ impl Runtime {
     }
 }
 
+/// Thread-local poison flag — set when any prior JIT compile on
+/// this thread panicked. Once set, `jit_tier_up_hook` returns
+/// early without touching the Lowerer. Rationale: a Cranelift
+/// panic indicates our lowering produced IR that violates
+/// Cranelift's invariants. Empirical (maze): the workload that
+/// triggers the panic ALSO has functions whose uniform-NB
+/// translation compiles "cleanly" but produces wrong native code
+/// (negative vector indices) — those don't panic at compile time
+/// but corrupt runtime state. The safest containment after seeing
+/// a panic is to stop attempting JIT compilation on this thread
+/// for the rest of the process. Functions stay on the bytecode VM
+/// (which is correct by construction).
+///
+/// Set never reset within a process: a panic indicates a JIT bug
+/// that won't be fixed at runtime. The runtime keeps running
+/// correctly on the VM tier.
+std::thread_local! {
+    static JIT_POISONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Tier-up hook installed by [`Runtime::install_jit`]. Compiles
 /// the closure's bytecode body via the bytecode→RIR translator and
 /// the Cranelift lowerer; on success, stashes the native function
 /// pointer on the closure.
 ///
 /// Silent on failure: any unsupported opcode, env access, or
-/// translation error leaves the closure on the bytecode VM.
+/// translation error leaves the closure on the bytecode VM. A
+/// Cranelift panic during lowering also leaves the closure on the
+/// VM, and sets [`JIT_POISONED`] so subsequent tier-up attempts on
+/// this thread short-circuit.
 fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
+    if JIT_POISONED.with(|p| p.get()) {
+        return;
+    }
     // SAFETY: The hook fires only inside the closure-call dispatch,
     // which runs inside `Runtime::with_active` (set by `eval_str` /
     // `eval_str_via_vm`). The active back-pointer is the unique
@@ -182,12 +208,65 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     //     NB payloads alive across `collect()` independently. Heap
     //     trace via `Bindings::Trace` walks NB-encoded slots through
     //     the `ManuallyDrop` borrow pattern.
-    let (ptr, return_tag_override) = match lowerer.compile_uniform_nb(&rir) {
-        Ok(p) => (p, Some(cs_vm::vm::JIT_RT_NB)),
-        Err(_) => match lowerer.compile_pure_fixnum(&rir) {
-            Ok(p) => (p, None),
-            Err(_) => return,
-        },
+    // Both `compile_*` paths can panic from inside Cranelift's
+    // codegen when our lowering produces an IR shape Cranelift's
+    // internal assertions reject (e.g., the v36 `remove_constant_
+    // phis` pass's `entry block unknown` expect on patterns we
+    // currently lower invalidly — maze/sboyer/t3a-tree-rewriter
+    // etc.). Aborting the host process for a tier-up attempt is
+    // never the right behavior: the bytecode VM is always a
+    // correct fallback. `AssertUnwindSafe` is sound because we
+    // treat any panic as "drop this JIT attempt entirely" — we
+    // never observe the Lowerer state after a panic to draw
+    // conclusions; we just stop trying to JIT this closure and
+    // leave it on the VM.
+    //
+    // Critical: on a uniform-NB **panic**, we do NOT fall through
+    // to `compile_pure_fixnum`. The two tiers cover overlapping
+    // RIR subsets — a function uniform-NB rejected via panic
+    // (rather than via a clean `Err`) is one whose RIR shape may
+    // also trip `compile_pure_fixnum`'s codegen invariants in
+    // ways that don't abort cleanly. Empirical: some maze
+    // functions where uniform-NB panicked lowered through
+    // `compile_pure_fixnum` without panic, but the resulting
+    // native code computed bogus vector indices (negative
+    // offsets) that crashed `vm_vector_ref_gc` at runtime. The
+    // pre-panic-catch behavior was "process aborts → user never
+    // sees this" which hid the pure-fixnum miscompile; with the
+    // catch in place the runtime symptom surfaces. Safest: any
+    // panic means abandon both tiers for this closure.
+    //
+    // A clean uniform-NB `Err` (the prewalk's `Unsupported` /
+    // `Codegen` returns) still falls through to pure_fixnum since
+    // those cases are by-design tier-routing, not codegen
+    // failures.
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let uniform_result = catch_unwind(AssertUnwindSafe(|| lowerer.compile_uniform_nb(&rir)));
+    let (ptr, return_tag_override) = match uniform_result {
+        Ok(Ok(p)) => (p, Some(cs_vm::vm::JIT_RT_NB)),
+        Err(_) => {
+            // uniform-NB panicked — poison the JIT subsystem.
+            // See the JIT_POISONED rationale above; the safest
+            // response is to stop attempting JIT on this thread
+            // entirely for the rest of the process.
+            JIT_POISONED.with(|p| p.set(true));
+            return;
+        }
+        Ok(Err(_)) => {
+            // Clean rejection from uniform-NB — try the
+            // specialized tier. pure_fixnum can also panic
+            // (its codegen path overlaps cranelift's), so wrap
+            // it the same way and poison on panic.
+            let pure_result = catch_unwind(AssertUnwindSafe(|| lowerer.compile_pure_fixnum(&rir)));
+            match pure_result {
+                Ok(Ok(p)) => (p, None),
+                Err(_) => {
+                    JIT_POISONED.with(|p| p.set(true));
+                    return;
+                }
+                Ok(Err(_)) => return,
+            }
+        }
     };
     closure.set_jit_ptr(ptr, lam.params.len() as u32);
     closure.set_jit_param_types(&param_tags);

@@ -1,0 +1,19 @@
+[package]
+name = "cs-opt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "Pluggable optimizer-pass framework for CrabScheme (ADR 0014)."
+
+[features]
+# ADR 0014 iter 4 — dev-build verifier. When enabled, the pass
+# pipeline runs `cs_rir::verify_function` after each pass and
+# panics with the offending pass name when the pass produces
+# malformed RIR. Off by default; release builds skip the cost.
+pass_verify = []
+
+[dependencies]
+cs-core = { workspace = true }
+cs-rir = { workspace = true }

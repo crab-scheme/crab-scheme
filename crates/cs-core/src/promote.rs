@@ -112,12 +112,14 @@ pub fn to_rc_deep(v: &Value) -> Value {
             v.clone()
         }
         // Leaves and Procedure (already Rc<dyn>): just clone.
+        // Identifier is leaf-shaped (Symbol + u64 mark).
         Value::Null
         | Value::Unspecified
         | Value::Eof
         | Value::Boolean(_)
         | Value::Character(_)
         | Value::Symbol(_)
+        | Value::Identifier { .. }
         | Value::Number(_)
         | Value::Procedure(_) => v.clone(),
     }
@@ -282,12 +284,14 @@ impl Promote for Value {
                 // Rc-backed: nothing to descend into.
             }
             // Leaves: no heap pointers.
+            // Identifier is leaf (Symbol + u64 mark).
             Value::Null
             | Value::Unspecified
             | Value::Eof
             | Value::Boolean(_)
             | Value::Character(_)
             | Value::Symbol(_)
+            | Value::Identifier { .. }
             | Value::Number(_)
             // Procedure is Rc<dyn>; already global heap.
             | Value::Procedure(_) => {}

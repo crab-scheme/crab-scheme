@@ -221,25 +221,14 @@ fn prune_old_helper_definition_loads() {
     );
 }
 
-/// The actual `lib/beam/prelude.scm` file. Verification result:
-/// the prelude as written is NOT loadable because it uses
-/// Racket-style `#:keyword` argument syntax (e.g.,
-/// `#:strategy 'one-for-one`) that the cs-lex lexer does not
-/// recognize — the lexer hits `unexpected character '#'`.
-///
-/// This test pins that finding: the prelude is design-validated
-/// (its building blocks all load — see the other tests in this
-/// file) but it needs ONE of:
-///   (a) rewriting `make-supervisor` / `define-behavior` to use
-///       plain positional or symbol-key args instead of
-///       `#:foo`, OR
-///   (b) extending cs-lex + cs-parse to handle Racket-style
-///       keyword arguments.
-///
-/// If anyone makes either change, this test will start passing
-/// — flipping the assertion to a load-success check.
+/// The actual `lib/beam/prelude.scm` file. Per #109 the prelude
+/// was rewritten to use case-lambda + bare-symbol clause keys
+/// instead of Racket `#:keyword` args, so the load now succeeds.
+/// Spot-check that a representative subset of prelude bindings
+/// (helpers + the supervisor record type) are procedure-bound
+/// after loading.
 #[test]
-fn load_full_prelude_file_documents_keyword_syntax_gap() {
+fn load_full_prelude_file_succeeds() {
     let prelude_path =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lib/beam/prelude.scm");
 
@@ -247,25 +236,25 @@ fn load_full_prelude_file_documents_keyword_syntax_gap() {
         .unwrap_or_else(|e| panic!("read {:?}: {}", prelude_path, e));
 
     let mut rt = Runtime::new();
-    let result = rt.eval_str("<prelude>", &src);
+    rt.eval_str("<prelude>", &src)
+        .expect("lib/beam/prelude.scm should load after #109");
 
-    match result {
-        Ok(_) => {
-            // If this branch fires, the gap closed — update the
-            // test to assert success + helper-binding checks.
-            panic!(
-                "lib/beam/prelude.scm now loads! Update this test \
-                 to assert successful load + procedure?-bind checks \
-                 for the prelude helpers."
-            );
-        }
-        Err(diag) => {
-            let msg = format!("{}", diag);
-            assert!(
-                msg.contains("unexpected character '#'") || msg.contains("#:"),
-                "expected the #:keyword lexer failure; got: {}",
-                msg
-            );
-        }
+    // Spot-check: a handful of well-known prelude bindings should
+    // be procedures after loading. Picking helpers that don't
+    // require actor primops at lookup time.
+    for name in &[
+        "prune-old",
+        "id-of-pid",
+        "find-spec",
+        "make-supervisor",
+        "make-child-spec",
+        "child-spec?",
+    ] {
+        let probe = format!("(procedure? {})", name);
+        let v = rt
+            .eval_str("<t>", &probe)
+            .expect("procedure?-probe should at least eval");
+        let s = rt.format_value(&v, cs_core::WriteMode::Display);
+        assert_eq!(s, "#t", "{} should be defined as a procedure", name);
     }
 }

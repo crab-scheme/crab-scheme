@@ -71,6 +71,11 @@ pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, St
         Value::Number(n) => num_to_sendable(n),
         Value::String(s) => Ok(SendableValue::String(s.borrow().clone())),
         Value::Symbol(s) => Ok(SendableValue::Symbol(syms.name(*s).to_string())),
+        // Identifiers cross as their name (mark dropped). Marks
+        // are a per-process lexical-hygiene concept that doesn't
+        // survive a cross-actor boundary -- a fresh expansion in
+        // the destination would assign new marks anyway.
+        Value::Identifier { name, .. } => Ok(SendableValue::Symbol(syms.name(*name).to_string())),
         Value::Pair(p) => {
             let head = to_sendable_in(&p.car.borrow(), syms)?;
             let tail = to_sendable_in(&p.cdr.borrow(), syms)?;

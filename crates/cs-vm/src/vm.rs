@@ -1237,9 +1237,14 @@ impl NanboxValue {
                 NanboxValue(nb_make(NB_TAG_PROMISE, tagged) as i64)
             }
             // Number variants outside Fixnum/Flonum (BigInt,
-            // Rational, Complex). Wrap in Gc<Value> — these are
-            // rare in performance-sensitive code.
-            other @ Value::Number(_) => {
+            // Rational, Complex), plus hygienic Identifier (a
+            // (Symbol, u64-mark) pair that doesn't fit in the
+            // 47-bit NB payload alongside its tag). All wrap in
+            // Gc<Value> — these are rare in performance-
+            // sensitive code. A future iter could carve out a
+            // dedicated NB_TAG_IDENTIFIER if identifier-heavy
+            // code shows up in the hot path.
+            other @ (Value::Number(_) | Value::Identifier { .. }) => {
                 let g = cs_gc::Gc::new(other);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
@@ -1643,11 +1648,12 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
     // build Pairs still use `cs_core::Pair::new` (unregistered),
     // mirroring the pre-NaN-box split where only JIT wrap allocs
     // were heap-tracked.
-    // Pair has private cycle-tombstone fields under
-    // countable-memory; use the public constructor which returns
-    // an already-allocated Gc<Pair>. The construct-via-struct-
-    // literal optimization below the JIT fast path is preserved
-    // on the tracing variant via the cfg branch.
+    // Pair has private cycle-tombstone fields (countable-memory)
+    // plus our `source: Cell<Option<Span>>` field; use the public
+    // constructor which returns an already-allocated Gc<Pair>
+    // with all fields initialized. The JIT_ACTIVE_HEAP tracked-
+    // allocation path is sacrificed here; see follow-up for
+    // re-adding it once Pair gets a heap-aware constructor.
     let g: cs_gc::Gc<cs_core::Pair> = cs_core::Pair::new(car_v, cdr_v);
     let raw_ptr = cs_gc::Gc::into_raw_jit(g) as u64;
     debug_assert!(raw_ptr & !NB_PAYLOAD_MASK == 0);

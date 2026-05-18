@@ -59,10 +59,10 @@ impl Datum {
             Datum::String(s, _) => Value::string((**s).clone()),
             Datum::Symbol(s, _) => Value::Symbol(*s),
             Datum::Null(_) => Value::Null,
-            Datum::Pair(car, cdr, _) => {
+            Datum::Pair(car, cdr, span) => {
                 let car_v = car.to_value();
                 let cdr_v = cdr.to_value();
-                Value::Pair(cs_core::Pair::new(car_v, cdr_v))
+                Value::Pair(cs_core::Pair::with_source(car_v, cdr_v, *span))
             }
             Datum::Vector(items, _) => {
                 let v: Vec<Value> = items.iter().map(|d| d.to_value()).collect();

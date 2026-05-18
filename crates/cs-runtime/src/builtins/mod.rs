@@ -3,6 +3,9 @@
 #[cfg(feature = "actor")]
 pub mod beam;
 
+#[cfg(feature = "sandbox")]
+pub mod sandbox;
+
 use cs_core::{
     eq, Hashtable, HtEqKind, Number, Pair, Port, Promise, PromiseState, SymbolTable, Value,
     WriteMode,
@@ -167,6 +170,29 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("rational?", b_rational_p),
         ("boolean?", b_boolean_p),
         ("pair?", b_pair_p),
+        // R6RS++ §9 source metadata accessors. Today read from the
+        // reader-attached span on Pair only; full first-class
+        // syntax objects (#118) extend the surface.
+        ("syntax-source", b_syntax_source),
+        ("syntax-line", b_syntax_line),
+        ("syntax-column", b_syntax_column),
+        // R6RS++ §12 (#118) Iter A — syntax-case foundation surface.
+        // identifier? / syntax->datum / datum->syntax / bound-id=? /
+        // free-id=? today degrade to symbol-eq semantics; generate-
+        // temporaries (below in ho_builtins) needs SymbolTable.
+        ("identifier?", b_identifier_p),
+        ("syntax->datum", b_syntax_to_datum),
+        ("datum->syntax", b_datum_to_syntax),
+        ("bound-identifier=?", b_bound_identifier_eq),
+        ("free-identifier=?", b_free_identifier_eq),
+        ("make-variable-transformer", b_make_variable_transformer),
+        // Phase 1.5 Iter C internals: emitted by
+        // compile_syntax_template + expand_syntax_case to stamp
+        // template-introduced identifiers with per-expansion marks.
+        // Not part of the R6RS user surface; exposed as builtins
+        // so the generated code is a plain procedure call.
+        ("make-identifier", b_make_identifier),
+        ("fresh-mark!", b_fresh_mark),
         ("null?", b_null_p),
         ("list?", b_list_p),
         ("symbol?", b_symbol_p),
@@ -448,6 +474,20 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("syntax-violation?", b_syntax_violation_p),
         ("syntax-violation-form", b_syntax_violation_form),
         ("syntax-violation-subform", b_syntax_violation_subform),
+        // R6RS++ Phase 2D: condition subtypes for Phase 2 ecosystem.
+        ("make-contract-violation", b_make_contract_violation),
+        ("contract-violation?", b_contract_violation_p),
+        ("contract-violation-source", b_contract_violation_source),
+        ("contract-violation-target", b_contract_violation_target),
+        ("contract-violation-contract", b_contract_violation_contract),
+        ("contract-violation-value", b_contract_violation_value),
+        ("make-type-error", b_make_type_error),
+        ("type-error?", b_type_error_p),
+        ("type-error-expected", b_type_error_expected),
+        ("type-error-actual", b_type_error_actual),
+        ("make-module-error", b_make_module_error),
+        ("module-error?", b_module_error_p),
+        ("module-error-library", b_module_error_library),
         ("make-undefined-violation", b_make_undefined_violation),
         ("undefined-violation?", b_undefined_violation_p),
         ("make-lexical-violation", b_make_lexical_violation),
@@ -655,6 +695,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("hashtable-mutable?", b_hashtable_mutable_p),
         ("hashtable-hash-function", b_hashtable_hash_function),
         ("make-parameter", b_make_parameter),
+        ("parameter?", b_parameter_p),
         // (rnrs enums) — R6RS §13. Each enum-set is encoded as
         // #("__enum-set__" #(<universe symbols>) <bits-fixnum>).
         // M9 iter 2 limits the universe to ≤63 symbols (fixnum bitset);
@@ -793,8 +834,33 @@ fn b_make_string_in_region(args: &[Value]) -> Result<Value, String> {
 }
 
 pub fn higher_order_builtins() -> Vec<HoEntry> {
-    vec![
+    #[allow(unused_mut)]
+    let mut v: Vec<HoEntry> = vec![
+        // ADR 0014 — optimizer-pass installation.
+        ("install-optimizer-pass!", b_install_optimizer_pass),
+        ("remove-optimizer-pass!", b_remove_optimizer_pass),
+        ("installed-optimizer-passes", b_installed_optimizer_passes),
+        (
+            "with-active-optimizer-passes",
+            b_with_active_optimizer_passes,
+        ),
+        // ADR 0015 L1.1 — environment predicate.
+        ("environment?", b_environment_p),
+        // ADR 0015 L1.2 — mutable namespace constructor + ops.
+        ("make-namespace", b_make_namespace),
+        (
+            "namespace-set-variable-value!",
+            b_namespace_set_variable_value,
+        ),
+        (
+            "namespace-undefine-variable!",
+            b_namespace_undefine_variable,
+        ),
         ("apply", b_apply),
+        // (Sandbox builtins under `sandbox` feature are
+        // appended below this vec literal to avoid mixing #cfg
+        // attributes inside the macro-style vec! — see
+        // append_sandbox_builtins.)
         // Gap B-2-lite: open a region scope, call `thunk`,
         // close the region. Allocations made inside `thunk`
         // via `cons-in-region` / `make-vector-in-region` /
@@ -835,6 +901,9 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("emergency-exit", b_emergency_exit),
         ("symbol->string", b_symbol_to_string_ho),
         ("string->symbol", b_string_to_symbol_ho),
+        // R6RS++ §12 (#118) Iter A — generate-temporaries needs
+        // SymbolTable to mint fresh names.
+        ("generate-temporaries", b_generate_temporaries_ho),
         ("hashtable-update!", b_hashtable_update_ho),
         ("hashtable-walk", b_hashtable_walk),
         ("hashtable-entries", b_hashtable_entries),
@@ -950,7 +1019,20 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         // hashtable HO
         ("hashtable-fold", b_hashtable_fold),
         ("hashtable-for-each", b_hashtable_for_each),
-    ]
+    ];
+    // ADR 0015 L2 — sandbox builtins live in their own module
+    // and are appended (rather than spread inline with #cfg) to
+    // keep the main vec literal clean.
+    #[cfg(feature = "sandbox")]
+    {
+        for entry in sandbox::builtins() {
+            v.push(entry);
+        }
+    }
+    #[cfg(feature = "sandbox")]
+    return v;
+    #[cfg(not(feature = "sandbox"))]
+    v
 }
 
 type SymsEntry = (
@@ -2379,6 +2461,351 @@ fn b_pair_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("pair?", "1", args.len()));
     }
     Ok(Value::Boolean(matches!(args[0], Value::Pair(_))))
+}
+
+/// `(syntax-source v)` — return the source-text origin of `v` as a
+/// list `(file-id start-byte end-byte)`, or `#f` if `v` carries no
+/// source span. Per R6RS++ §9: today only reader-produced Pairs
+/// carry source. Future iters (full syntax-case) extend this to
+/// hygiene-tracked syntax objects.
+fn b_syntax_source(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax-source", "1", args.len()));
+    }
+    let span = match &args[0] {
+        Value::Pair(p) => p.source_span(),
+        _ => None,
+    };
+    match span {
+        None => Ok(Value::Boolean(false)),
+        Some(s) => {
+            // (file-id start end)
+            let end = Value::Pair(Pair::new(
+                Value::Number(Number::Fixnum(s.end as i64)),
+                Value::Null,
+            ));
+            let mid = Value::Pair(Pair::new(
+                Value::Number(Number::Fixnum(s.start as i64)),
+                end,
+            ));
+            Ok(Value::Pair(Pair::new(
+                Value::Number(Number::Fixnum(s.file.0 as i64)),
+                mid,
+            )))
+        }
+    }
+}
+
+/// `(syntax-line v)` — return the 1-based line number of `v`'s
+/// source position, or `#f` if `v` carries no source span. The
+/// line lookup requires the SourceMap to be threaded; today we
+/// approximate by returning the start-byte (callers can convert
+/// via tooling). Full line/column resolution lands when this
+/// accessor moves into a higher-order builtin with SourceMap
+/// access.
+fn b_syntax_line(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax-line", "1", args.len()));
+    }
+    let span = match &args[0] {
+        Value::Pair(p) => p.source_span(),
+        _ => None,
+    };
+    match span {
+        None => Ok(Value::Boolean(false)),
+        Some(s) => Ok(Value::Number(Number::Fixnum(s.start as i64))),
+    }
+}
+
+/// `(syntax-column v)` — see [`b_syntax_line`]. Today returns the
+/// end-byte; tooling can derive column from start-byte + SourceMap.
+fn b_syntax_column(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax-column", "1", args.len()));
+    }
+    let span = match &args[0] {
+        Value::Pair(p) => p.source_span(),
+        _ => None,
+    };
+    match span {
+        None => Ok(Value::Boolean(false)),
+        Some(s) => Ok(Value::Number(Number::Fixnum(s.end as i64))),
+    }
+}
+
+// ---- R6RS++ §12 (#118) Iter A — syntax-case foundation surface ----
+//
+// As of Phase 1.5 Iter A, `Value::Identifier { name, mark }` exists
+// alongside `Value::Symbol`. The hygiene surface widens to accept
+// either kind where R6RS calls for "identifier"; `symbol?` stays
+// strict (Symbol only) per R6RS. Iter 1.5.D upgrades the equality
+// builtins to compare marks.
+
+/// `(identifier? v)` — R6RS §11.18. True iff `v` is a syntax object
+/// representing an identifier. Accepts either a bare `Symbol` (which
+/// behaves as an identifier with implicit mark 0) or an explicit
+/// `Identifier { name, mark }` value produced by syntax-case
+/// template instantiation.
+fn b_identifier_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("identifier?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(
+        args[0],
+        Value::Symbol(_) | Value::Identifier { .. }
+    )))
+}
+
+/// `(syntax->datum stx)` — R6RS §12.6. Strip syntax-object marks
+/// and return the underlying datum. For an `Identifier { name, mark }`
+/// returns the bare `Symbol(name)` (mark discarded). For other
+/// values (including bare Symbol), pass through unchanged --
+/// they're already datum-shaped.
+///
+/// Compound structures (pairs, vectors) containing identifiers
+/// recurse: each Identifier leaf is stripped. Iter 1.5.B ships
+/// the leaf-only version; the recursive walker lands once the
+/// 1.5.C template instantiator creates compound structures
+/// with embedded identifiers.
+fn b_syntax_to_datum(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax->datum", "1", args.len()));
+    }
+    Ok(strip_identifier_marks(&args[0]))
+}
+
+/// Recursive helper for `syntax->datum`. Walks the value
+/// converting each `Identifier { name, .. }` leaf to
+/// `Symbol(name)`. Pair / Vector recurse; other variants pass
+/// through. Inverts `stamp_datum_with_mark` (used by
+/// `datum->syntax`) so round-trips compose correctly.
+fn strip_identifier_marks(v: &Value) -> Value {
+    match v {
+        Value::Identifier { name, .. } => Value::Symbol(*name),
+        Value::Pair(p) => {
+            let car_new = strip_identifier_marks(&p.car.borrow());
+            let cdr_new = strip_identifier_marks(&p.cdr.borrow());
+            Value::Pair(Pair::new(car_new, cdr_new))
+        }
+        Value::Vector(vec_) => {
+            let items: Vec<Value> = vec_.borrow().iter().map(strip_identifier_marks).collect();
+            Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(items)))
+        }
+        _ => v.clone(),
+    }
+}
+
+/// `(datum->syntax template-id datum)` — R6RS §12.6. Stamp
+/// `datum` with the lexical context of `template-id` so
+/// introduced identifiers resolve correctly. Accepts either a
+/// bare `Symbol` (treated as mark = 0) or an `Identifier` as
+/// `template-id`.
+///
+/// Iter 1.5.F: recursively walks `datum`, converting every
+/// bare `Symbol` leaf to a `Value::Identifier` carrying the
+/// template's mark. Existing `Identifier` leaves are left
+/// alone (the user explicitly built them with a chosen mark).
+/// Non-identifier atoms (numbers, strings, chars, booleans)
+/// pass through unchanged. Pairs and vectors recurse.
+fn b_datum_to_syntax(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("datum->syntax", "2", args.len()));
+    }
+    let ctx_mark = match &args[0] {
+        Value::Symbol(_) => 0u64,
+        Value::Identifier { mark, .. } => *mark,
+        v => return Err(type_err("datum->syntax", "identifier", v)),
+    };
+    Ok(stamp_datum_with_mark(&args[1], ctx_mark))
+}
+
+/// Recursive helper for `datum->syntax`. Walks `v` rewriting
+/// bare `Symbol` leaves as `Identifier { name, mark }` and
+/// rebuilding pair / vector structures. Leaves existing
+/// `Identifier`s and non-identifier atoms alone.
+fn stamp_datum_with_mark(v: &Value, mark: u64) -> Value {
+    match v {
+        Value::Symbol(name) => Value::Identifier { name: *name, mark },
+        Value::Pair(p) => {
+            let car_new = stamp_datum_with_mark(&p.car.borrow(), mark);
+            let cdr_new = stamp_datum_with_mark(&p.cdr.borrow(), mark);
+            Value::Pair(Pair::new(car_new, cdr_new))
+        }
+        Value::Vector(vec_) => {
+            let items: Vec<Value> = vec_
+                .borrow()
+                .iter()
+                .map(|e| stamp_datum_with_mark(e, mark))
+                .collect();
+            Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(items)))
+        }
+        _ => v.clone(),
+    }
+}
+
+/// `(bound-identifier=? a b)` — R6RS §12.6. True iff `a` and `b`
+/// would refer to the same binding if substituted into a template.
+///
+/// Compares `(name, mark)` pairs. A bare `Value::Symbol(s)` is
+/// treated as an identifier with mark = 0 (reader-input
+/// identifier). So:
+///   - two Symbols equal iff same name
+///   - two Identifiers equal iff same name AND same mark
+///   - Symbol vs Identifier equal iff same name AND mark = 0
+///
+/// This is the foundation of macro hygiene: two `(syntax foo)`
+/// from different macro expansions produce Identifier values
+/// with different marks (see Phase 1.5 Iter C), so they're
+/// distinguishable here.
+fn b_bound_identifier_eq(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("bound-identifier=?", "2", args.len()));
+    }
+    let (n1, m1) = match &args[0] {
+        Value::Symbol(s) => (*s, 0u64),
+        Value::Identifier { name, mark } => (*name, *mark),
+        v => return Err(type_err("bound-identifier=?", "identifier", v)),
+    };
+    let (n2, m2) = match &args[1] {
+        Value::Symbol(s) => (*s, 0u64),
+        Value::Identifier { name, mark } => (*name, *mark),
+        v => return Err(type_err("bound-identifier=?", "identifier", v)),
+    };
+    Ok(Value::Boolean(n1 == n2 && m1 == m2))
+}
+
+/// `(free-identifier=? a b)` — R6RS §12.6. True iff `a` and `b`
+/// resolve to the same binding in their respective scopes.
+///
+/// Today's semantics: name-equality on the underlying `Symbol`
+/// or `Identifier` name (mark ignored). Two `(syntax foo)` from
+/// different macro expansions both refer to "the foo binding in
+/// scope", so they're free-identifier=? even though their marks
+/// differ. This is the intuition that bound-identifier=?
+/// distinguishes by *introduction site* whereas free-identifier=?
+/// distinguishes by *resolved binding*.
+///
+/// True R6RS semantics with full lexical-env resolution requires
+/// the Phase 2 SyntaxObject + binding-table track. The name-only
+/// approximation handles the most common case (identifiers
+/// referring to top-level / library bindings) correctly.
+fn b_free_identifier_eq(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("free-identifier=?", "2", args.len()));
+    }
+    let n1 = match &args[0] {
+        Value::Symbol(s) => *s,
+        Value::Identifier { name, .. } => *name,
+        v => return Err(type_err("free-identifier=?", "identifier", v)),
+    };
+    let n2 = match &args[1] {
+        Value::Symbol(s) => *s,
+        Value::Identifier { name, .. } => *name,
+        v => return Err(type_err("free-identifier=?", "identifier", v)),
+    };
+    Ok(Value::Boolean(n1 == n2))
+}
+
+/// `(make-identifier name mark)` — Phase 1.5 Iter C primitive.
+/// Constructs a `Value::Identifier { name, mark }`. Called by
+/// code emitted by `compile_syntax_template` for non-pvar
+/// identifiers in syntax-case templates; not part of the R6RS
+/// public surface, but exposed at the builtin layer so the
+/// generated code is a plain procedure call instead of needing
+/// a new CoreExpr variant.
+///
+/// `name` must be a Symbol (or Identifier, whose name is
+/// extracted); `mark` must be a non-negative fixnum.
+fn b_make_identifier(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("make-identifier", "2", args.len()));
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => *s,
+        Value::Identifier { name, .. } => *name,
+        v => return Err(type_err("make-identifier", "symbol or identifier", v)),
+    };
+    let mark = match &args[1] {
+        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as u64,
+        v => {
+            return Err(type_err("make-identifier", "non-negative fixnum mark", v));
+        }
+    };
+    Ok(Value::Identifier { name, mark })
+}
+
+/// `(fresh-mark!)` — Phase 1.5 Iter C primitive. Returns a
+/// globally-fresh `u64` value (as a fixnum) suitable for use as
+/// an identifier mark. Called once per syntax-case form
+/// evaluation; all introduced identifiers in that one
+/// macro-expansion share the resulting mark.
+///
+/// Counter is process-global via a thread-safe atomic. Starts
+/// at 1 so that mark=0 stays available as the "unmarked"
+/// (datum-introduced or reader-input) identifier marker.
+fn b_fresh_mark(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("fresh-mark!", "0", args.len()));
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MARK_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let mark = MARK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(Value::Number(Number::Fixnum(mark as i64)))
+}
+
+/// `(make-variable-transformer proc)` — R6RS §12.3. Wraps a
+/// transformer procedure so that it's invoked on *variable
+/// reference* occurrences as well as the usual application
+/// positions. R6RS-conformant macro systems use this to let
+/// `define-syntax` produce identifier macros.
+///
+/// Today's semantics: pass-through. We return the procedure
+/// unchanged; the macro architecture in cs-expand doesn't yet
+/// distinguish variable-ref from application transformer calls.
+/// Documenting the gap honestly here so user code that calls
+/// `make-variable-transformer` won't fail with "undefined" --
+/// it'll get the bare procedure back and only application-
+/// position substitution will work. Tracking ticket: post-1.0
+/// SyntaxObject + procedural-macro track.
+fn b_make_variable_transformer(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("make-variable-transformer", "1", args.len()));
+    }
+    if !matches!(args[0], Value::Procedure(_)) {
+        return Err(type_err("make-variable-transformer", "procedure", &args[0]));
+    }
+    Ok(args[0].clone())
+}
+
+/// `(generate-temporaries lst)` — R6RS §12.6. Returns a list of N
+/// fresh identifiers, where N is the length of `lst`. The argument
+/// itself is consumed only for its length; the values inside are
+/// ignored. Names are guaranteed distinct from any identifier that
+/// has appeared (we use `SymbolTable::len` as the monotonic counter,
+/// matching the existing `gensym` convention).
+fn b_generate_temporaries_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("generate-temporaries", "1", args.len()));
+    }
+    let mut n: usize = 0;
+    let mut cur = args[0].clone();
+    loop {
+        match cur {
+            Value::Null => break,
+            Value::Pair(p) => {
+                n += 1;
+                cur = p.cdr.borrow().clone();
+            }
+            _ => return Err(type_err("generate-temporaries", "list", &args[0])),
+        }
+    }
+    let mut fresh = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = ctx.syms.len();
+        let name = format!("t.{}", id);
+        fresh.push(Value::Symbol(ctx.syms.intern(&name)));
+    }
+    Ok(Value::list(fresh))
 }
 
 fn b_null_p(args: &[Value]) -> Result<Value, String> {
@@ -4396,15 +4823,15 @@ fn b_string_ge(args: &[Value]) -> Result<Value, String> {
 // expansion, so user types and standard types share one registry.
 
 const COND_COMPOUND_TAG: &str = "&compound-condition";
-const TAG_MESSAGE: &str = "&message";
+pub(crate) const TAG_MESSAGE: &str = "&message";
 const TAG_IRRITANTS: &str = "&irritants";
 const TAG_WARNING: &str = "&warning";
 const TAG_SERIOUS: &str = "&serious";
 const TAG_ERROR: &str = "&error";
 const TAG_VIOLATION: &str = "&violation";
-const TAG_ASSERTION: &str = "&assertion";
+pub(crate) const TAG_ASSERTION: &str = "&assertion";
 const TAG_NON_CONTINUABLE: &str = "&non-continuable";
-const TAG_WHO: &str = "&who";
+pub(crate) const TAG_WHO: &str = "&who";
 const TAG_CONDITION: &str = "&condition";
 const TAG_FILE_ERROR: &str = "&file-error";
 const TAG_READ_ERROR: &str = "&read-error";
@@ -4429,6 +4856,20 @@ const TAG_LEXICAL: &str = "&lexical";
 const TAG_IMPL_RESTRICTION: &str = "&implementation-restriction";
 const TAG_NO_INFINITIES: &str = "&no-infinities";
 const TAG_NO_NANS: &str = "&no-nans";
+// R6RS++ §9 (Phase 2D): condition subtypes extending &error
+// for the Phase 2 ecosystem.
+//
+//   &contract   raised by Phase 2B contract violations; carries
+//               source / target / contract-description / blamed
+//               value (4 fields, all surfaced as accessors).
+//   &type       runtime type errors -- complementary to cs-typer's
+//               static type errors. 2 fields: expected type
+//               description (string/symbol) + actual value.
+//   &module     library / import / module-system errors. 1 field:
+//               the offending library-name list (e.g. `(http server)`).
+const TAG_CONTRACT: &str = "&contract";
+const TAG_TYPE: &str = "&type";
+const TAG_MODULE: &str = "&module";
 
 thread_local! {
     /// Map from condition tag → its parent tag. Walked by predicates to
@@ -4491,6 +4932,10 @@ pub fn init_condition_registry() {
         m.insert(TAG_IMPL_RESTRICTION.into(), TAG_VIOLATION.into());
         m.insert(TAG_NO_INFINITIES.into(), TAG_IMPL_RESTRICTION.into());
         m.insert(TAG_NO_NANS.into(), TAG_IMPL_RESTRICTION.into());
+        // R6RS++ Phase 2D extensions, all rooted at &error.
+        m.insert(TAG_CONTRACT.into(), TAG_ERROR.into());
+        m.insert(TAG_TYPE.into(), TAG_ERROR.into());
+        m.insert(TAG_MODULE.into(), TAG_ERROR.into());
     });
     COND_KNOWN_TAGS.with(|reg| {
         let mut s = reg.borrow_mut();
@@ -4527,6 +4972,10 @@ pub fn init_condition_registry() {
             TAG_IMPL_RESTRICTION,
             TAG_NO_INFINITIES,
             TAG_NO_NANS,
+            // Phase 2D additions:
+            TAG_CONTRACT,
+            TAG_TYPE,
+            TAG_MODULE,
         ] {
             s.insert(t.into());
         }
@@ -4651,7 +5100,7 @@ fn find_simple_with_tag(cond: &Value, tag: &str) -> Option<Value> {
 }
 
 /// Build a simple condition: `#("&<tag>" field0 field1 ...)`.
-fn make_simple(tag: &str, fields: Vec<Value>) -> Value {
+pub(crate) fn make_simple(tag: &str, fields: Vec<Value>) -> Value {
     let mut v = Vec::with_capacity(1 + fields.len());
     v.push(Value::string(tag));
     v.extend(fields);
@@ -4660,7 +5109,7 @@ fn make_simple(tag: &str, fields: Vec<Value>) -> Value {
 
 /// Wrap a list of simples in a compound condition vector. Always wraps —
 /// even a single simple — so the data shape is uniform.
-fn make_compound(simples: Vec<Value>) -> Value {
+pub(crate) fn make_compound(simples: Vec<Value>) -> Value {
     let mut v = Vec::with_capacity(1 + simples.len());
     v.push(Value::string(COND_COMPOUND_TAG));
     v.extend(simples);
@@ -5061,6 +5510,151 @@ fn b_syntax_violation_subform(args: &[Value]) -> Result<Value, String> {
         }
     }
     Err("syntax-violation-subform: malformed".to_string())
+}
+
+// ---- R6RS++ Phase 2D condition subtypes ----
+
+/// `(make-contract-violation source target contract value)` ->
+/// compound &contract condition. Used by Phase 2B contract
+/// machinery to raise blame on a contract failure.
+fn b_make_contract_violation(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err(arity_err("make-contract-violation", "4", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(
+        TAG_CONTRACT,
+        vec![
+            args[0].clone(), // source library
+            args[1].clone(), // target library
+            args[2].clone(), // contract description
+            args[3].clone(), // blamed value
+        ],
+    )]))
+}
+
+fn b_contract_violation_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("contract-violation?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_CONTRACT)))
+}
+
+fn contract_field(args: &[Value], idx: usize, name: &str) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err(name, "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_CONTRACT)
+        .ok_or_else(|| format!("{}: not a contract-violation", name))?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() > idx {
+            return Ok(v[idx].clone());
+        }
+    }
+    Err(format!("{}: malformed", name))
+}
+
+fn b_contract_violation_source(args: &[Value]) -> Result<Value, String> {
+    contract_field(args, 1, "contract-violation-source")
+}
+
+fn b_contract_violation_target(args: &[Value]) -> Result<Value, String> {
+    contract_field(args, 2, "contract-violation-target")
+}
+
+fn b_contract_violation_contract(args: &[Value]) -> Result<Value, String> {
+    contract_field(args, 3, "contract-violation-contract")
+}
+
+fn b_contract_violation_value(args: &[Value]) -> Result<Value, String> {
+    contract_field(args, 4, "contract-violation-value")
+}
+
+/// `(make-type-error expected actual)` -> compound &type
+/// condition. Runtime type errors; complementary to cs-typer's
+/// static checks. `expected` is typically a string or symbol
+/// describing the wanted type; `actual` is the offending value.
+fn b_make_type_error(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("make-type-error", "2", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(
+        TAG_TYPE,
+        vec![args[0].clone(), args[1].clone()],
+    )]))
+}
+
+fn b_type_error_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("type-error?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_TYPE)))
+}
+
+fn b_type_error_expected(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("type-error-expected", "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_TYPE)
+        .ok_or_else(|| "type-error-expected: not a type-error".to_string())?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() >= 2 {
+            return Ok(v[1].clone());
+        }
+    }
+    Err("type-error-expected: malformed".into())
+}
+
+fn b_type_error_actual(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("type-error-actual", "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_TYPE)
+        .ok_or_else(|| "type-error-actual: not a type-error".to_string())?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() >= 3 {
+            return Ok(v[2].clone());
+        }
+    }
+    Err("type-error-actual: malformed".into())
+}
+
+/// `(make-module-error library-name)` -> compound &module
+/// condition. For library/import-system errors at runtime;
+/// `library-name` is the offending library name spec (e.g. a
+/// list like `(http server)`).
+fn b_make_module_error(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("make-module-error", "1", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(
+        TAG_MODULE,
+        vec![args[0].clone()],
+    )]))
+}
+
+fn b_module_error_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("module-error?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_MODULE)))
+}
+
+fn b_module_error_library(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("module-error-library", "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_MODULE)
+        .ok_or_else(|| "module-error-library: not a module-error".to_string())?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() >= 2 {
+            return Ok(v[1].clone());
+        }
+    }
+    Err("module-error-library: malformed".into())
 }
 
 // ---- standard accessors ----
@@ -9832,18 +10426,509 @@ pub fn exact_integer_sqrt_num(x: &Value) -> Result<(Value, Value), String> {
 
 // ---- environments ----
 //
-// Foundation: every binding is global, so all `environment` /
-// `interaction-environment` calls return the same opaque sentinel.
-// `eval` accepts and ignores the env argument. Real per-import
-// environments will land alongside library namespace filtering.
+// ADR 0015 L1.1: `(environment <import-spec> ...)` builds a real
+// R6RS §15.2 immutable snapshot environment. The returned value
+// is a vector record:
+//
+//   #('__environment__ <bindings-alist> <mutable?>)
+//
+// where the alist captures (sym . value) pairs at construction
+// time. `eval` recognizes this shape and runs the expanded
+// program against a Frame::immutable_root built from the alist.
+//
+// Import-spec resolution is hardcoded for the (rnrs base) set
+// at this milestone. Library membership metadata at the builtin
+// level is a future iter (L1.3 composite construction); for now
+// passing any other import spec returns an "unknown library"
+// error so future-incompatible code doesn't silently work.
 
-fn b_environment(_args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
-    // R6RS allows any number of import-specs; we accept and ignore.
-    Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
+/// Sentinel marking a Vector value as an R6RS environment record.
+pub(crate) const ENV_TAG: &str = "__environment__";
+
+/// Sentinel symbol returned by `(interaction-environment)` and
+/// `(scheme-report-environment N)`. Pure marker — `eval`'s 2nd-arg
+/// handler recognizes it as "no L1.1 restriction; use ctx.top".
+/// Not user-visible and not matched by string anywhere; the name
+/// is intentionally non-Scheme-valid so it can't be reproduced by
+/// `(intern ...)` from user code.
+pub(crate) const TOP_LEVEL_ENV_SENTINEL: &str = "__top-level-env__";
+
+/// Sentinel symbol returned by `(null-environment 5)`. Same role
+/// as [`TOP_LEVEL_ENV_SENTINEL`] — opaque marker for an unrestricted
+/// (in our impl) eval environment.
+pub(crate) const NULL_ENV_SENTINEL: &str = "__null-env__";
+
+/// Classification of a candidate R6RS environment-record Value.
+/// Used by `is_environment_value`, `decode_environment`, and
+/// `namespace_update` to share one shape-check implementation
+/// instead of three near-identical inline matches.
+#[derive(Debug)]
+pub(crate) enum EnvShape {
+    /// Well-formed; `mutable` is the value of slot[2].
+    Valid { mutable: bool },
+    /// Not a Vector at all.
+    NotVector,
+    /// Vector with len != 3.
+    WrongArity,
+    /// Slot[0] isn't the `ENV_TAG` string sentinel.
+    MissingTag,
+}
+
+/// Single source of truth for the env-record shape predicate.
+/// Caller is responsible for translating the failure variants
+/// into user-facing error text or a boolean answer.
+pub(crate) fn classify_env_record(v: &Value) -> EnvShape {
+    let Value::Vector(items) = v else {
+        return EnvShape::NotVector;
+    };
+    let items = items.borrow();
+    if items.len() != 3 {
+        return EnvShape::WrongArity;
+    }
+    let tag_ok = matches!(&items[0], Value::String(s) if s.borrow().as_str() == ENV_TAG);
+    if !tag_ok {
+        return EnvShape::MissingTag;
+    }
+    let mutable = matches!(&items[2], Value::Boolean(true));
+    EnvShape::Valid { mutable }
+}
+
+/// Hardcoded (rnrs base) export list — the R6RS §11 base library
+/// names registered as global builtins. NOT the full R6RS surface;
+/// targets the names common Scheme programs use. L1.3 split this
+/// from the (rnrs lists) exports; library-membership metadata at
+/// builtin-registration time is the right long-term shape but the
+/// hardcoded split is enough for composite construction to work.
+const RNRS_BASE_EXPORTS: &[&str] = &[
+    // arithmetic
+    "+",
+    "-",
+    "*",
+    "/",
+    "=",
+    "<",
+    ">",
+    "<=",
+    ">=",
+    "abs",
+    "min",
+    "max",
+    "modulo",
+    "quotient",
+    "remainder",
+    "expt",
+    "gcd",
+    "lcm",
+    "floor",
+    "ceiling",
+    "truncate",
+    "round",
+    "zero?",
+    "positive?",
+    "negative?",
+    "odd?",
+    "even?",
+    "square",
+    // number predicates
+    "number?",
+    "integer?",
+    "rational?",
+    "real?",
+    "complex?",
+    "exact?",
+    "inexact?",
+    "exact-integer?",
+    "exact->inexact",
+    "inexact->exact",
+    "number->string",
+    "string->number",
+    // list ops
+    "pair?",
+    "cons",
+    "car",
+    "cdr",
+    "set-car!",
+    "set-cdr!",
+    "null?",
+    "list",
+    "list?",
+    "length",
+    "append",
+    "reverse",
+    "list-tail",
+    "list-ref",
+    "map",
+    "for-each",
+    "memq",
+    "memv",
+    "member",
+    "assq",
+    "assv",
+    "assoc",
+    // booleans + equality
+    "not",
+    "boolean?",
+    "eq?",
+    "eqv?",
+    "equal?",
+    // strings
+    "string?",
+    "string",
+    "string-length",
+    "string-ref",
+    "substring",
+    "string-append",
+    "string->list",
+    "list->string",
+    "string->symbol",
+    // chars
+    "char?",
+    "char->integer",
+    "integer->char",
+    // vectors
+    "vector?",
+    "make-vector",
+    "vector",
+    "vector-length",
+    "vector-ref",
+    "vector-set!",
+    "vector->list",
+    "list->vector",
+    // symbols
+    "symbol?",
+    "symbol->string",
+    // procedures
+    "procedure?",
+    "apply",
+    // exceptions
+    "error",
+    "raise",
+    "raise-continuable",
+    "with-exception-handler",
+    // I/O minimum
+    "display",
+    "write",
+    "newline",
+    // eval / environment (so guests can themselves construct envs)
+    "eval",
+    "environment",
+];
+
+/// Hardcoded (rnrs lists) export list — R6RS §3 lists library
+/// procedures. These are NOT in (rnrs base); a user importing
+/// only (rnrs base) doesn't see them. L1.3 split.
+const RNRS_LISTS_EXPORTS: &[&str] = &[
+    "find",
+    "for-all",
+    "exists",
+    "filter",
+    "partition",
+    "fold-left",
+    "fold-right",
+    "remove",
+    "remp",
+    "remv",
+    "remq",
+    "cons*",
+];
+
+/// Resolve an import-spec datum (a list like `'(rnrs base)`) into
+/// the set of names it exports. Returns `Err` for any spec we
+/// don't yet know about; user code gets a clear "unknown library"
+/// rather than a silent empty environment.
+fn resolve_import_spec(
+    spec: &Value,
+    syms: &SymbolTable,
+) -> Result<&'static [&'static str], String> {
+    // Per R6RS, an import-spec can carry a trailing version
+    // sublist (e.g. `(rnrs base (6))`). Strip it. L1.1 also
+    // aliases `(rnrs lists)` and `(rnrs)` to the same approved-
+    // base set — permissive but preserves R6RS conformance; L1.3
+    // splits them via per-library binding metadata.
+    let parts = collect_proper_list("environment", spec)?;
+    let symbol_parts: Vec<&Value> = parts
+        .iter()
+        .take_while(|v| matches!(v, Value::Symbol(_)))
+        .collect();
+    let tail_len = parts.len() - symbol_parts.len();
+    if tail_len > 0 {
+        // Only acceptable tail: a single trailing version
+        // sublist (which is a Pair or Null).
+        let tail = &parts[symbol_parts.len()..];
+        if tail_len != 1 || !matches!(&tail[0], Value::Pair(_) | Value::Null) {
+            return Err(format!(
+                "environment: import-spec part must be a symbol, got {:?}",
+                tail[0]
+            ));
+        }
+    }
+    let names: Vec<String> = symbol_parts
+        .iter()
+        .map(|v| match v {
+            Value::Symbol(s) => syms.name(*s).to_string(),
+            _ => unreachable!("take_while filter"),
+        })
+        .collect();
+    let joined = names.join(" ");
+    match joined.as_str() {
+        "rnrs base" | "scheme base" => Ok(RNRS_BASE_EXPORTS),
+        "rnrs lists" => Ok(RNRS_LISTS_EXPORTS),
+        "rnrs" => Ok(RNRS_BASE_EXPORTS), // umbrella; still aliased to base for L1.3
+        _ => Err(format!(
+            "environment: unknown library {:?} (supported at L1.3: \
+             (rnrs base), (rnrs lists), (rnrs))",
+            joined
+        )),
+    }
+}
+
+fn b_environment(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    // Collect the visible names across all requested import specs.
+    let mut visible: Vec<String> = Vec::new();
+    for spec in args {
+        let names = resolve_import_spec(spec, ctx.syms)?;
+        for n in names {
+            if !visible.iter().any(|x| x == n) {
+                visible.push((*n).to_string());
+            }
+        }
+    }
+    // Snapshot each name's value from the global top-level frame.
+    // Names registered as builtins (the vast majority of L1.1
+    // entries) are guaranteed present; missing names are silently
+    // dropped — they wouldn't be importable from a real library
+    // anyway.
+    let mut bindings: Vec<Value> = Vec::with_capacity(visible.len());
+    for name in &visible {
+        let sym = ctx.syms.intern(name);
+        if let Some(v) = ctx.top.get(sym) {
+            // Each binding is a Scheme pair (sym . value).
+            bindings.push(Value::Pair(Pair::new(Value::Symbol(sym), v)));
+        }
+    }
+    let alist = Value::list(bindings);
+    // Build the vector record: #('__environment__ <alist> #f).
+    let env = new_vector(vec![
+        Value::string(ENV_TAG),
+        alist,
+        Value::Boolean(false), // immutable for `environment`
+    ]);
+    Ok(env)
+}
+
+/// `(environment? v)` — true when `v` is an L1.1 environment record.
+fn b_environment_p(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("environment?", "1", args.len()));
+    }
+    Ok(Value::Boolean(is_environment_value(&args[0])))
+}
+
+/// Internal: check the L1.1 environment-record shape.
+pub(crate) fn is_environment_value(v: &Value) -> bool {
+    matches!(classify_env_record(v), EnvShape::Valid { .. })
+}
+
+/// Internal: extract (bindings_map, mutable) from an environment
+/// value. Returns `None` for any malformed shape — caller can use
+/// `is_environment_value` first if they want a separate boolean.
+pub(crate) fn decode_environment(
+    v: &Value,
+) -> Option<(std::collections::HashMap<cs_core::Symbol, Value>, bool)> {
+    let EnvShape::Valid { mutable } = classify_env_record(v) else {
+        return None;
+    };
+    // Shape validated; pull out the alist (slot 1) and walk it.
+    let Value::Vector(items) = v else {
+        // Unreachable: classify_env_record only returns Valid for
+        // Vector values. Keep the destructure here for borrow scope.
+        return None;
+    };
+    let items = items.borrow();
+    let alist = &items[1];
+    let mut map = std::collections::HashMap::new();
+    let mut cur = alist.clone();
+    loop {
+        match cur {
+            Value::Null => break,
+            Value::Pair(p) => {
+                let head = p.car.borrow().clone();
+                let tail = p.cdr.borrow().clone();
+                if let Value::Pair(kv) = head {
+                    if let Value::Symbol(s) = kv.car.borrow().clone() {
+                        map.insert(s, kv.cdr.borrow().clone());
+                    }
+                }
+                cur = tail;
+            }
+            _ => break,
+        }
+    }
+    Some((map, mutable))
+}
+
+/// `(make-namespace <import-spec> ...)` (ADR 0015 L1.2) — Racket-
+/// style mutable namespace constructor. Same record shape as
+/// `(environment ...)` but the third slot is `#t` (mutable).
+/// Mutations via `namespace-set-variable-value!` /
+/// `namespace-undefine-variable!` are visible to subsequent
+/// evals against the same namespace.
+///
+/// `eval` against a mutable namespace builds a NON-immutable
+/// Frame, so `set!` inside the eval'd expression no longer
+/// raises `&assertion`. Note: writes via `set!` only mutate
+/// the per-eval Frame and are NOT persisted back to the
+/// namespace — explicit `namespace-set-variable-value!` is
+/// the primary write path. (Eval-write-back is a future
+/// iter when a concrete REPL use case asks for it.)
+fn b_make_namespace(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    let mut visible: Vec<String> = Vec::new();
+    for spec in args {
+        let names = resolve_import_spec(spec, ctx.syms)?;
+        for n in names {
+            if !visible.iter().any(|x| x == n) {
+                visible.push((*n).to_string());
+            }
+        }
+    }
+    let mut bindings: Vec<Value> = Vec::with_capacity(visible.len());
+    for name in &visible {
+        let sym = ctx.syms.intern(name);
+        if let Some(v) = ctx.top.get(sym) {
+            bindings.push(Value::Pair(Pair::new(Value::Symbol(sym), v)));
+        }
+    }
+    let alist = Value::list(bindings);
+    let env = new_vector(vec![
+        Value::string(ENV_TAG),
+        alist,
+        Value::Boolean(true), // mutable for `make-namespace`
+    ]);
+    Ok(env)
+}
+
+/// `(namespace-set-variable-value! ns 'name value)` — install or
+/// overwrite a binding in `ns`. Errors if `ns` isn't a mutable
+/// namespace (snapshot environments from `(environment ...)` are
+/// rejected with a clear message).
+fn b_namespace_set_variable_value(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("namespace-set-variable-value!", "3", args.len()));
+    }
+    let sym = match &args[1] {
+        Value::Symbol(s) => *s,
+        v => return Err(type_err("namespace-set-variable-value!", "symbol", v)),
+    };
+    let new_val = args[2].clone();
+    namespace_update(&args[0], sym, Some(new_val), ctx)
+}
+
+/// `(namespace-undefine-variable! ns 'name)` — remove a binding
+/// from `ns`. No-op if the name wasn't bound. Errors if `ns`
+/// isn't a mutable namespace.
+fn b_namespace_undefine_variable(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("namespace-undefine-variable!", "2", args.len()));
+    }
+    let sym = match &args[1] {
+        Value::Symbol(s) => *s,
+        v => return Err(type_err("namespace-undefine-variable!", "symbol", v)),
+    };
+    namespace_update(&args[0], sym, None, ctx)
+}
+
+/// Shared helper for the two `namespace-*!` builtins. `new_val =
+/// Some(v)` means insert-or-overwrite; `None` means remove.
+/// Implementation: decode the alist to a Vec, apply the
+/// mutation, re-encode, swap slot[1]. O(n) per call; n is the
+/// binding count (~100 for (rnrs base)). In-place pair-splicing
+/// would be faster but the aliasing cases are subtle; the
+/// decode/re-encode path is obviously correct.
+fn namespace_update(
+    ns: &Value,
+    sym: cs_core::Symbol,
+    new_val: Option<Value>,
+    _ctx: &mut EvalCtx,
+) -> Result<Value, String> {
+    // Distinguish the failure modes so users can diagnose without
+    // staring at the same generic message three times — passing a
+    // pair vs. a 4-vector vs. a tagged-but-not-namespace vector
+    // each gets its own diagnostic.
+    match classify_env_record(ns) {
+        EnvShape::NotVector => {
+            return Err(format!(
+                "namespace mutation: argument is not a namespace (got {})",
+                ns.type_name()
+            ));
+        }
+        EnvShape::WrongArity => {
+            return Err(
+                "namespace mutation: argument is a vector but not a namespace record \
+                 (expected 3-element [tag, bindings, mutable] shape)"
+                    .into(),
+            );
+        }
+        EnvShape::MissingTag => {
+            return Err(
+                "namespace mutation: argument is a vector but not a namespace record \
+                 (slot 0 is not the namespace-tag sentinel)"
+                    .into(),
+            );
+        }
+        EnvShape::Valid { mutable: false } => {
+            return Err(
+                "namespace mutation: argument is an immutable environment (from `environment`); \
+                 use `make-namespace` for a mutable namespace"
+                    .into(),
+            );
+        }
+        EnvShape::Valid { mutable: true } => { /* fall through */ }
+    }
+    let Value::Vector(items) = ns else {
+        // Unreachable: classify_env_record returned Valid which
+        // implies Vector. Mirror decode_environment's pattern.
+        return Err("namespace mutation: unreachable shape".into());
+    };
+    let mut entries: Vec<(cs_core::Symbol, Value)> = Vec::new();
+    let mut cur = items.borrow()[1].clone();
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let head = p.car.borrow().clone();
+                if let Value::Pair(kv) = head {
+                    if let Value::Symbol(s) = kv.car.borrow().clone() {
+                        entries.push((s, kv.cdr.borrow().clone()));
+                    }
+                }
+                cur = p.cdr.borrow().clone();
+            }
+            _ => break,
+        }
+    }
+    let existing = entries.iter().position(|(s, _)| *s == sym);
+    match (existing, new_val) {
+        (Some(idx), Some(v)) => entries[idx].1 = v,
+        (Some(idx), None) => {
+            entries.remove(idx);
+        }
+        (None, Some(v)) => entries.push((sym, v)),
+        (None, None) => {}
+    }
+    let pairs: Vec<Value> = entries
+        .into_iter()
+        .map(|(s, v)| Value::Pair(Pair::new(Value::Symbol(s), v)))
+        .collect();
+    let new_alist = Value::list(pairs);
+    items.borrow_mut()[1] = new_alist;
+    Ok(Value::Unspecified)
 }
 
 fn b_interaction_environment(_args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
-    Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
+    // The interaction environment is the live top-level — not
+    // restricted. Returning a sentinel here means eval recognizes
+    // "no restriction" and uses ctx.top directly (preserving
+    // pre-L1.1 behavior).
+    Ok(Value::Symbol(ctx.syms.intern(TOP_LEVEL_ENV_SENTINEL)))
 }
 
 /// R5RS / R7RS legacy: `(null-environment version)`. Returns the
@@ -9859,7 +10944,7 @@ fn b_null_environment(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String
     if v != 5 {
         return Err(format!("null-environment: unsupported version: {}", v));
     }
-    Ok(Value::Symbol(ctx.syms.intern("__null-env__")))
+    Ok(Value::Symbol(ctx.syms.intern(NULL_ENV_SENTINEL)))
 }
 
 /// R5RS / R7RS legacy: `(scheme-report-environment version)`. Returns
@@ -9876,7 +10961,7 @@ fn b_scheme_report_environment(args: &[Value], ctx: &mut EvalCtx) -> Result<Valu
             v
         ));
     }
-    Ok(Value::Symbol(ctx.syms.intern("__top-level-env__")))
+    Ok(Value::Symbol(ctx.syms.intern(TOP_LEVEL_ENV_SENTINEL)))
 }
 
 /// R7RS `(load filename [environment])`. Reads filename as a sequence
@@ -9919,7 +11004,28 @@ fn b_eval(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err(arity_err("eval", "1 or 2", args.len()));
     }
-    // We ignore the 2nd argument (environment) for foundation; always use top-level.
+    // ADR 0015 L1.1: when the 2nd arg is an environment record
+    // (Vector tagged `__environment__`), build an immutable root
+    // Frame from its snapshot bindings and run against that.
+    // Otherwise (sentinel symbol, missing, or unknown shape),
+    // fall back to the live top-level frame (pre-L1.1 behavior).
+    let restricted_env: Option<std::rc::Rc<crate::env::Frame>> = if args.len() == 2 {
+        if let Some((bindings, mutable)) = decode_environment(&args[1]) {
+            // L1.2: mutable namespaces use mutable_root so set!
+            // inside the eval'd expression no longer raises.
+            // Immutable envs from L1.1 still use immutable_root.
+            Some(if mutable {
+                crate::env::Frame::mutable_root(bindings)
+            } else {
+                crate::env::Frame::immutable_root(bindings)
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let eval_frame = restricted_env.unwrap_or_else(|| ctx.top.clone());
     // Convert the Value back into a Datum-like form by serializing-then-parsing.
     let datum_str = args[0].format_with(ctx.syms, WriteMode::Write);
     // Parse datum_str into a Datum tree using a fresh file id.
@@ -9936,7 +11042,17 @@ fn b_eval(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         .expand_program(&data)
         .map_err(|e| format!("eval: expand error: {}", e.message()))?;
     drop(expander);
-    crate::eval::eval(&core, ctx.top.clone(), ctx).map_err(|e| e.message())
+    // If the eval raises a condition, propagate via the
+    // pending_raise side-channel so `guard` on the host side
+    // catches it as a real condition instead of a plain string
+    // error. Otherwise return the plain Err message.
+    crate::eval::eval(&core, eval_frame, ctx).map_err(|e| match e.kind {
+        crate::eval::EvalErrorKind::Raised(cond) => {
+            ctx.pending_raise = Some(cond);
+            "__raised__".to_string()
+        }
+        _ => e.message(),
+    })
 }
 
 // ---- load-shared-library ----
@@ -10058,8 +11174,170 @@ fn b_make_parameter(args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err(arity_err("make-parameter", "1 or 2", args.len()));
     }
-    // R6RS make-parameter takes (init [converter]); we ignore converter for now.
+    // R6RS make-parameter takes (init [converter]). The optional
+    // converter procedure is meant to transform values on write
+    // (including the initial value). Today we ignore it -- threading
+    // a Scheme procedure call through the eval context from
+    // cs-core's Parameter::call dispatch is a tier-crossing change
+    // tracked as Phase 2E follow-up. Documented here so user code
+    // that passes a converter gets the un-converted behavior and
+    // can be migrated when the proper support lands.
+    if args.len() == 2 && !matches!(args[1], Value::Procedure(_)) {
+        return Err(type_err(
+            "make-parameter",
+            "procedure (converter)",
+            &args[1],
+        ));
+    }
     Ok(crate::proc::make_parameter(args[0].clone()))
+}
+
+/// `(parameter? v)` — true iff `v` is a parameter procedure
+/// created by `make-parameter`. R6RS R7RS-large add this
+/// predicate; our prior surface had `make-parameter` and
+/// `parameterize` but no way to test for parameter-ness.
+fn b_parameter_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("parameter?", "1", args.len()));
+    }
+    let is_param = match &args[0] {
+        Value::Procedure(p) => {
+            // Parameter lives in cs-core; downcast through the
+            // Procedure trait's `as_any` hook.
+            p.as_any().downcast_ref::<cs_core::Parameter>().is_some()
+        }
+        _ => false,
+    };
+    Ok(Value::Boolean(is_param))
+}
+
+// ---- ADR 0014 — optimizer-pass installation ----
+//
+// Three Scheme builtins backed by cs-opt's thread-local active-pass
+// list. The thread-local is read by cs-opt::run_active_pipeline,
+// which is called at the end of bytecode→RIR translation in cs-vm.
+//
+// Validation: install! checks the pass name against the global
+// registry at install time so user code gets an immediate error
+// rather than a silent skip at codegen time.
+//
+// These are higher-order builtins because they need `ctx.syms` to
+// resolve / intern Symbol names.
+
+fn b_install_optimizer_pass(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("install-optimizer-pass!", "1", args.len()));
+    }
+    let sym = match &args[0] {
+        Value::Symbol(s) => *s,
+        _ => {
+            return Err(type_err(
+                "install-optimizer-pass!",
+                "symbol (pass name)",
+                &args[0],
+            ));
+        }
+    };
+    let name = ctx.syms.name(sym).to_string();
+    let registry = cs_opt::PassRegistry::global()
+        .lock()
+        .map_err(|_| "install-optimizer-pass!: registry mutex poisoned".to_string())?;
+    if registry.get(&name).is_none() {
+        return Err(format!("install-optimizer-pass!: unknown pass {:?}", name));
+    }
+    drop(registry);
+    cs_opt::install_active_pass(&name);
+    Ok(Value::Unspecified)
+}
+
+fn b_remove_optimizer_pass(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("remove-optimizer-pass!", "1", args.len()));
+    }
+    let sym = match &args[0] {
+        Value::Symbol(s) => *s,
+        _ => {
+            return Err(type_err(
+                "remove-optimizer-pass!",
+                "symbol (pass name)",
+                &args[0],
+            ));
+        }
+    };
+    let name = ctx.syms.name(sym).to_string();
+    cs_opt::remove_active_pass(&name);
+    Ok(Value::Unspecified)
+}
+
+fn b_installed_optimizer_passes(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("installed-optimizer-passes", "0", args.len()));
+    }
+    let names = cs_opt::active_passes();
+    let syms: Vec<Value> = names
+        .into_iter()
+        .map(|s| Value::Symbol(ctx.syms.intern(&s)))
+        .collect();
+    Ok(Value::list(syms))
+}
+
+/// `(with-active-optimizer-passes '(name ...) thunk)` —
+/// run `(thunk)` with the optimizer's active-pass list scoped
+/// to the given names. The previous list is restored on
+/// return, even if `thunk` raises.
+///
+/// This is the closure-based stand-in for the ADR 0014 §5
+/// `parameterize`-over-`(active-passes)` design — install! /
+/// remove! mutate the SCOPED list inside the thunk, so their
+/// effects are local. Outside the thunk, the pre-call list is
+/// restored verbatim.
+///
+/// The names list must be a proper list of symbols; each name
+/// must validate against the global pass registry the same way
+/// `install-optimizer-pass!` does. A bad name fails the whole
+/// call (no scoped swap, no partial state).
+fn b_with_active_optimizer_passes(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("with-active-optimizer-passes", "2", args.len()));
+    }
+    let names_list = collect_proper_list("with-active-optimizer-passes", &args[0])?;
+    let mut names: Vec<String> = Vec::with_capacity(names_list.len());
+    for v in &names_list {
+        match v {
+            Value::Symbol(s) => names.push(ctx.syms.name(*s).to_string()),
+            _ => {
+                return Err(type_err(
+                    "with-active-optimizer-passes",
+                    "symbol (pass name)",
+                    v,
+                ))
+            }
+        }
+    }
+    // Validate names against the registry BEFORE entering the
+    // scoped guard so a typo doesn't leave us in an inconsistent
+    // state. Same check install-optimizer-pass! does.
+    {
+        let registry = cs_opt::PassRegistry::global()
+            .lock()
+            .map_err(|_| "with-active-optimizer-passes: registry mutex poisoned".to_string())?;
+        for name in &names {
+            if registry.get(name).is_none() {
+                return Err(format!(
+                    "with-active-optimizer-passes: unknown pass {:?}",
+                    name
+                ));
+            }
+        }
+    }
+    let thunk = args[1].clone();
+    // RAII guard fires on early return too — if apply_procedure
+    // returns Err, the guard restores the prev list on the
+    // way out via the `?` unwinding path. (Rust's `?` doesn't
+    // panic; the Drop runs because `_guard` is dropped at scope
+    // exit no matter how we leave.)
+    cs_opt::with_scoped_active_passes(names, || apply_procedure(&thunk, &[], ctx))
+        .map_err(|e| e.message())
 }
 
 // ---- SRFI-1 extras ----

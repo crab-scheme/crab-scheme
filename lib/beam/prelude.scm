@@ -51,15 +51,17 @@
 ; mailbox-order preservation across non-matches) lives in a
 ; later iter once mailbox introspection lands.
 
+; Each clause is `(pat body ...)` with an implicit `begin` around
+; the body — the standard Scheme convention.
 (define-syntax receive
   (syntax-rules (after)
-    ((_ (pat action) ...)
+    ((_ (pat body ...) ...)
      (let loop ()
        (let ((msg (raw-receive #f)))
          (cond
-           ((match-and-bind msg pat action) ...)
+           ((match-and-bind msg pat) body ...) ...
            (else (loop))))))
-    ((_ (pat action) ... (after timeout-ms timeout-action))
+    ((_ (pat body ...) ... (after timeout-ms timeout-action))
      (let ((deadline (+ (current-jiffy)
                         (* timeout-ms (/ (jiffies-per-second) 1000)))))
        (let loop ()
@@ -71,16 +73,18 @@
                 (msg (raw-receive remaining-ms)))
            (cond
              ((not msg) timeout-action)
-             ((match-and-bind msg pat action) ...)
+             ((match-and-bind msg pat) body ...) ...
              (else (loop)))))))))
 
-; Stub macro: in a real impl this is a pattern compiler. For
-; the prelude draft we expand to a simple equal? check.
+; Stub matcher: a real impl is a pattern compiler. For the
+; prelude draft we expand to a simple equal? check on a quoted
+; pattern. Returns truthy/falsy so the surrounding cond can run
+; the clause body via implicit begin.
 (define-syntax match-and-bind
   (syntax-rules (_)
-    ((_ msg _ action) action)
-    ((_ msg pat action)
-     (if (equal? msg pat) action #f))))
+    ((_ msg _) #t)
+    ((_ msg pat)
+     (equal? msg 'pat))))
 
 ; ============================================================
 ; PART 2 — call (synchronous RPC) over send + receive
@@ -162,16 +166,24 @@
 ;      and exits itself if children crash too fast (escalating
 ;      to its own supervisor).
 ;
-; Public API:
-;   (make-supervisor name children
-;     #:strategy 'one-for-one
-;     #:intensity 1
-;     #:period 5)
+; Public API (positional, with case-lambda overloads for defaults):
+;   (make-supervisor name children)
+;     => strategy 'one-for-one, intensity 1, period 5
+;   (make-supervisor name children strategy)
+;     => intensity 1, period 5
+;   (make-supervisor name children strategy intensity)
+;     => period 5
+;   (make-supervisor name children strategy intensity period)
 ;     -> supervisor-pid
 ;
 ;   (supervisor-which-children sup-pid) -> alist (id . pid)
 ;   (supervisor-terminate-child sup-pid id)
 ;   (supervisor-restart-child sup-pid id)
+;
+; Why positional + case-lambda instead of Racket #:keyword args:
+; the prelude is R6RS-conformant; cs-lex does not recognise `#:foo`
+; syntax (which is a Racket extension). case-lambda gives the same
+; "defaults for trailing args" ergonomics in pure R6RS.
 
 (define-record-type <child-spec>
   (make-child-spec id start-thunk restart shutdown child-type)
@@ -182,15 +194,20 @@
   (shutdown child-spec-shutdown) ; 'brutal-kill | <ms> | 'infinity
   (child-type child-spec-type))  ; 'worker | 'supervisor
 
-(define (make-supervisor name children
-                         #:strategy [strategy 'one-for-one]
-                         #:intensity [intensity 1]
-                         #:period [period 5])
-  (spawn
-    (lambda ()
-      (trap-exit! #t)
-      (supervisor-loop name children strategy intensity period
-                       (start-all children) '() 0))))
+(define make-supervisor
+  (case-lambda
+    ((name children)
+     (make-supervisor name children 'one-for-one 1 5))
+    ((name children strategy)
+     (make-supervisor name children strategy 1 5))
+    ((name children strategy intensity)
+     (make-supervisor name children strategy intensity 5))
+    ((name children strategy intensity period)
+     (spawn
+       (lambda ()
+         (trap-exit! #t)
+         (supervisor-loop name children strategy intensity period
+                          (start-all children) '() 0))))))
 
 (define (start-all child-specs)
   (map (lambda (spec)
@@ -317,30 +334,37 @@
 ; ============================================================
 ;
 ; (define-behavior <name>
-;   #:init    (lambda (args)        <body returning State>)
-;   #:handle-call (lambda (msg state) <returns (values Reply NewState)>)
-;   #:handle-cast (lambda (msg state) <returns NewState>)
-;   #:handle-info (lambda (msg state) <returns NewState>)
-;   #:terminate   (lambda (reason state) <cleanup>)
-;   #:code-change (lambda (from-version state extra)
-;                   <returns (values 'ok NewState)>))
+;   (init         (lambda (args)        <body returning State>))
+;   (handle-call  (lambda (msg state)   <returns (values Reply NewState)>))
+;   (handle-cast  (lambda (msg state)   <returns NewState>))
+;   (handle-info  (lambda (msg state)   <returns NewState>))
+;   (terminate    (lambda (reason state) <cleanup>))
+;   (code-change  (lambda (from-version state extra)
+;                   <returns (values 'ok NewState)>)))
 ;
 ; Expands to:
 ;   - (<name>-start args) — spawns the actor; returns its pid
 ;   - (<name>-call pid msg [timeout]) — synchronous RPC
 ;   - (<name>-cast pid msg) — fire-and-forget
 ;
-; The expansion is straightforward; we use syntax-rules for now.
+; Clause keys are bare symbols (`init`, `handle-call`, …) listed
+; in the macro's literals. The earlier `#:init` Racket-style
+; spelling was R6RS-non-conformant (cs-lex does not recognise
+; `#:foo`); the macro semantics are unchanged.
+;
+; The clauses must appear in the order shown above. A future
+; iter can lift the order constraint via a richer macro that
+; sorts / defaults missing clauses.
 
 (define-syntax define-behavior
   (syntax-rules (init handle-call handle-cast handle-info terminate code-change)
     ((_ name
-        #:init init-fn
-        #:handle-call call-fn
-        #:handle-cast cast-fn
-        #:handle-info info-fn
-        #:terminate term-fn
-        #:code-change cc-fn)
+        (init         init-fn)
+        (handle-call  call-fn)
+        (handle-cast  cast-fn)
+        (handle-info  info-fn)
+        (terminate    term-fn)
+        (code-change  cc-fn))
      (begin
        (define (name-start . args)
          (spawn
@@ -481,11 +505,11 @@
 ;
 ; (We don't redefine behavior-loop here — the version above
 ; already calls cc-fn with from-version/state/extra. Behaviors
-; whose #:code-change wraps run-state-migration get the
-; registered migration for free.)
+; whose (code-change …) clause wraps run-state-migration get
+; the registered migration for free.)
 ;
 ; Example wire-up inside a behavior body:
-;   #:code-change
+;   (code-change
 ;     (lambda (from-ver state _extra)
-;       (values 'ok (run-state-migration 'counter from-ver state)))
+;       (values 'ok (run-state-migration 'counter from-ver state))))
 

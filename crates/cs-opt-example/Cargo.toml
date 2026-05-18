@@ -1,0 +1,15 @@
+[package]
+name = "cs-opt-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "Reference third-party optimizer plugin for cs-opt (ADR 0014 iter 6)."
+
+[dependencies]
+cs-opt = { workspace = true }
+cs-rir = { workspace = true }
+
+[dev-dependencies]
+cs-core = { workspace = true }

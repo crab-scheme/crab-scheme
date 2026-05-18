@@ -1,0 +1,17 @@
+[package]
+name = "cs-pkg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme package manifest, lockfile, and library resolver. See docs/research/r6rs_extensions_spec.md §10."
+
+[dependencies]
+# cs-parse provides the s-expression reader; manifest + lockfile are
+# both parsed as Scheme datums and walked as a small AST. Avoids an
+# external TOML/JSON dependency for the v1 manifest format.
+cs-parse = { workspace = true }
+cs-core = { workspace = true }
+cs-diag = { workspace = true }
+thiserror = { workspace = true }

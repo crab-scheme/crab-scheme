@@ -16,4 +16,5 @@ cs-rir = { workspace = true }
 
 [dev-dependencies]
 cs-expand = { workspace = true }
+cs-runtime = { workspace = true }
 cs-vm = { workspace = true }

@@ -44,6 +44,110 @@ impl ExpandError {
 /// owned by a single layer.
 pub type IncludeResolver<'a> = dyn FnMut(&str) -> Option<(cs_diag::FileId, String)> + 'a;
 
+/// Callback the expander invokes when an `(import …)` form references a
+/// library that hasn't been declared in the current session. The
+/// resolver is given the library name spec (e.g., `(rnrs base)` or
+/// `(pkg http server)`) as a slice of interned symbols plus read-only
+/// access to the SymbolTable for printing, and returns
+/// `Some((file_id, source))` if it can locate the library file. The
+/// expander then parses + expands that source, expecting it to contain
+/// a matching `(library …)` declaration.
+///
+/// Architectural call: this is the integration seam for cs-pkg,
+/// `LIBRARY_PATH`-style search, or any other library-discovery
+/// mechanism. cs-expand stays agnostic — it never opens a file or
+/// names a package format.
+pub type LibraryResolver<'a> =
+    dyn FnMut(&[Symbol], &SymbolTable) -> Option<(cs_diag::FileId, String)> + 'a;
+
+/// Cache key for a loaded library: (name-segments, source-hash).
+/// Names are stored as `Vec<String>` (printable segment names)
+/// rather than `Vec<Symbol>` so the cache stays valid across
+/// SymbolTable boundaries -- Symbol IDs are per-table and
+/// shouldn't leak into long-lived state. The source-hash is a
+/// 64-bit content hash — if the resolved source's hash matches
+/// a cached entry, the parse + expand work is skipped and the
+/// cached CoreExpr is reused.
+pub type LibraryCacheKey = (Vec<String>, u64);
+
+/// A cached library expansion + its direct-import dependency
+/// closure. Phase 2F: when A imports B, A's cache entry records
+/// `(B's-name-segments, B's-source-hash-at-cache-time)` so the
+/// expander can re-resolve B on cache hit and detect upstream
+/// changes even if A's own source is unchanged.
+///
+/// Transitive deps fall out naturally: invalidating B (because
+/// some C in B's deps changed) re-expands B, which gets a new
+/// hash, which differs from what A cached for its B-dep, which
+/// invalidates A.
+///
+/// Dep names are stored as `Vec<String>` (printable segment
+/// names) instead of `Vec<Symbol>` so the cache stays valid
+/// across SymbolTable boundaries. Symbol IDs are per-table;
+/// reusing them in a different session would index into the
+/// wrong slot. The validator re-interns the strings against
+/// the current session's SymbolTable before resolving.
+#[derive(Clone, Debug)]
+pub struct LibraryCacheEntry {
+    pub core_expr: CoreExpr,
+    /// Each entry: `(dep-library-name-segments, dep-source-hash-at-cache-time)`.
+    pub deps: Vec<(Vec<String>, u64)>,
+}
+
+/// Cache for the expanded form of cross-file libraries. The
+/// expander consults this in [`Expander::try_load_library`]
+/// after the resolver returns source but before parsing +
+/// expansion. Callers can plug in any backend (in-memory map,
+/// on-disk file-system cache, content-addressed store, …); the
+/// default in-process backend is [`HashMapLibraryCache`].
+pub trait LibraryCache {
+    fn get(&self, key: &LibraryCacheKey) -> Option<LibraryCacheEntry>;
+    fn put(&mut self, key: LibraryCacheKey, value: LibraryCacheEntry);
+}
+
+/// Simple in-memory `LibraryCache` keyed by name+hash. Reset
+/// each Expander session unless the caller persists it across
+/// sessions.
+#[derive(Default)]
+pub struct HashMapLibraryCache {
+    entries: std::collections::HashMap<LibraryCacheKey, LibraryCacheEntry>,
+}
+
+impl HashMapLibraryCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl LibraryCache for HashMapLibraryCache {
+    fn get(&self, key: &LibraryCacheKey) -> Option<LibraryCacheEntry> {
+        self.entries.get(key).cloned()
+    }
+    fn put(&mut self, key: LibraryCacheKey, value: LibraryCacheEntry) {
+        self.entries.insert(key, value);
+    }
+}
+
+/// 64-bit content hash for library source. Stable for the
+/// process; not stable across rebuilds (uses Rust's
+/// `DefaultHasher`). For an on-disk persistent cache, swap to a
+/// proper content-addressed hash (sha256, blake3, etc.) at the
+/// trait impl layer.
+fn hash_library_source(src: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    src.hash(&mut h);
+    h.finish()
+}
+
 pub struct Expander<'a> {
     pub syms: &'a mut SymbolTable,
     pub macros: &'a mut std::collections::HashMap<Symbol, Macro>,
@@ -55,6 +159,14 @@ pub struct Expander<'a> {
     gensym_counter: u32,
     /// Hook for `(include "path")` forms.
     include_resolver: Option<&'a mut IncludeResolver<'a>>,
+    /// Hook for `(import (name …))` forms whose library hasn't been
+    /// declared in this session. See [`LibraryResolver`].
+    library_resolver: Option<&'a mut LibraryResolver<'a>>,
+    /// Optional content-hash cache for cross-file library loads.
+    /// When set, the expander consults it in `try_load_library`
+    /// before re-parsing + re-expanding identical sources. See
+    /// [`LibraryCache`].
+    library_cache: Option<&'a mut dyn LibraryCache>,
     /// Per-Expander record-type registry. Populated each time
     /// `define-record-type` expands; consulted when a child names a
     /// `(parent <type-name>)` so we can resolve its tag chain and inherited
@@ -76,6 +188,45 @@ pub struct Expander<'a> {
     /// registry adds validation and a structural foothold for the
     /// per-library scope frames that land in the next pre-M5 step.
     libraries: std::collections::HashMap<Vec<Symbol>, LibraryInfo>,
+    /// Stack of currently-bound syntax-case pattern variables, used
+    /// by `(syntax X)` template instantiation. Each entry is
+    /// `(name, depth)` -- depth is 0 for ordinary scalar pvars,
+    /// 1 for pvars bound under one ellipsis (`...`), 2 for two
+    /// nesting levels, etc. Iter C2 introduced depth-1 pvars
+    /// (single-pvar ellipsis); Iter C3 adds depth-1 for
+    /// compound-pattern ellipsis.
+    ///
+    /// Each call to `expand_syntax_case` / `expand_with_syntax`
+    /// pushes its clause-local pvars before expanding the clause
+    /// body and pops them after. Nested syntax-binding forms
+    /// inherit the outer pvars by reading the full stack at
+    /// expansion time, so `(syntax X)` resolves correctly when X
+    /// is bound at any surrounding scope.
+    syntax_pvars: Vec<(Symbol, u32)>,
+    /// Stack of in-progress library loads' direct-dep
+    /// collectors. Phase 2F: when `try_load_library(A)` runs and
+    /// recursively triggers `try_load_library(B)` for one of A's
+    /// imports, B's `(name, source-hash)` is appended to the top
+    /// of this stack so it gets attached to A's cache entry on
+    /// completion. Empty when no library is being loaded.
+    library_dep_stack: Vec<Vec<(Vec<String>, u64)>>,
+    /// Phase 2A.2 user-defined syntax class registry. Each
+    /// `(define-syntax-class name predicate)` form binds
+    /// `name -> predicate-symbol`. The `define-syntax-parser`
+    /// dispatcher consults this map (after the four built-in
+    /// classes id/expr/number/string) when resolving `name:class`
+    /// annotations in user macro patterns. Cleared per Expander
+    /// session; user classes don't persist across sessions
+    /// unless registered before the session begins.
+    syntax_classes: std::collections::HashMap<Symbol, Symbol>,
+    /// Stack of mark-expression Datums, one per enclosing
+    /// syntax-case form being expanded. The top-of-stack entry
+    /// is consumed by `compile_syntax_template` (Phase 1.5
+    /// Iter C) to stamp non-pvar identifiers in templates with
+    /// the right per-expansion mark. Standalone `(syntax T)`
+    /// outside any syntax-case body (empty stack) gets a
+    /// literal 0 (the "unmarked" identifier).
+    syntax_mark_exprs: Vec<Datum>,
 }
 
 /// Compile-time info recorded for each `(library ...)` declaration.
@@ -169,9 +320,17 @@ struct Keywords {
     immutable: Symbol,
     mutable: Symbol,
     define_syntax: Symbol,
+    define_syntax_parser: Symbol,
+    define_syntax_class: Symbol,
     let_syntax: Symbol,
     letrec_syntax: Symbol,
     syntax_rules: Symbol,
+    syntax_case: Symbol,
+    syntax_: Symbol,
+    with_syntax: Symbol,
+    quasisyntax: Symbol,
+    unsyntax: Symbol,
+    unsyntax_splicing: Symbol,
     syntax_error: Symbol,
     ellipsis: Symbol,
     underscore: Symbol,
@@ -188,6 +347,7 @@ struct Keywords {
     cond_expand: Symbol,
     include: Symbol,
     endianness: Symbol,
+    submodule: Symbol,
 }
 
 impl Keywords {
@@ -225,9 +385,17 @@ impl Keywords {
             immutable: syms.intern("immutable"),
             mutable: syms.intern("mutable"),
             define_syntax: syms.intern("define-syntax"),
+            define_syntax_parser: syms.intern("define-syntax-parser"),
+            define_syntax_class: syms.intern("define-syntax-class"),
             let_syntax: syms.intern("let-syntax"),
             letrec_syntax: syms.intern("letrec-syntax"),
             syntax_rules: syms.intern("syntax-rules"),
+            syntax_case: syms.intern("syntax-case"),
+            syntax_: syms.intern("syntax"),
+            with_syntax: syms.intern("with-syntax"),
+            quasisyntax: syms.intern("quasisyntax"),
+            unsyntax: syms.intern("unsyntax"),
+            unsyntax_splicing: syms.intern("unsyntax-splicing"),
             syntax_error: syms.intern("syntax-error"),
             ellipsis: syms.intern("..."),
             underscore: syms.intern("_"),
@@ -244,6 +412,7 @@ impl Keywords {
             cond_expand: syms.intern("cond-expand"),
             include: syms.intern("include"),
             endianness: syms.intern("endianness"),
+            submodule: syms.intern("submodule"),
         }
     }
 }
@@ -260,8 +429,14 @@ impl<'a> Expander<'a> {
             keywords,
             gensym_counter: 0,
             include_resolver: None,
+            library_resolver: None,
+            library_cache: None,
             record_types: std::collections::HashMap::new(),
             condition_types: std::collections::HashMap::new(),
+            syntax_pvars: Vec::new(),
+            library_dep_stack: Vec::new(),
+            syntax_classes: std::collections::HashMap::new(),
+            syntax_mark_exprs: Vec::new(),
             libraries: std::collections::HashMap::new(),
         }
     }
@@ -270,6 +445,26 @@ impl<'a> Expander<'a> {
     /// invoke this callback with the literal path string from the form.
     pub fn with_include_resolver(mut self, resolver: &'a mut IncludeResolver<'a>) -> Self {
         self.include_resolver = Some(resolver);
+        self
+    }
+
+    /// Install a library resolver. When `(import (name …))` references
+    /// a library not declared in this session, the expander calls
+    /// this with the symbol-list name; the resolver returns the
+    /// library file's source (or `None` to leave the import as a
+    /// no-op rename collector, matching the legacy behavior).
+    pub fn with_library_resolver(mut self, resolver: &'a mut LibraryResolver<'a>) -> Self {
+        self.library_resolver = Some(resolver);
+        self
+    }
+
+    /// Install a library cache. When set, the expander consults
+    /// the cache by `(name, source-hash)` before parsing +
+    /// expanding library source returned from the resolver. On a
+    /// hit the cached CoreExpr is reused; on a miss the expander
+    /// stores the freshly-expanded form keyed by the same hash.
+    pub fn with_library_cache(mut self, cache: &'a mut dyn LibraryCache) -> Self {
+        self.library_cache = Some(cache);
         self
     }
 
@@ -316,6 +511,12 @@ impl<'a> Expander<'a> {
                 if *s == self.keywords.define_syntax {
                     return self.expand_define_syntax(&tail, d.span());
                 }
+                if *s == self.keywords.define_syntax_parser {
+                    return self.expand_define_syntax_parser(&tail, d.span());
+                }
+                if *s == self.keywords.define_syntax_class {
+                    return self.expand_define_syntax_class(&tail, d.span());
+                }
                 if *s == self.keywords.include {
                     return self.expand_include(&tail, d.span());
                 }
@@ -327,6 +528,31 @@ impl<'a> Expander<'a> {
                 }
                 if *s == self.keywords.import {
                     return self.expand_import(&tail, d.span());
+                }
+                // Top-level `begin` splices its children at the
+                // top level so that a `(begin (define ...) ...)`
+                // produced by a macro is treated the same as
+                // writing those defines directly. This matches
+                // R7RS top-level begin semantics.
+                if *s == self.keywords.begin {
+                    let mut exprs = Vec::with_capacity(tail.len());
+                    for child in &tail {
+                        exprs.push(self.expand_top(child)?);
+                    }
+                    return Ok(CoreExpr::Begin {
+                        exprs,
+                        span: d.span(),
+                    });
+                }
+                // Top-level macro use: expand once, then route the
+                // expansion back through expand_top so a macro that
+                // yields a `(define ...)` (or any other top-level-
+                // only form) is recognized as such. Without this,
+                // the expansion falls into expand_pair which only
+                // handles expression-position forms.
+                if self.macros.contains_key(s) {
+                    let expanded = self.try_expand_macro(*s, d)?;
+                    return self.expand_top(&expanded);
                 }
             }
         }
@@ -425,15 +651,109 @@ impl<'a> Expander<'a> {
         // is the next pre-M5 step. The export list is now validated
         // and tracked, so future scope work has the manifest to filter
         // against.
+        //
+        // Phase 3B: `(submodule NAME body...)` clauses inside the
+        // body are lifted into sibling library declarations named
+        // `(parent... NAME)` and expanded after the parent body so
+        // they can see the parent's defines (the global-namespace
+        // milestone means parent bindings are visible).
         let body = &items[3..];
         let mut exprs: Vec<CoreExpr> = Vec::with_capacity(body.len() + 1);
         // Run the import effects first so library bodies have access
         // to renamed bindings before their `define`s run.
         exprs.push(import_expr);
+        let mut deferred_submodules: Vec<CoreExpr> = Vec::new();
         for d in body {
+            if let Some((head, sub_tail)) = list_head(d) {
+                if let Datum::Symbol(s, _) = &*head {
+                    if *s == self.keywords.submodule {
+                        let lifted = self.lift_submodule(&name_syms, &sub_tail, d.span())?;
+                        deferred_submodules.push(lifted);
+                        continue;
+                    }
+                }
+            }
             exprs.push(self.expand_top(d)?);
         }
+        exprs.extend(deferred_submodules);
         Ok(CoreExpr::Begin { exprs, span })
+    }
+
+    /// Phase 3B: lift a `(submodule NAME body...)` into a sibling
+    /// library declaration named `(parent... NAME)` and expand it.
+    /// Submodules can optionally provide leading `(export ...)`
+    /// and/or `(import ...)` clauses; missing clauses default to
+    /// empty `(export)` / `(import)` respectively. Body expressions
+    /// see the parent's bindings because the library system is
+    /// still global at this milestone.
+    fn lift_submodule(
+        &mut self,
+        parent_name: &[Symbol],
+        tail: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        if tail.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "submodule needs a name".into(),
+                span,
+            });
+        }
+        let sub_name_sym = match &tail[0] {
+            Datum::Symbol(s, _) => *s,
+            _ => {
+                return Err(ExpandError::BadSyntax {
+                    what: "submodule name must be a single identifier".into(),
+                    span: tail[0].span(),
+                })
+            }
+        };
+        // Build the sibling library name list as datum form
+        // ((parent...) sub_name).
+        let mut full_name_parts: Vec<Datum> = parent_name
+            .iter()
+            .map(|s| Datum::Symbol(*s, span))
+            .collect();
+        full_name_parts.push(Datum::Symbol(sub_name_sym, span));
+        let name_datum = Self::datum_list(full_name_parts, span);
+
+        // Walk the rest of the submodule's body, extracting any
+        // leading `(export ...)` and `(import ...)` clauses, then
+        // the body expressions.
+        let mut export_clause: Option<Datum> = None;
+        let mut import_clause: Option<Datum> = None;
+        let mut body_items: Vec<Datum> = Vec::new();
+        for d in &tail[1..] {
+            if let Some((head, _)) = list_head(d) {
+                if let Datum::Symbol(s, _) = &*head {
+                    if *s == self.keywords.export && export_clause.is_none() {
+                        export_clause = Some(d.clone());
+                        continue;
+                    }
+                    if *s == self.keywords.import && import_clause.is_none() {
+                        import_clause = Some(d.clone());
+                        continue;
+                    }
+                }
+            }
+            body_items.push(d.clone());
+        }
+        let export_kw = self.keywords.export;
+        let import_kw = self.keywords.import;
+        let export_datum = export_clause
+            .unwrap_or_else(|| Self::datum_list(vec![Datum::Symbol(export_kw, span)], span));
+        let import_datum = import_clause
+            .unwrap_or_else(|| Self::datum_list(vec![Datum::Symbol(import_kw, span)], span));
+
+        // Synthesize (library (parent... sub) (export ...) (import ...) body...).
+        let mut library_parts: Vec<Datum> = vec![
+            Datum::Symbol(self.keywords.library, span),
+            name_datum,
+            export_datum,
+            import_datum,
+        ];
+        library_parts.extend(body_items);
+        let library_form = Self::datum_list(library_parts, span);
+        self.expand_top(&library_form)
     }
 
     /// Parse a library name datum list into the canonical symbol list,
@@ -668,20 +988,23 @@ impl<'a> Expander<'a> {
     /// library scope filters out non-imported names.
     fn expand_import(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
         let mut renames: Vec<(Symbol, Symbol)> = Vec::new();
+        let mut loaded_bodies: Vec<CoreExpr> = Vec::new();
         for spec in items {
-            self.collect_import_renames(spec, &mut renames)?;
+            self.collect_import_renames(spec, &mut renames, &mut loaded_bodies)?;
         }
-        if renames.is_empty() {
+        if renames.is_empty() && loaded_bodies.is_empty() {
             return Ok(CoreExpr::Const {
                 value: Value::Unspecified,
                 span,
             });
         }
+        // Splice the loaded library bodies FIRST so their top-level
+        // defines run before any subsequent renames refer to them.
+        let mut exprs: Vec<CoreExpr> = loaded_bodies;
         // Synthesize `(define <new> <old>)` for each rename. The
         // expander lowers top-level define to CoreExpr::Set, which the
         // runtime treats as a top-level binding (auto-defined on first
         // assignment), so the renamed name becomes a fresh global.
-        let mut exprs: Vec<CoreExpr> = Vec::with_capacity(renames.len());
         for (old, new) in renames {
             exprs.push(CoreExpr::Set {
                 name: new,
@@ -692,14 +1015,174 @@ impl<'a> Expander<'a> {
         Ok(CoreExpr::Begin { exprs, span })
     }
 
+    /// Try to load a library that hasn't been declared in this
+    /// session. Returns the expanded library body's CoreExpr (a
+    /// Begin that includes the library's defines) if a resolver
+    /// was installed and produced a source. Returns `Ok(None)` if
+    /// no resolver was installed — the bare reference behaves as
+    /// before (no-op).
+    fn try_load_library(
+        &mut self,
+        name: &[Symbol],
+        span: Span,
+    ) -> Result<Option<CoreExpr>, ExpandError> {
+        // Already loaded in this session — nothing to do.
+        if self.libraries.contains_key(name) {
+            return Ok(None);
+        }
+        let (file_id, src) = match &mut self.library_resolver {
+            Some(r) => match r(name, self.syms) {
+                Some(loaded) => loaded,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        let source_hash = hash_library_source(&src);
+
+        // Record this library as a direct dep of the parent
+        // load (if any). Phase 2F dep-closure tracking: store the
+        // observed (name-as-strings, source_hash) on the parent's
+        // collection. We convert Symbols to Strings so cached
+        // entries stay valid across SymbolTable boundaries.
+        if let Some(parent_deps) = self.library_dep_stack.last_mut() {
+            let name_strs: Vec<String> = name
+                .iter()
+                .map(|s| self.syms.name(*s).to_string())
+                .collect();
+            parent_deps.push((name_strs, source_hash));
+        }
+
+        // Cache key uses printable name strings for cross-session
+        // SymbolTable safety; see LibraryCacheKey doc.
+        let name_strs: Vec<String> = name
+            .iter()
+            .map(|s| self.syms.name(*s).to_string())
+            .collect();
+        let cache_key: LibraryCacheKey = (name_strs, source_hash);
+
+        // Content-hash cache lookup. A hit additionally validates
+        // each cached dep by re-resolving + re-hashing it; if any
+        // upstream lib has drifted we fall through to a fresh
+        // expansion.
+        let cache_hit_valid: Option<LibraryCacheEntry> = {
+            let cached = self
+                .library_cache
+                .as_deref()
+                .and_then(|c| c.get(&cache_key));
+            match cached {
+                Some(entry) => {
+                    if self.cached_deps_still_valid(&entry.deps) {
+                        Some(entry)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        if let Some(entry) = cache_hit_valid {
+            // Replay the expansion to populate self.libraries
+            // via the (library …) declaration's side effect.
+            // Then return the cached body.
+            let data = cs_parse::read_all(file_id, &src, self.syms)
+                .map_err(|errs| parse_err(errs, name, self.syms, span))?;
+            for d in &data {
+                self.expand_top(d)?;
+            }
+            return Ok(Some(entry.core_expr));
+        }
+
+        // Cache miss (or invalidated): full parse + expand,
+        // tracking THIS library's direct deps.
+        self.library_dep_stack.push(Vec::new());
+        let data = cs_parse::read_all(file_id, &src, self.syms)
+            .map_err(|errs| parse_err(errs, name, self.syms, span))?;
+        // The loaded file should declare a `(library …)` form. Expand
+        // each top-level datum so the (library …) registration
+        // populates self.libraries and the body defines splice into
+        // the importer's scope.
+        let mut exprs: Vec<CoreExpr> = Vec::with_capacity(data.len());
+        for d in &data {
+            exprs.push(self.expand_top(d)?);
+        }
+        let collected_deps = self.library_dep_stack.pop().expect("pushed above");
+        if !self.libraries.contains_key(name) {
+            return Err(ExpandError::BadSyntax {
+                what: format!(
+                    "library file did not declare library {}",
+                    format_library_name(name, self.syms)
+                ),
+                span,
+            });
+        }
+        let result = CoreExpr::Begin { exprs, span };
+        if let Some(cache) = self.library_cache.as_deref_mut() {
+            cache.put(
+                cache_key,
+                LibraryCacheEntry {
+                    core_expr: result.clone(),
+                    deps: collected_deps,
+                },
+            );
+        }
+        Ok(Some(result))
+    }
+
+    /// Phase 2F: re-resolve each cached dep and compare its
+    /// current source hash to the cached value. Returns true if
+    /// every dep still matches, false if any has drifted (which
+    /// means the cached entry is stale).
+    ///
+    /// If the resolver returns None for a dep (gone), treat as
+    /// drift (invalidate). If no resolver is installed, treat
+    /// as valid (we couldn't have loaded the dep anyway).
+    fn cached_deps_still_valid(&mut self, deps: &[(Vec<String>, u64)]) -> bool {
+        if self.library_resolver.is_none() {
+            return true;
+        }
+        // Re-intern each dep's printable name into the current
+        // SymbolTable, then call the resolver with the fresh
+        // Symbol IDs. We do the interning first (with the
+        // SymbolTable borrowed mutably) and only afterwards
+        // borrow the resolver, so the two mutable borrows don't
+        // overlap.
+        let mut resolved: Vec<(Vec<Symbol>, u64)> = Vec::with_capacity(deps.len());
+        for (dep_name_strs, cached_hash) in deps {
+            let name_syms: Vec<Symbol> =
+                dep_name_strs.iter().map(|s| self.syms.intern(s)).collect();
+            resolved.push((name_syms, *cached_hash));
+        }
+        let resolver = self.library_resolver.as_deref_mut().expect("checked above");
+        for (name_syms, cached_hash) in &resolved {
+            match resolver(name_syms, self.syms) {
+                Some((_, src)) => {
+                    if hash_library_source(&src) != *cached_hash {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// Walk an import-spec shape and accumulate any `rename` pairs into
     /// `out`. Other modifier shapes (`only`/`except`/`prefix`) are
     /// validated for syntactic well-formedness but contribute nothing —
     /// they become enforceable when we have per-library scopes.
+    ///
+    /// Bare library references — `(rnrs base)`, `(pkg http server)`,
+    /// etc. — additionally try to load the library file via
+    /// [`Self::try_load_library`] when a [`LibraryResolver`] is
+    /// installed and the library hasn't been declared in this
+    /// session. The expanded library body is pushed into
+    /// `loaded_bodies` so the caller can splice it into the
+    /// importer's compilation BEFORE the rename defines fire.
     fn collect_import_renames(
         &mut self,
         spec: &Datum,
         out: &mut Vec<(Symbol, Symbol)>,
+        loaded_bodies: &mut Vec<CoreExpr>,
     ) -> Result<(), ExpandError> {
         let parts = collect_proper_list_strict(spec).ok_or(ExpandError::BadSyntax {
             what: "import spec must be a list".into(),
@@ -727,7 +1210,7 @@ impl<'a> Expander<'a> {
                         span: spec.span(),
                     });
                 }
-                self.collect_import_renames(&parts[1], out)?;
+                self.collect_import_renames(&parts[1], out, loaded_bodies)?;
                 for id in &parts[2..] {
                     if !matches!(id, Datum::Symbol(_, _)) {
                         return Err(ExpandError::BadSyntax {
@@ -745,7 +1228,7 @@ impl<'a> Expander<'a> {
                         span: spec.span(),
                     });
                 }
-                self.collect_import_renames(&parts[1], out)?;
+                self.collect_import_renames(&parts[1], out, loaded_bodies)?;
                 if !matches!(&parts[2], Datum::Symbol(_, _)) {
                     return Err(ExpandError::BadSyntax {
                         what: "prefix: third element must be an identifier".into(),
@@ -761,7 +1244,7 @@ impl<'a> Expander<'a> {
                         span: spec.span(),
                     });
                 }
-                self.collect_import_renames(&parts[1], out)?;
+                self.collect_import_renames(&parts[1], out, loaded_bodies)?;
                 for pair in &parts[2..] {
                     let pair_items =
                         collect_proper_list_strict(pair).ok_or(ExpandError::BadSyntax {
@@ -797,7 +1280,17 @@ impl<'a> Expander<'a> {
                 return Ok(());
             }
         }
-        // Bare library reference — no rename effect.
+        // Bare library reference. Try to load the library via the
+        // installed LibraryResolver if it hasn't been declared in
+        // this session. Loading splices the library body's top-level
+        // forms (defines, macros, etc.) into the importer's scope —
+        // matching the legacy "library body splices into importer"
+        // semantics. No rename effect at this layer; per-library
+        // export filtering is its own milestone.
+        let name = self.parse_library_name(&parts, spec.span())?;
+        if let Some(body) = self.try_load_library(&name, spec.span())? {
+            loaded_bodies.push(body);
+        }
         Ok(())
     }
 
@@ -938,6 +1431,237 @@ impl<'a> Expander<'a> {
     }
 
     /// `(define-syntax name (syntax-rules (literals...) (pattern template) ...))`
+    /// R6RS++ Phase 2A.2: `(define-syntax-class name predicate)`.
+    /// Binds `name` as a user-defined syntax class. After
+    /// definition, patterns like `pat:name` inside
+    /// `define-syntax-parser` clauses consult the registered
+    /// predicate to constrain matched values.
+    ///
+    /// Simple predicate form only; Racket's compound class
+    /// definitions (`(pattern ... #:when ...)`) defer to a later
+    /// iter.
+    ///
+    /// Lowers to a no-op CoreExpr (Unspecified). The registry
+    /// update is the side effect.
+    fn expand_define_syntax_class(
+        &mut self,
+        items: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        if items.len() != 2 {
+            return Err(ExpandError::BadSyntax {
+                what: "define-syntax-class: (define-syntax-class name predicate)".into(),
+                span,
+            });
+        }
+        let name = match &items[0] {
+            Datum::Symbol(s, _) => *s,
+            other => {
+                return Err(ExpandError::BadSyntax {
+                    what: "define-syntax-class: name must be a symbol".into(),
+                    span: other.span(),
+                });
+            }
+        };
+        let pred = match &items[1] {
+            Datum::Symbol(s, _) => *s,
+            other => {
+                return Err(ExpandError::BadSyntax {
+                    what: "define-syntax-class: predicate must be a bare symbol naming a procedure"
+                        .into(),
+                    span: other.span(),
+                });
+            }
+        };
+        self.syntax_classes.insert(name, pred);
+        Ok(CoreExpr::Const {
+            value: Value::Unspecified,
+            span,
+        })
+    }
+
+    /// R6RS++ Phase 2A.1: `(define-syntax-parser name clause ...)`.
+    /// Each clause is `[(_ pat ...) body ...]` where pattern items
+    /// may be annotated `id:class` to constrain the matched value
+    /// to a specific syntax class.
+    ///
+    /// Implementation strategy: desugar to `(define-syntax name
+    /// (syntax-rules () (<stripped-pat> <class-checked-body>)
+    /// ...))` where `:class` annotations are stripped from the
+    /// pattern (leaving just the pvar name) and each annotated
+    /// pvar gains a runtime predicate check at the top of the
+    /// template body. If the check fails, an error is raised.
+    ///
+    /// Supported classes (resolved via builtin predicates):
+    ///   id       -> identifier?
+    ///   expr     -> (always #t)
+    ///   number   -> number?
+    ///   string   -> string?
+    ///
+    /// Limitation: the class check fires at RUNTIME of the
+    /// expanded code, not at expand time. Phase 2A.4 lifts this
+    /// to expand-time pinpointing.
+    fn expand_define_syntax_parser(
+        &mut self,
+        items: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        if items.len() < 2 {
+            return Err(ExpandError::BadSyntax {
+                what: "define-syntax-parser: (define-syntax-parser name clause ...)".into(),
+                span,
+            });
+        }
+        let name_datum = items[0].clone();
+        let clause_datums = &items[1..];
+        // Build the syntax-rules form: (syntax-rules () <translated-clauses>...)
+        // For each clause: walk the pattern, strip ":class" annotations,
+        // wrap body in class-check ifs.
+        let mut translated_clauses: Vec<Datum> = Vec::with_capacity(clause_datums.len());
+        for clause in clause_datums {
+            let parts = collect_proper_list_strict(clause).ok_or(ExpandError::BadSyntax {
+                what: "define-syntax-parser clause must be (pattern body ...)".into(),
+                span: clause.span(),
+            })?;
+            if parts.len() < 2 {
+                return Err(ExpandError::BadSyntax {
+                    what: "define-syntax-parser clause needs pattern + body".into(),
+                    span: clause.span(),
+                });
+            }
+            let pattern = &parts[0];
+            let body_datums = &parts[1..];
+            // Walk the pattern, collecting class checks.
+            // class_checks: each entry is (pvar-sym, class-name-str)
+            let mut class_checks: Vec<(Symbol, String)> = Vec::new();
+            let stripped_pattern = strip_class_annotations(pattern, &mut class_checks, self.syms);
+            // Wrap body in a (begin) and prepend class-check ifs from
+            // OUTSIDE in (deepest check innermost so first-failing
+            // check fires its error first).
+            let body_begin = if body_datums.len() == 1 {
+                body_datums[0].clone()
+            } else {
+                let mut all = vec![Datum::Symbol(self.keywords.begin, clause.span())];
+                all.extend(body_datums.iter().cloned());
+                mk_list(all, clause.span())
+            };
+            // Build the class-checked body bottom-up.
+            let mut checked_body = body_begin;
+            for (pvar, class_name) in class_checks.iter().rev() {
+                let pred = match class_name.as_str() {
+                    "id" => Some(self.syms.intern("identifier?")),
+                    "number" => Some(self.syms.intern("number?")),
+                    "string" => Some(self.syms.intern("string?")),
+                    "expr" => None, // matches anything
+                    other => {
+                        // Phase 2A.2: consult user-defined
+                        // syntax-class registry. Intern the
+                        // class-name symbol and look up.
+                        let name_sym = self.syms.intern(other);
+                        match self.syntax_classes.get(&name_sym) {
+                            Some(p) => Some(*p),
+                            None => {
+                                return Err(ExpandError::BadSyntax {
+                                    what: format!(
+                                        "define-syntax-parser: unknown syntax class `{}` (built-in: id, expr, number, string; user classes registered via define-syntax-class)",
+                                        class_name
+                                    ),
+                                    span: clause.span(),
+                                });
+                            }
+                        }
+                    }
+                };
+                if let Some(pred_sym) = pred {
+                    // For :id, the matched pvar is a literal
+                    // identifier -- evaluating it as a variable
+                    // ref would crash with undefined. Wrap in
+                    // (quote pvar) so the predicate sees the
+                    // symbol itself. For value-classes (:number,
+                    // :string), the bare pvar is fine: the
+                    // matched expression evaluates to a value
+                    // and the predicate checks it.
+                    let pvar_for_check = if class_name == "id" {
+                        mk_list(
+                            vec![
+                                Datum::Symbol(self.keywords.quote, clause.span()),
+                                Datum::Symbol(*pvar, clause.span()),
+                            ],
+                            clause.span(),
+                        )
+                    } else {
+                        Datum::Symbol(*pvar, clause.span())
+                    };
+                    // (if (pred pvar-for-check) checked_body
+                    //   (error 'name "expected <class>" pvar-for-check))
+                    let pred_call = mk_list(
+                        vec![
+                            Datum::Symbol(pred_sym, clause.span()),
+                            pvar_for_check.clone(),
+                        ],
+                        clause.span(),
+                    );
+                    let macro_name_sym = match &name_datum {
+                        Datum::Symbol(s, _) => *s,
+                        _ => self.syms.intern("define-syntax-parser"),
+                    };
+                    let error_call = mk_list(
+                        vec![
+                            Datum::Symbol(self.syms.intern("error"), clause.span()),
+                            mk_list(
+                                vec![
+                                    Datum::Symbol(self.keywords.quote, clause.span()),
+                                    Datum::Symbol(macro_name_sym, clause.span()),
+                                ],
+                                clause.span(),
+                            ),
+                            Datum::String(
+                                Rc::new(format!(
+                                    "expected {} for `{}`",
+                                    class_name,
+                                    self.syms.name(*pvar)
+                                )),
+                                clause.span(),
+                            ),
+                            pvar_for_check,
+                        ],
+                        clause.span(),
+                    );
+                    checked_body = mk_list(
+                        vec![
+                            Datum::Symbol(self.keywords.if_, clause.span()),
+                            pred_call,
+                            checked_body,
+                            error_call,
+                        ],
+                        clause.span(),
+                    );
+                }
+            }
+            translated_clauses.push(mk_list(vec![stripped_pattern, checked_body], clause.span()));
+        }
+        // Build (define-syntax <name> (syntax-rules () <clauses>...))
+        let mut sr_items = vec![
+            Datum::Symbol(self.keywords.syntax_rules, span),
+            Datum::Null(span), // empty literals list
+        ];
+        sr_items.extend(translated_clauses);
+        let syntax_rules_form = mk_list(sr_items, span);
+        let define_syntax_form = mk_list(
+            vec![
+                Datum::Symbol(self.keywords.define_syntax, span),
+                name_datum,
+                syntax_rules_form,
+            ],
+            span,
+        );
+        // define-syntax is a top-level form, not an expression --
+        // it lives in expand_top's dispatch table. Route there
+        // directly instead of via self.expand (which goes to
+        // expand_pair and wouldn't recognize the form).
+        self.expand_top(&define_syntax_form)
+    }
+
     fn expand_define_syntax(
         &mut self,
         items: &[Datum],
@@ -1154,6 +1878,30 @@ impl<'a> Expander<'a> {
                 // for syntax-rules templates that need to reject a
                 // malformed input pattern.
                 return self.expand_syntax_error(&tail_items, span);
+            }
+            if s == self.keywords.syntax_case {
+                return self.expand_syntax_case(&tail_items, span);
+            }
+            if s == self.keywords.syntax_ {
+                return self.expand_syntax_form(&tail_items, span);
+            }
+            if s == self.keywords.with_syntax {
+                return self.expand_with_syntax(&tail_items, span);
+            }
+            if s == self.keywords.quasisyntax {
+                if tail_items.len() != 1 {
+                    return Err(ExpandError::BadSyntax {
+                        what: "quasisyntax takes exactly 1 argument".into(),
+                        span,
+                    });
+                }
+                return self.expand_quasisyntax(&tail_items[0], 1, span);
+            }
+            if s == self.keywords.unsyntax || s == self.keywords.unsyntax_splicing {
+                return Err(ExpandError::BadSyntax {
+                    what: "unsyntax / unsyntax-splicing only valid inside quasisyntax".into(),
+                    span,
+                });
             }
             if s == self.keywords.delay_force {
                 // R7RS delay-force: same expansion as delay (a thunk-wrapping
@@ -1994,6 +2742,467 @@ impl<'a> Expander<'a> {
             body: Rc::new(acc),
             span,
         })
+    }
+
+    // ---- R6RS++ §12 (#118) Iter B: syntax-case form ----
+    //
+    // `(syntax-case <expr> (<literal>...) (<pattern> <template>) ...)`
+    //
+    // Iter B implements the runtime form: matches `<expr>` against
+    // each pattern in turn; on first match, evaluates the
+    // corresponding template with pattern variables in scope.
+    // The pattern grammar matches the syntax-rules subset (no
+    // ellipsis -- Iter C):
+    //   _                 wildcard, no binding
+    //   <literal-sym>     matches `eq?` to <literal-sym> (must
+    //                     appear in the literals list)
+    //   <pvar>            binds the matched value
+    //   <number|string|bool|char>  matches `equal?` to itself
+    //   ()                matches null
+    //   (<p> . <p>)       matches a pair
+    //   (<p1> <p2> ...)   matches a proper list of that length
+    //
+    // Template handling: scan the template body for `(syntax T)`
+    // forms and replace them with code that re-constructs T using
+    // the bound pattern variables. Outside `(syntax ...)` the body
+    // is ordinary Scheme code that can reference pvars by name.
+    //
+    // Desugars to:
+    //   (let ((__sc-key__ <expr>))
+    //     (cond [<test1> (let (<pvars1>) <body1>)]
+    //           [<test2> (let (<pvars2>) <body2>)]
+    //           ...
+    //           [else (error 'syntax-case "no matching pattern" __sc-key__)]))
+    //
+    // The desugared datum is fed back through `self.expand` so the
+    // existing `let`/`cond`/`error` handlers do the rest.
+    fn expand_syntax_case(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        if items.len() < 2 {
+            return Err(ExpandError::BadSyntax {
+                what: "syntax-case needs <expr> (<literal>...) <clause>...".into(),
+                span,
+            });
+        }
+        let scrut = items[0].clone();
+        let literals = collect_proper_list_strict(&items[1]).ok_or(ExpandError::BadSyntax {
+            what: "syntax-case literals must be a proper list".into(),
+            span: items[1].span(),
+        })?;
+        let mut literal_syms: Vec<Symbol> = Vec::with_capacity(literals.len());
+        for l in &literals {
+            match l {
+                Datum::Symbol(s, _) => literal_syms.push(*s),
+                _ => {
+                    return Err(ExpandError::BadSyntax {
+                        what: "syntax-case literal must be a symbol".into(),
+                        span: l.span(),
+                    });
+                }
+            }
+        }
+
+        let key_sym = self.syms.intern("__sc-key__");
+        let key_ref = Datum::Symbol(key_sym, span);
+
+        // For each clause, build a `(test, body-with-pvar-lets)`
+        // pair as Datums. Pvars are pushed onto `syntax_pvars`
+        // around the body conversion so that any `(syntax X)`
+        // inside the body (or nested syntax-binding forms) sees
+        // them at expansion time.
+        let mut cond_clauses_dat: Vec<Datum> = Vec::with_capacity(items.len() - 2 + 1);
+
+        for clause_d in &items[2..] {
+            let clause_parts =
+                collect_proper_list_strict(clause_d).ok_or(ExpandError::BadSyntax {
+                    what: "syntax-case clause must be (pattern template)".into(),
+                    span: clause_d.span(),
+                })?;
+            // Allow 2-element `(pattern template)` and 3-element
+            // `(pattern fender template)`. R6RS doesn't define a
+            // 4+ shape.
+            if clause_parts.len() != 2 && clause_parts.len() != 3 {
+                return Err(ExpandError::BadSyntax {
+                    what:
+                        "syntax-case clause must be (pattern template) or (pattern fender template)"
+                            .into(),
+                    span: clause_d.span(),
+                });
+            }
+            let pat = &clause_parts[0];
+            let (fender_opt, tmpl_body) = if clause_parts.len() == 3 {
+                (Some(clause_parts[1].clone()), &clause_parts[2])
+            } else {
+                (None, &clause_parts[1])
+            };
+
+            let mut pvars: Vec<(Symbol, u32, Datum)> = Vec::new();
+            let test = compile_sc_pattern(
+                pat,
+                key_ref.clone(),
+                &literal_syms,
+                &mut pvars,
+                self.syms,
+                &self.keywords,
+            )?;
+
+            // Build the inner body datum: optionally wrap in
+            // (if <fender> <body> __sc-try-next__), and wrap in a
+            // `let` that binds pvars to their extractors. The
+            // `__sc-try-next__` placeholder is replaced with a
+            // 0-arity thunk call in the CoreExpr-building loop;
+            // for the datum representation we use a literal
+            // marker symbol to keep the per-clause shape uniform.
+            let inner_body = if let Some(fender_dat) = &fender_opt {
+                // (if <fender> <body> (__sc-try-next__))
+                let try_next_call = mk_list(
+                    vec![Datum::Symbol(
+                        self.syms.intern("__sc-try-next__"),
+                        clause_d.span(),
+                    )],
+                    clause_d.span(),
+                );
+                mk_list(
+                    vec![
+                        Datum::Symbol(self.keywords.if_, clause_d.span()),
+                        fender_dat.clone(),
+                        tmpl_body.clone(),
+                        try_next_call,
+                    ],
+                    clause_d.span(),
+                )
+            } else {
+                tmpl_body.clone()
+            };
+            let body_with_lets = if pvars.is_empty() {
+                inner_body
+            } else {
+                let mut binding_list = Datum::Null(clause_d.span());
+                for (pname, _depth, ext) in pvars.iter().rev() {
+                    let bind_pair = mk_list(
+                        vec![Datum::Symbol(*pname, clause_d.span()), ext.clone()],
+                        clause_d.span(),
+                    );
+                    binding_list =
+                        Datum::Pair(Rc::new(bind_pair), Rc::new(binding_list), clause_d.span());
+                }
+                mk_list(
+                    vec![
+                        Datum::Symbol(self.keywords.let_, clause_d.span()),
+                        binding_list,
+                        inner_body,
+                    ],
+                    clause_d.span(),
+                )
+            };
+
+            // Tag fender presence into the clause datum so the
+            // CoreExpr-building loop knows whether to bind a thunk.
+            // 2-element clause -> (test body)
+            // 3-element clause -> (test body 'has-fender)
+            let cond_clause = if fender_opt.is_some() {
+                mk_list(
+                    vec![
+                        test,
+                        body_with_lets,
+                        Datum::Symbol(self.syms.intern("__has-fender__"), clause_d.span()),
+                    ],
+                    clause_d.span(),
+                )
+            } else {
+                mk_list(vec![test, body_with_lets], clause_d.span())
+            };
+            let _ = &pvars;
+            cond_clauses_dat.push(cond_clause);
+        }
+
+        // Else clause: raise a syntax-case mismatch error.
+        let else_kw = Datum::Symbol(self.keywords.else_, span);
+        let error_call = mk_list(
+            vec![
+                Datum::Symbol(self.syms.intern("error"), span),
+                mk_list(
+                    vec![
+                        Datum::Symbol(self.keywords.quote, span),
+                        Datum::Symbol(self.syms.intern("syntax-case"), span),
+                    ],
+                    span,
+                ),
+                Datum::String(Rc::new("no matching pattern".to_string()), span),
+                key_ref.clone(),
+            ],
+            span,
+        );
+        cond_clauses_dat.push(mk_list(vec![else_kw, error_call], span));
+
+        // (cond clause1 ... else-clause). We can't simply call
+        // self.expand on the whole assembled form because we need
+        // to push per-clause pvars around the matching clause's
+        // body expansion. Build a CoreExpr by hand instead.
+        //
+        // Each clause has `(test body)` shape. We extract per-
+        // clause pvars by re-walking the original patterns; the
+        // already-built Datum tree wraps body in `(let ((pv ext)
+        // ...) body)`, but we still need to push pvars onto
+        // `syntax_pvars` so nested `(syntax X)` sees them.
+        // Phase 1.5 Iter C: each syntax-case form gets one
+        // fresh mark, shared by every `(syntax T)` evaluation
+        // inside any clause body during this form's runtime
+        // invocation. Bound as `__sc-mark-N__` via the outer
+        // Letrec; pushed onto `syntax_mark_exprs` so
+        // `expand_syntax_form` can pick it up when compiling
+        // template-introduced identifiers.
+        self.gensym_counter += 1;
+        let mark_sym = self
+            .syms
+            .intern(&format!("__sc-mark-{}__", self.gensym_counter));
+        let mark_ref = Datum::Symbol(mark_sym, span);
+        self.syntax_mark_exprs.push(mark_ref);
+
+        let key_expr = self.expand(&scrut)?;
+        // Walk clauses in reverse so the final accumulator is the
+        // else fallthrough (raises a no-match error).
+        let last = cond_clauses_dat.pop().expect("else clause was just pushed");
+        let last_parts = collect_proper_list_strict(&last).expect("else clause is a list");
+        let mut acc = self.expand(&last_parts[1])?;
+
+        let try_next_sym = self.syms.intern("__sc-try-next__");
+        for (clause_i, clause_dat) in cond_clauses_dat.iter().enumerate().rev() {
+            let parts = collect_proper_list_strict(clause_dat).expect("clause is a list");
+            let test_dat = &parts[0];
+            let body_dat = &parts[1];
+            // A 3rd element (the `__has-fender__` marker) flags a
+            // fender clause. Body already encodes
+            // `(if <fender> <body> __sc-try-next__)`; we just
+            // need to bind __sc-try-next__ to a 0-arity thunk
+            // whose body is the current acc (next-clause
+            // expression), so both the test-failure path and the
+            // fender-failure path call into the same shared
+            // continuation without duplicating the CoreExpr tree.
+            let has_fender = parts.len() >= 3;
+
+            // Determine this clause's pvars from the original
+            // pattern. (We already compiled it once and discarded
+            // the names; recompile to recover them. The cost is
+            // negligible -- pattern compilation is a small linear
+            // walk.)
+            let orig_clause_parts =
+                collect_proper_list_strict(&items[2 + clause_i]).expect("orig clause");
+            let mut pvars_pairs: Vec<(Symbol, u32, Datum)> = Vec::new();
+            let _ = compile_sc_pattern(
+                &orig_clause_parts[0],
+                key_ref.clone(),
+                &literal_syms,
+                &mut pvars_pairs,
+                self.syms,
+                &self.keywords,
+            )?;
+            let pvar_entries: Vec<(Symbol, u32)> =
+                pvars_pairs.into_iter().map(|(s, d, _)| (s, d)).collect();
+
+            // Push, expand body, pop. The body datum already
+            // wraps in a `let` that binds the pvars as Scheme
+            // vars; pushing the pvar names onto `syntax_pvars`
+            // ensures any `(syntax X)` inside (or in nested
+            // syntax-binding forms) treats X as a pvar.
+            let saved = self.syntax_pvars.len();
+            self.syntax_pvars.extend(pvar_entries.iter().copied());
+            let body_expr = self.expand(body_dat)?;
+            self.syntax_pvars.truncate(saved);
+
+            let test_expr = self.expand(test_dat)?;
+
+            if has_fender {
+                // Wrap so that __sc-try-next__ -> (next-clause).
+                // The clause body has already been expanded
+                // referencing __sc-try-next__ as a variable; we
+                // wire it through a Letrec binding to a 0-arity
+                // thunk whose body is `acc` (the previous
+                // cond's accumulated cascade).
+                let next_thunk = CoreExpr::Lambda {
+                    params: Params::fixed(vec![]),
+                    body: Rc::new(acc.clone()),
+                    span,
+                };
+                let next_call = CoreExpr::App {
+                    func: Rc::new(CoreExpr::Ref {
+                        name: try_next_sym,
+                        span,
+                    }),
+                    args: vec![],
+                    span,
+                };
+                let inner_if = CoreExpr::If {
+                    cond: Rc::new(test_expr),
+                    then: Rc::new(body_expr),
+                    alt: Rc::new(next_call),
+                    span,
+                };
+                acc = CoreExpr::Letrec {
+                    bindings: vec![(try_next_sym, next_thunk)],
+                    body: Rc::new(inner_if),
+                    span,
+                };
+            } else {
+                acc = CoreExpr::If {
+                    cond: Rc::new(test_expr),
+                    then: Rc::new(body_expr),
+                    alt: Rc::new(acc),
+                    span,
+                };
+            }
+        }
+
+        // Done with this syntax-case form's mark scope.
+        self.syntax_mark_exprs.pop();
+
+        // Outer Letrec binds both the scrutinee key AND the
+        // freshly-generated mark for the form. The mark binding
+        // calls `(fresh-mark!)` at form-eval time so every
+        // invocation of this syntax-case gets a distinct mark
+        // (the mechanism that makes two calls of the same
+        // macro-defining-syntax distinguishable under
+        // bound-identifier=?).
+        let fresh_mark_call = CoreExpr::App {
+            func: Rc::new(CoreExpr::Ref {
+                name: self.syms.intern("fresh-mark!"),
+                span,
+            }),
+            args: vec![],
+            span,
+        };
+        Ok(CoreExpr::Letrec {
+            bindings: vec![(key_sym, key_expr), (mark_sym, fresh_mark_call)],
+            body: Rc::new(acc),
+            span,
+        })
+    }
+
+    /// Standalone `(syntax T)` outside of a syntax-case body. Iter
+    /// B treats this as `(quote T)` -- there are no pvars in scope
+    /// to substitute. Iter C extends this when used inside macro
+    /// transformers (with-syntax / quasisyntax) where pvars do
+    /// exist.
+    fn expand_syntax_form(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        if items.len() != 1 {
+            return Err(ExpandError::BadSyntax {
+                what: "syntax takes exactly 1 argument".into(),
+                span,
+            });
+        }
+        // Consult `self.syntax_pvars` for currently-bound pattern
+        // variables. `compile_syntax_template` turns pvar symbols
+        // into variable references and everything else (literal
+        // identifiers, atoms, sub-lists) into self-quoting /
+        // cons-constructed values. Standalone `(syntax T)` outside
+        // any syntax-binding scope therefore lowers to roughly
+        // `(quote T)` -- but inside a syntax-case or with-syntax
+        // body it transparently substitutes the bound pvars.
+        let pvars_snapshot: Vec<(Symbol, u32)> = self.syntax_pvars.clone();
+        // Top-of-stack mark expression for this `(syntax T)` form:
+        // when inside a syntax-case body, that's the body's
+        // `__sc-mark-N__` variable reference; standalone use
+        // gets the literal 0 (unmarked identifier).
+        let mark_expr = self
+            .syntax_mark_exprs
+            .last()
+            .cloned()
+            .unwrap_or_else(|| Datum::Number(cs_core::Number::Fixnum(0), span));
+        let compiled = compile_syntax_template(
+            &items[0],
+            &pvars_snapshot,
+            self.syms,
+            &self.keywords,
+            &mark_expr,
+        );
+        self.expand(&compiled)
+    }
+
+    // ---- R6RS++ §12 (#118) Iter C: with-syntax + quasisyntax ----
+
+    /// `(with-syntax ((pat val) ...) body ...)`
+    ///
+    /// Pattern-binds each `val` against the corresponding `pat`
+    /// (using the same pattern grammar as syntax-case) and
+    /// evaluates `body ...` with the pvars in scope. Desugars to
+    /// a nest of single-clause `syntax-case` forms; the final
+    /// innermost body becomes `(let () body ...)` so `body` can be
+    /// a sequence with internal defines.
+    fn expand_with_syntax(&mut self, items: &[Datum], span: Span) -> Result<CoreExpr, ExpandError> {
+        if items.len() < 2 {
+            return Err(ExpandError::BadSyntax {
+                what: "with-syntax needs ((pat val) ...) body ...".into(),
+                span,
+            });
+        }
+        let bindings_datum = &items[0];
+        let body_datums = &items[1..];
+
+        let bindings =
+            collect_proper_list_strict(bindings_datum).ok_or(ExpandError::BadSyntax {
+                what: "with-syntax bindings must be a proper list".into(),
+                span: bindings_datum.span(),
+            })?;
+        // Sanity-check each binding shape up front.
+        let mut pat_val: Vec<(Datum, Datum)> = Vec::with_capacity(bindings.len());
+        for b in &bindings {
+            let parts = collect_proper_list_strict(b).ok_or(ExpandError::BadSyntax {
+                what: "with-syntax binding must be (pattern value)".into(),
+                span: b.span(),
+            })?;
+            if parts.len() != 2 {
+                return Err(ExpandError::BadSyntax {
+                    what: "with-syntax binding must be (pattern value)".into(),
+                    span: b.span(),
+                });
+            }
+            pat_val.push((parts[0].clone(), parts[1].clone()));
+        }
+
+        // Innermost form: (let () body ...) so multi-form bodies
+        // sequence cleanly and support internal defines.
+        let mut inner: Datum = {
+            let mut all = vec![Datum::Symbol(self.keywords.let_, span), Datum::Null(span)];
+            for d in body_datums {
+                all.push(d.clone());
+            }
+            mk_list(all, span)
+        };
+
+        // Build the nested syntax-case bottom-up: innermost form
+        // is `inner`; each outer layer wraps it with another
+        // single-clause syntax-case binding the next pvar.
+        for (pat, val) in pat_val.into_iter().rev() {
+            let clause = mk_list(vec![pat, inner.clone()], span);
+            inner = mk_list(
+                vec![
+                    Datum::Symbol(self.keywords.syntax_case, span),
+                    val,
+                    Datum::Null(span),
+                    clause,
+                ],
+                span,
+            );
+        }
+        self.expand(&inner)
+    }
+
+    /// `(quasisyntax T)` -- like `quasiquote` but `#,e` / `#,@e`
+    /// (`unsyntax e` / `unsyntax-splicing e`) interpolate
+    /// evaluated expressions. With today's syntax-object-as-datum
+    /// model the semantics match `quasiquote` exactly, so we
+    /// rewrite the template by swapping the qs/us/uss head
+    /// symbols for the corresponding quasiquote/unquote/
+    /// unquote-splicing symbols and delegate. Future iters
+    /// distinguish syntax-object marking; the rewrite hook
+    /// stays the same.
+    fn expand_quasisyntax(
+        &mut self,
+        template: &Datum,
+        depth: u32,
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        let rewritten = rewrite_qs_to_qq(template, &self.keywords);
+        self.expand_quasiquote(&rewritten, depth, span)
     }
 
     /// `(do ((var init step) ...) (test result ...) body ...)`
@@ -3618,9 +4827,18 @@ impl<'a> Expander<'a> {
                             mutator: None,
                         });
                     } else if kind == self.keywords.mutable {
-                        if parts.len() != 4 {
+                        // Accept three shapes:
+                        //   (mutable FIELD)
+                        //     → accessor NAME-FIELD, mutator set-NAME-FIELD!
+                        //   (mutable FIELD ACCESSOR MUTATOR)
+                        //     → fully explicit
+                        // The two-element shorthand is what
+                        // define-record-mutable in lib/record/record.scm
+                        // relies on; syntax-rules can't synthesize the
+                        // accessor/mutator names itself.
+                        if parts.len() != 2 && parts.len() != 4 {
                             return Err(ExpandError::BadSyntax {
-                                what: "(mutable field accessor mutator) needs 4 elements".into(),
+                                what: "(mutable field) or (mutable field accessor mutator)".into(),
                                 span: f.span(),
                             });
                         }
@@ -3633,23 +4851,33 @@ impl<'a> Expander<'a> {
                                 });
                             }
                         };
-                        let accessor = match &parts[2] {
-                            Datum::Symbol(s, _) => *s,
-                            _ => {
-                                return Err(ExpandError::BadSyntax {
-                                    what: "accessor name must be symbol".into(),
-                                    span: f.span(),
-                                });
-                            }
-                        };
-                        let mutator = match &parts[3] {
-                            Datum::Symbol(s, _) => *s,
-                            _ => {
-                                return Err(ExpandError::BadSyntax {
-                                    what: "mutator name must be symbol".into(),
-                                    span: f.span(),
-                                });
-                            }
+                        let (accessor, mutator) = if parts.len() == 2 {
+                            let fname = self.syms.name(name).to_string();
+                            (
+                                self.syms.intern(&format!("{}-{}", type_name_str, fname)),
+                                self.syms
+                                    .intern(&format!("set-{}-{}!", type_name_str, fname)),
+                            )
+                        } else {
+                            let acc = match &parts[2] {
+                                Datum::Symbol(s, _) => *s,
+                                _ => {
+                                    return Err(ExpandError::BadSyntax {
+                                        what: "accessor name must be symbol".into(),
+                                        span: f.span(),
+                                    });
+                                }
+                            };
+                            let mut_ = match &parts[3] {
+                                Datum::Symbol(s, _) => *s,
+                                _ => {
+                                    return Err(ExpandError::BadSyntax {
+                                        what: "mutator name must be symbol".into(),
+                                        span: f.span(),
+                                    });
+                                }
+                            };
+                            (acc, mut_)
                         };
                         fields.push(FieldDecl {
                             name,
@@ -4419,19 +5647,72 @@ fn rename_binder_form(
 
     match kind {
         BinderFormKind::LetLike => {
-            // (let ((name val) ...) body ...)
+            // Two shapes for `let`:
+            //   (let ((name val) ...) body ...)         -- plain
+            //   (let LOOP ((name val) ...) body ...)    -- named (R7RS)
+            // letrec / letrec* / let* don't have a named form.
             if items.len() < 2 {
                 return rebuild_list(items.to_vec(), span);
             }
-            let bindings_datum = &items[1];
-            let body_datums = &items[2..];
+            // Detect named-let: head is `let` (after stripping
+            // marker) AND items[1] is a bare symbol (the loop
+            // name) AND items.len() >= 3.
+            let head_unmarked = match &items[0] {
+                Datum::Symbol(s, _) => {
+                    let n = syms.name(*s).to_string();
+                    if let Some(stripped) = n.strip_prefix(TEMPLATE_MARKER) {
+                        stripped.to_string()
+                    } else {
+                        n
+                    }
+                }
+                _ => String::new(),
+            };
+            let is_named_let = head_unmarked == "let"
+                && items.len() >= 3
+                && matches!(&items[1], Datum::Symbol(_, _));
+
+            let (loop_name_idx, bindings_idx, body_start_idx) = if is_named_let {
+                (Some(1usize), 2usize, 3usize)
+            } else {
+                (None, 1usize, 2usize)
+            };
+
+            // For named-let, the loop name is a binder visible
+            // throughout the body. Rename it (if marked) BEFORE
+            // processing bindings so any recursive references
+            // inside the body / step exprs see the fresh name.
+            if let Some(lni) = loop_name_idx {
+                let loop_datum = &items[lni];
+                let new_loop_datum = match loop_datum {
+                    Datum::Symbol(s, ns) if is_template_marked(*s, syms) => {
+                        let fresh = fresh_gensym(*s, counter, syms);
+                        local_renames.insert(*s, fresh);
+                        Datum::Symbol(fresh, *ns)
+                    }
+                    other => hygiene_pass(other, parent_renames, counter, syms),
+                };
+                // Stash for re-insertion in order: we'll push
+                // [head, loop_name, bindings, body...] below.
+                new_items.push(new_loop_datum);
+            }
+
+            let bindings_datum = &items[bindings_idx];
+            let body_datums = &items[body_start_idx..];
+
             // Process bindings: for each (name val), rename name if marked.
+            // Val evals in the outer scope (parent_renames + loop_name
+            // rename if named-let), not the binding-local scope.
             let bindings_items = collect_proper_list_strict(bindings_datum).unwrap_or_default();
             let mut new_bindings: Vec<Datum> = Vec::with_capacity(bindings_items.len());
+            // Snapshot of renames available for val expressions:
+            // includes the loop_name (for named-let) but NOT the
+            // about-to-be-introduced binding names.
+            let val_renames = local_renames.clone();
             for b in &bindings_items {
                 let parts = collect_proper_list_strict(b).unwrap_or_default();
                 if parts.len() != 2 {
-                    new_bindings.push(hygiene_pass(b, parent_renames, counter, syms));
+                    new_bindings.push(hygiene_pass(b, &val_renames, counter, syms));
                     continue;
                 }
                 let name_datum = &parts[0];
@@ -4444,8 +5725,7 @@ fn rename_binder_form(
                     }
                     other => hygiene_pass(other, parent_renames, counter, syms),
                 };
-                // val is evaluated in OUTER scope (parent_renames), not local.
-                let new_val = hygiene_pass(val_datum, parent_renames, counter, syms);
+                let new_val = hygiene_pass(val_datum, &val_renames, counter, syms);
                 new_bindings.push(rebuild_list(vec![new_name_datum, new_val], b.span()));
             }
             new_items.push(rebuild_list(new_bindings, bindings_datum.span()));
@@ -4601,11 +5881,24 @@ fn match_pattern(
     is_outer: bool,
     bindings: &mut std::collections::HashMap<cs_core::Symbol, MatchBinding>,
 ) -> bool {
+    // The outer macro-name placeholder slot matches anything —
+    // it's the macro keyword being invoked, not a real pattern.
+    if is_outer {
+        if let Datum::Symbol(_, _) = pattern {
+            return true;
+        }
+    }
     match (pattern, input) {
-        // Wildcards
-        (Datum::Symbol(s, _), _) if *s == underscore_sym => true,
-        // Literal keyword: must be the same symbol
+        // Literal keyword: must be the same symbol — checked before
+        // the `_` wildcard so a macro that explicitly puts `_` in
+        // its literals list (overriding the R7RS wildcard default)
+        // gets literal-match semantics. Otherwise `_` in the input
+        // would slip past as a wildcard and the user's catch-all
+        // identifier rule would never fire.
         (Datum::Symbol(s, _), Datum::Symbol(t, _)) if literals.contains(s) => *s == *t,
+        (Datum::Symbol(s, _), _) if literals.contains(s) => false,
+        // Wildcards (only when not declared as a literal above)
+        (Datum::Symbol(s, _), _) if *s == underscore_sym => true,
         // Pattern variable: bind it (unless it's the outer macro name)
         (Datum::Symbol(s, _), _) => {
             if is_outer {
@@ -4648,6 +5941,25 @@ fn match_list_pattern(
     is_outer: bool,
     bindings: &mut std::collections::HashMap<cs_core::Symbol, MatchBinding>,
 ) -> bool {
+    // Detect dotted patterns: (p1 p2 . tail-pat) matches a list of
+    // any length ≥ #spine, binding tail-pat to the remainder.
+    // Ellipsis-in-spine + dotted-tail combinations are not supported
+    // here; either-or, not both. The ellipsis branch below stays on
+    // the proper-list code path.
+    if let Some((pspine, ptail)) = collect_pair_chain(pattern) {
+        if !matches!(ptail, Datum::Null(_)) {
+            return match_dotted_list_pattern(
+                &pspine,
+                &ptail,
+                input,
+                literals,
+                ellipsis_sym,
+                underscore_sym,
+                is_outer,
+                bindings,
+            );
+        }
+    }
     let pattern_items = match collect_proper_list_strict(pattern) {
         Some(v) => v,
         None => return false,
@@ -4760,6 +6072,57 @@ fn match_list_pattern(
     true
 }
 
+/// Match `(p1 p2 ... pn . tail-pat)` against an input list.
+///
+/// Semantics: spine elements match positionally; the tail
+/// pattern binds the remainder of the input (which may itself be
+/// a list or any atom).
+fn match_dotted_list_pattern(
+    pspine: &[Datum],
+    ptail: &Datum,
+    input: &Datum,
+    literals: &[cs_core::Symbol],
+    ellipsis_sym: cs_core::Symbol,
+    underscore_sym: cs_core::Symbol,
+    is_outer: bool,
+    bindings: &mut std::collections::HashMap<cs_core::Symbol, MatchBinding>,
+) -> bool {
+    let (ispine, itail) = match collect_pair_chain(input) {
+        Some(p) => p,
+        None => return false,
+    };
+    if ispine.len() < pspine.len() {
+        return false;
+    }
+    // Spine match.
+    for (i, (p, inp)) in pspine.iter().zip(ispine.iter()).enumerate() {
+        let outer = is_outer && i == 0;
+        if !match_pattern(
+            p,
+            inp,
+            literals,
+            ellipsis_sym,
+            underscore_sym,
+            outer,
+            bindings,
+        ) {
+            return false;
+        }
+    }
+    // Tail: bundle the remaining input spine + input tail back into
+    // a single Datum and recurse on the tail pattern.
+    let remaining = rebuild_list_with_tail(ispine[pspine.len()..].to_vec(), itail, ptail.span());
+    match_pattern(
+        ptail,
+        &remaining,
+        literals,
+        ellipsis_sym,
+        underscore_sym,
+        false,
+        bindings,
+    )
+}
+
 fn collect_pattern_vars(
     pattern: &Datum,
     literals: &[cs_core::Symbol],
@@ -4788,9 +6151,12 @@ fn collect_pattern_vars_into(
             }
         }
         Datum::Pair(_, _, _) => {
-            if let Some(items) = collect_proper_list_strict(pattern) {
-                for it in items {
+            if let Some((spine, tail)) = collect_pair_chain(pattern) {
+                for it in spine {
                     collect_pattern_vars_into(&it, literals, ellipsis_sym, underscore_sym, out);
+                }
+                if !matches!(tail, Datum::Null(_)) {
+                    collect_pattern_vars_into(&tail, literals, ellipsis_sym, underscore_sym, out);
                 }
             }
         }
@@ -4854,11 +6220,16 @@ fn instantiate(
             }
         }
         Datum::Pair(_, _, span) => {
-            let items = collect_proper_list_strict(template).ok_or(ExpandError::BadSyntax {
-                what: "template must be proper list".into(),
-                span: *span,
-            })?;
-            // Process items, expanding ellipses.
+            // Templates may be proper OR dotted: support both. The
+            // ellipsis expansion logic operates over the spine; a
+            // non-Null tail is instantiated separately and reattached
+            // via rebuild_list_with_tail.
+            let (items, tail_template) =
+                collect_pair_chain(template).ok_or_else(|| ExpandError::BadSyntax {
+                    what: "template must be a pair".into(),
+                    span: *span,
+                })?;
+            // Process spine, expanding ellipses.
             let mut out: Vec<Datum> = Vec::new();
             let mut i = 0;
             while i < items.len() {
@@ -4907,7 +6278,11 @@ fn instantiate(
                     i += 1;
                 }
             }
-            Ok(rebuild_list(out, *span))
+            let tail = match &tail_template {
+                Datum::Null(_) => tail_template,
+                other => instantiate(other, bindings, ellipsis_sym, _gensym_counter, syms)?,
+            };
+            Ok(rebuild_list_with_tail(out, tail, *span))
         }
         _ => Ok(template.clone()),
     }
@@ -4969,6 +6344,779 @@ fn collect_proper_list_strict(d: &Datum) -> Option<Vec<Datum>> {
             }
             _ => return None,
         }
+    }
+}
+
+/// Render a library name spec as `(seg seg seg)` for diagnostics.
+fn format_library_name(name: &[Symbol], syms: &SymbolTable) -> String {
+    let segs: Vec<&str> = name.iter().map(|s| syms.name(*s)).collect();
+    format!("({})", segs.join(" "))
+}
+
+/// Build a parse-error ExpandError for cross-file library loads.
+/// Factored out so the cache-hit and cache-miss paths share the
+/// same diagnostic shape.
+fn parse_err(
+    errs: Vec<cs_parse::ReaderError>,
+    name: &[Symbol],
+    syms: &SymbolTable,
+    span: Span,
+) -> ExpandError {
+    let e = errs.into_iter().next().unwrap();
+    ExpandError::BadSyntax {
+        what: format!(
+            "library {}: parse error: {}",
+            format_library_name(name, syms),
+            e.message()
+        ),
+        span,
+    }
+}
+
+/// Walks a Pair chain returning the spine of car-elements and the
+/// cdr of the last pair. For a proper list `(a b c)` the tail is
+/// `Datum::Null`. For an improper list `(a b . c)` the tail is the
+/// atom `c`. Returns None if `d` is not a Pair at all.
+fn collect_pair_chain(d: &Datum) -> Option<(Vec<Datum>, Datum)> {
+    let mut out = Vec::new();
+    let mut cur = d.clone();
+    loop {
+        match cur {
+            Datum::Pair(car, cdr, _) => {
+                out.push((*car).clone());
+                cur = (*cdr).clone();
+            }
+            other => {
+                if out.is_empty() {
+                    return None;
+                }
+                return Some((out, other));
+            }
+        }
+    }
+}
+
+/// Rebuild a list from a spine + optional dotted tail. With
+/// `tail = Datum::Null(_)` this produces a proper list; with any
+/// other tail it produces a dotted-pair chain ending in `tail`.
+fn rebuild_list_with_tail(items: Vec<Datum>, tail: Datum, _span: Span) -> Datum {
+    let mut acc = tail;
+    for item in items.into_iter().rev() {
+        let s = item.span().merge(acc.span());
+        acc = Datum::Pair(Rc::new(item), Rc::new(acc), s);
+    }
+    acc
+}
+
+/// Build a proper-list Datum from a vector of items at `span`.
+/// Used by the syntax-case desugarer to assemble synthesized
+/// forms before handing them back through `Expander::expand`.
+fn mk_list(items: Vec<Datum>, span: Span) -> Datum {
+    let mut acc = Datum::Null(span);
+    for item in items.into_iter().rev() {
+        acc = Datum::Pair(Rc::new(item), Rc::new(acc), span);
+    }
+    acc
+}
+
+/// Phase 2A.1 helper: walk a `define-syntax-parser` pattern,
+/// strip `:class` annotations from each symbol, and record the
+/// stripped symbol + class-name pairs into `class_checks` so
+/// the caller can wrap the template body in class-predicate
+/// `if`s.
+///
+/// A pattern symbol like `name:class` is split into:
+///   - stripped symbol `name`  (binds the pvar in the syntax-rules pattern)
+///   - class name `"class"`    (looked up against the built-in predicate map)
+///
+/// Plain symbols without a colon pass through untouched and
+/// aren't recorded. Compound datums (pairs, vectors) recurse;
+/// non-symbol atoms pass through.
+///
+/// Edge cases:
+///   * `_:class` and leading/trailing `:` patterns are left
+///     untouched (no annotation extracted)
+///   * Multiple colons: split at the first `:` only
+fn strip_class_annotations(
+    pat: &Datum,
+    class_checks: &mut Vec<(Symbol, String)>,
+    syms: &mut SymbolTable,
+) -> Datum {
+    match pat {
+        Datum::Symbol(s, span) => {
+            let name = syms.name(*s).to_string();
+            // Find the first colon NOT at position 0 (so `:class`
+            // alone or `_` alone passes through).
+            if let Some(colon_idx) = name.find(':').filter(|&i| i > 0 && i < name.len() - 1) {
+                let (pvar_name, _) = name.split_at(colon_idx);
+                let class_name = &name[colon_idx + 1..];
+                let pvar_sym = syms.intern(pvar_name);
+                class_checks.push((pvar_sym, class_name.to_string()));
+                Datum::Symbol(pvar_sym, *span)
+            } else {
+                pat.clone()
+            }
+        }
+        Datum::Pair(car, cdr, span) => {
+            let new_car = strip_class_annotations(car, class_checks, syms);
+            let new_cdr = strip_class_annotations(cdr, class_checks, syms);
+            Datum::Pair(Rc::new(new_car), Rc::new(new_cdr), *span)
+        }
+        Datum::Vector(items, span) => {
+            let new_items: Vec<Datum> = items
+                .iter()
+                .map(|i| strip_class_annotations(i, class_checks, syms))
+                .collect();
+            Datum::Vector(new_items, *span)
+        }
+        _ => pat.clone(),
+    }
+}
+
+/// Compile a syntax-case pattern into a boolean-valued test
+/// `Datum` over the key expression `key`, while collecting any
+/// pattern-variable bindings (each `(pvar, extractor-expr)`)
+/// into `pvars_out`.
+///
+/// Symbols in `literals` match by name (compiled to `eq?`).
+/// Other symbols become pattern variables that bind the matched
+/// sub-value. `_` is a wildcard (no binding, no constraint).
+///
+/// Returns the test-datum; the caller composes it into the
+/// outer `cond` clause and emits a `let` over `pvars_out` to
+/// bind the variables in the template body.
+fn compile_sc_pattern(
+    pat: &Datum,
+    key: Datum,
+    literals: &[Symbol],
+    pvars_out: &mut Vec<(Symbol, u32, Datum)>,
+    syms: &mut SymbolTable,
+    kw: &Keywords,
+) -> Result<Datum, ExpandError> {
+    let span = pat.span();
+    let mk_sym =
+        |name: &str, syms: &mut SymbolTable| -> Datum { Datum::Symbol(syms.intern(name), span) };
+    match pat {
+        Datum::Symbol(s, _) if *s == kw.underscore => Ok(Datum::Boolean(true, span)),
+        Datum::Symbol(s, _) if literals.contains(s) => {
+            let eq_call = mk_list(
+                vec![
+                    mk_sym("eq?", syms),
+                    key,
+                    mk_list(
+                        vec![Datum::Symbol(kw.quote, span), Datum::Symbol(*s, span)],
+                        span,
+                    ),
+                ],
+                span,
+            );
+            Ok(eq_call)
+        }
+        Datum::Symbol(s, _) => {
+            // Pattern variable at depth 0: binds `s` to `key`.
+            pvars_out.push((*s, 0, key));
+            Ok(Datum::Boolean(true, span))
+        }
+        Datum::Null(_) => Ok(mk_list(vec![mk_sym("null?", syms), key], span)),
+        Datum::Boolean(_, _)
+        | Datum::Number(_, _)
+        | Datum::Character(_, _)
+        | Datum::String(_, _) => {
+            let lit_quote = mk_list(vec![Datum::Symbol(kw.quote, span), pat.clone()], span);
+            Ok(mk_list(vec![mk_sym("equal?", syms), key, lit_quote], span))
+        }
+        Datum::Pair(_, _, _) => {
+            // Detect a trailing `(prefix... sub ...)` form. `sub` may
+            // be either:
+            //   * a bare symbol pvar -- Iter C2's minimal case
+            //   * a proper list of bare-symbol pvars (Iter C3
+            //     compound sub-pattern)
+            // Anything more complex (nested ellipsis, dotted sub,
+            // literals inside sub) is rejected with a pointer.
+            if let Some(items) = collect_proper_list_strict(pat) {
+                let n = items.len();
+                if n >= 2 {
+                    if let Datum::Symbol(last, _) = &items[n - 1] {
+                        if *last == kw.ellipsis {
+                            let sub = &items[n - 2];
+                            // Walk the prefix (items[0..n-2]).
+                            let mut tests: Vec<Datum> = Vec::new();
+                            let mut walking_key = key.clone();
+                            for prefix_item in &items[..n - 2] {
+                                let pair_test =
+                                    mk_list(vec![mk_sym("pair?", syms), walking_key.clone()], span);
+                                let car_key =
+                                    mk_list(vec![mk_sym("car", syms), walking_key.clone()], span);
+                                let inner_test = compile_sc_pattern(
+                                    prefix_item,
+                                    car_key,
+                                    literals,
+                                    pvars_out,
+                                    syms,
+                                    kw,
+                                )?;
+                                tests.push(pair_test);
+                                tests.push(inner_test);
+                                walking_key = mk_list(vec![mk_sym("cdr", syms), walking_key], span);
+                            }
+
+                            // Bare-pvar sub: Iter C2 case.
+                            if let Datum::Symbol(s, _) = sub {
+                                if *s != kw.underscore && !literals.contains(s) {
+                                    pvars_out.push((*s, 1, walking_key.clone()));
+                                    let list_test =
+                                        mk_list(vec![mk_sym("list?", syms), walking_key], span);
+                                    tests.push(list_test);
+                                    let mut all = vec![Datum::Symbol(kw.and, span)];
+                                    all.extend(tests);
+                                    return Ok(mk_list(all, span));
+                                }
+                            }
+
+                            // Nested ellipsis detection (Iter C6/C7).
+                            // If sub itself has the shape `(inner-pat ...)`
+                            // — a proper-list of length 2 ending in `...`
+                            // — that's a nested ellipsis section.
+                            // General handling: recursively compile sub
+                            // as a standalone ellipsis pattern against a
+                            // synthetic `__sc-inner-elem__` key. The
+                            // resulting per-element test/extractors get
+                            // wrapped in `every` / `map` to lift them to
+                            // the outer ellipsis. Each inner pvar's
+                            // depth bumps by 1 (e.g. depth-1 -> depth-2).
+                            //
+                            // This subsumes Iter C6's bare-pvar
+                            // special-case and handles Iter C7
+                            // compound/prefixed inner forms uniformly:
+                            //   ((p …) …)          -> p at depth 2
+                            //   ((kw p …) …)       -> p at depth 2
+                            //   (((a b) …) …)      -> a,b at depth 2
+                            //   (((a b) c …) …)    -> a,b at depth 2, c at depth 2
+                            if let Some(sub_items) = collect_proper_list_strict(sub) {
+                                if sub_items.len() >= 2 {
+                                    if let Datum::Symbol(inner_ellipsis, _) =
+                                        &sub_items[sub_items.len() - 1]
+                                    {
+                                        if *inner_ellipsis == kw.ellipsis {
+                                            let inner_elem_sym = syms.intern("__sc-inner-elem__");
+                                            let inner_key = Datum::Symbol(inner_elem_sym, span);
+                                            let mut inner_pvars: Vec<(Symbol, u32, Datum)> =
+                                                Vec::new();
+                                            let inner_test = compile_sc_pattern(
+                                                sub,
+                                                inner_key,
+                                                literals,
+                                                &mut inner_pvars,
+                                                syms,
+                                                kw,
+                                            )?;
+
+                                            // Outer shape: list? walking-key
+                                            // + (every (lambda (e) <inner-test>) walking-key)
+                                            let inner_test_lambda = mk_list(
+                                                vec![
+                                                    Datum::Symbol(kw.lambda, span),
+                                                    mk_list(
+                                                        vec![Datum::Symbol(inner_elem_sym, span)],
+                                                        span,
+                                                    ),
+                                                    inner_test,
+                                                ],
+                                                span,
+                                            );
+                                            let list_test = mk_list(
+                                                vec![mk_sym("list?", syms), walking_key.clone()],
+                                                span,
+                                            );
+                                            let every_test = mk_list(
+                                                vec![
+                                                    mk_sym("every", syms),
+                                                    inner_test_lambda,
+                                                    walking_key.clone(),
+                                                ],
+                                                span,
+                                            );
+                                            tests.push(list_test);
+                                            tests.push(every_test);
+
+                                            // For each inner pvar (name, inner-depth,
+                                            // inner-extractor), bump depth by 1 and
+                                            // wrap extractor in
+                                            // `(map (lambda (__sc-inner-elem__) <extr>) walking-key)`.
+                                            for (pv, inner_depth, inner_extractor) in inner_pvars {
+                                                let extractor_lambda = mk_list(
+                                                    vec![
+                                                        Datum::Symbol(kw.lambda, span),
+                                                        mk_list(
+                                                            vec![Datum::Symbol(
+                                                                inner_elem_sym,
+                                                                span,
+                                                            )],
+                                                            span,
+                                                        ),
+                                                        inner_extractor,
+                                                    ],
+                                                    span,
+                                                );
+                                                let map_call = mk_list(
+                                                    vec![
+                                                        mk_sym("map", syms),
+                                                        extractor_lambda,
+                                                        walking_key.clone(),
+                                                    ],
+                                                    span,
+                                                );
+                                                pvars_out.push((pv, inner_depth + 1, map_call));
+                                            }
+
+                                            let mut all = vec![Datum::Symbol(kw.and, span)];
+                                            all.extend(tests);
+                                            return Ok(mk_list(all, span));
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Compound sub: walk recursively to
+                            // collect structural constraints + pvar
+                            // accessors. Handles arbitrarily nested
+                            // compound sub-patterns (Iter C5);
+                            // rejects nested ellipsis with a clear
+                            // pointer to a future iter.
+                            let elem_sym = syms.intern("__sc-elem__");
+                            let mut sub_constraints: Vec<Datum> = Vec::new();
+                            let mut sub_pvars: Vec<(Symbol, Datum)> = Vec::new();
+                            if walk_sub_pattern(
+                                sub,
+                                Datum::Symbol(elem_sym, span),
+                                literals,
+                                kw,
+                                &mut sub_constraints,
+                                &mut sub_pvars,
+                                syms,
+                            )
+                            .is_err()
+                            {
+                                return Err(ExpandError::BadSyntax {
+                                    what: "syntax-case ellipsis: sub-pattern contains nested ellipsis or vector pattern -- lands in a future iter".into(),
+                                    span,
+                                });
+                            }
+
+                            // Build the shape lambda: (lambda (e) (and <c1> <c2> ...))
+                            // If there are zero constraints (the sub is
+                            // a single bare pvar), the lambda just returns #t.
+                            let mut shape_body_parts: Vec<Datum> =
+                                vec![Datum::Symbol(kw.and, span)];
+                            shape_body_parts.extend(sub_constraints);
+                            let shape_body = mk_list(shape_body_parts, span);
+                            let shape_lambda = mk_list(
+                                vec![
+                                    Datum::Symbol(kw.lambda, span),
+                                    mk_list(vec![Datum::Symbol(elem_sym, span)], span),
+                                    shape_body,
+                                ],
+                                span,
+                            );
+
+                            let list_test =
+                                mk_list(vec![mk_sym("list?", syms), walking_key.clone()], span);
+                            let every_test = mk_list(
+                                vec![mk_sym("every", syms), shape_lambda, walking_key.clone()],
+                                span,
+                            );
+                            tests.push(list_test);
+                            tests.push(every_test);
+
+                            // Bind each pvar's depth-1 list via
+                            // `(map (lambda (e) <accessor>) walking-key)`.
+                            for (pv, accessor) in sub_pvars {
+                                let extractor_lambda = mk_list(
+                                    vec![
+                                        Datum::Symbol(kw.lambda, span),
+                                        mk_list(vec![Datum::Symbol(elem_sym, span)], span),
+                                        accessor,
+                                    ],
+                                    span,
+                                );
+                                let map_call = mk_list(
+                                    vec![
+                                        mk_sym("map", syms),
+                                        extractor_lambda,
+                                        walking_key.clone(),
+                                    ],
+                                    span,
+                                );
+                                pvars_out.push((pv, 1, map_call));
+                            }
+
+                            let mut all = vec![Datum::Symbol(kw.and, span)];
+                            all.extend(tests);
+                            return Ok(mk_list(all, span));
+                        }
+                    }
+                }
+            }
+            // (p1 . p2) or fixed-arity list: pair-spine traversal.
+            let car_pat = match pat {
+                Datum::Pair(c, _, _) => (**c).clone(),
+                _ => unreachable!(),
+            };
+            let cdr_pat = match pat {
+                Datum::Pair(_, c, _) => (**c).clone(),
+                _ => unreachable!(),
+            };
+            let pair_test = mk_list(vec![mk_sym("pair?", syms), key.clone()], span);
+            let car_key = mk_list(vec![mk_sym("car", syms), key.clone()], span);
+            let cdr_key = mk_list(vec![mk_sym("cdr", syms), key], span);
+            let car_test = compile_sc_pattern(&car_pat, car_key, literals, pvars_out, syms, kw)?;
+            let cdr_test = compile_sc_pattern(&cdr_pat, cdr_key, literals, pvars_out, syms, kw)?;
+            Ok(mk_list(
+                vec![Datum::Symbol(kw.and, span), pair_test, car_test, cdr_test],
+                span,
+            ))
+        }
+        Datum::Vector(_, _) | Datum::ByteVector(_, _) => Err(ExpandError::BadSyntax {
+            what: "syntax-case vector patterns land in a future iter".into(),
+            span,
+        }),
+    }
+}
+
+/// Rewrite a `quasisyntax` template so the existing
+/// `expand_quasiquote` engine can process it: swap
+/// `quasisyntax` / `unsyntax` / `unsyntax-splicing` head symbols
+/// for `quasiquote` / `unquote` / `unquote-splicing` everywhere
+/// in the template. Only head positions of pair forms are
+/// rewritten; the rest of the structure is preserved verbatim.
+fn rewrite_qs_to_qq(d: &Datum, kw: &Keywords) -> Datum {
+    match d {
+        Datum::Pair(head, tail, span) => {
+            // If head is a recognized qs-keyword symbol, swap it.
+            let new_head = match &**head {
+                Datum::Symbol(s, hsp) if *s == kw.quasisyntax => Datum::Symbol(kw.quasiquote, *hsp),
+                Datum::Symbol(s, hsp) if *s == kw.unsyntax => Datum::Symbol(kw.unquote, *hsp),
+                Datum::Symbol(s, hsp) if *s == kw.unsyntax_splicing => {
+                    Datum::Symbol(kw.unquote_splicing, *hsp)
+                }
+                other => rewrite_qs_to_qq(other, kw),
+            };
+            let new_tail = rewrite_qs_to_qq(tail, kw);
+            Datum::Pair(Rc::new(new_head), Rc::new(new_tail), *span)
+        }
+        Datum::Vector(items, span) => {
+            let new_items: Vec<Datum> = items.iter().map(|i| rewrite_qs_to_qq(i, kw)).collect();
+            Datum::Vector(new_items, *span)
+        }
+        _ => d.clone(),
+    }
+}
+
+/// Recursive walker for a compound sub-pattern under ellipsis.
+/// Builds (a) a list of structural constraint expressions, each
+/// applied to a free variable representing one outer-list
+/// element, and (b) a list of `(pvar, accessor-expr)` bindings
+/// where the accessor extracts the pvar's value from that
+/// element.
+///
+/// Supports arbitrarily nested compound sub-patterns:
+/// `((a (b c)) …)`, `((a (b . c)) …)`, `((kw (a b)) …)` with
+/// literal kw, `((a _) …)` with wildcard, mixed nesting.
+///
+/// Nested ellipsis (`((p …) …)`) is NOT supported -- detected
+/// at the outer Pair walk and signaled via an Err; the caller
+/// surfaces it with a "future iter" pointer.
+fn walk_sub_pattern(
+    sub: &Datum,
+    accessor: Datum,
+    literals: &[Symbol],
+    kw: &Keywords,
+    constraints: &mut Vec<Datum>,
+    pvars: &mut Vec<(Symbol, Datum)>,
+    syms: &mut SymbolTable,
+) -> Result<(), ()> {
+    let span = sub.span();
+    let mk_sym =
+        |name: &str, syms: &mut SymbolTable| -> Datum { Datum::Symbol(syms.intern(name), span) };
+    match sub {
+        Datum::Symbol(s, _) if *s == kw.underscore => Ok(()),
+        Datum::Symbol(s, _) if *s == kw.ellipsis => Err(()),
+        Datum::Symbol(s, _) if literals.contains(s) => {
+            let quoted = mk_list(
+                vec![Datum::Symbol(kw.quote, span), Datum::Symbol(*s, span)],
+                span,
+            );
+            constraints.push(mk_list(vec![mk_sym("eq?", syms), accessor, quoted], span));
+            Ok(())
+        }
+        Datum::Symbol(s, _) => {
+            pvars.push((*s, accessor));
+            Ok(())
+        }
+        Datum::Null(_) => {
+            constraints.push(mk_list(vec![mk_sym("null?", syms), accessor], span));
+            Ok(())
+        }
+        Datum::Boolean(_, _)
+        | Datum::Number(_, _)
+        | Datum::Character(_, _)
+        | Datum::String(_, _) => {
+            let quoted = mk_list(vec![Datum::Symbol(kw.quote, span), sub.clone()], span);
+            constraints.push(mk_list(
+                vec![mk_sym("equal?", syms), accessor, quoted],
+                span,
+            ));
+            Ok(())
+        }
+        Datum::Pair(_, _, _) => {
+            // Reject nested ellipsis: any spine position with the
+            // `...` symbol means an inner `(p …)` form, which would
+            // need a per-element matcher loop.
+            if let Some(items) = collect_proper_list_strict(sub) {
+                if items.len() >= 2 {
+                    if let Datum::Symbol(last, _) = &items[items.len() - 1] {
+                        if *last == kw.ellipsis {
+                            return Err(());
+                        }
+                    }
+                }
+            }
+            // Otherwise: descend into car + cdr with adjusted accessors.
+            constraints.push(mk_list(vec![mk_sym("pair?", syms), accessor.clone()], span));
+            let car_acc = mk_list(vec![mk_sym("car", syms), accessor.clone()], span);
+            let cdr_acc = mk_list(vec![mk_sym("cdr", syms), accessor], span);
+            let (car_d, cdr_d) = match sub {
+                Datum::Pair(a, b, _) => ((**a).clone(), (**b).clone()),
+                _ => unreachable!(),
+            };
+            walk_sub_pattern(&car_d, car_acc, literals, kw, constraints, pvars, syms)?;
+            walk_sub_pattern(&cdr_d, cdr_acc, literals, kw, constraints, pvars, syms)?;
+            Ok(())
+        }
+        Datum::Vector(_, _) | Datum::ByteVector(_, _) => Err(()),
+    }
+}
+
+/// Walk a template datum and collect every symbol that's a pvar
+/// at depth >= 1 in `pvars`. Used by the zip-map case of
+/// `compile_syntax_template` to figure out which lists to map
+/// over in parallel. Skips into `(quote X)` (literal datum).
+fn collect_depth1_pvars(t: &Datum, pvars: &[(Symbol, u32)], out: &mut Vec<Symbol>) {
+    match t {
+        Datum::Symbol(s, _) => {
+            if pvars.iter().any(|(p, d)| *p == *s && *d >= 1) && !out.contains(s) {
+                out.push(*s);
+            }
+        }
+        Datum::Pair(head, tail, _) => {
+            // Skip into (quote X) -- never substitutes.
+            if let Datum::Symbol(_, _) = &**head {
+                // Don't recognize quote keyword here without
+                // access to Keywords; the worst that happens is
+                // we collect a pvar reference that won't trip
+                // (quote forms quoting a pvar name aren't a
+                // meaningful template construct).
+            }
+            collect_depth1_pvars(head, pvars, out);
+            collect_depth1_pvars(tail, pvars, out);
+        }
+        Datum::Vector(items, _) => {
+            for i in items {
+                collect_depth1_pvars(i, pvars, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Compile a `(syntax T)` template into an expression that, when
+/// evaluated, reproduces T with pattern-variable substitutions.
+/// `pvars` carries `(name, depth)`: depth 0 is a scalar pvar that
+/// can be referenced anywhere; depth >= 1 must appear inside a
+/// matching number of `...` template positions or it's an error
+/// (today we just emit the variable reference and let the runtime
+/// trip; Iter C3+ formalizes this).
+fn compile_syntax_template(
+    t: &Datum,
+    pvars: &[(Symbol, u32)],
+    syms: &mut SymbolTable,
+    kw: &Keywords,
+    mark_expr: &Datum,
+) -> Datum {
+    let span = t.span();
+    let is_pvar = |s: Symbol| pvars.iter().any(|(p, _)| *p == s);
+    match t {
+        Datum::Symbol(s, _) => {
+            if is_pvar(*s) {
+                Datum::Symbol(*s, span)
+            } else {
+                // Phase 1.5 Iter C: template-introduced
+                // identifiers wrap as a hygienic Identifier
+                // carrying the surrounding (syntax-case ...)
+                // form's mark, so two macro call sites of the
+                // same template produce distinguishable values.
+                // For standalone `(syntax T)` outside any
+                // syntax-case body, `mark_expr` evaluates to 0
+                // (unmarked) -- see the caller in
+                // expand_syntax_form.
+                mk_list(
+                    vec![
+                        Datum::Symbol(syms.intern("make-identifier"), span),
+                        mk_list(
+                            vec![Datum::Symbol(kw.quote, span), Datum::Symbol(*s, span)],
+                            span,
+                        ),
+                        mark_expr.clone(),
+                    ],
+                    span,
+                )
+            }
+        }
+        Datum::Null(_) => mk_list(vec![Datum::Symbol(kw.quote, span), t.clone()], span),
+        Datum::Pair(_, _, _) => {
+            // Detect a trailing `(prefix... sub ...)` template
+            // (matches the shape of the corresponding ellipsis
+            // pattern). Two cases for `sub`:
+            //   * a bare pvar at depth >= 1 -- splice its list
+            //     (Iter C2 minimal case)
+            //   * a compound template whose pvars are all
+            //     depth >= 1 -- zip-map (Iter C3)
+            if let Some(items) = collect_proper_list_strict(t) {
+                let n = items.len();
+                if n >= 2 {
+                    if let Datum::Symbol(last, _) = &items[n - 1] {
+                        if *last == kw.ellipsis {
+                            let sub = &items[n - 2];
+
+                            // Case 1: sub is a single pvar at depth>=1.
+                            if let Datum::Symbol(s, _) = sub {
+                                if is_pvar(*s) {
+                                    // Splice: (cons 'p1 (cons 'p2 ... (cons 'pK sub)))
+                                    let mut acc: Datum = Datum::Symbol(*s, span);
+                                    for prefix in items[..n - 2].iter().rev() {
+                                        let car_expr = compile_syntax_template(
+                                            prefix, pvars, syms, kw, mark_expr,
+                                        );
+                                        acc = mk_list(
+                                            vec![
+                                                Datum::Symbol(syms.intern("cons"), span),
+                                                car_expr,
+                                                acc,
+                                            ],
+                                            span,
+                                        );
+                                    }
+                                    return acc;
+                                }
+                            }
+
+                            // Case 2: sub is a compound. Collect all
+                            // depth>=1 pvars referenced inside sub.
+                            // For each, the map call needs that pvar's
+                            // depth-1 list as one of its inputs. The
+                            // inner template re-binds them at depth 0
+                            // (since the lambda's params are scalars).
+                            let mut depth1_pvars: Vec<Symbol> = Vec::new();
+                            collect_depth1_pvars(sub, pvars, &mut depth1_pvars);
+                            if depth1_pvars.is_empty() {
+                                // No depth>=1 pvars inside sub means
+                                // there's nothing to zip over -- this
+                                // would loop forever / produce empty.
+                                // Reject explicitly.
+                                return mk_list(
+                                    vec![
+                                        Datum::Symbol(syms.intern("error"), span),
+                                        mk_list(
+                                            vec![
+                                                Datum::Symbol(kw.quote, span),
+                                                Datum::Symbol(
+                                                    syms.intern("syntax-template"),
+                                                    span,
+                                                ),
+                                            ],
+                                            span,
+                                        ),
+                                        Datum::String(
+                                            Rc::new(
+                                                "no depth>=1 pattern variable inside `...` template"
+                                                    .to_string(),
+                                            ),
+                                            span,
+                                        ),
+                                    ],
+                                    span,
+                                );
+                            }
+                            // Inner template: each ellipsis layer
+                            // drops one level of depth for the pvars
+                            // referenced inside. A depth-1 pvar
+                            // becomes depth-0 (scalar in the lambda
+                            // body); a depth-2 pvar becomes depth-1
+                            // (still needs another nested ellipsis to
+                            // fully unwrap). Other pvars pass through
+                            // unchanged.
+                            let inner_pvars: Vec<(Symbol, u32)> = pvars
+                                .iter()
+                                .map(|(p, d)| {
+                                    if depth1_pvars.contains(p) && *d > 0 {
+                                        (*p, *d - 1)
+                                    } else {
+                                        (*p, *d)
+                                    }
+                                })
+                                .collect();
+                            let inner_expr =
+                                compile_syntax_template(sub, &inner_pvars, syms, kw, mark_expr);
+                            // Build `(map (lambda (p1 p2 ... pK) <inner>) p1-list ... pK-list)`.
+                            let lambda_params = mk_list(
+                                depth1_pvars
+                                    .iter()
+                                    .map(|p| Datum::Symbol(*p, span))
+                                    .collect(),
+                                span,
+                            );
+                            let lambda_form = mk_list(
+                                vec![Datum::Symbol(kw.lambda, span), lambda_params, inner_expr],
+                                span,
+                            );
+                            let mut map_call =
+                                vec![Datum::Symbol(syms.intern("map"), span), lambda_form];
+                            for p in &depth1_pvars {
+                                map_call.push(Datum::Symbol(*p, span));
+                            }
+                            let mapped = mk_list(map_call, span);
+
+                            // Splice mapped result into prefix:
+                            // (cons 'p1 (cons 'p2 ... (cons 'pK mapped)))
+                            let mut acc = mapped;
+                            for prefix in items[..n - 2].iter().rev() {
+                                let car_expr =
+                                    compile_syntax_template(prefix, pvars, syms, kw, mark_expr);
+                                acc = mk_list(
+                                    vec![Datum::Symbol(syms.intern("cons"), span), car_expr, acc],
+                                    span,
+                                );
+                            }
+                            return acc;
+                        }
+                    }
+                }
+            }
+            // Compose `(cons <T car> <T cdr>)` recursively.
+            let (car, cdr) = match t {
+                Datum::Pair(a, b, _) => ((**a).clone(), (**b).clone()),
+                _ => unreachable!(),
+            };
+            let car_expr = compile_syntax_template(&car, pvars, syms, kw, mark_expr);
+            let cdr_expr = compile_syntax_template(&cdr, pvars, syms, kw, mark_expr);
+            mk_list(
+                vec![Datum::Symbol(syms.intern("cons"), span), car_expr, cdr_expr],
+                span,
+            )
+        }
+        // Self-quoting atoms (numbers, strings, chars, bools)
+        // already evaluate to themselves; emit unchanged.
+        _ => t.clone(),
     }
 }
 
@@ -5251,5 +7399,411 @@ mod tests {
         } else {
             panic!("expected BadSyntax, got {:?}", r);
         }
+    }
+
+    #[test]
+    fn library_resolver_loads_external_library() {
+        // The library declares (sample lib) and the importer pulls
+        // it in. The resolver must discriminate by name — the
+        // library's own (import) clause is empty here so we don't
+        // recurse, but a permissive resolver would loop on any
+        // nested import.
+        let importer_src = r#"
+            (import (sample lib))
+            (greeting)
+        "#;
+        let library_src = r#"
+            (library (sample lib)
+              (export greeting)
+              (import)
+              (define (greeting) 'hello))
+        "#;
+
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let importer_data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+
+        let library_src_owned = library_src.to_string();
+        let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+            let printed = format_library_name(name, syms);
+            if printed == "(sample lib)" {
+                Some((FileId(1), library_src_owned.clone()))
+            } else {
+                None
+            }
+        });
+        let mut exp = Expander::new(&mut syms, &mut macros).with_library_resolver(&mut *resolver);
+        exp.expand_program(&importer_data)
+            .expect("import + library load");
+    }
+
+    #[test]
+    fn library_resolver_not_installed_is_noop() {
+        // Without a resolver, an undeclared library import is a
+        // no-op (matches legacy behavior pre-#117).
+        let src = "(import (no-such lib))";
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let data = cs_parse::read_all(FileId(0), src, &mut syms).unwrap();
+        let mut exp = Expander::new(&mut syms, &mut macros);
+        exp.expand_program(&data)
+            .expect("no-resolver import is a no-op");
+    }
+
+    #[test]
+    fn library_resolver_called_only_once_for_same_lib() {
+        // Two imports of the same library in one Expander session
+        // should only resolve+load once. Use Rc<Cell> to observe.
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let library_src = "(library (single lib) (export x) (import) (define x 1))";
+        let importer_src = r#"
+            (import (single lib))
+            (import (single lib))
+        "#;
+
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_for_closure = calls.clone();
+        let library_src_owned = library_src.to_string();
+        let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+            let printed = format_library_name(name, syms);
+            if printed == "(single lib)" {
+                calls_for_closure.set(calls_for_closure.get() + 1);
+                Some((FileId(1), library_src_owned.clone()))
+            } else {
+                None
+            }
+        });
+        let mut exp = Expander::new(&mut syms, &mut macros).with_library_resolver(&mut *resolver);
+        exp.expand_program(&data)
+            .expect("two imports of one library");
+        drop(exp);
+
+        assert_eq!(calls.get(), 1, "library should be loaded exactly once");
+    }
+
+    #[test]
+    fn library_file_missing_declaration_errors() {
+        // Resolver returns source that does NOT declare the
+        // requested library. Should error.
+        let library_src = "(define oops 1)  ;; no (library …) declaration";
+        let importer_src = "(import (sample lib))";
+
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+
+        let library_src_owned = library_src.to_string();
+        let mut resolver: Box<LibraryResolver> =
+            Box::new(move |_name, _syms| Some((FileId(1), library_src_owned.clone())));
+        let mut exp = Expander::new(&mut syms, &mut macros).with_library_resolver(&mut *resolver);
+        let err = exp
+            .expand_program(&data)
+            .expect_err("missing library declaration should error");
+        if let ExpandError::BadSyntax { what, .. } = err {
+            assert!(what.contains("did not declare library"), "got: {}", what);
+        } else {
+            panic!("expected BadSyntax");
+        }
+    }
+
+    // ---------- Library cache (#116) ----------
+
+    #[test]
+    fn library_cache_hit_skips_reexpansion() {
+        // First load populates the cache; a second Expander session
+        // wired to the same cache reuses the expanded body.
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let library_src = "(library (cache lib) (export x) (import) (define x 1))";
+        let importer_src = "(import (cache lib))";
+
+        // Track resolver invocations across both sessions.
+        let calls = Rc::new(Cell::new(0u32));
+
+        // Shared cache that survives session 1 → session 2.
+        let mut cache = HashMapLibraryCache::new();
+
+        // Session 1: cold cache, resolver runs.
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+            let calls_inner = calls.clone();
+            let library_src_owned = library_src.to_string();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                if format_library_name(name, syms) == "(cache lib)" {
+                    calls_inner.set(calls_inner.get() + 1);
+                    Some((FileId(1), library_src_owned.clone()))
+                } else {
+                    None
+                }
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data)
+                .expect("session 1: cold-cache load");
+        }
+        assert_eq!(calls.get(), 1, "session 1 invokes resolver");
+        assert_eq!(cache.len(), 1, "cache populated after session 1");
+
+        // Session 2: same source, same cache. Resolver still runs
+        // (we need source content to compute the hash key), but the
+        // expansion work is skipped.
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+            let calls_inner = calls.clone();
+            let library_src_owned = library_src.to_string();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                if format_library_name(name, syms) == "(cache lib)" {
+                    calls_inner.set(calls_inner.get() + 1);
+                    Some((FileId(1), library_src_owned.clone()))
+                } else {
+                    None
+                }
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data)
+                .expect("session 2: warm-cache load");
+        }
+        assert_eq!(calls.get(), 2, "session 2 also invokes resolver");
+        assert_eq!(cache.len(), 1, "cache stays at 1 entry (same key reused)");
+    }
+
+    #[test]
+    fn library_cache_miss_on_source_change_repopulates() {
+        // Different source under the same library name produces a
+        // different hash → new cache entry, not a stale hit.
+        let mut cache = HashMapLibraryCache::new();
+
+        // Round 1: load v1 source.
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), "(import (changing lib))", &mut syms).unwrap();
+            let mut resolver: Box<LibraryResolver> = Box::new(|name, syms| {
+                if format_library_name(name, syms) == "(changing lib)" {
+                    Some((
+                        FileId(1),
+                        "(library (changing lib) (export x) (import) (define x 1))".to_string(),
+                    ))
+                } else {
+                    None
+                }
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data).unwrap();
+        }
+        assert_eq!(cache.len(), 1);
+
+        // Round 2: same name, NEW source (different define). The
+        // cache key (name, hash) differs because hash differs, so we
+        // expect the cache to grow.
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), "(import (changing lib))", &mut syms).unwrap();
+            let mut resolver: Box<LibraryResolver> = Box::new(|name, syms| {
+                if format_library_name(name, syms) == "(changing lib)" {
+                    Some((
+                        FileId(1),
+                        "(library (changing lib) (export x) (import) (define x 2))".to_string(),
+                    ))
+                } else {
+                    None
+                }
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data).unwrap();
+        }
+        assert_eq!(cache.len(), 2, "source change adds a new cache entry");
+    }
+
+    #[test]
+    fn library_cache_optional_no_install() {
+        // The cache is opt-in. Without with_library_cache the
+        // expander behaves exactly as it did before #116.
+        let library_src = "(library (no-cache lib) (export x) (import) (define x 1))";
+        let importer_src = "(import (no-cache lib))";
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+        let library_src_owned = library_src.to_string();
+        let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+            if format_library_name(name, syms) == "(no-cache lib)" {
+                Some((FileId(1), library_src_owned.clone()))
+            } else {
+                None
+            }
+        });
+        let mut exp = Expander::new(&mut syms, &mut macros).with_library_resolver(&mut *resolver);
+        exp.expand_program(&data).expect("works without cache");
+    }
+
+    // ---------- Phase 2F: dep-closure invalidation ----------
+
+    #[test]
+    fn cache_invalidates_when_transitive_dep_changes() {
+        // Library A imports B. After both are cached, simulate
+        // B's source changing on disk; A's cache entry must be
+        // invalidated even though A's own source is unchanged.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let a_src = "(library (depc a) (export x) (import (depc b)) (define x 1))";
+        let b_src_v1 = "(library (depc b) (export y) (import) (define y 1))";
+        let b_src_v2 = "(library (depc b) (export y) (import) (define y 2))";
+        let importer_src = "(import (depc a))";
+
+        // Resolver returns the current version from a mutable map.
+        let sources: Rc<RefCell<std::collections::HashMap<String, String>>> =
+            Rc::new(RefCell::new(std::collections::HashMap::from([
+                ("(depc a)".into(), a_src.into()),
+                ("(depc b)".into(), b_src_v1.into()),
+            ])));
+
+        let mut cache = HashMapLibraryCache::new();
+
+        // Session 1: cold cache, load A which transitively loads B.
+        let resolve_calls_b_v1: Rc<std::cell::Cell<u32>> = Rc::new(std::cell::Cell::new(0));
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+            let srcs = sources.clone();
+            let calls_b = resolve_calls_b_v1.clone();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                let key = format_library_name(name, syms);
+                if key == "(depc b)" {
+                    calls_b.set(calls_b.get() + 1);
+                }
+                srcs.borrow().get(&key).map(|s| (FileId(1), s.clone()))
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data).expect("session 1 cold load");
+        }
+        assert_eq!(cache.len(), 2, "both A and B cached after session 1");
+
+        // Session 2: same sources, same cache. Hit on both -- no
+        // expansion needed but resolver still runs for hashing
+        // and for dep validation.
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+            let srcs = sources.clone();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                let key = format_library_name(name, syms);
+                srcs.borrow().get(&key).map(|s| (FileId(1), s.clone()))
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data).expect("session 2 warm cache");
+        }
+        assert_eq!(cache.len(), 2, "no new entries on unchanged warm cache");
+
+        // Session 3: mutate B's source. A's cache entry must
+        // detect the upstream change and re-expand. Cache should
+        // contain B's new hash entry + A's new hash entry.
+        sources
+            .borrow_mut()
+            .insert("(depc b)".into(), b_src_v2.into());
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+            let srcs = sources.clone();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                let key = format_library_name(name, syms);
+                srcs.borrow().get(&key).map(|s| (FileId(1), s.clone()))
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data)
+                .expect("session 3 after dep change");
+        }
+        // A's cache key (source-hash) is unchanged -- only B's
+        // source changed. Without dep-closure tracking, A's entry
+        // would remain valid (wrong: A's compiled body references
+        // the old B). With Phase 2F, A is invalidated and
+        // re-expanded with B's new content. Cache ends up with B's
+        // new entry (3rd) AND A re-stored under its same key
+        // (overwrite), so total entries = 3 (A, B-v1, B-v2)
+        // because the cache uses (name, hash) keys so stale B-v1
+        // sticks around -- the validation logic uses dep-hash
+        // mismatch, not eviction.
+        assert!(
+            cache.len() >= 3,
+            "expected B v2 entry + A re-cached, got {}",
+            cache.len()
+        );
+    }
+
+    #[test]
+    fn cache_entry_records_direct_deps() {
+        // Verify the cache entry carries the dep list with the
+        // observed (name, source-hash) tuples.
+        let a_src = "(library (depr a) (export x) (import (depr b)) (define x 1))";
+        let b_src = "(library (depr b) (export y) (import) (define y 1))";
+        let importer_src = "(import (depr a))";
+
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+        let mut cache = HashMapLibraryCache::new();
+        {
+            let a_owned = a_src.to_string();
+            let b_owned = b_src.to_string();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                let key = format_library_name(name, syms);
+                match key.as_str() {
+                    "(depr a)" => Some((FileId(1), a_owned.clone())),
+                    "(depr b)" => Some((FileId(2), b_owned.clone())),
+                    _ => None,
+                }
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data).expect("loads");
+        }
+
+        // Recompute the cache key for A and inspect its entry.
+        let a_name_strs: Vec<String> = vec!["depr".into(), "a".into()];
+        let a_hash = hash_library_source(a_src);
+        let entry = cache
+            .get(&(a_name_strs.clone(), a_hash))
+            .expect("A is cached");
+        // A imported B, so A's deps should include B as a
+        // string-tuple (per the cross-session-safe encoding).
+        let b_name_strs: Vec<String> = vec!["depr".into(), "b".into()];
+        let b_hash = hash_library_source(b_src);
+        assert!(
+            entry
+                .deps
+                .iter()
+                .any(|(n, h)| n == &b_name_strs && *h == b_hash),
+            "expected A's dep list to include ([depr, b], B's hash); got {:?}",
+            entry.deps
+        );
     }
 }

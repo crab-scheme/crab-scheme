@@ -11,6 +11,9 @@ members = [
     "crates/cs-vm",
     "crates/cs-gc",
     "crates/cs-rir",
+    "crates/cs-opt",
+    "crates/cs-opt-example",
+    "crates/cs-sandbox-wasm",
     "crates/cs-typer",
     "crates/cs-jit",
     "crates/cs-jit-cranelift",
@@ -29,6 +32,8 @@ members = [
     "crates/cs-actor",
     "crates/cs-table",
     "crates/cs-hotreload",
+    # R6RS++ (see docs/research/r6rs_extensions_spec.md).
+    "crates/cs-pkg",
     # stdlib-modules (see .spec-workflow/specs/stdlib-modules/).
     # Each is an optional dep of cs-runtime behind a per-module
     # cargo feature; default-on for native, opt-out for WASM.
@@ -87,6 +92,9 @@ cs-runtime = { path = "crates/cs-runtime", default-features = false, features = 
 cs-vm = { path = "crates/cs-vm" }
 cs-gc = { path = "crates/cs-gc" }
 cs-rir = { path = "crates/cs-rir" }
+cs-opt = { path = "crates/cs-opt" }
+cs-opt-example = { path = "crates/cs-opt-example" }
+cs-sandbox-wasm = { path = "crates/cs-sandbox-wasm" }
 cs-typer = { path = "crates/cs-typer" }
 cs-jit = { path = "crates/cs-jit" }
 cs-jit-cranelift = { path = "crates/cs-jit-cranelift" }
@@ -100,6 +108,8 @@ cs-ffi-macros = { path = "crates/cs-ffi-macros" }
 cs-actor = { path = "crates/cs-actor" }
 cs-table = { path = "crates/cs-table" }
 cs-hotreload = { path = "crates/cs-hotreload" }
+# R6RS++ package manager. Spec §10.
+cs-pkg = { path = "crates/cs-pkg" }
 cs-stdlib-path = { path = "crates/cs-stdlib-path" }
 cs-stdlib-fs = { path = "crates/cs-stdlib-fs" }
 cs-stdlib-os = { path = "crates/cs-stdlib-os" }

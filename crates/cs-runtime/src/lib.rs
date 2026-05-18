@@ -29,6 +29,7 @@ use cs_diag::{Diagnostic, FileId, SourceMap};
 use cs_expand::Expander;
 use cs_parse::read_all;
 
+use crate::builtins::{NULL_ENV_SENTINEL, TOP_LEVEL_ENV_SENTINEL};
 use crate::env::Frame;
 use crate::eval::{eval, EvalCtx, EvalError};
 
@@ -190,6 +191,17 @@ impl Runtime {
     /// minimal runtime without the `(crab …)` modules can build
     /// against `--no-default-features` and skip the stdlib hookup.
     fn new_inner() -> Self {
+        // ADR 0014 — register the shipped builtin optimizer passes
+        // into the process-wide registry exactly once. Subsequent
+        // Runtime::new() calls hit the duplicate-name path on every
+        // pass; ignored — the registration already happened in the
+        // first call (or in a third-party plugin's startup hook).
+        let _ = cs_opt::register_builtins(
+            &mut cs_opt::PassRegistry::global()
+                .lock()
+                .expect("pass registry poisoned"),
+        );
+
         // Gap B-3: wire cs-vm's region-resolver function-
         // pointer hook to cs-runtime's per-thread REGION_STACK
         // accessor. This lets `vm_alloc_pair_region_gc` (the
@@ -551,7 +563,7 @@ impl Runtime {
         vm_env.define(
             env_sym,
             cs_vm::vm::make_vm_builtin_syms("environment", |_args, st| {
-                Ok(Value::Symbol(st.intern("__top-level-env__")))
+                Ok(Value::Symbol(st.intern(TOP_LEVEL_ENV_SENTINEL)))
             }),
         );
         // R6RS multi-value division ops. Both stash the (d, m) pair via
@@ -937,7 +949,7 @@ impl Runtime {
                 if !args.is_empty() {
                     return Err("interaction-environment: 0 args".into());
                 }
-                Ok(Value::Symbol(st.intern("__top-level-env__")))
+                Ok(Value::Symbol(st.intern(TOP_LEVEL_ENV_SENTINEL)))
             }),
         );
         // R5RS/R7RS legacy environment-introspection procedures.
@@ -955,7 +967,7 @@ impl Runtime {
                 if v != 5 {
                     return Err(format!("null-environment: unsupported version: {}", v));
                 }
-                Ok(Value::Symbol(st.intern("__null-env__")))
+                Ok(Value::Symbol(st.intern(NULL_ENV_SENTINEL)))
             }),
         );
         let srenv_sym = syms.intern("scheme-report-environment");
@@ -975,7 +987,7 @@ impl Runtime {
                         v
                     ));
                 }
-                Ok(Value::Symbol(st.intern("__top-level-env__")))
+                Ok(Value::Symbol(st.intern(TOP_LEVEL_ENV_SENTINEL)))
             }),
         );
         // get-string-all does not need ctx; install as pure VM builtin.
@@ -1976,8 +1988,13 @@ impl Runtime {
     /// Evaluate a string of Scheme source. Returns the value of the final
     /// top-level expression (or `Unspecified` for empty/define-only input).
     pub fn eval_str(&mut self, name: &str, src: &str) -> Result<Value, Diagnostic> {
-        let file_id = self.sources.add(name, src);
-        self.with_active(|rt| rt.eval_str_in_file(file_id, src))
+        // Phase 3C: detect and rewrite a leading `#!lang NAME`
+        // header into `(import (lang NAME))`. The rewritten source
+        // (same line count as original) is what gets registered
+        // and parsed; downstream line numbers stay accurate.
+        let rewritten = rewrite_lang_header(src);
+        let file_id = self.sources.add(name, &rewritten);
+        self.with_active(|rt| rt.eval_str_in_file(file_id, &rewritten))
     }
 
     /// Register a Rust procedure as a top-level Scheme binding. After
@@ -2150,6 +2167,13 @@ impl Runtime {
         v.format_with(&self.syms, mode)
     }
 
+    /// Convert a span into its (line, column) coordinates using
+    /// this runtime's SourceMap. Returned coordinates are
+    /// 1-indexed.
+    pub fn sources_line_col(&self, span: cs_diag::Span) -> (u32, u32) {
+        self.sources.line_col(span)
+    }
+
     /// Evaluate a string of Scheme source via the **bytecode VM** tier.
     /// Foundation: only pure builtins are supported. Higher-order builtins
     /// (apply/map/raise/with-exception-handler/etc.) and parameterize/dynamic-wind
@@ -2263,6 +2287,40 @@ impl Runtime {
 ///
 /// The output reads like:
 ///   error in <who>: <message> (<irritant ...>) [<other tags>]
+/// Phase 3C — rewrite a leading `#!lang NAME` header into the
+/// equivalent `(import (lang NAME))` form. The replacement
+/// happens in-place on line 1 only, preserving the file's line
+/// count so source-span line numbers reported in diagnostics
+/// continue to point at the right source line. Column positions
+/// on line 1 may shift, but that's acceptable for an MVP.
+///
+/// If no `#!lang` header is present, the source is returned
+/// unchanged. Allows leading whitespace and/or a UTF-8 BOM before
+/// the directive.
+fn rewrite_lang_header(src: &str) -> String {
+    let no_bom = src.strip_prefix('\u{FEFF}').unwrap_or(src);
+    let (first_line, rest) = match no_bom.find('\n') {
+        Some(idx) => (&no_bom[..idx], Some(&no_bom[idx..])),
+        None => (no_bom, None),
+    };
+    let trimmed = first_line.trim_start();
+    let lang_name = trimmed
+        .strip_prefix("#!lang ")
+        .or_else(|| trimmed.strip_prefix("#lang "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.chars().all(|c| !c.is_whitespace()));
+    match lang_name {
+        Some(name) => {
+            let mut out = format!("(import (lang {}))", name);
+            if let Some(r) = rest {
+                out.push_str(r);
+            }
+            out
+        }
+        None => src.to_string(),
+    }
+}
+
 /// or:
 ///   assertion-violation in <who>: <message> ...
 /// with each section omitted when not present. `who` is rendered with

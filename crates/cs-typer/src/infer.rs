@@ -48,7 +48,13 @@ fn infer_const(v: &Value) -> Type {
         Value::Null => Type::Null,
         Value::Boolean(_) => Type::Boolean,
         Value::Character(_) => Type::Character,
-        Value::Symbol(_) => Type::Symbol,
+        // Symbols and hygienic Identifiers are both "name-like"
+        // atoms at the cs-typer Phase-2 atom level. R6RS treats
+        // them as distinct types but for type inference of
+        // literal constants they share the Symbol atom -- the
+        // mark carried by Identifier is only meaningful to
+        // bound-identifier=? / free-identifier=?.
+        Value::Symbol(_) | Value::Identifier { .. } => Type::Symbol,
         Value::String(_) => Type::String,
         Value::Vector(_) => Type::Vector,
         Value::ByteVector(_) => Type::ByteVector,

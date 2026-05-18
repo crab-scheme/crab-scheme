@@ -1,0 +1,17 @@
+[package]
+name = "cs-sandbox-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "WASM-instance sandbox for CrabScheme (ADR 0015 L2). Embeds wasmtime to spawn isolated guest instances of crabscheme.wasm with WASI capability constraints."
+
+[dependencies]
+# ADR 0015 resolution Q1: pin to the 36.x LTS line (24-month
+# support, modern component-model APIs available when iter 7
+# evaluates the migration).
+# `wat` enables Module::new on WAT text (only needed for the
+# iter-1 inline smoke test — iter 1.5 loads .wasm bytes directly).
+wasmtime = { version = "36", default-features = false, features = ["cranelift", "runtime", "wat"] }
+wasmtime-wasi = "36"

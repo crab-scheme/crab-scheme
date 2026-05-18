@@ -14,6 +14,11 @@ use cs_gc::cycle::CycleVisit as _;
 
 /// A pair (cons cell). Mutable per R6RS via `set-car!` / `set-cdr!`.
 ///
+/// Pairs that originate from the reader carry their source-text span
+/// in `source`, populated by `Datum::to_value`. Pairs created at run
+/// time via `(cons …)` leave `source` as `None`. This is the
+/// foundation that R6RS++ §9's `(syntax-source …)` accessors read.
+///
 /// # Cycle-break tombstones (countable-memory iter 7.1)
 ///
 /// Under `feature = "countable-memory"`, `car_weak` / `cdr_weak`
@@ -37,6 +42,10 @@ use cs_gc::cycle::CycleVisit as _;
 pub struct Pair {
     pub car: RefCell<Value>,
     pub cdr: RefCell<Value>,
+    /// Source-text origin if this pair came from the reader. `Cell`
+    /// rather than plain field so the post-construction setter
+    /// `set_source` doesn't need `&mut Pair`.
+    pub source: std::cell::Cell<Option<cs_diag::Span>>,
     car_weak: RefCell<Option<WeakValue>>,
     cdr_weak: RefCell<Option<WeakValue>>,
 }
@@ -46,9 +55,25 @@ impl Pair {
         cs_gc::Gc::new(Pair {
             car: RefCell::new(car),
             cdr: RefCell::new(cdr),
+            source: std::cell::Cell::new(None),
             car_weak: RefCell::new(None),
             cdr_weak: RefCell::new(None),
         })
+    }
+
+    /// Construct a pair tagged with its reader-produced source span.
+    pub fn with_source(car: Value, cdr: Value, span: cs_diag::Span) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Pair {
+            car: RefCell::new(car),
+            cdr: RefCell::new(cdr),
+            source: std::cell::Cell::new(Some(span)),
+            car_weak: RefCell::new(None),
+            cdr_weak: RefCell::new(None),
+        })
+    }
+
+    pub fn source_span(&self) -> Option<cs_diag::Span> {
+        self.source.get()
     }
 
     /// Construct a Pair allocated in `region`'s bump arena
@@ -62,6 +87,7 @@ impl Pair {
             Pair {
                 car: RefCell::new(car),
                 cdr: RefCell::new(cdr),
+                source: std::cell::Cell::new(None),
                 car_weak: RefCell::new(None),
                 cdr_weak: RefCell::new(None),
             },
@@ -325,12 +351,15 @@ impl WeakValue {
             Value::Promise(p) => Some(WeakValue::Promise(cs_gc::Gc::downgrade(p))),
             Value::Procedure(p) => Some(WeakValue::Procedure(Rc::downgrade(p))),
             // Leaf values — no heap allocation to weaken.
+            // `Value::Identifier` is leaf-shaped (Symbol + u64 mark),
+            // no heap pointer to downgrade.
             Value::Null
             | Value::Unspecified
             | Value::Eof
             | Value::Boolean(_)
             | Value::Character(_)
             | Value::Symbol(_)
+            | Value::Identifier { .. }
             | Value::Number(_) => None,
         }
     }
@@ -664,6 +693,29 @@ pub enum Value {
     Number(Number),
     String(crate::Gc<RefCell<String>>),
     Symbol(Symbol),
+    /// Hygienic identifier: a name plus a per-macro-call mark.
+    /// Distinct from `Symbol` in R6RS terms (an identifier is a
+    /// syntax object wrapping a name with lexical context).
+    ///
+    /// * `mark == 0` is the "unmarked" identifier produced by
+    ///   `datum->syntax` when given a non-marked context, or by
+    ///   reader input that's been wrapped into a syntax object
+    ///   without flowing through a macro expansion.
+    /// * Each `syntax-case` template instantiation stamps the
+    ///   non-pvar identifiers in the template with a fresh
+    ///   mark unique to that expansion site; this is the
+    ///   mechanism that lets `bound-identifier=?` distinguish
+    ///   two `(mark-a x)` / `(mark-b x)` invocations.
+    ///
+    /// `Symbol` and `Identifier` interoperate at most
+    /// predicates (`identifier?` accepts either; `eq?` returns
+    /// false across the kinds even when the symbol/identifier
+    /// share a name). The migration that introduced this
+    /// variant is tracked in the R6RS++ plan as Phase 1.5.
+    Identifier {
+        name: Symbol,
+        mark: u64,
+    },
     Pair(crate::Gc<Pair>),
     Vector(crate::Gc<RefCell<Vec<Value>>>),
     ByteVector(crate::Gc<RefCell<Vec<u8>>>),
@@ -756,6 +808,7 @@ impl cs_gc::cycle::CycleVisit for Value {
             | Value::Boolean(_)
             | Value::Character(_)
             | Value::Symbol(_)
+            | Value::Identifier { .. }
             | Value::Number(_) => {}
         }
     }
@@ -807,6 +860,7 @@ impl Value {
             | Value::Boolean(_)
             | Value::Character(_)
             | Value::Symbol(_)
+            | Value::Identifier { .. }
             | Value::Number(_) => None,
         }
     }
@@ -821,6 +875,7 @@ impl Value {
             Value::Number(_) => "number",
             Value::String(_) => "string",
             Value::Symbol(_) => "symbol",
+            Value::Identifier { .. } => "identifier",
             Value::Pair(_) => "pair",
             Value::Vector(_) => "vector",
             Value::ByteVector(_) => "bytevector",
@@ -873,6 +928,11 @@ impl Value {
                 WriteMode::Display => write!(out, "{}", s.borrow()),
             },
             Value::Symbol(s) => write!(out, "{}", syms.name(*s)),
+            // Identifier renders identically to a symbol with
+            // the same name in normal write/display output;
+            // the mark is observable only via R6RS hygiene
+            // predicates (`bound-identifier=?`).
+            Value::Identifier { name, .. } => write!(out, "{}", syms.name(*name)),
             Value::Pair(p) => write_pair(out, p, syms, mode, visited),
             Value::Vector(v) => {
                 let ptr = crate::Gc::as_addr(v);
@@ -1013,6 +1073,13 @@ impl fmt::Display for Value {
             Value::Number(n) => write!(f, "{}", n),
             Value::String(s) => write!(f, "\"{}\"", s.borrow()),
             Value::Symbol(s) => write!(f, "#<symbol#{}>", s.0),
+            // Debug-style Display for Identifier surfaces the
+            // mark so it's visible in debug dumps / Rust-side
+            // panics; user-facing write/display in
+            // `write_to_visited` hides it.
+            Value::Identifier { name, mark } => {
+                write!(f, "#<identifier#{}:{}>", name.0, mark)
+            }
             Value::Pair(p) => display_pair(f, p),
             Value::Vector(v) => {
                 write!(f, "#(")?;
