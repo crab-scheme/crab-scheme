@@ -7,6 +7,9 @@
 use cs_core::WriteMode;
 use cs_runtime::Runtime;
 
+mod common;
+use common::wait_until;
+
 /// Render a Value to a Scheme-equivalent display string using
 /// the runtime's symbol table. Bare `format!("{}", v)` doesn't
 /// resolve symbol names (it has no SymbolTable handle), so it
@@ -194,13 +197,11 @@ fn raw_receive_bad_timeout_errors() {
     );
 
     let _pid = cs_runtime::builtins::beam::primop_spawn("test:bad-timeout-actor", vec![]).unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while err_msg.lock().unwrap().is_none() {
-        if std::time::Instant::now() >= deadline {
-            panic!("bad-timeout actor never finished");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
+    wait_until(
+        std::time::Duration::from_secs(1),
+        "bad-timeout actor never finished",
+        || err_msg.lock().unwrap().is_some(),
+    );
     let s = err_msg.lock().unwrap().clone().unwrap();
     assert!(s.contains("timeout") || s.contains("must be"), "got: {}", s);
 }
@@ -259,13 +260,11 @@ fn all_scheme_actor_body_self_send_receive() {
     };
     primop_send(target_pid, SendableValue::Symbol("payload".into())).unwrap();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while result.lock().unwrap().is_none() {
-        if std::time::Instant::now() >= deadline {
-            panic!("scheme actor body never finished");
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    wait_until(
+        Duration::from_secs(2),
+        "scheme actor body never finished",
+        || result.lock().unwrap().is_some(),
+    );
     let (me_s, msg_s) = result.lock().unwrap().clone().unwrap();
     assert_eq!(me_s, pid_display, "(self) should match the spawn'd pid");
     assert_eq!(msg_s, "payload");
@@ -479,14 +478,11 @@ fn reductions_in_actor_increment_and_yield_resets() {
     let _pid =
         cs_runtime::builtins::beam::primop_spawn("test:reductions-actor", vec![]).expect("spawn");
 
-    // Wait for the actor to finish recording all three snapshots.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while snapshots.lock().unwrap().len() < 3 {
-        if std::time::Instant::now() >= deadline {
-            panic!("reductions actor never finished");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
+    wait_until(
+        std::time::Duration::from_secs(1),
+        "reductions actor never finished",
+        || snapshots.lock().unwrap().len() >= 3,
+    );
     let snaps = snapshots.lock().unwrap().clone();
     assert_eq!(snaps, vec![0, 17, 0]);
 }
@@ -565,20 +561,11 @@ fn spawn_registered_proc_round_trip() {
     let send_src = format!(r#"(send (string->symbol "{}") 'hello)"#, pid_display);
     rt.eval_str("<t>", &send_src).expect("send to spawned pid");
 
-    // Wait for the echo to land.
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while received.lock().unwrap().is_none() {
-        if std::time::Instant::now() >= deadline {
-            // Sanity: confirm the spawn primop is wired by going
-            // directly through it so the test fails for a
-            // meaningful reason if the Scheme path silently
-            // dropped the send.
-            let pid = primop_spawn("test:scheme-spawn-echo", vec![]).unwrap();
-            primop_send(pid, SendableValue::Symbol("backup".into())).unwrap();
-            panic!("echo never received via Scheme path");
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    wait_until(
+        Duration::from_secs(1),
+        "echo never received via Scheme path",
+        || received.lock().unwrap().is_some(),
+    );
     assert_eq!(
         *received.lock().unwrap(),
         Some(SendableValue::Symbol("hello".into()))

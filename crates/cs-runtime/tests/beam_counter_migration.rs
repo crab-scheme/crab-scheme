@@ -46,6 +46,8 @@ use std::time::Duration;
 use cs_runtime::builtins::beam::{beam_state, payload_to_sendable, primop_send, SendableValue};
 use cs_runtime::Runtime;
 
+mod common;
+
 /// The migration function. In the prelude-driven flow this is
 /// what `(define-state-migration counter ((from-version 1) state)
 /// (cons state 0))` registers. Pulled out as a Rust function
@@ -346,14 +348,7 @@ fn wait_for_result<F: FnOnce()>(
 ) {
     *result.lock().unwrap() = None;
     trigger();
-    let deadline = std::time::Instant::now() + timeout;
-    while result.lock().unwrap().is_none() {
-        if std::time::Instant::now() >= deadline {
-            panic!(
-                "counter actor did not produce a snapshot within {:?}",
-                timeout
-            );
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    crate::common::wait_until(timeout, "counter actor produced no snapshot", || {
+        result.lock().unwrap().is_some()
+    });
 }

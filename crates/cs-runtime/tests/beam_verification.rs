@@ -25,6 +25,9 @@ use cs_runtime::builtins::beam::{
 };
 use cs_runtime::Runtime;
 
+mod common;
+use common::wait_until;
+
 // ============================================================
 // 1. Procedure-version hot reload.
 // ============================================================
@@ -61,22 +64,10 @@ fn procedure_reregistration_swaps_for_future_spawns() {
 
     primop_spawn("test:proc-hotswap", vec![]).expect("spawn v2");
 
-    // Wait for both actors to finish — the spawn order isn't
-    // guaranteed to match the completion order, so we wait for
-    // a v1 AND a v2 to land. Up to 1 second.
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        let v = observed.lock().unwrap().clone();
-        let has_v1 = v.iter().any(|s| *s == "v1");
-        let has_v2 = v.iter().any(|s| *s == "v2");
-        if has_v1 && has_v2 {
-            break;
-        }
-        if Instant::now() >= deadline {
-            panic!("proc-hotswap timeout, observed: {:?}", v);
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    wait_until(Duration::from_secs(1), "proc-hotswap", || {
+        let v = observed.lock().unwrap();
+        v.iter().any(|s| *s == "v1") && v.iter().any(|s| *s == "v2")
+    });
 }
 
 #[test]
@@ -117,29 +108,20 @@ fn already_running_actor_keeps_its_original_version() {
     let pid_v2 = primop_spawn("test:proc-running-pin", vec![]).expect("spawn v2");
     primop_send(pid_v2, SendableValue::Symbol("go".into())).expect("send v2");
 
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        let v = observed.lock().unwrap().clone();
-        if v.len() >= 2 {
-            // Both actors finished. The running-v1 actor must
-            // have pushed "v1" (NOT "v2") despite the re-registration.
-            assert!(
-                v.iter().any(|s| *s == "v1"),
-                "running v1 actor should have pushed v1, observed: {:?}",
-                v
-            );
-            assert!(
-                v.iter().any(|s| *s == "v2"),
-                "spawned-after-swap actor should have pushed v2, observed: {:?}",
-                v
-            );
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!("running-pin timeout, observed: {:?}", v);
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    wait_until(Duration::from_secs(1), "running-pin", || {
+        observed.lock().unwrap().len() >= 2
+    });
+    let v = observed.lock().unwrap();
+    assert!(
+        v.iter().any(|s| *s == "v1"),
+        "running v1 actor should have pushed v1, observed: {:?}",
+        v
+    );
+    assert!(
+        v.iter().any(|s| *s == "v2"),
+        "spawned-after-swap actor should have pushed v2, observed: {:?}",
+        v
+    );
 }
 
 // ============================================================
@@ -306,18 +288,11 @@ fn soak_n_actors_m_messages_no_deadlock() {
         }
     }
 
-    // Wait for all messages to land.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while completed.load(Ordering::Relaxed) < total as u64 {
-        if Instant::now() >= deadline {
-            panic!(
-                "soak timeout: {} of {} completed",
-                completed.load(Ordering::Relaxed),
-                total
-            );
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    wait_until(
+        Duration::from_secs(10),
+        "soak: messages didn't all land",
+        || completed.load(Ordering::Relaxed) >= total as u64,
+    );
     let elapsed = start.elapsed();
 
     // Tell workers to exit.
