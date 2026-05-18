@@ -124,17 +124,24 @@ output is what the spec gates on.
 ### WASM-subset build (iter 15)
 
 `cs-cli` now defines a `wasm-stdlib` convenience feature pulling
-in the 21 WASM-safe modules:
+in the 25 WASM-safe modules:
 
 ```
-path, fs, string, format, regex, time, random, uuid,
-json, csv, toml, base, url, hash, deflate, archive,
-log, metrics, collection, math, meta
+path, fs, os, string, format, regex, time, random, uuid,
+json, csv, toml, base, url, hash, compress, deflate, archive,
+log, metrics, collection, math, signal, tty, meta
 ```
 
-(Iter 17 split flate2 into `cs-stdlib-deflate` so gzip + raw
-deflate ship on WASM; `cs-stdlib-compress` now contains only
-zstd, which still doesn't cross-compile.)
+Iter 17 split flate2 into `cs-stdlib-deflate` so gzip + raw
+deflate ship on WASM. Iter 18 (a) added `cs-stdlib-{signal,tty}`
+to the subset (they already compiled — the cfg-not-unix stub
+covers WASM, and rustix handles WASI for terminal-size);
+(b) gated `gethostname` in `cs-stdlib-os` to non-WASM with
+a `HOSTNAME`-env-var-falling-back-to-`"wasi"` stub; and
+(c) swapped `zstd-sys` for the pure-Rust `ruzstd 0.8` on the
+WASM target so `cs-stdlib-compress` (zstd) ships there too —
+encoder uses `CompressionLevel::Fastest` only (ruzstd 0.8
+panics on Default/Better/Best), decoder is full-format.
 
 Build:
 
@@ -148,20 +155,37 @@ debug, smaller in release).
 
 **Excluded** (and why):
 
-- `os` — `gethostname` crate doesn't compile for `wasm32-wasip1`
-  (Unix-only platform module).
 - `process` — `std::process::Command::spawn` is unimplemented in
-  WASI preview 1.
-- `net` / `http` / `websocket` — no real socket support; ureq +
-  tiny_http + tungstenite all need `std::net::TcpStream`.
-- `signal` — `signal-hook` is Unix-only. We do have a Windows
-  stub but no WASI stub; `signal-watch!` would silently no-op.
-- `tty` — `terminal-size` reads IOCTLs.
-- `compress` — `zstd-sys` triggers `cc-rs` clang invocation with
-  flags (`-fzero-call-used-regs`) that nix-wrapped clang rejects
-  for `wasm32-wasip1`. Resolved partially in iter 17 by splitting
-  flate2 into `cs-stdlib-deflate`, which IS in the WASM subset.
-  WASM users get gzip + raw deflate; only zstd is unavailable.
+  both WASI preview 1 and preview 2 (WASI intentionally excludes
+  fork/exec — Component Model philosophy). Genuinely blocked
+  without forking to WASIX.
+- `net` / `http` / `websocket` — `std::net::TcpStream` is stubbed
+  on `wasm32-wasip1`. Unlocked by migrating to `wasm32-wasip2`,
+  which exposes `wasi:sockets` and `wasi:http`. Tracked as a
+  separate spec decision (drops wasip1 runtime compatibility,
+  requires replacing ureq/tiny_http with wasi-http bindings).
+
+Iter-18 stub work resolved three earlier exclusions:
+
+- `signal` — `[target.'cfg(unix)'.dependencies]` already excluded
+  signal-hook on WASM, and the existing `#[cfg(not(unix))]` stub
+  block (no-op `watch`/`poll`) covers WASI. **No code change** —
+  just added to `wasm-stdlib`.
+- `tty` — `terminal_size` → `rustix` already handles WASI via
+  `fd_isatty()` / size-query that gracefully returns None.
+  **No code change** — just added to `wasm-stdlib`.
+- `os` — `gethostname` crate fails to compile for WASM. Gated dep
+  to `[target.'cfg(not(target_family = "wasm"))'.dependencies]`,
+  added WASM-only `hostname` fn that reads `HOSTNAME` env var
+  (with literal `"wasi"` fallback).
+- `compress` (zstd) — `zstd-sys`' build script passes
+  `-fzero-call-used-regs` to clang, which nix-wrapped clang
+  rejects for wasm32. Swapped to pure-Rust `ruzstd 0.8` on the
+  WASM target. Encoder is limited to ruzstd's `Fastest` mode
+  (Default/Better/Best are `unimplemented!()` panics in ruzstd
+  0.8); decoder supports the full format. Output is valid zstd
+  — native C-zstd consumers decode it fine, just at a weaker
+  compression ratio than the same nominal level on native.
 
 ### Cross-cutting cleanup landed in iter 15
 
@@ -233,15 +257,18 @@ Resolved post-merge:
 
 ## Closing state
 
-- `stdlib-modules-spec` branch head: iter 17 (this commit) on
-  top of the merged iter-16 review-fixes.
+- `stdlib-modules-spec` branch head: iter 18 (this commit) on
+  top of the merged iter-16 + iter-17 (PR #8).
 - 29 new crates + 30 conformance tests + 2 realworld benches +
   1 WASM build matrix entry.
 - All 147 conformance tests green on native.
-- WASM build green with `wasm-stdlib` feature; 21 of 28
-  modules portable.
+- WASM build green with `wasm-stdlib` feature; **25 of 28
+  modules portable** (only `net`/`http`/`websocket`/`process`
+  remain, blocked on WASI socket support / Component-Model
+  process model — see exclusion rationale above).
 - Default cs-cli build unchanged in behaviour — every module
   the umbrella was advertising before iter 15 is still
   enabled (with gzip/deflate now coming from `cs-stdlib-deflate`
-  instead of `cs-stdlib-compress`); the user-facing Scheme
+  instead of `cs-stdlib-compress`, and WASM-target zstd coming
+  from `ruzstd` rather than `zstd-sys`); the user-facing Scheme
   procedure names are unchanged.

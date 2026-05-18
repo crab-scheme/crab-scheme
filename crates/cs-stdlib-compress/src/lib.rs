@@ -108,6 +108,7 @@ fn read_capped<R: Read>(name: &str, mut r: R, max_bytes: u64) -> Result<Vec<u8>,
     Ok(out)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn zstd_compress(args: &[Value]) -> Result<Value, FfiError> {
     let input = expect_bv("zstd-compress", args, 0)?;
     let level = opt_level(args, 1, 3, 22)? as i32;
@@ -116,10 +117,39 @@ fn zstd_compress(args: &[Value]) -> Result<Value, FfiError> {
         .map_err(|e| FfiError::HostFailure(format!("zstd-compress: {}", e)))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn zstd_decompress(args: &[Value]) -> Result<Value, FfiError> {
     let input = expect_bv("zstd-decompress", args, 0)?;
     let max = opt_max_bytes(args, 1)?;
     let decoder = zstd::Decoder::new(std::io::Cursor::new(input))
+        .map_err(|e| FfiError::HostFailure(format!("zstd-decompress: {}", e)))?;
+    let out = read_capped("zstd-decompress", decoder, max)?;
+    Ok(bv_value(out))
+}
+
+// WASM uses `ruzstd` — pure-Rust port of zstd. ruzstd 0.8 only
+// implements the `Uncompressed` and `Fastest` encoder levels
+// (Default/Better/Best panic with `unimplemented!()`), so we map
+// every requested level to `Fastest`. Output is still valid zstd
+// — native consumers decode it fine; only the compression ratio
+// is weaker than what the C zstd would give at the same level.
+// Decompression supports the full format.
+#[cfg(target_arch = "wasm32")]
+fn zstd_compress(args: &[Value]) -> Result<Value, FfiError> {
+    let input = expect_bv("zstd-compress", args, 0)?;
+    // Still parse the level for argument-validation parity with
+    // the native path; we don't actually use the value.
+    let _level = opt_level(args, 1, 3, 22)?;
+    let out =
+        ruzstd::encoding::compress_to_vec(&input[..], ruzstd::encoding::CompressionLevel::Fastest);
+    Ok(bv_value(out))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn zstd_decompress(args: &[Value]) -> Result<Value, FfiError> {
+    let input = expect_bv("zstd-decompress", args, 0)?;
+    let max = opt_max_bytes(args, 1)?;
+    let decoder = ruzstd::decoding::StreamingDecoder::new(&input[..])
         .map_err(|e| FfiError::HostFailure(format!("zstd-decompress: {}", e)))?;
     let out = read_capped("zstd-decompress", decoder, max)?;
     Ok(bv_value(out))

@@ -112,12 +112,16 @@ wasm-stdlib = [
     "stdlib-base",
     "stdlib-url",
     "stdlib-hash",
+    "stdlib-compress",
     "stdlib-deflate",
     "stdlib-archive",
     "stdlib-log",
     "stdlib-metrics",
     "stdlib-collection",
     "stdlib-math",
+    "stdlib-os",
+    "stdlib-signal",
+    "stdlib-tty",
     "stdlib-meta",
 ]
 # Backward-compat alias matching the W1 feature name.

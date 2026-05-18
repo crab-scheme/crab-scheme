@@ -10,6 +10,10 @@ description = "CrabScheme stdlib module (crab os) — environment, process ident
 [dependencies]
 cs-core = { workspace = true }
 cs-ffi = { workspace = true }
-# Tiny pure-Rust crate for cross-platform hostname (no libc deps on
-# Unix; uses GetComputerNameW on Windows). std doesn't expose this.
+
+# gethostname uses libc/Win32 calls that don't exist on
+# wasm32-wasip1 (the crate itself fails to compile for that
+# target). Gate to non-WASM; the WASM path falls back to the
+# HOSTNAME env var with "wasi" as default.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 gethostname = "0.5"
