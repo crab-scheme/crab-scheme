@@ -108,6 +108,205 @@ fn conformance_arithmetic() {
     run_conformance_file("arithmetic.scm");
 }
 
+// --- stdlib-modules (see .spec-workflow/specs/stdlib-modules) ---
+
+#[test]
+#[cfg(feature = "stdlib-path")]
+fn conformance_crab_path() {
+    run_conformance_file("crab-path.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-fs")]
+fn conformance_crab_fs() {
+    run_conformance_file("crab-fs.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-os")]
+fn conformance_crab_os() {
+    run_conformance_file("crab-os.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-process")]
+fn conformance_crab_process() {
+    run_conformance_file("crab-process.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-string")]
+fn conformance_crab_string() {
+    run_conformance_file("crab-string.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-format")]
+fn conformance_crab_format() {
+    run_conformance_file("crab-format.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-regex")]
+fn conformance_crab_regex() {
+    run_conformance_file("crab-regex.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-time")]
+fn conformance_crab_time() {
+    run_conformance_file("crab-time.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-random")]
+fn conformance_crab_random() {
+    run_conformance_file("crab-random.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-uuid")]
+fn conformance_crab_uuid() {
+    run_conformance_file("crab-uuid.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-json")]
+fn conformance_crab_json() {
+    run_conformance_file("crab-json.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-csv")]
+fn conformance_crab_csv() {
+    run_conformance_file("crab-csv.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-toml")]
+fn conformance_crab_toml() {
+    run_conformance_file("crab-toml.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-base")]
+fn conformance_crab_base() {
+    run_conformance_file("crab-base.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-url")]
+fn conformance_crab_url() {
+    run_conformance_file("crab-url.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-hash")]
+fn conformance_crab_hash() {
+    run_conformance_file("crab-hash.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-compress")]
+fn conformance_crab_compress() {
+    run_conformance_file("crab-compress.scm");
+}
+
+#[test]
+#[cfg(all(
+    feature = "stdlib-archive",
+    feature = "stdlib-fs",
+    feature = "stdlib-process"
+))]
+fn conformance_crab_archive() {
+    run_conformance_file("crab-archive.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-log")]
+fn conformance_crab_log() {
+    run_conformance_file("crab-log.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-metrics")]
+fn conformance_crab_metrics() {
+    run_conformance_file("crab-metrics.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-net")]
+fn conformance_crab_net() {
+    run_conformance_file("crab-net.scm");
+}
+
+#[test]
+#[cfg(all(feature = "stdlib-http", feature = "stdlib-net"))]
+fn conformance_crab_http() {
+    run_conformance_file("crab-http.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-http")]
+fn conformance_crab_http_server() {
+    run_conformance_file("crab-http-server.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-websocket")]
+fn conformance_crab_websocket() {
+    run_conformance_file("crab-websocket.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-collection")]
+fn conformance_crab_collection() {
+    run_conformance_file("crab-collection.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-math")]
+fn conformance_crab_math() {
+    run_conformance_file("crab-math.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-tty")]
+fn conformance_crab_tty() {
+    run_conformance_file("crab-tty.scm");
+}
+
+#[test]
+#[cfg(all(
+    feature = "stdlib-signal",
+    feature = "stdlib-process",
+    feature = "stdlib-os",
+    feature = "stdlib-time"
+))]
+fn conformance_crab_signal() {
+    run_conformance_file("crab-signal.scm");
+}
+
+// `(crab)` meta needs the umbrella `stdlib` feature on so the
+// manifest actually has the modules the test spot-checks for
+// (path, fs, json, hash, http, collection, signal). Subset
+// embeds that only enable a few cs-stdlib-* crates won't see
+// those names and the test would (correctly) fail.
+#[test]
+#[cfg(all(
+    feature = "stdlib-meta",
+    feature = "stdlib-path",
+    feature = "stdlib-fs",
+    feature = "stdlib-json",
+    feature = "stdlib-hash",
+    feature = "stdlib-http",
+    feature = "stdlib-collection",
+    feature = "stdlib-signal"
+))]
+fn conformance_crab_meta() {
+    run_conformance_file("crab-meta.scm");
+}
+
 #[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");

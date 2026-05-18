@@ -1,0 +1,15 @@
+[package]
+name = "cs-stdlib-os"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab os) — environment, process identity, platform info."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+# Tiny pure-Rust crate for cross-platform hostname (no libc deps on
+# Unix; uses GetComputerNameW on Windows). std doesn't expose this.
+gethostname = "0.5"

@@ -15,7 +15,7 @@ license.workspace = true
 # wasm32-wasip1.
 # Layer 2 (Rc-backed Gc<T> + synchronous cycle detector) is
 # unconditional after countable-memory iter 12b — ADR 0014.
-default = ["jit", "ffi-dynamic", "regions"]
+default = ["jit", "ffi-dynamic", "regions", "stdlib"]
 # Enables `cs-jit*` deps and `Runtime::install_jit` / `jit_lowerer`.
 # Disabled in WASM and AOT-binary builds (which inline their codegen
 # at build time instead of at runtime).
@@ -63,6 +63,77 @@ tracing-cycle-collector = [
 # library only loads when this feature is on.
 actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload"]
 
+# ----- (crab …) stdlib modules — see .spec-workflow/specs/stdlib-modules
+#
+# `stdlib` is the umbrella: every Tier-1/2/3 module compiled in.
+# Per-module flags (`stdlib-path`, `stdlib-fs`, …) toggle individual
+# crates so embedders can build subset distributions. Each per-module
+# flag implies `ffi-trait` because registration goes through
+# `register_host_procedure`.
+stdlib = [
+    "stdlib-path",
+    "stdlib-fs",
+    "stdlib-os",
+    "stdlib-process",
+    "stdlib-string",
+    "stdlib-format",
+    "stdlib-regex",
+    "stdlib-time",
+    "stdlib-random",
+    "stdlib-uuid",
+    "stdlib-json",
+    "stdlib-csv",
+    "stdlib-toml",
+    "stdlib-base",
+    "stdlib-url",
+    "stdlib-hash",
+    "stdlib-compress",
+    "stdlib-archive",
+    "stdlib-log",
+    "stdlib-metrics",
+    "stdlib-net",
+    "stdlib-http",
+    "stdlib-websocket",
+    "stdlib-collection",
+    "stdlib-math",
+    "stdlib-tty",
+    "stdlib-signal",
+    "stdlib-meta",
+]
+# Each `stdlib-<name>` feature also enables the matching
+# `cs-stdlib-meta?/meta-<name>` flag (via the `?` optional-dep
+# syntax) so `(crab-list-modules)` reflects whatever's compiled
+# in, even on subset builds. cs-stdlib-meta itself is optional;
+# the `stdlib` umbrella turns it on by default.
+stdlib-meta = ["ffi-trait", "dep:cs-stdlib-meta"]
+stdlib-path = ["ffi-trait", "dep:cs-stdlib-path", "cs-stdlib-meta?/meta-path"]
+stdlib-fs = ["ffi-trait", "dep:cs-stdlib-fs", "cs-stdlib-meta?/meta-fs"]
+stdlib-os = ["ffi-trait", "dep:cs-stdlib-os", "cs-stdlib-meta?/meta-os"]
+stdlib-process = ["ffi-trait", "dep:cs-stdlib-process", "cs-stdlib-meta?/meta-process"]
+stdlib-string = ["ffi-trait", "dep:cs-stdlib-string", "cs-stdlib-meta?/meta-string"]
+stdlib-format = ["ffi-trait", "dep:cs-stdlib-format", "cs-stdlib-meta?/meta-format"]
+stdlib-regex = ["ffi-trait", "dep:cs-stdlib-regex", "cs-stdlib-meta?/meta-regex"]
+stdlib-time = ["ffi-trait", "dep:cs-stdlib-time", "cs-stdlib-meta?/meta-time"]
+stdlib-random = ["ffi-trait", "dep:cs-stdlib-random", "cs-stdlib-meta?/meta-random"]
+stdlib-uuid = ["ffi-trait", "dep:cs-stdlib-uuid", "cs-stdlib-meta?/meta-uuid"]
+stdlib-json = ["ffi-trait", "dep:cs-stdlib-json", "cs-stdlib-meta?/meta-json"]
+stdlib-csv = ["ffi-trait", "dep:cs-stdlib-csv", "cs-stdlib-meta?/meta-csv"]
+stdlib-toml = ["ffi-trait", "dep:cs-stdlib-toml", "cs-stdlib-meta?/meta-toml"]
+stdlib-base = ["ffi-trait", "dep:cs-stdlib-base", "cs-stdlib-meta?/meta-base"]
+stdlib-url = ["ffi-trait", "dep:cs-stdlib-url", "cs-stdlib-meta?/meta-url"]
+stdlib-hash = ["ffi-trait", "dep:cs-stdlib-hash", "cs-stdlib-meta?/meta-hash"]
+stdlib-compress = ["ffi-trait", "dep:cs-stdlib-compress", "cs-stdlib-meta?/meta-compress"]
+stdlib-archive = ["ffi-trait", "dep:cs-stdlib-archive", "cs-stdlib-meta?/meta-archive"]
+stdlib-log = ["ffi-trait", "dep:cs-stdlib-log", "cs-stdlib-meta?/meta-log"]
+stdlib-metrics = ["ffi-trait", "dep:cs-stdlib-metrics", "cs-stdlib-meta?/meta-metrics"]
+stdlib-net = ["ffi-trait", "dep:cs-stdlib-net", "cs-stdlib-meta?/meta-net"]
+stdlib-http = ["ffi-trait", "dep:cs-stdlib-http", "cs-stdlib-meta?/meta-http"]
+stdlib-websocket = ["ffi-trait", "dep:cs-stdlib-websocket", "cs-stdlib-meta?/meta-websocket"]
+stdlib-collection = ["ffi-trait", "dep:cs-stdlib-collection", "cs-stdlib-meta?/meta-collection"]
+stdlib-math = ["ffi-trait", "dep:cs-stdlib-math", "cs-stdlib-meta?/meta-math"]
+stdlib-tty = ["ffi-trait", "dep:cs-stdlib-tty", "cs-stdlib-meta?/meta-tty"]
+stdlib-signal = ["ffi-trait", "dep:cs-stdlib-signal", "cs-stdlib-meta?/meta-signal"]
+
 [dependencies]
 cs-core = { workspace = true }
 cs-diag = { workspace = true }
@@ -85,6 +156,34 @@ thiserror = { workspace = true }
 cs-actor = { workspace = true, optional = true }
 cs-table = { workspace = true, optional = true }
 cs-hotreload = { workspace = true, optional = true }
+cs-stdlib-path = { workspace = true, optional = true }
+cs-stdlib-fs = { workspace = true, optional = true }
+cs-stdlib-os = { workspace = true, optional = true }
+cs-stdlib-process = { workspace = true, optional = true }
+cs-stdlib-string = { workspace = true, optional = true }
+cs-stdlib-format = { workspace = true, optional = true }
+cs-stdlib-regex = { workspace = true, optional = true }
+cs-stdlib-time = { workspace = true, optional = true }
+cs-stdlib-random = { workspace = true, optional = true }
+cs-stdlib-uuid = { workspace = true, optional = true }
+cs-stdlib-json = { workspace = true, optional = true }
+cs-stdlib-csv = { workspace = true, optional = true }
+cs-stdlib-toml = { workspace = true, optional = true }
+cs-stdlib-base = { workspace = true, optional = true }
+cs-stdlib-url = { workspace = true, optional = true }
+cs-stdlib-hash = { workspace = true, optional = true }
+cs-stdlib-compress = { workspace = true, optional = true }
+cs-stdlib-archive = { workspace = true, optional = true }
+cs-stdlib-log = { workspace = true, optional = true }
+cs-stdlib-metrics = { workspace = true, optional = true }
+cs-stdlib-net = { workspace = true, optional = true }
+cs-stdlib-http = { workspace = true, optional = true }
+cs-stdlib-websocket = { workspace = true, optional = true }
+cs-stdlib-collection = { workspace = true, optional = true }
+cs-stdlib-math = { workspace = true, optional = true }
+cs-stdlib-tty = { workspace = true, optional = true }
+cs-stdlib-signal = { workspace = true, optional = true }
+cs-stdlib-meta = { workspace = true, optional = true }
 
 [dev-dependencies]
 cs-ffi-example = { workspace = true }

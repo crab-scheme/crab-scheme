@@ -1,0 +1,14 @@
+[package]
+name = "cs-stdlib-base"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab base) — base64 / hex encoding."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+base64 = "0.22"
+hex = "0.4"

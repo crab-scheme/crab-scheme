@@ -180,6 +180,16 @@ impl Runtime {
     }
 
     pub fn new() -> Self {
+        let mut rt = Self::new_inner();
+        rt.register_stdlib();
+        rt
+    }
+
+    /// Body of `Runtime::new` minus the post-construction stdlib
+    /// registration step. Kept private so callers that want a
+    /// minimal runtime without the `(crab …)` modules can build
+    /// against `--no-default-features` and skip the stdlib hookup.
+    fn new_inner() -> Self {
         // Gap B-3: wire cs-vm's region-resolver function-
         // pointer hook to cs-runtime's per-thread REGION_STACK
         // accessor. This lets `vm_alloc_pair_region_gc` (the
@@ -1737,6 +1747,130 @@ impl Runtime {
     /// before the lambda first crosses the tier-up threshold.
     pub fn install_typer_hints(&self, hints: std::collections::HashMap<u32, Vec<cs_rir::Type>>) {
         *self.typer_hints_by_lambda_id.borrow_mut() = hints;
+    }
+
+    /// Register every compiled-in `(crab …)` stdlib module on this
+    /// runtime. Each `cs-stdlib-<name>` crate exposes a `procs()`
+    /// function returning `Vec<Arc<dyn HostProcedure>>`; this method
+    /// iterates the enabled crates and registers each procedure.
+    ///
+    /// Per-module features (`stdlib-path`, `stdlib-fs`, …) toggle
+    /// individual modules. When no `stdlib-X` feature is enabled
+    /// the body compiles to a no-op. Called automatically from
+    /// `Runtime::new`.
+    pub fn register_stdlib(&mut self) {
+        #[cfg(feature = "stdlib-path")]
+        for p in cs_stdlib_path::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-fs")]
+        for p in cs_stdlib_fs::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-os")]
+        for p in cs_stdlib_os::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-process")]
+        for p in cs_stdlib_process::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-string")]
+        for p in cs_stdlib_string::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-format")]
+        for p in cs_stdlib_format::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-regex")]
+        for p in cs_stdlib_regex::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-time")]
+        for p in cs_stdlib_time::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-random")]
+        for p in cs_stdlib_random::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-uuid")]
+        for p in cs_stdlib_uuid::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-json")]
+        for p in cs_stdlib_json::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-csv")]
+        for p in cs_stdlib_csv::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-toml")]
+        for p in cs_stdlib_toml::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-base")]
+        for p in cs_stdlib_base::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-url")]
+        for p in cs_stdlib_url::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-hash")]
+        for p in cs_stdlib_hash::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-compress")]
+        for p in cs_stdlib_compress::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-archive")]
+        for p in cs_stdlib_archive::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-log")]
+        for p in cs_stdlib_log::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-metrics")]
+        for p in cs_stdlib_metrics::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-net")]
+        for p in cs_stdlib_net::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-http")]
+        for p in cs_stdlib_http::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-websocket")]
+        for p in cs_stdlib_websocket::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-collection")]
+        for p in cs_stdlib_collection::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-math")]
+        for p in cs_stdlib_math::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-tty")]
+        for p in cs_stdlib_tty::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-signal")]
+        for p in cs_stdlib_signal::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-meta")]
+        for p in cs_stdlib_meta::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call

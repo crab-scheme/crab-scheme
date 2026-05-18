@@ -1,0 +1,15 @@
+[package]
+name = "cs-stdlib-time"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab time) — wall + monotonic time, sleep, strftime formatting."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+# strftime-style formatting. The default feature set is minimal
+# (no serde, no clock-of-the-day).
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

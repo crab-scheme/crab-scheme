@@ -1,0 +1,12 @@
+[package]
+name = "cs-stdlib-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab net …) — TCP, UDP, DNS via std::net."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "cs-stdlib-string"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab string) — string ops beyond R6RS basics."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "cs-stdlib-uuid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab uuid) — UUID v4 / v7 generation + parsing."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+uuid = { version = "1", features = ["v4", "v7"] }
