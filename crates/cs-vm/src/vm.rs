@@ -10105,10 +10105,12 @@ pub fn reset_yield_count() {
 }
 
 /// Bump the reduction counter and fire the yield hook if the
-/// budget is exhausted. Called from the dispatch loop. Hot path —
-/// keep small.
+/// budget is exhausted. Called from the dispatch loop on every
+/// instruction; also `pub` for integration tests that simulate
+/// bytecode interpretation without spinning up a full VM frame
+/// (parallel-runtime spec C2.3). Hot path — keep small.
 #[inline]
-fn vm_tick_reductions() {
+pub fn vm_tick_reductions() {
     VM_REDUCTIONS_USED.with(|used| {
         let new = used.get().saturating_add(1);
         let budget = VM_REDUCTION_BUDGET.with(|b| b.get());
