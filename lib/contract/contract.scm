@@ -155,3 +155,57 @@
                                    acc)))))))
              (result (apply proc checked-args)))
         (__apply-range rng result name desc)))))
+
+; ============================================================
+; Phase 2B.5 — combinators
+;
+; Combinators build new predicates out of existing ones. They
+; return PREDICATES (one-arg procedures returning a boolean), so
+; they slot into `(-> dom rng)` without any grammar changes —
+; e.g. `(-> (or/c number? string?) any/c)`.
+;
+;   (or/c p1 p2 ...)   disjunction: succeeds if any pi accepts v
+;   (and/c p1 p2 ...)  conjunction: succeeds if all pi accept v
+;   (list/c p1 p2 ...) fixed-length list, per-position checks
+;   any/c              accepts anything
+;   none/c             accepts nothing
+;
+; Note: these intentionally return plain predicates rather than
+; contract records. We don't need higher-order behavior for the
+; combinators themselves; the user can still pass a `make-contract`
+; record as any pi if they want HO semantics at that position.
+
+(define (any/c x) #t)
+(define (none/c x) #f)
+
+(define or/c
+  (lambda preds
+    (lambda (v)
+      (let loop ((ps preds))
+        (cond
+          ((null? ps) #f)
+          (((car ps) v) #t)
+          (else (loop (cdr ps))))))))
+
+(define and/c
+  (lambda preds
+    (lambda (v)
+      (let loop ((ps preds))
+        (cond
+          ((null? ps) #t)
+          (((car ps) v) (loop (cdr ps)))
+          (else #f))))))
+
+; (list/c p1 p2 ... pn) — accepts a proper list of length n where
+; element i satisfies pi.
+(define list/c
+  (lambda preds
+    (let ((n (length preds)))
+      (lambda (v)
+        (and (list? v)
+             (= (length v) n)
+             (let loop ((ps preds) (xs v))
+               (cond
+                 ((null? ps) #t)
+                 (((car ps) (car xs)) (loop (cdr ps) (cdr xs)))
+                 (else #f))))))))
