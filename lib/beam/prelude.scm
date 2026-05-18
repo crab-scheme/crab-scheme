@@ -51,38 +51,30 @@
 ; mailbox-order preservation across non-matches) lives in a
 ; later iter once mailbox introspection lands.
 
-; Uses explicit letrec/lambda instead of named-let `(let loop () …)`
-; because the named-let surface form interacts badly with hygienic
-; template instantiation in the current cs-expand — tracked as
-; #119. Functionally equivalent; the named-let rewrite is the
-; standard `(letrec ((loop (lambda () body))) (loop))` desugar.
-;
 ; Each clause is `(pat body ...)` with an implicit `begin` around
 ; the body — the standard Scheme convention.
 (define-syntax receive
   (syntax-rules (after)
     ((_ (pat body ...) ...)
-     (letrec ((loop (lambda ()
-                      (let ((msg (raw-receive #f)))
-                        (cond
-                          ((match-and-bind msg pat) body ...) ...
-                          (else (loop)))))))
-       (loop)))
+     (let loop ()
+       (let ((msg (raw-receive #f)))
+         (cond
+           ((match-and-bind msg pat) body ...) ...
+           (else (loop))))))
     ((_ (pat body ...) ... (after timeout-ms timeout-action))
      (let ((deadline (+ (current-jiffy)
                         (* timeout-ms (/ (jiffies-per-second) 1000)))))
-       (letrec ((loop (lambda ()
-                        (let* ((remaining (- deadline (current-jiffy)))
-                               (remaining-ms (if (< remaining 0)
-                                                 0
-                                                 (quotient (* remaining 1000)
-                                                           (jiffies-per-second))))
-                               (msg (raw-receive remaining-ms)))
-                          (cond
-                            ((not msg) timeout-action)
-                            ((match-and-bind msg pat) body ...) ...
-                            (else (loop)))))))
-         (loop))))))
+       (let loop ()
+         (let* ((remaining (- deadline (current-jiffy)))
+                (remaining-ms (if (< remaining 0)
+                                  0
+                                  (quotient (* remaining 1000)
+                                            (jiffies-per-second))))
+                (msg (raw-receive remaining-ms)))
+           (cond
+             ((not msg) timeout-action)
+             ((match-and-bind msg pat) body ...) ...
+             (else (loop)))))))))
 
 ; Stub matcher: a real impl is a pattern compiler. For the
 ; prelude draft we expand to a simple equal? check on a quoted
