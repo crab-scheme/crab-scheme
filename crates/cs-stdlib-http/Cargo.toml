@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-description = "CrabScheme stdlib module (crab http client) — synchronous HTTP client via ureq."
+description = "CrabScheme stdlib module (crab http client + server) — synchronous HTTP."
 
 [dependencies]
 cs-core = { workspace = true }
@@ -15,3 +15,6 @@ cs-ffi = { workspace = true }
 # which matches our concurrency posture (drive concurrent IO
 # from BEAM actors).
 ureq = { version = "2", default-features = false, features = ["tls"] }
+# tiny_http is the matching sync server — no Tokio dep, accept
+# loop blocks. Drive concurrent connections from BEAM actors.
+tiny_http = "0.12"

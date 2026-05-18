@@ -247,6 +247,12 @@ fn conformance_crab_http() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-http")]
+fn conformance_crab_http_server() {
+    run_conformance_file("crab-http-server.scm");
+}
+
+#[test]
 #[cfg(feature = "stdlib-websocket")]
 fn conformance_crab_websocket() {
     run_conformance_file("crab-websocket.scm");
