@@ -10217,12 +10217,11 @@ pub fn exact_integer_sqrt_num(x: &Value) -> Result<(Value, Value), String> {
 pub(crate) const ENV_TAG: &str = "__environment__";
 
 /// Hardcoded (rnrs base) export list — the R6RS §11 base library
-/// names that the runtime registers as global builtins. NOT the
-/// full R6RS surface; targets the names the L1.1 acceptance
-/// tests need + the obvious-to-include arithmetic / list / I/O
-/// procedures. L1.3 (composite construction) replaces this
-/// with library-membership metadata at builtin-registration
-/// time.
+/// names registered as global builtins. NOT the full R6RS surface;
+/// targets the names common Scheme programs use. L1.3 split this
+/// from the (rnrs lists) exports; library-membership metadata at
+/// builtin-registration time is the right long-term shape but the
+/// hardcoded split is enough for composite construction to work.
 const RNRS_BASE_EXPORTS: &[&str] = &[
     // arithmetic
     "+",
@@ -10338,6 +10337,24 @@ const RNRS_BASE_EXPORTS: &[&str] = &[
     "environment",
 ];
 
+/// Hardcoded (rnrs lists) export list — R6RS §3 lists library
+/// procedures. These are NOT in (rnrs base); a user importing
+/// only (rnrs base) doesn't see them. L1.3 split.
+const RNRS_LISTS_EXPORTS: &[&str] = &[
+    "find",
+    "for-all",
+    "exists",
+    "filter",
+    "partition",
+    "fold-left",
+    "fold-right",
+    "remove",
+    "remp",
+    "remv",
+    "remq",
+    "cons*",
+];
+
 /// Resolve an import-spec datum (a list like `'(rnrs base)`) into
 /// the set of names it exports. Returns `Err` for any spec we
 /// don't yet know about; user code gets a clear "unknown library"
@@ -10377,11 +10394,12 @@ fn resolve_import_spec(
         .collect();
     let joined = names.join(" ");
     match joined.as_str() {
-        "rnrs base" | "scheme base" | "rnrs lists" | "rnrs" => Ok(RNRS_BASE_EXPORTS),
+        "rnrs base" | "scheme base" => Ok(RNRS_BASE_EXPORTS),
+        "rnrs lists" => Ok(RNRS_LISTS_EXPORTS),
+        "rnrs" => Ok(RNRS_BASE_EXPORTS), // umbrella; still aliased to base for L1.3
         _ => Err(format!(
-            "environment: unknown library {:?} (only (rnrs base), (rnrs lists), \
-             (rnrs) supported at L1.1 — L1.3 follow-up adds per-library binding \
-             metadata)",
+            "environment: unknown library {:?} (supported at L1.3: \
+             (rnrs base), (rnrs lists), (rnrs))",
             joined
         )),
     }
