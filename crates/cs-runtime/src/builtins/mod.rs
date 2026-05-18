@@ -692,6 +692,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("hashtable-mutable?", b_hashtable_mutable_p),
         ("hashtable-hash-function", b_hashtable_hash_function),
         ("make-parameter", b_make_parameter),
+        ("parameter?", b_parameter_p),
         // (rnrs enums) — R6RS §13. Each enum-set is encoded as
         // #("__enum-set__" #(<universe symbols>) <bits-fixnum>).
         // M9 iter 2 limits the universe to ≤63 symbols (fixnum bitset);
@@ -10406,8 +10407,41 @@ fn b_make_parameter(args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 2 {
         return Err(arity_err("make-parameter", "1 or 2", args.len()));
     }
-    // R6RS make-parameter takes (init [converter]); we ignore converter for now.
+    // R6RS make-parameter takes (init [converter]). The optional
+    // converter procedure is meant to transform values on write
+    // (including the initial value). Today we ignore it -- threading
+    // a Scheme procedure call through the eval context from
+    // cs-core's Parameter::call dispatch is a tier-crossing change
+    // tracked as Phase 2E follow-up. Documented here so user code
+    // that passes a converter gets the un-converted behavior and
+    // can be migrated when the proper support lands.
+    if args.len() == 2 && !matches!(args[1], Value::Procedure(_)) {
+        return Err(type_err(
+            "make-parameter",
+            "procedure (converter)",
+            &args[1],
+        ));
+    }
     Ok(crate::proc::make_parameter(args[0].clone()))
+}
+
+/// `(parameter? v)` — true iff `v` is a parameter procedure
+/// created by `make-parameter`. R6RS R7RS-large add this
+/// predicate; our prior surface had `make-parameter` and
+/// `parameterize` but no way to test for parameter-ness.
+fn b_parameter_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("parameter?", "1", args.len()));
+    }
+    let is_param = match &args[0] {
+        Value::Procedure(p) => {
+            // Parameter lives in cs-core; downcast through the
+            // Procedure trait's `as_any` hook.
+            p.as_any().downcast_ref::<cs_core::Parameter>().is_some()
+        }
+        _ => false,
+    };
+    Ok(Value::Boolean(is_param))
 }
 
 // ---- SRFI-1 extras ----
