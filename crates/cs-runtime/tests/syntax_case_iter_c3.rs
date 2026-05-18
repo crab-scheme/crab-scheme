@@ -172,19 +172,8 @@ fn let_style_macro_emulation() {
 
 // ---- diagnostics ----
 
-#[test]
-fn nested_ellipsis_pattern_rejected() {
-    let mut rt = Runtime::new();
-    let err = rt
-        .eval_str(
-            "<t>",
-            "(syntax-case '(((1) (2)) ((3))) ()
-               (((x ...) ...) (syntax 0)))",
-        )
-        .expect_err("nested ellipsis not yet supported");
-    let s = format!("{}", err);
-    assert!(s.contains("future iter"), "got: {}", s);
-}
+// (Iter C3 used to reject nested ellipsis; Iter C6 now handles
+// the `((p ...) ...)` form -- see syntax_case_iter_c6.rs.)
 
 // (Iter C3 used to reject literals inside compound sub-patterns;
 // Iter C4 handles them -- see syntax_case_iter_c4.rs.)

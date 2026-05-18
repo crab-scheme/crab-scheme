@@ -58,9 +58,40 @@ Several downstream items want this:
 | **C3** | Compound sub-patterns under `…`, multi-pvar zip-map templates | **Done** | Yes — unblocks `let`-style macros |
 | **C4** | Literals + wildcards + dotted tail inside compound sub | **Done** | Yes — unblocks `cond`/`case-lambda`/`=>`-bearing macros |
 | **C5** | Nested compound sub `((a (b c)) …)` (recursive sub-pattern walker) | **Done** | Yes — handles arbitrarily deep nesting under one ellipsis level |
-| **C6** | Nested ellipsis `((p …) …)` — per-element matcher loops, depth-≥2 pvars | pending | Last grammar gap |
+| **C6** | Minimal nested ellipsis `((p …) …)` with bare-pvar inner | **Done** | Yes — covers the canonical "list of lists" shape |
+| **C7** | Nested ellipsis with compound/prefixed inner: `((kw p …) …)` / `(((a b) …) …)` | pending | Last ellipsis grammar gap |
 | **D** | Fender expressions (expand-time Scheme eval) | pending | Largest iter; may slip to Phase 2 |
 | **E** | Proper hygiene tracking — mark-aware identifier comparison | pending | Replaces the Iter A symbol-eq stand-ins; needs SyntaxObject decision |
+
+## Iter C6 — Minimal nested ellipsis
+
+Pattern `((p …) …)` where `p` is a single bare pvar binds `p` at
+**depth 2** — a list-of-lists. Because the inner `(p …)`
+trivially binds `p` to the entire inner element, the outer
+depth-2 `p` value is just `walking-key` itself (with a structural
+check that every outer element is a proper list).
+
+Template machinery: each ellipsis layer drops one depth level
+for referenced pvars. `(syntax ((p …) …))` with `p` at depth 2:
+* Outer `(… …)` rebinds `p` to depth 1 in the inner template.
+* Inner `(p …)` with `p` at depth 1 splices the inner list
+  (already implemented by Iter C2).
+
+The fix that made this work cleanly: in `compile_syntax_template`'s
+zip-map case, drop `(depth, depth - 1)` for matched pvars rather
+than reset to 0 — that lets deeper-depth pvars survive one
+ellipsis layer.
+
+**What lands:**
+* `((p …) …)` pattern + `(syntax p)` / `(syntax ((p …) …))` /
+  `(syntax ((wrap p …) …))` templates
+* Empty-outer / empty-inner-lists handled
+
+**Deferred to Iter C7 (last grammar piece):**
+* Compound inner: `(((a b) …) …)` — needs the recursive walker
+  to handle nested ellipsis recursively, with depth bookkeeping
+* Prefixed inner: `((kw p …) …)` — needs the inner ellipsis to
+  consume a prefix per outer element
 
 ## Iter C5 — Nested compound sub-patterns (recursive walker)
 

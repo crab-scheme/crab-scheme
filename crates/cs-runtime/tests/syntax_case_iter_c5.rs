@@ -169,16 +169,5 @@ fn record_field_extraction_emulation() {
 
 // ---- diagnostics ----
 
-#[test]
-fn nested_ellipsis_still_rejected_in_c5() {
-    let mut rt = Runtime::new();
-    let err = rt
-        .eval_str(
-            "<t>",
-            "(syntax-case '(((1) (2)) ((3))) ()
-               (((x ...) ...) (syntax 0)))",
-        )
-        .expect_err("nested ellipsis still pending");
-    let s = format!("{}", err);
-    assert!(s.contains("future iter"), "got: {}", s);
-}
+// (Iter C5's "nested ellipsis still rejected" test removed --
+// Iter C6 now handles `((p ...) ...)`. See syntax_case_iter_c6.rs.)

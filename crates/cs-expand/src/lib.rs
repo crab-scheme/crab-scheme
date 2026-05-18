@@ -5823,6 +5823,65 @@ fn compile_sc_pattern(
                                 }
                             }
 
+                            // Nested ellipsis detection (Iter C6).
+                            // If sub itself has the shape `(inner ...)`
+                            // — a proper-list of length 2 ending in
+                            // `...` — that's a nested ellipsis section.
+                            // Iter C6 minimal: only support `inner`
+                            // being a single bare pvar (no inner
+                            // prefix, no compound inner). The outer
+                            // pvar becomes depth-2.
+                            if let Some(sub_items) = collect_proper_list_strict(sub) {
+                                if sub_items.len() == 2 {
+                                    if let Datum::Symbol(inner_ellipsis, _) = &sub_items[1] {
+                                        if *inner_ellipsis == kw.ellipsis {
+                                            let inner = &sub_items[0];
+                                            if let Datum::Symbol(inner_sym, _) = inner {
+                                                if *inner_sym != kw.underscore
+                                                    && *inner_sym != kw.ellipsis
+                                                    && !literals.contains(inner_sym)
+                                                {
+                                                    // Test: walking-key is a list
+                                                    // of lists. Bind inner_sym at
+                                                    // depth 2 = walking-key (each
+                                                    // outer element is itself the
+                                                    // depth-1 inner-list).
+                                                    let list_test = mk_list(
+                                                        vec![
+                                                            mk_sym("list?", syms),
+                                                            walking_key.clone(),
+                                                        ],
+                                                        span,
+                                                    );
+                                                    let every_list_test = mk_list(
+                                                        vec![
+                                                            mk_sym("every", syms),
+                                                            mk_sym("list?", syms),
+                                                            walking_key.clone(),
+                                                        ],
+                                                        span,
+                                                    );
+                                                    tests.push(list_test);
+                                                    tests.push(every_list_test);
+                                                    pvars_out.push((*inner_sym, 2, walking_key));
+                                                    let mut all = vec![Datum::Symbol(kw.and, span)];
+                                                    all.extend(tests);
+                                                    return Ok(mk_list(all, span));
+                                                }
+                                            }
+                                            // Anything more complex
+                                            // inside the inner
+                                            // ellipsis section lands
+                                            // in a future iter.
+                                            return Err(ExpandError::BadSyntax {
+                                                what: "nested ellipsis: only `((p ...) ...)` with single bare-pvar inner is supported in Iter C6; compound or prefixed inner lands in a future iter".into(),
+                                                span,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+
                             // Compound sub: walk recursively to
                             // collect structural constraints + pvar
                             // accessors. Handles arbitrarily nested
@@ -6175,17 +6234,24 @@ fn compile_syntax_template(
                                     span,
                                 );
                             }
-                            // Inner template: re-bind those pvars at
-                            // depth 0 so the recursive compile treats
-                            // them as scalar references.
-                            let mut inner_pvars: Vec<(Symbol, u32)> = pvars
+                            // Inner template: each ellipsis layer
+                            // drops one level of depth for the pvars
+                            // referenced inside. A depth-1 pvar
+                            // becomes depth-0 (scalar in the lambda
+                            // body); a depth-2 pvar becomes depth-1
+                            // (still needs another nested ellipsis to
+                            // fully unwrap). Other pvars pass through
+                            // unchanged.
+                            let inner_pvars: Vec<(Symbol, u32)> = pvars
                                 .iter()
-                                .filter(|(p, _)| !depth1_pvars.contains(p))
-                                .copied()
+                                .map(|(p, d)| {
+                                    if depth1_pvars.contains(p) && *d > 0 {
+                                        (*p, *d - 1)
+                                    } else {
+                                        (*p, *d)
+                                    }
+                                })
                                 .collect();
-                            for p in &depth1_pvars {
-                                inner_pvars.push((*p, 0));
-                            }
                             let inner_expr = compile_syntax_template(sub, &inner_pvars, syms, kw);
                             // Build `(map (lambda (p1 p2 ... pK) <inner>) p1-list ... pK-list)`.
                             let lambda_params = mk_list(
