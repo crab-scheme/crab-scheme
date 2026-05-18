@@ -30,6 +30,7 @@ pub mod annotate;
 pub mod builtins;
 pub mod check;
 pub mod checker;
+pub mod contract_lowering;
 pub mod env;
 pub mod extract;
 pub mod infer;
