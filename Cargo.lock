@@ -562,6 +562,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-opt"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-rir",
+]
+
+[[package]]
 name = "cs-parse"
 version = "0.0.1"
 dependencies = [
@@ -631,6 +639,7 @@ dependencies = [
  "cs-ir",
  "cs-parse",
  "cs-rir",
+ "cs-runtime",
  "cs-vm",
 ]
 
@@ -643,6 +652,7 @@ dependencies = [
  "cs-gc",
  "cs-ir",
  "cs-jit",
+ "cs-opt",
  "cs-rir",
  "num-traits",
  "rustc-hash",
