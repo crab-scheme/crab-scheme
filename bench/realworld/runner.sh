@@ -59,8 +59,8 @@ mkdir -p "$RESULTS_DIR"
 : > "$OUTPUT"  # truncate
 
 # Build crabscheme once.
-echo "==> building crabscheme (release + aot)..." >&2
-(cd "$ROOT" && cargo build --release -p cs-cli --features aot --bin crabscheme \
+echo "==> building crabscheme (release + aot + jit)..." >&2
+(cd "$ROOT" && cargo build --release -p cs-cli --features "aot jit" --bin crabscheme \
    2>&1 | tail -3) >&2
 CS_BIN="$ROOT/target/release/crabscheme"
 if [ ! -x "$CS_BIN" ]; then
@@ -74,6 +74,7 @@ fi
 declare -a ENGINES=(
   "crabscheme:walker"   # tree-walker tier
   "crabscheme:vm"       # bytecode VM tier
+  "crabscheme:vm-jit"   # Cranelift JIT (requires --features jit at build)
 )
 # AOT tier is more involved (each bench needs --multi build + run);
 # wire when Tier-2 benches need AOT comparison.
