@@ -56,9 +56,37 @@ Several downstream items want this:
 | **C** | `with-syntax`, `quasisyntax`/`unsyntax`/`unsyntax-splicing`; pvar stack on Expander | **Done** | Yes — depends on B |
 | **C2** | Minimal ellipsis `…` (single-pvar form only) | **Done** | Yes — covers `(prefix… pvar …)` / `(prefix… pvar …)` splice |
 | **C3** | Compound sub-patterns under `…`, multi-pvar zip-map templates | **Done** | Yes — unblocks `let`-style macros |
-| **C4** | Nested ellipsis `((p …) …)`, literals-inside-compound, dotted-tail sub-patterns | pending | Largest remaining grammar gap |
+| **C4** | Literals + wildcards + dotted tail inside compound sub | **Done** | Yes — unblocks `cond`/`case-lambda`/`=>`-bearing macros |
+| **C5** | Nested ellipsis `((p …) …)` + nested compound `((a (b c)) …)` | pending | Final grammar piece; needs the matcher to recurse into ellipsis sections |
 | **D** | Fender expressions (expand-time Scheme eval) | pending | Largest iter; may slip to Phase 2 |
 | **E** | Proper hygiene tracking — mark-aware identifier comparison | pending | Replaces the Iter A symbol-eq stand-ins; needs SyntaxObject decision |
+
+## Iter C4 — Literals + wildcards + dotted tail in compound sub
+
+Extends Iter C3's compound sub-pattern handling. Each spine slot
+is classified as one of:
+
+* `Pvar(s)` — bare-symbol pvar (Iter C3 case)
+* `Literal(s)` — name from the `literals` list, `eq?`-checked
+* `Wildcard` — `_`, accepts anything, no binding
+
+The compound sub may also have a dotted tail of pvar/wildcard
+form: `((a . b) …)`, `((x y . rest) …)`.
+
+`classify_compound_sub` returns `(spine_slots, tail_slot)`; the
+shape lambda emits `pair?` for each spine position plus the
+slot-specific check (`eq?` for literals, nothing for pvars/
+wildcards), and either `null?` for proper-list sub or no
+constraint for dotted-tail sub.
+
+**Unblocks:** `cond` macros (`((test => proc) …)` with `=>`
+literal), `case-lambda` rewrites (`((args body) …)` and
+`((args . body) …)` shapes), and any other macro that wants to
+discriminate its compound clauses by a keyword.
+
+**Deferred to Iter C5:** nested ellipsis (`((p …) …)`), nested
+compound sub-patterns (`((a (b c)) …)`). Both still rejected
+with the same "future iter" pointer.
 
 ## Iter C3 — Compound + zip-map ellipsis
 

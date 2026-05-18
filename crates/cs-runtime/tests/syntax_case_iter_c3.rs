@@ -186,16 +186,5 @@ fn nested_ellipsis_pattern_rejected() {
     assert!(s.contains("future iter"), "got: {}", s);
 }
 
-#[test]
-fn literal_inside_compound_ellipsis_rejected() {
-    let mut rt = Runtime::new();
-    let err = rt
-        .eval_str(
-            "<t>",
-            "(syntax-case '((kw 1) (kw 2)) (kw)
-               (((kw v) ...) (syntax 0)))",
-        )
-        .expect_err("literal inside compound sub-pattern not yet supported");
-    let s = format!("{}", err);
-    assert!(s.contains("future iter"), "got: {}", s);
-}
+// (Iter C3 used to reject literals inside compound sub-patterns;
+// Iter C4 handles them -- see syntax_case_iter_c4.rs.)
