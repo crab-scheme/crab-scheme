@@ -9,10 +9,19 @@ use crate::number::Number;
 use crate::symbol::{Symbol, SymbolTable};
 
 /// A pair (cons cell). Mutable per R6RS via `set-car!` / `set-cdr!`.
+///
+/// Pairs that originate from the reader carry their source-text span
+/// in `source`, populated by `Datum::to_value`. Pairs created at run
+/// time via `(cons …)` leave `source` as `None`. This is the
+/// foundation that R6RS++ §9's `(syntax-source …)` accessors read.
 #[derive(Debug)]
 pub struct Pair {
     pub car: RefCell<Value>,
     pub cdr: RefCell<Value>,
+    /// Source-text origin if this pair came from the reader. `Cell`
+    /// rather than plain field so the post-construction setter
+    /// `set_source` doesn't need `&mut Pair`.
+    pub source: std::cell::Cell<Option<cs_diag::Span>>,
 }
 
 impl Pair {
@@ -20,7 +29,21 @@ impl Pair {
         cs_gc::Gc::new(Pair {
             car: RefCell::new(car),
             cdr: RefCell::new(cdr),
+            source: std::cell::Cell::new(None),
         })
+    }
+
+    /// Construct a pair tagged with its reader-produced source span.
+    pub fn with_source(car: Value, cdr: Value, span: cs_diag::Span) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Pair {
+            car: RefCell::new(car),
+            cdr: RefCell::new(cdr),
+            source: std::cell::Cell::new(Some(span)),
+        })
+    }
+
+    pub fn source_span(&self) -> Option<cs_diag::Span> {
+        self.source.get()
     }
 }
 

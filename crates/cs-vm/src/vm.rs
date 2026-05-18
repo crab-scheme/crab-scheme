@@ -1616,6 +1616,7 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
     let pair = cs_core::Pair {
         car: std::cell::RefCell::new(car_v),
         cdr: std::cell::RefCell::new(cdr_v),
+        source: std::cell::Cell::new(None),
     };
     let g: cs_gc::Gc<cs_core::Pair> = JIT_ACTIVE_HEAP.with(|c| {
         let ptr = c.get();

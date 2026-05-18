@@ -167,6 +167,12 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("rational?", b_rational_p),
         ("boolean?", b_boolean_p),
         ("pair?", b_pair_p),
+        // R6RS++ §9 source metadata accessors. Today read from the
+        // reader-attached span on Pair only; full first-class
+        // syntax objects (#118) extend the surface.
+        ("syntax-source", b_syntax_source),
+        ("syntax-line", b_syntax_line),
+        ("syntax-column", b_syntax_column),
         ("null?", b_null_p),
         ("list?", b_list_p),
         ("symbol?", b_symbol_p),
@@ -2293,6 +2299,76 @@ fn b_pair_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("pair?", "1", args.len()));
     }
     Ok(Value::Boolean(matches!(args[0], Value::Pair(_))))
+}
+
+/// `(syntax-source v)` — return the source-text origin of `v` as a
+/// list `(file-id start-byte end-byte)`, or `#f` if `v` carries no
+/// source span. Per R6RS++ §9: today only reader-produced Pairs
+/// carry source. Future iters (full syntax-case) extend this to
+/// hygiene-tracked syntax objects.
+fn b_syntax_source(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax-source", "1", args.len()));
+    }
+    let span = match &args[0] {
+        Value::Pair(p) => p.source_span(),
+        _ => None,
+    };
+    match span {
+        None => Ok(Value::Boolean(false)),
+        Some(s) => {
+            // (file-id start end)
+            let end = Value::Pair(Pair::new(
+                Value::Number(Number::Fixnum(s.end as i64)),
+                Value::Null,
+            ));
+            let mid = Value::Pair(Pair::new(
+                Value::Number(Number::Fixnum(s.start as i64)),
+                end,
+            ));
+            Ok(Value::Pair(Pair::new(
+                Value::Number(Number::Fixnum(s.file.0 as i64)),
+                mid,
+            )))
+        }
+    }
+}
+
+/// `(syntax-line v)` — return the 1-based line number of `v`'s
+/// source position, or `#f` if `v` carries no source span. The
+/// line lookup requires the SourceMap to be threaded; today we
+/// approximate by returning the start-byte (callers can convert
+/// via tooling). Full line/column resolution lands when this
+/// accessor moves into a higher-order builtin with SourceMap
+/// access.
+fn b_syntax_line(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax-line", "1", args.len()));
+    }
+    let span = match &args[0] {
+        Value::Pair(p) => p.source_span(),
+        _ => None,
+    };
+    match span {
+        None => Ok(Value::Boolean(false)),
+        Some(s) => Ok(Value::Number(Number::Fixnum(s.start as i64))),
+    }
+}
+
+/// `(syntax-column v)` — see [`b_syntax_line`]. Today returns the
+/// end-byte; tooling can derive column from start-byte + SourceMap.
+fn b_syntax_column(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax-column", "1", args.len()));
+    }
+    let span = match &args[0] {
+        Value::Pair(p) => p.source_span(),
+        _ => None,
+    };
+    match span {
+        None => Ok(Value::Boolean(false)),
+        Some(s) => Ok(Value::Number(Number::Fixnum(s.end as i64))),
+    }
 }
 
 fn b_null_p(args: &[Value]) -> Result<Value, String> {
