@@ -80,6 +80,7 @@ fi
 declare -a ENGINES=(
   "crabscheme:walker"   # tree-walker tier
   "crabscheme:vm"       # bytecode VM tier
+  "crabscheme:vm-jit"   # bytecode VM + Cranelift JIT tier-up
 )
 # AOT tier is more involved (each bench needs --multi build + run);
 # wire when Tier-2 benches need AOT comparison.
@@ -118,6 +119,11 @@ run_one() {
   tmpfile=$(mktemp -t "rw-$bench-$tier-XXXXXX.scm")
   cat "$HARNESS" "$bench_file" > "$tmpfile"
   # Set env vars so the harness picks up the right config.
+  # Capture the bench's real exit code without letting `set -e` kill
+  # the runner. `|| rc=$?` preserves the non-zero status while
+  # absorbing the failure; the previous `|| true` collapsed the
+  # exit code into 0, silently dropping the error JSON below.
+  local rc=0
   REALWORLD_ENGINE="$engine" \
   REALWORLD_ENGINE_TIER="$tier" \
   REALWORLD_ENGINE_VERSION="$CS_VERSION" \
@@ -126,8 +132,7 @@ run_one() {
   REALWORLD_TIME_BUDGET_SEC="$BUDGET" \
     "$CS_BIN" --tier "$tier" run "$tmpfile" \
       2> "$tmpfile.stderr" \
-      || true  # never let set -e kill the loop on a failing bench
-  local rc=${PIPESTATUS[0]:-$?}
+      || rc=$?
   if [ $rc -ne 0 ]; then
     # Emit a failure record so render.py can show "fail" cells
     # instead of dropping rows silently.
