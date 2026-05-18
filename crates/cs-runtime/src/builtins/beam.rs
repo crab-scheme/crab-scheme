@@ -304,51 +304,63 @@ pub fn primop_spawn(name: &str, args: Vec<SendableValue>) -> Result<ActorPid, St
         .procs
         .lookup(name)
         .ok_or_else(|| format!("spawn: no procedure registered under {:?}", name))?;
-    // parallel-runtime C1.2: use spawn_sync_body_on_task so the
-    // actor runs as a tokio task (not a parked OS thread via
-    // spawn_blocking). The body inside is still synchronous
-    // bytecode interpretation; cs-actor wraps it in
-    // `block_in_place` so the worker thread stays available to
-    // the runtime. Until C2 wires the yield hook into the
-    // dispatch loop, an actor that blocks on receive still
-    // ties up one worker — so the 4096-task practical ceiling
-    // isn't fully collapsed yet. Moving to the task scheduler
-    // now means C2 can drop in without touching this site.
-    let actor_ref = st.actors.spawn_sync_body_on_task(move |actor| {
-        // Hold a raw pointer to `actor` for the duration of the
-        // body so the (self) / (raw-receive) Scheme builtins
-        // can reach it via ACTOR_CTX. Safety: the pointer lives
-        // only on the worker thread for the block_in_place
-        // duration (managed inside spawn_sync_body_on_task);
-        // the Guard clears it before the closure returns.
-        let ptr: *mut cs_actor::Actor = actor;
-        ACTOR_CTX.with(|c| c.set(ptr));
-        REDUCTIONS.with(|c| c.set(0));
-        // parallel-runtime C2.2: install the reduction-yield hook
-        // for this worker thread. The hook routes through
-        // tokio::task::yield_now so a CPU-bound actor releases the
-        // worker cooperatively. Outside-actor contexts (REPL,
-        // direct eval) don't reach this path, so the hook stays
-        // None there and the dispatch loop's per-op tick is a
-        // pure counter no-op.
-        let prev_hook = cs_vm::vm::install_yield_hook(Some(cs_actor::tokio_yield_hook));
-        struct Guard {
-            prev_hook: Option<cs_vm::vm::VmYieldHook>,
-        }
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
-                REDUCTIONS.with(|c| c.set(0));
-                // Restore the previous hook (typically None) so a
-                // pooled worker thread reused by a non-actor caller
-                // doesn't see our hook.
-                cs_vm::vm::install_yield_hook(self.prev_hook);
-            }
-        }
-        let _g = Guard { prev_hook };
-        entry(actor, args);
-    });
+    // parallel-runtime C1.2 + C3.2 (partial): use spawn_sync_
+    // body_on_task so the actor runs as a tokio task. The full
+    // C3.2 wiring of `REGION_STACK_TASK.scope(...)` is BLOCKED
+    // on making `cs_gc::Region` Send — its Rc-internals can't
+    // cross an `await` point on the multi_thread runtime. The
+    // task-local infrastructure exists (C3.1's dual-stack) and
+    // its tests pass synthetically, but the actor's body can't
+    // .scope() over an Rc-bearing stack without Region: Send.
+    //
+    // Today's behavior: an actor's `(with-region …)` still
+    // rides the TLS path. Works correctly as long as the body
+    // doesn't yield between `enter` and `Drop` (the common
+    // case — yield budget is 2000 ops, region scopes are
+    // typically much shorter). Migration WITH an open region
+    // scope is a documented limitation; filed as a separate
+    // gap. The non-actor REPL path is unaffected.
+    let actor_ref = st
+        .actors
+        .spawn_sync_body_on_task(move |actor| run_actor_body(actor, entry, args));
     Ok(actor_ref.pid())
+}
+
+/// Sync inner of the actor body: installs the yield hook,
+/// ACTOR_CTX, REDUCTIONS counter, runs `entry`, cleans up via
+/// RAII Guard. Factored out so the spawn_async closure shape
+/// stays readable.
+fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<SendableValue>) {
+    // Hold a raw pointer to `actor` for the body's duration so
+    // the (self) / (raw-receive) Scheme builtins can reach it
+    // via ACTOR_CTX. Safety: this pointer lives only on the
+    // worker thread inside block_in_place; the Guard clears it
+    // before the closure returns or unwinds.
+    let ptr: *mut cs_actor::Actor = actor;
+    ACTOR_CTX.with(|c| c.set(ptr));
+    REDUCTIONS.with(|c| c.set(0));
+    // parallel-runtime C2.2: install the reduction-yield hook
+    // for this worker thread. cs-actor::tokio_yield_hook
+    // routes through tokio::task::yield_now so CPU-bound actor
+    // bodies release their worker cooperatively. Non-actor
+    // contexts never reach here, so the hook stays None and
+    // the dispatch loop's per-op tick is a pure counter no-op.
+    let prev_hook = cs_vm::vm::install_yield_hook(Some(cs_actor::tokio_yield_hook));
+    struct Guard {
+        prev_hook: Option<cs_vm::vm::VmYieldHook>,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
+            REDUCTIONS.with(|c| c.set(0));
+            // Restore the previous hook (typically None) so a
+            // pooled worker thread reused by a non-actor caller
+            // doesn't see our hook.
+            cs_vm::vm::install_yield_hook(self.prev_hook);
+        }
+    }
+    let _g = Guard { prev_hook };
+    entry(actor, args);
 }
 
 // ActorContext: thread-local pointer to the currently-running

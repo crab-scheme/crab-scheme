@@ -57,7 +57,7 @@ tokio::task_local! {
     /// contain the actor's region, so `cons-in-region` errors
     /// (or worse, allocates into the wrong region). The
     /// task-local travels with the task across worker hops.
-    static REGION_STACK_TASK: RefCell<Vec<Rc<Region>>>;
+    pub(crate) static REGION_STACK_TASK: RefCell<Vec<Rc<Region>>>;
 }
 
 /// Test/debug helper enumeration of which stack was used at
