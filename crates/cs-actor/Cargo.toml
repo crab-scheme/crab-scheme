@@ -14,6 +14,10 @@ description = "CrabScheme BEAM-style actor system: per-actor Runtime + tokio mps
 # design. Real Value transport lands when Scheme primops
 # integrate (post-B3) via copy-on-send wrappers.
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
+# `futures` provides FutureExt::catch_unwind for the async-task
+# panic capture in spawn_async (parallel-runtime C1.1). Smaller
+# pull than tokio-util; the cost is one extra dep.
+futures = "0.3"
 thiserror = { workspace = true }
 rustc-hash = { workspace = true }
 

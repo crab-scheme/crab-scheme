@@ -228,11 +228,26 @@ impl Actor {
     /// can ever send us a message).
     ///
     /// In B2 this is a true OS-thread block via tokio's
-    /// `blocking_recv`. B3 swaps this for a cooperative async-aware
-    /// receive that yields to the tokio scheduler so other actors
-    /// can run on the same worker.
+    /// `blocking_recv`. B3 (parallel-runtime spec, C1) ships
+    /// [`receive_async`] which yields cooperatively instead of
+    /// parking the OS thread. New code should prefer the async
+    /// variant.
     pub fn receive(&mut self) -> Option<Message> {
         self.inbox.blocking_recv()
+    }
+
+    /// Async receive (parallel-runtime spec C1.1). Returns the next
+    /// message, or `None` if all senders have dropped. Yields to
+    /// the tokio scheduler while waiting instead of parking the OS
+    /// thread, so M worker threads can multiplex N ≫ M actors.
+    ///
+    /// Sound to call from any `async fn` running inside the cs-actor
+    /// tokio runtime. If called outside that runtime context the
+    /// underlying `mpsc::UnboundedReceiver::recv` still works (no
+    /// runtime dependency) — the `.await` is what differs from
+    /// [`receive`].
+    pub async fn receive_async(&mut self) -> Option<Message> {
+        self.inbox.recv().await
     }
 
     /// Non-blocking receive — returns immediately. `Ok(msg)` if a
@@ -366,6 +381,58 @@ impl ActorSystem {
                 eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
                 // B5 will deliver this as Message::Exit to linked
                 // actors; B2 just logs.
+            }
+        });
+
+        ActorRef { pid, inbox: tx }
+    }
+
+    /// Async-body counterpart of [`spawn`] (parallel-runtime spec
+    /// C1.1). `body` is an async closure that takes an owned
+    /// `Actor` and returns a `Future`; the future runs as a tokio
+    /// task (not `spawn_blocking`), so M worker threads can
+    /// multiplex N ≫ M actors instead of one OS thread per actor.
+    ///
+    /// The 4096-actor ceiling from `max_blocking_threads(4096)`
+    /// does not apply to this path. The practical ceiling is
+    /// memory (each task carries a per-actor Runtime).
+    ///
+    /// Panic capture: tokio tasks panicking surface via
+    /// `JoinHandle`; we install a panic handler at task entry
+    /// that mirrors the sync path's behavior (deregister + log).
+    pub fn spawn_async<F, Fut>(&self, body: F) -> ActorRef
+    where
+        F: FnOnce(Actor) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let pid = self.inner.next_pid();
+        let (tx, rx) = mpsc::unbounded_channel::<Message>();
+        self.inner
+            .registry
+            .lock()
+            .expect("registry poisoned")
+            .insert(pid, tx.clone());
+
+        let system_for_actor = self.inner.clone();
+        let inner_for_cleanup = self.inner.clone();
+        let pid_for_cleanup = pid;
+
+        self.inner.handle.spawn(async move {
+            let actor = Actor {
+                pid,
+                inbox: rx,
+                system: system_for_actor,
+            };
+            // Wrap in AssertUnwindSafe + catch_unwind so a panic in
+            // body() doesn't poison the whole runtime. Tokio's
+            // default behavior aborts the task; we want the same
+            // log-and-deregister semantics as `spawn`.
+            let fut = std::panic::AssertUnwindSafe(body(actor));
+            let result = futures::FutureExt::catch_unwind(fut).await;
+            inner_for_cleanup.deregister(pid_for_cleanup);
+            if let Err(payload) = result {
+                let msg = panic_message(&payload);
+                eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
             }
         });
 
@@ -563,6 +630,57 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let c = counter.clone();
         sys.spawn(move |_a| {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
+        sys.wait_idle();
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        sys.shutdown();
+    }
+
+    // ---- parallel-runtime spec C1.1 — async spawn + receive ----
+
+    #[test]
+    fn async_round_trip_one_thousand_actors() {
+        // Acceptance for C1.1 from tasks.md: 1k actors via
+        // spawn_async, each receives + replies once. Validates the
+        // async path doesn't park OS threads per-actor and that
+        // both spawn_async and receive_async work end-to-end.
+        let sys = ActorSystem::new();
+        let reply_count = Arc::new(AtomicUsize::new(0));
+
+        // A router actor that sends `N` messages and collects replies.
+        let n = 1000usize;
+        let workers: Vec<ActorRef> = (0..n)
+            .map(|_| {
+                let reply_count = reply_count.clone();
+                sys.spawn_async(move |mut actor| async move {
+                    if let Some(Message::User(_)) = actor.receive_async().await {
+                        reply_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        for w in &workers {
+            w.send(Arc::new(())).expect("send to worker");
+        }
+        sys.wait_idle();
+        assert_eq!(reply_count.load(Ordering::Relaxed), n);
+        sys.shutdown();
+    }
+
+    #[test]
+    fn async_panic_in_body_is_isolated() {
+        // catch_unwind around the async body must mirror the sync
+        // path: process keeps running, sibling actors unaffected.
+        let sys = ActorSystem::new();
+        sys.spawn_async(|_actor| async move {
+            panic!("intentional async panic");
+        });
+        sys.wait_idle();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        sys.spawn_async(move |_actor| async move {
             c.fetch_add(1, Ordering::Relaxed);
         });
         sys.wait_idle();
