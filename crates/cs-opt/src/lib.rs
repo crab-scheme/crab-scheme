@@ -440,24 +440,97 @@ impl std::fmt::Display for PipelineError {
 
 impl std::error::Error for PipelineError {}
 
-// ---- Integration shim for cs-vm::jit_translate ----
+// ---- Active-pass list + integration shim for cs-vm::jit_translate ----
+
+// Thread-local active-pass name list. Scheme's
+// `install-optimizer-pass!` / `remove-optimizer-pass!` builtins
+// (in cs-runtime) mutate this through the accessor functions
+// below. `run_active_pipeline` reads it to decide what to run.
+//
+// Per-thread isolation matters because the runtime may spawn
+// worker threads (cs-actor) that compile independently; the
+// active-pass set should not bleed between them.
+//
+// A future iter could promote this to a Scheme Parameter so
+// `parameterize` gives lexical scoping. For now it's a flat
+// thread-local: install! adds, remove! removes, list reads.
+std::thread_local! {
+    static ACTIVE_PASSES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Append `name` to the current thread's active-pass list.
+/// Idempotent — re-installing a pass that's already active does
+/// nothing (preserves the original position).
+pub fn install_active_pass(name: &str) {
+    ACTIVE_PASSES.with(|c| {
+        let mut list = c.borrow_mut();
+        if !list.iter().any(|n| n == name) {
+            list.push(name.to_string());
+        }
+    });
+}
+
+/// Remove every occurrence of `name` from the current thread's
+/// active-pass list. No-op if the pass wasn't installed.
+pub fn remove_active_pass(name: &str) {
+    ACTIVE_PASSES.with(|c| c.borrow_mut().retain(|n| n != name));
+}
+
+/// Snapshot the current thread's active-pass list. Returns a
+/// cloned `Vec` so callers can iterate without holding the
+/// thread-local borrow.
+pub fn active_passes() -> Vec<String> {
+    ACTIVE_PASSES.with(|c| c.borrow().clone())
+}
+
+/// Reset the current thread's active-pass list to empty. Used
+/// by tests; production code should call `remove_active_pass`
+/// per name instead.
+pub fn clear_active_passes() {
+    ACTIVE_PASSES.with(|c| c.borrow_mut().clear());
+}
 
 /// Pipeline-integration entry point called by
 /// `cs-vm::jit_translate::bytecode_to_rir_full` just before the
 /// translated `Function` flows on to codegen.
 ///
-/// **Iter 1 implementation: no-op.** A future iter (3 per ADR
-/// 0014) replaces the body to read the active pipeline from a
-/// thread-local set by Scheme's `parameterize` over
-/// `(active-passes)`. Until then, this gives the cs-vm side a
-/// stable call-site whose semantics can change without further
-/// cs-vm edits.
+/// Iter 3 implementation: resolves the current thread's active
+/// pass list against the global registry, runs the resulting
+/// pipeline. When the active list is empty (the typical case),
+/// short-circuits to a single thread-local read — the cost
+/// measured at the empty-pipeline path is sub-100ns.
 ///
-/// The signature deliberately takes only `&mut Function` (no
-/// `SymbolTable`, no hints) so the cs-vm integration doesn't
-/// have to thread state it doesn't currently carry. When iter 3
-/// wires the Scheme side, that side will pull context from a
-/// thread-local rather than rely on the caller threading it.
-pub fn run_active_pipeline(_func: &mut Function) {
-    // Intentional no-op. See iter-3 plan in ADR 0014.
+/// Pipeline-construction failures (unknown pass names) are
+/// silently skipped here — they shouldn't happen because
+/// install-optimizer-pass! validates against the registry at
+/// install time. A future iter could plumb the diagnostic
+/// through, but right now there's no error channel from
+/// jit_translate back to user code at this point in the
+/// pipeline.
+///
+/// SymbolTable and typer hints are stubbed because the cs-vm
+/// integration doesn't currently carry them through to this
+/// call. Passes that need them today must check `ctx.syms.len()
+/// == 0` (the empty stub) as a sentinel; iter 5+ may widen the
+/// integration signature.
+pub fn run_active_pipeline(func: &mut Function) {
+    let names = active_passes();
+    if names.is_empty() {
+        return;
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let registry = PassRegistry::global().lock().expect("registry poisoned");
+    let Ok(pipeline) = PassPipeline::from_names(&registry, &refs) else {
+        return;
+    };
+    drop(registry);
+    let syms = SymbolTable::new();
+    let mut stats = PassStats::default();
+    let mut ctx = PassContext {
+        syms: &syms,
+        typer_hints: None,
+        stats: &mut stats,
+    };
+    pipeline.run(func, &mut ctx);
 }

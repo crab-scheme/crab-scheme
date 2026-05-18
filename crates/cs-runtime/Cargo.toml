@@ -50,6 +50,11 @@ cs-ffi = { workspace = true, optional = true }
 cs-gc = { workspace = true }
 cs-ir = { workspace = true }
 cs-lex = { workspace = true }
+# ADR 0014 — optimizer-pass framework. cs-runtime registers the
+# shipped builtin passes at Runtime::new() and exposes Scheme
+# builtins (install-optimizer-pass!, etc.) that mutate cs-opt's
+# thread-local active-pass list.
+cs-opt = { workspace = true }
 # Phase 5.4: typer-derived param hints. cs-rir's `Type` is the
 # vocabulary the JIT translator consumes, so the Runtime needs
 # the alias to accept hints from external callers (cs-cli, etc.).
@@ -66,6 +71,10 @@ cs-table = { workspace = true, optional = true }
 cs-hotreload = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Tests for the ADR 0014 Scheme surface call clear_active_passes
+# to isolate test-to-test thread-local state. Production code
+# never needs to import cs-opt directly.
 cs-ffi-example = { workspace = true }
 cs-ffi-macros = { workspace = true }
+cs-opt = { workspace = true }
 

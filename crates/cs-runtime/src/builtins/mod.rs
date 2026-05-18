@@ -753,6 +753,10 @@ pub fn pure_builtins() -> Vec<PureEntry> {
 
 pub fn higher_order_builtins() -> Vec<HoEntry> {
     vec![
+        // ADR 0014 — optimizer-pass installation.
+        ("install-optimizer-pass!", b_install_optimizer_pass),
+        ("remove-optimizer-pass!", b_remove_optimizer_pass),
+        ("installed-optimizer-passes", b_installed_optimizer_passes),
         ("apply", b_apply),
         // (time-apply) lives as a Scheme-level wrapper in the
         // benchmark harness, not a builtin: the VM dispatches
@@ -10442,6 +10446,76 @@ fn b_parameter_p(args: &[Value]) -> Result<Value, String> {
         _ => false,
     };
     Ok(Value::Boolean(is_param))
+}
+
+// ---- ADR 0014 — optimizer-pass installation ----
+//
+// Three Scheme builtins backed by cs-opt's thread-local active-pass
+// list. The thread-local is read by cs-opt::run_active_pipeline,
+// which is called at the end of bytecode→RIR translation in cs-vm.
+//
+// Validation: install! checks the pass name against the global
+// registry at install time so user code gets an immediate error
+// rather than a silent skip at codegen time.
+//
+// These are higher-order builtins because they need `ctx.syms` to
+// resolve / intern Symbol names.
+
+fn b_install_optimizer_pass(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("install-optimizer-pass!", "1", args.len()));
+    }
+    let sym = match &args[0] {
+        Value::Symbol(s) => *s,
+        _ => {
+            return Err(type_err(
+                "install-optimizer-pass!",
+                "symbol (pass name)",
+                &args[0],
+            ));
+        }
+    };
+    let name = ctx.syms.name(sym).to_string();
+    let registry = cs_opt::PassRegistry::global()
+        .lock()
+        .map_err(|_| "install-optimizer-pass!: registry mutex poisoned".to_string())?;
+    if registry.get(&name).is_none() {
+        return Err(format!("install-optimizer-pass!: unknown pass {:?}", name));
+    }
+    drop(registry);
+    cs_opt::install_active_pass(&name);
+    Ok(Value::Unspecified)
+}
+
+fn b_remove_optimizer_pass(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("remove-optimizer-pass!", "1", args.len()));
+    }
+    let sym = match &args[0] {
+        Value::Symbol(s) => *s,
+        _ => {
+            return Err(type_err(
+                "remove-optimizer-pass!",
+                "symbol (pass name)",
+                &args[0],
+            ));
+        }
+    };
+    let name = ctx.syms.name(sym).to_string();
+    cs_opt::remove_active_pass(&name);
+    Ok(Value::Unspecified)
+}
+
+fn b_installed_optimizer_passes(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("installed-optimizer-passes", "0", args.len()));
+    }
+    let names = cs_opt::active_passes();
+    let syms: Vec<Value> = names
+        .into_iter()
+        .map(|s| Value::Symbol(ctx.syms.intern(&s)))
+        .collect();
+    Ok(Value::list(syms))
 }
 
 // ---- SRFI-1 extras ----

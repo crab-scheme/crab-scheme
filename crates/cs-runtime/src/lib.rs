@@ -148,6 +148,17 @@ impl Default for Runtime {
 
 impl Runtime {
     pub fn new() -> Self {
+        // ADR 0014 — register the shipped builtin optimizer passes
+        // into the process-wide registry exactly once. Subsequent
+        // Runtime::new() calls hit the duplicate-name path on every
+        // pass; ignored — the registration already happened in the
+        // first call (or in a third-party plugin's startup hook).
+        let _ = cs_opt::register_builtins(
+            &mut cs_opt::PassRegistry::global()
+                .lock()
+                .expect("pass registry poisoned"),
+        );
+
         let mut syms = SymbolTable::new();
         let top = Frame::root();
         builtins::install_into(&top, &mut syms);
