@@ -48,6 +48,13 @@ pub struct SandboxRuntime {
     memory_limit: usize,
     fuel: Option<u64>,
     allow_paths: Vec<PathBuf>,
+    /// L1-inside-L2 defense in depth: the guest's expression is
+    /// wrapped in `(eval 'EXPR (environment IMPORTS...))` so the
+    /// L1 namespace restriction layer fires even when the host
+    /// accidentally grants too-much WASI capability. Snapshot
+    /// taken at runtime construction; (reset-sandbox!) picks up
+    /// any config changes.
+    imports: Vec<String>,
 }
 
 /// Per-Store data: the WASI ctx + the resource limiter.
@@ -90,6 +97,7 @@ impl SandboxRuntime {
             memory_limit: config.memory_limit,
             fuel: config.fuel,
             allow_paths: config.allow_paths.clone(),
+            imports: config.imports.clone(),
         })
     }
 
@@ -120,6 +128,17 @@ impl SandboxRuntime {
             )
         })?;
 
+        // Iter 5 — L1 inside L2 defense in depth: wrap the
+        // user's expression in (eval 'EXPR (environment IMPORTS))
+        // so the guest's L1 namespace restriction runs even if
+        // the host accidentally grants too-much WASI capability.
+        // The user expression must be a single datum (the
+        // outer quote turns it into a quoted form). Production
+        // embedders that want to skip the L1 wrap can set
+        // SandboxConfig.imports to ["(rnrs)"] which aliases to
+        // the full base set.
+        let wrapped_expr = build_l1_wrapped_eval(expr_source, &self.imports);
+
         // Build WASI ctx with --eval EXPR argv and captured stdio.
         let stdout = MemoryOutputPipe::new(1024 * 1024); // 1 MiB cap
         let stderr = MemoryOutputPipe::new(1024 * 1024);
@@ -131,7 +150,7 @@ impl SandboxRuntime {
             .stderr(stderr.clone())
             .arg("crabscheme")
             .arg("--eval")
-            .arg(expr_source);
+            .arg(&wrapped_expr);
         for path in &self.allow_paths {
             // Map each allow_path to itself in the guest's
             // filesystem namespace. Full DirPerms + FilePerms
@@ -217,6 +236,35 @@ impl SandboxRuntime {
 fn parse_stdout_into_result(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes);
     s.trim_end_matches('\n').to_string()
+}
+
+/// Iter 5: wrap the user's expression in an L1 environment
+/// lookup. The outer `(eval 'USER (environment IMPORTS))` form
+/// runs USER inside the guest's restricted environment.
+///
+/// `imports` is a list of import-spec strings — each one is a
+/// Scheme datum like `"(rnrs base)"` that gets pasted in
+/// verbatim. The default `["(rnrs base)"]` produces:
+///
+/// ```text
+/// (eval 'USER_EXPR (environment '(rnrs base)))
+/// ```
+///
+/// The wrap requires USER_EXPR to be a single datum (typical).
+/// Multi-datum input would need `(begin ...)` wrapping at the
+/// caller; the cs-runtime sandbox-eval builtin enforces
+/// single-string-single-datum at the surface.
+fn build_l1_wrapped_eval(user_expr: &str, imports: &[String]) -> String {
+    let mut s = String::with_capacity(user_expr.len() + 64 + imports.len() * 32);
+    s.push_str("(eval '");
+    s.push_str(user_expr);
+    s.push_str(" (environment");
+    for spec in imports {
+        s.push_str(" '");
+        s.push_str(spec);
+    }
+    s.push_str("))");
+    s
 }
 
 /// Iter 1 smoke: compile + instantiate a trivial WAT module

@@ -106,15 +106,25 @@ fn sandbox_instance_exposes_config_readonly() {
     assert_eq!(sb.config().fuel, Some(100_000_000));
 }
 
-// ---- Eval surface stubbed for iter 1 ----
+// ---- Eval surface ----
+//
+// Iter 1 stubbed eval; iter 1.5 wired the real protocol. Iter 1
+// configs leave binary_path=None, so eval now reports the
+// missing-path Internal error rather than NotImplementedYet.
 
 #[test]
-fn eval_returns_not_implemented_yet_in_iter1() {
+fn eval_without_binary_returns_internal_path_error() {
     let mut sb = SandboxInstance::new(SandboxConfig::adversarial()).unwrap();
     let err = sb.eval("(+ 1 2)").unwrap_err();
     match err {
-        SandboxError::NotImplementedYet(_) => (),
-        other => panic!("expected NotImplementedYet, got {:?}", other),
+        SandboxError::Internal(msg) => {
+            assert!(
+                msg.contains("binary_path") || msg.contains("not set"),
+                "expected missing-binary-path message, got: {}",
+                msg
+            );
+        }
+        other => panic!("expected Internal(missing-binary-path), got {:?}", other),
     }
 }
 
