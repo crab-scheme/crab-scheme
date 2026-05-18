@@ -29,6 +29,8 @@ members = [
     "crates/cs-actor",
     "crates/cs-table",
     "crates/cs-hotreload",
+    # R6RS++ (see docs/research/r6rs_extensions_spec.md).
+    "crates/cs-pkg",
 ]
 
 [workspace.package]
@@ -63,6 +65,8 @@ cs-ffi-macros = { path = "crates/cs-ffi-macros" }
 cs-actor = { path = "crates/cs-actor" }
 cs-table = { path = "crates/cs-table" }
 cs-hotreload = { path = "crates/cs-hotreload" }
+# R6RS++ package manager. Spec §10.
+cs-pkg = { path = "crates/cs-pkg" }
 
 # External crates
 logos = "0.14"
