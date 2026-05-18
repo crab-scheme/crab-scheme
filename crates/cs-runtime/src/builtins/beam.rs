@@ -1,42 +1,8 @@
 //! BEAM-style actor + table + hot-reload primops, exposed to
 //! Scheme as builtins. Behind the `actor` feature.
 //!
-//! See `docs/research/beam_runtime_spec.md`. This module is the
-//! glue layer between the three Rust crates (cs-actor / cs-table /
-//! cs-hotreload) and the user-facing Scheme surface that
-//! `lib/beam/prelude.scm` builds on.
-//!
-//! ## What's here
-//!
-//! - [`SendableValue`] — the subset of `cs_core::Value` that can
-//!   cross an actor boundary. Procedures, GC-managed cell types,
-//!   and ports are *not* representable: per BEAM's copy-on-send
-//!   model, every cross-actor value gets deep-cloned into the
-//!   receiver's heap. Sharing a `Rc<Slot<T>>` across threads
-//!   wouldn't be safe (Rc is `!Send`) and wouldn't match the
-//!   spec's "send-copies semantics" choice.
-//! - [`to_sendable_in`] / [`from_sendable`] — the boundary
-//!   conversions. Source / sink for the `Payload` type-erased
-//!   `Arc<dyn Any + Send + Sync>` used by cs-actor and cs-table.
-//! - [`actor_table_primops`] / [`hotreload_primops`] —
-//!   higher-order builtin entries to plug into
-//!   `pure_builtins()` / `higher_order_builtins()` in `mod.rs`.
-//!
-//! ## What's *not* here (yet)
-//!
-//! - `(spawn thunk)` with a real Scheme thunk. The closure
-//!   captures `Rc` references and Symbols local to its source
-//!   Runtime, so it can't cross to a child actor's Runtime as-is.
-//!   The first cut will require the spawned procedure to be a
-//!   *top-level name* the child Runtime can resolve by re-load:
-//!   `(spawn 'my-mod:my-proc)`. That keeps thunk-transport out
-//!   of the boundary and matches BEAM's `spawn(Mod, Fun, Args)`.
-//!   Implementation lands when this module joins the dispatch
-//!   layer; design is sketched below.
-//! - Selective receive at the Rust level — that's done in
-//!   `lib/beam/prelude.scm`'s `(receive ...)` macro on top of
-//!   the `raw-receive` primop. The Rust side stays a plain
-//!   blocking dequeue.
+//! See `docs/research/beam_runtime_spec.md` for the design and
+//! `docs/milestones/beam-v1-exit.md` for what shipped.
 
 #![cfg(feature = "actor")]
 
@@ -45,10 +11,6 @@ use std::sync::Arc;
 use cs_core::{Number, Pair, SymbolTable, Value};
 
 use cs_actor::{ActorPid, Payload};
-
-// ============================================================
-// SendableValue — the cross-actor value subset.
-// ============================================================
 
 /// A subset of `cs_core::Value` safe to ship across actor
 /// boundaries.
@@ -184,14 +146,6 @@ fn num_to_sendable(n: &Number) -> Result<SendableValue, String> {
     }
 }
 
-// ============================================================
-// Payload wrappers.
-// ============================================================
-//
-// cs-actor `Payload` and cs-table value cells are both
-// `Arc<dyn Any + Send + Sync>`. We carry a SendableValue inside
-// the Arc; downcast at the receiver to pull it back out.
-
 /// Wrap a SendableValue as a cs-actor `Payload`.
 pub fn payload_of(s: SendableValue) -> Payload {
     Arc::new(s)
@@ -205,14 +159,10 @@ pub fn payload_to_sendable(p: &Payload) -> Option<SendableValue> {
     p.downcast_ref::<SendableValue>().cloned()
 }
 
-// ============================================================
-// Cross-actor key conversion for cs-table.
-// ============================================================
-//
-// cs-table's `Key` enum is intentionally narrow (Fixnum / String
-// / Bytes). Map a SendableValue → Key for the small set of
-// values that have sensible Hash + Ord; reject everything else.
-
+/// Map a SendableValue to a cs-table Key. cs-table's Key enum
+/// is intentionally narrow (Fixnum / String / Bytes); other
+/// SendableValue variants don't have sensible Hash + Ord, so
+/// they're rejected at the boundary.
 pub fn key_of(s: &SendableValue) -> Result<cs_table::Key, String> {
     match s {
         SendableValue::Fixnum(i) => Ok(cs_table::Key::Fixnum(*i)),
@@ -226,9 +176,6 @@ pub fn key_of(s: &SendableValue) -> Result<cs_table::Key, String> {
     }
 }
 
-// ============================================================
-// BeamState — the global Actor/Table/HotReload state.
-// ============================================================
 //
 // Per the spec, the BEAM-style primops are process-global:
 // PIDs, tables, and module versions are identifiers that any
@@ -282,9 +229,6 @@ pub fn beam_state() -> &'static BeamState {
     BEAM_STATE.get_or_init(BeamState::new)
 }
 
-// ============================================================
-// ProcedureRegistry — the answer to "how do thunks cross threads?"
-// ============================================================
 //
 // BEAM solves this with `spawn(Mod, Fun, Args)`: the receiver
 // loads the named module fresh and calls the function. Our v1
@@ -337,9 +281,6 @@ impl ProcedureRegistry {
     }
 }
 
-// ============================================================
-// Primop implementations (Rust side).
-// ============================================================
 //
 // These functions are the Rust-callable shape of the BEAM
 // primops. The Scheme-builtin wrappers further down convert
@@ -383,13 +324,10 @@ pub fn primop_spawn(name: &str, args: Vec<SendableValue>) -> Result<ActorPid, St
     Ok(actor_ref.pid())
 }
 
-// ============================================================
-// ActorContext — thread-local pointer to the currently-running
-// Actor. Lets per-actor Scheme builtins ((self), (raw-receive))
-// find their context without it being threaded through every
-// builtin signature.
-// ============================================================
-
+// ActorContext: thread-local pointer to the currently-running
+// Actor so per-actor Scheme builtins ((self), (raw-receive))
+// can find their context without it being threaded through
+// every builtin signature.
 std::thread_local! {
     static ACTOR_CTX: std::cell::Cell<*mut cs_actor::Actor> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
@@ -552,10 +490,6 @@ fn sendable_list(items: Vec<SendableValue>) -> SendableValue {
     acc
 }
 
-// ============================================================
-// cs-table primop implementations.
-// ============================================================
-
 pub fn primop_make_table(name: &str, type_str: &str) -> Result<(), String> {
     let ty = match type_str {
         "set" => TableType::Set,
@@ -607,9 +541,6 @@ pub fn primop_table_size(name: &str) -> Result<usize, String> {
         .map_err(|e| format!("table-size: {}", e))
 }
 
-// ============================================================
-// cs-hotreload primop implementations.
-// ============================================================
 //
 // VersionRegistry exports are type-erased `Arc<dyn Any + Send + Sync>`;
 // we wrap a SendableValue inside the Arc so the same Value <->
@@ -678,9 +609,6 @@ pub fn primop_code_unload(module: &str) {
     beam_state().versions.unload(module);
 }
 
-// ============================================================
-// Scheme-builtin wrappers (Value <-> SendableValue at the edge).
-// ============================================================
 //
 // Each builtin takes a slice of `Value` from the dispatcher,
 // converts via `to_sendable_in` / `from_sendable`, calls the
@@ -1102,10 +1030,6 @@ pub fn beam_syms_builtins() -> Vec<(
         ("code-unload!", b_beam_code_unload),
     ]
 }
-
-// ============================================================
-// Tests.
-// ============================================================
 
 #[cfg(test)]
 mod tests {
