@@ -1,0 +1,12 @@
+[package]
+name = "cs-stdlib-collection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab collection queue|set|heap) — FIFO queue, hash set, priority heap."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }

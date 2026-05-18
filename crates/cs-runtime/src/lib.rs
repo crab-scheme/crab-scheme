@@ -1852,6 +1852,14 @@ impl Runtime {
         for p in cs_stdlib_websocket::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-collection")]
+        for p in cs_stdlib_collection::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-math")]
+        for p in cs_stdlib_math::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call

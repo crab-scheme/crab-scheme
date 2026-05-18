@@ -259,6 +259,18 @@ fn conformance_crab_websocket() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-collection")]
+fn conformance_crab_collection() {
+    run_conformance_file("crab-collection.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-math")]
+fn conformance_crab_math() {
+    run_conformance_file("crab-math.scm");
+}
+
+#[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");
 }

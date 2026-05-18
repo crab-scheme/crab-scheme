@@ -50,6 +50,8 @@ stdlib = [
     "stdlib-net",
     "stdlib-http",
     "stdlib-websocket",
+    "stdlib-collection",
+    "stdlib-math",
 ]
 stdlib-path = ["cs-runtime/stdlib", "cs-runtime/stdlib-path"]
 stdlib-fs = ["cs-runtime/stdlib", "cs-runtime/stdlib-fs"]
@@ -74,6 +76,8 @@ stdlib-metrics = ["cs-runtime/stdlib", "cs-runtime/stdlib-metrics"]
 stdlib-net = ["cs-runtime/stdlib", "cs-runtime/stdlib-net"]
 stdlib-http = ["cs-runtime/stdlib", "cs-runtime/stdlib-http"]
 stdlib-websocket = ["cs-runtime/stdlib", "cs-runtime/stdlib-websocket"]
+stdlib-collection = ["cs-runtime/stdlib", "cs-runtime/stdlib-collection"]
+stdlib-math = ["cs-runtime/stdlib", "cs-runtime/stdlib-math"]
 # Backward-compat alias matching the W1 feature name.
 ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the

@@ -725,6 +725,7 @@ dependencies = [
  "cs-rir",
  "cs-stdlib-archive",
  "cs-stdlib-base",
+ "cs-stdlib-collection",
  "cs-stdlib-compress",
  "cs-stdlib-csv",
  "cs-stdlib-format",
@@ -733,6 +734,7 @@ dependencies = [
  "cs-stdlib-http",
  "cs-stdlib-json",
  "cs-stdlib-log",
+ "cs-stdlib-math",
  "cs-stdlib-metrics",
  "cs-stdlib-net",
  "cs-stdlib-os",
@@ -772,6 +774,14 @@ dependencies = [
  "cs-core",
  "cs-ffi",
  "hex",
+]
+
+[[package]]
+name = "cs-stdlib-collection"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
 ]
 
 [[package]]
@@ -847,6 +857,15 @@ version = "0.0.1"
 dependencies = [
  "cs-core",
  "cs-ffi",
+]
+
+[[package]]
+name = "cs-stdlib-math"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
+ "libm",
 ]
 
 [[package]]
