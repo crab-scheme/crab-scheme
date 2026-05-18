@@ -62,13 +62,6 @@ impl Runtime {
     }
 }
 
-/// Tier-up hook installed by [`Runtime::install_jit`]. Compiles
-/// the closure's bytecode body via the bytecode→RIR translator and
-/// the Cranelift lowerer; on success, stashes the native function
-/// pointer on the closure.
-///
-/// Silent on failure: any unsupported opcode, env access, or
-/// translation error leaves the closure on the bytecode VM.
 /// Thread-local poison flag — set when any prior JIT compile on
 /// this thread panicked. Once set, `jit_tier_up_hook` returns
 /// early without touching the Lowerer. Rationale: a Cranelift
@@ -89,6 +82,16 @@ std::thread_local! {
     static JIT_POISONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Tier-up hook installed by [`Runtime::install_jit`]. Compiles
+/// the closure's bytecode body via the bytecode→RIR translator and
+/// the Cranelift lowerer; on success, stashes the native function
+/// pointer on the closure.
+///
+/// Silent on failure: any unsupported opcode, env access, or
+/// translation error leaves the closure on the bytecode VM. A
+/// Cranelift panic during lowering also leaves the closure on the
+/// VM, and sets [`JIT_POISONED`] so subsequent tier-up attempts on
+/// this thread short-circuit.
 fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     if JIT_POISONED.with(|p| p.get()) {
         return;

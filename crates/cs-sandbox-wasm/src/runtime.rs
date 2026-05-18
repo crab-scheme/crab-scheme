@@ -396,3 +396,249 @@ pub fn verify_wasmtime_integration(
     add.call(&mut store, (a, b))
         .map_err(|e| SandboxError::Internal(format!("call failed: {}", e)))
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the L1-wrap support functions added in
+    //! cluster A's MEDIUM-2 security fix. The end-to-end coverage
+    //! from `tests/iter15_protocol.rs` etc. exercises these via
+    //! actual guest evals; these unit tests assert the underlying
+    //! string-building invariants directly so a regression that
+    //! re-introduces the escape gap fails at the lowest layer
+    //! rather than only via a guest exploit attempt.
+    use super::*;
+
+    // ---- escape_scheme_string ----
+
+    #[test]
+    fn escape_passes_normal_chars_through() {
+        assert_eq!(escape_scheme_string("(+ 1 2 3)"), "(+ 1 2 3)");
+        assert_eq!(escape_scheme_string(""), "");
+        assert_eq!(escape_scheme_string("hello world"), "hello world");
+    }
+
+    #[test]
+    fn escape_doubles_backslash() {
+        // Backslash MUST be escaped first; otherwise the subsequent
+        // quote-escape would itself be undone by an injected `\"`.
+        assert_eq!(escape_scheme_string("\\"), "\\\\");
+        assert_eq!(escape_scheme_string("a\\b"), "a\\\\b");
+        assert_eq!(escape_scheme_string("\\\\"), "\\\\\\\\");
+    }
+
+    #[test]
+    fn escape_doubles_quote() {
+        assert_eq!(escape_scheme_string("\""), "\\\"");
+        assert_eq!(escape_scheme_string("a\"b"), "a\\\"b");
+    }
+
+    #[test]
+    fn escape_converts_control_chars() {
+        assert_eq!(escape_scheme_string("\n"), "\\n");
+        assert_eq!(escape_scheme_string("\r"), "\\r");
+        assert_eq!(escape_scheme_string("\t"), "\\t");
+        assert_eq!(escape_scheme_string("line1\nline2"), "line1\\nline2");
+    }
+
+    #[test]
+    fn escape_blocks_wrapper_break_attempts() {
+        // MEDIUM-2 exploit attempts from the original review: each
+        // input contains characters that would close the wrapper's
+        // string literal early IF the escape were missing. Verify
+        // the output keeps the literal closed by doubling the
+        // injection chars.
+        //
+        // Attempt 1: bare quote tries to terminate the string mid-
+        // wrap. With escape: the quote becomes \" inside the
+        // literal, so the literal stays open.
+        let input1 = "foo\"; (display 'pwned)";
+        let out1 = escape_scheme_string(input1);
+        assert!(!out1.contains(r#"""#) || out1.contains(r#"\""#));
+        // Check that every `"` in the output is preceded by `\`.
+        let chars: Vec<char> = out1.chars().collect();
+        for (i, c) in chars.iter().enumerate() {
+            if *c == '"' {
+                assert!(
+                    i > 0 && chars[i - 1] == '\\',
+                    "unescaped quote at {}: {:?}",
+                    i,
+                    out1
+                );
+            }
+        }
+
+        // Attempt 2: backslash followed by quote — naive escaper
+        // that escapes only `"` first would let the `\` consume the
+        // escape backslash. Order matters: `\` is escaped first.
+        let input2 = "\\\"";
+        assert_eq!(escape_scheme_string(input2), "\\\\\\\"");
+
+        // Attempt 3: raw newline mid-expression. The R6RS reader
+        // accepts raw control bytes in string literals as data, so
+        // this isn't strictly a wrapper-break attempt, but we
+        // defensively escape it so the guest's reader never sees a
+        // surprise terminator from the host's serialization.
+        let input3 = "foo\nbar";
+        assert_eq!(escape_scheme_string(input3), "foo\\nbar");
+
+        // Attempt 4: line continuation (backslash + newline).
+        // Backslash-first ordering means the `\` doubles, then the
+        // newline converts to `\n`. The resulting `\\\n` is data,
+        // not a continuation.
+        let input4 = "foo\\\nbar";
+        assert_eq!(escape_scheme_string(input4), "foo\\\\\\nbar");
+    }
+
+    #[test]
+    fn escape_is_idempotent_against_double_application() {
+        // Defensive: running escape twice on the same input
+        // shouldn't introduce wrap breaks. The output of one pass
+        // is just text — a second pass treats it as ordinary
+        // string data.
+        let original = "embed \\ and \" and \n";
+        let once = escape_scheme_string(original);
+        let twice = escape_scheme_string(&once);
+        // Twice-escaped output must still have all quotes preceded
+        // by backslash and all backslashes doubled.
+        let chars: Vec<char> = twice.chars().collect();
+        for (i, c) in chars.iter().enumerate() {
+            if *c == '"' {
+                assert!(
+                    i > 0 && chars[i - 1] == '\\',
+                    "twice-escaped unescaped quote"
+                );
+            }
+        }
+    }
+
+    // ---- build_l1_wrapper_argv ----
+
+    #[test]
+    fn wrapper_default_imports_uses_rnrs_base() {
+        let out = build_l1_wrapper_argv("(+ 1 2)", &["(rnrs base)".to_string()]);
+        assert_eq!(
+            out,
+            r#"(eval (with-input-from-string "(+ 1 2)" read) (environment '(rnrs base)))"#
+        );
+    }
+
+    #[test]
+    fn wrapper_multiple_imports_each_quoted() {
+        let out = build_l1_wrapper_argv(
+            "x",
+            &["(rnrs base)".to_string(), "(rnrs lists)".to_string()],
+        );
+        assert_eq!(
+            out,
+            r#"(eval (with-input-from-string "x" read) (environment '(rnrs base) '(rnrs lists)))"#
+        );
+    }
+
+    /// Verify the wrap is structurally well-formed for the given
+    /// user input + imports: outer structure is the host-owned
+    /// prefix + suffix, and every `"` inside the literal region is
+    /// preceded by an odd number of `\` (i.e., escape-canceled).
+    /// Panics with a debug-friendly message on violation. Used by
+    /// the exploit-attempt tests below.
+    fn assert_wrap_well_formed(out: &str, expected_imports: &[&str]) {
+        const PREFIX: &str = r#"(eval (with-input-from-string ""#;
+        let suffix_imports: String = expected_imports
+            .iter()
+            .map(|s| format!(" '{}", s))
+            .collect();
+        let suffix = format!("\" read) (environment{}))", suffix_imports);
+        assert!(
+            out.starts_with(PREFIX),
+            "wrap prefix broken: {:?}",
+            &out[..PREFIX.len().min(out.len())]
+        );
+        assert!(out.ends_with(&suffix), "wrap suffix broken: {:?}", out);
+        // The literal region is between the opening `"` (last char
+        // of PREFIX) and the closing `"` (first char of suffix).
+        let literal_start = PREFIX.len();
+        let literal_end = out.len() - suffix.len() + 1; // include the closing `"`? no
+        let literal = &out[literal_start..out.len() - suffix.len()];
+        // Walk the literal. Every `"` must be preceded by an odd
+        // number of `\`. Track the run-length of `\` as we go.
+        let chars: Vec<char> = literal.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '"' {
+                // Count consecutive `\` preceding this position.
+                let mut backslashes = 0usize;
+                let mut j = i;
+                while j > 0 && chars[j - 1] == '\\' {
+                    backslashes += 1;
+                    j -= 1;
+                }
+                assert!(
+                    backslashes % 2 == 1,
+                    "unescaped `\"` at offset {} in literal {:?} (full wrap: {:?})",
+                    i,
+                    literal,
+                    out
+                );
+            }
+            i += 1;
+        }
+        let _ = literal_end; // silence unused, kept for documentation
+    }
+
+    #[test]
+    fn wrapper_escapes_user_expr_inside_string_literal() {
+        // The whole point of cluster A's MEDIUM-2 fix: user
+        // expression is embedded as a string literal that the
+        // guest's `read` parses at runtime. Crafted user input
+        // can't break out of the literal.
+        let out = build_l1_wrapper_argv("1) (display 'pwned", &["(rnrs base)".to_string()]);
+        assert_wrap_well_formed(&out, &["(rnrs base)"]);
+        // Sanity: the wrap ends with `))` (close `eval` + close
+        // `environment`).
+        assert!(out.ends_with("))"));
+    }
+
+    #[test]
+    fn wrapper_rejects_wrap_escape_via_backslash_quote() {
+        // Sneakier: backslash followed by quote. If the escaper
+        // ordered quote-first then backslash-first, the resulting
+        // wrap would have an unescaped `\"` sequence terminating
+        // the literal early. Verify the wrap's literal region
+        // keeps every `"` escape-canceled (odd backslash prefix).
+        let out = build_l1_wrapper_argv("\\\"", &["(rnrs base)".to_string()]);
+        assert_wrap_well_formed(&out, &["(rnrs base)"]);
+    }
+
+    #[test]
+    fn wrapper_rejects_naked_quote_followed_by_payload() {
+        // Direct paste of the MEDIUM-2 original repro from the
+        // security-auditor agent: a naked `"` mid-expr would close
+        // the literal early in any wrap that pasted the user expr
+        // directly. With escape, it can't.
+        let out = build_l1_wrapper_argv(r#"foo"; (display 'pwned"#, &["(rnrs base)".to_string()]);
+        assert_wrap_well_formed(&out, &["(rnrs base)"]);
+    }
+
+    #[test]
+    fn wrapper_rejects_control_char_smuggling() {
+        // Raw newlines in the user expr don't terminate a Scheme
+        // string literal (the reader accepts them as data), so
+        // this isn't a wrap-break, but the escape converts to `\n`
+        // anyway for defensive consistency. Verify the wrap region
+        // still has only escaped `"` chars.
+        let out = build_l1_wrapper_argv("foo\nbar\n", &["(rnrs base)".to_string()]);
+        assert_wrap_well_formed(&out, &["(rnrs base)"]);
+    }
+
+    #[test]
+    fn wrapper_empty_user_expr_still_well_formed() {
+        // eval_via_protocol rejects empty input upfront via
+        // ProtocolError, but build_l1_wrapper_argv itself must
+        // still produce a well-formed wrap (defensive — the
+        // function is callable from other paths in the future).
+        let out = build_l1_wrapper_argv("", &["(rnrs base)".to_string()]);
+        assert_eq!(
+            out,
+            r#"(eval (with-input-from-string "" read) (environment '(rnrs base)))"#
+        );
+    }
+}

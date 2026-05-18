@@ -28,9 +28,18 @@
 //!    no `wasi_snapshot_preview1::sock_*` imports are satisfied for
 //!    a module that tries to import them.
 //!
-//! All four tests use the `requires_wasm!` skip-when-no-binary
-//! pattern from the iter15 suite, so CI without the WASM build
-//! gets a green skip rather than a red miss.
+//! 5. **Wall-clock timeout end-to-end** (added after pr-test-analyzer
+//!    follow-up, severity 9): cluster A wired the epoch-interruption
+//!    + ticker-thread machinery for `wall_clock_timeout`, but no test
+//!    exercised the full `Trap::Interrupt → SandboxError::Timeout`
+//!    path end-to-end. A guest infinite loop with a sub-second timeout
+//!    must trap as `Timeout`, not as `FuelExhausted` or a generic
+//!    `Internal`. Also covers the case where fuel is intentionally
+//!    `None` so the timeout is the only forcing mechanism.
+//!
+//! All tests use the `requires_wasm!` skip-when-no-binary pattern
+//! from the iter15 suite, so CI without the WASM build gets a green
+//! skip rather than a red miss.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -275,6 +284,87 @@ fn linker_does_not_grant_socket_capabilities_to_sockets_module() {
         "expected unsatisfied-import error mentioning sock_open or 'unknown import', got: {}",
         err
     );
+}
+
+// ---- 5. Wall-clock timeout end-to-end ----
+
+/// Cluster A's marquee fix: wall-clock timeout actually fires. The
+/// pre-fix behavior was that `wall_clock_timeout` was validated > 0
+/// but never armed, so an infinite loop with no fuel cap would hang
+/// the host until manually killed. With the fix in place, an
+/// infinite loop traps as `SandboxError::Timeout` within
+/// approximately the configured timeout window.
+///
+/// Important: `fuel = None`. Fuel was the prior containment fallback;
+/// disabling it forces the test to rely on `wall_clock_timeout`
+/// alone, so a regression that re-breaks the ticker / epoch wiring
+/// would either hang the test (caught by `cargo test`'s per-test
+/// timeout) or produce a different error variant (caught by the
+/// match below).
+#[test]
+fn wall_clock_timeout_fires_on_long_running_eval() {
+    requires_wasm!();
+    let mut config = SandboxConfig::hygiene();
+    config.binary_path = binary_path();
+    // 500ms — tight enough that the test runs fast; loose enough
+    // that any reasonable build/scheduler doesn't false-positive
+    // before the eval starts.
+    config.wall_clock_timeout = Duration::from_millis(500);
+    // No fuel — wall-clock is the only enforcement mechanism for
+    // this test. A regression that re-breaks the ticker / epoch
+    // wiring would either hang (caught by cargo's per-test
+    // timeout) or surface a different error variant.
+    config.fuel = None;
+    let mut sb = SandboxInstance::new(config).unwrap();
+    let start = std::time::Instant::now();
+    // Naive Fibonacci — non-tail recursive (bounded depth ~35 so
+    // it won't blow the guest's host stack in --tier walker) but
+    // computationally heavy enough that the walker tier takes
+    // multiple seconds. The 500ms ticker will fire well before
+    // completion. We use fib instead of a tail-recursive infinite
+    // loop because the guest binary is built --no-default-features
+    // → walker tier → no tail-call optimization → infinite loops
+    // overflow the wasm stack instead of running long enough for
+    // the timeout to catch them.
+    let result = sb.eval("(let f ((n 35)) (if (< n 2) n (+ (f (- n 1)) (f (- n 2)))))");
+    let elapsed = start.elapsed();
+    match result {
+        Err(SandboxError::Timeout) => (),
+        other => panic!(
+            "expected SandboxError::Timeout; got {:?} after {:?}",
+            other, elapsed
+        ),
+    }
+    // Sanity: the timeout actually fired in roughly the configured
+    // window. Allow generous slack for slow CI and ticker-thread
+    // spawn latency. A timeout that fires way too early
+    // (sub-100ms) would suggest the ticker is armed-too-early
+    // (issue #14's spurious-Timeout failure mode).
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "timeout fired suspiciously early: {:?} (expected ~500ms)",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "timeout took way too long: {:?} (expected ~500ms with ticker firing)",
+        elapsed
+    );
+}
+
+/// Companion: an eval that completes BEFORE the timeout fires
+/// returns normally without spurious `Timeout`. Guards against a
+/// regression where the ticker fires too aggressively or the epoch
+/// deadline is set too low at the start of the call.
+#[test]
+fn fast_eval_below_timeout_returns_normally() {
+    requires_wasm!();
+    let mut config = SandboxConfig::hygiene();
+    config.binary_path = binary_path();
+    config.wall_clock_timeout = Duration::from_secs(30);
+    let mut sb = SandboxInstance::new(config).unwrap();
+    let result = sb.eval("(+ 1 2 3)").expect("fast eval should succeed");
+    assert_eq!(result, "6");
 }
 
 // ---- helpers ----
