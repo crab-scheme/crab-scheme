@@ -54,9 +54,36 @@ Several downstream items want this:
 | **A** | identifier?, syntax→datum, datum→syntax, generate-temporaries, bound-identifier=?, free-identifier=? as builtins | **Done** (`08f0e0f`) | Yes — foundational surface, used by downstream Scheme code |
 | **B** | `syntax-case` form recognizer + matcher + single-template clause | **Done** | Yes — covers ~80% of real-world syntax-case use without fenders |
 | **C** | `with-syntax`, `quasisyntax`/`unsyntax`/`unsyntax-splicing`; pvar stack on Expander | **Done** | Yes — depends on B |
-| **C2** | Ellipsis `…` in patterns + templates | pending | Split out — biggest single piece of grammar work |
+| **C2** | Minimal ellipsis `…` (single-pvar form only) | **Done** | Yes — covers `(prefix… pvar …)` / `(prefix… pvar …)` splice |
+| **C3** | Compound + nested ellipsis (`((p ...) ...)`, multi-pvar zip) | pending | Larger logic — needs runtime mapping/zipping |
 | **D** | Fender expressions (expand-time Scheme eval) | pending | Largest iter; may slip to Phase 2 |
 | **E** | Proper hygiene tracking — mark-aware identifier comparison | pending | Replaces the Iter A symbol-eq stand-ins; needs SyntaxObject decision |
+
+## Iter C2 — Minimal ellipsis
+
+Patterns of shape `(prefix… pvar …)` where `pvar` is a single
+bare symbol: the pvar binds to the *list* of remaining
+subject elements (after consuming the prefix). The subject must
+be a proper list of length ≥ prefix-length.
+
+Templates of matching shape `(prefix… pvar …)` splice the bound
+list into the rebuilt structure: emitted as
+`(cons prefix1 (cons prefix2 … (cons prefixN pvar)))`.
+
+**What lands here:**
+* `(args …)` / `(args …)` — common args-pattern macro shape
+* `(name args body)` + ellipsis-rich templates like
+  `(define name (lambda args body))` (no ellipsis required)
+* `with-syntax` patterns of the same shape
+
+**Explicitly rejected, with pointer to Iter C3:**
+* Compound sub-patterns: `((a b) …)` — needs per-element matcher loop
+  with pvar accumulators
+* Multiple pvars under one ellipsis position: `((a b) …)` template-side
+* Nested ellipsis: `((p …) …)`
+
+This is the 80/20 cut: covers the canonical "args-list" macro
+shape without the considerable complexity of multi-pvar zip-maps.
 
 ## Iter C — `with-syntax`, `quasisyntax`, pvar stack
 

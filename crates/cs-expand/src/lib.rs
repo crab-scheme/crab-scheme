@@ -5781,6 +5781,74 @@ fn compile_sc_pattern(
             Ok(test)
         }
         Datum::Pair(_, _, _) => {
+            // Detect a trailing `(prefix... pvar ...)` form, which
+            // is Iter C2's minimal ellipsis case. We require:
+            //   * the pattern is a proper list (tail is Null)
+            //   * the `...` symbol appears exactly once, as the
+            //     last element of the spine
+            //   * the element immediately before `...` is a bare
+            //     symbol pvar (no compound sub-patterns)
+            // Such a pattern matches any list of length >= prefix
+            // length; the pvar binds to the remaining list.
+            if let Some(items) = collect_proper_list_strict(pat) {
+                let n = items.len();
+                if n >= 2 {
+                    if let Datum::Symbol(last, _) = &items[n - 1] {
+                        if *last == kw.ellipsis {
+                            // Reject sub-pattern compound under ellipsis for now.
+                            let sub = &items[n - 2];
+                            let sub_sym = match sub {
+                                Datum::Symbol(s, _)
+                                    if *s != kw.underscore && !literals.contains(s) =>
+                                {
+                                    Some(*s)
+                                }
+                                _ => None,
+                            };
+                            if sub_sym.is_none() {
+                                return Err(ExpandError::BadSyntax {
+                                    what: "Iter C2 ellipsis only supports a single pvar before `...`; compound sub-patterns and nested ellipsis land in a follow-up iter".into(),
+                                    span,
+                                });
+                            }
+                            let sub_sym = sub_sym.unwrap();
+                            // Walk the prefix (items[0..n-2]). Each
+                            // prefix element compiles as a sub-pattern
+                            // on (car key), then key becomes (cdr key).
+                            let mut tests: Vec<Datum> = Vec::new();
+                            let mut walking_key = key.clone();
+                            for prefix_item in &items[..n - 2] {
+                                let pair_test =
+                                    mk_list(vec![mk_sym("pair?", syms), walking_key.clone()], span);
+                                let car_key =
+                                    mk_list(vec![mk_sym("car", syms), walking_key.clone()], span);
+                                let inner_test = compile_sc_pattern(
+                                    prefix_item,
+                                    car_key,
+                                    literals,
+                                    pvars_out,
+                                    syms,
+                                    kw,
+                                )?;
+                                tests.push(pair_test);
+                                tests.push(inner_test);
+                                walking_key = mk_list(vec![mk_sym("cdr", syms), walking_key], span);
+                            }
+                            // Bind sub_sym to the remaining list (could be empty).
+                            pvars_out.push((sub_sym, walking_key.clone()));
+                            // The remainder must be a proper list
+                            // (any list, including empty). list? checks
+                            // proper-list shape -- avoids accepting
+                            // dotted-tail rests under ellipsis.
+                            let list_test = mk_list(vec![mk_sym("list?", syms), walking_key], span);
+                            tests.push(list_test);
+                            let mut all = vec![Datum::Symbol(kw.and, span)];
+                            all.extend(tests);
+                            return Ok(mk_list(all, span));
+                        }
+                    }
+                }
+            }
             // (p1 . p2) or (p1 p2 ... pn). Compile as the
             // pair-spine traversal: test pair?, then sub-pattern
             // on car (with key->car), then sub-pattern on cdr
@@ -5863,6 +5931,72 @@ fn compile_syntax_template(
         }
         Datum::Null(_) => mk_list(vec![Datum::Symbol(kw.quote, span), t.clone()], span),
         Datum::Pair(_, _, _) => {
+            // Iter C2: detect ellipsis at the end of a proper-list
+            // template. Shape `(prefix... sub ...)` -- the `sub ...`
+            // splices the depth-1 pvar list into the prefix.
+            // Mirror of compile_sc_pattern's ellipsis branch.
+            if let Some(items) = collect_proper_list_strict(t) {
+                let n = items.len();
+                if n >= 2 {
+                    if let Datum::Symbol(last, _) = &items[n - 1] {
+                        if *last == kw.ellipsis {
+                            let sub = &items[n - 2];
+                            // For the minimal Iter C2 we only handle
+                            // `sub` being a single pvar symbol that
+                            // was bound as the depth-1 list by the
+                            // matching ellipsis pattern. Compound
+                            // sub-templates defer to a follow-up.
+                            let sub_sym = match sub {
+                                Datum::Symbol(s, _) if pvars.contains(s) => Some(*s),
+                                _ => None,
+                            };
+                            if let Some(sub_sym) = sub_sym {
+                                // Build `(cons 'p1 (cons 'p2 ... (cons 'pN sub-pvar)))`
+                                let mut acc: Datum = Datum::Symbol(sub_sym, span);
+                                for prefix in items[..n - 2].iter().rev() {
+                                    let car_expr = compile_syntax_template(prefix, pvars, syms, kw);
+                                    acc = mk_list(
+                                        vec![
+                                            Datum::Symbol(syms.intern("cons"), span),
+                                            car_expr,
+                                            acc,
+                                        ],
+                                        span,
+                                    );
+                                }
+                                return acc;
+                            }
+                            // Compound sub-template: not yet supported.
+                            // We could fall through to the recursive
+                            // `(cons car cdr)` walk, but the result
+                            // would interpret `...` as a literal
+                            // symbol -- silently producing the wrong
+                            // datum. Reject explicitly so the user
+                            // gets a clear pointer.
+                            return mk_list(
+                                vec![
+                                    Datum::Symbol(syms.intern("error"), span),
+                                    mk_list(
+                                        vec![
+                                            Datum::Symbol(kw.quote, span),
+                                            Datum::Symbol(syms.intern("syntax-template"), span),
+                                        ],
+                                        span,
+                                    ),
+                                    Datum::String(
+                                        Rc::new(
+                                            "compound sub-template under `...` not yet supported"
+                                                .to_string(),
+                                        ),
+                                        span,
+                                    ),
+                                ],
+                                span,
+                            );
+                        }
+                    }
+                }
+            }
             // Compose `(cons <T car> <T cdr>)` recursively.
             let (car, cdr) = match t {
                 Datum::Pair(a, b, _) => ((**a).clone(), (**b).clone()),
