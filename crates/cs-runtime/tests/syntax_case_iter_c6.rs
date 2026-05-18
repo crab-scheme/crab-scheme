@@ -129,30 +129,7 @@ fn template_inner_ellipsis_with_prefix() {
 
 // ---- diagnostics ----
 
-#[test]
-fn nested_ellipsis_with_compound_inner_rejected() {
-    let mut rt = Runtime::new();
-    let err = rt
-        .eval_str(
-            "<t>",
-            "(syntax-case '(((1 2)) ((3 4))) ()
-               ((((a b) ...) ...) (syntax 0)))",
-        )
-        .expect_err("compound inner under nested ellipsis lands later");
-    let s = format!("{}", err);
-    assert!(s.contains("future iter"), "got: {}", s);
-}
-
-#[test]
-fn nested_ellipsis_with_prefix_inner_rejected() {
-    let mut rt = Runtime::new();
-    let err = rt
-        .eval_str(
-            "<t>",
-            "(syntax-case '((1 a b) (2 c d)) ()
-               (((kw p ...) ...) (syntax 0)))",
-        )
-        .expect_err("prefix inside inner ellipsis section lands later");
-    let s = format!("{}", err);
-    assert!(s.contains("future iter"), "got: {}", s);
-}
+// (Iter C6's "compound inner / prefix inner rejected" tests
+// removed -- Iter C7 generalized nested ellipsis to handle both
+// via recursive compile_sc_pattern + depth bump. See
+// syntax_case_iter_c7.rs for the success-side tests.)

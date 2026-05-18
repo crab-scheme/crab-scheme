@@ -59,9 +59,41 @@ Several downstream items want this:
 | **C4** | Literals + wildcards + dotted tail inside compound sub | **Done** | Yes — unblocks `cond`/`case-lambda`/`=>`-bearing macros |
 | **C5** | Nested compound sub `((a (b c)) …)` (recursive sub-pattern walker) | **Done** | Yes — handles arbitrarily deep nesting under one ellipsis level |
 | **C6** | Minimal nested ellipsis `((p …) …)` with bare-pvar inner | **Done** | Yes — covers the canonical "list of lists" shape |
-| **C7** | Nested ellipsis with compound/prefixed inner: `((kw p …) …)` / `(((a b) …) …)` | pending | Last ellipsis grammar gap |
+| **C7** | Nested ellipsis with compound/prefixed inner: `((kw p …) …)` / `(((a b) …) …)` | **Done** | Final ellipsis grammar piece — `compile_sc_pattern` recurses through nested-ellipsis layers with depth-bumping wrappers |
 | **D** | Fender expressions (expand-time Scheme eval) | pending | Largest iter; may slip to Phase 2 |
 | **E** | Proper hygiene tracking — mark-aware identifier comparison | pending | Replaces the Iter A symbol-eq stand-ins; needs SyntaxObject decision |
+
+## Iter C7 — Nested ellipsis: full grammar
+
+Generalizes Iter C6's bare-pvar special-case via recursive
+compilation. When `compile_sc_pattern` detects a sub of shape
+`(inner-pat …)` — a nested-ellipsis section — it:
+
+1. Recursively calls `compile_sc_pattern` on `sub` against a
+   synthetic `__sc-inner-elem__` key, getting back
+   `(inner_test, inner_pvars[])` where each inner pvar is at
+   the depth it would have if `sub` were a top-level pattern.
+2. Outer shape check: `(and (list? walking-key)
+   (every (lambda (__sc-inner-elem__) <inner_test>) walking-key))`.
+3. For each inner pvar `(name, depth, extractor)`, emits the
+   outer pvar `(name, depth + 1,
+   (map (lambda (__sc-inner-elem__) <extractor>) walking-key))`.
+
+This subsumes:
+* Iter C6's `((p …) …)` (bare-pvar inner)
+* Iter C7's `((kw p …) …)` (literal-prefixed inner)
+* Iter C7's `((h p …) …)` (pvar-prefixed inner)
+* Iter C7's `(((a b) …) …)` (compound inner)
+* Iter C7's `((((name val) …) …) …)` (let*-style nested groups)
+
+Naturally handles arbitrary nesting depth because the recursive
+call hits its own nested-ellipsis detection for the inner sub,
+bumping depths cumulatively (e.g., `(((p …) …) …)` produces
+depth-3 p).
+
+**What lands**: every realistic syntax-case grammar shape. The
+remaining gaps (Iter D: fenders, Iter E: hygiene) are
+orthogonal — they don't extend the pattern/template grammar.
 
 ## Iter C6 — Minimal nested ellipsis
 

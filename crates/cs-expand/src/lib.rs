@@ -5823,60 +5823,105 @@ fn compile_sc_pattern(
                                 }
                             }
 
-                            // Nested ellipsis detection (Iter C6).
-                            // If sub itself has the shape `(inner ...)`
-                            // — a proper-list of length 2 ending in
-                            // `...` — that's a nested ellipsis section.
-                            // Iter C6 minimal: only support `inner`
-                            // being a single bare pvar (no inner
-                            // prefix, no compound inner). The outer
-                            // pvar becomes depth-2.
+                            // Nested ellipsis detection (Iter C6/C7).
+                            // If sub itself has the shape `(inner-pat ...)`
+                            // — a proper-list of length 2 ending in `...`
+                            // — that's a nested ellipsis section.
+                            // General handling: recursively compile sub
+                            // as a standalone ellipsis pattern against a
+                            // synthetic `__sc-inner-elem__` key. The
+                            // resulting per-element test/extractors get
+                            // wrapped in `every` / `map` to lift them to
+                            // the outer ellipsis. Each inner pvar's
+                            // depth bumps by 1 (e.g. depth-1 -> depth-2).
+                            //
+                            // This subsumes Iter C6's bare-pvar
+                            // special-case and handles Iter C7
+                            // compound/prefixed inner forms uniformly:
+                            //   ((p …) …)          -> p at depth 2
+                            //   ((kw p …) …)       -> p at depth 2
+                            //   (((a b) …) …)      -> a,b at depth 2
+                            //   (((a b) c …) …)    -> a,b at depth 2, c at depth 2
                             if let Some(sub_items) = collect_proper_list_strict(sub) {
-                                if sub_items.len() == 2 {
-                                    if let Datum::Symbol(inner_ellipsis, _) = &sub_items[1] {
+                                if sub_items.len() >= 2 {
+                                    if let Datum::Symbol(inner_ellipsis, _) =
+                                        &sub_items[sub_items.len() - 1]
+                                    {
                                         if *inner_ellipsis == kw.ellipsis {
-                                            let inner = &sub_items[0];
-                                            if let Datum::Symbol(inner_sym, _) = inner {
-                                                if *inner_sym != kw.underscore
-                                                    && *inner_sym != kw.ellipsis
-                                                    && !literals.contains(inner_sym)
-                                                {
-                                                    // Test: walking-key is a list
-                                                    // of lists. Bind inner_sym at
-                                                    // depth 2 = walking-key (each
-                                                    // outer element is itself the
-                                                    // depth-1 inner-list).
-                                                    let list_test = mk_list(
-                                                        vec![
-                                                            mk_sym("list?", syms),
-                                                            walking_key.clone(),
-                                                        ],
+                                            let inner_elem_sym = syms.intern("__sc-inner-elem__");
+                                            let inner_key = Datum::Symbol(inner_elem_sym, span);
+                                            let mut inner_pvars: Vec<(Symbol, u32, Datum)> =
+                                                Vec::new();
+                                            let inner_test = compile_sc_pattern(
+                                                sub,
+                                                inner_key,
+                                                literals,
+                                                &mut inner_pvars,
+                                                syms,
+                                                kw,
+                                            )?;
+
+                                            // Outer shape: list? walking-key
+                                            // + (every (lambda (e) <inner-test>) walking-key)
+                                            let inner_test_lambda = mk_list(
+                                                vec![
+                                                    Datum::Symbol(kw.lambda, span),
+                                                    mk_list(
+                                                        vec![Datum::Symbol(inner_elem_sym, span)],
                                                         span,
-                                                    );
-                                                    let every_list_test = mk_list(
-                                                        vec![
-                                                            mk_sym("every", syms),
-                                                            mk_sym("list?", syms),
-                                                            walking_key.clone(),
-                                                        ],
-                                                        span,
-                                                    );
-                                                    tests.push(list_test);
-                                                    tests.push(every_list_test);
-                                                    pvars_out.push((*inner_sym, 2, walking_key));
-                                                    let mut all = vec![Datum::Symbol(kw.and, span)];
-                                                    all.extend(tests);
-                                                    return Ok(mk_list(all, span));
-                                                }
-                                            }
-                                            // Anything more complex
-                                            // inside the inner
-                                            // ellipsis section lands
-                                            // in a future iter.
-                                            return Err(ExpandError::BadSyntax {
-                                                what: "nested ellipsis: only `((p ...) ...)` with single bare-pvar inner is supported in Iter C6; compound or prefixed inner lands in a future iter".into(),
+                                                    ),
+                                                    inner_test,
+                                                ],
                                                 span,
-                                            });
+                                            );
+                                            let list_test = mk_list(
+                                                vec![mk_sym("list?", syms), walking_key.clone()],
+                                                span,
+                                            );
+                                            let every_test = mk_list(
+                                                vec![
+                                                    mk_sym("every", syms),
+                                                    inner_test_lambda,
+                                                    walking_key.clone(),
+                                                ],
+                                                span,
+                                            );
+                                            tests.push(list_test);
+                                            tests.push(every_test);
+
+                                            // For each inner pvar (name, inner-depth,
+                                            // inner-extractor), bump depth by 1 and
+                                            // wrap extractor in
+                                            // `(map (lambda (__sc-inner-elem__) <extr>) walking-key)`.
+                                            for (pv, inner_depth, inner_extractor) in inner_pvars {
+                                                let extractor_lambda = mk_list(
+                                                    vec![
+                                                        Datum::Symbol(kw.lambda, span),
+                                                        mk_list(
+                                                            vec![Datum::Symbol(
+                                                                inner_elem_sym,
+                                                                span,
+                                                            )],
+                                                            span,
+                                                        ),
+                                                        inner_extractor,
+                                                    ],
+                                                    span,
+                                                );
+                                                let map_call = mk_list(
+                                                    vec![
+                                                        mk_sym("map", syms),
+                                                        extractor_lambda,
+                                                        walking_key.clone(),
+                                                    ],
+                                                    span,
+                                                );
+                                                pvars_out.push((pv, inner_depth + 1, map_call));
+                                            }
+
+                                            let mut all = vec![Datum::Symbol(kw.and, span)];
+                                            all.extend(tests);
+                                            return Ok(mk_list(all, span));
                                         }
                                     }
                                 }
