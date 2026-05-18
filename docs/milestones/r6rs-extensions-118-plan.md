@@ -57,9 +57,42 @@ Several downstream items want this:
 | **C2** | Minimal ellipsis `…` (single-pvar form only) | **Done** | Yes — covers `(prefix… pvar …)` / `(prefix… pvar …)` splice |
 | **C3** | Compound sub-patterns under `…`, multi-pvar zip-map templates | **Done** | Yes — unblocks `let`-style macros |
 | **C4** | Literals + wildcards + dotted tail inside compound sub | **Done** | Yes — unblocks `cond`/`case-lambda`/`=>`-bearing macros |
-| **C5** | Nested ellipsis `((p …) …)` + nested compound `((a (b c)) …)` | pending | Final grammar piece; needs the matcher to recurse into ellipsis sections |
+| **C5** | Nested compound sub `((a (b c)) …)` (recursive sub-pattern walker) | **Done** | Yes — handles arbitrarily deep nesting under one ellipsis level |
+| **C6** | Nested ellipsis `((p …) …)` — per-element matcher loops, depth-≥2 pvars | pending | Last grammar gap |
 | **D** | Fender expressions (expand-time Scheme eval) | pending | Largest iter; may slip to Phase 2 |
 | **E** | Proper hygiene tracking — mark-aware identifier comparison | pending | Replaces the Iter A symbol-eq stand-ins; needs SyntaxObject decision |
+
+## Iter C5 — Nested compound sub-patterns (recursive walker)
+
+Replaces Iter C3/C4's flat `classify_compound_sub` with a
+recursive `walk_sub_pattern`. Given a sub-pattern Datum and an
+accessor expression referencing one outer-list element, it
+accumulates:
+
+* `constraints: Vec<Datum>` — structural predicates AND-conjoined
+  in the shape lambda body (`pair?`, `null?`, `eq?` for literals,
+  `equal?` for self-quoting atoms).
+* `pvars: Vec<(Symbol, Datum)>` — pvar name + accessor
+  expression describing how to extract its value from the element.
+
+For each compound layer the walker emits `(pair? <acc>)` and
+recurses on `(car <acc>)` and `(cdr <acc>)`. Atomic cases
+(literal, pvar, wildcard, null, self-quoting) terminate.
+Nested ellipsis (`(p …)` inside the sub) returns `Err` and the
+caller surfaces a "future iter" pointer.
+
+**What lands:**
+* `((a (b c)) …)` — pvar + nested compound
+* `((a (b . c)) …)` — dotted nested
+* `((kw (a b)) …)` — literal kw + nested compound
+* `((a (_ c)) …)` — wildcards at any depth
+* `((a (b (c d))) …)` — arbitrary nesting depth
+* `define-record-type`-style field-list zip-maps
+
+**Deferred to Iter C6 (the last grammar gap):**
+* Nested ellipsis `((p …) …)` — needs per-element matcher loops
+  to handle variable-length inner sections producing depth-2
+  pvars.
 
 ## Iter C4 — Literals + wildcards + dotted tail in compound sub
 

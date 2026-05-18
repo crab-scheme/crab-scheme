@@ -5823,151 +5823,82 @@ fn compile_sc_pattern(
                                 }
                             }
 
-                            // Compound sub: spine of pvars / literals /
-                            // wildcards, optionally with a dotted tail
-                            // that's a bare pvar or wildcard. Iter C3
-                            // started with bare-pvar spine only; Iter
-                            // C4 adds literals + wildcards + dotted
-                            // tail.
-                            if let Some((spine_slots, tail_slot)) =
-                                classify_compound_sub(sub, literals, kw)
+                            // Compound sub: walk recursively to
+                            // collect structural constraints + pvar
+                            // accessors. Handles arbitrarily nested
+                            // compound sub-patterns (Iter C5);
+                            // rejects nested ellipsis with a clear
+                            // pointer to a future iter.
+                            let elem_sym = syms.intern("__sc-elem__");
+                            let mut sub_constraints: Vec<Datum> = Vec::new();
+                            let mut sub_pvars: Vec<(Symbol, Datum)> = Vec::new();
+                            if walk_sub_pattern(
+                                sub,
+                                Datum::Symbol(elem_sym, span),
+                                literals,
+                                kw,
+                                &mut sub_constraints,
+                                &mut sub_pvars,
+                                syms,
+                            )
+                            .is_err()
                             {
-                                let elem_sym = syms.intern("__sc-elem__");
+                                return Err(ExpandError::BadSyntax {
+                                    what: "syntax-case ellipsis: sub-pattern contains nested ellipsis or vector pattern -- lands in a future iter".into(),
+                                    span,
+                                });
+                            }
 
-                                // Build the per-element shape test as
-                                // an `and` over the slot checks.
-                                let mut shape_parts: Vec<Datum> = vec![Datum::Symbol(kw.and, span)];
-                                let mut cdr_chain = Datum::Symbol(elem_sym, span);
-                                for slot in &spine_slots {
-                                    // Each spine slot consumes one pair.
-                                    shape_parts.push(mk_list(
-                                        vec![mk_sym("pair?", syms), cdr_chain.clone()],
-                                        span,
-                                    ));
-                                    // Slot-specific car check.
-                                    if let SubSlot::Literal(lit_sym) = slot {
-                                        let car_expr = mk_list(
-                                            vec![mk_sym("car", syms), cdr_chain.clone()],
-                                            span,
-                                        );
-                                        let quoted_lit = mk_list(
-                                            vec![
-                                                Datum::Symbol(kw.quote, span),
-                                                Datum::Symbol(*lit_sym, span),
-                                            ],
-                                            span,
-                                        );
-                                        shape_parts.push(mk_list(
-                                            vec![mk_sym("eq?", syms), car_expr, quoted_lit],
-                                            span,
-                                        ));
-                                    }
-                                    cdr_chain = mk_list(vec![mk_sym("cdr", syms), cdr_chain], span);
-                                }
-                                // Tail check: null? for proper-list sub,
-                                // or no constraint for dotted-pvar /
-                                // dotted-wildcard. Literal tail isn't
-                                // produced by classify_compound_sub
-                                // (classifier emits Literal only for
-                                // spine atoms).
-                                match &tail_slot {
-                                    SubSlot::Null => {
-                                        shape_parts.push(mk_list(
-                                            vec![mk_sym("null?", syms), cdr_chain.clone()],
-                                            span,
-                                        ));
-                                    }
-                                    SubSlot::Pvar(_) | SubSlot::Wildcard => {
-                                        // Any value accepted as the tail.
-                                    }
-                                    SubSlot::Literal(_) => {
-                                        unreachable!("classify_compound_sub never emits Literal as the tail slot")
-                                    }
-                                }
-                                let shape_body = mk_list(shape_parts, span);
-                                let shape_lambda = mk_list(
+                            // Build the shape lambda: (lambda (e) (and <c1> <c2> ...))
+                            // If there are zero constraints (the sub is
+                            // a single bare pvar), the lambda just returns #t.
+                            let mut shape_body_parts: Vec<Datum> =
+                                vec![Datum::Symbol(kw.and, span)];
+                            shape_body_parts.extend(sub_constraints);
+                            let shape_body = mk_list(shape_body_parts, span);
+                            let shape_lambda = mk_list(
+                                vec![
+                                    Datum::Symbol(kw.lambda, span),
+                                    mk_list(vec![Datum::Symbol(elem_sym, span)], span),
+                                    shape_body,
+                                ],
+                                span,
+                            );
+
+                            let list_test =
+                                mk_list(vec![mk_sym("list?", syms), walking_key.clone()], span);
+                            let every_test = mk_list(
+                                vec![mk_sym("every", syms), shape_lambda, walking_key.clone()],
+                                span,
+                            );
+                            tests.push(list_test);
+                            tests.push(every_test);
+
+                            // Bind each pvar's depth-1 list via
+                            // `(map (lambda (e) <accessor>) walking-key)`.
+                            for (pv, accessor) in sub_pvars {
+                                let extractor_lambda = mk_list(
                                     vec![
                                         Datum::Symbol(kw.lambda, span),
                                         mk_list(vec![Datum::Symbol(elem_sym, span)], span),
-                                        shape_body,
+                                        accessor,
                                     ],
                                     span,
                                 );
-
-                                let list_test =
-                                    mk_list(vec![mk_sym("list?", syms), walking_key.clone()], span);
-                                let every_test = mk_list(
-                                    vec![mk_sym("every", syms), shape_lambda, walking_key.clone()],
+                                let map_call = mk_list(
+                                    vec![
+                                        mk_sym("map", syms),
+                                        extractor_lambda,
+                                        walking_key.clone(),
+                                    ],
                                     span,
                                 );
-                                tests.push(list_test);
-                                tests.push(every_test);
-
-                                // Bind each pvar in spine + tail to its
-                                // depth-1 list via a `map`. Position-`i`
-                                // pvar extractor is
-                                // `(map (lambda (e) (car (cdr^i e))) walking-key)`.
-                                // The dotted-tail pvar extractor is
-                                // `(map (lambda (e) (cdr^len e)) walking-key)`.
-                                for (i, slot) in spine_slots.iter().enumerate() {
-                                    if let SubSlot::Pvar(pv) = slot {
-                                        let mut acc = Datum::Symbol(elem_sym, span);
-                                        for _ in 0..i {
-                                            acc = mk_list(vec![mk_sym("cdr", syms), acc], span);
-                                        }
-                                        let acc = mk_list(vec![mk_sym("car", syms), acc], span);
-                                        let extractor_lambda = mk_list(
-                                            vec![
-                                                Datum::Symbol(kw.lambda, span),
-                                                mk_list(vec![Datum::Symbol(elem_sym, span)], span),
-                                                acc,
-                                            ],
-                                            span,
-                                        );
-                                        let map_call = mk_list(
-                                            vec![
-                                                mk_sym("map", syms),
-                                                extractor_lambda,
-                                                walking_key.clone(),
-                                            ],
-                                            span,
-                                        );
-                                        pvars_out.push((*pv, 1, map_call));
-                                    }
-                                }
-                                if let SubSlot::Pvar(tail_pv) = tail_slot {
-                                    let mut acc = Datum::Symbol(elem_sym, span);
-                                    for _ in 0..spine_slots.len() {
-                                        acc = mk_list(vec![mk_sym("cdr", syms), acc], span);
-                                    }
-                                    let extractor_lambda = mk_list(
-                                        vec![
-                                            Datum::Symbol(kw.lambda, span),
-                                            mk_list(vec![Datum::Symbol(elem_sym, span)], span),
-                                            acc,
-                                        ],
-                                        span,
-                                    );
-                                    let map_call = mk_list(
-                                        vec![
-                                            mk_sym("map", syms),
-                                            extractor_lambda,
-                                            walking_key.clone(),
-                                        ],
-                                        span,
-                                    );
-                                    pvars_out.push((tail_pv, 1, map_call));
-                                }
-
-                                let mut all = vec![Datum::Symbol(kw.and, span)];
-                                all.extend(tests);
-                                return Ok(mk_list(all, span));
+                                pvars_out.push((pv, 1, map_call));
                             }
 
-                            return Err(ExpandError::BadSyntax {
-                                what: "syntax-case ellipsis: sub-pattern must be a pvar, literal, `_`, or a list/dotted-pair of those; nested ellipsis lands in a future iter".into(),
-                                span,
-                            });
+                            let mut all = vec![Datum::Symbol(kw.and, span)];
+                            all.extend(tests);
+                            return Ok(mk_list(all, span));
                         }
                     }
                 }
@@ -6027,66 +5958,89 @@ fn rewrite_qs_to_qq(d: &Datum, kw: &Keywords) -> Datum {
     }
 }
 
-/// Classification of one slot inside a compound sub-pattern under
-/// ellipsis. The compound sub is allowed to be either a proper
-/// list (tail = Null) or a dotted pair (tail = Pvar/Wildcard).
-/// Each spine slot is one of:
-///   * Pvar(s) -- bare-symbol pvar, binds at depth 1
-///   * Literal(s) -- a symbol in the literals list, eq?-checked
-///   * Wildcard -- the `_` symbol, no binding
-#[derive(Clone, Copy, Debug)]
-enum SubSlot {
-    Pvar(Symbol),
-    Literal(Symbol),
-    Wildcard,
-    /// Proper-list tail marker (used only as the `tail_slot` value).
-    Null,
-}
-
-/// Decompose a compound sub-pattern (the `sub` in `(sub ...)`)
-/// into a spine of slots + a tail slot. Returns None if `sub`
-/// contains anything more elaborate (nested sub-list, vector,
-/// nested ellipsis, etc.) -- the caller falls through to a clear
-/// rejection diagnostic in that case.
-fn classify_compound_sub(
+/// Recursive walker for a compound sub-pattern under ellipsis.
+/// Builds (a) a list of structural constraint expressions, each
+/// applied to a free variable representing one outer-list
+/// element, and (b) a list of `(pvar, accessor-expr)` bindings
+/// where the accessor extracts the pvar's value from that
+/// element.
+///
+/// Supports arbitrarily nested compound sub-patterns:
+/// `((a (b c)) …)`, `((a (b . c)) …)`, `((kw (a b)) …)` with
+/// literal kw, `((a _) …)` with wildcard, mixed nesting.
+///
+/// Nested ellipsis (`((p …) …)`) is NOT supported -- detected
+/// at the outer Pair walk and signaled via an Err; the caller
+/// surfaces it with a "future iter" pointer.
+fn walk_sub_pattern(
     sub: &Datum,
+    accessor: Datum,
     literals: &[Symbol],
     kw: &Keywords,
-) -> Option<(Vec<SubSlot>, SubSlot)> {
-    let classify_atom = |s: Symbol| -> Option<SubSlot> {
-        if s == kw.underscore {
-            Some(SubSlot::Wildcard)
-        } else if literals.contains(&s) {
-            Some(SubSlot::Literal(s))
-        } else if s == kw.ellipsis {
-            None
-        } else {
-            Some(SubSlot::Pvar(s))
+    constraints: &mut Vec<Datum>,
+    pvars: &mut Vec<(Symbol, Datum)>,
+    syms: &mut SymbolTable,
+) -> Result<(), ()> {
+    let span = sub.span();
+    let mk_sym =
+        |name: &str, syms: &mut SymbolTable| -> Datum { Datum::Symbol(syms.intern(name), span) };
+    match sub {
+        Datum::Symbol(s, _) if *s == kw.underscore => Ok(()),
+        Datum::Symbol(s, _) if *s == kw.ellipsis => Err(()),
+        Datum::Symbol(s, _) if literals.contains(s) => {
+            let quoted = mk_list(
+                vec![Datum::Symbol(kw.quote, span), Datum::Symbol(*s, span)],
+                span,
+            );
+            constraints.push(mk_list(vec![mk_sym("eq?", syms), accessor, quoted], span));
+            Ok(())
         }
-    };
-    let (spine_d, tail_d) = match collect_pair_chain(sub) {
-        Some((s, t)) => (s, t),
-        None => return None,
-    };
-    let mut spine: Vec<SubSlot> = Vec::with_capacity(spine_d.len());
-    for d in &spine_d {
-        match d {
-            Datum::Symbol(s, _) => match classify_atom(*s) {
-                Some(slot) => spine.push(slot),
-                None => return None,
-            },
-            _ => return None,
+        Datum::Symbol(s, _) => {
+            pvars.push((*s, accessor));
+            Ok(())
         }
+        Datum::Null(_) => {
+            constraints.push(mk_list(vec![mk_sym("null?", syms), accessor], span));
+            Ok(())
+        }
+        Datum::Boolean(_, _)
+        | Datum::Number(_, _)
+        | Datum::Character(_, _)
+        | Datum::String(_, _) => {
+            let quoted = mk_list(vec![Datum::Symbol(kw.quote, span), sub.clone()], span);
+            constraints.push(mk_list(
+                vec![mk_sym("equal?", syms), accessor, quoted],
+                span,
+            ));
+            Ok(())
+        }
+        Datum::Pair(_, _, _) => {
+            // Reject nested ellipsis: any spine position with the
+            // `...` symbol means an inner `(p …)` form, which would
+            // need a per-element matcher loop.
+            if let Some(items) = collect_proper_list_strict(sub) {
+                if items.len() >= 2 {
+                    if let Datum::Symbol(last, _) = &items[items.len() - 1] {
+                        if *last == kw.ellipsis {
+                            return Err(());
+                        }
+                    }
+                }
+            }
+            // Otherwise: descend into car + cdr with adjusted accessors.
+            constraints.push(mk_list(vec![mk_sym("pair?", syms), accessor.clone()], span));
+            let car_acc = mk_list(vec![mk_sym("car", syms), accessor.clone()], span);
+            let cdr_acc = mk_list(vec![mk_sym("cdr", syms), accessor], span);
+            let (car_d, cdr_d) = match sub {
+                Datum::Pair(a, b, _) => ((**a).clone(), (**b).clone()),
+                _ => unreachable!(),
+            };
+            walk_sub_pattern(&car_d, car_acc, literals, kw, constraints, pvars, syms)?;
+            walk_sub_pattern(&cdr_d, cdr_acc, literals, kw, constraints, pvars, syms)?;
+            Ok(())
+        }
+        Datum::Vector(_, _) | Datum::ByteVector(_, _) => Err(()),
     }
-    let tail = match &tail_d {
-        Datum::Null(_) => SubSlot::Null,
-        Datum::Symbol(s, _) => match classify_atom(*s) {
-            Some(slot) => slot,
-            None => return None,
-        },
-        _ => return None,
-    };
-    Some((spine, tail))
 }
 
 /// Walk a template datum and collect every symbol that's a pvar

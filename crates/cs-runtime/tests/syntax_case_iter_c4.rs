@@ -188,16 +188,6 @@ fn nested_ellipsis_still_rejected() {
     assert!(s.contains("future iter"), "got: {}", s);
 }
 
-#[test]
-fn nested_compound_sub_still_rejected() {
-    let mut rt = Runtime::new();
-    let err = rt
-        .eval_str(
-            "<t>",
-            "(syntax-case '((a (b c)) (d (e f))) ()
-               (((x (y z)) ...) (syntax 0)))",
-        )
-        .expect_err("nested compound sub-pattern not supported");
-    let s = format!("{}", err);
-    assert!(s.contains("future iter"), "got: {}", s);
-}
+// (Iter C4 used to reject nested compound sub-patterns; Iter C5
+// handles them via the recursive sub-pattern walker -- see
+// syntax_case_iter_c5.rs.)
