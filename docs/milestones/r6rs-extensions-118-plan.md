@@ -53,9 +53,39 @@ Several downstream items want this:
 |------|-------|--------|----------------------|
 | **A** | identifier?, syntax→datum, datum→syntax, generate-temporaries, bound-identifier=?, free-identifier=? as builtins | **Done** (`08f0e0f`) | Yes — foundational surface, used by downstream Scheme code |
 | **B** | `syntax-case` form recognizer + matcher + single-template clause | **Done** | Yes — covers ~80% of real-world syntax-case use without fenders |
-| **C** | `with-syntax`, `quasisyntax`/`unsyntax`/`unsyntax-splicing`, ellipsis `…` in patterns/templates | pending | Yes — depends on B |
+| **C** | `with-syntax`, `quasisyntax`/`unsyntax`/`unsyntax-splicing`; pvar stack on Expander | **Done** | Yes — depends on B |
+| **C2** | Ellipsis `…` in patterns + templates | pending | Split out — biggest single piece of grammar work |
 | **D** | Fender expressions (expand-time Scheme eval) | pending | Largest iter; may slip to Phase 2 |
 | **E** | Proper hygiene tracking — mark-aware identifier comparison | pending | Replaces the Iter A symbol-eq stand-ins; needs SyntaxObject decision |
+
+## Iter C — `with-syntax`, `quasisyntax`, pvar stack
+
+`with-syntax` desugars to a nest of single-clause `syntax-case`
+forms. `quasisyntax` is implemented by rewriting the template
+(`quasisyntax`/`unsyntax`/`unsyntax-splicing` → `quasiquote`/
+`unquote`/`unquote-splicing`) and delegating to the existing
+`expand_quasiquote` engine — with today's syntax-object-as-datum
+model the semantics match exactly.
+
+**Architectural change:** Iter B's "eager pre-pass walker"
+(`rewrite_syntax_forms`) was removed in favor of an
+Expander-level `syntax_pvars: Vec<Symbol>` stack. Every
+syntax-binding form pushes its clause-local pvars before
+expanding its body and pops after. `expand_syntax_form` consults
+the stack at expansion time. This means:
+
+* Nested with-syntax / syntax-case forms correctly inherit
+  outer pvars (Iter B's pre-pass scoping was broken for the
+  nested case).
+* Standalone `(syntax X)` outside any binding form sees an
+  empty stack and lowers to literal — same as Iter B.
+* Single source of truth for what's a pvar; no more risk of the
+  walker and expander disagreeing.
+
+16 Iter C tests cover with-syntax single+multi+destructuring
+bindings, quasisyntax+unsyntax+unsyntax-splicing,
+`unsyntax`-outside-`quasisyntax` rejection, and the
+`syntax-case`+`with-syntax`+`quasisyntax` composition pipeline.
 
 ## Iter B — `syntax-case` form
 
