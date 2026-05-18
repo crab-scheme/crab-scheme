@@ -61,7 +61,7 @@ tracing-cycle-collector = [
 # Scheme builtins. Disabled on WASM (tokio's rt-multi-thread needs
 # real threads) and on bare-AOT builds. The `lib/beam/prelude.scm`
 # library only loads when this feature is on.
-actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload"]
+actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload", "dep:tokio"]
 # ADR 0015 L2 — WASM-instance sandbox builtins. Pulls in
 # cs-sandbox-wasm + wasmtime. Default off because the wasmtime
 # dep is ~30s of compile time and not useful for non-sandbox
@@ -167,6 +167,12 @@ num-traits = { workspace = true }
 thiserror = { workspace = true }
 cs-actor = { workspace = true, optional = true }
 cs-table = { workspace = true, optional = true }
+# tokio is pulled in transitively by cs-actor under the `actor`
+# feature, but cs-runtime needs a direct dep so it can use
+# `tokio::task_local!` for the region-stack task-local
+# (parallel-runtime spec C3). Only the rt + macros features —
+# the full multi-thread runtime is owned by cs-actor.
+tokio = { workspace = true, features = ["rt", "macros", "sync"], optional = true }
 cs-hotreload = { workspace = true, optional = true }
 cs-sandbox-wasm = { workspace = true, optional = true }
 cs-stdlib-path = { workspace = true, optional = true }
