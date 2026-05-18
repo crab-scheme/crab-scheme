@@ -1,7 +1,11 @@
 # R6RS++ Phase 1 — interim status
 
-> Status: **Phase 1 partial (2 of 4 deliverables shipped; 2 blocked on
-> cs-expand work).** Branch: `r6rs-extensions`.
+> Status: **Phase 1 mostly landed — 2 of 4 spec deliverables
+> shipped, 2 cs-expand bug fixes that unblock match's natural
+> spelling, 1 cs-pkg import-bridge for future library loading.
+> Remaining blockers (syntax-case, cross-file library loading)
+> are scoped as separate milestones.**
+> Branch: `r6rs-extensions`.
 > Spec: `docs/research/r6rs_extensions_spec.md` (§1, §9, §10, §11).
 > Predecessor: 1.0-rc4 (`beam-runtime` merged in `58dc1af`).
 
@@ -80,71 +84,91 @@ design decision is the **library-level cache key schema**
 work to be meaningful. The content-hash machinery already lives
 in `cs-pkg::Lockfile`. Tracked as #116.
 
-## cs-expand limitations surfaced during implementation
+## cs-expand bugs surfaced during implementation — both FIXED
 
-Two real bugs in cs-expand's `syntax-rules` surfaced building
-the `match` library. Both have documented workarounds in
-`lib/match/match.scm` and are tracked separately so other
-macro work can avoid them.
+Two `syntax-rules` bugs surfaced while building the `match`
+library. Both were root-caused, fixed in cs-expand, regression-
+tested, and the match library was rewritten to use the natural
+spellings the fixes enable. Combined diff: ~50 lines of
+expander code + 4 new tests.
 
-### #111 — dotted-pair patterns not supported in `syntax-rules`
+### #112 — `_` in literals list broke subsequent catch-all rule (FIXED `0f7aa92`)
 
-```scheme
-(define-syntax car-of
-  (syntax-rules ()
-    ((_ (x . y)) x)))     ;; no matching rule for input (1 2 3)
-```
+Bug: `match_pattern` checked the `_`-as-wildcard arm
+unconditionally before the literals-list check, so a macro that
+opted into literal-`_` semantics still saw `_` patterns match
+anything.
 
-A standard R6RS `(x . y)` pattern matches lists `(1 2 3)` with
-`x=1, y=(2 3)`. cs-expand rejects it. Workaround: use
-`(cons a b)` and `(list a b c)` explicit forms instead.
+Fix: hoist the outer-macro-name pass to the top, reorder
+match arms so literals-list takes precedence over the underscore
+wildcard, and reject literal-symbol patterns matched against
+non-symbol input.
 
-### #112 — `_` in literals list breaks subsequent catch-all rule
+### #111 — dotted-pair patterns + templates not supported (FIXED `4c02b30`)
 
-```scheme
-(define-syntax try-bind
-  (syntax-rules (_)
-    ((_ subj _ body)         body)
-    ((_ subj var body)       (let ((var subj)) body))))
-(try-bind 99 x (+ x 1))     ;; undefined variable: x
-```
+Bug: both `match_list_pattern` (pattern side) and `instantiate`
+(template side) called `collect_proper_list_strict` and bailed
+on improper lists, rejecting `(x . y)` and dotted templates
+`(a . b)`.
 
-When `_` is a literal, the second-rule pattern variable `var`
-fails to substitute into the template. Workaround: don't list
-`_` as a literal; treat it as a regular unused-identifier
-binding.
+Fix: new `collect_pair_chain` helper returns `(spine, tail)`
+where tail is `Null` for proper lists and the dotted atom
+otherwise. New `match_dotted_list_pattern` walks the spine
+positionally then binds the tail-pattern to the input
+remainder. `instantiate` uses the same helper to support
+dotted templates. `collect_pattern_vars_into` walks the dotted
+tail so its variables are seen by ellipsis logic.
 
-Both bugs land on `syntax-rules`-only consumers. Other
-codepaths in the project use `define-syntax`/`syntax-rules`
-sparingly enough that this is the first time they've surfaced.
+`lib/match/match.scm` was rewritten to use the natural
+`(P1 . P2)` and `(P1 P2 P3)` forms as the primary spelling,
+with `(cons ...)` and `(list ...)` kept as Racket-style sugar.
+21 match tests, all green.
 
-## Phase 1 follow-up work
+## cs-pkg integration seam — landed (`f121d4a`)
 
-Reordered after this sweep:
+Added `Resolver::resolve_import_spec` that bridges from a Scheme
+import-spec datum to a filesystem path. Recognises
+`(pkg NAME SEG...)` shape, delegates to the existing version map.
+
+Architectural call: **cs-expand stays agnostic of cs-pkg.** The
+seam is the existing `IncludeResolver` callback that callers
+(cs-cli, REPL) install — that callback invokes
+`resolve_import_spec` on the import datum and routes the
+resulting path through the include machinery.
+
+What's still missing for `(import (pkg http server))` to work
+end-to-end: cs-expand's cross-file library loading. The
+existing code only supports same-Expander libraries (declared
+via `(library ...)` in the same source unit). Building real
+cross-file loading is its own milestone — see "What's left"
+below.
+
+## What's left for full Phase 1
+
+After this sweep, two genuinely large items remain:
 
 | # | Item | Blocked on |
 |---|---|---|
-| 1 | `(match …)` ✓ | — (shipped) |
-| 2 | `cs-pkg` ✓ | — (shipped) |
-| 3 | Wire `cs-pkg::Resolver` into cs-expand's import path | cs-expand surgery; small |
-| 4 | Fix #111 + #112 in cs-expand, restore bare-list patterns + `_` wildcard in match | cs-expand work; medium |
-| 5 | `syntax-case` extension to cs-expand | medium-to-large; unlocks §9 and §3 |
-| 6 | Syntax-source / syntax-line / syntax-column primitives | #5 above |
-| 7 | Library-level incremental cache | #3 + cache-key schema |
+| A | Cross-file library loading in cs-expand | New subsystem; multi-day. Today cs-expand only resolves libraries declared in the same Expander session. Needed before `(import (pkg http server))` can splice external bindings into the importer. |
+| B | `syntax-case` extension to cs-expand | Multi-day. Unlocks §9 source metadata (`syntax-source` / `syntax-line` / `syntax-column`) AND Phase 2's `syntax-parse`. Requires first-class syntax objects, hygiene-mark tracking through user code, `syntax->datum`/`datum->syntax` primitives. |
 
-Items 3 + 4 are the smallest cs-expand changes and unlock the
-most surface area. Item 5 is the architectural prerequisite for
-Phase 2's `syntax-parse`.
+Both are properly scoped as their own milestones. They're not
+blocking the work already shipped — match works, packages parse
+and resolve, the expander bugs are fixed.
 
 ## Recommended next iter
 
-Tackle #4 (cs-expand fixes for `syntax-rules` dotted patterns +
-`_` literal) before continuing to Phase 2. The two bugs aren't
-load-bearing on Phase 1's shipped work, but they will block
-every richer macro that future contributors write, and `match`'s
-in-library workarounds become unnecessary cruft once they're
-fixed.
+Two tractable options:
 
-After that, item 5 (`syntax-case`) unlocks both §9 source
-metadata and Phase 2's `syntax-parse` — the biggest cumulative
-ergonomic win still available.
+1. **Start syntax-case**: it's the higher-leverage item — it
+   unlocks both §9 source-metadata accessors AND `syntax-parse`
+   in Phase 2. Multi-iter, but each iter (datum syntax objects;
+   then `syntax-case`-the-form; then `with-syntax`; then
+   `syntax->datum`/`datum->syntax`) is independently shippable.
+2. **Start cross-file library loading**: smaller scope (no new
+   value type, just file I/O + lib registry plumbing), unlocks
+   `(import (pkg ...))` actually loading. Useful for ecosystem
+   bootstrap once published packages exist.
+
+Order doesn't matter — they don't block each other. Pick by
+what we want to demo first.
