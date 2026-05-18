@@ -18,7 +18,6 @@
 #![cfg(feature = "regions")]
 
 use std::cell::RefCell;
-use std::marker::PhantomData;
 use std::rc::Rc;
 
 use cs_gc::Region;
@@ -40,26 +39,20 @@ thread_local! {
 
 /// RAII guard binding a region to the current thread's
 /// region stack. Drops pop the entry.
-///
-/// The lifetime parameter is purely a marker — the runtime
-/// stack stores `Rc<Region>` and the guard's drop pops
-/// regardless of any outer borrow.
-pub struct RegionScope<'a> {
-    _marker: PhantomData<&'a ()>,
+pub struct RegionScope {
+    _private: (),
 }
 
-impl<'a> RegionScope<'a> {
+impl RegionScope {
     /// Push `region` onto the per-thread stack and return a
     /// drop-guard that pops on scope exit.
     pub fn enter(region: Rc<Region>) -> Self {
         REGION_STACK.with(|s| s.borrow_mut().push(region));
-        RegionScope {
-            _marker: PhantomData,
-        }
+        RegionScope { _private: () }
     }
 }
 
-impl<'a> Drop for RegionScope<'a> {
+impl Drop for RegionScope {
     fn drop(&mut self) {
         REGION_STACK.with(|s| {
             s.borrow_mut().pop();

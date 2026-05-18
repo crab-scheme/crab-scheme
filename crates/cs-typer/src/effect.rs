@@ -109,6 +109,15 @@ impl AllocEffect {
             may_cycle: self.may_cycle || other.may_cycle,
         }
     }
+
+    /// Top of the effect lattice — assume the worst on every
+    /// axis. Used for unresolved callees (Symbol refs without
+    /// SymbolTable access, computed/higher-order callees).
+    pub const UNKNOWN: AllocEffect = AllocEffect {
+        allocates: true,
+        escapes: EscapeKind::Unknown,
+        may_cycle: true,
+    };
 }
 
 impl EscapeKind {
@@ -338,16 +347,13 @@ fn infer_effect_with_scope(expr: &CoreExpr, self_bound: &HashSet<Symbol>) -> All
         CoreExpr::App { func, args, .. } => {
             // Try to resolve `func` to a primitive name.
             let prim_effect = match &**func {
-                CoreExpr::Ref { name, .. } => {
+                CoreExpr::Ref { .. } => {
                     // Symbol(u32) is the interned form;
-                    // primitive names are normally resolved by
-                    // SymbolTable. Without table access here,
-                    // fall back to scanning the global primop
-                    // table by reverse lookup. The cleanest
-                    // path is to consult cs-typer's builtins
-                    // primop_table, but to keep iter 3 self-
-                    // contained we walk it lazily.
-                    primitive_effect_by_symbol(*name)
+                    // resolving it to a primitive effect needs
+                    // SymbolTable access we don't have at this
+                    // layer. Conservative top-of-lattice until a
+                    // later iter threads the table down here.
+                    AllocEffect::UNKNOWN
                 }
                 _ => {
                     // Unknown callee (computed or higher-order
@@ -398,36 +404,6 @@ fn infer_effect_with_scope(expr: &CoreExpr, self_bound: &HashSet<Symbol>) -> All
             }
             acc.join(infer_effect_with_scope(body, &inner))
         }
-    }
-}
-
-/// Resolve a primitive's `AllocEffect` from its interned
-/// Symbol. Walks the cs-typer builtins primop table once per
-/// process (cached via a `OnceLock` of name→effect indexed by
-/// symbol). For non-primitive Symbols, returns
-/// `escapes = Unknown` — the caller can't trace the function.
-fn primitive_effect_by_symbol(sym: Symbol) -> AllocEffect {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<Vec<(Symbol, AllocEffect)>> = OnceLock::new();
-    let table = CACHE.get_or_init(|| {
-        // The primop table uses string names; for Symbol-based
-        // lookup we mint a fresh SymbolTable that mirrors the
-        // intern order primop_pairs uses. Iter 3 punts on this
-        // and just probes `primitive_effect` by name via a
-        // global SymbolTable — but cs-typer doesn't own one.
-        // For now return an empty cache; a future iter can wire
-        // a real Symbol-keyed table.
-        Vec::new()
-    });
-    for (s, e) in table {
-        if *s == sym {
-            return *e;
-        }
-    }
-    AllocEffect {
-        allocates: true,
-        escapes: EscapeKind::Unknown,
-        may_cycle: true,
     }
 }
 
