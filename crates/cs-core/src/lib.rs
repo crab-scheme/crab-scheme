@@ -39,10 +39,6 @@ pub use value::{
 /// (`Heap`, `Marker`, `Trace`) is replaced by `Weak<T>` and the
 /// `cycle` module; consumer crates need only `cs_core::Gc<T>`
 /// (which is always exported) plus the optional `cycle` types.
-#[cfg(not(feature = "countable-memory"))]
-pub use cs_gc::{Gc, Heap, Marker, Trace};
-
-#[cfg(feature = "countable-memory")]
 pub use cs_gc::{Gc, Weak};
 
 thread_local! {

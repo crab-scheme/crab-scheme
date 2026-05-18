@@ -7,8 +7,6 @@
 //! graph (1000 pairs), runs `cycle_check` repeatedly, and asserts
 //! the p99 timing is well under the spec gate.
 
-#![cfg(feature = "countable-memory")]
-
 use std::time::{Duration, Instant};
 
 use cs_gc::cycle::{cycle_check, CycleVisit, CycleVisitor};

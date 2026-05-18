@@ -10,8 +10,6 @@
 //! port finalization is a contractual guarantee of the
 //! countable-memory representation.
 
-#![cfg(feature = "countable-memory")]
-
 use std::fs;
 
 use cs_runtime::Runtime;

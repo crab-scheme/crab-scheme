@@ -18,7 +18,7 @@
 //! detector. Contrast with an Rc-allocated Pair where the
 //! same gated path DOES fire.
 
-#![cfg(all(feature = "regions", feature = "countable-memory"))]
+#![cfg(feature = "regions")]
 
 use std::cell::RefCell;
 

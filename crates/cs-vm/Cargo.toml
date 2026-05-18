@@ -6,17 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-# Iter 11: default-on. Forward the countable-memory feature down
-# to cs-core (which forwards to cs-gc). Required so the cs-vm
-# crate's CycleVisit impls (VmClosure, Bindings, Env) compile
-# against the feature-gated trait.
-default = ["countable-memory", "regions"]
-countable-memory = ["cs-core/countable-memory"]
-# Forwards the cs-gc `regions` feature so the VM can
-# operate on region-allocated heap values. The VM has no
-# region-specific code paths today — it just sees Gc<T>
-# polymorphically — so this is purely about feature
-# propagation.
+# Layer 2 (Rc-backed Gc<T> + CycleVisit) is unconditional after
+# countable-memory iter 12b — ADR 0014. Remaining flags forward
+# the *optional* layers of the unified memory architecture
+# (ADR 0015) through to cs-core/cs-gc.
+default = ["regions"]
+# Forwards cs-gc/regions. The VM has no region-specific code
+# paths — it sees Gc<T> polymorphically — so this is purely
+# feature propagation.
 regions = ["cs-core/regions", "cs-gc/regions"]
 tracing-cycle-collector = ["cs-core/tracing-cycle-collector", "cs-gc/tracing-cycle-collector"]
 

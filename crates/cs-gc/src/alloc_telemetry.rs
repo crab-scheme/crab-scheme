@@ -28,8 +28,6 @@
 //! values; the runtime's `Heap::reset_stats`-equivalent
 //! (under tracing) snapshots a baseline and subtracts.
 
-#![cfg(feature = "countable-memory")]
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Cumulative bytes allocated across every `Gc::new` call on

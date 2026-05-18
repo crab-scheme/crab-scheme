@@ -2,7 +2,7 @@
 //! synchronous cycle detector populates `cs_gc::cycle_registry`
 //! when the `tracing-cycle-collector` feature is on.
 
-#![cfg(all(feature = "tracing-cycle-collector", feature = "countable-memory"))]
+#![cfg(feature = "tracing-cycle-collector")]
 
 use cs_core::{Pair, Value};
 use cs_gc::cycle_registry;

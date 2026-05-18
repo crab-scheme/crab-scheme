@@ -9,8 +9,6 @@
 //! User-visible cycle semantics (cycles stay refcount-leaking
 //! until iter 7.1) are unchanged from M5 Phase 1.
 
-#![cfg(feature = "countable-memory")]
-
 use cs_runtime::countable_memory_cycle::{cycle_detection_count, reset_cycle_detection_count};
 use cs_runtime::Runtime;
 

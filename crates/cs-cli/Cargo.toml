@@ -26,8 +26,7 @@ ffi = ["cs-runtime/ffi"]
 aot = ["dep:cs-aot", "dep:cs-vm", "dep:cs-rir", "dep:cs-parse", "dep:cs-expand", "dep:cs-typer"]
 # Layer-4 tracing cycle collector (tracing-revival spec).
 # Off by default; embedders and benchmarks that want to
-# exercise the layer-4 path enable it explicitly. Implies
-# countable-memory (already in cs-runtime's default).
+# exercise the layer-4 path enable it explicitly.
 tracing-cycle-collector = ["cs-runtime/tracing-cycle-collector"]
 # Convenience feature: turns on every memory-management
 # layer so benchmarks can exercise the full architecture.

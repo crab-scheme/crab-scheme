@@ -52,28 +52,11 @@ impl Runtime {
         // live by refcount alone, telemetry comes from the
         // global cs_gc::alloc_telemetry atomics (Gap A-1) — so
         // both setups are no-ops.
-        #[cfg(not(feature = "countable-memory"))]
-        let prev_heap = {
-            // SAFETY: `self.heap` is owned by this Runtime and `self`
-            // outlives the closure call below.
-            let prev_heap = cs_vm::vm::current_jit_active_heap();
-            unsafe { cs_vm::vm::set_jit_active_heap(&self.heap as *const cs_gc::Heap) };
-            prev_heap
-        };
         // B1 (BEAM runtime spec): install this Runtime's Heap as
         // the thread's active gc-stats target. Only meaningful
         // under tracing — countable-memory's telemetry path is
         // independent of Heap.
-        #[cfg(not(feature = "countable-memory"))]
-        let _gc_stats_guard = self.heap.activate();
         let result = f(self);
-        #[cfg(not(feature = "countable-memory"))]
-        {
-            drop(_gc_stats_guard);
-            // Restore previous heap pointer (typically null) so nested
-            // with_active calls work correctly.
-            unsafe { cs_vm::vm::set_jit_active_heap(prev_heap) };
-        }
         ACTIVE_RUNTIME.with(|c| c.set(prev));
         result
     }

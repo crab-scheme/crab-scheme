@@ -5,7 +5,7 @@
 //!
 //! Build with `--features regions`.
 
-#![cfg(all(feature = "regions", feature = "countable-memory"))]
+#![cfg(feature = "regions")]
 
 use std::cell::RefCell;
 

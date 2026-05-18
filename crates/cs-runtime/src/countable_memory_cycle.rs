@@ -18,8 +18,6 @@
 //! list. The cycle leaks at refcount-drop time. Iter 7.1 closes
 //! that leak via Strong/Weak storage slot enums.
 
-#![cfg(feature = "countable-memory")]
-
 use std::cell::Cell;
 
 thread_local! {

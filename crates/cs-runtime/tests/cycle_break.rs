@@ -22,8 +22,6 @@
 //! is the canonical example that iter 7.1.x's heuristic
 //! would have leaked but iter 7.1.x.y reclaims correctly.
 
-#![cfg(feature = "countable-memory")]
-
 use cs_runtime::countable_memory_cycle::{
     cycle_broken_count, cycle_detection_count, reset_cycle_detection_count,
 };

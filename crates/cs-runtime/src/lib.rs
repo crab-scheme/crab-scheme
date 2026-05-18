@@ -4,7 +4,6 @@ pub mod active;
 #[cfg(feature = "regions")]
 pub mod alloc_dispatch;
 pub mod builtins;
-#[cfg(feature = "countable-memory")]
 pub mod countable_memory_cycle;
 pub mod env;
 pub mod eval;
@@ -42,40 +41,26 @@ pub struct Runtime {
     macros: std::collections::HashMap<cs_core::Symbol, cs_expand::Macro>,
     /// VM-tier persistent root env (lazily populated with pure builtins at construction).
     vm_env: Rc<cs_vm::vm::Env>,
-    /// GC heap. M5 milestone: pre-registered with the walker top frame
-    /// and the VM root env as persistent roots. Phase 1 collect() walks
-    /// these roots transitively but the underlying allocations are
-    /// still Rc-backed, so collect() has no observable side effect on
-    /// existing programs — it's the seam Phase 2 swaps to a real arena.
-    ///
-    /// Under `feature = "countable-memory"` there is no Heap —
-    /// reclamation is purely refcount-driven and this field is
-    /// elided. `collect()` becomes a no-op shim and `heap()` is
-    /// unavailable.
-    #[cfg(not(feature = "countable-memory"))]
-    heap: cs_gc::Heap,
-    /// Slab of values rooted via `pin()`. Keyed by a monotonically-
-    /// increasing PinId. The shared root closure registered at
-    /// construction marks every value in here on every collect.
-    /// `Pinned<'rt>::Drop` removes its entry by id. (M5b iter 4.)
+    /// Slab of pinned values that survive intervening collects.
+    /// Populated by [`Runtime::pin`]; cleared on the returned
+    /// [`Pinned`] guard's drop. Cloned (Rc-shared) into the Pinned
+    /// guard so drop can remove the slot without holding the
+    /// Runtime.
     pinned: Rc<RefCell<HashMap<PinId, Value>>>,
-    /// Next PinId — never reused. u64 is enough for any conceivable
-    /// program lifetime (~5×10^14 pins/sec for 1000 years).
+    /// Monotonic counter producing fresh [`PinId`]s. Starts at 1
+    /// so handle 0 can be reserved by FFI as the null
+    /// [`crate::ffi::ValueRef`].
     next_pin_id: Rc<Cell<u64>>,
-    /// Shared libraries loaded via [`Runtime::load_shared_library`].
-    /// Held here only so the plugin's text segment stays mapped for
-    /// the runtime's lifetime; we never inspect them after register.
-    /// (M10 W1: gated on `ffi-dynamic` — WASM has no `dlopen`.
-    /// Plugins compiled-in via the `ffi-trait` API don't need this.)
+    /// Dynamically loaded shared libraries kept alive for the
+    /// runtime's lifetime so dlopen'd host procedures' captured
+    /// back-pointers stay valid.
     #[cfg(feature = "ffi-dynamic")]
     loaded_libs: Vec<libloading::Library>,
-    /// Cached C-ABI context. Lazily initialized on first dlopen use;
-    /// kept alive for the runtime's lifetime so registered host
-    /// procedures' captured back-pointers stay valid. Boxed so the
-    /// runtime back-pointer (which equals `self`) stays valid even
-    /// if Runtime fields are reordered. Only the dlopen path
-    /// constructs this — `ffi-trait`-only embedders register their
-    /// procedures via `register_host_procedure` directly.
+    /// Dlopen-time C-ABI context. Boxed so the runtime
+    /// back-pointer (which equals `self`) stays valid even if
+    /// Runtime fields are reordered. Only the dlopen path
+    /// constructs this — `ffi-trait`-only embedders register
+    /// their procedures via `register_host_procedure` directly.
     #[cfg(feature = "ffi-dynamic")]
     ffi_ctx: Option<Box<crate::ffi::RuntimeFfiContext>>,
     /// JIT lowerer; populated by [`Runtime::install_jit`]. None
@@ -1735,39 +1720,11 @@ impl Runtime {
         // chain from these same Rc<Frame>/Rc<Env> fields keeps the
         // values alive on its own. The pinned slab below similarly
         // holds strong Value references, no root closure needed.
-        #[cfg(not(feature = "countable-memory"))]
-        let heap = cs_gc::Heap::new();
-        #[cfg(not(feature = "countable-memory"))]
-        {
-            let top_root = Rc::clone(&top);
-            heap.add_root(move |marker| {
-                use cs_gc::Trace;
-                top_root.trace(marker);
-            });
-        }
-        #[cfg(not(feature = "countable-memory"))]
-        {
-            let vm_root = Rc::clone(&vm_env);
-            heap.add_root(move |marker| {
-                use cs_gc::Trace;
-                vm_root.trace(marker);
-            });
-        }
 
         // Pinned-value slab. The root closure traces every value in
         // the map on every collect, so anything passed to `pin()`
         // stays reachable until its Pinned guard drops.
         let pinned: Rc<RefCell<HashMap<PinId, Value>>> = Rc::new(RefCell::new(HashMap::new()));
-        #[cfg(not(feature = "countable-memory"))]
-        {
-            let pinned_clone = Rc::clone(&pinned);
-            heap.add_root(move |marker| {
-                use cs_gc::Trace;
-                for v in pinned_clone.borrow().values() {
-                    v.trace(marker);
-                }
-            });
-        }
 
         Self {
             syms,
@@ -1775,8 +1732,6 @@ impl Runtime {
             top,
             macros: std::collections::HashMap::new(),
             vm_env,
-            #[cfg(not(feature = "countable-memory"))]
-            heap,
             pinned,
             // Start at 1 so handle 0 can be reserved as the FFI
             // "null" ValueRef. Internal Pinned guards never use 0
@@ -1876,19 +1831,12 @@ impl Runtime {
     /// Under `feature = "countable-memory"` there is no heap to
     /// collect — reclamation runs at Rc::drop time — so this is
     /// a no-op shim preserved for callers that still invoke it.
-    pub fn collect(&self) {
-        #[cfg(not(feature = "countable-memory"))]
-        self.heap.collect();
-    }
+    pub fn collect(&self) {}
 
     /// Read-only access to the GC heap (for tests and tooling).
     ///
     /// Unavailable under `feature = "countable-memory"` (there is
     /// no heap).
-    #[cfg(not(feature = "countable-memory"))]
-    pub fn heap(&self) -> &cs_gc::Heap {
-        &self.heap
-    }
 
     pub fn symbols(&self) -> &SymbolTable {
         &self.syms

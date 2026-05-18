@@ -10,8 +10,6 @@
 //! Gated on `feature = "countable-memory"`; under the tracing
 //! default the file compiles to an empty module.
 
-#![cfg(feature = "countable-memory")]
-
 use std::cell::{Cell, RefCell};
 
 use cs_gc::cycle::{check_and_break, cycle_check, set_limit, CycleVisit, CycleVisitor};

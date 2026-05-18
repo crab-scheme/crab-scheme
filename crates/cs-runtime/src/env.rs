@@ -55,19 +55,6 @@ impl Frame {
     }
 }
 
-#[cfg(not(feature = "countable-memory"))]
-impl cs_core::Trace for Frame {
-    fn trace(&self, marker: &mut cs_core::Marker) {
-        for (_, val) in self.bindings.borrow().iter() {
-            val.trace(marker);
-        }
-        if let Some(p) = &self.parent {
-            p.trace(marker);
-        }
-    }
-}
-
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Frame {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         // Frame is Rc<Self>; the address-based dedup keeps the

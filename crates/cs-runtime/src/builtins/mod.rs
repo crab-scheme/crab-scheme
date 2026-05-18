@@ -2569,7 +2569,6 @@ fn b_set_car(args: &[Value]) -> Result<Value, String> {
             if cs_gc::Gc::is_region(p) {
                 return Ok(Value::Unspecified);
             }
-            #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(p, |p| {
                 crate::countable_memory_cycle::record_cycle_with_candidate(p);
                 // Iter 7.1.x.y: caller-supplied baseline=3
@@ -2600,7 +2599,6 @@ fn b_set_cdr(args: &[Value]) -> Result<Value, String> {
             if cs_gc::Gc::is_region(p) {
                 return Ok(Value::Unspecified);
             }
-            #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(p, |p| {
                 crate::countable_memory_cycle::record_cycle_with_candidate(p);
                 if p.break_cdr_cycle(3) {
@@ -3854,7 +3852,6 @@ fn b_vector_set(args: &[Value]) -> Result<Value, String> {
             if cs_gc::Gc::is_region(v) {
                 return Ok(Value::Unspecified);
             }
-            #[cfg(feature = "countable-memory")]
             cs_gc::cycle::check_and_break(v, |v| {
                 crate::countable_memory_cycle::record_cycle_with_candidate(v);
             });
@@ -5993,7 +5990,6 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
                 if cs_gc::Gc::is_region(&h) {
                     return Ok(Value::Unspecified);
                 }
-                #[cfg(feature = "countable-memory")]
                 cs_gc::cycle::check_and_break(&h, |h| {
                     crate::countable_memory_cycle::record_cycle_with_candidate(h);
                 });
@@ -6007,7 +6003,6 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         if cs_gc::Gc::is_region(&h) {
             return Ok(Value::Unspecified);
         }
-        #[cfg(feature = "countable-memory")]
         cs_gc::cycle::check_and_break(&h, |h| {
             crate::countable_memory_cycle::record_cycle_with_candidate(h);
         });
@@ -6027,7 +6022,6 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if cs_gc::Gc::is_region(&h) {
         return Ok(Value::Unspecified);
     }
-    #[cfg(feature = "countable-memory")]
     cs_gc::cycle::check_and_break(&h, |h| {
         crate::countable_memory_cycle::record_cycle_with_candidate(h);
     });
@@ -11838,30 +11832,6 @@ fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
         let key_sym = syms.intern(k);
         Value::Pair(cs_core::Pair::new(Value::Symbol(key_sym), v))
     };
-    #[cfg(not(feature = "countable-memory"))]
-    {
-        let rt = unsafe { crate::Runtime::active() }
-            .ok_or_else(|| "gc-stats: no active runtime".to_string())?;
-        let s = rt.heap().stats();
-        let ns_to_ms = |d: std::time::Duration| (d.as_nanos() as f64) / 1_000_000.0;
-        Ok(Value::list(vec![
-            pair(
-                "bytes-allocated-total",
-                fixnum_or_bigint(s.bytes_allocated_total),
-            ),
-            pair("alloc-count-total", fixnum_or_bigint(s.alloc_count_total)),
-            pair("collect-count", fixnum_or_bigint(s.collect_count)),
-            pair("live-slots", Value::fixnum(s.live_slots as i64)),
-            pair(
-                "collect-time-ms",
-                Value::flonum(ns_to_ms(s.collect_duration_total)),
-            ),
-            pair("last-pause-ms", Value::flonum(ns_to_ms(s.last_pause))),
-            pair("max-pause-ms", Value::flonum(ns_to_ms(s.max_pause))),
-            pair("stats-enabled?", Value::Boolean(s.stats_enabled)),
-        ]))
-    }
-    #[cfg(feature = "countable-memory")]
     {
         let cycles_seen = crate::countable_memory_cycle::cycle_detection_count();
         let cycles_broken = crate::countable_memory_cycle::cycle_broken_count();
@@ -11912,13 +11882,6 @@ fn b_gc_stats_reset(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats-reset!", "0", args.len()));
     }
-    #[cfg(not(feature = "countable-memory"))]
-    {
-        let rt = unsafe { crate::Runtime::active() }
-            .ok_or_else(|| "gc-stats-reset!: no active runtime".to_string())?;
-        rt.heap().reset_stats();
-    }
-    #[cfg(feature = "countable-memory")]
     {
         // No tracing heap to reset. Zero the cycle counter
         // and the layer-2 alloc-telemetry atomics (Gap A-1)
@@ -11939,12 +11902,6 @@ fn b_gc_stats_enable(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats-enable!", "0", args.len()));
     }
-    #[cfg(not(feature = "countable-memory"))]
-    {
-        let rt = unsafe { crate::Runtime::active() }
-            .ok_or_else(|| "gc-stats-enable!: no active runtime".to_string())?;
-        rt.heap().set_stats_enabled(true);
-    }
     Ok(Value::Unspecified)
 }
 
@@ -11953,12 +11910,6 @@ fn b_gc_stats_enable(args: &[Value]) -> Result<Value, String> {
 fn b_gc_stats_disable(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats-disable!", "0", args.len()));
-    }
-    #[cfg(not(feature = "countable-memory"))]
-    {
-        let rt = unsafe { crate::Runtime::active() }
-            .ok_or_else(|| "gc-stats-disable!: no active runtime".to_string())?;
-        rt.heap().set_stats_enabled(false);
     }
     Ok(Value::Unspecified)
 }
@@ -11977,14 +11928,6 @@ fn b_collect_garbage(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("collect-garbage", "0", args.len()));
     }
-    #[cfg(not(feature = "countable-memory"))]
-    {
-        let rt = unsafe { crate::Runtime::active() }
-            .ok_or_else(|| "collect-garbage: no active runtime".to_string())?;
-        rt.heap().collect();
-        return Ok(Value::fixnum(rt.heap().live_slots() as i64));
-    }
-    #[cfg(feature = "countable-memory")]
     {
         #[cfg(feature = "tracing-cycle-collector")]
         cs_gc::cycle_registry::run_sweep();
@@ -12002,12 +11945,6 @@ fn b_gc_auto_collect_enable(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-auto-collect-enable!", "0", args.len()));
     }
-    #[cfg(not(feature = "countable-memory"))]
-    {
-        let rt = unsafe { crate::Runtime::active() }
-            .ok_or_else(|| "gc-auto-collect-enable!: no active runtime".to_string())?;
-        rt.heap().set_auto_collect(true);
-    }
     Ok(Value::Unspecified)
 }
 
@@ -12017,12 +11954,6 @@ fn b_gc_auto_collect_disable(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-auto-collect-disable!", "0", args.len()));
     }
-    #[cfg(not(feature = "countable-memory"))]
-    {
-        let rt = unsafe { crate::Runtime::active() }
-            .ok_or_else(|| "gc-auto-collect-disable!: no active runtime".to_string())?;
-        rt.heap().set_auto_collect(false);
-    }
     Ok(Value::Unspecified)
 }
 
@@ -12031,9 +11962,10 @@ fn b_gc_auto_collect_disable(args: &[Value]) -> Result<Value, String> {
 /// want to lower this so collection fires per inner loop rather
 /// than once at the end.
 ///
-/// Under countable-memory: forwards to the
-/// `tracing-cycle-collector` registry's auto-trigger threshold
-/// when that feature is on; otherwise no-op.
+/// Forwards to the layer-4 `tracing-cycle-collector` registry's
+/// auto-trigger threshold when that feature is on; otherwise a
+/// no-op (the layer-2 synchronous detector has no threshold knob —
+/// it always runs on the mutation site).
 fn b_gc_set_threshold(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("gc-set-threshold!", "1", args.len()));
@@ -12042,15 +11974,9 @@ fn b_gc_set_threshold(args: &[Value]) -> Result<Value, String> {
         Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as usize,
         v => return Err(type_err("gc-set-threshold!", "non-negative fixnum", v)),
     };
-    #[cfg(not(feature = "countable-memory"))]
-    {
-        let rt = unsafe { crate::Runtime::active() }
-            .ok_or_else(|| "gc-set-threshold!: no active runtime".to_string())?;
-        rt.heap().set_threshold(n);
-    }
-    #[cfg(all(feature = "countable-memory", feature = "tracing-cycle-collector"))]
+    #[cfg(feature = "tracing-cycle-collector")]
     cs_gc::cycle_registry::set_auto_trigger_threshold(n);
-    #[cfg(all(feature = "countable-memory", not(feature = "tracing-cycle-collector")))]
+    #[cfg(not(feature = "tracing-cycle-collector"))]
     let _ = n;
     Ok(Value::Unspecified)
 }
@@ -12151,18 +12077,11 @@ fn b_current_memory_use(args: &[Value]) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("current-memory-use", "0", args.len()));
     }
-    #[cfg(not(feature = "countable-memory"))]
-    {
-        let rt = unsafe { crate::Runtime::active() }
-            .ok_or_else(|| "current-memory-use: no active runtime".to_string())?;
-        Ok(fixnum_or_bigint(rt.heap().bytes_allocated_total()))
-    }
     // Under countable-memory: Gap A-1 telemetry tracks
     // cumulative bytes allocated since process start (or
     // since the last `(gc-stats-reset!)`). Shape-compatible
     // with the tracing variant's `bytes_allocated_total`.
     // For RSS specifically, use `(current-rss-bytes)`.
-    #[cfg(feature = "countable-memory")]
     {
         Ok(fixnum_or_bigint(
             cs_gc::alloc_telemetry::bytes_allocated_total(),

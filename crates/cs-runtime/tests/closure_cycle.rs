@@ -13,8 +13,6 @@
 //! When iter 8 lands, the leak assertion will tighten to "no
 //! leaked allocations on runtime drop".
 
-#![cfg(feature = "countable-memory")]
-
 use cs_runtime::countable_memory_cycle::{cycle_detection_count, reset_cycle_detection_count};
 use cs_runtime::Runtime;
 

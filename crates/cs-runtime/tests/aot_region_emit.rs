@@ -3,7 +3,7 @@
 //! to the per-thread region stack via the resolver
 //! registered from `Runtime::new`.
 
-#![cfg(all(feature = "regions", feature = "countable-memory"))]
+#![cfg(feature = "regions")]
 
 use std::rc::Rc;
 

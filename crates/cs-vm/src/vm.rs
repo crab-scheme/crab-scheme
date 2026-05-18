@@ -580,49 +580,10 @@ fn value_to_any_i64(v: Value) -> i64 {
     Box::into_raw(Box::new(v)) as i64
 }
 
-// JIT_ACTIVE_HEAP + set/clear/current_jit_active_heap exist only
-// under the tracing representation. Under countable-memory the
-// JIT runtime helpers never consult a heap — every allocation
-// goes through plain `Gc::new` (= `Rc::new`).
-#[cfg(not(feature = "countable-memory"))]
-thread_local! {
-    /// Pointer to the active `Heap` for the current thread, used by
-    /// JIT runtime helpers when allocating Gc<Value> handles. Set by
-    /// `cs_runtime::Runtime::with_active` (iter BP) so JIT-allocated
-    /// Pairs etc. participate in tracing GC. Null when no Heap is
-    /// installed — helpers fall back to unregistered `Gc::new`.
-    /// ADR 0012 D-2 (iter BO).
-    static JIT_ACTIVE_HEAP: Cell<*const cs_gc::Heap> = const { Cell::new(std::ptr::null()) };
-}
-
-/// Install a `Heap` pointer for use by JIT runtime helpers on the
-/// current thread. Pair with `clear_jit_active_heap` (or another
-/// `set_jit_active_heap`) to restore. Pointer must remain valid
-/// until cleared.
-///
-/// # Safety
-///
-/// `heap` must outlive the next call to `clear_jit_active_heap` and
-/// must point at a live `Heap`. Typical pattern: stash inside a
-/// guard struct whose Drop calls `clear_jit_active_heap`.
-#[cfg(not(feature = "countable-memory"))]
-pub unsafe fn set_jit_active_heap(heap: *const cs_gc::Heap) {
-    JIT_ACTIVE_HEAP.with(|c| c.set(heap));
-}
-
-/// Clear the active Heap pointer.
-#[cfg(not(feature = "countable-memory"))]
-pub fn clear_jit_active_heap() {
-    JIT_ACTIVE_HEAP.with(|c| c.set(std::ptr::null()));
-}
-
-/// Read the current active Heap pointer. Returns null if no Heap
-/// is installed. Used by `with_active`-style guards that save the
-/// previous pointer before overwriting.
-#[cfg(not(feature = "countable-memory"))]
-pub fn current_jit_active_heap() -> *const cs_gc::Heap {
-    JIT_ACTIVE_HEAP.with(|c| c.get())
-}
+// countable-memory iter 12b deleted JIT_ACTIVE_HEAP + the
+// set/clear/current_jit_active_heap helpers. JIT runtime helpers
+// never consult a heap — every allocation goes through plain
+// `Gc::new` (= `Rc::new`).
 
 // ---- Iter BW — deopt-instead-of-panic sentinel ----------------------
 //
@@ -1128,25 +1089,11 @@ mod proc_table {
 /// in `NanboxValue::from_value` (Procedure + non-Fixnum/Flonum
 /// Number variants) to preserve the heap-tracking semantics the
 /// pre-NaN-box `value_to_gc_i64` had.
-#[cfg(not(feature = "countable-memory"))]
-fn nb_alloc_gc_value(v: Value) -> cs_gc::Gc<Value> {
-    JIT_ACTIVE_HEAP.with(|c| {
-        let ptr = c.get();
-        if ptr.is_null() {
-            cs_gc::Gc::new(v)
-        } else {
-            // SAFETY: caller of set_jit_active_heap guaranteed the
-            // pointer is live until clear/replace.
-            unsafe { (*ptr).alloc(v) }
-        }
-    })
-}
 
 /// Countable-memory variant: no Heap to consult; always allocate
 /// via plain `Gc::new` (= `Rc::new`). The JIT runtime helpers
 /// produce live `Gc<Value>` handles whose reclamation is driven
 /// by the strong-count chain alone.
-#[cfg(feature = "countable-memory")]
 fn nb_alloc_gc_value(v: Value) -> cs_gc::Gc<Value> {
     cs_gc::Gc::new(v)
 }
@@ -1723,22 +1670,6 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
     // an already-allocated Gc<Pair>. The construct-via-struct-
     // literal optimization below the JIT fast path is preserved
     // on the tracing variant via the cfg branch.
-    #[cfg(not(feature = "countable-memory"))]
-    let g: cs_gc::Gc<cs_core::Pair> = {
-        let pair = cs_core::Pair {
-            car: std::cell::RefCell::new(car_v),
-            cdr: std::cell::RefCell::new(cdr_v),
-        };
-        JIT_ACTIVE_HEAP.with(|c| {
-            let ptr = c.get();
-            if ptr.is_null() {
-                cs_gc::Gc::new(pair)
-            } else {
-                unsafe { (*ptr).alloc(pair) }
-            }
-        })
-    };
-    #[cfg(feature = "countable-memory")]
     let g: cs_gc::Gc<cs_core::Pair> = cs_core::Pair::new(car_v, cdr_v);
     let raw_ptr = cs_gc::Gc::into_raw_jit(g) as u64;
     debug_assert!(raw_ptr & !NB_PAYLOAD_MASK == 0);
@@ -1754,7 +1685,7 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
 /// pointer hook (rather than `extern "C"` linkage) avoids a
 /// dep cycle: cs-vm doesn't depend on cs-runtime, but the
 /// pointer gets wired up at runtime.
-#[cfg(all(feature = "regions", feature = "countable-memory"))]
+#[cfg(feature = "regions")]
 static REGION_RESOLVER: std::sync::atomic::AtomicPtr<()> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
@@ -1763,7 +1694,7 @@ static REGION_RESOLVER: std::sync::atomic::AtomicPtr<()> =
 /// resolver returns a raw pointer to the innermost
 /// `cs_gc::Region` on the current thread's region stack, or
 /// null if none is in scope.
-#[cfg(all(feature = "regions", feature = "countable-memory"))]
+#[cfg(feature = "regions")]
 pub fn register_region_resolver(resolver: extern "C" fn() -> *const ()) {
     REGION_RESOLVER.store(resolver as *mut (), std::sync::atomic::Ordering::Relaxed);
 }
@@ -1784,7 +1715,7 @@ pub fn register_region_resolver(resolver: extern "C" fn() -> *const ()) {
 /// stays on the Rc path until a lifetime-aware translator
 /// lands.
 #[no_mangle]
-#[cfg(all(feature = "regions", feature = "countable-memory"))]
+#[cfg(feature = "regions")]
 pub unsafe extern "C" fn vm_alloc_pair_region_gc(
     car: i64,
     car_tag: u8,
@@ -10782,19 +10713,6 @@ impl Procedure for VmClosure {
     }
 }
 
-#[cfg(not(feature = "countable-memory"))]
-impl cs_gc::Trace for VmClosure {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        // Trace the captured environment chain. Bytecode is immutable
-        // shared `Rc<Bytecode>` containing only Symbols and opcodes —
-        // no Values to trace. The shared `LambdaProfile` is leaf JIT
-        // state (counters, raw pointers, stack maps) — no Values to
-        // trace either.
-        self.env.trace(marker);
-    }
-}
-
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for VmClosure {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         // Dedup on VmClosure's Rc identity; descend into env
@@ -10867,118 +10785,6 @@ impl Drop for Bindings {
     }
 }
 
-#[cfg(not(feature = "countable-memory"))]
-impl cs_gc::Trace for Bindings {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        // Borrow each slot's Gc<T> handle without touching the
-        // refcount (ManuallyDrop pattern), trace it, then let the
-        // ManuallyDrop wrapper forget the temporary handle. The
-        // slot still owns the strong ref.
-        let trace_nb = |nb: &NanboxValue, marker: &mut cs_gc::Marker| {
-            let bits = nb.into_raw() as u64;
-            if !nb_is_tagged(bits) {
-                return; // Flonum — leaf (raw f64 bit pattern, no payload to trace).
-            }
-            let tag = nb_tag_of(bits);
-            // Inline immediates (Fixnum / Boolean / Character / Symbol /
-            // Null / Unspecified / Eof) carry no GC payload — skip.
-            // Without this guard, tracing a Fixnum-bound `p` after
-            // `(set! p 0)` would reinterpret the payload as a
-            // `Gc<Value>` raw pointer and segfault.
-            if tag < NB_TAG_PAIR {
-                return;
-            }
-            let payload = nb_payload_of(bits);
-            let ptr = payload as *const ();
-            match tag {
-                t if t == NB_TAG_PAIR => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<cs_core::Pair>::from_raw_jit(ptr)
-                    });
-                    (*g).trace(marker);
-                }
-                t if t == NB_TAG_VECTOR => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<std::cell::RefCell<Vec<Value>>>::from_raw_jit(ptr)
-                    });
-                    (*g).trace(marker);
-                }
-                t if t == NB_TAG_STRING => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<std::cell::RefCell<String>>::from_raw_jit(ptr)
-                    });
-                    (*g).trace(marker);
-                }
-                t if t == NB_TAG_BYTEVECTOR => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<std::cell::RefCell<Vec<u8>>>::from_raw_jit(ptr)
-                    });
-                    (*g).trace(marker);
-                }
-                t if t == NB_TAG_HASHTABLE => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<cs_core::Hashtable>::from_raw_jit(ptr)
-                    });
-                    (*g).trace(marker);
-                }
-                t if t == NB_TAG_PORT => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<cs_core::Port>::from_raw_jit(ptr)
-                    });
-                    (*g).trace(marker);
-                }
-                t if t == NB_TAG_PROMISE => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<cs_core::Promise>::from_raw_jit(ptr)
-                    });
-                    (*g).trace(marker);
-                }
-                // Phase 6 Stage B2 — NB_TAG_PROCEDURE payload is a
-                // u32 ProcTable slot index, NOT a Gc pointer.
-                // Reinterpreting it as a pointer (via the catch-all
-                // arm) would segfault. The trace is a no-op:
-                // `Value::Procedure`'s `Trace` impl is also no-op
-                // (cs-core/value.rs ~line 321) — captures are rooted
-                // through the VM stack / caller env, not via this
-                // carrier.
-                t if t == NB_TAG_PROCEDURE => {}
-                _ => {
-                    // NB_TAG_GC_VALUE (or any other pointer tag routed
-                    // through the Gc<Value> wrap fallback). Trace the
-                    // wrap, which in turn traces the inner Value.
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<Value>::from_raw_jit(ptr)
-                    });
-                    (*g).trace(marker);
-                }
-            }
-        };
-        match self {
-            Bindings::Small(v) => {
-                for (_, nb) in v {
-                    trace_nb(nb, marker);
-                }
-            }
-            Bindings::Large(m) => {
-                for (_, nb) in m {
-                    trace_nb(nb, marker);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(not(feature = "countable-memory"))]
-impl cs_gc::Trace for Env {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        self.bindings.borrow().trace(marker);
-        if let Some(p) = &self.parent {
-            p.trace(marker);
-        }
-    }
-}
-
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Bindings {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         // Mirrors the trace_nb dispatch above. Each NanboxValue slot
@@ -11082,7 +10888,6 @@ impl cs_gc::cycle::CycleVisit for Bindings {
     }
 }
 
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Env {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         // Dedup on this Env's Rc identity so the detector
@@ -15156,85 +14961,9 @@ fn sort_with_predicate(
     Ok(())
 }
 
-// Empty `Trace` impl for VM-tier procedure types that hold no Values.
-// Builtins, marker types like VmApply/VmMap, and continuation handles
-// (which carry only an i64 id) all carry no reachable Values inside.
-// VmClosure has its own non-empty Trace impl elsewhere because it
-// captures an Env; everything else listed here is a leaf.
-//
-// Under countable-memory the trait surface that needs Trace is gone:
-// these markers all implement Procedure, which provides an empty
-// default `visit_closure_children`. The macro emits nothing in that
-// configuration.
-#[cfg(not(feature = "countable-memory"))]
-macro_rules! trace_leaf_proc {
-    ($($t:ty),* $(,)?) => {
-        $(
-            impl cs_gc::Trace for $t {
-                fn trace(&self, _marker: &mut cs_gc::Marker) {}
-            }
-        )*
-    };
-}
-
-#[cfg(feature = "countable-memory")]
-macro_rules! trace_leaf_proc {
-    ($($t:ty),* $(,)?) => {};
-}
-
-trace_leaf_proc!(
-    VmBuiltin,
-    VmBuiltinSyms,
-    VmHostBuiltin,
-    VmApply,
-    VmMap,
-    VmForEach,
-    VmFilter,
-    VmFind,
-    VmAny,
-    VmEvery,
-    VmFoldLeft,
-    VmFoldRight,
-    VmReduce,
-    VmCount,
-    VmPartition,
-    VmValues,
-    VmCallWithValues,
-    VmVectorMap,
-    VmVectorForEach,
-    VmVectorFold,
-    VmVectorFilter,
-    VmStringMap,
-    VmStringForEach,
-    VmHashtableWalk,
-    VmHashtableForEach,
-    VmHashtableFold,
-    VmHashtableUpdate,
-    VmUnfold,
-    VmListSort,
-    VmVectorSort,
-    VmVectorSortBang,
-    VmTabulate,
-    VmRemove,
-    VmForce,
-    VmEval,
-    VmDisplay,
-    VmWrite,
-    VmNewline,
-    VmWithOutputToString,
-    VmWithInputFromString,
-    VmWithOutputToFile,
-    VmWithInputFromFile,
-    VmCurrentInputPort,
-    VmCurrentOutputPort,
-    VmRaise,
-    VmErrorFn,
-    VmAssertionViolation,
-    VmWithExceptionHandler,
-    VmCallCc,
-    VmDynamicWind,
-    VmContinuation,
-);
+// (countable-memory iter 12b deleted the per-leaf `impl Trace`
+// expansions that lived here. Every VM-tier marker type's
+// `visit_closure_children` is now the empty `Procedure` default.)
 
 // =========================================================================
 // RC3 Phase 2 iter 2.1 — AOT-procedure public API surface
@@ -15386,12 +15115,6 @@ impl cs_core::Procedure for VmAotClosure {
     }
 }
 
-#[cfg(not(feature = "countable-memory"))]
-impl cs_gc::Trace for VmAotClosure {
-    fn trace(&self, _marker: &mut cs_gc::Marker) {
-        // No Gc-tracked fields; the fn pointer is a static address.
-    }
-}
 // Under countable-memory VmAotClosure inherits the empty default
 // `visit_closure_children` via its Procedure impl.
 
@@ -15965,7 +15688,7 @@ mod gc_helper_tests {
     /// when no region is in scope. (Region-scope variant is
     /// tested by `cs-runtime` integration tests since this
     /// fn depends on cs-runtime's REGION_STACK.)
-    #[cfg(all(feature = "regions", feature = "countable-memory"))]
+    #[cfg(feature = "regions")]
     #[test]
     fn vm_alloc_pair_region_gc_fallback_when_no_region() {
         let car = 13i64;
@@ -16299,138 +16022,6 @@ mod gc_helper_tests_extra {
         assert_eq!(unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Null)) }, 1);
     }
 
-    #[cfg(not(feature = "countable-memory"))]
-    #[test]
-    fn value_to_gc_i64_uses_active_heap_when_set() {
-        // K1 step 2b (NaN-box): Pairs encode by storing their raw
-        // `Gc<Pair>` ptr directly with `NB_TAG_PAIR` — they do NOT
-        // route through the Gc<Value> wrap allocation that the
-        // active heap tracks. To exercise the active-heap routing,
-        // we need a value that DOES wrap in `Gc<Value>` — the
-        // catchall `NB_TAG_GC_VALUE` path. Oversized Fixnums
-        // (beyond `NB_FIXNUM_MAX`) take exactly that path.
-        let h = cs_gc::Heap::new();
-        let before = h.alloc_count();
-        let mk_big = || Value::Number(cs_core::Number::Fixnum(NB_FIXNUM_MAX + 1));
-        let _ = value_to_gc_i64(mk_big());
-        assert_eq!(
-            h.alloc_count(),
-            before,
-            "no Heap installed; alloc_count should not move"
-        );
-
-        // Install the Heap; subsequent Gc<Value>-wrap allocations
-        // are tracked.
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let _ = value_to_gc_i64(mk_big());
-        let _ = value_to_gc_i64(mk_big());
-        clear_jit_active_heap();
-        assert_eq!(
-            h.alloc_count(),
-            before + 2,
-            "two GC_VALUE-wrap allocations through the Heap should bump alloc_count by 2"
-        );
-    }
-
-    #[cfg(not(feature = "countable-memory"))]
-    #[test]
-    fn value_to_gc_i64_inline_fixnum_skips_allocation() {
-        // Small Fixnums encode inline (low-bit tag) — no Gc allocation
-        // is made at all, even with an active Heap. Round-trip
-        // through `gc_i64_to_value` recovers the original value.
-        let h = cs_gc::Heap::new();
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let before = h.alloc_count();
-        for n in [0i64, 1, -1, 42, -42, NB_FIXNUM_MAX, NB_FIXNUM_MIN] {
-            let i = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(n)));
-            assert!(
-                any_i64_is_inline(i),
-                "Fixnum({}) should encode inline, got i64={:#x}",
-                n,
-                i
-            );
-            let back = unsafe { gc_i64_to_value(i) };
-            match back {
-                Value::Number(cs_core::Number::Fixnum(m)) => assert_eq!(m, n),
-                other => panic!("expected Fixnum({}), got {:?}", n, other),
-            }
-        }
-        clear_jit_active_heap();
-        assert_eq!(
-            h.alloc_count(),
-            before,
-            "inline encoding must not touch the Heap"
-        );
-    }
-
-    #[cfg(not(feature = "countable-memory"))]
-    #[test]
-    fn value_to_gc_i64_inline_immediates_round_trip() {
-        // Boolean, Character, Null, Unspecified, Eof all encode
-        // inline (no Gc allocation) and round-trip through
-        // `gc_i64_to_value` without touching the Heap.
-        let h = cs_gc::Heap::new();
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let before = h.alloc_count();
-
-        let cases: Vec<(Value, &str)> = vec![
-            (Value::Boolean(false), "Boolean(false)"),
-            (Value::Boolean(true), "Boolean(true)"),
-            (Value::Character('a'), "Character('a')"),
-            (Value::Character('\u{1F4A9}'), "Character('💩')"),
-            (Value::Character('\0'), "Character('\\0')"),
-            (Value::Null, "Null"),
-            (Value::Unspecified, "Unspecified"),
-            (Value::Eof, "Eof"),
-        ];
-        for (v, label) in cases {
-            let i = value_to_gc_i64(v.clone());
-            assert!(any_i64_is_inline(i), "{} should encode inline", label);
-            let back = unsafe { gc_i64_to_value(i) };
-            let same = match (&v, &back) {
-                (Value::Boolean(a), Value::Boolean(b)) => a == b,
-                (Value::Character(a), Value::Character(b)) => a == b,
-                (Value::Null, Value::Null) => true,
-                (Value::Unspecified, Value::Unspecified) => true,
-                (Value::Eof, Value::Eof) => true,
-                _ => false,
-            };
-            assert!(same, "{} round-trip mismatch: {:?} -> {:?}", label, v, back);
-        }
-
-        clear_jit_active_heap();
-        assert_eq!(
-            h.alloc_count(),
-            before,
-            "inline immediates must not touch the Heap"
-        );
-    }
-
-    #[cfg(not(feature = "countable-memory"))]
-    #[test]
-    fn value_to_gc_i64_oversized_fixnum_falls_back_to_heap() {
-        // A Fixnum past the 47-bit NaN-box inline range falls
-        // through to the `NB_TAG_GC_VALUE` Gc<Value>-wrap path.
-        // Encode + decode still round-trips — only the carrier
-        // changes.
-        let h = cs_gc::Heap::new();
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let before = h.alloc_count();
-        let big = NB_FIXNUM_MAX + 1;
-        let i = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(big)));
-        assert!(
-            !any_i64_is_inline(i),
-            "Fixnum past inline range should fall back to Gc handle"
-        );
-        let back = unsafe { gc_i64_to_value(i) };
-        clear_jit_active_heap();
-        match back {
-            Value::Number(cs_core::Number::Fixnum(m)) => assert_eq!(m, big),
-            other => panic!("expected Fixnum({}), got {:?}", big, other),
-        }
-        assert_eq!(h.alloc_count(), before + 1);
-    }
-
     // ===== NanboxValue (K1 step 2) — NaN-box encoding tests =====
 
     #[test]
@@ -16512,109 +16103,6 @@ mod gc_helper_tests_extra {
             };
             assert!(matches, "{}: round-trip mismatch: {:?}", label, back);
         }
-    }
-
-    #[cfg(not(feature = "countable-memory"))]
-    #[test]
-    fn nanbox_round_trips_flonum_inline() {
-        // Flonums travel as raw f64 bits. No allocation, no
-        // signature collision (verified by encode).
-        let h = cs_gc::Heap::new();
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let before = h.alloc_count();
-
-        for f in [0.0_f64, 1.0, -1.0, 3.14, 1e100, -1e-100, f64::EPSILON] {
-            let nb = NanboxValue::flonum(f);
-            assert!(nb.is_flonum(), "Flonum({}) should encode as f64 lane", f);
-            assert_eq!(nb.as_flonum(), Some(f));
-            let back = unsafe { nb.to_value() };
-            match back {
-                Value::Number(cs_core::Number::Flonum(g)) => assert_eq!(f.to_bits(), g.to_bits()),
-                other => panic!("expected Flonum({}), got {:?}", f, other),
-            }
-        }
-
-        // Special f64s: infinities round-trip, NaN canonicalizes.
-        let pos_inf = NanboxValue::flonum(f64::INFINITY);
-        assert_eq!(pos_inf.as_flonum(), Some(f64::INFINITY));
-        let neg_inf = NanboxValue::flonum(f64::NEG_INFINITY);
-        assert_eq!(neg_inf.as_flonum(), Some(f64::NEG_INFINITY));
-
-        // A sign=1 NaN bit pattern would collide with the tagged
-        // range; `nb_encode_flonum` canonicalizes it. Use a sign=0
-        // NaN to test the non-collision path.
-        let nan = NanboxValue::flonum(f64::NAN);
-        assert!(nan.is_flonum());
-        let nan_back = unsafe { nan.to_value() };
-        match nan_back {
-            Value::Number(cs_core::Number::Flonum(g)) => assert!(g.is_nan()),
-            other => panic!("expected NaN, got {:?}", other),
-        }
-
-        clear_jit_active_heap();
-        assert_eq!(
-            h.alloc_count(),
-            before,
-            "inline Flonum encoding must not touch the Heap"
-        );
-    }
-
-    #[cfg(not(feature = "countable-memory"))]
-    #[test]
-    fn nanbox_round_trips_heap_pair_without_extra_wrap() {
-        // The whole point of NaN-boxing: a heap-typed Value (here
-        // a Pair) encodes by stashing its `Gc<Pair>` raw pointer
-        // **directly** in the 47-bit payload — no extra
-        // `Gc<Value>` wrap. Round-trip must preserve the Pair's
-        // identity and contents.
-        let h = cs_gc::Heap::new();
-        unsafe { set_jit_active_heap(&h as *const cs_gc::Heap) };
-        let before = h.alloc_count();
-
-        // `Pair::new` already returns a `Gc<Pair>` (matches the
-        // construction sites elsewhere in vm.rs).
-        let v = Value::Pair(cs_core::Pair::new(
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(2)),
-        ));
-        // alloc_count: 0 here (Gc::new is unregistered when no
-        // heap is set yet… but I set the heap above. Let me
-        // recount.) Actually the Pair allocation here used
-        // unregistered Gc::new, not the heap. So heap count
-        // didn't move.
-        let after_construct = h.alloc_count();
-
-        let nb = NanboxValue::from_value(v);
-        // The encoding should NOT trigger an additional heap
-        // allocation — the `Gc<Pair>` ptr is stored directly.
-        assert_eq!(
-            h.alloc_count(),
-            after_construct,
-            "NaN-box encode of Pair must not allocate a Gc<Value> wrap"
-        );
-        assert!(nb.is_tagged());
-        assert_eq!(nb.tag(), NB_TAG_PAIR);
-
-        let back = unsafe { nb.to_value() };
-        match back {
-            Value::Pair(g) => {
-                let car = g.car();
-                let cdr = g.cdr();
-                match (&car, &cdr) {
-                    (
-                        Value::Number(cs_core::Number::Fixnum(a)),
-                        Value::Number(cs_core::Number::Fixnum(b)),
-                    ) => {
-                        assert_eq!(*a, 1);
-                        assert_eq!(*b, 2);
-                    }
-                    _ => panic!("Pair contents wrong: car={:?}, cdr={:?}", car, cdr),
-                }
-            }
-            other => panic!("expected Pair, got {:?}", other),
-        }
-
-        clear_jit_active_heap();
     }
 
     #[test]
@@ -16832,36 +16320,5 @@ mod nb_arith_tests {
         let r = unsafe { vm_value_lt_nb(nb_bool(true), nb_fixnum(1)) };
         assert_eq!(jit_take_deopt(), DEOPT_REASON_ARITH_MISS);
         assert_bool(r, false);
-    }
-
-    #[cfg(not(feature = "countable-memory"))]
-    #[test]
-    fn bindings_trace_skips_inline_immediates() {
-        // Regression test for the Phase 4 keystone SIGSEGV in
-        // diff_jit_pair_alloc_then_collect_reclaims_when_unreachable.
-        // Bindings::trace's trace_nb only skipped Flonum (untagged); inline
-        // TAGGED immediates (Fixnum/Boolean/Character/Symbol/Null/
-        // Unspecified/Eof) fell into the Gc<Value> default arm and
-        // dereferenced the payload as a heap pointer, crashing for any
-        // non-pointer-typed binding (e.g., `(set! p 0)` then `collect()`).
-        use cs_gc::Trace;
-        let mut syms = SymbolTable::new();
-        let mut b = Bindings::default();
-        // One entry per inline-immediate tag.
-        b.insert_nb(syms.intern("fx"), NanboxValue::fixnum(0));
-        b.insert_nb(syms.intern("bt"), NanboxValue::boolean(true));
-        b.insert_nb(syms.intern("bf"), NanboxValue::boolean(false));
-        b.insert_nb(syms.intern("ch"), NanboxValue::character('x'));
-        b.insert_nb(syms.intern("sy"), NanboxValue::symbol(syms.intern("hi")));
-        b.insert_nb(syms.intern("nl"), NanboxValue::NULL);
-        b.insert_nb(syms.intern("us"), NanboxValue::UNSPECIFIED);
-        b.insert_nb(syms.intern("eo"), NanboxValue::EOF);
-        b.insert_nb(syms.intern("fl"), NanboxValue::flonum(3.14));
-        // Tracing must complete without segfault. The trace is a no-op
-        // for these (no GC payload), but the dispatch must not deref
-        // the payload as a pointer.
-        let heap = cs_gc::Heap::new();
-        heap.add_root(move |marker| b.trace(marker));
-        heap.collect();
     }
 }

@@ -10,7 +10,6 @@ use crate::symbol::{Symbol, SymbolTable};
 
 // Bring the CycleVisit trait into scope so per-type
 // `visit_children` calls resolve under the feature.
-#[cfg(feature = "countable-memory")]
 use cs_gc::cycle::CycleVisit as _;
 
 /// A pair (cons cell). Mutable per R6RS via `set-car!` / `set-cdr!`.
@@ -38,9 +37,7 @@ use cs_gc::cycle::CycleVisit as _;
 pub struct Pair {
     pub car: RefCell<Value>,
     pub cdr: RefCell<Value>,
-    #[cfg(feature = "countable-memory")]
     car_weak: RefCell<Option<WeakValue>>,
-    #[cfg(feature = "countable-memory")]
     cdr_weak: RefCell<Option<WeakValue>>,
 }
 
@@ -49,9 +46,7 @@ impl Pair {
         cs_gc::Gc::new(Pair {
             car: RefCell::new(car),
             cdr: RefCell::new(cdr),
-            #[cfg(feature = "countable-memory")]
             car_weak: RefCell::new(None),
-            #[cfg(feature = "countable-memory")]
             cdr_weak: RefCell::new(None),
         })
     }
@@ -67,26 +62,21 @@ impl Pair {
             Pair {
                 car: RefCell::new(car),
                 cdr: RefCell::new(cdr),
-                #[cfg(feature = "countable-memory")]
                 car_weak: RefCell::new(None),
-                #[cfg(feature = "countable-memory")]
                 cdr_weak: RefCell::new(None),
             },
         )
     }
 
-    /// Read the car as a `Value`. Under countable-memory, an
-    /// upgraded weak tombstone takes precedence over the strong
-    /// slot — so broken cycles still produce the user-observable
-    /// cyclic value as long as some other strong reference
-    /// holds the target alive. Returns `Value::Unspecified` if
-    /// the tombstone target has been fully reclaimed.
+    /// Read the car as a `Value`. An upgraded weak tombstone takes
+    /// precedence over the strong slot — so broken cycles still
+    /// produce the user-observable cyclic value as long as some
+    /// other strong reference holds the target alive. Returns
+    /// `Value::Unspecified` if the tombstone target has been fully
+    /// reclaimed.
     pub fn car(&self) -> Value {
-        #[cfg(feature = "countable-memory")]
-        {
-            if let Some(w) = self.car_weak.borrow().as_ref() {
-                return w.upgrade().unwrap_or(Value::Unspecified);
-            }
+        if let Some(w) = self.car_weak.borrow().as_ref() {
+            return w.upgrade().unwrap_or(Value::Unspecified);
         }
         self.car.borrow().clone()
     }
@@ -94,11 +84,8 @@ impl Pair {
     /// Read the cdr as a `Value`. See [`car`] for the
     /// tombstone semantics.
     pub fn cdr(&self) -> Value {
-        #[cfg(feature = "countable-memory")]
-        {
-            if let Some(w) = self.cdr_weak.borrow().as_ref() {
-                return w.upgrade().unwrap_or(Value::Unspecified);
-            }
+        if let Some(w) = self.cdr_weak.borrow().as_ref() {
+            return w.upgrade().unwrap_or(Value::Unspecified);
         }
         self.cdr.borrow().clone()
     }
@@ -106,19 +93,13 @@ impl Pair {
     /// Replace the car slot with `v`. Clears any weak tombstone
     /// (the new value is unambiguously strong).
     pub fn set_car(&self, v: Value) {
-        #[cfg(feature = "countable-memory")]
-        {
-            self.car_weak.replace(None);
-        }
+        self.car_weak.replace(None);
         self.car.replace(v);
     }
 
     /// Replace the cdr slot with `v`. Clears any weak tombstone.
     pub fn set_cdr(&self, v: Value) {
-        #[cfg(feature = "countable-memory")]
-        {
-            self.cdr_weak.replace(None);
-        }
+        self.cdr_weak.replace(None);
         self.cdr.replace(v);
     }
 
@@ -161,7 +142,6 @@ impl Pair {
     /// the move from caller-supplied baselines to full
     /// Bacon-Rajan trial deletion that picks safe cycle
     /// edges without caller hints.
-    #[cfg(feature = "countable-memory")]
     pub fn break_car_cycle(&self, baseline: usize) -> bool {
         // Read strong count WITHOUT cloning so the count
         // reflects the slot's contribution plus the caller's
@@ -184,7 +164,6 @@ impl Pair {
     /// Cycle-break action for the cdr slot. See
     /// [`break_car_cycle`] for the `baseline` parameter
     /// convention.
-    #[cfg(feature = "countable-memory")]
     pub fn break_cdr_cycle(&self, baseline: usize) -> bool {
         let cdr_borrow = self.cdr.borrow();
         let total = cdr_borrow.heap_strong_count().unwrap_or(0);
@@ -237,7 +216,6 @@ impl Drop for Pair {
 /// sweep runs outside any mutation — no transient args[…]
 /// refs inflate the strong count, so any strong_count > 0
 /// reflects only persistent holders.
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::BreakCycle for Pair {
     fn try_break_cycle(&self) -> bool {
         self.break_cdr_cycle(0) || self.break_car_cycle(0)
@@ -258,7 +236,6 @@ impl cs_gc::cycle::BreakCycle for Pair {
 /// (e.g., `(hashtable-set! h 'key h)`). The cycle detector
 /// (layer 2) flags these on the `hashtable-set!` site; this
 /// trait impl lets the layer-4 sweep also reclaim them.
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::BreakCycle for Hashtable {
     fn try_break_cycle(&self) -> bool {
         // Take a borrow; iterate looking for the first
@@ -308,9 +285,7 @@ impl cs_gc::cycle::BreakCycle for Hashtable {
 /// `Vector` newtype wrapper to take ownership of the inner
 /// type. Tracked as a known limitation in the gap-closure
 /// follow-on.
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::BreakCycle for Port {}
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::BreakCycle for Promise {}
 
 /// Weak counterpart of [`Value`]'s heap-bearing variants, used by
@@ -321,7 +296,6 @@ impl cs_gc::cycle::BreakCycle for Promise {}
 /// Only present under `feature = "countable-memory"`; the tracing
 /// path doesn't need this because the mark-sweep collector breaks
 /// cycles via slot-zeroing rather than weak-pointer storage.
-#[cfg(feature = "countable-memory")]
 #[derive(Debug, Clone)]
 pub enum WeakValue {
     String(cs_gc::Weak<RefCell<String>>),
@@ -334,7 +308,6 @@ pub enum WeakValue {
     Procedure(std::rc::Weak<dyn Procedure>),
 }
 
-#[cfg(feature = "countable-memory")]
 impl WeakValue {
     /// Construct a `WeakValue` from `v` if `v` carries a heap
     /// pointer. Returns `None` for leaf values (Null, Boolean,
@@ -379,15 +352,6 @@ impl WeakValue {
     }
 }
 
-#[cfg(not(feature = "countable-memory"))]
-impl cs_gc::Trace for Pair {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        self.car.borrow().trace(marker);
-        self.cdr.borrow().trace(marker);
-    }
-}
-
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Pair {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         // Walk via the accessors so the detector observes the
@@ -477,21 +441,6 @@ impl Hashtable {
     }
 }
 
-#[cfg(not(feature = "countable-memory"))]
-impl cs_gc::Trace for Hashtable {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        for (k, v) in self.items.borrow().iter() {
-            k.trace(marker);
-            v.trace(marker);
-        }
-        if let Some(c) = &self.custom {
-            c.hash.trace(marker);
-            c.equiv.trace(marker);
-        }
-    }
-}
-
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Hashtable {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         for (k, v) in self.items.borrow().iter() {
@@ -610,16 +559,6 @@ impl Port {
     }
 }
 
-#[cfg(not(feature = "countable-memory"))]
-impl cs_gc::Trace for Port {
-    fn trace(&self, _marker: &mut cs_gc::Marker) {
-        // Leaf: every Port variant holds either chars/bytes/Strings or a
-        // file-output buffer. None contain a Value or Gc<T>, so there's
-        // nothing to mark transitively.
-    }
-}
-
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Port {
     fn visit_children(&self, _ctx: &mut cs_gc::cycle::CycleVisitor) {
         // Leaf: Port variants hold no Gc<...> children.
@@ -648,16 +587,6 @@ impl Promise {
     }
 }
 
-#[cfg(not(feature = "countable-memory"))]
-impl cs_gc::Trace for Promise {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        match &*self.state.borrow() {
-            PromiseState::Pending(v) | PromiseState::Forced(v) => v.trace(marker),
-        }
-    }
-}
-
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Promise {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         match &*self.state.borrow() {
@@ -678,15 +607,7 @@ impl cs_gc::cycle::CycleVisit for Promise {
 /// collector consults when walking a Value::Procedure. Most builtins
 /// hold no Scheme heap children and inherit the empty default impl;
 /// only closures and Parameter override it.
-#[cfg(not(feature = "countable-memory"))]
-pub trait Procedure: fmt::Debug + cs_gc::Trace + 'static {
-    fn as_any(&self) -> &dyn Any;
-    fn name(&self) -> Option<&str> {
-        None
-    }
-}
 
-#[cfg(feature = "countable-memory")]
 pub trait Procedure: fmt::Debug + 'static {
     fn as_any(&self) -> &dyn Any;
     fn name(&self) -> Option<&str> {
@@ -714,20 +635,11 @@ impl Procedure for Parameter {
     fn name(&self) -> Option<&str> {
         Some("parameter")
     }
-    #[cfg(feature = "countable-memory")]
     fn visit_closure_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         self.cell.borrow().visit_children(ctx);
     }
 }
 
-#[cfg(not(feature = "countable-memory"))]
-impl cs_gc::Trace for Parameter {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        self.cell.borrow().trace(marker);
-    }
-}
-
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Parameter {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         self.cell.borrow().visit_children(ctx);
@@ -785,31 +697,6 @@ pub enum WriteMode {
 /// walker top frame and the VM root env, both of which are root closures.
 /// True cycles that go *through* `Rc<dyn Procedure>` would leak in
 /// Phase 1; the M5 spec's exit gate calls this out explicitly.
-#[cfg(not(feature = "countable-memory"))]
-impl cs_gc::Trace for Value {
-    fn trace(&self, marker: &mut cs_gc::Marker) {
-        match self {
-            // Gc<T>-backed heap variants.
-            Value::String(s) => s.trace(marker),
-            Value::ByteVector(v) => v.trace(marker),
-            Value::Vector(v) => v.trace(marker),
-            Value::Pair(p) => p.trace(marker),
-            Value::Hashtable(h) => h.trace(marker),
-            Value::Port(p) => p.trace(marker),
-            Value::Promise(p) => p.trace(marker),
-            // Rc-backed (Phase 1 limitation, see doc above).
-            Value::Procedure(_) => {}
-            // Leaf variants — no heap pointers.
-            Value::Null
-            | Value::Unspecified
-            | Value::Eof
-            | Value::Boolean(_)
-            | Value::Character(_)
-            | Value::Symbol(_)
-            | Value::Number(_) => {}
-        }
-    }
-}
 
 /// Under countable-memory, every heap-bearing Value variant
 /// (including Procedure) participates in cycle detection. Pair
@@ -818,7 +705,6 @@ impl cs_gc::Trace for Value {
 /// hook so concrete closures and parameters can enumerate their
 /// captured values without each Value match-arm knowing the
 /// concrete type.
-#[cfg(feature = "countable-memory")]
 impl cs_gc::cycle::CycleVisit for Value {
     fn visit_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         match self {
@@ -905,7 +791,6 @@ impl Value {
     /// heap allocation, if any. Returns `None` for leaf values
     /// (no allocation to count). Used by `Pair::break_*_cycle`'s
     /// strong-count guard.
-    #[cfg(feature = "countable-memory")]
     pub fn heap_strong_count(&self) -> Option<usize> {
         match self {
             Value::String(g) => Some(cs_gc::Gc::strong_count(g)),

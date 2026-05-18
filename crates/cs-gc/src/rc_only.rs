@@ -562,14 +562,12 @@ impl<T: ?Sized> Drop for Gc<T> {
 /// # Example: upgrade-after-drop returns `None`
 ///
 /// ```
-/// # #[cfg(feature = "countable-memory")] {
 /// use cs_gc::Gc;
 /// let g = Gc::new(42_i64);
 /// let w = Gc::downgrade(&g);
 /// assert_eq!(w.upgrade().map(|g| *g), Some(42));
 /// drop(g);
 /// assert!(w.upgrade().is_none());
-/// # }
 /// ```
 pub struct Weak<T: ?Sized> {
     inner: RawWeak<T>,

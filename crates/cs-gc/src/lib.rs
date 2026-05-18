@@ -1,46 +1,33 @@
-//! CrabScheme heap-pointer crate.
+//! CrabScheme heap-pointer crate (layer 2 of the unified memory
+//! architecture, ADR 0015).
 //!
-//! Two representations of `Gc<T>` live here, selected at compile
-//! time by the `countable-memory` feature:
+//! `Gc<T>` is a thin newtype around `Rc<T>` (the `rc_only` module);
+//! cycle handling lives in a sibling [`cycle`] module that wraps the
+//! synchronous detector + Bacon-Rajan trial deletion. Public surface
+//! (`new`, `Clone`, `Deref`, `PartialEq`, `Debug`, `ptr_eq`,
+//! `as_addr`, `into_raw_jit`, `from_raw_jit`, `raw_incref`,
+//! `downgrade`, `strong_count`, `Weak<T>`) is what every consumer in
+//! the workspace targets.
 //!
-//! - **Default (feature off): tracing variant.** M5 Phase 1
-//!   precise mark-sweep GC. `Gc<T>` wraps `Rc<Slot<T>>` where
-//!   `Slot<T>` adds a mark cell consumed by the tracing layer.
-//!   The crate exports `Heap`, `Trace`, `Marker`, `add_root`,
-//!   `collect`. See `tracing.rs` and `docs/adr/0006-gc-design.md`.
+//! Optional sibling modules add the other architecture layers:
 //!
-//! - **`countable-memory` on: Rc-only variant.** `Gc<T>` is a thin
-//!   newtype around `Rc<T>` with no per-slot bookkeeping. Cycle
-//!   handling moves out of this crate (to a sibling `cycle`
-//!   module in iter 3 of the countable-memory spec; to `Weak<T>`
-//!   back-edges in iter 8). See `rc_only.rs` and
-//!   `.spec-workflow/specs/countable-memory/`.
+//! - [`region`] (feature `regions`, on by default) — layer 3 bump
+//!   arenas (ADR 0016).
+//! - [`cycle_registry`] (feature `tracing-cycle-collector`, off by
+//!   default) — layer 4 residual-cycle sweep (ADR 0018).
 //!
-//! Both variants expose `Gc<T>`'s public API surface (`new`,
-//! `Clone`, `Deref`, `PartialEq`, `Debug`, `ptr_eq`, `as_addr`,
-//! `into_raw_jit`, `from_raw_jit`, `raw_incref`). The Rc-only
-//! variant also exposes `downgrade`, `strong_count`, and `Weak<T>`.
-//!
-//! The two are mutually exclusive: iter 11 of the countable-memory
-//! spec flips the feature default-on, iter 12 deletes the tracing
-//! variant entirely.
+//! ADR 0014 (iter 12b) deleted the M5 Phase 1 precise tracing GC
+//! that previously lived here; see `docs/adr/0006-gc-design.md` for
+//! the superseded design and `docs/milestones/countable-memory-exit.md`
+//! for the transition history.
 
 #![allow(clippy::missing_safety_doc)]
 
-#[cfg(not(feature = "countable-memory"))]
-mod tracing;
-#[cfg(not(feature = "countable-memory"))]
-pub use tracing::{Gc, Heap, Marker, Trace};
-
-#[cfg(feature = "countable-memory")]
 mod rc_only;
-#[cfg(feature = "countable-memory")]
 pub use rc_only::{Gc, Weak};
 
-#[cfg(feature = "countable-memory")]
 pub mod alloc_telemetry;
 
-#[cfg(feature = "countable-memory")]
 pub mod cycle;
 
 #[cfg(feature = "tracing-cycle-collector")]

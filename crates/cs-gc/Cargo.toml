@@ -5,32 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "CrabScheme precise tracing garbage collector"
+description = "CrabScheme heap-pointer crate — Rc-backed Gc<T> + cycle detector"
 
 [features]
-# Iter 11 of the countable-memory spec flips this on by default.
-# The Rc-backed `Gc<T>` representation + synchronous cycle-
-# collector (`cs_gc::cycle`) is the production path. Disable with
-# `--no-default-features` to fall back to the M5 Phase 1 tracing
-# infrastructure (`Heap`, `Trace`, `Marker`, mark-sweep
-# `collect()`) — that path stays available for rollback / parity
-# verification until iter 12 deletes it. See
-# `.spec-workflow/specs/countable-memory/` for the migration plan.
-default = ["countable-memory", "regions"]
-countable-memory = []
-# Layer 3 of the unified memory management architecture
-# (ADR 0015). Adds `cs_gc::Region` — a bump arena whose
-# allocations bulk-free when the region drops. Iter 6 of
-# the region-memory spec flipped this default-on; opt out
-# with `--no-default-features --features countable-memory`.
+# Layer 2 (the Rc-backed Gc<T> + synchronous cycle detector) is
+# unconditional after countable-memory iter 12b — see ADR 0014. The
+# remaining feature flags toggle the *optional* layers of the unified
+# memory architecture (ADR 0015).
+default = ["regions"]
+# Layer 3 (ADR 0016): `cs_gc::Region` bump arena. Default-on since
+# region-memory iter 6.
 regions = ["dep:bumpalo"]
-# Layer 4 of the unified memory management architecture
-# (ADR 0015). Adds `cs_gc::cycle_registry` — a candidate-based
-# tracing sweep that complements the layer-2 synchronous
-# detector by reclaiming residual cycles the detector
-# couldn't break. Off by default; opt in for embedders that
-# need it. See `.spec-workflow/specs/tracing-revival/`.
-tracing-cycle-collector = ["countable-memory"]
+# Layer 4 (ADR 0018): `cs_gc::cycle_registry` candidate-based
+# tracing sweep that complements the layer-2 synchronous detector
+# by reclaiming residual cycles. Off by default; opt in for
+# embedders that want it.
+tracing-cycle-collector = []
 
 [dependencies]
 bumpalo = { workspace = true, optional = true }
