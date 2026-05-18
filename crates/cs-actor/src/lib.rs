@@ -42,14 +42,17 @@
 //!
 //! ## Quick start
 //!
-//! ```
+//! ```no_run
 //! use std::sync::Arc;
 //! use cs_actor::{ActorSystem, Message};
 //!
 //! let sys = ActorSystem::new();
 //!
-//! // Spawn a "pong" actor that drains every message it gets.
-//! let pong = sys.spawn(|actor| {
+//! // Spawn a "pong" actor that drains every message it gets. The
+//! // sync-body-on-task path (parallel-runtime C1.1+) runs each
+//! // actor as a tokio task rather than an OS thread — no per-actor
+//! // OS-thread ceiling.
+//! let pong = sys.spawn_sync_body_on_task(|actor| {
 //!     while let Some(msg) = actor.receive() {
 //!         if let Message::User(_p) = msg {
 //!             // (real ping/pong needs the sender's PID embedded in the
@@ -370,6 +373,26 @@ impl ActorSystem {
     /// Panic inside `body` is captured and (B5) propagated as an
     /// `ExitReason::Error` to linked actors; B2 just logs it to
     /// stderr.
+    ///
+    /// **Deprecated (parallel-runtime C1.4).** This path uses
+    /// `spawn_blocking`, which dedicates one OS thread per
+    /// actor and hits the 4096-actor ceiling from
+    /// `max_blocking_threads(4096)`. New code should use:
+    ///
+    /// - [`Self::spawn_sync_body_on_task`] for an
+    ///   identically-shaped sync `FnOnce(&mut Actor)` body
+    ///   that runs as a tokio task (no thread-per-actor
+    ///   ceiling), or
+    /// - [`Self::spawn_async`] for native async bodies.
+    ///
+    /// Existing call sites work unchanged and won't be
+    /// removed in 1.0, but the API is no longer the
+    /// recommended path.
+    #[deprecated(
+        since = "1.0.0",
+        note = "use spawn_sync_body_on_task (sync body, no thread-per-actor ceiling) \
+                or spawn_async (native async body) — see parallel-runtime spec C1.4"
+    )]
     pub fn spawn<F>(&self, body: F) -> ActorRef
     where
         F: FnOnce(&mut Actor) + Send + 'static,
@@ -563,6 +586,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // legacy `spawn` (C1.4) still has tests
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
