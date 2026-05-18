@@ -283,6 +283,27 @@ mod tests {
     }
 
     #[test]
+    fn span_merge_cross_file_prefers_self() {
+        // Macro expansion legitimately merges spans from
+        // different files: the template carries the macro's
+        // definition site (file A); substituted user args carry
+        // the call site (file B). The earlier strict
+        // `debug_assert_eq` panicked. Verify we now prefer self
+        // (the span being extended) instead of panicking.
+        let a = Span::new(FileId(0), 5, 10);
+        let b = Span::new(FileId(1), 100, 200);
+        assert_eq!(a.merge(b), a);
+    }
+
+    #[test]
+    fn span_merge_dummy_returns_other() {
+        let a = Span::DUMMY;
+        let b = Span::new(FileId(0), 5, 10);
+        assert_eq!(a.merge(b), b);
+        assert_eq!(b.merge(a), b);
+    }
+
+    #[test]
     fn line_col_basic() {
         let mut sm = SourceMap::new();
         let id = sm.add("test", "abc\ndef\nghi");
