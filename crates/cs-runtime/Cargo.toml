@@ -15,7 +15,7 @@ license.workspace = true
 # wasm32-wasip1.
 # Layer 2 (Rc-backed Gc<T> + synchronous cycle detector) is
 # unconditional after countable-memory iter 12b — ADR 0014.
-default = ["jit", "ffi-dynamic", "regions"]
+default = ["jit", "ffi-dynamic", "regions", "stdlib"]
 # Enables `cs-jit*` deps and `Runtime::install_jit` / `jit_lowerer`.
 # Disabled in WASM and AOT-binary builds (which inline their codegen
 # at build time instead of at runtime).
@@ -63,6 +63,17 @@ tracing-cycle-collector = [
 # library only loads when this feature is on.
 actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload"]
 
+# ----- (crab …) stdlib modules — see .spec-workflow/specs/stdlib-modules
+#
+# `stdlib` is the umbrella: every Tier-1/2/3 module compiled in.
+# Per-module flags (`stdlib-path`, `stdlib-fs`, …) toggle individual
+# crates so embedders can build subset distributions. Each per-module
+# flag implies `ffi-trait` because registration goes through
+# `register_host_procedure`.
+stdlib = ["stdlib-path", "stdlib-fs"]
+stdlib-path = ["ffi-trait", "dep:cs-stdlib-path"]
+stdlib-fs = ["ffi-trait", "dep:cs-stdlib-fs"]
+
 [dependencies]
 cs-core = { workspace = true }
 cs-diag = { workspace = true }
@@ -85,6 +96,8 @@ thiserror = { workspace = true }
 cs-actor = { workspace = true, optional = true }
 cs-table = { workspace = true, optional = true }
 cs-hotreload = { workspace = true, optional = true }
+cs-stdlib-path = { workspace = true, optional = true }
+cs-stdlib-fs = { workspace = true, optional = true }
 
 [dev-dependencies]
 cs-ffi-example = { workspace = true }

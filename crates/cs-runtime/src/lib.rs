@@ -180,6 +180,17 @@ impl Runtime {
     }
 
     pub fn new() -> Self {
+        let mut rt = Self::new_inner();
+        #[cfg(feature = "stdlib")]
+        rt.register_stdlib();
+        rt
+    }
+
+    /// Body of `Runtime::new` minus the post-construction stdlib
+    /// registration step. Kept private so callers that want a
+    /// minimal runtime without the `(crab …)` modules can build
+    /// against `--no-default-features` and skip the stdlib hookup.
+    fn new_inner() -> Self {
         // Gap B-3: wire cs-vm's region-resolver function-
         // pointer hook to cs-runtime's per-thread REGION_STACK
         // accessor. This lets `vm_alloc_pair_region_gc` (the
@@ -1737,6 +1748,26 @@ impl Runtime {
     /// before the lambda first crosses the tier-up threshold.
     pub fn install_typer_hints(&self, hints: std::collections::HashMap<u32, Vec<cs_rir::Type>>) {
         *self.typer_hints_by_lambda_id.borrow_mut() = hints;
+    }
+
+    /// Register every compiled-in `(crab …)` stdlib module on this
+    /// runtime. Each `cs-stdlib-<name>` crate exposes a `procs()`
+    /// function returning `Vec<Arc<dyn HostProcedure>>`; this method
+    /// iterates the enabled crates and registers each procedure.
+    ///
+    /// Gated on the `stdlib` umbrella feature; per-module features
+    /// (`stdlib-path`, `stdlib-fs`, …) toggle individual modules.
+    /// Called automatically from `Runtime::new` when `stdlib` is on.
+    #[cfg(feature = "stdlib")]
+    pub fn register_stdlib(&mut self) {
+        #[cfg(feature = "stdlib-path")]
+        for p in cs_stdlib_path::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-fs")]
+        for p in cs_stdlib_fs::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call

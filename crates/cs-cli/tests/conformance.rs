@@ -108,6 +108,20 @@ fn conformance_arithmetic() {
     run_conformance_file("arithmetic.scm");
 }
 
+// --- stdlib-modules (see .spec-workflow/specs/stdlib-modules) ---
+
+#[test]
+#[cfg(feature = "stdlib-path")]
+fn conformance_crab_path() {
+    run_conformance_file("crab-path.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-fs")]
+fn conformance_crab_fs() {
+    run_conformance_file("crab-fs.scm");
+}
+
 #[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");

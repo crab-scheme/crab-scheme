@@ -15,10 +15,19 @@ path = "src/main.rs"
 # A WASM build uses `--no-default-features`; an in-process Rust
 # embedder that wants custom builtins without dlopen uses
 # `--features ffi-trait` (e.g. for compile-into-WASM plugins).
-default = ["jit", "ffi-dynamic", "aot"]
+default = ["jit", "ffi-dynamic", "aot", "stdlib"]
 jit = ["cs-runtime/jit"]
 ffi-trait = ["cs-runtime/ffi-trait"]
 ffi-dynamic = ["cs-runtime/ffi-dynamic"]
+# (crab …) stdlib modules. See .spec-workflow/specs/stdlib-modules.
+# `stdlib` is the umbrella — turns on every shipped module. Per-module
+# flags compose so subset embeds work (`--no-default-features --features
+# stdlib-path` ships only path manipulation). Each per-module flag
+# enables the cs-runtime umbrella so `Runtime::register_stdlib` (gated
+# on `cs-runtime/stdlib`) actually compiles in.
+stdlib = ["cs-runtime/stdlib", "stdlib-path", "stdlib-fs"]
+stdlib-path = ["cs-runtime/stdlib", "cs-runtime/stdlib-path"]
+stdlib-fs = ["cs-runtime/stdlib", "cs-runtime/stdlib-fs"]
 # Backward-compat alias matching the W1 feature name.
 ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the

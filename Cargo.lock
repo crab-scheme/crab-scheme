@@ -599,11 +599,29 @@ dependencies = [
  "cs-lex",
  "cs-parse",
  "cs-rir",
+ "cs-stdlib-fs",
+ "cs-stdlib-path",
  "cs-table",
  "cs-vm",
  "libloading",
  "num-traits",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cs-stdlib-fs"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
+]
+
+[[package]]
+name = "cs-stdlib-path"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
 ]
 
 [[package]]

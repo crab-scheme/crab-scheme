@@ -1,0 +1,12 @@
+[package]
+name = "cs-stdlib-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab fs) — filesystem operations backed by std::fs."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
