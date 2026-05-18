@@ -1844,6 +1844,14 @@ impl Runtime {
         for p in cs_stdlib_net::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-http")]
+        for p in cs_stdlib_http::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-websocket")]
+        for p in cs_stdlib_websocket::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call

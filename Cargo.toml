@@ -53,6 +53,8 @@ members = [
     "crates/cs-stdlib-log",
     "crates/cs-stdlib-metrics",
     "crates/cs-stdlib-net",
+    "crates/cs-stdlib-http",
+    "crates/cs-stdlib-websocket",
 ]
 
 [workspace.package]
@@ -113,6 +115,8 @@ cs-stdlib-archive = { path = "crates/cs-stdlib-archive" }
 cs-stdlib-log = { path = "crates/cs-stdlib-log" }
 cs-stdlib-metrics = { path = "crates/cs-stdlib-metrics" }
 cs-stdlib-net = { path = "crates/cs-stdlib-net" }
+cs-stdlib-http = { path = "crates/cs-stdlib-http" }
+cs-stdlib-websocket = { path = "crates/cs-stdlib-websocket" }
 
 # External crates
 logos = "0.14"

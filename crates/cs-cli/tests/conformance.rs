@@ -241,6 +241,18 @@ fn conformance_crab_net() {
 }
 
 #[test]
+#[cfg(all(feature = "stdlib-http", feature = "stdlib-net"))]
+fn conformance_crab_http() {
+    run_conformance_file("crab-http.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-websocket")]
+fn conformance_crab_websocket() {
+    run_conformance_file("crab-websocket.scm");
+}
+
+#[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");
 }

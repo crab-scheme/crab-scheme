@@ -1,0 +1,13 @@
+[package]
+name = "cs-stdlib-websocket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab websocket) — sync WebSocket client via tungstenite."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }

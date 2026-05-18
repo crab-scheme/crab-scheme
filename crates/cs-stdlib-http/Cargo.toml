@@ -1,0 +1,17 @@
+[package]
+name = "cs-stdlib-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab http client) — synchronous HTTP client via ureq."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+# ureq is the sync HTTP client of choice for CrabScheme — no
+# Tokio dep, smaller than reqwest, blocks the calling thread
+# which matches our concurrency posture (drive concurrent IO
+# from BEAM actors).
+ureq = { version = "2", default-features = false, features = ["tls"] }
