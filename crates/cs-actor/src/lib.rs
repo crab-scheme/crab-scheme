@@ -505,6 +505,32 @@ impl Default for ActorSystem {
     }
 }
 
+/// Reduction-yield bridge for cs-vm's `install_yield_hook`
+/// (parallel-runtime spec C2.2). Calling this from a thread that's
+/// currently inside a tokio runtime's `block_in_place` (i.e., an
+/// actor body launched via `spawn_sync_body_on_task`) briefly
+/// returns control to the tokio scheduler so the runtime can drain
+/// queued tasks, then resumes.
+///
+/// Outside an actor context (no current tokio runtime) this is a
+/// no-op — `Handle::try_current()` returns `Err` and we skip the
+/// `block_on`.
+///
+/// Designed to be wired up as
+/// `cs_vm::vm::install_yield_hook(Some(cs_actor::tokio_yield_hook))`
+/// at the start of every actor body. Function pointer compatible
+/// with `cs_vm::vm::VmYieldHook = fn()`.
+pub fn tokio_yield_hook() {
+    if let Ok(h) = tokio::runtime::Handle::try_current() {
+        // block_on of yield_now is sound from inside block_in_place
+        // on a multi_thread runtime: block_in_place excused this
+        // worker from its async duties; yield_now is a one-tick
+        // yield that always returns Ready on the next poll. No
+        // deadlock potential.
+        h.block_on(tokio::task::yield_now());
+    }
+}
+
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()

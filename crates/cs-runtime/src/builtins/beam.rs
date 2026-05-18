@@ -324,14 +324,28 @@ pub fn primop_spawn(name: &str, args: Vec<SendableValue>) -> Result<ActorPid, St
         let ptr: *mut cs_actor::Actor = actor;
         ACTOR_CTX.with(|c| c.set(ptr));
         REDUCTIONS.with(|c| c.set(0));
-        struct Guard;
+        // parallel-runtime C2.2: install the reduction-yield hook
+        // for this worker thread. The hook routes through
+        // tokio::task::yield_now so a CPU-bound actor releases the
+        // worker cooperatively. Outside-actor contexts (REPL,
+        // direct eval) don't reach this path, so the hook stays
+        // None there and the dispatch loop's per-op tick is a
+        // pure counter no-op.
+        let prev_hook = cs_vm::vm::install_yield_hook(Some(cs_actor::tokio_yield_hook));
+        struct Guard {
+            prev_hook: Option<cs_vm::vm::VmYieldHook>,
+        }
         impl Drop for Guard {
             fn drop(&mut self) {
                 ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
                 REDUCTIONS.with(|c| c.set(0));
+                // Restore the previous hook (typically None) so a
+                // pooled worker thread reused by a non-actor caller
+                // doesn't see our hook.
+                cs_vm::vm::install_yield_hook(self.prev_hook);
             }
         }
-        let _g = Guard;
+        let _g = Guard { prev_hook };
         entry(actor, args);
     });
     Ok(actor_ref.pid())
