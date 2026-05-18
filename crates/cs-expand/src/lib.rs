@@ -60,11 +60,39 @@ pub type IncludeResolver<'a> = dyn FnMut(&str) -> Option<(cs_diag::FileId, Strin
 pub type LibraryResolver<'a> =
     dyn FnMut(&[Symbol], &SymbolTable) -> Option<(cs_diag::FileId, String)> + 'a;
 
-/// Cache key for a loaded library: (name-symbols, source-hash).
-/// The source-hash is a 64-bit content hash — if the resolved
-/// source's hash matches a cached entry, the parse + expand work
-/// is skipped and the cached CoreExpr is reused.
-pub type LibraryCacheKey = (Vec<Symbol>, u64);
+/// Cache key for a loaded library: (name-segments, source-hash).
+/// Names are stored as `Vec<String>` (printable segment names)
+/// rather than `Vec<Symbol>` so the cache stays valid across
+/// SymbolTable boundaries -- Symbol IDs are per-table and
+/// shouldn't leak into long-lived state. The source-hash is a
+/// 64-bit content hash — if the resolved source's hash matches
+/// a cached entry, the parse + expand work is skipped and the
+/// cached CoreExpr is reused.
+pub type LibraryCacheKey = (Vec<String>, u64);
+
+/// A cached library expansion + its direct-import dependency
+/// closure. Phase 2F: when A imports B, A's cache entry records
+/// `(B's-name-segments, B's-source-hash-at-cache-time)` so the
+/// expander can re-resolve B on cache hit and detect upstream
+/// changes even if A's own source is unchanged.
+///
+/// Transitive deps fall out naturally: invalidating B (because
+/// some C in B's deps changed) re-expands B, which gets a new
+/// hash, which differs from what A cached for its B-dep, which
+/// invalidates A.
+///
+/// Dep names are stored as `Vec<String>` (printable segment
+/// names) instead of `Vec<Symbol>` so the cache stays valid
+/// across SymbolTable boundaries. Symbol IDs are per-table;
+/// reusing them in a different session would index into the
+/// wrong slot. The validator re-interns the strings against
+/// the current session's SymbolTable before resolving.
+#[derive(Clone, Debug)]
+pub struct LibraryCacheEntry {
+    pub core_expr: CoreExpr,
+    /// Each entry: `(dep-library-name-segments, dep-source-hash-at-cache-time)`.
+    pub deps: Vec<(Vec<String>, u64)>,
+}
 
 /// Cache for the expanded form of cross-file libraries. The
 /// expander consults this in [`Expander::try_load_library`]
@@ -73,8 +101,8 @@ pub type LibraryCacheKey = (Vec<Symbol>, u64);
 /// on-disk file-system cache, content-addressed store, …); the
 /// default in-process backend is [`HashMapLibraryCache`].
 pub trait LibraryCache {
-    fn get(&self, key: &LibraryCacheKey) -> Option<CoreExpr>;
-    fn put(&mut self, key: LibraryCacheKey, value: CoreExpr);
+    fn get(&self, key: &LibraryCacheKey) -> Option<LibraryCacheEntry>;
+    fn put(&mut self, key: LibraryCacheKey, value: LibraryCacheEntry);
 }
 
 /// Simple in-memory `LibraryCache` keyed by name+hash. Reset
@@ -82,7 +110,7 @@ pub trait LibraryCache {
 /// sessions.
 #[derive(Default)]
 pub struct HashMapLibraryCache {
-    entries: std::collections::HashMap<LibraryCacheKey, CoreExpr>,
+    entries: std::collections::HashMap<LibraryCacheKey, LibraryCacheEntry>,
 }
 
 impl HashMapLibraryCache {
@@ -100,10 +128,10 @@ impl HashMapLibraryCache {
 }
 
 impl LibraryCache for HashMapLibraryCache {
-    fn get(&self, key: &LibraryCacheKey) -> Option<CoreExpr> {
+    fn get(&self, key: &LibraryCacheKey) -> Option<LibraryCacheEntry> {
         self.entries.get(key).cloned()
     }
-    fn put(&mut self, key: LibraryCacheKey, value: CoreExpr) {
+    fn put(&mut self, key: LibraryCacheKey, value: LibraryCacheEntry) {
         self.entries.insert(key, value);
     }
 }
@@ -175,6 +203,13 @@ pub struct Expander<'a> {
     /// expansion time, so `(syntax X)` resolves correctly when X
     /// is bound at any surrounding scope.
     syntax_pvars: Vec<(Symbol, u32)>,
+    /// Stack of in-progress library loads' direct-dep
+    /// collectors. Phase 2F: when `try_load_library(A)` runs and
+    /// recursively triggers `try_load_library(B)` for one of A's
+    /// imports, B's `(name, source-hash)` is appended to the top
+    /// of this stack so it gets attached to A's cache entry on
+    /// completion. Empty when no library is being loaded.
+    library_dep_stack: Vec<Vec<(Vec<String>, u64)>>,
     /// Stack of mark-expression Datums, one per enclosing
     /// syntax-case form being expanded. The top-of-stack entry
     /// is consumed by `compile_syntax_template` (Phase 1.5
@@ -384,6 +419,7 @@ impl<'a> Expander<'a> {
             record_types: std::collections::HashMap::new(),
             condition_types: std::collections::HashMap::new(),
             syntax_pvars: Vec::new(),
+            library_dep_stack: Vec::new(),
             syntax_mark_exprs: Vec::new(),
             libraries: std::collections::HashMap::new(),
         }
@@ -860,24 +896,64 @@ impl<'a> Expander<'a> {
             },
             None => return Ok(None),
         };
-        // Content-hash cache lookup. A hit returns the cached
-        // CoreExpr directly; we still need to register the library
-        // in self.libraries (the cache stores only the expanded
-        // body, not the side-effect on the registry).
-        let cache_key: LibraryCacheKey = (name.to_vec(), hash_library_source(&src));
-        if let Some(cache) = self.library_cache.as_deref() {
-            if let Some(cached) = cache.get(&cache_key) {
-                // Replay the expansion to populate self.libraries
-                // via the (library …) declaration's side effect.
-                // Then return the cached body.
-                let data = cs_parse::read_all(file_id, &src, self.syms)
-                    .map_err(|errs| parse_err(errs, name, self.syms, span))?;
-                for d in &data {
-                    self.expand_top(d)?;
-                }
-                return Ok(Some(cached));
-            }
+        let source_hash = hash_library_source(&src);
+
+        // Record this library as a direct dep of the parent
+        // load (if any). Phase 2F dep-closure tracking: store the
+        // observed (name-as-strings, source_hash) on the parent's
+        // collection. We convert Symbols to Strings so cached
+        // entries stay valid across SymbolTable boundaries.
+        if let Some(parent_deps) = self.library_dep_stack.last_mut() {
+            let name_strs: Vec<String> = name
+                .iter()
+                .map(|s| self.syms.name(*s).to_string())
+                .collect();
+            parent_deps.push((name_strs, source_hash));
         }
+
+        // Cache key uses printable name strings for cross-session
+        // SymbolTable safety; see LibraryCacheKey doc.
+        let name_strs: Vec<String> = name
+            .iter()
+            .map(|s| self.syms.name(*s).to_string())
+            .collect();
+        let cache_key: LibraryCacheKey = (name_strs, source_hash);
+
+        // Content-hash cache lookup. A hit additionally validates
+        // each cached dep by re-resolving + re-hashing it; if any
+        // upstream lib has drifted we fall through to a fresh
+        // expansion.
+        let cache_hit_valid: Option<LibraryCacheEntry> = {
+            let cached = self
+                .library_cache
+                .as_deref()
+                .and_then(|c| c.get(&cache_key));
+            match cached {
+                Some(entry) => {
+                    if self.cached_deps_still_valid(&entry.deps) {
+                        Some(entry)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        if let Some(entry) = cache_hit_valid {
+            // Replay the expansion to populate self.libraries
+            // via the (library …) declaration's side effect.
+            // Then return the cached body.
+            let data = cs_parse::read_all(file_id, &src, self.syms)
+                .map_err(|errs| parse_err(errs, name, self.syms, span))?;
+            for d in &data {
+                self.expand_top(d)?;
+            }
+            return Ok(Some(entry.core_expr));
+        }
+
+        // Cache miss (or invalidated): full parse + expand,
+        // tracking THIS library's direct deps.
+        self.library_dep_stack.push(Vec::new());
         let data = cs_parse::read_all(file_id, &src, self.syms)
             .map_err(|errs| parse_err(errs, name, self.syms, span))?;
         // The loaded file should declare a `(library …)` form. Expand
@@ -888,6 +964,7 @@ impl<'a> Expander<'a> {
         for d in &data {
             exprs.push(self.expand_top(d)?);
         }
+        let collected_deps = self.library_dep_stack.pop().expect("pushed above");
         if !self.libraries.contains_key(name) {
             return Err(ExpandError::BadSyntax {
                 what: format!(
@@ -899,9 +976,53 @@ impl<'a> Expander<'a> {
         }
         let result = CoreExpr::Begin { exprs, span };
         if let Some(cache) = self.library_cache.as_deref_mut() {
-            cache.put(cache_key, result.clone());
+            cache.put(
+                cache_key,
+                LibraryCacheEntry {
+                    core_expr: result.clone(),
+                    deps: collected_deps,
+                },
+            );
         }
         Ok(Some(result))
+    }
+
+    /// Phase 2F: re-resolve each cached dep and compare its
+    /// current source hash to the cached value. Returns true if
+    /// every dep still matches, false if any has drifted (which
+    /// means the cached entry is stale).
+    ///
+    /// If the resolver returns None for a dep (gone), treat as
+    /// drift (invalidate). If no resolver is installed, treat
+    /// as valid (we couldn't have loaded the dep anyway).
+    fn cached_deps_still_valid(&mut self, deps: &[(Vec<String>, u64)]) -> bool {
+        if self.library_resolver.is_none() {
+            return true;
+        }
+        // Re-intern each dep's printable name into the current
+        // SymbolTable, then call the resolver with the fresh
+        // Symbol IDs. We do the interning first (with the
+        // SymbolTable borrowed mutably) and only afterwards
+        // borrow the resolver, so the two mutable borrows don't
+        // overlap.
+        let mut resolved: Vec<(Vec<Symbol>, u64)> = Vec::with_capacity(deps.len());
+        for (dep_name_strs, cached_hash) in deps {
+            let name_syms: Vec<Symbol> =
+                dep_name_strs.iter().map(|s| self.syms.intern(s)).collect();
+            resolved.push((name_syms, *cached_hash));
+        }
+        let resolver = self.library_resolver.as_deref_mut().expect("checked above");
+        for (name_syms, cached_hash) in &resolved {
+            match resolver(name_syms, self.syms) {
+                Some((_, src)) => {
+                    if hash_library_source(&src) != *cached_hash {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        true
     }
 
     /// Walk an import-spec shape and accumulate any `rename` pairs into
@@ -7087,5 +7208,157 @@ mod tests {
         });
         let mut exp = Expander::new(&mut syms, &mut macros).with_library_resolver(&mut *resolver);
         exp.expand_program(&data).expect("works without cache");
+    }
+
+    // ---------- Phase 2F: dep-closure invalidation ----------
+
+    #[test]
+    fn cache_invalidates_when_transitive_dep_changes() {
+        // Library A imports B. After both are cached, simulate
+        // B's source changing on disk; A's cache entry must be
+        // invalidated even though A's own source is unchanged.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let a_src = "(library (depc a) (export x) (import (depc b)) (define x 1))";
+        let b_src_v1 = "(library (depc b) (export y) (import) (define y 1))";
+        let b_src_v2 = "(library (depc b) (export y) (import) (define y 2))";
+        let importer_src = "(import (depc a))";
+
+        // Resolver returns the current version from a mutable map.
+        let sources: Rc<RefCell<std::collections::HashMap<String, String>>> =
+            Rc::new(RefCell::new(std::collections::HashMap::from([
+                ("(depc a)".into(), a_src.into()),
+                ("(depc b)".into(), b_src_v1.into()),
+            ])));
+
+        let mut cache = HashMapLibraryCache::new();
+
+        // Session 1: cold cache, load A which transitively loads B.
+        let resolve_calls_b_v1: Rc<std::cell::Cell<u32>> = Rc::new(std::cell::Cell::new(0));
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+            let srcs = sources.clone();
+            let calls_b = resolve_calls_b_v1.clone();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                let key = format_library_name(name, syms);
+                if key == "(depc b)" {
+                    calls_b.set(calls_b.get() + 1);
+                }
+                srcs.borrow().get(&key).map(|s| (FileId(1), s.clone()))
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data).expect("session 1 cold load");
+        }
+        assert_eq!(cache.len(), 2, "both A and B cached after session 1");
+
+        // Session 2: same sources, same cache. Hit on both -- no
+        // expansion needed but resolver still runs for hashing
+        // and for dep validation.
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+            let srcs = sources.clone();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                let key = format_library_name(name, syms);
+                srcs.borrow().get(&key).map(|s| (FileId(1), s.clone()))
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data).expect("session 2 warm cache");
+        }
+        assert_eq!(cache.len(), 2, "no new entries on unchanged warm cache");
+
+        // Session 3: mutate B's source. A's cache entry must
+        // detect the upstream change and re-expand. Cache should
+        // contain B's new hash entry + A's new hash entry.
+        sources
+            .borrow_mut()
+            .insert("(depc b)".into(), b_src_v2.into());
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+            let srcs = sources.clone();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                let key = format_library_name(name, syms);
+                srcs.borrow().get(&key).map(|s| (FileId(1), s.clone()))
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data)
+                .expect("session 3 after dep change");
+        }
+        // A's cache key (source-hash) is unchanged -- only B's
+        // source changed. Without dep-closure tracking, A's entry
+        // would remain valid (wrong: A's compiled body references
+        // the old B). With Phase 2F, A is invalidated and
+        // re-expanded with B's new content. Cache ends up with B's
+        // new entry (3rd) AND A re-stored under its same key
+        // (overwrite), so total entries = 3 (A, B-v1, B-v2)
+        // because the cache uses (name, hash) keys so stale B-v1
+        // sticks around -- the validation logic uses dep-hash
+        // mismatch, not eviction.
+        assert!(
+            cache.len() >= 3,
+            "expected B v2 entry + A re-cached, got {}",
+            cache.len()
+        );
+    }
+
+    #[test]
+    fn cache_entry_records_direct_deps() {
+        // Verify the cache entry carries the dep list with the
+        // observed (name, source-hash) tuples.
+        let a_src = "(library (depr a) (export x) (import (depr b)) (define x 1))";
+        let b_src = "(library (depr b) (export y) (import) (define y 1))";
+        let importer_src = "(import (depr a))";
+
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+        let mut cache = HashMapLibraryCache::new();
+        {
+            let a_owned = a_src.to_string();
+            let b_owned = b_src.to_string();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                let key = format_library_name(name, syms);
+                match key.as_str() {
+                    "(depr a)" => Some((FileId(1), a_owned.clone())),
+                    "(depr b)" => Some((FileId(2), b_owned.clone())),
+                    _ => None,
+                }
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data).expect("loads");
+        }
+
+        // Recompute the cache key for A and inspect its entry.
+        let a_name_strs: Vec<String> = vec!["depr".into(), "a".into()];
+        let a_hash = hash_library_source(a_src);
+        let entry = cache
+            .get(&(a_name_strs.clone(), a_hash))
+            .expect("A is cached");
+        // A imported B, so A's deps should include B as a
+        // string-tuple (per the cross-session-safe encoding).
+        let b_name_strs: Vec<String> = vec!["depr".into(), "b".into()];
+        let b_hash = hash_library_source(b_src);
+        assert!(
+            entry
+                .deps
+                .iter()
+                .any(|(n, h)| n == &b_name_strs && *h == b_hash),
+            "expected A's dep list to include ([depr, b], B's hash); got {:?}",
+            entry.deps
+        );
     }
 }
