@@ -60,6 +60,66 @@ pub type IncludeResolver<'a> = dyn FnMut(&str) -> Option<(cs_diag::FileId, Strin
 pub type LibraryResolver<'a> =
     dyn FnMut(&[Symbol], &SymbolTable) -> Option<(cs_diag::FileId, String)> + 'a;
 
+/// Cache key for a loaded library: (name-symbols, source-hash).
+/// The source-hash is a 64-bit content hash — if the resolved
+/// source's hash matches a cached entry, the parse + expand work
+/// is skipped and the cached CoreExpr is reused.
+pub type LibraryCacheKey = (Vec<Symbol>, u64);
+
+/// Cache for the expanded form of cross-file libraries. The
+/// expander consults this in [`Expander::try_load_library`]
+/// after the resolver returns source but before parsing +
+/// expansion. Callers can plug in any backend (in-memory map,
+/// on-disk file-system cache, content-addressed store, …); the
+/// default in-process backend is [`HashMapLibraryCache`].
+pub trait LibraryCache {
+    fn get(&self, key: &LibraryCacheKey) -> Option<CoreExpr>;
+    fn put(&mut self, key: LibraryCacheKey, value: CoreExpr);
+}
+
+/// Simple in-memory `LibraryCache` keyed by name+hash. Reset
+/// each Expander session unless the caller persists it across
+/// sessions.
+#[derive(Default)]
+pub struct HashMapLibraryCache {
+    entries: std::collections::HashMap<LibraryCacheKey, CoreExpr>,
+}
+
+impl HashMapLibraryCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl LibraryCache for HashMapLibraryCache {
+    fn get(&self, key: &LibraryCacheKey) -> Option<CoreExpr> {
+        self.entries.get(key).cloned()
+    }
+    fn put(&mut self, key: LibraryCacheKey, value: CoreExpr) {
+        self.entries.insert(key, value);
+    }
+}
+
+/// 64-bit content hash for library source. Stable for the
+/// process; not stable across rebuilds (uses Rust's
+/// `DefaultHasher`). For an on-disk persistent cache, swap to a
+/// proper content-addressed hash (sha256, blake3, etc.) at the
+/// trait impl layer.
+fn hash_library_source(src: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    src.hash(&mut h);
+    h.finish()
+}
+
 pub struct Expander<'a> {
     pub syms: &'a mut SymbolTable,
     pub macros: &'a mut std::collections::HashMap<Symbol, Macro>,
@@ -74,6 +134,11 @@ pub struct Expander<'a> {
     /// Hook for `(import (name …))` forms whose library hasn't been
     /// declared in this session. See [`LibraryResolver`].
     library_resolver: Option<&'a mut LibraryResolver<'a>>,
+    /// Optional content-hash cache for cross-file library loads.
+    /// When set, the expander consults it in `try_load_library`
+    /// before re-parsing + re-expanding identical sources. See
+    /// [`LibraryCache`].
+    library_cache: Option<&'a mut dyn LibraryCache>,
     /// Per-Expander record-type registry. Populated each time
     /// `define-record-type` expands; consulted when a child names a
     /// `(parent <type-name>)` so we can resolve its tag chain and inherited
@@ -280,6 +345,7 @@ impl<'a> Expander<'a> {
             gensym_counter: 0,
             include_resolver: None,
             library_resolver: None,
+            library_cache: None,
             record_types: std::collections::HashMap::new(),
             condition_types: std::collections::HashMap::new(),
             libraries: std::collections::HashMap::new(),
@@ -300,6 +366,16 @@ impl<'a> Expander<'a> {
     /// no-op rename collector, matching the legacy behavior).
     pub fn with_library_resolver(mut self, resolver: &'a mut LibraryResolver<'a>) -> Self {
         self.library_resolver = Some(resolver);
+        self
+    }
+
+    /// Install a library cache. When set, the expander consults
+    /// the cache by `(name, source-hash)` before parsing +
+    /// expanding library source returned from the resolver. On a
+    /// hit the cached CoreExpr is reused; on a miss the expander
+    /// stores the freshly-expanded form keyed by the same hash.
+    pub fn with_library_cache(mut self, cache: &'a mut dyn LibraryCache) -> Self {
+        self.library_cache = Some(cache);
         self
     }
 
@@ -747,17 +823,26 @@ impl<'a> Expander<'a> {
             },
             None => return Ok(None),
         };
-        let data = cs_parse::read_all(file_id, &src, self.syms).map_err(|errs| {
-            let e = errs.into_iter().next().unwrap();
-            ExpandError::BadSyntax {
-                what: format!(
-                    "library {}: parse error: {}",
-                    format_library_name(name, self.syms),
-                    e.message()
-                ),
-                span,
+        // Content-hash cache lookup. A hit returns the cached
+        // CoreExpr directly; we still need to register the library
+        // in self.libraries (the cache stores only the expanded
+        // body, not the side-effect on the registry).
+        let cache_key: LibraryCacheKey = (name.to_vec(), hash_library_source(&src));
+        if let Some(cache) = self.library_cache.as_deref() {
+            if let Some(cached) = cache.get(&cache_key) {
+                // Replay the expansion to populate self.libraries
+                // via the (library …) declaration's side effect.
+                // Then return the cached body.
+                let data = cs_parse::read_all(file_id, &src, self.syms)
+                    .map_err(|errs| parse_err(errs, name, self.syms, span))?;
+                for d in &data {
+                    self.expand_top(d)?;
+                }
+                return Ok(Some(cached));
             }
-        })?;
+        }
+        let data = cs_parse::read_all(file_id, &src, self.syms)
+            .map_err(|errs| parse_err(errs, name, self.syms, span))?;
         // The loaded file should declare a `(library …)` form. Expand
         // each top-level datum so the (library …) registration
         // populates self.libraries and the body defines splice into
@@ -775,7 +860,11 @@ impl<'a> Expander<'a> {
                 span,
             });
         }
-        Ok(Some(CoreExpr::Begin { exprs, span }))
+        let result = CoreExpr::Begin { exprs, span };
+        if let Some(cache) = self.library_cache.as_deref_mut() {
+            cache.put(cache_key, result.clone());
+        }
+        Ok(Some(result))
     }
 
     /// Walk an import-spec shape and accumulate any `rename` pairs into
@@ -5178,6 +5267,26 @@ fn format_library_name(name: &[Symbol], syms: &SymbolTable) -> String {
     format!("({})", segs.join(" "))
 }
 
+/// Build a parse-error ExpandError for cross-file library loads.
+/// Factored out so the cache-hit and cache-miss paths share the
+/// same diagnostic shape.
+fn parse_err(
+    errs: Vec<cs_parse::ReaderError>,
+    name: &[Symbol],
+    syms: &SymbolTable,
+    span: Span,
+) -> ExpandError {
+    let e = errs.into_iter().next().unwrap();
+    ExpandError::BadSyntax {
+        what: format!(
+            "library {}: parse error: {}",
+            format_library_name(name, syms),
+            e.message()
+        ),
+        span,
+    }
+}
+
 /// Walks a Pair chain returning the spine of car-elements and the
 /// cdr of the last pair. For a proper list `(a b c)` the tail is
 /// `Datum::Null`. For an improper list `(a b . c)` the tail is the
@@ -5603,5 +5712,148 @@ mod tests {
         } else {
             panic!("expected BadSyntax");
         }
+    }
+
+    // ---------- Library cache (#116) ----------
+
+    #[test]
+    fn library_cache_hit_skips_reexpansion() {
+        // First load populates the cache; a second Expander session
+        // wired to the same cache reuses the expanded body.
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let library_src = "(library (cache lib) (export x) (import) (define x 1))";
+        let importer_src = "(import (cache lib))";
+
+        // Track resolver invocations across both sessions.
+        let calls = Rc::new(Cell::new(0u32));
+
+        // Shared cache that survives session 1 → session 2.
+        let mut cache = HashMapLibraryCache::new();
+
+        // Session 1: cold cache, resolver runs.
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+            let calls_inner = calls.clone();
+            let library_src_owned = library_src.to_string();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                if format_library_name(name, syms) == "(cache lib)" {
+                    calls_inner.set(calls_inner.get() + 1);
+                    Some((FileId(1), library_src_owned.clone()))
+                } else {
+                    None
+                }
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data)
+                .expect("session 1: cold-cache load");
+        }
+        assert_eq!(calls.get(), 1, "session 1 invokes resolver");
+        assert_eq!(cache.len(), 1, "cache populated after session 1");
+
+        // Session 2: same source, same cache. Resolver still runs
+        // (we need source content to compute the hash key), but the
+        // expansion work is skipped.
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+            let calls_inner = calls.clone();
+            let library_src_owned = library_src.to_string();
+            let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+                if format_library_name(name, syms) == "(cache lib)" {
+                    calls_inner.set(calls_inner.get() + 1);
+                    Some((FileId(1), library_src_owned.clone()))
+                } else {
+                    None
+                }
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data)
+                .expect("session 2: warm-cache load");
+        }
+        assert_eq!(calls.get(), 2, "session 2 also invokes resolver");
+        assert_eq!(cache.len(), 1, "cache stays at 1 entry (same key reused)");
+    }
+
+    #[test]
+    fn library_cache_miss_on_source_change_repopulates() {
+        // Different source under the same library name produces a
+        // different hash → new cache entry, not a stale hit.
+        let mut cache = HashMapLibraryCache::new();
+
+        // Round 1: load v1 source.
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), "(import (changing lib))", &mut syms).unwrap();
+            let mut resolver: Box<LibraryResolver> = Box::new(|name, syms| {
+                if format_library_name(name, syms) == "(changing lib)" {
+                    Some((
+                        FileId(1),
+                        "(library (changing lib) (export x) (import) (define x 1))".to_string(),
+                    ))
+                } else {
+                    None
+                }
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data).unwrap();
+        }
+        assert_eq!(cache.len(), 1);
+
+        // Round 2: same name, NEW source (different define). The
+        // cache key (name, hash) differs because hash differs, so we
+        // expect the cache to grow.
+        {
+            let mut syms = SymbolTable::new();
+            let mut macros = std::collections::HashMap::new();
+            let data = cs_parse::read_all(FileId(0), "(import (changing lib))", &mut syms).unwrap();
+            let mut resolver: Box<LibraryResolver> = Box::new(|name, syms| {
+                if format_library_name(name, syms) == "(changing lib)" {
+                    Some((
+                        FileId(1),
+                        "(library (changing lib) (export x) (import) (define x 2))".to_string(),
+                    ))
+                } else {
+                    None
+                }
+            });
+            let mut exp = Expander::new(&mut syms, &mut macros)
+                .with_library_resolver(&mut *resolver)
+                .with_library_cache(&mut cache);
+            exp.expand_program(&data).unwrap();
+        }
+        assert_eq!(cache.len(), 2, "source change adds a new cache entry");
+    }
+
+    #[test]
+    fn library_cache_optional_no_install() {
+        // The cache is opt-in. Without with_library_cache the
+        // expander behaves exactly as it did before #116.
+        let library_src = "(library (no-cache lib) (export x) (import) (define x 1))";
+        let importer_src = "(import (no-cache lib))";
+        let mut syms = SymbolTable::new();
+        let mut macros = std::collections::HashMap::new();
+        let data = cs_parse::read_all(FileId(0), importer_src, &mut syms).unwrap();
+        let library_src_owned = library_src.to_string();
+        let mut resolver: Box<LibraryResolver> = Box::new(move |name, syms| {
+            if format_library_name(name, syms) == "(no-cache lib)" {
+                Some((FileId(1), library_src_owned.clone()))
+            } else {
+                None
+            }
+        });
+        let mut exp = Expander::new(&mut syms, &mut macros).with_library_resolver(&mut *resolver);
+        exp.expand_program(&data).expect("works without cache");
     }
 }
