@@ -742,9 +742,11 @@ dependencies = [
  "cs-stdlib-process",
  "cs-stdlib-random",
  "cs-stdlib-regex",
+ "cs-stdlib-signal",
  "cs-stdlib-string",
  "cs-stdlib-time",
  "cs-stdlib-toml",
+ "cs-stdlib-tty",
  "cs-stdlib-url",
  "cs-stdlib-uuid",
  "cs-stdlib-websocket",
@@ -929,6 +931,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-stdlib-signal"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
+ "signal-hook",
+]
+
+[[package]]
 name = "cs-stdlib-string"
 version = "0.0.1"
 dependencies = [
@@ -952,6 +963,15 @@ dependencies = [
  "cs-core",
  "cs-ffi",
  "toml",
+]
+
+[[package]]
+name = "cs-stdlib-tty"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
+ "terminal_size",
 ]
 
 [[package]]
@@ -2405,6 +2425,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2497,6 +2537,16 @@ name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+
+[[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix 1.1.4",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "thiserror"

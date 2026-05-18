@@ -1860,6 +1860,14 @@ impl Runtime {
         for p in cs_stdlib_math::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-tty")]
+        for p in cs_stdlib_tty::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-signal")]
+        for p in cs_stdlib_signal::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call

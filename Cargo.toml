@@ -57,6 +57,8 @@ members = [
     "crates/cs-stdlib-websocket",
     "crates/cs-stdlib-collection",
     "crates/cs-stdlib-math",
+    "crates/cs-stdlib-tty",
+    "crates/cs-stdlib-signal",
 ]
 
 [workspace.package]
@@ -121,6 +123,8 @@ cs-stdlib-http = { path = "crates/cs-stdlib-http" }
 cs-stdlib-websocket = { path = "crates/cs-stdlib-websocket" }
 cs-stdlib-collection = { path = "crates/cs-stdlib-collection" }
 cs-stdlib-math = { path = "crates/cs-stdlib-math" }
+cs-stdlib-tty = { path = "crates/cs-stdlib-tty" }
+cs-stdlib-signal = { path = "crates/cs-stdlib-signal" }
 
 # External crates
 logos = "0.14"

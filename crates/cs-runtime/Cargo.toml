@@ -96,6 +96,8 @@ stdlib = [
     "stdlib-websocket",
     "stdlib-collection",
     "stdlib-math",
+    "stdlib-tty",
+    "stdlib-signal",
 ]
 stdlib-path = ["ffi-trait", "dep:cs-stdlib-path"]
 stdlib-fs = ["ffi-trait", "dep:cs-stdlib-fs"]
@@ -122,6 +124,8 @@ stdlib-http = ["ffi-trait", "dep:cs-stdlib-http"]
 stdlib-websocket = ["ffi-trait", "dep:cs-stdlib-websocket"]
 stdlib-collection = ["ffi-trait", "dep:cs-stdlib-collection"]
 stdlib-math = ["ffi-trait", "dep:cs-stdlib-math"]
+stdlib-tty = ["ffi-trait", "dep:cs-stdlib-tty"]
+stdlib-signal = ["ffi-trait", "dep:cs-stdlib-signal"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -170,6 +174,8 @@ cs-stdlib-http = { workspace = true, optional = true }
 cs-stdlib-websocket = { workspace = true, optional = true }
 cs-stdlib-collection = { workspace = true, optional = true }
 cs-stdlib-math = { workspace = true, optional = true }
+cs-stdlib-tty = { workspace = true, optional = true }
+cs-stdlib-signal = { workspace = true, optional = true }
 
 [dev-dependencies]
 cs-ffi-example = { workspace = true }

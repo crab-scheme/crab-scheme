@@ -271,6 +271,23 @@ fn conformance_crab_math() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-tty")]
+fn conformance_crab_tty() {
+    run_conformance_file("crab-tty.scm");
+}
+
+#[test]
+#[cfg(all(
+    feature = "stdlib-signal",
+    feature = "stdlib-process",
+    feature = "stdlib-os",
+    feature = "stdlib-time"
+))]
+fn conformance_crab_signal() {
+    run_conformance_file("crab-signal.scm");
+}
+
+#[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");
 }
