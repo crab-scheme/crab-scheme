@@ -15,7 +15,7 @@
 //!   receiver's heap. Sharing a `Rc<Slot<T>>` across threads
 //!   wouldn't be safe (Rc is `!Send`) and wouldn't match the
 //!   spec's "send-copies semantics" choice.
-//! - [`to_sendable`] / [`from_sendable`] — the boundary
+//! - [`to_sendable_in`] / [`from_sendable`] — the boundary
 //!   conversions. Source / sink for the `Payload` type-erased
 //!   `Arc<dyn Any + Send + Sync>` used by cs-actor and cs-table.
 //! - [`actor_table_primops`] / [`hotreload_primops`] —
@@ -94,12 +94,12 @@ pub enum SendableValue {
     Pid(ActorPid),
 }
 
-/// Convert a Scheme `Value` to its sendable representation. Fails
-/// for types that can't safely cross actor boundaries
-/// (procedures, ports, promises, hashtables — the latter is
-/// representable in principle but the v1 design treats it as a
-/// per-actor concept; share state via `cs-table` instead).
-pub fn to_sendable(v: &Value) -> Result<SendableValue, String> {
+/// Project a Scheme `Value` onto a `SendableValue`. Symbols
+/// cross as their names (re-interned in the destination's
+/// SymbolTable on the other side). Procedures, ports, promises,
+/// and hashtables can't cross — see the SendableValue doc for
+/// the design call.
+pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, String> {
     match v {
         Value::Null => Ok(SendableValue::Null),
         Value::Unspecified => Ok(SendableValue::Unspecified),
@@ -108,39 +108,6 @@ pub fn to_sendable(v: &Value) -> Result<SendableValue, String> {
         Value::Character(c) => Ok(SendableValue::Character(*c)),
         Value::Number(n) => num_to_sendable(n),
         Value::String(s) => Ok(SendableValue::String(s.borrow().clone())),
-        // Symbol -> string requires a SymbolTable to resolve the
-        // u32 to its name; the caller supplies one via the
-        // `to_sendable_in` variant below. The bare `to_sendable`
-        // can't see one, so it rejects symbols. Callers in this
-        // module use the `_in` variant.
-        Value::Symbol(_) => {
-            Err("to_sendable: symbol requires SymbolTable; use to_sendable_in".into())
-        }
-        Value::Pair(p) => {
-            let head = to_sendable(&p.car.borrow())?;
-            let tail = to_sendable(&p.cdr.borrow())?;
-            Ok(SendableValue::Pair(Box::new(head), Box::new(tail)))
-        }
-        Value::Vector(v) => {
-            let items: Result<Vec<_>, _> = v.borrow().iter().map(to_sendable).collect();
-            Ok(SendableValue::Vector(items?))
-        }
-        Value::ByteVector(bv) => Ok(SendableValue::ByteVector(bv.borrow().clone())),
-        Value::Procedure(_) => Err("to_sendable: procedures cannot cross actor boundaries".into()),
-        Value::Hashtable(_) => {
-            Err("to_sendable: hashtables are per-actor; use cs-table for shared state".into())
-        }
-        Value::Port(_) => Err("to_sendable: ports cannot cross actor boundaries".into()),
-        Value::Promise(_) => Err("to_sendable: promises cannot cross actor boundaries".into()),
-    }
-}
-
-/// Like [`to_sendable`] but resolves Symbols against the source
-/// SymbolTable so they cross as names. Recursive callers must
-/// keep using this variant so nested symbols inside pairs /
-/// vectors are also resolved.
-pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, String> {
-    match v {
         Value::Symbol(s) => Ok(SendableValue::Symbol(syms.name(*s).to_string())),
         Value::Pair(p) => {
             let head = to_sendable_in(&p.car.borrow(), syms)?;
@@ -152,7 +119,13 @@ pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, St
                 v.borrow().iter().map(|e| to_sendable_in(e, syms)).collect();
             Ok(SendableValue::Vector(items?))
         }
-        other => to_sendable(other),
+        Value::ByteVector(bv) => Ok(SendableValue::ByteVector(bv.borrow().clone())),
+        Value::Procedure(_) => Err("to_sendable: procedures cannot cross actor boundaries".into()),
+        Value::Hashtable(_) => {
+            Err("to_sendable: hashtables are per-actor; use cs-table for shared state".into())
+        }
+        Value::Port(_) => Err("to_sendable: ports cannot cross actor boundaries".into()),
+        Value::Promise(_) => Err("to_sendable: promises cannot cross actor boundaries".into()),
     }
 }
 
