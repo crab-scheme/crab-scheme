@@ -41,6 +41,11 @@ ffi = ["ffi-dynamic"]
 # real threads) and on bare-AOT builds. The `lib/beam/prelude.scm`
 # library only loads when this feature is on.
 actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload"]
+# ADR 0015 L2 — WASM-instance sandbox builtins. Pulls in
+# cs-sandbox-wasm + wasmtime. Default off because the wasmtime
+# dep is ~30s of compile time and not useful for non-sandbox
+# builds.
+sandbox = ["dep:cs-sandbox-wasm"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -69,6 +74,7 @@ thiserror = { workspace = true }
 cs-actor = { workspace = true, optional = true }
 cs-table = { workspace = true, optional = true }
 cs-hotreload = { workspace = true, optional = true }
+cs-sandbox-wasm = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Tests for the ADR 0014 Scheme surface call clear_active_passes

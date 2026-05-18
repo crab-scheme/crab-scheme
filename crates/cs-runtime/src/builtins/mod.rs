@@ -3,6 +3,9 @@
 #[cfg(feature = "actor")]
 pub mod beam;
 
+#[cfg(feature = "sandbox")]
+pub mod sandbox;
+
 use cs_core::{
     eq, Hashtable, HtEqKind, Number, Pair, Port, Promise, PromiseState, SymbolTable, Value,
     WriteMode,
@@ -752,7 +755,8 @@ pub fn pure_builtins() -> Vec<PureEntry> {
 }
 
 pub fn higher_order_builtins() -> Vec<HoEntry> {
-    vec![
+    #[allow(unused_mut)]
+    let mut v: Vec<HoEntry> = vec![
         // ADR 0014 — optimizer-pass installation.
         ("install-optimizer-pass!", b_install_optimizer_pass),
         ("remove-optimizer-pass!", b_remove_optimizer_pass),
@@ -770,6 +774,10 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
             b_namespace_undefine_variable,
         ),
         ("apply", b_apply),
+        // (Sandbox builtins under `sandbox` feature are
+        // appended below this vec literal to avoid mixing #cfg
+        // attributes inside the macro-style vec! — see
+        // append_sandbox_builtins.)
         // (time-apply) lives as a Scheme-level wrapper in the
         // benchmark harness, not a builtin: the VM dispatches
         // higher-order builtins through marker-type downcasts
@@ -921,7 +929,20 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         // hashtable HO
         ("hashtable-fold", b_hashtable_fold),
         ("hashtable-for-each", b_hashtable_for_each),
-    ]
+    ];
+    // ADR 0015 L2 — sandbox builtins live in their own module
+    // and are appended (rather than spread inline with #cfg) to
+    // keep the main vec literal clean.
+    #[cfg(feature = "sandbox")]
+    {
+        for entry in sandbox::builtins() {
+            v.push(entry);
+        }
+    }
+    #[cfg(feature = "sandbox")]
+    return v;
+    #[cfg(not(feature = "sandbox"))]
+    v
 }
 
 type SymsEntry = (
