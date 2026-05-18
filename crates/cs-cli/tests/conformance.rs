@@ -123,6 +123,18 @@ fn conformance_crab_fs() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-os")]
+fn conformance_crab_os() {
+    run_conformance_file("crab-os.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-process")]
+fn conformance_crab_process() {
+    run_conformance_file("crab-process.scm");
+}
+
+#[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");
 }

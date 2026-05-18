@@ -1768,6 +1768,14 @@ impl Runtime {
         for p in cs_stdlib_fs::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-os")]
+        for p in cs_stdlib_os::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-process")]
+        for p in cs_stdlib_process::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call

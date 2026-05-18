@@ -34,6 +34,8 @@ members = [
     # cargo feature; default-on for native, opt-out for WASM.
     "crates/cs-stdlib-path",
     "crates/cs-stdlib-fs",
+    "crates/cs-stdlib-os",
+    "crates/cs-stdlib-process",
 ]
 
 [workspace.package]
@@ -75,6 +77,8 @@ cs-table = { path = "crates/cs-table" }
 cs-hotreload = { path = "crates/cs-hotreload" }
 cs-stdlib-path = { path = "crates/cs-stdlib-path" }
 cs-stdlib-fs = { path = "crates/cs-stdlib-fs" }
+cs-stdlib-os = { path = "crates/cs-stdlib-os" }
+cs-stdlib-process = { path = "crates/cs-stdlib-process" }
 
 # External crates
 logos = "0.14"
