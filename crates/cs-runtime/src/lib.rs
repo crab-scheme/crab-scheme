@@ -1840,6 +1840,10 @@ impl Runtime {
         for p in cs_stdlib_metrics::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-net")]
+        for p in cs_stdlib_net::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call

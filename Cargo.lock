@@ -705,6 +705,7 @@ dependencies = [
  "cs-stdlib-json",
  "cs-stdlib-log",
  "cs-stdlib-metrics",
+ "cs-stdlib-net",
  "cs-stdlib-os",
  "cs-stdlib-path",
  "cs-stdlib-process",
@@ -810,6 +811,14 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-metrics"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
+]
+
+[[package]]
+name = "cs-stdlib-net"
 version = "0.0.1"
 dependencies = [
  "cs-core",

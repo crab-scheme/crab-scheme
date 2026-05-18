@@ -52,6 +52,7 @@ members = [
     "crates/cs-stdlib-archive",
     "crates/cs-stdlib-log",
     "crates/cs-stdlib-metrics",
+    "crates/cs-stdlib-net",
 ]
 
 [workspace.package]
@@ -111,6 +112,7 @@ cs-stdlib-compress = { path = "crates/cs-stdlib-compress" }
 cs-stdlib-archive = { path = "crates/cs-stdlib-archive" }
 cs-stdlib-log = { path = "crates/cs-stdlib-log" }
 cs-stdlib-metrics = { path = "crates/cs-stdlib-metrics" }
+cs-stdlib-net = { path = "crates/cs-stdlib-net" }
 
 # External crates
 logos = "0.14"

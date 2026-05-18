@@ -235,6 +235,12 @@ fn conformance_crab_metrics() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-net")]
+fn conformance_crab_net() {
+    run_conformance_file("crab-net.scm");
+}
+
+#[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");
 }
