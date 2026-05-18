@@ -570,6 +570,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-opt-example"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-opt",
+ "cs-rir",
+]
+
+[[package]]
 name = "cs-parse"
 version = "0.0.1"
 dependencies = [
@@ -612,6 +621,7 @@ dependencies = [
  "cs-jit",
  "cs-jit-cranelift",
  "cs-lex",
+ "cs-opt",
  "cs-parse",
  "cs-rir",
  "cs-table",
