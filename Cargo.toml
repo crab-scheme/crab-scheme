@@ -11,6 +11,7 @@ members = [
     "crates/cs-vm",
     "crates/cs-gc",
     "crates/cs-rir",
+    "crates/cs-opt",
     "crates/cs-typer",
     "crates/cs-jit",
     "crates/cs-jit-cranelift",
@@ -52,6 +53,7 @@ cs-runtime = { path = "crates/cs-runtime", default-features = false }
 cs-vm = { path = "crates/cs-vm" }
 cs-gc = { path = "crates/cs-gc" }
 cs-rir = { path = "crates/cs-rir" }
+cs-opt = { path = "crates/cs-opt" }
 cs-typer = { path = "crates/cs-typer" }
 cs-jit = { path = "crates/cs-jit" }
 cs-jit-cranelift = { path = "crates/cs-jit-cranelift" }

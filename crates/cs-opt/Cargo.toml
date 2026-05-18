@@ -1,0 +1,12 @@
+[package]
+name = "cs-opt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "Pluggable optimizer-pass framework for CrabScheme (ADR 0014)."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-rir = { workspace = true }

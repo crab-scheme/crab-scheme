@@ -6882,6 +6882,14 @@ pub fn bytecode_to_rir_full(
     if func.return_type == Type::Any {
         box_mixed_returns(&mut func, &mut value_types, &mut alloc);
     }
+    // ADR 0014 integration point — the pluggable optimizer-pass
+    // pipeline runs here, between bytecode→RIR translation and the
+    // back-end consumers (cs-jit-cranelift / cs-aot). Iter 1 is a
+    // documented no-op; iter 3 (Scheme `install-optimizer-pass!`)
+    // replaces cs-opt's implementation to actually consult an
+    // active-pass list. Calling it now means no further cs-vm
+    // edits are required when the iter 3 surface lands.
+    cs_opt::run_active_pipeline(&mut func);
     Ok(func)
 }
 
