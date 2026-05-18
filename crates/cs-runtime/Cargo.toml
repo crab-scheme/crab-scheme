@@ -89,6 +89,8 @@ stdlib = [
     "stdlib-hash",
     "stdlib-compress",
     "stdlib-archive",
+    "stdlib-log",
+    "stdlib-metrics",
 ]
 stdlib-path = ["ffi-trait", "dep:cs-stdlib-path"]
 stdlib-fs = ["ffi-trait", "dep:cs-stdlib-fs"]
@@ -108,6 +110,8 @@ stdlib-url = ["ffi-trait", "dep:cs-stdlib-url"]
 stdlib-hash = ["ffi-trait", "dep:cs-stdlib-hash"]
 stdlib-compress = ["ffi-trait", "dep:cs-stdlib-compress"]
 stdlib-archive = ["ffi-trait", "dep:cs-stdlib-archive"]
+stdlib-log = ["ffi-trait", "dep:cs-stdlib-log"]
+stdlib-metrics = ["ffi-trait", "dep:cs-stdlib-metrics"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -149,6 +153,8 @@ cs-stdlib-url = { workspace = true, optional = true }
 cs-stdlib-hash = { workspace = true, optional = true }
 cs-stdlib-compress = { workspace = true, optional = true }
 cs-stdlib-archive = { workspace = true, optional = true }
+cs-stdlib-log = { workspace = true, optional = true }
+cs-stdlib-metrics = { workspace = true, optional = true }
 
 [dev-dependencies]
 cs-ffi-example = { workspace = true }

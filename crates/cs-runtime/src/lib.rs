@@ -1832,6 +1832,14 @@ impl Runtime {
         for p in cs_stdlib_archive::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-log")]
+        for p in cs_stdlib_log::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-metrics")]
+        for p in cs_stdlib_metrics::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call

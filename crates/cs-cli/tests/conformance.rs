@@ -223,6 +223,18 @@ fn conformance_crab_archive() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-log")]
+fn conformance_crab_log() {
+    run_conformance_file("crab-log.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-metrics")]
+fn conformance_crab_metrics() {
+    run_conformance_file("crab-metrics.scm");
+}
+
+#[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");
 }

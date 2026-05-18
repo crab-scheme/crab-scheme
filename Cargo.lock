@@ -703,6 +703,8 @@ dependencies = [
  "cs-stdlib-fs",
  "cs-stdlib-hash",
  "cs-stdlib-json",
+ "cs-stdlib-log",
+ "cs-stdlib-metrics",
  "cs-stdlib-os",
  "cs-stdlib-path",
  "cs-stdlib-process",
@@ -796,6 +798,22 @@ dependencies = [
  "cs-core",
  "cs-ffi",
  "serde_json",
+]
+
+[[package]]
+name = "cs-stdlib-log"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
+]
+
+[[package]]
+name = "cs-stdlib-metrics"
+version = "0.0.1"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
 ]
 
 [[package]]
