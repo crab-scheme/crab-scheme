@@ -4731,9 +4731,18 @@ impl<'a> Expander<'a> {
                             mutator: None,
                         });
                     } else if kind == self.keywords.mutable {
-                        if parts.len() != 4 {
+                        // Accept three shapes:
+                        //   (mutable FIELD)
+                        //     → accessor NAME-FIELD, mutator set-NAME-FIELD!
+                        //   (mutable FIELD ACCESSOR MUTATOR)
+                        //     → fully explicit
+                        // The two-element shorthand is what
+                        // define-record-mutable in lib/record/record.scm
+                        // relies on; syntax-rules can't synthesize the
+                        // accessor/mutator names itself.
+                        if parts.len() != 2 && parts.len() != 4 {
                             return Err(ExpandError::BadSyntax {
-                                what: "(mutable field accessor mutator) needs 4 elements".into(),
+                                what: "(mutable field) or (mutable field accessor mutator)".into(),
                                 span: f.span(),
                             });
                         }
@@ -4746,23 +4755,33 @@ impl<'a> Expander<'a> {
                                 });
                             }
                         };
-                        let accessor = match &parts[2] {
-                            Datum::Symbol(s, _) => *s,
-                            _ => {
-                                return Err(ExpandError::BadSyntax {
-                                    what: "accessor name must be symbol".into(),
-                                    span: f.span(),
-                                });
-                            }
-                        };
-                        let mutator = match &parts[3] {
-                            Datum::Symbol(s, _) => *s,
-                            _ => {
-                                return Err(ExpandError::BadSyntax {
-                                    what: "mutator name must be symbol".into(),
-                                    span: f.span(),
-                                });
-                            }
+                        let (accessor, mutator) = if parts.len() == 2 {
+                            let fname = self.syms.name(name).to_string();
+                            (
+                                self.syms.intern(&format!("{}-{}", type_name_str, fname)),
+                                self.syms
+                                    .intern(&format!("set-{}-{}!", type_name_str, fname)),
+                            )
+                        } else {
+                            let acc = match &parts[2] {
+                                Datum::Symbol(s, _) => *s,
+                                _ => {
+                                    return Err(ExpandError::BadSyntax {
+                                        what: "accessor name must be symbol".into(),
+                                        span: f.span(),
+                                    });
+                                }
+                            };
+                            let mut_ = match &parts[3] {
+                                Datum::Symbol(s, _) => *s,
+                                _ => {
+                                    return Err(ExpandError::BadSyntax {
+                                        what: "mutator name must be symbol".into(),
+                                        span: f.span(),
+                                    });
+                                }
+                            };
+                            (acc, mut_)
                         };
                         fields.push(FieldDecl {
                             name,
