@@ -39,6 +39,9 @@ members = [
     "crates/cs-stdlib-string",
     "crates/cs-stdlib-format",
     "crates/cs-stdlib-regex",
+    "crates/cs-stdlib-time",
+    "crates/cs-stdlib-random",
+    "crates/cs-stdlib-uuid",
 ]
 
 [workspace.package]
@@ -85,6 +88,9 @@ cs-stdlib-process = { path = "crates/cs-stdlib-process" }
 cs-stdlib-string = { path = "crates/cs-stdlib-string" }
 cs-stdlib-format = { path = "crates/cs-stdlib-format" }
 cs-stdlib-regex = { path = "crates/cs-stdlib-regex" }
+cs-stdlib-time = { path = "crates/cs-stdlib-time" }
+cs-stdlib-random = { path = "crates/cs-stdlib-random" }
+cs-stdlib-uuid = { path = "crates/cs-stdlib-uuid" }
 
 # External crates
 logos = "0.14"

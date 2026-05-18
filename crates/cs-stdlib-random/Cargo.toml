@@ -1,0 +1,13 @@
+[package]
+name = "cs-stdlib-random"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab random) — RNG backed by the rand crate."
+
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+rand = "0.8"

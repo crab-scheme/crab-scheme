@@ -153,6 +153,24 @@ fn conformance_crab_regex() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-time")]
+fn conformance_crab_time() {
+    run_conformance_file("crab-time.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-random")]
+fn conformance_crab_random() {
+    run_conformance_file("crab-random.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-uuid")]
+fn conformance_crab_uuid() {
+    run_conformance_file("crab-uuid.scm");
+}
+
+#[test]
 fn conformance_lists() {
     run_conformance_file("lists.scm");
 }

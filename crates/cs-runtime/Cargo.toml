@@ -78,6 +78,9 @@ stdlib = [
     "stdlib-string",
     "stdlib-format",
     "stdlib-regex",
+    "stdlib-time",
+    "stdlib-random",
+    "stdlib-uuid",
 ]
 stdlib-path = ["ffi-trait", "dep:cs-stdlib-path"]
 stdlib-fs = ["ffi-trait", "dep:cs-stdlib-fs"]
@@ -86,6 +89,9 @@ stdlib-process = ["ffi-trait", "dep:cs-stdlib-process"]
 stdlib-string = ["ffi-trait", "dep:cs-stdlib-string"]
 stdlib-format = ["ffi-trait", "dep:cs-stdlib-format"]
 stdlib-regex = ["ffi-trait", "dep:cs-stdlib-regex"]
+stdlib-time = ["ffi-trait", "dep:cs-stdlib-time"]
+stdlib-random = ["ffi-trait", "dep:cs-stdlib-random"]
+stdlib-uuid = ["ffi-trait", "dep:cs-stdlib-uuid"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -116,6 +122,9 @@ cs-stdlib-process = { workspace = true, optional = true }
 cs-stdlib-string = { workspace = true, optional = true }
 cs-stdlib-format = { workspace = true, optional = true }
 cs-stdlib-regex = { workspace = true, optional = true }
+cs-stdlib-time = { workspace = true, optional = true }
+cs-stdlib-random = { workspace = true, optional = true }
+cs-stdlib-uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 cs-ffi-example = { workspace = true }

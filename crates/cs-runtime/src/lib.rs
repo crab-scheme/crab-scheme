@@ -1788,6 +1788,18 @@ impl Runtime {
         for p in cs_stdlib_regex::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-time")]
+        for p in cs_stdlib_time::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-random")]
+        for p in cs_stdlib_random::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-uuid")]
+        for p in cs_stdlib_uuid::procs() {
+            self.register_host_procedure(p);
+        }
     }
 
     /// Set the `(command-line)` override for this runtime. Call
