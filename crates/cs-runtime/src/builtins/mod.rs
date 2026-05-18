@@ -471,6 +471,20 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("syntax-violation?", b_syntax_violation_p),
         ("syntax-violation-form", b_syntax_violation_form),
         ("syntax-violation-subform", b_syntax_violation_subform),
+        // R6RS++ Phase 2D: condition subtypes for Phase 2 ecosystem.
+        ("make-contract-violation", b_make_contract_violation),
+        ("contract-violation?", b_contract_violation_p),
+        ("contract-violation-source", b_contract_violation_source),
+        ("contract-violation-target", b_contract_violation_target),
+        ("contract-violation-contract", b_contract_violation_contract),
+        ("contract-violation-value", b_contract_violation_value),
+        ("make-type-error", b_make_type_error),
+        ("type-error?", b_type_error_p),
+        ("type-error-expected", b_type_error_expected),
+        ("type-error-actual", b_type_error_actual),
+        ("make-module-error", b_make_module_error),
+        ("module-error?", b_module_error_p),
+        ("module-error-library", b_module_error_library),
         ("make-undefined-violation", b_make_undefined_violation),
         ("undefined-violation?", b_undefined_violation_p),
         ("make-lexical-violation", b_make_lexical_violation),
@@ -4621,6 +4635,20 @@ const TAG_LEXICAL: &str = "&lexical";
 const TAG_IMPL_RESTRICTION: &str = "&implementation-restriction";
 const TAG_NO_INFINITIES: &str = "&no-infinities";
 const TAG_NO_NANS: &str = "&no-nans";
+// R6RS++ §9 (Phase 2D): condition subtypes extending &error
+// for the Phase 2 ecosystem.
+//
+//   &contract   raised by Phase 2B contract violations; carries
+//               source / target / contract-description / blamed
+//               value (4 fields, all surfaced as accessors).
+//   &type       runtime type errors -- complementary to cs-typer's
+//               static type errors. 2 fields: expected type
+//               description (string/symbol) + actual value.
+//   &module     library / import / module-system errors. 1 field:
+//               the offending library-name list (e.g. `(http server)`).
+const TAG_CONTRACT: &str = "&contract";
+const TAG_TYPE: &str = "&type";
+const TAG_MODULE: &str = "&module";
 
 thread_local! {
     /// Map from condition tag → its parent tag. Walked by predicates to
@@ -4683,6 +4711,10 @@ pub fn init_condition_registry() {
         m.insert(TAG_IMPL_RESTRICTION.into(), TAG_VIOLATION.into());
         m.insert(TAG_NO_INFINITIES.into(), TAG_IMPL_RESTRICTION.into());
         m.insert(TAG_NO_NANS.into(), TAG_IMPL_RESTRICTION.into());
+        // R6RS++ Phase 2D extensions, all rooted at &error.
+        m.insert(TAG_CONTRACT.into(), TAG_ERROR.into());
+        m.insert(TAG_TYPE.into(), TAG_ERROR.into());
+        m.insert(TAG_MODULE.into(), TAG_ERROR.into());
     });
     COND_KNOWN_TAGS.with(|reg| {
         let mut s = reg.borrow_mut();
@@ -4719,6 +4751,10 @@ pub fn init_condition_registry() {
             TAG_IMPL_RESTRICTION,
             TAG_NO_INFINITIES,
             TAG_NO_NANS,
+            // Phase 2D additions:
+            TAG_CONTRACT,
+            TAG_TYPE,
+            TAG_MODULE,
         ] {
             s.insert(t.into());
         }
@@ -5253,6 +5289,151 @@ fn b_syntax_violation_subform(args: &[Value]) -> Result<Value, String> {
         }
     }
     Err("syntax-violation-subform: malformed".to_string())
+}
+
+// ---- R6RS++ Phase 2D condition subtypes ----
+
+/// `(make-contract-violation source target contract value)` ->
+/// compound &contract condition. Used by Phase 2B contract
+/// machinery to raise blame on a contract failure.
+fn b_make_contract_violation(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err(arity_err("make-contract-violation", "4", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(
+        TAG_CONTRACT,
+        vec![
+            args[0].clone(), // source library
+            args[1].clone(), // target library
+            args[2].clone(), // contract description
+            args[3].clone(), // blamed value
+        ],
+    )]))
+}
+
+fn b_contract_violation_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("contract-violation?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_CONTRACT)))
+}
+
+fn contract_field(args: &[Value], idx: usize, name: &str) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err(name, "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_CONTRACT)
+        .ok_or_else(|| format!("{}: not a contract-violation", name))?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() > idx {
+            return Ok(v[idx].clone());
+        }
+    }
+    Err(format!("{}: malformed", name))
+}
+
+fn b_contract_violation_source(args: &[Value]) -> Result<Value, String> {
+    contract_field(args, 1, "contract-violation-source")
+}
+
+fn b_contract_violation_target(args: &[Value]) -> Result<Value, String> {
+    contract_field(args, 2, "contract-violation-target")
+}
+
+fn b_contract_violation_contract(args: &[Value]) -> Result<Value, String> {
+    contract_field(args, 3, "contract-violation-contract")
+}
+
+fn b_contract_violation_value(args: &[Value]) -> Result<Value, String> {
+    contract_field(args, 4, "contract-violation-value")
+}
+
+/// `(make-type-error expected actual)` -> compound &type
+/// condition. Runtime type errors; complementary to cs-typer's
+/// static checks. `expected` is typically a string or symbol
+/// describing the wanted type; `actual` is the offending value.
+fn b_make_type_error(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("make-type-error", "2", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(
+        TAG_TYPE,
+        vec![args[0].clone(), args[1].clone()],
+    )]))
+}
+
+fn b_type_error_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("type-error?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_TYPE)))
+}
+
+fn b_type_error_expected(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("type-error-expected", "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_TYPE)
+        .ok_or_else(|| "type-error-expected: not a type-error".to_string())?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() >= 2 {
+            return Ok(v[1].clone());
+        }
+    }
+    Err("type-error-expected: malformed".into())
+}
+
+fn b_type_error_actual(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("type-error-actual", "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_TYPE)
+        .ok_or_else(|| "type-error-actual: not a type-error".to_string())?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() >= 3 {
+            return Ok(v[2].clone());
+        }
+    }
+    Err("type-error-actual: malformed".into())
+}
+
+/// `(make-module-error library-name)` -> compound &module
+/// condition. For library/import-system errors at runtime;
+/// `library-name` is the offending library name spec (e.g. a
+/// list like `(http server)`).
+fn b_make_module_error(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("make-module-error", "1", args.len()));
+    }
+    Ok(make_compound(vec![make_simple(
+        TAG_MODULE,
+        vec![args[0].clone()],
+    )]))
+}
+
+fn b_module_error_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("module-error?", "1", args.len()));
+    }
+    Ok(Value::Boolean(cond_has_subtype(&args[0], TAG_MODULE)))
+}
+
+fn b_module_error_library(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("module-error-library", "1", args.len()));
+    }
+    let simple = find_simple_with_tag(&args[0], TAG_MODULE)
+        .ok_or_else(|| "module-error-library: not a module-error".to_string())?;
+    if let Value::Vector(vc) = simple {
+        let v = vc.borrow();
+        if v.len() >= 2 {
+            return Ok(v[1].clone());
+        }
+    }
+    Err("module-error-library: malformed".into())
 }
 
 // ---- standard accessors ----
