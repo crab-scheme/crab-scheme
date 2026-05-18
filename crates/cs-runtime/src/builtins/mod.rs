@@ -173,6 +173,15 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("syntax-source", b_syntax_source),
         ("syntax-line", b_syntax_line),
         ("syntax-column", b_syntax_column),
+        // R6RS++ §12 (#118) Iter A — syntax-case foundation surface.
+        // identifier? / syntax->datum / datum->syntax / bound-id=? /
+        // free-id=? today degrade to symbol-eq semantics; generate-
+        // temporaries (below in ho_builtins) needs SymbolTable.
+        ("identifier?", b_identifier_p),
+        ("syntax->datum", b_syntax_to_datum),
+        ("datum->syntax", b_datum_to_syntax),
+        ("bound-identifier=?", b_bound_identifier_eq),
+        ("free-identifier=?", b_free_identifier_eq),
         ("null?", b_null_p),
         ("list?", b_list_p),
         ("symbol?", b_symbol_p),
@@ -755,6 +764,9 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("emergency-exit", b_emergency_exit),
         ("symbol->string", b_symbol_to_string_ho),
         ("string->symbol", b_string_to_symbol_ho),
+        // R6RS++ §12 (#118) Iter A — generate-temporaries needs
+        // SymbolTable to mint fresh names.
+        ("generate-temporaries", b_generate_temporaries_ho),
         ("hashtable-update!", b_hashtable_update_ho),
         ("hashtable-walk", b_hashtable_walk),
         ("hashtable-entries", b_hashtable_entries),
@@ -2369,6 +2381,112 @@ fn b_syntax_column(args: &[Value]) -> Result<Value, String> {
         None => Ok(Value::Boolean(false)),
         Some(s) => Ok(Value::Number(Number::Fixnum(s.end as i64))),
     }
+}
+
+// ---- R6RS++ §12 (#118) Iter A — syntax-case foundation surface ----
+//
+// First-class SyntaxObjects don't exist yet; identifiers are bare
+// `Value::Symbol`s. These builtins pin the public surface so user
+// code and downstream iters can target it now. Iter E replaces the
+// symbol-eq stand-ins with proper mark-aware comparisons.
+
+/// `(identifier? v)` — R6RS §11.18. True iff `v` is a syntax object
+/// representing an identifier. Today: true iff `v` is a `Symbol`,
+/// because identifiers are just symbols in our current model. When
+/// first-class SyntaxObjects land (Iter E), this widens to also
+/// recognize a SyntaxObject wrapping a symbol.
+fn b_identifier_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("identifier?", "1", args.len()));
+    }
+    Ok(Value::Boolean(matches!(args[0], Value::Symbol(_))))
+}
+
+/// `(syntax->datum stx)` — R6RS §12.6. Strip syntax-object marks and
+/// return the underlying datum. Today: identity, since datums and
+/// syntax objects are not yet distinguished. Future: walks a wrapped
+/// SyntaxObject and returns its inner Value with marks discarded.
+fn b_syntax_to_datum(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax->datum", "1", args.len()));
+    }
+    Ok(args[0].clone())
+}
+
+/// `(datum->syntax template-id datum)` — R6RS §12.6. Stamp `datum`
+/// with the lexical context of `template-id` so introduced
+/// identifiers resolve correctly. Today: returns `datum` unchanged;
+/// the `template-id` argument is type-checked (must satisfy
+/// `identifier?`) but its context isn't yet propagated. Future iters
+/// thread the template-id's marks onto every identifier in `datum`.
+fn b_datum_to_syntax(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("datum->syntax", "2", args.len()));
+    }
+    if !matches!(args[0], Value::Symbol(_)) {
+        return Err(type_err("datum->syntax", "identifier", &args[0]));
+    }
+    Ok(args[1].clone())
+}
+
+/// `(bound-identifier=? a b)` — R6RS §12.6. True iff `a` and `b`
+/// would refer to the same binding if substituted into a template.
+/// Today: name-equality on Symbols. Iter E refines this to compare
+/// names + accumulated marks; macros that introduce shadowing
+/// identifiers depend on the marks-aware version for correctness.
+fn b_bound_identifier_eq(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("bound-identifier=?", "2", args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Symbol(a), Value::Symbol(b)) => Ok(Value::Boolean(a == b)),
+        _ => Err(type_err("bound-identifier=?", "identifier", &args[0])),
+    }
+}
+
+/// `(free-identifier=? a b)` — R6RS §12.6. True iff `a` and `b`
+/// resolve to the same binding in their respective scopes. Today:
+/// name-equality on Symbols. Iter E walks both identifiers' lexical
+/// environments and compares binding identity.
+fn b_free_identifier_eq(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("free-identifier=?", "2", args.len()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Symbol(a), Value::Symbol(b)) => Ok(Value::Boolean(a == b)),
+        _ => Err(type_err("free-identifier=?", "identifier", &args[0])),
+    }
+}
+
+/// `(generate-temporaries lst)` — R6RS §12.6. Returns a list of N
+/// fresh identifiers, where N is the length of `lst`. The argument
+/// itself is consumed only for its length; the values inside are
+/// ignored. Names are guaranteed distinct from any identifier that
+/// has appeared (we use `SymbolTable::len` as the monotonic counter,
+/// matching the existing `gensym` convention).
+fn b_generate_temporaries_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("generate-temporaries", "1", args.len()));
+    }
+    let mut n: usize = 0;
+    let mut cur = args[0].clone();
+    loop {
+        match cur {
+            Value::Null => break,
+            Value::Pair(p) => {
+                n += 1;
+                cur = p.cdr.borrow().clone();
+            }
+            _ => return Err(type_err("generate-temporaries", "list", &args[0])),
+        }
+    }
+    let mut fresh = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = ctx.syms.len();
+        let name = format!("t.{}", id);
+        fresh.push(Value::Symbol(ctx.syms.intern(&name)));
+    }
+    Ok(Value::list(fresh))
 }
 
 fn b_null_p(args: &[Value]) -> Result<Value, String> {
