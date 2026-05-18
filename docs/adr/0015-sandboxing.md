@@ -1,7 +1,7 @@
 # ADR 0015 — Sandboxing
 
-**Status:** Proposed
-**Date:** 2026-05-18
+**Status:** Accepted
+**Date:** 2026-05-18 (Proposed); 2026-05-18 (Accepted after Q1-Q6 resolution)
 **Context:** R6RS++ Phase 4 (`docs/research/r6rs_extensions_spec.md` §"Phase 4 — Advanced research"); optimizer-plugins arc landed (`docs/milestones/r6rs-extensions-p4-optimizer-plugins-exit.md`)
 **Predecessors:** ADR 0007 (JIT architecture); ADR 0014 (optimizer plugins); M10 Track W exit (`docs/milestones/m10-trackW-exit.md`)
 
@@ -184,39 +184,57 @@ WASM instance."
 `null-environment` are builtins returning sentinels. The work for
 L1 is:
 
-1. **Real environment representation.** Replace the sentinel with
-   a structure that carries the import set (library specs to
-   resolve at eval time). Likely shape:
+L1 ships TWO clearly-named constructors with different semantics —
+the user's Q4 decision (see Resolution section). Both implement
+namespace restriction; they differ in mutation semantics:
+
+1. **`(environment '(rnrs base) ...)` — R6RS strict snapshot
+   (Chez behavior, R6RS §15.2).** Returns an **immutable**
+   environment. The binding set is resolved at construction time;
+   subsequent changes to the host's libraries don't affect it;
+   `(eval '(set! x 1) env)` raises `&assertion`. Best for
+   reasoning about sandboxed code; prevents subtle aliasing bugs.
+
+2. **`(make-namespace '(rnrs base) ...)` — Racket-style live
+   namespace (NEW form).** Returns a **mutable container**. The
+   host can `namespace-set-variable-value!` after construction;
+   mutations are visible to code holding the namespace. Better
+   for interactive REPL workflows where iterative redefinition
+   is the point.
+
+Internally both are represented similarly; the difference is the
+`mutable: bool` flag on the inner struct and which builtins are
+allowed against it:
 
    ```rust
    pub struct Environment {
        imports: Vec<LibrarySpec>,
-       /// Resolved binding set, computed lazily on first use.
-       /// Maps each visible name to the value at construction
-       /// time (snapshot semantics — re-defining a name in the
-       /// host doesn't affect existing environments).
-       resolved: OnceLock<HashMap<Symbol, Value>>,
+       /// Resolved binding set. For `environment`, populated once
+       /// at construction (snapshot semantics). For
+       /// `make-namespace`, mutable Cell across host operations.
+       bindings: RefCell<HashMap<Symbol, Value>>,
+       mutable: bool,
    }
    ```
 
-2. **`eval` consults the environment.** Today's `eval` runs
-   against the global top-level frame. The new path: when given
-   a non-sentinel environment, build a fresh `Frame` whose
-   bindings are exactly the env's `resolved` map, run the
-   expression against that.
+The `eval` builtin consults the environment regardless of
+mutability — it just constructs a fresh `Frame` from `bindings`
+and runs the expression there. Mutation primitives
+(`namespace-set-variable-value!`, etc.) check `mutable` and raise
+`&assertion` when false.
 
-3. **Reject undefined references at expand time.** The expander
-   already knows which symbols are bound; running it against a
-   restricted environment means unknown names produce
-   `unbound-identifier` at expand, not runtime — better
-   ergonomics, matches Chez behavior.
+Reject undefined references at expand time: the expander already
+knows which symbols are bound; running it against a restricted
+environment means unknown names produce `unbound-identifier` at
+expand, not runtime — better ergonomics, matches Chez behavior.
 
-This is iter-1 of L1. Two iters of follow-up for a complete
-implementation:
-
-- Iter 2: composite environments. `(environment '(rnrs base)
-  '(my custom lib))` combines two import sets.
-- Iter 3: `eval` accepts a constructed environment from a saved
+L1 rollout (sub-iters):
+- L1.1: `(environment ...)` immutable snapshot (R6RS strict).
+- L1.2: `(make-namespace ...)` mutable variant +
+  `namespace-set-variable-value!` / `namespace-undefine-variable!`.
+- L1.3: composite construction. `(environment '(rnrs base) '(my
+  custom lib))` combines two import sets.
+- L1.4: `eval` accepts a constructed environment from a saved
   source location (the "first-class environment" R6RS pattern).
 
 ### Layer 2 — WASM-instance sandbox
@@ -264,15 +282,23 @@ embedders).
 pub struct SandboxConfig {
     /// Max linear memory the guest can allocate (bytes). Default 64 MiB.
     pub memory_limit: usize,
-    /// Wasmtime fuel — roughly proportional to executed Wasm
-    /// instructions. None = unlimited (don't use for adversarial
-    /// code). Default Some(10_000_000).
+    /// Wasmtime fuel — roughly 1 unit per executed Wasm
+    /// instruction. None = unlimited (don't use for adversarial
+    /// code). Default Some(10_000_000). Deterministic; same
+    /// program hits the same trap point regardless of host load.
     pub fuel: Option<u64>,
+    /// Cheaper alternative to fuel: epoch interruption. Host
+    /// ticks an epoch counter at this interval; guest traps when
+    /// its store's epoch deadline expires. Non-deterministic but
+    /// much lower per-instruction overhead. None = disabled.
+    /// Mutually exclusive with `fuel` in the default config —
+    /// pick one. Default None (fuel is the default CPU bound).
+    pub epoch_tick_interval: Option<Duration>,
     /// Paths the guest can read/write. Empty = no filesystem.
     pub allow_paths: Vec<PathBuf>,
-    /// Whether to grant network capabilities. Default false.
-    /// Currently a no-op placeholder; wasi-sockets adoption in
-    /// wasmtime is in flux.
+    /// Whether to grant network capabilities (wasi-sockets, WASI
+    /// 0.2). Default false. Lands working in iter 1 (research
+    /// log Q2 — wasi-sockets is in the stable WASI 0.2 surface).
     pub allow_network: bool,
     /// Wall-clock timeout for a single sandbox-eval call.
     /// Independent of fuel — covers I/O stalls. Default 30s.
@@ -280,7 +306,47 @@ pub struct SandboxConfig {
     /// Initial library import-spec the guest's eval will see.
     /// Default: ("(rnrs base)").
     pub imports: Vec<String>,
+    /// Whether to reuse the same wasmtime Instance across
+    /// multiple sandbox-eval calls on this SandboxInstance.
+    /// - true: REPL-like; bindings/state persist across calls;
+    ///   faster per-call. Recommended for friendly threat
+    ///   models.
+    /// - false: each eval spawns a fresh wasmtime Instance;
+    ///   no cross-call state. Slower per-call but strongest
+    ///   isolation. Recommended for adversarial use cases.
+    /// Default depends on construction site: the spec-driven
+    /// defaults below pick the safe value per use case rather
+    /// than forcing one global default.
+    pub reuse_instance: bool,
 }
+```
+
+**Defaults per threat-model preset.** Most users don't write a
+`SandboxConfig` from scratch; the crate exposes three named
+presets matching the user's threat-model decision (see Resolution
+section, Q1):
+
+```rust
+impl SandboxConfig {
+    /// Hygiene-only L2 wrapper. Friendly code; cross-call state
+    /// preserved (REPL feel). reuse_instance=true, fuel=None,
+    /// 5min wall-clock, allow_paths empty, allow_network=false.
+    pub fn hygiene() -> Self;
+
+    /// Plugin / extension use case. Untrusted-by-default but
+    /// long-running. reuse_instance=true, fuel=Some(100M),
+    /// 30s wall-clock, allow_paths empty, allow_network=false.
+    pub fn plugin() -> Self;
+
+    /// Adversarial / per-eval-fresh use case (code playground,
+    /// untrusted user submission). reuse_instance=false,
+    /// fuel=Some(10M), 5s wall-clock, allow_paths empty,
+    /// allow_network=false.
+    pub fn adversarial() -> Self;
+}
+```
+
+Users start from a preset and override specific fields.
 
 pub struct SandboxInstance { /* wasmtime guts */ }
 
@@ -313,8 +379,11 @@ pub enum SandboxError {
 
 #### Wire protocol (host ↔ guest)
 
-Newline-framed text on stdin/stdout, each line a self-describing
-record:
+**Iter 1 ships the text protocol; iter 5 evaluates migrating to
+the WASM component model.** Reasoning recorded under Q1 below.
+
+Iter 1 wire format: newline-framed text on stdin/stdout, each
+line a self-describing record:
 
 ```
 > EVAL <length>
@@ -332,36 +401,70 @@ Or on error:
 `<kind>` is one of `raised`, `fuel`, `memory`, `capability`,
 `internal`. The host's `SandboxError` mirrors the wire kinds.
 
-Why a text protocol on stdin/stdout, not a richer Wasm-component-model
-interface? Three reasons:
+Why the text protocol initially:
 
-1. **WASI Preview 1 stability.** Preview 2 + the component model
-   are still in flux; Preview 1's stdin/stdout works today and
-   the conformance suite already exercises it.
-2. **Debuggability.** A text protocol prints in test logs and
+1. **Debuggability.** A text protocol prints in test logs and
    captures cleanly under `wasmtime run`. The guest binary is
    the same one users can run interactively, which makes
    reproducing host-vs-guest behavior trivial.
-3. **Zero ABI surface.** Adding richer host↔guest bindings means
+2. **Zero ABI surface.** Adding richer host↔guest bindings means
    new wasmtime exports + matching imports in the guest; the
    text protocol uses the existing CLI-script-evaluation path
    in crabscheme.wasm and adds no new ABI to maintain.
+3. **Defers component-model commitment until after iter 4** when
+   we have a working baseline to compare against.
 
 The cost is round-trip latency — each `eval` is one process-IO
 hop. For the use cases sandboxing addresses (running notebook
 cells, plugin scripts, untrusted user-submitted programs), that
 latency is dominated by the eval itself.
 
+After iter 4 (Scheme builtins shipped), iter 5 evaluates whether
+to migrate to component-model bindings using `wasmtime::component::Component`
+and WIT-defined imports/exports. WASI 0.2 + components are stable
+on the wasmtime 36.x LTS line as of 2026 (research log Q2); the
+migration would replace the text protocol with typed function
+calls but otherwise preserves the architecture. Decision deferred
+until iter-4 perf numbers tell us whether the text-protocol RTT is
+actually a bottleneck.
+
 #### Resource semantics
 
-| Resource    | Mechanism                                         | Failure mode                  |
-|-------------|---------------------------------------------------|-------------------------------|
-| Memory      | `wasmtime::ResourceLimiter` rejects allocs >limit | `MemoryExhausted` error       |
-| CPU         | `wasmtime::Engine` fuel-consuming mode            | `FuelExhausted` error         |
-| Wall clock  | Host-side `tokio::time::timeout` around the call  | `Timeout` error               |
-| Filesystem  | `WasiCtx::preopened_dir` enumeration              | `CapabilityDenied` (WASI)     |
-| Network     | Default off; wasi-sockets opt-in (future)         | `CapabilityDenied` placeholder|
-| FFI         | `--no-default-features` build has no dlopen       | guest builtin returns error   |
+| Resource    | Mechanism                                                  | Failure mode                 |
+|-------------|------------------------------------------------------------|------------------------------|
+| Memory      | `wasmtime::ResourceLimiter` impl via `Store::limiter(fn)`  | `MemoryExhausted` error      |
+| CPU (det.)  | `Config::consume_fuel(true)` + `Store::set_fuel(N)`        | `FuelExhausted` error        |
+| CPU (cheap) | `Config::epoch_interruption(true)` + epoch deadline + host ticker | `Timeout` error       |
+| Wall clock  | Host-side `tokio::time::timeout` around the call           | `Timeout` error              |
+| Filesystem  | `WasiCtx::preopened_dir` enumeration (WASI 0.2)            | `CapabilityDenied` (WASI)    |
+| Network     | wasi-sockets opt-in via `SandboxConfig.allow_network`      | `CapabilityDenied` (WASI)    |
+| FFI         | `--no-default-features` build has no dlopen                | guest builtin returns error  |
+
+**Fuel vs epoch interruption:** fuel is deterministic — same program
+hits the same trap point regardless of host load — but counts every
+WASM instruction (per-instruction host overhead). Epoch interruption
+is much cheaper (host increments an epoch counter periodically; the
+guest checks it at trap-safe points) but non-deterministic (depends
+on epoch tick rate vs guest execution speed). `SandboxConfig`
+exposes both; the default config enables fuel for reproducibility,
+recommends epoch interruption for production where the cheaper-
+per-instruction cost matters and determinism doesn't.
+
+**Wasmtime version pin:** wasmtime adopted an LTS policy in 2025.
+The cs-sandbox-wasm crate pins to the **36.x LTS line** (24-month
+support, modern component-model APIs available when iter-5
+migration lands). Patch updates within the line are guaranteed
+API-compatible; major-version moves are explicit per-release
+decisions.
+
+**WASI 0.2 readiness:** unlike the original ADR draft, WASI 0.2 +
+the component model are stable as of early 2026 (research log
+Q2). `wasmtime::component::Component` is treated as stable on
+the 36.x LTS line; wasi-sockets is part of the stable surface.
+The ADR's "allow_network is a no-op placeholder" caveat is
+**removed**: iter-1 ships `allow_network` working via wasi-sockets
+when wasmtime is configured with the appropriate Linker bindings,
+defaulting off.
 
 Memory limit and fuel are enforced by wasmtime itself — they
 can't be bypassed by guest Scheme code because guest Scheme
@@ -489,7 +592,102 @@ constrain capabilities. Either ship both layers and let users
 choose, or rename the deliverable to "namespace restriction"
 and don't claim sandboxing.
 
-## Open questions
+## Resolution of open questions
+
+The original "Open questions" section captured 6 design questions
+flagged at Proposed time. Subsequent research + user decisions
+resolved them as follows:
+
+### Threat-model (interview Q1) — both, tiered
+Ship BOTH layers. L1 for the common case (cheap, in-process); L2
+for the marked-untrusted path (opt-in, real isolation). The
+SandboxConfig presets (`hygiene` / `plugin` / `adversarial`)
+match the three concrete use cases this targets.
+
+### Use cases driving this (interview Q2) — REPL/notebooks + plugins + untrusted user code
+All three are in scope. REPL/notebook drives the `hygiene` /
+persistent-instance preset. Plugin marketplace drives the
+`plugin` preset with reasonable fuel limits. Untrusted code (web
+playground, judge-like CI) drives the `adversarial` preset with
+fresh-per-eval isolation. All three flow through the same
+`make-wasm-sandbox` constructor with different presets.
+
+### L1 binding semantics (interview Q3) — both, separate constructors
+Ship two constructors:
+- `(environment '(rnrs base) ...)` — R6RS strict immutable
+  snapshot (Chez behavior). `(eval '(set! x 1) env)` raises
+  `&assertion`.
+- `(make-namespace '(rnrs base) ...)` — Racket-style live mutable
+  container. `namespace-set-variable-value!` etc. work.
+
+Both delegate to the same internal `Environment` struct; the
+difference is a `mutable: bool` flag + which builtins are
+allowed against it. Cost of both is one extra builtin
+constructor; benefit is users get the semantic they expect
+without confusion.
+
+### Instance reuse (interview Q4) — user chooses via config flag
+`SandboxConfig.reuse_instance: bool` field; per-preset defaults
+documented above. No single global default — each preset picks the
+safe value for its threat model.
+
+### Wasmtime version (research Q1) — pin 36.x LTS
+Wasmtime adopted an LTS policy in 2025; 36.x is the modern LTS
+line with 24-month support and component-model APIs available.
+The cs-sandbox-wasm crate pins to `wasmtime = "36"` in its
+Cargo.toml; patch updates within 36.x are guaranteed
+API-compatible. Major-version migrations are explicit per-release
+decisions.
+
+### WASI Preview 2 + component model (research Q2) — stable, defer migration to iter 5
+WASI 0.2 + component model are stable on the 36.x LTS line as of
+early 2026. The original ADR rejected component-model bindings
+"because Preview 2 is in flux"; that rationale is obsolete.
+However, iter 1 still ships the text-protocol design because (a)
+the same code path is exercised by interactive `wasmtime run`,
+giving debugging parity, and (b) it doesn't commit to a specific
+WIT-typed ABI before we have perf data on whether the protocol
+RTT is actually a bottleneck. **Iter 5 evaluates migrating to
+component bindings** based on iter-4 measurements.
+
+### Fuel vs epoch interruption (research Q3) — both available; fuel is default
+Both `Config::consume_fuel` (deterministic per-instruction) and
+`Config::epoch_interruption` (cheap non-deterministic) are
+exposed via `SandboxConfig.fuel` and `SandboxConfig.epoch_tick_interval`.
+The default preset configs use fuel for reproducibility; embedders
+who care about per-instruction cost more than determinism can
+switch to epoch interruption.
+
+### Wasi-sockets (was: future iter) — available in iter 1
+wasi-sockets is part of the stable WASI 0.2 surface; the original
+ADR's "no-op placeholder" caveat is removed. Iter 1 ships
+`SandboxConfig.allow_network` working via the wasmtime Linker's
+wasi-sockets bindings, defaulting off.
+
+### Layer-1 binding snapshot semantics (was: open) — answered by interview Q3
+Resolved by shipping both constructors. `environment` snapshots;
+`make-namespace` lives. Behavior is opt-in per call site.
+
+## Open questions (residual)
+
+1. **Cross-eval continuation handles for plugin REPLs.** When
+   `reuse_instance=true`, can the guest expose call-cc'd
+   continuations across multiple eval calls? Probably yes (the
+   guest stays alive between calls), but the host has no way to
+   serialize / address them. Defer until a plugin actually wants
+   this; document the limit ("continuations are intra-eval
+   only") in the iter-4 builtin docs.
+
+2. **Component-model migration go/no-go.** Iter 5's decision
+   depends on iter-4 measurements: text-protocol RTT vs
+   component-call RTT on representative workloads. Pre-commit
+   to nothing; the iter-5 outcome may keep the text protocol if
+   the perf delta is small enough.
+
+3. **Preloaded user libraries in the sandbox.** Mentioned in the
+   original Open Questions; still tracked as iter 5 follow-up.
+   The shape (`SandboxConfig.preload: Vec<(name, source)>`)
+   stays as written.
 
 1. **WASM-component-model migration.** Preview 2 + components
    would let us replace the stdin/stdout protocol with typed
@@ -532,41 +730,69 @@ and don't claim sandboxing.
 
 ## Action items
 
-- [ ] **Phase-4-sb iter 1:** new `cs-sandbox-wasm` crate with
-  `SandboxConfig`, `SandboxInstance`, `SandboxError`. Wasmtime
-  dep gated behind a feature flag. Spawns crabscheme.wasm at
-  init; implements the stdin/stdout text protocol; supports
-  basic value round-trip (Fixnum, Flonum, Boolean, String,
-  Symbol, list). Tests verify: simple eval succeeds, restricted
-  filesystem denial, fuel exhaustion, memory exhaustion.
+Per-iter scope updated to reflect the Q1-Q6 resolutions above.
 
-- [ ] **Phase-4-sb iter 2:** L1 — real environment representation
-  + `eval` consulting it. Replace the sentinel; implement
-  `(environment '(rnrs base))` returning a real env. Tests:
-  unknown identifier in restricted env errors at expand time,
-  defined identifier succeeds, `set!` inside an env doesn't
-  affect the host top level.
+- [ ] **Phase-4-sb iter 1:** new `cs-sandbox-wasm` crate. Pins
+  `wasmtime = "36"`. Ships `SandboxConfig` with all fields from
+  the Detailed Design table (including `epoch_tick_interval`,
+  `allow_network`, `reuse_instance`); the three presets
+  (`hygiene`, `plugin`, `adversarial`); `SandboxInstance` and
+  `SandboxError`. Implements the stdin/stdout text protocol;
+  supports basic value round-trip (Fixnum, Flonum, Boolean,
+  String, Symbol, list). Tests verify: simple eval succeeds,
+  restricted filesystem denial, fuel exhaustion, memory
+  exhaustion, fresh-vs-reuse semantics across two evals.
 
-- [ ] **Phase-4-sb iter 3:** L1 layered inside L2 — the
+- [ ] **Phase-4-sb iter 2 — L1.1:** `(environment '(rnrs base))`
+  immutable snapshot (R6RS strict). Replace the sentinel
+  `Value::Symbol("__top-level-env__")` with a real
+  `Environment` struct; `eval` constructs a `Frame` from its
+  bindings. Tests: unknown identifier errors at expand time,
+  defined identifier succeeds, `(eval '(set! x 1) env)` raises
+  `&assertion`.
+
+- [ ] **Phase-4-sb iter 3 — L1.2:** `(make-namespace '(rnrs
+  base))` mutable variant + `namespace-set-variable-value!` /
+  `namespace-undefine-variable!`. Same `Environment` struct
+  with `mutable: true`. Tests: mutate via builtin succeeds,
+  mutation is visible to subsequent `eval` against the same
+  namespace, snapshot env from iter 2 still errors on `set!`.
+
+- [ ] **Phase-4-sb iter 4 — Scheme builtins for L2:**
+  `(make-wasm-sandbox preset ...)`, `(sandbox-eval s expr)`,
+  `(sandbox-config s)`, `(reset-sandbox s)`. cs-runtime adds
+  `cs-sandbox-wasm` as a feature-gated dep. Tests: eval
+  through the sandbox returns correct values; `adversarial`
+  preset's fuel exhaustion fires; `plugin` preset's wall-clock
+  fires; hygiene preset preserves state across two evals.
+
+- [ ] **Phase-4-sb iter 5 — L1 inside L2 (defense-in-depth):**
   guest's eval defaults to the SandboxConfig.imports
-  environment. Defense-in-depth verification: even when the
-  host accidentally grants too-much path access, restricted
-  `imports` in the guest prevent `(open-output-file ...)` from
-  resolving.
+  environment (using iter 2's `environment`). Defense-in-depth
+  verification test: even when the host accidentally grants
+  too-much path access, restricted `imports` in the guest
+  prevent `(open-output-file ...)` from resolving at expand
+  time. Both `environment` and `make-namespace` are usable
+  inside the sandboxed guest (per L1.1/L1.2 surface).
 
-- [ ] **Phase-4-sb iter 4:** Scheme builtins —
-  `(make-wasm-sandbox ...)`, `(sandbox-eval s expr)`,
-  `(sandbox-config s)`, `(reset-sandbox s)`. Wire to the L2
-  crate. Cs-runtime adds `cs-sandbox-wasm` as a feature-gated
-  dep.
+- [ ] **Phase-4-sb iter 6 — measurements:** text-protocol RTT vs
+  hypothetical component-call RTT on representative workloads
+  (1k-eval REPL loop, single-eval cold start, big-result
+  round-trip). Decide whether iter 7's component-model
+  migration is worth it. If yes, iter 7 ships the WIT bindings;
+  if no, document the decision in this ADR and call iter 6
+  the close of the work.
 
-- [ ] **Phase-4-sb iter 5 (stretch):** preloaded user libraries
-  in the sandbox; cross-eval state preservation toggle;
-  diagnostic improvements.
+- [ ] **Phase-4-sb iter 7 (conditional):** migrate to wasmtime
+  component-model bindings if iter-6 measurements show
+  text-protocol RTT is a bottleneck. Replace stdin/stdout
+  framing with WIT-typed function calls; preserve the
+  SandboxConfig + SandboxError surface unchanged.
 
-- [ ] **Phase-4-sb iter 6 (stretch):** wasi-sockets opt-in for
-  network access when wasmtime's Preview 2 sockets land
-  stable.
+- [ ] **Phase-4-sb iter 8 (stretch):** preloaded user libraries
+  in the sandbox (`SandboxConfig.preload: Vec<(name,
+  source)>`); cross-eval continuation handles (currently
+  intra-eval only); diagnostic improvements.
 
 ## References
 
@@ -589,3 +815,17 @@ and don't claim sandboxing.
 - WASI Preview 1 specification — the capability model we lean on
 - Wasmtime fuel and resource-limit docs — primary references
   for L2 implementation
+- Wasmtime LTS policy
+  (https://bytecodealliance.org/articles/wasmtime-lts) —
+  rationale for the 36.x pin
+- WASI 0.2 status
+  (https://eunomia.dev/blog/2025/02/16/wasi-and-the-webassembly-component-model-current-status/)
+  — confirmation that component model + wasi-sockets are stable
+- R6RS §15.2 environment semantics
+  (https://www.r6rs.org/final/html/r6rs-lib/r6rs-lib-Z-H-17.html)
+  — basis for the `environment` constructor's immutable
+  snapshot behavior
+- Racket namespace docs
+  (https://docs.racket-lang.org/reference/Namespaces.html) —
+  basis for the `make-namespace` constructor's live-mutable
+  behavior
