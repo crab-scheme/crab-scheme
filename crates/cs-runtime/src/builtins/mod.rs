@@ -2386,45 +2386,72 @@ fn b_syntax_column(args: &[Value]) -> Result<Value, String> {
 
 // ---- R6RS++ §12 (#118) Iter A — syntax-case foundation surface ----
 //
-// First-class SyntaxObjects don't exist yet; identifiers are bare
-// `Value::Symbol`s. These builtins pin the public surface so user
-// code and downstream iters can target it now. Iter E replaces the
-// symbol-eq stand-ins with proper mark-aware comparisons.
+// As of Phase 1.5 Iter A, `Value::Identifier { name, mark }` exists
+// alongside `Value::Symbol`. The hygiene surface widens to accept
+// either kind where R6RS calls for "identifier"; `symbol?` stays
+// strict (Symbol only) per R6RS. Iter 1.5.D upgrades the equality
+// builtins to compare marks.
 
 /// `(identifier? v)` — R6RS §11.18. True iff `v` is a syntax object
-/// representing an identifier. Today: true iff `v` is a `Symbol`,
-/// because identifiers are just symbols in our current model. When
-/// first-class SyntaxObjects land (Iter E), this widens to also
-/// recognize a SyntaxObject wrapping a symbol.
+/// representing an identifier. Accepts either a bare `Symbol` (which
+/// behaves as an identifier with implicit mark 0) or an explicit
+/// `Identifier { name, mark }` value produced by syntax-case
+/// template instantiation.
 fn b_identifier_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("identifier?", "1", args.len()));
     }
-    Ok(Value::Boolean(matches!(args[0], Value::Symbol(_))))
+    Ok(Value::Boolean(matches!(
+        args[0],
+        Value::Symbol(_) | Value::Identifier { .. }
+    )))
 }
 
-/// `(syntax->datum stx)` — R6RS §12.6. Strip syntax-object marks and
-/// return the underlying datum. Today: identity, since datums and
-/// syntax objects are not yet distinguished. Future: walks a wrapped
-/// SyntaxObject and returns its inner Value with marks discarded.
+/// `(syntax->datum stx)` — R6RS §12.6. Strip syntax-object marks
+/// and return the underlying datum. For an `Identifier { name, mark }`
+/// returns the bare `Symbol(name)` (mark discarded). For other
+/// values (including bare Symbol), pass through unchanged --
+/// they're already datum-shaped.
+///
+/// Compound structures (pairs, vectors) containing identifiers
+/// recurse: each Identifier leaf is stripped. Iter 1.5.B ships
+/// the leaf-only version; the recursive walker lands once the
+/// 1.5.C template instantiator creates compound structures
+/// with embedded identifiers.
 fn b_syntax_to_datum(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("syntax->datum", "1", args.len()));
     }
-    Ok(args[0].clone())
+    Ok(strip_identifier_marks(&args[0]))
 }
 
-/// `(datum->syntax template-id datum)` — R6RS §12.6. Stamp `datum`
-/// with the lexical context of `template-id` so introduced
-/// identifiers resolve correctly. Today: returns `datum` unchanged;
-/// the `template-id` argument is type-checked (must satisfy
-/// `identifier?`) but its context isn't yet propagated. Future iters
-/// thread the template-id's marks onto every identifier in `datum`.
+/// Recursive helper for `syntax->datum`. Walks the value
+/// converting each `Identifier { name, .. }` leaf to
+/// `Symbol(name)`. Pair / Vector recurse; other variants pass
+/// through. Currently used for the leaf case only.
+fn strip_identifier_marks(v: &Value) -> Value {
+    match v {
+        Value::Identifier { name, .. } => Value::Symbol(*name),
+        // Pair / Vector recursion deferred until the C-iter
+        // creates compound structures containing identifiers;
+        // for the Iter 1.5.B surface, leaf identifiers are the
+        // observable case.
+        _ => v.clone(),
+    }
+}
+
+/// `(datum->syntax template-id datum)` — R6RS §12.6. Stamp
+/// `datum` with the lexical context of `template-id` so introduced
+/// identifiers resolve correctly. Accepts either a bare `Symbol`
+/// (treated as having mark 0) or an `Identifier` as `template-id`.
+/// Returns `datum` unchanged today; Iter 1.5.F wires the
+/// recursive context-stamping that converts bare symbols inside
+/// `datum` to Identifier values carrying the template's mark.
 fn b_datum_to_syntax(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("datum->syntax", "2", args.len()));
     }
-    if !matches!(args[0], Value::Symbol(_)) {
+    if !matches!(args[0], Value::Symbol(_) | Value::Identifier { .. }) {
         return Err(type_err("datum->syntax", "identifier", &args[0]));
     }
     Ok(args[1].clone())
