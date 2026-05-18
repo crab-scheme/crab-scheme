@@ -69,9 +69,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::marker::PhantomData;
-use std::num::NonZeroU64;
+use std::num::NonZeroU32;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use bumpalo::Bump;
 
@@ -79,14 +79,18 @@ use bumpalo::Bump;
 /// debug builds and to disambiguate handles from sibling
 /// regions.
 ///
-/// The id is a 64-bit non-zero counter minted from a global
-/// atomic. Roll-over after 2⁶³ regions per process is a
-/// theoretical concern only — realistically the counter never
-/// approaches u64::MAX in any program.
+/// The id is a 32-bit non-zero counter minted from a global
+/// atomic. Sized to u32 so it fits the `region_id` field of
+/// [`RegionSlot`] — that field stores the owning region's id
+/// inline so `from_raw_jit_region` can reconstruct
+/// `GcRepr::Region` from a raw slot pointer alone (no
+/// thread-local lookup required). Roll-over after 2³² regions
+/// per process is a theoretical concern only — realistically
+/// the counter never approaches u32::MAX in any program.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-pub struct RegionId(NonZeroU64);
+pub struct RegionId(NonZeroU32);
 
-static REGION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+static REGION_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 impl RegionId {
     /// Mint a fresh `RegionId` distinct from every other id
@@ -95,12 +99,21 @@ impl RegionId {
         let raw = REGION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         // Counter starts at 1 and only ever increments; the
         // NonZero invariant holds.
-        RegionId(NonZeroU64::new(raw).expect("RegionId counter overflowed to 0"))
+        RegionId(NonZeroU32::new(raw).expect("RegionId counter overflowed to 0"))
     }
 
-    /// Raw u64 form for diagnostic printing.
-    pub fn as_u64(self) -> u64 {
+    /// Raw u32 form for diagnostic printing and `RegionSlot`
+    /// storage.
+    pub fn as_u32(self) -> u32 {
         self.0.get()
+    }
+
+    /// Construct a `RegionId` from a raw u32 (as read from a
+    /// `RegionSlot`'s in-arena `region_id` field). Returns
+    /// `None` if the value is zero (the sentinel for "no
+    /// region" / corrupted slot).
+    pub fn from_raw_u32(raw: u32) -> Option<Self> {
+        NonZeroU32::new(raw).map(RegionId)
     }
 }
 
@@ -114,16 +127,25 @@ impl RegionId {
 /// **Reclamation is driven by the owning `Region`'s drop, not
 /// by this count reaching zero.**
 ///
-/// Layout: `#[repr(C)]` ensures the strong/_pad fields come
-/// before the payload at a predictable offset. The 4-byte
-/// `_pad` keeps `value` 8-byte aligned for the common case of
-/// `T` containing pointers; types with stricter alignment
-/// (>8) are over-aligned by the arena's alignment guarantee.
+/// Layout: `#[repr(C)]` ensures the header fields come before
+/// the payload at predictable offsets. `strong` + `region_id`
+/// together are 8 bytes, keeping `value` 8-byte aligned for
+/// the common case of `T` containing pointers; types with
+/// stricter alignment (>8) are over-aligned by the arena's
+/// alignment guarantee.
+///
+/// `region_id` carries the raw u32 from the owning
+/// [`RegionId`]. [`Gc::from_raw_jit_region`] (in `rc_only.rs`)
+/// reads this field to reconstruct a Region-arm `GcRepr`
+/// from a raw slot pointer alone — needed because the VM's
+/// nanbox encoding (low-bit region flag on pointer-typed
+/// tags) round-trips raw pointers without preserving the
+/// `RegionId` separately.
 #[repr(C)]
 #[allow(dead_code)] // wired into Gc<T> in iter 2 of the region-memory spec
 pub(crate) struct RegionSlot<T: ?Sized> {
     pub(crate) strong: Cell<u32>,
-    _pad: u32,
+    pub(crate) region_id: u32,
     pub(crate) value: T,
 }
 
@@ -276,7 +298,7 @@ impl Region {
     pub(crate) fn alloc<T: 'static>(&self, value: T) -> NonNull<RegionSlot<T>> {
         let slot = self.arena.alloc(RegionSlot {
             strong: Cell::new(1),
-            _pad: 0,
+            region_id: self.id.as_u32(),
             value,
         });
         // `bumpalo::Bump::alloc` returns `&mut T` with a
@@ -335,7 +357,7 @@ mod tests {
     #[test]
     fn region_id_is_nonzero() {
         let r = Region::new();
-        assert!(r.id().as_u64() > 0);
+        assert!(r.id().as_u32() > 0);
     }
 
     #[test]

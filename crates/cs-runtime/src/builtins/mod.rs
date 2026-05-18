@@ -3348,16 +3348,15 @@ fn b_newline(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
 ///
 /// # Tier support
 ///
-/// - **Walker tier**: fully supported (return any value
-///   shape; `to_rc_deep` handles the escape cleanly).
-/// - **VM/JIT tier**: works for non-heap return values
-///   (numbers, booleans, symbols). Heap returns from the
-///   VM dispatcher currently SIGSEGV after region drop —
-///   the VM's value-passing chain holds parallel handles
-///   the auto-promote doesn't reach. Tracked as a known
-///   limitation; for now, use the walker tier (`--tier
-///   walker`) when returning Pair/Vector from a
-///   with-region body.
+/// Fully supported on walker, VM, and JIT tiers as of the
+/// nanbox region-tag fix in `cs_vm::vm` (low bit of the
+/// pointer-typed nanbox payload distinguishes Rc/Region
+/// origin; decode routes through `Gc::from_raw_jit_region`
+/// when set). `to_rc_deep` still runs on return to promote
+/// any handles in the result to Rc — once layer-5 lowering
+/// auto-emits `with-region` around bounded scopes, the
+/// promote can be elided where the return value is provably
+/// non-heap.
 #[cfg(feature = "regions")]
 fn b_with_region(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 1 {

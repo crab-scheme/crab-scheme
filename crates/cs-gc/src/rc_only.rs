@@ -417,7 +417,40 @@ impl<T: Sized + 'static> Gc<T> {
         Gc(GcRepr::Rc(unsafe { Rc::from_raw(ptr as *const T) }))
     }
 
-    /// Bump the strong count for a raw handle without
+    /// Reconstitute a region-backed `Gc<T>` from a raw slot
+    /// pointer produced by [`into_raw_jit`] on a Region-arm
+    /// handle. Reads the `region_id` field of the in-arena
+    /// slot to restore the GcRepr::Region's id.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be the result of a matching `into_raw_jit`
+    /// call on a Region-backed `Gc<T>` for the same `T`, and
+    /// the slot must still be alive (the owning region not
+    /// dropped). Consumes one strong count from the in-arena
+    /// refcount header.
+    ///
+    /// Used by the VM nanbox decoder when the low payload
+    /// bit indicates the pointer was Region-allocated (see
+    /// `cs_vm::vm::NanboxValue::from_value` / `to_value`).
+    #[cfg(feature = "regions")]
+    pub unsafe fn from_raw_jit_region(ptr: *const ()) -> Self
+    where
+        T: Sized,
+    {
+        let slot_ptr = ptr as *const crate::region::RegionSlot<T>;
+        // SAFETY: slot is live per the function's contract;
+        // the region_id field is u32-aligned within the slot.
+        let raw_id = unsafe { (*slot_ptr).region_id };
+        let region_id = crate::region::RegionId::from_raw_u32(raw_id)
+            .expect("from_raw_jit_region: slot region_id was 0 (corrupted slot or wrong tag)");
+        Gc(GcRepr::Region {
+            ptr: std::ptr::NonNull::new(slot_ptr as *mut _).expect("from_raw_jit_region: null ptr"),
+            region_id,
+        })
+    }
+
+    /// Bump the strong count for a raw Rc handle without
     /// consuming a reference.
     ///
     /// # Safety
@@ -425,11 +458,33 @@ impl<T: Sized + 'static> Gc<T> {
     /// `ptr` must point at a live allocation produced by
     /// [`into_raw_jit`] on the same `T`.
     ///
-    /// Always interprets `ptr` as an Rc-backed allocation —
-    /// see [`from_raw_jit`] for the rationale (the
-    /// JIT/AOT ABI uses Rc only).
+    /// Interprets `ptr` as an Rc-backed allocation — for
+    /// Region-backed pointers, use [`raw_incref_region`].
     pub unsafe fn raw_incref(ptr: *const ()) {
         unsafe { Rc::increment_strong_count(ptr as *const T) }
+    }
+
+    /// Bump the in-arena strong count of a region-backed
+    /// raw slot pointer. Counterpart to [`raw_incref`] for
+    /// the Region arm.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a live `RegionSlot<T>` pointer (slot
+    /// still alive, region not dropped).
+    #[cfg(feature = "regions")]
+    pub unsafe fn raw_incref_region(ptr: *const ())
+    where
+        T: Sized,
+    {
+        let slot_ptr = ptr as *const crate::region::RegionSlot<T>;
+        // SAFETY: slot alive per contract; strong is a Cell<u32>.
+        unsafe {
+            let slot = &*slot_ptr;
+            let cur = slot.strong.get();
+            slot.strong
+                .set(cur.checked_add(1).expect("raw_incref_region: u32 overflow"));
+        }
     }
 }
 

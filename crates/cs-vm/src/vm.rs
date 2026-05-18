@@ -886,12 +886,82 @@ pub fn nb_make(tag: u64, payload: u64) -> u64 {
     NB_SIGNATURE_BITS | ((tag & 0xF) << NB_TAG_SHIFT) | (payload & NB_PAYLOAD_MASK)
 }
 
+/// Bit 0 of pointer-typed nanbox payloads: 0 = Rc-allocated,
+/// 1 = Region-allocated. The pointer-typed tags (NB_TAG_PAIR..
+/// NB_TAG_PROMISE, NB_TAG_GC_VALUE) carry an 8-byte-aligned
+/// pointer in the upper 46 bits; bit 0 is always zero in the
+/// raw pointer, so we repurpose it to distinguish the GcRepr
+/// arm.
+///
+/// Set by [`nb_encode_gc_ptr`] on encode; tested by
+/// [`nb_decode_gc_ptr`] on decode to route to
+/// `Gc::from_raw_jit` (Rc) or `Gc::from_raw_jit_region`
+/// (Region). Closes the SIGSEGV-on-with-region root cause —
+/// previously `from_raw_jit` always interpreted region
+/// pointers as Rc allocations, hitting allocator UB on drop.
+pub const NB_REGION_FLAG: u64 = 1;
+
+/// Encode a `Gc<T>` raw-jit pointer into the low 47 bits of a
+/// pointer-typed nanbox payload, tagging bit 0 with the
+/// Rc/Region origin flag.
+///
+/// Caller must invoke before `Gc::into_raw_jit` consumes the
+/// handle. `is_region` is `Gc::is_region(&g)`.
+///
+/// Safety: the returned u64 is suitable for `nb_make(tag, ...)`.
+/// The decoder must invert via [`nb_decode_gc_ptr`].
+#[inline]
+pub fn nb_encode_gc_ptr(raw_ptr: u64, is_region: bool) -> u64 {
+    debug_assert_eq!(
+        raw_ptr & NB_REGION_FLAG,
+        0,
+        "Gc raw pointer must be 8-byte aligned; low bit reserved for region flag"
+    );
+    raw_ptr | (is_region as u64)
+}
+
+/// Decode a pointer-typed nanbox payload into `(raw_ptr,
+/// is_region)`. Strips the region flag from bit 0.
+#[inline]
+pub fn nb_decode_gc_ptr(payload: u64) -> (*const (), bool) {
+    let is_region = (payload & NB_REGION_FLAG) != 0;
+    let ptr = (payload & !NB_REGION_FLAG) as *const ();
+    (ptr, is_region)
+}
+
 /// Sign-extend the low 47 bits of `payload` to a full i64. Used to
 /// decode the Fixnum tag (47-bit signed → i64).
 #[inline]
 pub fn nb_sign_extend_47(payload: u64) -> i64 {
     let shifted = (payload as i64) << 17;
     shifted >> 17
+}
+
+/// Dispatch a raw nanbox pointer + region flag to the right
+/// `Gc::from_raw_jit` variant. Pulled out so every pointer-
+/// typed decode arm in [`NanboxValue::to_value`],
+/// [`vm_value_drop_gc`], etc. shares one impl.
+///
+/// # Safety
+///
+/// `ptr` must be a live raw handle for `T` previously
+/// produced by `Gc::into_raw_jit`; `is_region` must reflect
+/// whether the originating `Gc<T>` was Region-backed.
+#[inline]
+pub(crate) unsafe fn decode_gc_handle<T: 'static + Sized>(
+    ptr: *const (),
+    is_region: bool,
+) -> cs_gc::Gc<T> {
+    #[cfg(feature = "regions")]
+    if is_region {
+        return unsafe { cs_gc::Gc::<T>::from_raw_jit_region(ptr) };
+    }
+    // Either Rc-backed, or the regions feature is off (then
+    // the encoder never sets the flag — debug-asserted in
+    // `nb_encode_gc_ptr` for the Rc path).
+    #[cfg(not(feature = "regions"))]
+    let _ = is_region;
+    unsafe { cs_gc::Gc::<T>::from_raw_jit(ptr) }
 }
 
 /// Encode an `f64` as a NaN-boxed `i64`. Real flonums map to their
@@ -1166,27 +1236,35 @@ impl NanboxValue {
             // so they fit in 47-bit signed canonical addresses
             // (and our 47-bit payload).
             Value::Pair(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(
                     ptr & !NB_PAYLOAD_MASK == 0,
                     "Pair ptr exceeds 47-bit payload"
                 );
-                NanboxValue(nb_make(NB_TAG_PAIR, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_PAIR, tagged) as i64)
             }
             Value::Vector(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_VECTOR, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_VECTOR, tagged) as i64)
             }
             Value::String(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_STRING, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_STRING, tagged) as i64)
             }
             Value::ByteVector(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_BYTEVECTOR, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_BYTEVECTOR, tagged) as i64)
             }
             // Phase 6 Stage B2 — thin-procedure NB encoding.
             // `Rc<dyn Procedure>` is a fat pointer (data + vtable,
@@ -1212,19 +1290,25 @@ impl NanboxValue {
                 NanboxValue(nb_make(NB_TAG_PROCEDURE, idx as u64) as i64)
             }
             Value::Hashtable(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_HASHTABLE, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_HASHTABLE, tagged) as i64)
             }
             Value::Port(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_PORT, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_PORT, tagged) as i64)
             }
             Value::Promise(g) => {
+                let is_region = cs_gc::Gc::is_region(&g);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 debug_assert!(ptr & !NB_PAYLOAD_MASK == 0);
-                NanboxValue(nb_make(NB_TAG_PROMISE, ptr) as i64)
+                let tagged = nb_encode_gc_ptr(ptr, is_region);
+                NanboxValue(nb_make(NB_TAG_PROMISE, tagged) as i64)
             }
             // Number variants outside Fixnum/Flonum (BigInt,
             // Rational, Complex). Wrap in Gc<Value> via the active
@@ -1284,23 +1368,26 @@ impl NanboxValue {
             // even if the caller clones the resulting Value, no deep
             // copy happens.)
             t if t == NB_TAG_PAIR => {
-                let g: cs_gc::Gc<cs_core::Pair> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
+                let g: cs_gc::Gc<cs_core::Pair> = decode_gc_handle(ptr, is_region);
                 Value::Pair(g)
             }
             t if t == NB_TAG_VECTOR => {
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
                 let g: cs_gc::Gc<std::cell::RefCell<Vec<Value>>> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                    decode_gc_handle(ptr, is_region);
                 Value::Vector(g)
             }
             t if t == NB_TAG_STRING => {
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
                 let g: cs_gc::Gc<std::cell::RefCell<String>> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                    decode_gc_handle(ptr, is_region);
                 Value::String(g)
             }
             t if t == NB_TAG_BYTEVECTOR => {
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
                 let g: cs_gc::Gc<std::cell::RefCell<Vec<u8>>> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                    decode_gc_handle(ptr, is_region);
                 Value::ByteVector(g)
             }
             // Phase 6 Stage B2 — thin-procedure decode. Symmetric
@@ -1315,18 +1402,18 @@ impl NanboxValue {
                 Value::Procedure(proc_table::take(idx))
             }
             t if t == NB_TAG_HASHTABLE => {
-                let g: cs_gc::Gc<cs_core::Hashtable> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
+                let g: cs_gc::Gc<cs_core::Hashtable> = decode_gc_handle(ptr, is_region);
                 Value::Hashtable(g)
             }
             t if t == NB_TAG_PORT => {
-                let g: cs_gc::Gc<cs_core::Port> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
+                let g: cs_gc::Gc<cs_core::Port> = decode_gc_handle(ptr, is_region);
                 Value::Port(g)
             }
             t if t == NB_TAG_PROMISE => {
-                let g: cs_gc::Gc<cs_core::Promise> =
-                    unsafe { cs_gc::Gc::from_raw_jit(payload as *const ()) };
+                let (ptr, is_region) = nb_decode_gc_ptr(payload);
+                let g: cs_gc::Gc<cs_core::Promise> = decode_gc_handle(ptr, is_region);
                 Value::Promise(g)
             }
             _t /* NB_TAG_GC_VALUE or unknown */ => {
@@ -1655,7 +1742,8 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
     let g: cs_gc::Gc<cs_core::Pair> = cs_core::Pair::new(car_v, cdr_v);
     let raw_ptr = cs_gc::Gc::into_raw_jit(g) as u64;
     debug_assert!(raw_ptr & !NB_PAYLOAD_MASK == 0);
-    NanboxValue(nb_make(NB_TAG_PAIR, raw_ptr) as i64).into_raw()
+    // Rc allocation — region flag (bit 0) stays clear.
+    NanboxValue(nb_make(NB_TAG_PAIR, nb_encode_gc_ptr(raw_ptr, false)) as i64).into_raw()
 }
 
 /// Gap B-3 cs-aot codegen: region-resolver init API.
@@ -1712,21 +1800,22 @@ pub unsafe extern "C" fn vm_alloc_pair_region_gc(
         let resolver: extern "C" fn() -> *const () = unsafe { std::mem::transmute(resolver_raw) };
         resolver()
     };
-    let g: cs_gc::Gc<cs_core::Pair> = if region_ptr.is_null() {
+    let (g, allocated_in_region): (cs_gc::Gc<cs_core::Pair>, bool) = if region_ptr.is_null() {
         #[cfg(debug_assertions)]
         eprintln!("vm_alloc_pair_region_gc: no region in scope — falling back to Rc allocation");
-        cs_core::Pair::new(car_v, cdr_v)
+        (cs_core::Pair::new(car_v, cdr_v), false)
     } else {
         // SAFETY: the resolver returns a ptr to a Region
         // kept alive by cs-runtime's REGION_STACK. The ptr
         // is valid for the duration of this call (the region
         // can't drop while we're inside this fn).
         let region: &cs_gc::Region = unsafe { &*(region_ptr as *const cs_gc::Region) };
-        cs_core::Pair::new_in(region, car_v, cdr_v)
+        (cs_core::Pair::new_in(region, car_v, cdr_v), true)
     };
     let raw_ptr = cs_gc::Gc::into_raw_jit(g) as u64;
     debug_assert!(raw_ptr & !NB_PAYLOAD_MASK == 0);
-    NanboxValue(nb_make(NB_TAG_PAIR, raw_ptr) as i64).into_raw()
+    NanboxValue(nb_make(NB_TAG_PAIR, nb_encode_gc_ptr(raw_ptr, allocated_in_region)) as i64)
+        .into_raw()
 }
 
 /// Gc-backed counterpart to `vm_pair_car`. Consumes the input Gc
@@ -6054,11 +6143,24 @@ pub unsafe extern "C" fn vm_value_clone_gc(r: i64) -> i64 {
     }
     // Pointer-typed (NB_TAG_PAIR..NB_TAG_GC_VALUE): bump the
     // strong refcount on the underlying `Gc<T>` allocation.
+    // Region pointers carry the `NB_REGION_FLAG` in payload
+    // bit 0 — route those through the Region-arm helper
+    // instead of `Rc::increment_strong_count` (which would
+    // corrupt the `RegionSlot`'s u32 header by interpreting
+    // it as an `RcInner.strong: usize`).
+    let (ptr, is_region) = nb_decode_gc_ptr(payload);
+    #[cfg(feature = "regions")]
+    if is_region {
+        unsafe { cs_gc::Gc::<Value>::raw_incref_region(ptr) };
+        return r;
+    }
+    #[cfg(not(feature = "regions"))]
+    let _ = is_region;
     // `Gc::<_>::raw_incref` is T-agnostic — it only touches the
     // strong-count header which lives at a fixed offset in the
     // `RcInner` regardless of T — so passing `Gc::<Value>` works
     // even when the actual T is `Pair` / `Vector` / etc.
-    unsafe { cs_gc::Gc::<Value>::raw_incref(payload as *const ()) };
+    unsafe { cs_gc::Gc::<Value>::raw_incref(ptr) };
     r
 }
 
@@ -6086,28 +6188,29 @@ pub unsafe extern "C" fn vm_value_drop_gc(r: i64) {
         proc_table::decref(payload as u32);
         return;
     }
-    let ptr = payload as *const ();
+    let (ptr, is_region) = nb_decode_gc_ptr(payload);
     match tag {
-        t if t == NB_TAG_PAIR => drop(unsafe { cs_gc::Gc::<cs_core::Pair>::from_raw_jit(ptr) }),
+        t if t == NB_TAG_PAIR => drop(unsafe { decode_gc_handle::<cs_core::Pair>(ptr, is_region) }),
         t if t == NB_TAG_VECTOR => {
-            drop(unsafe { cs_gc::Gc::<std::cell::RefCell<Vec<Value>>>::from_raw_jit(ptr) })
+            drop(unsafe { decode_gc_handle::<std::cell::RefCell<Vec<Value>>>(ptr, is_region) })
         }
         t if t == NB_TAG_STRING => {
-            drop(unsafe { cs_gc::Gc::<std::cell::RefCell<String>>::from_raw_jit(ptr) })
+            drop(unsafe { decode_gc_handle::<std::cell::RefCell<String>>(ptr, is_region) })
         }
         t if t == NB_TAG_BYTEVECTOR => {
-            drop(unsafe { cs_gc::Gc::<std::cell::RefCell<Vec<u8>>>::from_raw_jit(ptr) })
+            drop(unsafe { decode_gc_handle::<std::cell::RefCell<Vec<u8>>>(ptr, is_region) })
         }
         t if t == NB_TAG_HASHTABLE => {
-            drop(unsafe { cs_gc::Gc::<cs_core::Hashtable>::from_raw_jit(ptr) })
+            drop(unsafe { decode_gc_handle::<cs_core::Hashtable>(ptr, is_region) })
         }
-        t if t == NB_TAG_PORT => drop(unsafe { cs_gc::Gc::<cs_core::Port>::from_raw_jit(ptr) }),
+        t if t == NB_TAG_PORT => drop(unsafe { decode_gc_handle::<cs_core::Port>(ptr, is_region) }),
         t if t == NB_TAG_PROMISE => {
-            drop(unsafe { cs_gc::Gc::<cs_core::Promise>::from_raw_jit(ptr) })
+            drop(unsafe { decode_gc_handle::<cs_core::Promise>(ptr, is_region) })
         }
         // NB_TAG_GC_VALUE (and the reserved-but-routed-here
         // NB_TAG_PROCEDURE) — Gc<Value> wrap. Also the defensive
-        // default for any other pointer-typed tag.
+        // default for any other pointer-typed tag. GC_VALUE is
+        // always Rc (no region path constructs it).
         _ => drop(unsafe { cs_gc::Gc::<Value>::from_raw_jit(ptr) }),
     }
 }
