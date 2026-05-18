@@ -609,6 +609,16 @@ impl<T: ?Sized> Weak<T> {
     pub fn upgrade(&self) -> Option<Gc<T>> {
         self.inner.upgrade().map(|rc| Gc(GcRepr::Rc(rc)))
     }
+
+    /// Strong count of the underlying allocation, without
+    /// upgrading. Unlike `upgrade().map(|g| Gc::strong_count(&g))`,
+    /// this does NOT transiently add a strong reference — so the
+    /// returned value is the true reachable strong count, which
+    /// the Bacon-Rajan trial-deletion walk needs for correct
+    /// external-vs-internal classification (parallel-runtime C4.3).
+    pub fn strong_count(&self) -> usize {
+        self.inner.strong_count()
+    }
 }
 
 #[cfg(test)]

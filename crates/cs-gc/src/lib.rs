@@ -33,6 +33,9 @@ pub mod cycle;
 #[cfg(feature = "tracing-cycle-collector")]
 pub mod cycle_registry;
 
+#[cfg(feature = "tracing-cycle-collector")]
+pub mod cycle_collector;
+
 #[cfg(feature = "regions")]
 pub mod region;
 #[cfg(feature = "regions")]

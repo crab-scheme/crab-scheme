@@ -149,6 +149,22 @@ impl<T: CycleChildren> CycleChildren for Vec<T> {
     }
 }
 
+// Leaf blanket impls so primitives behind `Gc<T>` (e.g.
+// `Gc<i64>` in tests, or any future Gc-wrapped POD) can
+// register as candidates. No children to walk.
+macro_rules! cycle_children_leaf {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl CycleChildren for $t {
+                fn cycle_children(&self, _visit: &mut dyn FnMut(usize)) {}
+            }
+        )*
+    };
+}
+cycle_children_leaf!(
+    bool, char, u8, i8, u16, i16, u32, i32, u64, i64, usize, isize, f32, f64, String,
+);
+
 /// Per-candidate registry entry: the existing `AnyWeak` handle
 /// plus a Bacon-Rajan color (C4.1).
 ///
@@ -200,9 +216,19 @@ pub trait AnyWeak: Any {
     /// [`BreakCycle::try_break_cycle`] impl. Returns `true`
     /// if a slot was successfully demoted to `Weak`.
     fn upgrade_and_try_break(&self) -> bool;
+    /// parallel-runtime C4.2/C4.3: upgrade and walk
+    /// `CycleChildren`, emitting each child's heap address
+    /// to `visit`. Returns `true` if the walk happened.
+    fn upgrade_and_walk_children(&self, visit: &mut dyn FnMut(usize)) -> bool;
+    /// parallel-runtime C4.3: strong count of the underlying
+    /// allocation WITHOUT upgrading the Weak first.
+    /// `strong_count` above upgrades and is +1 biased; the BR
+    /// walk needs the true count for correct external-vs-
+    /// internal classification.
+    fn unbiased_strong_count(&self) -> usize;
 }
 
-impl<T: 'static + CycleVisit + BreakCycle> AnyWeak for Weak<T> {
+impl<T: 'static + CycleVisit + BreakCycle + CycleChildren> AnyWeak for Weak<T> {
     fn upgrade_addr(&self) -> Option<usize> {
         self.upgrade().map(|g| Gc::as_addr(&g))
     }
@@ -226,6 +252,18 @@ impl<T: 'static + CycleVisit + BreakCycle> AnyWeak for Weak<T> {
             Some(g) => g.try_break_cycle(),
             None => false,
         }
+    }
+    fn upgrade_and_walk_children(&self, visit: &mut dyn FnMut(usize)) -> bool {
+        match self.upgrade() {
+            Some(g) => {
+                g.cycle_children(visit);
+                true
+            }
+            None => false,
+        }
+    }
+    fn unbiased_strong_count(&self) -> usize {
+        Weak::strong_count(self)
     }
 }
 
@@ -266,7 +304,10 @@ thread_local! {
 /// invoke `try_break_cycle` per-candidate. Existing call
 /// sites in cs-runtime pass `Weak<Pair>` etc., which already
 /// have impls in cs-core.
-pub fn register_cycle_candidate<T: 'static + CycleVisit + BreakCycle>(addr: usize, weak: Weak<T>) {
+pub fn register_cycle_candidate<T: 'static + CycleVisit + BreakCycle + CycleChildren>(
+    addr: usize,
+    weak: Weak<T>,
+) {
     REGISTRY.with(|r| {
         let mut r = r.borrow_mut();
         // C4.1: newly-registered candidates start at PURPLE —
@@ -309,6 +350,71 @@ pub fn set_candidate_color(addr: usize, c: Color) {
             e.set_color(c);
         }
     });
+}
+
+// ---- parallel-runtime spec C4.3: helpers for cycle_collector ----
+
+/// Strong-reference count of the registered candidate at
+/// `addr`, or `None` if the address isn't registered. Returns
+/// `Some(0)` for a registered-but-dead candidate (the Weak no
+/// longer points to a live allocation).
+///
+/// Critically, this reads strong_count via the `Weak`'s native
+/// API (no upgrade, no transient strong-ref bump). The earlier
+/// `AnyWeak::strong_count` upgrades first and was +1 biased,
+/// which broke Bacon-Rajan's external-vs-internal
+/// classification. The BR walker needs the unbiased count.
+pub fn candidate_strong_count(addr: usize) -> Option<usize> {
+    REGISTRY.with(|r| {
+        let r = r.borrow();
+        r.get(&addr).map(|e| e.weak.unbiased_strong_count())
+    })
+}
+
+/// Walk the `CycleChildren` of the candidate at `addr`,
+/// calling `visit` with each child's heap address. Silently
+/// no-ops if the address isn't registered or its Weak has
+/// died. Used by the BR mark/scan/collect phases.
+pub fn walk_candidate_children(addr: usize, visit: &mut dyn FnMut(usize)) {
+    // Collect outside the borrow so the visitor can re-enter
+    // the registry (necessary for recursive walks).
+    let mut children: Vec<usize> = Vec::new();
+    REGISTRY.with(|r| {
+        if let Some(e) = r.borrow().get(&addr) {
+            e.weak.upgrade_and_walk_children(&mut |c| children.push(c));
+        }
+    });
+    for c in children {
+        visit(c);
+    }
+}
+
+/// Attempt to break a cycle at `addr` via the type's
+/// `BreakCycle::try_break_cycle` impl. Returns `true` if a
+/// slot was demoted to Weak.
+pub fn try_break_candidate(addr: usize) -> bool {
+    REGISTRY.with(|r| {
+        r.borrow()
+            .get(&addr)
+            .map(|e| e.weak.upgrade_and_try_break())
+            .unwrap_or(false)
+    })
+}
+
+/// Snapshot all registered candidate addresses (cheap copy of
+/// the `usize` keys). Used by the BR sweep to build the
+/// initial worklist of Purple candidates without holding the
+/// registry borrow during the walk.
+pub fn candidate_addresses() -> Vec<usize> {
+    REGISTRY.with(|r| r.borrow().keys().copied().collect())
+}
+
+/// Bump `SWEEP_BROKEN_COUNT` by one. Called by the BR
+/// collector when `collect_white` successfully breaks a
+/// cycle, so the cs-runtime sweep stats include collector-
+/// initiated reclamation alongside the layer-2 detector.
+pub fn bump_sweep_broken_count() {
+    SWEEP_BROKEN_COUNT.with(|c| c.set(c.get().saturating_add(1)));
 }
 
 /// Remove `addr` from the registry. Called when the
@@ -450,6 +556,10 @@ mod tests {
         fn visit_children(&self, _ctx: &mut crate::cycle::CycleVisitor) {}
     }
     impl BreakCycle for Leaf {}
+    // C4.2: test-stub also satisfies CycleChildren.
+    impl CycleChildren for Leaf {
+        fn cycle_children(&self, _visit: &mut dyn FnMut(usize)) {}
+    }
 
     #[test]
     fn empty_registry() {
