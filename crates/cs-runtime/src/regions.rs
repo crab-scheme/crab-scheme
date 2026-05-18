@@ -1,17 +1,61 @@
-//! Per-thread region-scope stack for lifetime-aware
-//! allocation dispatch (layer 5, escape-analysis spec iter 5).
+//! Region-scope stack for lifetime-aware allocation dispatch
+//! (layer 5, escape-analysis spec iter 5).
 //!
 //! When the typer's effect inferencer classifies an
 //! allocation as `Lifetime::Region(tag)`, the runtime needs a
 //! concrete `cs_gc::Region` to allocate into. This module
-//! maintains a per-thread stack of regions; each
-//! lifetime-aware expression enters the stack on
-//! introduction (via [`RegionScope::enter`]) and the
-//! corresponding RAII guard pops on drop.
+//! maintains a LIFO stack of regions; each lifetime-aware
+//! expression enters the stack on introduction (via
+//! [`RegionScope::enter`]) and the corresponding RAII guard
+//! pops on drop.
+//!
+//! # Dual-stack: TLS vs. tokio task-local
+//!
+//! There are *two* parallel stacks (parallel-runtime spec
+//! C3.1):
+//!
+//! - **TLS stack** ([`REGION_STACK_TLS`]) — per-thread; used
+//!   by single-threaded contexts (REPL, `crabscheme run`,
+//!   tests). This is the only stack when `feature = "actor"`
+//!   is off.
+//! - **Task-local stack** ([`REGION_STACK_TASK`]) — per
+//!   tokio task; used by actor bodies. An actor task can
+//!   migrate between tokio worker threads at `(receive)` /
+//!   reduction-budget yield boundaries; the task-local stack
+//!   travels with the task, so a `(with-region …)` opened on
+//!   worker A is still in scope when the actor resumes on
+//!   worker B.
+//!
+//! `RegionScope::enter` and [`current_region`] both check the
+//! task-local stack first (returning its top even when empty
+//! — see the note in [`current_region`] about not falling
+//! through to TLS), then fall back to TLS. The
+//! [`region_lookup_diagnostic`] helper exposes which stack
+//! was queried so callers (e.g., `alloc_dispatch::cons_in`)
+//! can format context-aware errors.
+//!
+//! # Known limitation: full task-local scope wiring
+//!
+//! `primop_spawn` (cs-runtime/src/builtins/beam.rs) **does
+//! not yet wrap actor bodies in
+//! `REGION_STACK_TASK.scope(…)`**. The infrastructure is in
+//! place and unit-tested synthetically, but live wiring is
+//! blocked on `cs_gc::Region: !Send` — a task-local holding
+//! `RefCell<Vec<Rc<Region>>>` makes the spawned Future
+//! `!Send`, which the multi_thread tokio runtime rejects.
+//! Until `Region` becomes Send (open follow-up), an actor's
+//! `(with-region …)` rides the TLS path; it works correctly
+//! as long as the body doesn't yield between push and pop
+//! and migrate to a worker with empty TLS. The diagnostic
+//! string in `alloc_dispatch::no_region_err` points users at
+//! this case explicitly when triggered from actor context.
+//!
+//! # Consumers
 //!
 //! The walker tier consults [`current_region`] in its
 //! allocation dispatch helpers; the VM does the same in
-//! `vm_alloc_pair_region_gc` etc. (iter 6).
+//! `vm_alloc_pair_region_gc` etc. (iter 6); AOT-emitted
+//! code via [`region_resolver_for_cs_vm`] (gap B-3).
 //!
 //! Gated on `feature = "regions"` (forwarded from cs-gc).
 
@@ -145,6 +189,40 @@ pub fn current_region() -> Option<Rc<Region>> {
         }
     }
     REGION_STACK_TLS.with(|s| s.borrow().last().cloned())
+}
+
+/// Which stack(s) currently hold any region, for error messages.
+/// Returned by [`region_lookup_diagnostic`] when the caller hit
+/// an empty-stack situation and needs to format a context-aware
+/// error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionLookupDiagnostic {
+    /// Not inside an actor task; the TLS stack is empty.
+    /// Most likely the user forgot `(with-region …)`.
+    NoTlsScope,
+    /// Inside an actor task and the task-local stack is empty.
+    /// Most likely the actor's body didn't open
+    /// `(with-region …)`, or it did but yielded across the
+    /// boundary on a build that doesn't yet have Send-Region
+    /// (see parallel-runtime C3.2's partial scope).
+    NoTaskScope,
+}
+
+/// Reports which stack the caller was queried against, so
+/// `no_region_err`-style error messages can point at the
+/// likely cause. Cheap (one `try_with` probe).
+pub fn region_lookup_diagnostic() -> RegionLookupDiagnostic {
+    #[cfg(feature = "actor")]
+    {
+        // try_with returns Ok inside an actor task even if the
+        // task-local stack is empty. That tells us we're in
+        // actor context and the user's `(with-region …)`
+        // either didn't run or was lost to migration.
+        if REGION_STACK_TASK.try_with(|_| ()).is_ok() {
+            return RegionLookupDiagnostic::NoTaskScope;
+        }
+    }
+    RegionLookupDiagnostic::NoTlsScope
 }
 
 /// Test/debug helper: current depth of the region stack.

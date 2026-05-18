@@ -41,8 +41,26 @@ use crate::regions::current_region;
 /// that reach this state are typer-bug-class — the inferencer
 /// must enter a `RegionScope` before emitting a
 /// `Lifetime::Region(_)` allocation.
+///
+/// Uses [`region_lookup_diagnostic`] to tailor the hint:
+/// from non-actor context the user most likely missed
+/// `(with-region …)`; from an actor task the task-local
+/// stack may have been lost across a yield boundary (see
+/// parallel-runtime C3.2 partial — full migration is gated
+/// on `cs_gc::Region: Send`).
 fn no_region_err(op: &'static str) -> String {
-    format!("{op}: Lifetime::Region(_) without enclosing RegionScope")
+    use crate::regions::{region_lookup_diagnostic, RegionLookupDiagnostic};
+    let hint = match region_lookup_diagnostic() {
+        RegionLookupDiagnostic::NoTlsScope => "no `(with-region …)` in scope on this thread",
+        RegionLookupDiagnostic::NoTaskScope => {
+            "inside an actor body but the task-local region stack is empty — \
+             either the actor's body opened no `(with-region …)`, or it did \
+             open one and the region was lost across an await/yield boundary \
+             (parallel-runtime C3.2 known limitation, gated on \
+             `cs_gc::Region: Send`)"
+        }
+    };
+    format!("{op}: Lifetime::Region(_) without enclosing RegionScope — {hint}")
 }
 
 /// `(cons car cdr)` lifetime-aware. Allocates a [`Pair`] in
@@ -181,6 +199,43 @@ mod tests {
         )
         .expect_err("expected error");
         assert!(err.contains("RegionScope"), "got: {err}");
+        // C3.3 diagnostic: TLS-context error names the user's
+        // most-likely cause (forgot `(with-region …)`).
+        assert!(err.contains("with-region"), "got: {err}");
+    }
+
+    /// parallel-runtime C3.3 — inside an actor task with an
+    /// empty task-local stack, the diagnostic should mention
+    /// the actor-context cause, not the TLS one.
+    #[cfg(feature = "actor")]
+    #[test]
+    fn cons_region_lifetime_inside_task_scope_errors_with_actor_hint() {
+        use crate::regions::REGION_STACK_TASK;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let stack = std::cell::RefCell::new(Vec::new());
+            REGION_STACK_TASK
+                .scope(stack, async {
+                    let err = cons_in(
+                        Lifetime::Region(RegionTag(0)),
+                        Value::Boolean(true),
+                        Value::Null,
+                    )
+                    .expect_err("expected error");
+                    assert!(
+                        err.contains("actor body"),
+                        "expected actor-context hint, got: {err}"
+                    );
+                    assert!(
+                        err.contains("Region: Send"),
+                        "expected Send-Region note, got: {err}"
+                    );
+                })
+                .await;
+        });
     }
 
     #[test]
