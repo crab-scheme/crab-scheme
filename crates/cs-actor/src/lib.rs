@@ -317,14 +317,35 @@ impl ActorSystemRef {
 impl ActorSystem {
     /// Create a new system with default settings.
     ///
-    /// B2 defaults:
-    /// - 1 tokio worker thread (spec: "single-threaded tokio runtime")
-    /// - Up to 4096 blocking threads (each spawned actor consumes one).
-    ///   B3 reverses this: many worker threads + async actors that
-    ///   share workers via cooperative yield.
+    /// Defaults (parallel-runtime spec C1.3):
+    /// - Worker threads = `std::thread::available_parallelism()`
+    ///   (host's logical core count, min 2). Honors the
+    ///   `CRABSCHEME_ACTOR_WORKERS` env var (numeric, or
+    ///   "physical" — not yet wired since `available_parallelism`
+    ///   already returns logical cores; physical-only would need
+    ///   the `num_cpus` crate).
+    /// - Up to 4096 blocking threads cap (legacy safety net for
+    ///   any caller still using `spawn` / `spawn_blocking`; the
+    ///   `spawn_async` and `spawn_sync_body_on_task` paths don't
+    ///   consume this budget once C2's yield hook fully releases
+    ///   workers between reductions).
+    ///
+    /// Pre-C1.3 default was `worker_threads(1)` — a single async
+    /// worker. Now M workers multiplex N async tasks, so the C2
+    /// yield-hook preemption has somewhere to migrate the
+    /// currently-yielded actor.
     pub fn new() -> Self {
+        let workers = std::env::var("CRABSCHEME_ACTOR_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2)
+            });
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            .worker_threads(workers)
             .max_blocking_threads(4096)
             .thread_name("cs-actor-blk")
             .enable_all()
