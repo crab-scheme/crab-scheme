@@ -347,6 +347,36 @@ impl<T: 'static> Gc<T> {
             region_id: region.id(),
         })
     }
+
+    /// Take ownership of the inner `T` when this is the only
+    /// strong holder, mirroring `Rc::into_inner`. Returns
+    /// `None` for shared handles and for region-backed
+    /// handles (the region owns the slot).
+    ///
+    /// Primary consumer is `Pair`'s iterative Drop, which
+    /// walks long cdr chains without recursing.
+    pub fn into_inner(this: Self) -> Option<T> {
+        // Fast-reject the region variant first — region drop
+        // owns reclamation; just let `this`'s natural Drop
+        // run to decrement the in-arena strong count.
+        #[cfg(feature = "regions")]
+        if matches!(this.0, GcRepr::Region { .. }) {
+            return None;
+        }
+        // Rc variant: suppress `Gc<T>`'s own Drop and move the
+        // inner GcRepr out so `Rc::into_inner` gets the strong
+        // count handoff. ManuallyDrop pins the wrapper;
+        // `ptr::read` extracts the GcRepr exactly once.
+        let this = std::mem::ManuallyDrop::new(this);
+        let repr = unsafe { std::ptr::read(&this.0) };
+        match repr {
+            GcRepr::Rc(rc) => Rc::into_inner(rc),
+            // Region case rejected above; this arm is
+            // unreachable but kept for exhaustiveness.
+            #[cfg(feature = "regions")]
+            GcRepr::Region { .. } => unreachable!("region fast-rejected above"),
+        }
+    }
 }
 
 // === JIT raw-handle ABI (ADR 0012 D-2) ===

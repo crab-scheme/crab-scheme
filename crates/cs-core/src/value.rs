@@ -202,6 +202,34 @@ impl Pair {
     }
 }
 
+impl Drop for Pair {
+    fn drop(&mut self) {
+        // Iteratively unlink the cdr chain. Without this,
+        // dropping a long list `(cons x1 (cons x2 …))` triggers
+        // recursive `Rc<Pair>::drop` calls — one stack frame per
+        // pair — and overflows the host stack at ~100k-500k
+        // elements (paraffins n=20 + macOS 8 MB default).
+        //
+        // The walk only descends when this Pair is the sole
+        // strong holder of the next cdr-Pair (`Gc::into_inner`
+        // returns `Some`). Shared pairs and region-backed pairs
+        // stop the walk — their other holders / the region drop
+        // is responsible for cleanup.
+        let mut cur = self.cdr.replace(Value::Null);
+        while let Value::Pair(gc) = cur {
+            match cs_gc::Gc::into_inner(gc) {
+                Some(mut pair) => {
+                    cur = std::mem::replace(pair.cdr.get_mut(), Value::Null);
+                    // `pair` drops at scope end: car drops
+                    // naturally (typically a leaf), cdr is
+                    // Null so no further recursion fires.
+                }
+                None => break,
+            }
+        }
+    }
+}
+
 /// Gap C-3: layer-4 sweep dispatch for `Pair`. Called by
 /// `cs_gc::cycle_registry::run_sweep` on every candidate.
 /// Tries cdr-cycle first (more common back-edge from list
