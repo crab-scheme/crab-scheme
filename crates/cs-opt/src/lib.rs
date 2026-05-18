@@ -522,6 +522,56 @@ pub fn clear_active_passes() {
     ACTIVE_PASSES.with(|c| c.borrow_mut().clear());
 }
 
+/// Run `f` with the active-pass list temporarily replaced by
+/// `names`. The previous list is restored when `f` returns —
+/// even if `f` panics (RAII guard). This is the lexical-scoping
+/// primitive that ADR 0014 §5 calls for: `parameterize`-like
+/// semantics where a file or block can locally set the pipeline
+/// configuration without bleeding into outer scope.
+///
+/// Nesting works: `with_scoped_active_passes([a, b], ||
+/// with_scoped_active_passes([c], || ...))` runs the inner body
+/// with `[c]`, restores `[a, b]` after the inner closure returns,
+/// then restores whatever was outside the outer closure.
+///
+/// install/remove inside `f` mutate the SCOPED list — their
+/// effects are visible only within `f` and are discarded on
+/// return. This matches the intended `parameterize` semantics
+/// where mutation inside the scope is local.
+///
+/// Note: ADR 0014 specified a true R6RS Scheme `parameter`
+/// (Phase-2E parameter machinery) for this. Migrating to that
+/// would require either making cs-opt depend on cs-runtime (a
+/// cycle) or inverting ownership so cs-runtime drives the list
+/// and cs-opt takes it as an argument to `run_active_pipeline`.
+/// That refactor is post-1.0 (#181-followup); this Rust-side
+/// scoped guard plus the Scheme `with-active-optimizer-passes`
+/// builtin in cs-runtime delivers the file-scoped behavior
+/// `#!lang` needs without the inversion.
+pub fn with_scoped_active_passes<F, R>(names: Vec<String>, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct Guard {
+        prev: Vec<String>,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // RAII restore — fires on panic too, matching
+            // parameterize's promise that the outer dynamic
+            // extent always sees its old value back.
+            let prev = std::mem::take(&mut self.prev);
+            ACTIVE_PASSES.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+    let _guard = ACTIVE_PASSES.with(|c| {
+        let mut list = c.borrow_mut();
+        let prev = std::mem::replace(&mut *list, names);
+        Guard { prev }
+    });
+    f()
+}
+
 /// Pipeline-integration entry point called by
 /// `cs-vm::jit_translate::bytecode_to_rir_full` just before the
 /// translated `Function` flows on to codegen.

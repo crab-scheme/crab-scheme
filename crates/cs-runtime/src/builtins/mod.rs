@@ -761,6 +761,10 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("install-optimizer-pass!", b_install_optimizer_pass),
         ("remove-optimizer-pass!", b_remove_optimizer_pass),
         ("installed-optimizer-passes", b_installed_optimizer_passes),
+        (
+            "with-active-optimizer-passes",
+            b_with_active_optimizer_passes,
+        ),
         // ADR 0015 L1.1 — environment predicate.
         ("environment?", b_environment_p),
         // ADR 0015 L1.2 — mutable namespace constructor + ops.
@@ -11070,6 +11074,65 @@ fn b_installed_optimizer_passes(args: &[Value], ctx: &mut EvalCtx) -> Result<Val
         .map(|s| Value::Symbol(ctx.syms.intern(&s)))
         .collect();
     Ok(Value::list(syms))
+}
+
+/// `(with-active-optimizer-passes '(name ...) thunk)` —
+/// run `(thunk)` with the optimizer's active-pass list scoped
+/// to the given names. The previous list is restored on
+/// return, even if `thunk` raises.
+///
+/// This is the closure-based stand-in for the ADR 0014 §5
+/// `parameterize`-over-`(active-passes)` design — install! /
+/// remove! mutate the SCOPED list inside the thunk, so their
+/// effects are local. Outside the thunk, the pre-call list is
+/// restored verbatim.
+///
+/// The names list must be a proper list of symbols; each name
+/// must validate against the global pass registry the same way
+/// `install-optimizer-pass!` does. A bad name fails the whole
+/// call (no scoped swap, no partial state).
+fn b_with_active_optimizer_passes(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("with-active-optimizer-passes", "2", args.len()));
+    }
+    let names_list = collect_proper_list("with-active-optimizer-passes", &args[0])?;
+    let mut names: Vec<String> = Vec::with_capacity(names_list.len());
+    for v in &names_list {
+        match v {
+            Value::Symbol(s) => names.push(ctx.syms.name(*s).to_string()),
+            _ => {
+                return Err(type_err(
+                    "with-active-optimizer-passes",
+                    "symbol (pass name)",
+                    v,
+                ))
+            }
+        }
+    }
+    // Validate names against the registry BEFORE entering the
+    // scoped guard so a typo doesn't leave us in an inconsistent
+    // state. Same check install-optimizer-pass! does.
+    {
+        let registry = cs_opt::PassRegistry::global()
+            .lock()
+            .map_err(|_| "with-active-optimizer-passes: registry mutex poisoned".to_string())?;
+        for name in &names {
+            if registry.get(name).is_none() {
+                return Err(format!(
+                    "with-active-optimizer-passes: unknown pass {:?}",
+                    name
+                ));
+            }
+        }
+    }
+    let thunk = args[1].clone();
+    // RAII guard fires on early return too — if apply_procedure
+    // returns Err, the guard restores the prev list on the
+    // way out via the `?` unwinding path. (Rust's `?` doesn't
+    // panic; the Drop runs because `_guard` is dropped at scope
+    // exit no matter how we leave.)
+    cs_opt::with_scoped_active_passes(names, || apply_procedure(&thunk, &[], ctx))
+        .map_err(|e| e.message())
 }
 
 // ---- SRFI-1 extras ----
