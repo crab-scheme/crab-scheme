@@ -6,11 +6,15 @@
 > ADR: `docs/adr/0014-countable-memory.md`, supersedes
 > `docs/adr/0006-gc-design.md`.
 
-This report closes iters 1–11 + iter 12a of the countable-memory
-spec. The Rc-only `Gc<T>` + synchronous cycle-collector path is
-now the production default workspace-wide; the M5 tracing
-infrastructure remains cfg-gated as a rollback path until iter
-12b deletes it.
+This report closes iters 1–12 of the countable-memory spec.
+The Rc-only `Gc<T>` + synchronous cycle-collector path is the
+sole heap representation workspace-wide; iter 12b (commit
+`938cf4d`, 2026-05-18) deleted the cfg-gated M5 tracing
+infrastructure (`crates/cs-gc/src/tracing.rs`, every
+`impl cs_gc::Trace for …` block, `Heap`/`Marker`/`Slot`,
+`JIT_ACTIVE_HEAP`, the `trace_leaf_proc!` macro, and the
+`countable-memory` Cargo feature itself). Net: -2825 / +110
+across 38 files; cs-gc shrinks 3013 → 2348 LoC (~22% reduction).
 
 ---
 
@@ -19,7 +23,7 @@ infrastructure remains cfg-gated as a rollback path until iter
 | Gate | Spec § | Result |
 |---|---|---|
 | FR-1: `Gc<T>` Rc-only representation | `requirements.md` | **✅** `crates/cs-gc/src/rc_only.rs` (325 LOC) replaces `Slot<T>` wrapper with a thin `Rc<T>` newtype. |
-| FR-2: tracing infrastructure removed from steady-state | `requirements.md` | **Partial** — cfg-gated out of the default build. Full deletion is iter 12b (point of no return). |
+| FR-2: tracing infrastructure removed from steady-state | `requirements.md` | **✅** iter 12b deleted `tracing.rs`, every `impl Trace`, `Heap`/`Marker`/`Slot`, `JIT_ACTIVE_HEAP`, and the `countable-memory` Cargo feature flag itself. |
 | FR-3: synchronous cycle detector at mutation sites | `requirements.md` | **✅** `cs_gc::cycle` + wiring in `b_set_car` / `b_set_cdr` / `b_vector_set` / `b_hashtable_set`. Detection counter accessible via `cs_runtime::countable_memory_cycle::cycle_detection_count`. |
 | FR-4: deterministic port finalization | `requirements.md` | **✅** `crates/cs-runtime/tests/port_finalization.rs` — 2 tests asserting file flush + close on `Rc<Port>` drop without `(close-port)` or explicit collect. |
 | FR-5: continuation / closure cycle prevention | `requirements.md` | **Partial** — iter-6 identity-dedup (`CycleVisitor::visit_addr` on Frame/Env/Closure/VmClosure) bounds the detector so cycle detection terminates. Closure-self-binding cycles (`(define (f) f)`) still leak refcount-wise pending iter 7.1's storage-slot refactor. The originally-planned iter 8 `Weak<Frame>` refactor was retired as architecturally incompatible — see ADR 0014. |
@@ -168,7 +172,7 @@ prerequisites for the iter-11 ship:
 | 7.1.x.z | **Partial — primitives shipped, runtime wiring deferred.** Investigated in-walk back-edge identification (CycleVisit::Pair detects child==root and demotes that slot directly). The cs_gc::cycle API gained `CycleVisitor::root_addr` / `set_found` / `mark_broken` / `is_broken` and a `check_and_break_walk(root, |r, broken|)` variant. The approach reclaimed nested closure-env structures too aggressively in deeply-recursive metacircular workloads (the `(define go ...)` inside `(define sum-up-to ...)` body) — full Bacon-Rajan trial deletion with subgraph reconstruction is the right approach. Runtime wiring reverted to iter 7.1.x.y's caller-supplied baseline; the cycle.rs primitives stay for the future full implementation. See ADR 0014 §"iter 7.1.x.z" for the analysis. |
 | 7.1.y | Vector and Hashtable tombstone structural break. **Scope reduced** in this milestone to documentation-only deferral: cycles via `vector-set!` / `hashtable-set!` are rare in idiomatic Scheme; the detector already finds them via CycleVisit; only refcount reclamation is missing. Refactor cost is 162 sites (Vector) + ~50 (Hashtable). Pair covers the common cycle pattern. Future iter lands the equivalent infrastructure on demand. |
 | 8 | `Frame.parent` / `Continuation` parent chain refactored to `Weak<Frame>`. Continuation captures keep the leaf strong; ancestors walked via `upgrade()`. | **Retired — not applicable to CrabScheme's walker architecture.** Attempted during iter 8; the walker's TCO loop overwrites `cur_env = new_env` (eval.rs:328) which drops the only strong reference to the outer scope. A weak parent chain dangles on the next lookup. CrabScheme's `Continuation` is also `{ id: u64 }`, not a frame-capturing struct, so the rationale that justifies the refactor doesn't hold. The actual closure-self-binding cycle (`(define (f) f)`) is closed by iter 7.1's storage-slot refactor instead. See ADR 0014 §"Iter 8 architectural mismatch". |
-| 12b | Delete the cfg-gated tracing path entirely (point of no return). Removes `tracing.rs`, the `Trace` impls, `Heap`/`Marker`, `JIT_ACTIVE_HEAP`, the `trace_leaf_proc!` macro. Slims cs-gc per the < 150 LOC spec target. | Should land after iter 7.1 and 8 are mature enough that no rollback path is needed. The cfg-gated tracing code is dead weight today (production default doesn't include it) but is rollback insurance. |
+| 12b | **Shipped** at commit `938cf4d` (2026-05-18). Deleted the cfg-gated tracing path entirely: `crates/cs-gc/src/tracing.rs` (650 LoC), every `impl cs_gc::Trace for …` block (Pair/Hashtable/Port/Promise/Parameter/Value/VmClosure/Bindings/Env/VmAotClosure + the `trace_leaf_proc!` expansion), `Heap`/`Marker`/`Slot`/`add_root`/`set_auto_collect`/`collect`/`trace_leaf!`/`Runtime::heap`, `vm::JIT_ACTIVE_HEAP` + set/clear/current accessors, the `trace_leaf_proc!` macro, and the `countable-memory` Cargo feature flag itself across cs-gc / cs-core / cs-vm / cs-runtime / cs-cli / cs-jit-cranelift + the workspace shared dep. Seven `gc_*.rs` test files that were `#![cfg(not(feature = "countable-memory"))]` deleted alongside. Net: -2825 / +110 across 38 files; cs-gc shrinks 3013 → 2348 LoC (~22% reduction). |
 
 ---
 

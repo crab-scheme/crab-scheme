@@ -274,9 +274,21 @@ synchronous detector closes the gap with bounded per-call cost.
   refactored to `Weak<Frame>` for structural cycle prevention.
   **Not applicable — closed as won't-do.** See "Iter 8
   architectural mismatch" below.
-- [ ] iter 12b — delete the cfg-gated tracing path entirely
-  (point of no return; gates on iter 7.1 being mature enough
-  that no rollback path is needed).
+- [x] iter 12b — delete the cfg-gated tracing path entirely
+  (commit `938cf4d`, 2026-05-18). Removed
+  `crates/cs-gc/src/tracing.rs` (650 lines), every
+  `impl cs_gc::Trace for …` block, `Heap`/`Marker`/`Slot`,
+  `JIT_ACTIVE_HEAP` + its accessors, the `trace_leaf_proc!`
+  macro and its invocation, and the seven `gc_*.rs` test files
+  that were `#![cfg(not(feature = "countable-memory"))]`. The
+  `countable-memory` Cargo feature itself was removed from
+  every crate's `[features]` block (cs-gc, cs-core, cs-vm,
+  cs-runtime, cs-cli, cs-jit-cranelift, the workspace shared
+  cs-runtime dep). Layer 2 is now unconditional; `regions`,
+  `tracing-cycle-collector`, `jit`, `ffi-{trait,dynamic}`,
+  `aot`, and `actor` remain as the surviving optional flags.
+  Net diff: -2825 / +110 across 38 files; cs-gc shrinks 3013
+  → 2348 LoC (~22% reduction).
 
 ### Iter 8 architectural mismatch
 
