@@ -28,6 +28,13 @@ struct Cli {
     #[arg(long = "color", value_name = "WHEN", default_value = "auto")]
     color: String,
 
+    /// Restrict (environment ...) to these import specs (ADR 0015 L1 sandbox).
+    /// Pass once per spec, e.g. --sandbox-imports '(rnrs base)'.
+    /// When set, any nested (environment ...) call naming an unlisted library
+    /// returns an error. Used by SandboxRuntime; not intended for end users.
+    #[arg(long = "sandbox-imports", value_name = "SPEC")]
+    sandbox_imports: Vec<String>,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -185,7 +192,12 @@ fn main() -> ExitCode {
     let color = color_enabled(&cli.color);
 
     if let Some(expr) = cli.expr {
-        return run_eval(&expr, via_vm, with_jit, color);
+        let sandbox_imports = if cli.sandbox_imports.is_empty() {
+            None
+        } else {
+            Some(cli.sandbox_imports)
+        };
+        return run_eval(&expr, via_vm, with_jit, color, sandbox_imports);
     }
 
     match cli.cmd {
@@ -1773,7 +1785,13 @@ fn eval_with_tier(
     }
 }
 
-fn run_eval(src: &str, via_vm: bool, with_jit: bool, color: bool) -> ExitCode {
+fn run_eval(
+    src: &str,
+    via_vm: bool,
+    with_jit: bool,
+    color: bool,
+    sandbox_imports: Option<Vec<String>>,
+) -> ExitCode {
     let mut rt = Runtime::new();
     if with_jit {
         #[cfg(feature = "jit")]
@@ -1787,6 +1805,7 @@ fn run_eval(src: &str, via_vm: bool, with_jit: bool, color: bool) -> ExitCode {
             return ExitCode::from(1);
         }
     }
+    rt.set_sandbox_import_policy(sandbox_imports);
     match eval_with_tier(&mut rt, "<command-line>", src, via_vm) {
         Ok(v) => {
             if !matches!(v, Value::Unspecified) {

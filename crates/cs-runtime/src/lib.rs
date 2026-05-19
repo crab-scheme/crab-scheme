@@ -108,6 +108,11 @@ pub struct Runtime {
     /// programs).
     pub(crate) typer_hints_by_lambda_id:
         std::cell::RefCell<std::collections::HashMap<u32, Vec<cs_rir::Type>>>,
+    /// L1 sandbox import-set policy (ADR 0015 issue #15).
+    /// When `Some`, every `(environment ...)` call rejects import specs
+    /// not in this list. Set via [`Runtime::set_sandbox_import_policy`]
+    /// before calling `eval_str`. `None` means unrestricted.
+    sandbox_import_policy: Option<Vec<String>>,
 }
 
 /// Opaque handle for a [`Pinned`] slot. See [`Runtime::pin`].
@@ -1765,7 +1770,21 @@ impl Runtime {
             jit_poisoned: Rc::new(Cell::new(false)),
             command_line: None,
             typer_hints_by_lambda_id: std::cell::RefCell::new(std::collections::HashMap::new()),
+            sandbox_import_policy: None,
         }
+    }
+
+    /// Restrict `(environment ...)` calls to the given import specs.
+    ///
+    /// When set, any call to `(environment '(some library))` that names a
+    /// library not in `imports` returns an error that explicitly identifies
+    /// the disallowed library. Pass `None` to remove the restriction.
+    ///
+    /// Intended for the L1 sandbox wrapper: `SandboxRuntime` calls this
+    /// before `eval_str` so the guest cannot widen the approved import set
+    /// via nested `(eval ... (environment ...))` calls (ADR 0015 issue #15).
+    pub fn set_sandbox_import_policy(&mut self, imports: Option<Vec<String>>) {
+        self.sandbox_import_policy = imports;
     }
 
     /// Install typer-derived param-type hints (Phase 5.4). Keyed
@@ -2105,6 +2124,7 @@ impl Runtime {
         drop(expander);
         drop(resolver);
         let mut ctx = EvalCtx::new(self.top.clone(), &mut self.syms, &mut self.macros);
+        ctx.sandbox_allowed_imports = self.sandbox_import_policy.clone();
         let result = eval(&core, self.top.clone(), &mut ctx);
         // Drain pending side-channels before ctx drops so we can render
         // proper messages even when EvalError carried only the sentinel
@@ -2805,5 +2825,59 @@ mod tests {
         let mut rt = Runtime::new();
         let err = rt.eval_str("<test>", "(+ x 1)").unwrap_err();
         assert!(err.message.contains("undefined"));
+    }
+
+    // ---- sandbox import policy (issue #15) ----
+
+    #[test]
+    fn sandbox_policy_blocks_unlisted_library() {
+        // (rnrs lists) is in resolve_import_spec's table; the only thing
+        // that blocks it is the host-policy enforcement from issue #15.
+        let mut rt = Runtime::new();
+        rt.set_sandbox_import_policy(Some(vec!["(rnrs base)".into()]));
+        let err = rt
+            .eval_str("<test>", "(environment '(rnrs lists))")
+            .unwrap_err();
+        assert!(
+            err.message.contains("rnrs lists"),
+            "error should name the disallowed library; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn sandbox_policy_allows_listed_library() {
+        let mut rt = Runtime::new();
+        rt.set_sandbox_import_policy(Some(vec!["(rnrs base)".into(), "(rnrs lists)".into()]));
+        // Both approved — should produce a valid environment value.
+        rt.eval_str(
+            "<test>",
+            "(environment? (environment '(rnrs base) '(rnrs lists)))",
+        )
+        .expect("approved libraries must not be blocked");
+    }
+
+    #[test]
+    fn sandbox_policy_none_is_unrestricted() {
+        // No policy set — any known library resolves fine.
+        let mut rt = Runtime::new();
+        rt.eval_str("<test>", "(environment '(rnrs lists))")
+            .expect("no policy means unrestricted");
+    }
+
+    #[test]
+    fn sandbox_policy_error_names_disallowed_library() {
+        let mut rt = Runtime::new();
+        rt.set_sandbox_import_policy(Some(vec!["(rnrs base)".into()]));
+        let err = rt
+            .eval_str("<test>", "(environment '(rnrs lists))")
+            .unwrap_err();
+        // The error message must include the library name so the caller
+        // can distinguish which spec was rejected.
+        assert!(
+            err.message.contains("rnrs lists"),
+            "error must name rejected library; got: {}",
+            err.message
+        );
     }
 }

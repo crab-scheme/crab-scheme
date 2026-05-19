@@ -96,6 +96,11 @@ pub struct EvalCtx<'a> {
     /// successful eval() return. On error the residue is the call chain
     /// that led to the failing site, used for backtraces.
     pub call_stack: Vec<Span>,
+    /// L1 sandbox import-set policy (ADR 0015 issue #15 fix).
+    /// When `Some`, `(environment ...)` rejects any import-spec not in this
+    /// list with an explicit error naming the disallowed library. `None`
+    /// means unrestricted (normal non-sandbox eval).
+    pub sandbox_allowed_imports: Option<Vec<String>>,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -117,6 +122,7 @@ impl<'a> EvalCtx<'a> {
             current_input_port: None,
             current_output_port: None,
             current_error_port: None,
+            sandbox_allowed_imports: None,
         }
     }
 }

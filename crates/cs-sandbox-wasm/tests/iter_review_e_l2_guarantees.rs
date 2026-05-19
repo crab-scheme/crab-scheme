@@ -163,47 +163,42 @@ fn l1_blocks_file_op_even_with_real_preopen() {
 
 // ---- 3. Nested eval respects L1 ----
 
-/// The user expression contains its own `(eval … (environment …))`.
-/// L1's scoping property: that inner call gets evaluated in an
-/// inner `(rnrs base)`-only frame, so attempting to escape via a
-/// nested eval still fails on unbound identifiers.
+/// The host approves only `(rnrs base)`. Guest code tries to call
+/// `(environment '(rnrs lists))` — a library that IS registered in
+/// `resolve_import_spec`'s table, so before the issue-#15 fix it
+/// would silently succeed and hand the guest `filter`, `for-all`,
+/// etc. After the fix the host's `--sandbox-imports` policy is
+/// threaded into the guest's EvalCtx and `b_environment` rejects
+/// the request with an error naming the disallowed library.
 ///
-/// What this catches: a regression where the outer L1 wrap is one-
-/// shot — applied only once at the host's wrap site, then a user
-/// can nest `(eval … (environment '(rnrs base) '(rnrs io)))` to
-/// re-open the import set. The expected behavior is that the
-/// guest's `(environment …)` builtin itself enforces the L1.3
-/// composite-construction rules, so nesting can't widen the set
-/// beyond what the host approved.
-///
-/// Concretely: `(rnrs io)` is currently not part of any preset's
-/// import list AND is also not registered in the guest's
-/// `resolve_import_spec` table — so requesting it inside the
-/// nested eval errors at the inner `(environment …)` call.
+/// This test proves causality: the *host policy* is what blocks the
+/// call, not an accident of `resolve_import_spec`'s library catalog.
 #[test]
 fn nested_eval_cannot_widen_l1_import_set() {
     requires_wasm!();
     let mut config = SandboxConfig::hygiene();
     config.binary_path = binary_path();
+    // Host approves only (rnrs base) — explicitly excludes (rnrs lists).
     config.imports = vec!["(rnrs base)".into()];
     let mut sb = SandboxInstance::new(config).unwrap();
-    // Nested eval that tries to pull in (rnrs io) which isn't in
-    // the host-approved set. The inner `(environment '(rnrs io))`
-    // call should fail because (rnrs io) isn't a recognized
-    // library spec.
-    let result = sb.eval("(eval '(+ 1 2) (environment '(rnrs io)))");
+    // (rnrs lists) IS in resolve_import_spec's table, so the only thing
+    // that blocks this is the host-policy enforcement added in issue #15.
+    let result = sb.eval("(eval '(for-all odd? '(1 3 5)) (environment '(rnrs lists)))");
     match result {
-        Err(_) => {
-            // Good — either (rnrs io) is unknown (preferred), or
-            // the nested eval fails some other way. The safety
-            // claim is just that this expression doesn't return
-            // a value (i.e., doesn't silently succeed and open
-            // up a bigger surface).
+        Err(e) => {
+            let msg = e.to_string();
+            // The error must name the disallowed library so the caller
+            // can diagnose policy violations — a generic "eval failed"
+            // would not be sufficient.
+            assert!(
+                msg.contains("rnrs lists"),
+                "error should name the disallowed library; got: {msg}"
+            );
         }
         Ok(v) => panic!(
-            "nested eval with unapproved import returned {:?}; L1 \
-             does NOT constrain nested (environment) calls",
-            v
+            "nested eval with unapproved (rnrs lists) returned {v:?}; \
+             host policy did NOT constrain nested (environment) calls \
+             (issue #15 regression)"
         ),
     }
 }
