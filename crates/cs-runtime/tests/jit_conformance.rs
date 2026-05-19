@@ -144,15 +144,19 @@ fn jit_conformance_cross_lambda_loop() {
     // to specialized with broken return-type inference. See
     // docs/research/jit_loop_cross_lambda_bug.md.
     //
-    // Runs in a dedicated thread with a larger stack. The walker
-    // tier uses host-stack recursion, and at the N=50000 named-let
-    // counts this benchmark uses to exercise the JIT tier-up
-    // boundary the recursion depth exceeds Rust's default 2 MB
-    // test-thread stack. The standalone `crabscheme run` binary is
-    // unaffected because the main process gets the OS default
-    // (~8 MB on macOS).
+    // Runs in a dedicated thread with a large stack. Driving this
+    // fixture's 50000-iteration loops through the three-tier
+    // conformance harness (parse + expand + walker + VM + JIT)
+    // needs well more than the default 2 MB test-thread stack —
+    // and in unoptimized `cargo test` builds, where stack frames
+    // are several times fatter than release, it exceeds 64 MB
+    // too (release CI passes at any of these sizes). 256 MB is a
+    // pure virtual reservation, lazily committed, so the headroom
+    // is free. The standalone `crabscheme run` binary is
+    // unaffected — the loops are tail-call eliminated on every
+    // tier; this is conformance-harness depth, not the fixture.
     std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
+        .stack_size(256 * 1024 * 1024)
         .spawn(|| assert_three_tier_pass_count("jit_cross_lambda_loop.scm"))
         .expect("spawn deep-stack test thread")
         .join()

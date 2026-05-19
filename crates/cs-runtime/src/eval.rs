@@ -254,7 +254,21 @@ pub fn apply_procedure(
 
 pub fn eval(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let stack_snapshot = ctx.call_stack.len();
+    // `depth` is the count of live nested `eval` invocations —
+    // i.e. the host-stack recursion depth of non-tail
+    // subexpressions. Tail calls stay inside `eval_inner`'s loop
+    // and never re-enter `eval`, so a tail-recursive program
+    // holds depth constant no matter how many iterations it runs.
+    // (It used to be bumped once per closure tail-call and never
+    // decremented, which made it a monotonic total-call counter
+    // that spuriously tripped `max_depth` on any long run.)
+    ctx.depth += 1;
+    if ctx.depth > ctx.max_depth {
+        ctx.depth -= 1;
+        return Err(EvalError::new("stack overflow", expr.span()));
+    }
     let r = eval_inner(expr, env, ctx);
+    ctx.depth -= 1;
     if r.is_ok() {
         ctx.call_stack.truncate(stack_snapshot);
     }
@@ -266,9 +280,10 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
     let mut cur_env = env;
 
     loop {
-        if ctx.depth > ctx.max_depth {
-            return Err(EvalError::new("stack overflow", cur_expr.span()));
-        }
+        // No depth check here: `depth` is bumped + checked in
+        // `eval` on entry, and the tail-call `continue`s below
+        // don't deepen the host stack, so depth is invariant
+        // across this loop.
         match cur_expr {
             CoreExpr::Const { value, .. } => return Ok(value),
             CoreExpr::Ref { name, span } => match cur_env.get(name) {
@@ -398,7 +413,6 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
                             }
                             cur_env = new_env;
                             cur_expr = (*c.body).clone();
-                            ctx.depth += 1;
                             continue;
                         }
                         if let Some(param) = any.downcast_ref::<Parameter>() {
