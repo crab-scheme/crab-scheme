@@ -74,16 +74,39 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
+use cs_table::{Mailbox, MailboxError, TableRegistry};
 use dashmap::DashMap;
 use rustc_hash::FxBuildHasher;
 use thiserror::Error;
-use tokio::sync::mpsc;
 
-// Re-export the tokio mpsc error type used in [`Actor::try_receive`]'s
-// signature so downstream crates can match on it without depending on
-// tokio themselves.
-pub use tokio::sync::mpsc::error::TryRecvError;
+/// Mirrors the shape of `tokio::sync::mpsc::error::TryRecvError`
+/// so downstream callers that already match on
+/// `Empty` / `Disconnected` keep working post-mailbox swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TryRecvError {
+    #[error("mailbox is empty (no message available right now)")]
+    Empty,
+    #[error("mailbox is closed (sender side dropped)")]
+    Disconnected,
+}
+
+/// Unwrap the cs-table Payload back into a Message.
+///
+/// Mailbox stores `Arc<dyn Any + Send + Sync>`; we always
+/// push wrapping `Arc::new(message)`, so the downcast must
+/// succeed on legitimately-pushed payloads. Any failure
+/// indicates someone pushed a non-Message payload via the
+/// raw `TableRegistry::insert` path bypassing the Mailbox
+/// wrapper — that's a usage bug, not a runtime condition.
+fn unwrap_message(payload: cs_table::Payload) -> Message {
+    // Cheap fast-path: try downcast on the Arc itself.
+    match Arc::downcast::<Message>(payload) {
+        Ok(arc_msg) => (*arc_msg).clone(),
+        Err(_) => panic!("mailbox payload was not a Message — internal usage bug"),
+    }
+}
 
 // ---------- Identifiers ----------
 
@@ -180,7 +203,11 @@ pub enum ActorError {
 /// big lock) keeps contention low on the hot send path —
 /// `inbox` reads have no lock at all.
 pub(crate) struct ActorState {
-    inbox: mpsc::UnboundedSender<Message>,
+    /// Per-actor mailbox, backed by a cs-table `OrderedSet`
+    /// keyed on monotonic sequence numbers. Wrapped in Arc
+    /// so push handles + the receiver can share the same
+    /// notify state without juggling channel halves.
+    mailbox: Arc<Mailbox>,
     /// Bidirectional link partners. When this actor dies it
     /// sends `Message::Exit { from: self.pid, reason }` to
     /// each linked actor; the receivers either die (default)
@@ -221,9 +248,9 @@ pub(crate) struct ActorState {
 }
 
 impl ActorState {
-    fn new(inbox: mpsc::UnboundedSender<Message>) -> Self {
+    fn new(mailbox: Arc<Mailbox>) -> Self {
         Self {
-            inbox,
+            mailbox,
             links: Mutex::new(HashSet::new()),
             monitored_by: Mutex::new(HashMap::new()),
             trap_exit: AtomicBool::new(false),
@@ -232,24 +259,32 @@ impl ActorState {
         }
     }
 
+    /// Internal raw push that wraps a Message in a Mailbox
+    /// payload and pushes onto the cs-table-backed queue.
+    /// Used by both system-message paths (Exit, Down) and
+    /// by `send_with_cap`.
+    fn push_raw(&self, pid: ActorPid, msg: Message) -> Result<(), ActorError> {
+        // The mailbox payload is `Arc<dyn Any + Send + Sync>`,
+        // same type cs-actor already uses. Wrap the Message in
+        // an Arc so it survives the type-erase round-trip.
+        let payload: cs_table::Payload = Arc::new(msg);
+        match self.mailbox.push(payload) {
+            Ok(()) => Ok(()),
+            Err(MailboxError::Closed { .. }) => Err(ActorError::SendFailed { pid }),
+            Err(MailboxError::Table(_)) => Err(ActorError::SendFailed { pid }),
+        }
+    }
+
     /// Send with soft-cap enforcement. Returns `Err(MailboxFull)`
     /// when `soft_cap > 0` and `pending >= soft_cap`; otherwise
-    /// behaves like the raw send. Increments `pending` on
+    /// behaves like the raw push. Increments `pending` on
     /// success — the receiver decrements after a successful recv.
     pub(crate) fn send_with_cap(&self, pid: ActorPid, msg: Message) -> Result<(), ActorError> {
         let cap = self.soft_cap.load(Ordering::Relaxed);
-        if cap > 0 {
-            // Speculative load + CAS would be more accurate
-            // under contention, but the cap is a soft hint
-            // (BEAM mailboxes are unbounded too) and the
-            // looser semantics are acceptable here.
-            if self.pending.load(Ordering::Relaxed) >= cap {
-                return Err(ActorError::MailboxFull { pid, cap });
-            }
+        if cap > 0 && self.pending.load(Ordering::Relaxed) >= cap {
+            return Err(ActorError::MailboxFull { pid, cap });
         }
-        self.inbox
-            .send(msg)
-            .map_err(|_| ActorError::SendFailed { pid })?;
+        self.push_raw(pid, msg)?;
         self.pending.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -301,7 +336,10 @@ type Registry = Arc<DashMap<ActorPid, Arc<ActorState>, FxBuildHasher>>;
 #[derive(Clone)]
 pub struct ActorRef {
     pid: ActorPid,
-    inbox: mpsc::UnboundedSender<Message>,
+    /// Direct handle on the actor's mailbox. The mailbox is
+    /// itself Arc-internal (notify state, open flag, seq
+    /// counter), so cloning ActorRef is cheap.
+    mailbox: Arc<Mailbox>,
 }
 
 impl ActorRef {
@@ -309,19 +347,18 @@ impl ActorRef {
         self.pid
     }
 
-    /// Fire-and-forget cast. Returns `Err` only if the receiver
-    /// has been dropped (actor terminated).
+    /// Fire-and-forget cast. Returns `Err` only if the
+    /// mailbox is closed (actor terminated).
     pub fn send(&self, payload: Payload) -> Result<(), ActorError> {
-        self.inbox
-            .send(Message::User(payload))
-            .map_err(|_| ActorError::SendFailed { pid: self.pid })
+        self.send_raw(Message::User(payload))
     }
 
     /// Send a pre-built system Message. Used internally by the
     /// supervisor / link mechanisms.
     pub fn send_raw(&self, msg: Message) -> Result<(), ActorError> {
-        self.inbox
-            .send(msg)
+        let p: cs_table::Payload = Arc::new(msg);
+        self.mailbox
+            .push(p)
             .map_err(|_| ActorError::SendFailed { pid: self.pid })
     }
 }
@@ -338,7 +375,11 @@ impl fmt::Debug for ActorRef {
 /// (B3+) hooks for yielding back to the scheduler.
 pub struct Actor {
     pid: ActorPid,
-    inbox: mpsc::UnboundedReceiver<Message>,
+    /// The same Mailbox handle the state holds — receive side.
+    /// Mailbox supports concurrent multi-sender / single-receiver,
+    /// so cs-actor's pattern of one body owning recv + many
+    /// outside senders pushing works directly.
+    mailbox: Arc<Mailbox>,
     /// Cloned from the system so the actor can spawn children or
     /// look up sibling actors by PID.
     system: ActorSystemRef,
@@ -354,40 +395,51 @@ impl Actor {
         self.pid
     }
 
-    /// Blocking receive — returns the next message in the mailbox,
-    /// or `None` if all senders have been dropped (i.e., we're the
-    /// last reference, system is shutting down, and nothing else
-    /// can ever send us a message).
-    ///
-    /// In B2 this is a true OS-thread block via tokio's
-    /// `blocking_recv`. B3 (parallel-runtime spec, C1) ships
-    /// [`receive_async`] which yields cooperatively instead of
-    /// parking the OS thread. New code should prefer the async
-    /// variant.
+    /// Blocking receive — returns the next message in the
+    /// mailbox, or `None` once the mailbox is closed AND
+    /// empty. Uses the cs-table Mailbox's Condvar wait, so
+    /// blocks the OS thread; callers running inside a tokio
+    /// async block should wrap in `block_in_place`
+    /// (`spawn_sync_body_on_task` does this automatically).
     pub fn receive(&mut self) -> Option<Message> {
-        self.inbox.blocking_recv()
+        self.recv_with_timeout(None)
     }
 
-    /// Async receive (parallel-runtime spec C1.1). Returns the next
-    /// message, or `None` if all senders have dropped. Yields to
-    /// the tokio scheduler while waiting instead of parking the OS
-    /// thread, so M worker threads can multiplex N ≫ M actors.
-    ///
-    /// Sound to call from any `async fn` running inside the cs-actor
-    /// tokio runtime. If called outside that runtime context the
-    /// underlying `mpsc::UnboundedReceiver::recv` still works (no
-    /// runtime dependency) — the `.await` is what differs from
-    /// [`receive`].
+    /// Async-equivalent of [`receive`]. cs-table's Mailbox
+    /// blocks on a Condvar (not tokio-async), so this is just
+    /// a shim that calls `receive`. Pre-mailbox-swap this used
+    /// `mpsc::UnboundedReceiver::recv().await`; now callers
+    /// need `spawn_sync_body_on_task` (or explicit
+    /// `block_in_place`) to keep the tokio worker free.
+    /// The function stays `async` to preserve the existing
+    /// signature for downstream callers.
     pub async fn receive_async(&mut self) -> Option<Message> {
-        self.inbox.recv().await
+        self.receive()
     }
 
-    /// Non-blocking receive — returns immediately. `Ok(msg)` if a
-    /// message was available, `Err(empty)` if the mailbox is empty
-    /// but the channel is still open, `Err(disconnected)` if all
-    /// senders have dropped.
-    pub fn try_receive(&mut self) -> Result<Message, mpsc::error::TryRecvError> {
-        self.inbox.try_recv()
+    /// Non-blocking receive — returns immediately. `Ok(msg)`
+    /// if a message was available, `Err(TryRecvError::Empty)`
+    /// if the mailbox is empty but the actor is still alive,
+    /// `Err(TryRecvError::Disconnected)` if the mailbox is
+    /// closed and drained.
+    pub fn try_receive(&mut self) -> Result<Message, TryRecvError> {
+        match self.mailbox.try_pop() {
+            Ok(Some(payload)) => Ok(unwrap_message(payload)),
+            Ok(None) if self.mailbox.is_closed() => Err(TryRecvError::Disconnected),
+            Ok(None) => Err(TryRecvError::Empty),
+            Err(_) => Err(TryRecvError::Disconnected),
+        }
+    }
+
+    /// Recv with optional timeout. `None` = block forever
+    /// until message or close. Returns `None` on timeout or
+    /// closed+empty mailbox.
+    fn recv_with_timeout(&mut self, timeout: Option<Duration>) -> Option<Message> {
+        match self.mailbox.pop_or_wait(timeout) {
+            Ok(Some(payload)) => Some(unwrap_message(payload)),
+            Ok(None) => None,
+            Err(_) => None,
+        }
     }
 
     // Note: there's no `receive_user` skip-system-messages helper.
@@ -590,6 +642,11 @@ struct ActorSystemRef {
     /// from PIDs so callers can't confuse the two.
     next_monitor_ref_id: Arc<AtomicU64>,
     handle: tokio::runtime::Handle,
+    /// Per-system cs-table fabric that backs each actor's
+    /// mailbox. Each spawn allocates a fresh table named
+    /// `__mailbox:<pid>` here; the Mailbox struct owns the
+    /// table's lifecycle (`Drop` removes it).
+    tables: TableRegistry,
     /// Signaled by `on_actor_termination` whenever an actor
     /// finishes. `wait_idle` blocks on the Condvar and
     /// rechecks `registry.is_empty()` instead of busy-
@@ -597,6 +654,21 @@ struct ActorSystemRef {
     /// dummy required by Condvar's API; the source of truth
     /// is `registry.is_empty()`.
     idle_notify: Arc<(Mutex<()>, Condvar)>,
+}
+
+impl ActorSystemRef {
+    /// Build a fresh mailbox for `pid`, registered in the
+    /// system's table fabric. The naming convention
+    /// (`__mailbox:<node>.<local>`) is exposed so debug
+    /// tools / Scheme introspection can find mailboxes via
+    /// the standard table-lookup primops.
+    fn build_mailbox(&self, pid: ActorPid) -> Arc<Mailbox> {
+        let name = format!("__mailbox:{}.{}", pid.node, pid.local_id);
+        Arc::new(
+            Mailbox::create(self.tables.clone(), name)
+                .expect("mailbox name collision — PID allocator misbehaved"),
+        )
+    }
 }
 
 impl ActorSystemRef {
@@ -609,10 +681,10 @@ impl ActorSystemRef {
 
     fn lookup(&self, pid: ActorPid) -> Option<ActorRef> {
         // DashMap::get returns a Ref guard scoped to one shard;
-        // clone the inbox out before the guard drops.
+        // clone the Mailbox handle out before the guard drops.
         self.registry.get(&pid).map(|entry| ActorRef {
             pid,
-            inbox: entry.value().inbox.clone(),
+            mailbox: Arc::clone(&entry.value().mailbox),
         })
     }
 
@@ -658,11 +730,14 @@ impl ActorSystemRef {
             .collect();
         for (ref_id, watcher) in monitors_snapshot {
             if let Some(entry) = self.registry.get(&watcher) {
-                let _ = entry.value().inbox.send(Message::Down {
-                    ref_id,
-                    pid,
-                    reason: reason.clone(),
-                });
+                let _ = entry.value().push_raw(
+                    watcher,
+                    Message::Down {
+                        ref_id,
+                        pid,
+                        reason: reason.clone(),
+                    },
+                );
             }
         }
 
@@ -685,10 +760,13 @@ impl ActorSystemRef {
                     .lock()
                     .expect("links lock poisoned")
                     .remove(&pid);
-                let _ = entry.value().inbox.send(Message::Exit {
-                    from: pid,
-                    reason: reason.clone(),
-                });
+                let _ = entry.value().push_raw(
+                    linked,
+                    Message::Exit {
+                        from: pid,
+                        reason: reason.clone(),
+                    },
+                );
                 // The survivor's receive_async decides whether
                 // to terminate or trap. We don't escalate
                 // here — propagation rides the Message::Exit
@@ -750,6 +828,7 @@ impl ActorSystem {
             registry: Arc::new(DashMap::with_hasher(FxBuildHasher::default())),
             next_local_id: Arc::new(AtomicU64::new(1)),
             next_monitor_ref_id: Arc::new(AtomicU64::new(1)),
+            tables: TableRegistry::new(),
             idle_notify: Arc::new((Mutex::new(()), Condvar::new())),
             handle,
         };
@@ -791,19 +870,20 @@ impl ActorSystem {
         F: FnOnce(&mut Actor) + Send + 'static,
     {
         let pid = self.inner.next_pid();
-        let (tx, rx) = mpsc::unbounded_channel::<Message>();
-        let state = Arc::new(ActorState::new(tx.clone()));
+        let mailbox = self.inner.build_mailbox(pid);
+        let state = Arc::new(ActorState::new(Arc::clone(&mailbox)));
         self.inner.register_actor(pid, Arc::clone(&state));
 
         let system_for_actor = self.inner.clone();
         let inner_for_cleanup = self.inner.clone();
         let state_for_actor = Arc::clone(&state);
+        let mailbox_for_actor = Arc::clone(&mailbox);
         let pid_for_cleanup = pid;
 
         self.inner.handle.spawn_blocking(move || {
             let mut actor = Actor {
                 pid,
-                inbox: rx,
+                mailbox: mailbox_for_actor,
                 system: system_for_actor,
                 state: state_for_actor,
             };
@@ -820,7 +900,7 @@ impl ActorSystem {
             inner_for_cleanup.on_actor_termination(pid_for_cleanup, reason);
         });
 
-        ActorRef { pid, inbox: tx }
+        ActorRef { pid, mailbox }
     }
 
     /// Spawn an actor whose body is a sync closure, but run that
@@ -866,19 +946,20 @@ impl ActorSystem {
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let pid = self.inner.next_pid();
-        let (tx, rx) = mpsc::unbounded_channel::<Message>();
-        let state = Arc::new(ActorState::new(tx.clone()));
+        let mailbox = self.inner.build_mailbox(pid);
+        let state = Arc::new(ActorState::new(Arc::clone(&mailbox)));
         self.inner.register_actor(pid, Arc::clone(&state));
 
         let system_for_actor = self.inner.clone();
         let inner_for_cleanup = self.inner.clone();
         let state_for_actor = Arc::clone(&state);
+        let mailbox_for_actor = Arc::clone(&mailbox);
         let pid_for_cleanup = pid;
 
         self.inner.handle.spawn(async move {
             let actor = Actor {
                 pid,
-                inbox: rx,
+                mailbox: mailbox_for_actor,
                 system: system_for_actor,
                 state: state_for_actor,
             };
@@ -899,7 +980,7 @@ impl ActorSystem {
             inner_for_cleanup.on_actor_termination(pid_for_cleanup, reason);
         });
 
-        ActorRef { pid, inbox: tx }
+        ActorRef { pid, mailbox }
     }
 
     /// **Perf-diagnostic only** — `spawn_async` minus the
@@ -915,7 +996,7 @@ impl ActorSystem {
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let pid = self.inner.next_pid();
-        let (tx, rx) = mpsc::unbounded_channel::<Message>();
+        let mailbox = self.inner.build_mailbox(pid);
         let system_for_actor = self.inner.clone();
         // Even unregistered actors need their own state cell —
         // Actor's supervision methods read from it — but we
@@ -923,18 +1004,19 @@ impl ActorSystem {
         // discover us by PID. Result: link/monitor of an
         // unregistered actor fails with NotFound, which is the
         // intent for perf-diagnostic isolation.
-        let state = Arc::new(ActorState::new(tx.clone()));
+        let state = Arc::new(ActorState::new(Arc::clone(&mailbox)));
+        let mailbox_for_actor = Arc::clone(&mailbox);
         self.inner.handle.spawn(async move {
             let actor = Actor {
                 pid,
-                inbox: rx,
+                mailbox: mailbox_for_actor,
                 system: system_for_actor,
                 state,
             };
             let fut = std::panic::AssertUnwindSafe(body(actor));
             let _ = futures::FutureExt::catch_unwind(fut).await;
         });
-        ActorRef { pid, inbox: tx }
+        ActorRef { pid, mailbox }
     }
 
     /// Look up an actor by PID. `None` if the actor has terminated

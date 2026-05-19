@@ -24,6 +24,11 @@ rustc-hash = { workspace = true }
 # follow-up: parallel-runtime spec showed `Mutex<HashMap>`
 # contention dropped spawn rate ~10× at 1M live actors).
 dashmap = { workspace = true }
+# Mnesia-style table fabric used as the per-actor mailbox
+# backing (audit follow-up — uniform storage primitive
+# across mailboxes + ETS-style shared tables, queue depth
+# inspectable via the regular table-size primop).
+cs-table = { path = "../cs-table" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
