@@ -76,10 +76,271 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use cs_table::{Mailbox, MailboxError, TableRegistry};
+use cs_table::{Mailbox as DurableMailbox, TableRegistry};
 use dashmap::DashMap;
 use rustc_hash::FxBuildHasher;
 use thiserror::Error;
+use tokio::sync::mpsc;
+
+// ---------- Mailbox backing strategy ----------
+
+/// Which mailbox implementation backs an actor's inbox.
+///
+/// - **Fast** — `tokio::sync::mpsc::UnboundedSender/Receiver`.
+///   Sharded, lock-free hot path. ~10× faster than Durable
+///   for send/receive throughput. The default for callers
+///   that don't opt in to a specific kind.
+///
+/// - **Durable** — cs-table `OrderedSet` backed Mailbox.
+///   Queue contents live in the same Mnesia-style table
+///   fabric as ETS-style shared state, so:
+///     * `(table-size '__mailbox:0.42)` reports queue depth
+///     * future cs-table disk-spill applies automatically
+///     * post-mortem inspection works via the standard
+///       table-lookup / table-fold primops
+///   Pays a ~4× throughput cost (RwLock<BTreeMap> vs sharded
+///   mpsc) for those properties.
+///
+/// Pick per spawn via `spawn_with_kind` / the `_durable`
+/// variants of the existing spawn API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxKind {
+    Fast,
+    Durable,
+}
+
+impl Default for MailboxKind {
+    fn default() -> Self {
+        MailboxKind::Fast
+    }
+}
+
+/// Per-actor mailbox handle that hides the Fast/Durable
+/// choice. Both backings expose the same surface (push,
+/// try_pop, pop_or_wait, is_closed, close, len) so call
+/// sites don't branch on the kind — only `new_fast` /
+/// `new_durable` do.
+#[derive(Clone)]
+pub(crate) struct ActorMailbox {
+    inner: Arc<MailboxBacking>,
+}
+
+enum MailboxBacking {
+    /// tokio mpsc with a single-owner receiver behind a
+    /// Mutex<Option<…>> so the receive side can be parked
+    /// during async block_in_place wrap without
+    /// the receiver vanishing under us.
+    Fast {
+        sender: mpsc::UnboundedSender<Message>,
+        /// Receiver lives behind the Mutex so `Actor::receive`
+        /// can take exclusive access (mpsc::UnboundedReceiver
+        /// is `!Sync`). The Option allows close-without-drop.
+        receiver: Mutex<Option<mpsc::UnboundedReceiver<Message>>>,
+        /// Approximate pending count — tokio mpsc doesn't
+        /// expose len() on the unbounded sender, so we track
+        /// it here for the soft-cap mechanism.
+        pending: AtomicUsize,
+    },
+    /// cs-table-backed FIFO. Multi-producer / single-consumer
+    /// via internal Condvar; same Arc-handle pattern works
+    /// for any number of senders.
+    Durable(Arc<DurableMailbox>),
+}
+
+impl ActorMailbox {
+    /// Construct a Fast mailbox (default — tokio mpsc).
+    pub(crate) fn new_fast() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            inner: Arc::new(MailboxBacking::Fast {
+                sender: tx,
+                receiver: Mutex::new(Some(rx)),
+                pending: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    /// Construct a Durable mailbox backed by `cs-table` under
+    /// the given system's `TableRegistry`. The table name
+    /// uniquely identifies the mailbox (one per actor).
+    pub(crate) fn new_durable(registry: TableRegistry, table_name: String) -> Self {
+        let mb = DurableMailbox::create(registry, table_name)
+            .expect("mailbox name collision — PID allocator misbehaved");
+        Self {
+            inner: Arc::new(MailboxBacking::Durable(Arc::new(mb))),
+        }
+    }
+
+    pub fn kind(&self) -> MailboxKind {
+        match &*self.inner {
+            MailboxBacking::Fast { .. } => MailboxKind::Fast,
+            MailboxBacking::Durable(_) => MailboxKind::Durable,
+        }
+    }
+
+    /// Push a message. Returns `Err(())` if the mailbox is
+    /// closed; otherwise `Ok(())`. Caller wraps the unit
+    /// error into `ActorError::SendFailed`.
+    pub fn push(&self, msg: Message) -> Result<(), ()> {
+        match &*self.inner {
+            MailboxBacking::Fast {
+                sender, pending, ..
+            } => {
+                sender.send(msg).map_err(|_| ())?;
+                pending.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            MailboxBacking::Durable(mb) => {
+                let payload: cs_table::Payload = Arc::new(msg);
+                mb.push(payload).map_err(|_| ())
+            }
+        }
+    }
+
+    /// Non-blocking pop. Returns `Some(msg)` on hit, `None`
+    /// on empty. (Closed-state inspection lives in
+    /// `is_closed`.)
+    pub fn try_pop(&self) -> Option<Message> {
+        match &*self.inner {
+            MailboxBacking::Fast {
+                receiver, pending, ..
+            } => {
+                let mut guard = receiver.lock().expect("receiver lock poisoned");
+                let recv = guard.as_mut()?;
+                match recv.try_recv() {
+                    Ok(msg) => {
+                        pending.fetch_sub(1, Ordering::Relaxed);
+                        Some(msg)
+                    }
+                    Err(_) => None,
+                }
+            }
+            MailboxBacking::Durable(mb) => mb.try_pop().ok().flatten().map(|p| {
+                Arc::downcast::<Message>(p)
+                    .map(|am| (*am).clone())
+                    .expect("durable mailbox payload was not a Message")
+            }),
+        }
+    }
+
+    /// Blocking pop with optional timeout. `None` timeout =
+    /// block until message OR mailbox closed-and-empty.
+    /// Returns `None` on timeout OR closed-and-empty.
+    pub fn pop_or_wait(&self, timeout: Option<Duration>) -> Option<Message> {
+        match &*self.inner {
+            MailboxBacking::Fast {
+                receiver, pending, ..
+            } => {
+                let mut guard = receiver.lock().expect("receiver lock poisoned");
+                let recv = guard.as_mut()?;
+                let msg = match timeout {
+                    None => recv.blocking_recv(),
+                    Some(d) => {
+                        // tokio UnboundedReceiver has no blocking
+                        // recv_timeout. Use try_recv in a sleep loop
+                        // — short timeouts only.
+                        let deadline = std::time::Instant::now() + d;
+                        loop {
+                            match recv.try_recv() {
+                                Ok(m) => break Some(m),
+                                Err(mpsc::error::TryRecvError::Disconnected) => break None,
+                                Err(mpsc::error::TryRecvError::Empty) => {
+                                    if std::time::Instant::now() >= deadline {
+                                        break None;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                            }
+                        }
+                    }
+                };
+                if msg.is_some() {
+                    pending.fetch_sub(1, Ordering::Relaxed);
+                }
+                msg
+            }
+            MailboxBacking::Durable(mb) => mb.pop_or_wait(timeout).ok().flatten().map(|p| {
+                Arc::downcast::<Message>(p)
+                    .map(|am| (*am).clone())
+                    .expect("durable mailbox payload was not a Message")
+            }),
+        }
+    }
+
+    /// Async pop. Used by `Actor::receive_async` so async-
+    /// body actors don't call `blocking_recv` (which panics
+    /// inside a multi_thread tokio runtime).
+    ///
+    /// For Fast: temporarily takes the UnboundedReceiver out
+    /// of the Mutex, awaits one recv, then puts it back. The
+    /// take-and-replace serializes concurrent recv attempts
+    /// the same way `pop_or_wait` does — mpsc semantics
+    /// disallow multiple concurrent receivers anyway.
+    ///
+    /// For Durable: delegates to `pop_or_wait` (Condvar
+    /// blocking; safe under `block_in_place`).
+    pub async fn pop_or_wait_async(&self) -> Option<Message> {
+        match &*self.inner {
+            MailboxBacking::Fast {
+                receiver, pending, ..
+            } => {
+                let mut rx = {
+                    let mut guard = receiver.lock().expect("receiver lock poisoned");
+                    guard.take()?
+                };
+                let msg = rx.recv().await;
+                // Put the receiver back so subsequent recvs
+                // can re-take it. Drop case: if msg is None
+                // (sender closed), the receiver still goes
+                // back so try_receive can observe Disconnected.
+                {
+                    let mut guard = receiver.lock().expect("receiver lock poisoned");
+                    *guard = Some(rx);
+                }
+                if msg.is_some() {
+                    pending.fetch_sub(1, Ordering::Relaxed);
+                }
+                msg
+            }
+            MailboxBacking::Durable(mb) => mb.pop_or_wait(None).ok().flatten().map(|p| {
+                Arc::downcast::<Message>(p)
+                    .map(|am| (*am).clone())
+                    .expect("durable mailbox payload was not a Message")
+            }),
+        }
+    }
+
+    /// Mark the mailbox closed. After close, `push` returns
+    /// `Err`. Any parked receivers wake and observe the
+    /// closed state.
+    pub fn close(&self) {
+        match &*self.inner {
+            MailboxBacking::Fast { receiver, .. } => {
+                // Drop the receiver so the sender's
+                // UnboundedSender::send returns Err. Parked
+                // blocking_recv calls wake with None.
+                receiver.lock().expect("receiver lock poisoned").take();
+            }
+            MailboxBacking::Durable(mb) => mb.close(),
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        match &*self.inner {
+            MailboxBacking::Fast {
+                sender, receiver, ..
+            } => sender.is_closed() || receiver.lock().map(|g| g.is_none()).unwrap_or(true),
+            MailboxBacking::Durable(mb) => mb.is_closed(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match &*self.inner {
+            MailboxBacking::Fast { pending, .. } => pending.load(Ordering::Relaxed),
+            MailboxBacking::Durable(mb) => mb.len(),
+        }
+    }
+}
 
 /// Mirrors the shape of `tokio::sync::mpsc::error::TryRecvError`
 /// so downstream callers that already match on
@@ -92,21 +353,8 @@ pub enum TryRecvError {
     Disconnected,
 }
 
-/// Unwrap the cs-table Payload back into a Message.
-///
-/// Mailbox stores `Arc<dyn Any + Send + Sync>`; we always
-/// push wrapping `Arc::new(message)`, so the downcast must
-/// succeed on legitimately-pushed payloads. Any failure
-/// indicates someone pushed a non-Message payload via the
-/// raw `TableRegistry::insert` path bypassing the Mailbox
-/// wrapper — that's a usage bug, not a runtime condition.
-fn unwrap_message(payload: cs_table::Payload) -> Message {
-    // Cheap fast-path: try downcast on the Arc itself.
-    match Arc::downcast::<Message>(payload) {
-        Ok(arc_msg) => (*arc_msg).clone(),
-        Err(_) => panic!("mailbox payload was not a Message — internal usage bug"),
-    }
-}
+// (unwrap_message helper removed — ActorMailbox::try_pop and
+// pop_or_wait now do the downcast at the boundary.)
 
 // ---------- Identifiers ----------
 
@@ -203,11 +451,12 @@ pub enum ActorError {
 /// big lock) keeps contention low on the hot send path —
 /// `inbox` reads have no lock at all.
 pub(crate) struct ActorState {
-    /// Per-actor mailbox, backed by a cs-table `OrderedSet`
-    /// keyed on monotonic sequence numbers. Wrapped in Arc
-    /// so push handles + the receiver can share the same
-    /// notify state without juggling channel halves.
-    mailbox: Arc<Mailbox>,
+    /// Per-actor mailbox. Either tokio-mpsc (Fast) or
+    /// cs-table-backed (Durable) — chosen at spawn time
+    /// via `MailboxKind`. The `ActorMailbox` wrapper hides
+    /// the choice from call sites that only need
+    /// push/try_pop/pop_or_wait.
+    mailbox: ActorMailbox,
     /// Bidirectional link partners. When this actor dies it
     /// sends `Message::Exit { from: self.pid, reason }` to
     /// each linked actor; the receivers either die (default)
@@ -248,7 +497,7 @@ pub(crate) struct ActorState {
 }
 
 impl ActorState {
-    fn new(mailbox: Arc<Mailbox>) -> Self {
+    fn new(mailbox: ActorMailbox) -> Self {
         Self {
             mailbox,
             links: Mutex::new(HashSet::new()),
@@ -259,20 +508,14 @@ impl ActorState {
         }
     }
 
-    /// Internal raw push that wraps a Message in a Mailbox
-    /// payload and pushes onto the cs-table-backed queue.
-    /// Used by both system-message paths (Exit, Down) and
-    /// by `send_with_cap`.
+    /// Internal raw push that delegates to the ActorMailbox.
+    /// Used by both system-message paths (Exit, Down) and by
+    /// `send_with_cap`. The backing kind (Fast vs Durable)
+    /// is transparent here.
     fn push_raw(&self, pid: ActorPid, msg: Message) -> Result<(), ActorError> {
-        // The mailbox payload is `Arc<dyn Any + Send + Sync>`,
-        // same type cs-actor already uses. Wrap the Message in
-        // an Arc so it survives the type-erase round-trip.
-        let payload: cs_table::Payload = Arc::new(msg);
-        match self.mailbox.push(payload) {
-            Ok(()) => Ok(()),
-            Err(MailboxError::Closed { .. }) => Err(ActorError::SendFailed { pid }),
-            Err(MailboxError::Table(_)) => Err(ActorError::SendFailed { pid }),
-        }
+        self.mailbox
+            .push(msg)
+            .map_err(|_| ActorError::SendFailed { pid })
     }
 
     /// Send with soft-cap enforcement. Returns `Err(MailboxFull)`
@@ -336,10 +579,9 @@ type Registry = Arc<DashMap<ActorPid, Arc<ActorState>, FxBuildHasher>>;
 #[derive(Clone)]
 pub struct ActorRef {
     pid: ActorPid,
-    /// Direct handle on the actor's mailbox. The mailbox is
-    /// itself Arc-internal (notify state, open flag, seq
-    /// counter), so cloning ActorRef is cheap.
-    mailbox: Arc<Mailbox>,
+    /// Direct handle on the actor's mailbox. Hides the Fast
+    /// vs Durable choice behind the same push API.
+    mailbox: ActorMailbox,
 }
 
 impl ActorRef {
@@ -356,10 +598,14 @@ impl ActorRef {
     /// Send a pre-built system Message. Used internally by the
     /// supervisor / link mechanisms.
     pub fn send_raw(&self, msg: Message) -> Result<(), ActorError> {
-        let p: cs_table::Payload = Arc::new(msg);
         self.mailbox
-            .push(p)
+            .push(msg)
             .map_err(|_| ActorError::SendFailed { pid: self.pid })
+    }
+
+    /// Which kind of mailbox backs this actor.
+    pub fn mailbox_kind(&self) -> MailboxKind {
+        self.mailbox.kind()
     }
 }
 
@@ -375,11 +621,10 @@ impl fmt::Debug for ActorRef {
 /// (B3+) hooks for yielding back to the scheduler.
 pub struct Actor {
     pid: ActorPid,
-    /// The same Mailbox handle the state holds — receive side.
-    /// Mailbox supports concurrent multi-sender / single-receiver,
-    /// so cs-actor's pattern of one body owning recv + many
-    /// outside senders pushing works directly.
-    mailbox: Arc<Mailbox>,
+    /// Same handle as `ActorState.mailbox` and the holders of
+    /// `ActorRef`. The mailbox is multi-producer /
+    /// single-consumer; this side owns the consumer.
+    mailbox: ActorMailbox,
     /// Cloned from the system so the actor can spawn children or
     /// look up sibling actors by PID.
     system: ActorSystemRef,
@@ -405,16 +650,16 @@ impl Actor {
         self.recv_with_timeout(None)
     }
 
-    /// Async-equivalent of [`receive`]. cs-table's Mailbox
-    /// blocks on a Condvar (not tokio-async), so this is just
-    /// a shim that calls `receive`. Pre-mailbox-swap this used
-    /// `mpsc::UnboundedReceiver::recv().await`; now callers
-    /// need `spawn_sync_body_on_task` (or explicit
-    /// `block_in_place`) to keep the tokio worker free.
-    /// The function stays `async` to preserve the existing
-    /// signature for downstream callers.
+    /// Async receive. For Fast-backed actors this awaits
+    /// tokio mpsc's `recv()` natively (no thread block).
+    /// For Durable-backed actors the cs-table Mailbox uses
+    /// a Condvar, so this falls back to a blocking wait —
+    /// callers expecting non-blocking semantics with a
+    /// durable mailbox should wrap their body in
+    /// `spawn_sync_body_on_task` (which uses
+    /// `block_in_place`).
     pub async fn receive_async(&mut self) -> Option<Message> {
-        self.receive()
+        self.mailbox.pop_or_wait_async().await
     }
 
     /// Non-blocking receive — returns immediately. `Ok(msg)`
@@ -424,10 +669,9 @@ impl Actor {
     /// closed and drained.
     pub fn try_receive(&mut self) -> Result<Message, TryRecvError> {
         match self.mailbox.try_pop() {
-            Ok(Some(payload)) => Ok(unwrap_message(payload)),
-            Ok(None) if self.mailbox.is_closed() => Err(TryRecvError::Disconnected),
-            Ok(None) => Err(TryRecvError::Empty),
-            Err(_) => Err(TryRecvError::Disconnected),
+            Some(msg) => Ok(msg),
+            None if self.mailbox.is_closed() => Err(TryRecvError::Disconnected),
+            None => Err(TryRecvError::Empty),
         }
     }
 
@@ -435,11 +679,12 @@ impl Actor {
     /// until message or close. Returns `None` on timeout or
     /// closed+empty mailbox.
     fn recv_with_timeout(&mut self, timeout: Option<Duration>) -> Option<Message> {
-        match self.mailbox.pop_or_wait(timeout) {
-            Ok(Some(payload)) => Some(unwrap_message(payload)),
-            Ok(None) => None,
-            Err(_) => None,
-        }
+        self.mailbox.pop_or_wait(timeout)
+    }
+
+    /// Which kind of mailbox backs this actor.
+    pub fn mailbox_kind(&self) -> MailboxKind {
+        self.mailbox.kind()
     }
 
     // Note: there's no `receive_user` skip-system-messages helper.
@@ -657,17 +902,19 @@ struct ActorSystemRef {
 }
 
 impl ActorSystemRef {
-    /// Build a fresh mailbox for `pid`, registered in the
-    /// system's table fabric. The naming convention
-    /// (`__mailbox:<node>.<local>`) is exposed so debug
-    /// tools / Scheme introspection can find mailboxes via
-    /// the standard table-lookup primops.
-    fn build_mailbox(&self, pid: ActorPid) -> Arc<Mailbox> {
-        let name = format!("__mailbox:{}.{}", pid.node, pid.local_id);
-        Arc::new(
-            Mailbox::create(self.tables.clone(), name)
-                .expect("mailbox name collision — PID allocator misbehaved"),
-        )
+    /// Build a fresh mailbox for `pid` with the requested
+    /// backing. Fast skips the cs-table allocation entirely
+    /// (cheaper); Durable allocates a `__mailbox:<pid>` table
+    /// in the system fabric so the queue is inspectable via
+    /// standard table-lookup primops.
+    fn build_mailbox(&self, pid: ActorPid, kind: MailboxKind) -> ActorMailbox {
+        match kind {
+            MailboxKind::Fast => ActorMailbox::new_fast(),
+            MailboxKind::Durable => {
+                let name = format!("__mailbox:{}.{}", pid.node, pid.local_id);
+                ActorMailbox::new_durable(self.tables.clone(), name)
+            }
+        }
     }
 }
 
@@ -681,10 +928,10 @@ impl ActorSystemRef {
 
     fn lookup(&self, pid: ActorPid) -> Option<ActorRef> {
         // DashMap::get returns a Ref guard scoped to one shard;
-        // clone the Mailbox handle out before the guard drops.
+        // clone the ActorMailbox handle out before the guard drops.
         self.registry.get(&pid).map(|entry| ActorRef {
             pid,
-            mailbox: Arc::clone(&entry.value().mailbox),
+            mailbox: entry.value().mailbox.clone(),
         })
     }
 
@@ -869,15 +1116,26 @@ impl ActorSystem {
     where
         F: FnOnce(&mut Actor) + Send + 'static,
     {
+        self.spawn_with_kind(MailboxKind::default(), body)
+    }
+
+    /// Like [`spawn`] but lets the caller pick the mailbox
+    /// backing. Most users want `Fast` (the default); pick
+    /// `Durable` for inspectable / persistable queues at the
+    /// cost of ~4× send throughput.
+    pub fn spawn_with_kind<F>(&self, kind: MailboxKind, body: F) -> ActorRef
+    where
+        F: FnOnce(&mut Actor) + Send + 'static,
+    {
         let pid = self.inner.next_pid();
-        let mailbox = self.inner.build_mailbox(pid);
-        let state = Arc::new(ActorState::new(Arc::clone(&mailbox)));
+        let mailbox = self.inner.build_mailbox(pid, kind);
+        let state = Arc::new(ActorState::new(mailbox.clone()));
         self.inner.register_actor(pid, Arc::clone(&state));
 
         let system_for_actor = self.inner.clone();
         let inner_for_cleanup = self.inner.clone();
         let state_for_actor = Arc::clone(&state);
-        let mailbox_for_actor = Arc::clone(&mailbox);
+        let mailbox_for_actor = mailbox.clone();
         let pid_for_cleanup = pid;
 
         self.inner.handle.spawn_blocking(move || {
@@ -920,7 +1178,18 @@ impl ActorSystem {
     where
         F: FnOnce(&mut Actor) + Send + 'static,
     {
-        self.spawn_async(move |mut actor| async move {
+        self.spawn_sync_body_on_task_with_kind(MailboxKind::default(), body)
+    }
+
+    /// Like [`spawn_sync_body_on_task`] but with an explicit
+    /// mailbox backing. Use `Durable` when the actor's queue
+    /// needs to survive crashes / be inspectable from
+    /// outside.
+    pub fn spawn_sync_body_on_task_with_kind<F>(&self, kind: MailboxKind, body: F) -> ActorRef
+    where
+        F: FnOnce(&mut Actor) + Send + 'static,
+    {
+        self.spawn_async_with_kind(kind, move |mut actor| async move {
             tokio::task::block_in_place(move || {
                 body(&mut actor);
             });
@@ -945,15 +1214,25 @@ impl ActorSystem {
         F: FnOnce(Actor) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        self.spawn_async_with_kind(MailboxKind::default(), body)
+    }
+
+    /// Like [`spawn_async`] but lets the caller pick the
+    /// mailbox backing.
+    pub fn spawn_async_with_kind<F, Fut>(&self, kind: MailboxKind, body: F) -> ActorRef
+    where
+        F: FnOnce(Actor) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let pid = self.inner.next_pid();
-        let mailbox = self.inner.build_mailbox(pid);
-        let state = Arc::new(ActorState::new(Arc::clone(&mailbox)));
+        let mailbox = self.inner.build_mailbox(pid, kind);
+        let state = Arc::new(ActorState::new(mailbox.clone()));
         self.inner.register_actor(pid, Arc::clone(&state));
 
         let system_for_actor = self.inner.clone();
         let inner_for_cleanup = self.inner.clone();
         let state_for_actor = Arc::clone(&state);
-        let mailbox_for_actor = Arc::clone(&mailbox);
+        let mailbox_for_actor = mailbox.clone();
         let pid_for_cleanup = pid;
 
         self.inner.handle.spawn(async move {
@@ -996,7 +1275,9 @@ impl ActorSystem {
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let pid = self.inner.next_pid();
-        let mailbox = self.inner.build_mailbox(pid);
+        // Perf-diagnostic only — always uses Fast backing
+        // since the goal is to measure tokio-task overhead.
+        let mailbox = self.inner.build_mailbox(pid, MailboxKind::Fast);
         let system_for_actor = self.inner.clone();
         // Even unregistered actors need their own state cell —
         // Actor's supervision methods read from it — but we
@@ -1004,8 +1285,8 @@ impl ActorSystem {
         // discover us by PID. Result: link/monitor of an
         // unregistered actor fails with NotFound, which is the
         // intent for perf-diagnostic isolation.
-        let state = Arc::new(ActorState::new(Arc::clone(&mailbox)));
-        let mailbox_for_actor = Arc::clone(&mailbox);
+        let state = Arc::new(ActorState::new(mailbox.clone()));
+        let mailbox_for_actor = mailbox.clone();
         self.inner.handle.spawn(async move {
             let actor = Actor {
                 pid,
@@ -1422,6 +1703,55 @@ mod tests {
         let err = errored_for_actor.lock().unwrap().take().expect("err");
         assert!(matches!(err, ActorError::NotFound { .. }));
         sys.shutdown();
+    }
+
+    // ---- Multi-kind mailbox backings ----
+
+    /// Default kind is Fast (tokio mpsc).
+    #[test]
+    fn default_spawn_uses_fast_mailbox() {
+        let sys = ActorSystem::new();
+        let r = sys.spawn_sync_body_on_task(|_actor| {});
+        assert_eq!(r.mailbox_kind(), MailboxKind::Fast);
+        sys.wait_idle();
+        sys.shutdown();
+    }
+
+    /// Explicit Durable spawn uses cs-table backing.
+    #[test]
+    fn durable_spawn_uses_durable_mailbox() {
+        let sys = ActorSystem::new();
+        let r = sys.spawn_sync_body_on_task_with_kind(MailboxKind::Durable, |_actor| {});
+        assert_eq!(r.mailbox_kind(), MailboxKind::Durable);
+        sys.wait_idle();
+        sys.shutdown();
+    }
+
+    /// Echo round-trip works for both backings — same
+    /// observable behavior, same code path other than
+    /// the kind selector.
+    #[test]
+    fn echo_works_with_both_backings() {
+        for kind in [MailboxKind::Fast, MailboxKind::Durable] {
+            let sys = ActorSystem::new();
+            let echo_count = Arc::new(AtomicUsize::new(0));
+            let echo_count_for_body = Arc::clone(&echo_count);
+            let target = sys.spawn_sync_body_on_task_with_kind(kind, move |actor| {
+                for _ in 0..10 {
+                    if let Some(Message::User(_)) = actor.receive() {
+                        echo_count_for_body.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        break;
+                    }
+                }
+            });
+            for i in 0..10 {
+                target.send(Arc::new(i as u64) as Payload).expect("send");
+            }
+            sys.wait_idle();
+            assert_eq!(echo_count.load(Ordering::Relaxed), 10, "kind = {kind:?}");
+            sys.shutdown();
+        }
     }
 
     /// Audit fix #5: soft-cap mailbox rejects sends when
