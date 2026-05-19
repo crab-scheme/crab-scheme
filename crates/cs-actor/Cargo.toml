@@ -20,6 +20,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "ti
 futures = "0.3"
 thiserror = { workspace = true }
 rustc-hash = { workspace = true }
+# Sharded concurrent HashMap for the actor registry (perf-arc
+# follow-up: parallel-runtime spec showed `Mutex<HashMap>`
+# contention dropped spawn rate ~10× at 1M live actors).
+dashmap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

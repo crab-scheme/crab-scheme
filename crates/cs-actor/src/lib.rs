@@ -72,9 +72,10 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use dashmap::DashMap;
+use rustc_hash::FxBuildHasher;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -166,7 +167,20 @@ pub enum ActorError {
 /// Process-wide registry mapping PID → mailbox sender. Cloned into
 /// every `ActorRef` so cross-actor `send` calls can look up the
 /// receiver without going through the ActorSystem.
-type Registry = Arc<Mutex<FxHashMap<ActorPid, mpsc::UnboundedSender<Message>>>>;
+///
+/// **Pre-rev:** `Arc<Mutex<FxHashMap<…>>>`. Profiled (see
+/// `examples/perf_spawn_echo.rs`) and found contention here
+/// dropped spawn rate ~10× at N=1M live actors: the spawner
+/// thread inserts while the worker pool concurrently
+/// `deregister`s, all serialized through one mutex.
+///
+/// **Now:** `DashMap`, which shards on key hash internally
+/// (default 64 shards, each with its own lock). The single
+/// mutex collapses into per-shard mutexes; concurrent
+/// insert + deregister hit different shards almost always.
+/// Workspace already depends on `dashmap = "6"` for cs-table
+/// / cs-runtime / cs-hotreload, so no new transitive dep.
+type Registry = Arc<DashMap<ActorPid, mpsc::UnboundedSender<Message>, FxBuildHasher>>;
 
 // ---------- Public handle ----------
 
@@ -306,14 +320,16 @@ impl ActorSystemRef {
     }
 
     fn lookup(&self, pid: ActorPid) -> Option<ActorRef> {
-        let reg = self.registry.lock().ok()?;
-        reg.get(&pid).cloned().map(|inbox| ActorRef { pid, inbox })
+        // DashMap::get returns a Ref guard scoped to one shard;
+        // clone the inbox out before the guard drops.
+        self.registry.get(&pid).map(|entry| ActorRef {
+            pid,
+            inbox: entry.value().clone(),
+        })
     }
 
     fn deregister(&self, pid: ActorPid) {
-        if let Ok(mut reg) = self.registry.lock() {
-            reg.remove(&pid);
-        }
+        self.registry.remove(&pid);
     }
 }
 
@@ -356,7 +372,7 @@ impl ActorSystem {
             .expect("build tokio runtime");
         let handle = tokio_rt.handle().clone();
         let inner = ActorSystemRef {
-            registry: Arc::new(Mutex::new(FxHashMap::default())),
+            registry: Arc::new(DashMap::with_hasher(FxBuildHasher::default())),
             next_local_id: Arc::new(AtomicU64::new(1)),
             handle,
         };
@@ -400,11 +416,7 @@ impl ActorSystem {
         let pid = self.inner.next_pid();
         let (tx, rx) = mpsc::unbounded_channel::<Message>();
         // Register the sender so anyone with the PID can find us.
-        self.inner
-            .registry
-            .lock()
-            .expect("registry poisoned")
-            .insert(pid, tx.clone());
+        self.inner.registry.insert(pid, tx.clone());
 
         let system_for_actor = self.inner.clone();
         let inner_for_cleanup = self.inner.clone();
@@ -475,11 +487,7 @@ impl ActorSystem {
     {
         let pid = self.inner.next_pid();
         let (tx, rx) = mpsc::unbounded_channel::<Message>();
-        self.inner
-            .registry
-            .lock()
-            .expect("registry poisoned")
-            .insert(pid, tx.clone());
+        self.inner.registry.insert(pid, tx.clone());
 
         let system_for_actor = self.inner.clone();
         let inner_for_cleanup = self.inner.clone();
@@ -507,6 +515,33 @@ impl ActorSystem {
         ActorRef { pid, inbox: tx }
     }
 
+    /// **Perf-diagnostic only** — `spawn_async` minus the
+    /// registry insert + deregister. The returned ActorRef
+    /// is NOT findable via `lookup(pid)`; `send()` works only
+    /// because the caller holds the ref directly. Used by
+    /// `examples/perf_spawn_echo.rs` to isolate registry-
+    /// contention cost from tokio-task overhead.
+    #[doc(hidden)]
+    pub fn spawn_async_unregistered<F, Fut>(&self, body: F) -> ActorRef
+    where
+        F: FnOnce(Actor) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let pid = self.inner.next_pid();
+        let (tx, rx) = mpsc::unbounded_channel::<Message>();
+        let system_for_actor = self.inner.clone();
+        self.inner.handle.spawn(async move {
+            let actor = Actor {
+                pid,
+                inbox: rx,
+                system: system_for_actor,
+            };
+            let fut = std::panic::AssertUnwindSafe(body(actor));
+            let _ = futures::FutureExt::catch_unwind(fut).await;
+        });
+        ActorRef { pid, inbox: tx }
+    }
+
     /// Look up an actor by PID. `None` if the actor has terminated
     /// or never existed.
     pub fn lookup(&self, pid: ActorPid) -> Option<ActorRef> {
@@ -515,7 +550,7 @@ impl ActorSystem {
 
     /// Total actors currently registered. Useful for tests + tools.
     pub fn live_actor_count(&self) -> usize {
-        self.inner.registry.lock().map(|r| r.len()).unwrap_or(0)
+        self.inner.registry.len()
     }
 
     /// Block until the registry drains (all spawned actors have
@@ -535,7 +570,7 @@ impl ActorSystem {
     pub fn shutdown(self) {
         // Drop the registry's senders so any blocking_recv() calls
         // wake up with None.
-        self.inner.registry.lock().expect("poisoned").clear();
+        self.inner.registry.clear();
         // Drop the runtime — this joins all worker + blocking
         // threads. Long-running actors that don't notice the
         // dropped senders will be aborted at runtime tear-down.
@@ -590,6 +625,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex; // tests use Mutex for their own shared state
 
     #[test]
     fn pid_displays() {

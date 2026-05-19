@@ -30,6 +30,8 @@ fn main() {
 
     match bench {
         "spawn" => bench_spawn(n.max(1)),
+        "spawn-noregistry" => bench_spawn_noregistry(n.max(1)),
+        "spawn-async-reg" => bench_spawn_async_with_registry(n.max(1)),
         "echo" => bench_echo(n.max(1)),
         "starvation" => bench_starvation(n.max(1)),
         "all" => {
@@ -48,17 +50,38 @@ fn main() {
 /// immediately. Measures both the spawn rate and the time to
 /// drain the runtime afterward (so the N-actor steady state is
 /// observable).
+///
+/// Also reports per-bucket spawn rate (every 10% of N) — that's
+/// the diagnostic for the "spawn rate degrades with N" pattern.
+/// If contention is the cause, per-bucket rate trends DOWN over
+/// the run.
 fn bench_spawn(n: usize) {
     let sys = ActorSystem::new();
     println!("== spawn N={n} ==");
 
+    let bucket = (n / 10).max(1);
+    let mut bucket_t = Instant::now();
     let t0 = Instant::now();
-    for _ in 0..n {
+    for i in 0..n {
         sys.spawn_sync_body_on_task(|_actor| {
             // No-op body. The actor's mpsc receive returns None
             // when the system drops the sender; we just return
             // immediately, which is the fastest path.
         });
+        if (i + 1) % bucket == 0 {
+            let elapsed = bucket_t.elapsed();
+            let rate = bucket as f64 / elapsed.as_secs_f64();
+            let live = sys.live_actor_count();
+            println!(
+                "    bucket {:>2}/10: {:>8} spawns in {:>7.3}s → {:>10.0} /s   live={}",
+                (i + 1) / bucket,
+                bucket,
+                elapsed.as_secs_f64(),
+                rate,
+                live
+            );
+            bucket_t = Instant::now();
+        }
     }
     let spawn_elapsed = t0.elapsed();
     let spawn_rate = n as f64 / spawn_elapsed.as_secs_f64();
@@ -83,6 +106,96 @@ fn bench_spawn(n: usize) {
         "  total:  {:>10.3}s → {:>12.0} actors/s (spawn+drain)",
         total.as_secs_f64(),
         throughput
+    );
+
+    sys.shutdown();
+}
+
+/// Isolation case: full registry path (insert + deregister)
+/// but uses `spawn_async` directly — no `block_in_place`
+/// wrap. If this is fast, the `block_in_place` per-task
+/// overhead is the bottleneck; if slow, the registry is.
+fn bench_spawn_async_with_registry(n: usize) {
+    let sys = ActorSystem::new();
+    println!("== spawn-async-reg N={n} (with registry, no block_in_place) ==");
+
+    let bucket = (n / 10).max(1);
+    let mut bucket_t = Instant::now();
+    let t0 = Instant::now();
+    for i in 0..n {
+        let _ = sys.spawn_async(|_actor| async {});
+        if (i + 1) % bucket == 0 {
+            let elapsed = bucket_t.elapsed();
+            let rate = bucket as f64 / elapsed.as_secs_f64();
+            let live = sys.live_actor_count();
+            println!(
+                "    bucket {:>2}/10: {:>8} in {:>7.3}s → {:>10.0} /s  live={}",
+                (i + 1) / bucket,
+                bucket,
+                elapsed.as_secs_f64(),
+                rate,
+                live
+            );
+            bucket_t = Instant::now();
+        }
+    }
+    let spawn_elapsed = t0.elapsed();
+    let spawn_rate = n as f64 / spawn_elapsed.as_secs_f64();
+    println!(
+        "  spawn:  {:>10} actors in {:>10.3}s → {:>12.0} actors/s",
+        n,
+        spawn_elapsed.as_secs_f64(),
+        spawn_rate
+    );
+
+    sys.wait_idle();
+    sys.shutdown();
+}
+
+/// Control case for the spawn-rate scaling diagnosis. Uses
+/// `spawn_async_unregistered` — same tokio task plumbing as
+/// the regular path but skips the registry `insert` +
+/// `deregister`. If the regular `bench_spawn` is bottlenecked
+/// on registry-mutex contention, this version stays fast at
+/// large N.
+fn bench_spawn_noregistry(n: usize) {
+    let sys = ActorSystem::new();
+    println!("== spawn-noregistry N={n} (control: no registry insert/deregister) ==");
+
+    let bucket = (n / 10).max(1);
+    let mut bucket_t = Instant::now();
+    let t0 = Instant::now();
+    for i in 0..n {
+        // Drop the ActorRef immediately — we don't use it.
+        let _ = sys.spawn_async_unregistered(|_actor| async {});
+        if (i + 1) % bucket == 0 {
+            let elapsed = bucket_t.elapsed();
+            let rate = bucket as f64 / elapsed.as_secs_f64();
+            println!(
+                "    bucket {:>2}/10: {:>8} spawns in {:>7.3}s → {:>10.0} /s",
+                (i + 1) / bucket,
+                bucket,
+                elapsed.as_secs_f64(),
+                rate
+            );
+            bucket_t = Instant::now();
+        }
+    }
+    let spawn_elapsed = t0.elapsed();
+    let spawn_rate = n as f64 / spawn_elapsed.as_secs_f64();
+    println!(
+        "  spawn:  {:>10} actors in {:>10.3}s → {:>12.0} actors/s",
+        n,
+        spawn_elapsed.as_secs_f64(),
+        spawn_rate
+    );
+
+    let t1 = Instant::now();
+    sys.wait_idle();
+    let drain_elapsed = t1.elapsed();
+    println!(
+        "  drain:  wait_idle took {:>10.3}s",
+        drain_elapsed.as_secs_f64()
     );
 
     sys.shutdown();
