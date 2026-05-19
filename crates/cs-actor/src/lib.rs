@@ -70,9 +70,10 @@
 
 #![allow(dead_code)] // some types are public for B3+ consumers; trim later.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use rustc_hash::FxBuildHasher;
@@ -164,23 +165,68 @@ pub enum ActorError {
 
 // ---------- Internal registry ----------
 
-/// Process-wide registry mapping PID → mailbox sender. Cloned into
-/// every `ActorRef` so cross-actor `send` calls can look up the
-/// receiver without going through the ActorSystem.
+/// Per-actor state shared between the registry (so other
+/// actors can look it up by PID) and the `ActorRef` handle
+/// returned to spawners. Holds the inbox sender plus all
+/// supervision metadata (link set, monitor map, trap-exit
+/// flag).
 ///
-/// **Pre-rev:** `Arc<Mutex<FxHashMap<…>>>`. Profiled (see
-/// `examples/perf_spawn_echo.rs`) and found contention here
-/// dropped spawn rate ~10× at N=1M live actors: the spawner
-/// thread inserts while the worker pool concurrently
-/// `deregister`s, all serialized through one mutex.
+/// Mutated from several threads: the actor's worker (sets
+/// trap_exit, updates monitor map), other actors' workers
+/// (link/unlink, register monitors), the actor's terminator
+/// (drops everything in cleanup). Per-field `Mutex` (not one
+/// big lock) keeps contention low on the hot send path —
+/// `inbox` reads have no lock at all.
+pub(crate) struct ActorState {
+    inbox: mpsc::UnboundedSender<Message>,
+    /// Bidirectional link partners. When this actor dies it
+    /// sends `Message::Exit { from: self.pid, reason }` to
+    /// each linked actor; the receivers either die (default)
+    /// or convert it to a regular `Exit` message they can
+    /// pattern-match (if `trap_exit` is true).
+    links: Mutex<HashSet<ActorPid>>,
+    /// Watchers monitoring this actor. Key is the monitor
+    /// ref_id (allocated by `Monitor::next_ref_id`); value is
+    /// the watcher's PID. On termination, send each watcher a
+    /// `Message::Down { ref_id, pid: self.pid, reason }`.
+    monitored_by: Mutex<HashMap<u64, ActorPid>>,
+    /// Whether this actor wants `Message::Exit` delivered as
+    /// a regular message (trap-exit mode) vs. terminating
+    /// the actor (default). Read by `Actor::receive` /
+    /// receive_async to decide the disposition of incoming
+    /// Exit messages.
+    trap_exit: AtomicBool,
+}
+
+impl ActorState {
+    fn new(inbox: mpsc::UnboundedSender<Message>) -> Self {
+        Self {
+            inbox,
+            links: Mutex::new(HashSet::new()),
+            monitored_by: Mutex::new(HashMap::new()),
+            trap_exit: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Process-wide registry mapping PID → per-actor state.
+/// Cloned `Arc`s into every `ActorRef` so cross-actor `send`
+/// calls bypass the registry entirely on the hot path.
 ///
-/// **Now:** `DashMap`, which shards on key hash internally
-/// (default 64 shards, each with its own lock). The single
-/// mutex collapses into per-shard mutexes; concurrent
-/// insert + deregister hit different shards almost always.
-/// Workspace already depends on `dashmap = "6"` for cs-table
-/// / cs-runtime / cs-hotreload, so no new transitive dep.
-type Registry = Arc<DashMap<ActorPid, mpsc::UnboundedSender<Message>, FxBuildHasher>>;
+/// **Pre-rev:** `Arc<Mutex<FxHashMap<PID, Sender>>>`.
+/// Profiled (see `examples/perf_spawn_echo.rs`) and found
+/// contention here dropped spawn rate ~10× at N=1M live
+/// actors: the spawner thread inserts while the worker pool
+/// concurrently `deregister`s, all serialized through one
+/// mutex.
+///
+/// **Now:** `DashMap` of `Arc<ActorState>`. Sharded on key
+/// hash internally (default 64 shards, each with its own
+/// lock). Concurrent insert + deregister hit different shards
+/// almost always. `dashmap = "6"` is already a workspace dep
+/// (cs-table / cs-runtime / cs-hotreload), so no new
+/// transitive cost.
+type Registry = Arc<DashMap<ActorPid, Arc<ActorState>, FxBuildHasher>>;
 
 // ---------- Public handle ----------
 
@@ -232,6 +278,11 @@ pub struct Actor {
     /// Cloned from the system so the actor can spawn children or
     /// look up sibling actors by PID.
     system: ActorSystemRef,
+    /// Shared per-actor state: trap_exit flag, link set,
+    /// monitor map. Held as `Arc` so supervision primops
+    /// (link / monitor / trap_exit) reach the same cells the
+    /// terminator reads from in `spawn_async`'s cleanup path.
+    pub(crate) state: Arc<ActorState>,
 }
 
 impl Actor {
@@ -293,6 +344,126 @@ impl Actor {
     pub fn lookup(&self, pid: ActorPid) -> Option<ActorRef> {
         self.system.lookup(pid)
     }
+
+    // ---- Supervision (BEAM-style link / monitor / trap_exit) ----
+
+    /// Bidirectionally link this actor to `target`. When
+    /// either dies, the other gets `Message::Exit { from,
+    /// reason }`. By default the receiver treats a non-Normal
+    /// Exit as a fatal signal and terminates; calling
+    /// [`Self::trap_exit`] flips it to a regular deliverable
+    /// message instead.
+    ///
+    /// Idempotent (linking twice is the same as linking once).
+    /// Returns `Err(NotFound)` if `target` doesn't exist —
+    /// matches BEAM behavior of immediately delivering an
+    /// `*exit*` for already-dead links.
+    pub fn link(&self, target: ActorPid) -> Result<(), ActorError> {
+        if target == self.pid {
+            // Self-link: BEAM treats this as a no-op (you
+            // can't supervise yourself in a useful way).
+            return Ok(());
+        }
+        let target_state = self
+            .system
+            .registry
+            .get(&target)
+            .map(|e| Arc::clone(e.value()))
+            .ok_or(ActorError::NotFound { pid: target })?;
+        // Insert into both link sets. Order doesn't matter
+        // because we use HashSet (no duplicates).
+        self.state
+            .links
+            .lock()
+            .expect("links lock poisoned")
+            .insert(target);
+        target_state
+            .links
+            .lock()
+            .expect("links lock poisoned")
+            .insert(self.pid);
+        Ok(())
+    }
+
+    /// Tear down a link previously created via [`Self::link`].
+    /// No-op if no link existed. Doesn't error on missing
+    /// target — by the time you decide to unlink, the target
+    /// may already be gone, and that's fine.
+    pub fn unlink(&self, target: ActorPid) {
+        if target == self.pid {
+            return;
+        }
+        self.state
+            .links
+            .lock()
+            .expect("links lock poisoned")
+            .remove(&target);
+        if let Some(entry) = self.system.registry.get(&target) {
+            entry
+                .value()
+                .links
+                .lock()
+                .expect("links lock poisoned")
+                .remove(&self.pid);
+        }
+    }
+
+    /// One-way monitor: when `target` dies, this actor gets
+    /// `Message::Down { ref_id, pid: target, reason }`.
+    /// Returns a `ref_id` the caller passes to
+    /// [`Self::demonitor`] to cancel. Unlike [`link`], the
+    /// dying side never receives anything — monitor is
+    /// asymmetric.
+    ///
+    /// Returns `Err(NotFound)` for non-existent target. (BEAM
+    /// instead sends an immediate Down with reason = noproc;
+    /// we may add that later.)
+    pub fn monitor(&self, target: ActorPid) -> Result<u64, ActorError> {
+        let target_state = self
+            .system
+            .registry
+            .get(&target)
+            .map(|e| Arc::clone(e.value()))
+            .ok_or(ActorError::NotFound { pid: target })?;
+        let ref_id = self.system.next_monitor_ref();
+        target_state
+            .monitored_by
+            .lock()
+            .expect("monitored_by lock poisoned")
+            .insert(ref_id, self.pid);
+        Ok(ref_id)
+    }
+
+    /// Cancel a monitor previously created via [`Self::monitor`].
+    /// `target` is the actor being monitored; `ref_id` is the
+    /// value [`monitor`] returned. Silent no-op if either is
+    /// already gone.
+    pub fn demonitor(&self, target: ActorPid, ref_id: u64) {
+        if let Some(entry) = self.system.registry.get(&target) {
+            entry
+                .value()
+                .monitored_by
+                .lock()
+                .expect("monitored_by lock poisoned")
+                .remove(&ref_id);
+        }
+    }
+
+    /// Set / clear trap-exit mode. When enabled, incoming
+    /// `Message::Exit` is delivered to the actor's mailbox
+    /// like any other message (the actor can pattern-match
+    /// it). When disabled (default), a non-Normal Exit
+    /// terminates the receiving actor.
+    ///
+    /// Returns the previous value.
+    pub fn trap_exit(&self, enabled: bool) -> bool {
+        self.state.trap_exit.swap(enabled, Ordering::SeqCst)
+    }
+
+    /// Read the current trap-exit setting without changing it.
+    pub fn is_trapping_exits(&self) -> bool {
+        self.state.trap_exit.load(Ordering::Relaxed)
+    }
 }
 
 // ---------- Actor system ----------
@@ -308,6 +479,9 @@ pub struct ActorSystem {
 struct ActorSystemRef {
     registry: Registry,
     next_local_id: Arc<AtomicU64>,
+    /// Monotonic counter for monitor ref_ids. Independent
+    /// from PIDs so callers can't confuse the two.
+    next_monitor_ref_id: Arc<AtomicU64>,
     handle: tokio::runtime::Handle,
 }
 
@@ -324,12 +498,89 @@ impl ActorSystemRef {
         // clone the inbox out before the guard drops.
         self.registry.get(&pid).map(|entry| ActorRef {
             pid,
-            inbox: entry.value().clone(),
+            inbox: entry.value().inbox.clone(),
         })
     }
 
-    fn deregister(&self, pid: ActorPid) {
-        self.registry.remove(&pid);
+    fn next_monitor_ref(&self) -> u64 {
+        self.next_monitor_ref_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Register a new actor's state in the registry. Called
+    /// by the spawn paths before the actor body runs.
+    fn register_actor(&self, pid: ActorPid, state: Arc<ActorState>) {
+        self.registry.insert(pid, state);
+    }
+
+    /// Called from spawn_async's cleanup path when an actor
+    /// terminates. Walks the link set + monitor set and
+    /// delivers `Exit` / `Down` messages to the survivors,
+    /// then removes the entry from the registry.
+    ///
+    /// `reason` is the actor's termination reason — Normal
+    /// for clean returns, Error("…") for panics. Links
+    /// receive Exit; if a linked actor is NOT trap_exit,
+    /// the Exit reason is propagated by also re-delivering
+    /// to that actor's links (cascading dies).
+    fn on_actor_termination(&self, pid: ActorPid, reason: ExitReason) {
+        // Pull the dying actor's state out so we have a
+        // stable view of its link/monitor sets even after
+        // removing it from the registry.
+        let dying = self.registry.remove(&pid).map(|(_, state)| state);
+        let Some(dying) = dying else {
+            return;
+        };
+
+        // Notify monitors (one-way: dying side only emits).
+        // Hold the lock briefly to snapshot, then send
+        // outside the lock so a downstream send that blocks
+        // doesn't keep the lock.
+        let monitors_snapshot: Vec<(u64, ActorPid)> = dying
+            .monitored_by
+            .lock()
+            .expect("monitored_by lock poisoned")
+            .iter()
+            .map(|(&r, &p)| (r, p))
+            .collect();
+        for (ref_id, watcher) in monitors_snapshot {
+            if let Some(entry) = self.registry.get(&watcher) {
+                let _ = entry.value().inbox.send(Message::Down {
+                    ref_id,
+                    pid,
+                    reason: reason.clone(),
+                });
+            }
+        }
+
+        // Notify links (bidirectional, propagating).
+        let links_snapshot: Vec<ActorPid> = dying
+            .links
+            .lock()
+            .expect("links lock poisoned")
+            .iter()
+            .copied()
+            .collect();
+        for linked in links_snapshot {
+            // Remove the back-pointer from the survivor's
+            // link set so a future link-cycle break doesn't
+            // re-notify.
+            if let Some(entry) = self.registry.get(&linked) {
+                entry
+                    .value()
+                    .links
+                    .lock()
+                    .expect("links lock poisoned")
+                    .remove(&pid);
+                let _ = entry.value().inbox.send(Message::Exit {
+                    from: pid,
+                    reason: reason.clone(),
+                });
+                // The survivor's receive_async decides whether
+                // to terminate or trap. We don't escalate
+                // here — propagation rides the Message::Exit
+                // chain naturally as receivers handle them.
+            }
+        }
     }
 }
 
@@ -374,6 +625,7 @@ impl ActorSystem {
         let inner = ActorSystemRef {
             registry: Arc::new(DashMap::with_hasher(FxBuildHasher::default())),
             next_local_id: Arc::new(AtomicU64::new(1)),
+            next_monitor_ref_id: Arc::new(AtomicU64::new(1)),
             handle,
         };
         Self { tokio_rt, inner }
@@ -415,11 +667,12 @@ impl ActorSystem {
     {
         let pid = self.inner.next_pid();
         let (tx, rx) = mpsc::unbounded_channel::<Message>();
-        // Register the sender so anyone with the PID can find us.
-        self.inner.registry.insert(pid, tx.clone());
+        let state = Arc::new(ActorState::new(tx.clone()));
+        self.inner.register_actor(pid, Arc::clone(&state));
 
         let system_for_actor = self.inner.clone();
         let inner_for_cleanup = self.inner.clone();
+        let state_for_actor = Arc::clone(&state);
         let pid_for_cleanup = pid;
 
         self.inner.handle.spawn_blocking(move || {
@@ -427,17 +680,19 @@ impl ActorSystem {
                 pid,
                 inbox: rx,
                 system: system_for_actor,
+                state: state_for_actor,
             };
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut actor)));
-            // Deregister so further sends to this PID error out.
-            inner_for_cleanup.deregister(pid_for_cleanup);
-            if let Err(payload) = result {
-                let msg = panic_message(&payload);
-                eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
-                // B5 will deliver this as Message::Exit to linked
-                // actors; B2 just logs.
-            }
+            let reason = match &result {
+                Ok(()) => ExitReason::Normal,
+                Err(payload) => {
+                    let msg = panic_message(payload);
+                    eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
+                    ExitReason::Error(msg)
+                }
+            };
+            inner_for_cleanup.on_actor_termination(pid_for_cleanup, reason);
         });
 
         ActorRef { pid, inbox: tx }
@@ -487,10 +742,12 @@ impl ActorSystem {
     {
         let pid = self.inner.next_pid();
         let (tx, rx) = mpsc::unbounded_channel::<Message>();
-        self.inner.registry.insert(pid, tx.clone());
+        let state = Arc::new(ActorState::new(tx.clone()));
+        self.inner.register_actor(pid, Arc::clone(&state));
 
         let system_for_actor = self.inner.clone();
         let inner_for_cleanup = self.inner.clone();
+        let state_for_actor = Arc::clone(&state);
         let pid_for_cleanup = pid;
 
         self.inner.handle.spawn(async move {
@@ -498,6 +755,7 @@ impl ActorSystem {
                 pid,
                 inbox: rx,
                 system: system_for_actor,
+                state: state_for_actor,
             };
             // Wrap in AssertUnwindSafe + catch_unwind so a panic in
             // body() doesn't poison the whole runtime. Tokio's
@@ -505,11 +763,15 @@ impl ActorSystem {
             // log-and-deregister semantics as `spawn`.
             let fut = std::panic::AssertUnwindSafe(body(actor));
             let result = futures::FutureExt::catch_unwind(fut).await;
-            inner_for_cleanup.deregister(pid_for_cleanup);
-            if let Err(payload) = result {
-                let msg = panic_message(&payload);
-                eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
-            }
+            let reason = match &result {
+                Ok(()) => ExitReason::Normal,
+                Err(payload) => {
+                    let msg = panic_message(payload);
+                    eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
+                    ExitReason::Error(msg)
+                }
+            };
+            inner_for_cleanup.on_actor_termination(pid_for_cleanup, reason);
         });
 
         ActorRef { pid, inbox: tx }
@@ -530,11 +792,19 @@ impl ActorSystem {
         let pid = self.inner.next_pid();
         let (tx, rx) = mpsc::unbounded_channel::<Message>();
         let system_for_actor = self.inner.clone();
+        // Even unregistered actors need their own state cell —
+        // Actor's supervision methods read from it — but we
+        // skip the registry insert so other actors can't
+        // discover us by PID. Result: link/monitor of an
+        // unregistered actor fails with NotFound, which is the
+        // intent for perf-diagnostic isolation.
+        let state = Arc::new(ActorState::new(tx.clone()));
         self.inner.handle.spawn(async move {
             let actor = Actor {
                 pid,
                 inbox: rx,
                 system: system_for_actor,
+                state,
             };
             let fut = std::panic::AssertUnwindSafe(body(actor));
             let _ = futures::FutureExt::catch_unwind(fut).await;
@@ -816,6 +1086,142 @@ mod tests {
         });
         sys.wait_idle();
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+        sys.shutdown();
+    }
+
+    // ---- Supervision (link / monitor / trap_exit) ----
+
+    /// Bidirectional link: A's death delivers Message::Exit to B.
+    /// With trap_exit on, B captures it instead of dying.
+    #[test]
+    fn link_propagates_exit_with_trap() {
+        let sys = ActorSystem::new();
+        // Channel for B to publish what it received.
+        let (tx, rx) = std::sync::mpsc::channel::<Message>();
+
+        // B: trap exits, link to A (passed via a oneshot for the
+        // pid handshake), then receive.
+        let (pid_tx, pid_rx) = std::sync::mpsc::sync_channel::<ActorPid>(1);
+        let b = sys.spawn_sync_body_on_task(move |actor| {
+            actor.trap_exit(true);
+            let a_pid = pid_rx.recv().expect("a_pid");
+            actor.link(a_pid).expect("link");
+            if let Some(msg) = actor.receive() {
+                tx.send(msg).expect("forward to test thread");
+            }
+        });
+
+        // A: exits normally. B should receive Exit { from: A,
+        // reason: Normal } and forward via the channel.
+        let a = sys.spawn_sync_body_on_task(|_actor| {
+            // body returns -> Normal exit
+        });
+        pid_tx.send(a.pid()).expect("pid handshake");
+
+        let received = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("B should receive an Exit message");
+        match received {
+            Message::Exit { from, reason } => {
+                assert_eq!(from, a.pid());
+                assert!(matches!(reason, ExitReason::Normal));
+            }
+            other => panic!("expected Exit, got {other:?}"),
+        }
+
+        let _ = b; // keep alive past assert
+        sys.shutdown();
+    }
+
+    /// One-way monitor: when target dies, watcher gets Message::Down
+    /// with the matching ref_id.
+    #[test]
+    fn monitor_fires_down_on_target_death() {
+        let sys = ActorSystem::new();
+        let (tx, rx) = std::sync::mpsc::channel::<Message>();
+        let (pid_tx, pid_rx) = std::sync::mpsc::sync_channel::<ActorPid>(1);
+
+        // Watcher: monitor target, then receive Down.
+        sys.spawn_sync_body_on_task(move |actor| {
+            let target = pid_rx.recv().expect("target_pid");
+            let _ref = actor.monitor(target).expect("monitor");
+            if let Some(msg) = actor.receive() {
+                tx.send(msg).expect("forward to test thread");
+            }
+        });
+
+        // Target: exit normally.
+        let target = sys.spawn_sync_body_on_task(|_actor| {});
+        pid_tx.send(target.pid()).expect("pid handshake");
+
+        let received = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("watcher should receive a Down message");
+        match received {
+            Message::Down { pid, reason, .. } => {
+                assert_eq!(pid, target.pid());
+                assert!(matches!(reason, ExitReason::Normal));
+            }
+            other => panic!("expected Down, got {other:?}"),
+        }
+
+        sys.shutdown();
+    }
+
+    /// link to a dead PID returns NotFound. (BEAM would send an
+    /// immediate Exit instead; we error explicitly for now —
+    /// noproc-immediate-exit is a follow-up if needed.)
+    #[test]
+    fn link_to_dead_actor_errors() {
+        let sys = ActorSystem::new();
+        let dead = sys.spawn_sync_body_on_task(|_actor| {});
+        sys.wait_idle();
+        let dead_pid = dead.pid();
+        let (errored, errored_for_actor) = (
+            Arc::new(std::sync::Mutex::new(None::<ActorError>)),
+            Arc::new(std::sync::Mutex::new(None::<ActorError>)),
+        );
+        let errored_clone = Arc::clone(&errored_for_actor);
+        sys.spawn_sync_body_on_task(move |actor| {
+            let err = actor.link(dead_pid).expect_err("link should fail");
+            *errored_clone.lock().unwrap() = Some(err);
+        });
+        sys.wait_idle();
+        let _ = errored;
+        let err = errored_for_actor.lock().unwrap().take().expect("err");
+        assert!(matches!(err, ActorError::NotFound { .. }));
+        sys.shutdown();
+    }
+
+    /// demonitor before target's death suppresses the Down.
+    /// Targets that die without active monitors emit nothing.
+    #[test]
+    fn demonitor_silences_down() {
+        let sys = ActorSystem::new();
+        let (tx, rx) = std::sync::mpsc::channel::<Message>();
+        let (pid_tx, pid_rx) = std::sync::mpsc::sync_channel::<ActorPid>(1);
+
+        sys.spawn_sync_body_on_task(move |actor| {
+            let target = pid_rx.recv().expect("target_pid");
+            let ref_id = actor.monitor(target).expect("monitor");
+            actor.demonitor(target, ref_id);
+            // Use 50ms try_recv loop with timeout to confirm
+            // no Down arrives — receive() would block forever.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Ok(msg) = actor.try_receive() {
+                tx.send(msg).expect("forward unexpected message");
+            }
+        });
+
+        let target = sys.spawn_sync_body_on_task(|_actor| {});
+        pid_tx.send(target.pid()).expect("pid handshake");
+        sys.wait_idle();
+
+        // Watcher's try_receive should have failed — channel empty.
+        assert!(
+            rx.try_recv().is_err(),
+            "demonitored watcher should not receive Down"
+        );
         sys.shutdown();
     }
 }
