@@ -612,21 +612,33 @@ above reflects these:
 
 ## Implementation status (2026-05-19)
 
-MVP shipped: CH-A + CH-D + CH-E + CH-H — unbounded + bounded
-channels, close semantics, cs-runtime primops, cross-actor
-delivery via existing SendableValue surface (no dedicated
-variant; the `(channel <id>)` pair carries naturally).
-`cs-channel` crate + `cs-runtime/builtins/channel.rs` +
-12 acceptance tests green.
+Feature-complete for 1.0. `cs-channel` crate +
+`cs-runtime/builtins/channel.rs` + 20 acceptance tests green.
 
-Deferred follow-ups:
+Shipped:
 
-- CH-B': unbuffered (capacity-0 rendezvous) — currently errors
-- CH-F + CH-G: `(select …)` primop + macro
-- broadcast channels (decision 3)
-- Unified receive (decision 1)
-- `(with-channel …)` macro + library helpers (CH-I)
-- Microbench (CH-J)
+- CH-A + CH-D + CH-E + CH-H — unbounded + bounded channels,
+  close semantics, cs-runtime primops, cross-actor delivery
+  via the existing SendableValue surface (no dedicated variant;
+  the `(channel <id>)` pair carries naturally).
+- CH-F + CH-G — `channel-select` primop + `(select …)` Scheme
+  macro with `recv` / `send!` / `after` / `else` clauses,
+  random-fairness default + `select-biased` opt-in.
+- CH-B' — unbuffered rendezvous channels (`(make-channel 0)`),
+  custom Mutex+oneshot protocol giving true sender-knows-
+  receiver-got-it semantics.
+- Broadcast channels (decision 3) — `(make-broadcast-channel
+  cap)` + `broadcast-subscribe` + `broadcast-send!` etc. on
+  top of `tokio::sync::broadcast`.
+- CH-I — `(with-channel …)` macro + library helpers
+  (`channel-for-each`, `channel-drain-to-list`) in
+  `lib/beam/channels.scm`.
+
+Deferred follow-ups (post-1.0):
+
+- Unified receive (decision 1) — single primitive over mailbox
+  + channels; the current design uses separate APIs.
+- CH-J — microbench suite (send/recv throughput, contention).
 
 ## References
 

@@ -25,12 +25,13 @@
 //! cs-runtime; the runtime wraps SendableValue at the boundary.
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use dashmap::DashMap;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
 /// Type-erased payload type. Channels carry these; the cs-runtime
 /// bridge wraps `SendableValue` into one on send and downcasts on
@@ -84,6 +85,19 @@ enum ChannelInner {
         tx: StdMutex<Option<mpsc::Sender<Payload>>>,
         rx: Mutex<mpsc::Receiver<Payload>>,
     },
+    /// Unbuffered rendezvous channel (capacity 0). Senders block
+    /// until a receiver picks up the value AND fires an ack;
+    /// receivers block until a sender parks a value. Implemented
+    /// as two queues guarded by a std-Mutex — no .await inside
+    /// the lock; tokio oneshots carry the handoff and confirmation
+    /// across the suspension boundary.
+    Rendezvous { state: StdMutex<RendezvousState> },
+}
+
+/// Parked-waiter state for a rendezvous channel.
+struct RendezvousState {
+    waiting_senders: VecDeque<(Payload, oneshot::Sender<()>)>,
+    waiting_receivers: VecDeque<oneshot::Sender<Payload>>,
 }
 
 impl Channel {
@@ -102,9 +116,8 @@ impl Channel {
     }
 
     fn new_bounded(id: ChannelId, capacity: usize) -> Self {
-        // tokio mpsc requires capacity >= 1. The spec's
-        // "unbuffered (capacity 0)" rendezvous semantics are a
-        // CH-C deliverable — v1 floors at 1.
+        // tokio mpsc requires capacity >= 1; cap=0 dispatches to
+        // new_rendezvous instead.
         let cap = capacity.max(1);
         let (tx, rx) = mpsc::channel(cap);
         Self {
@@ -115,6 +128,21 @@ impl Channel {
             inner: ChannelInner::Bounded {
                 tx: StdMutex::new(Some(tx)),
                 rx: Mutex::new(rx),
+            },
+        }
+    }
+
+    fn new_rendezvous(id: ChannelId) -> Self {
+        Self {
+            id,
+            capacity: Some(0),
+            depth: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            inner: ChannelInner::Rendezvous {
+                state: StdMutex::new(RendezvousState {
+                    waiting_senders: VecDeque::new(),
+                    waiting_receivers: VecDeque::new(),
+                }),
             },
         }
     }
@@ -162,6 +190,42 @@ impl Channel {
                     .await
                     .map_err(|_| ChannelError::Closed(self.id))
             }
+            ChannelInner::Rendezvous { state } => {
+                // Either hand v directly to a waiting receiver, or
+                // park here until one shows up. The ack oneshot
+                // lets the sender also wait for the receiver to
+                // actually take the value — true rendezvous
+                // semantics (sender knows receiver got it).
+                // Rendezvous depth is always 0; skip the
+                // depth bookkeeping at the bottom by returning
+                // directly from this arm.
+                let ack_rx = {
+                    let mut st = state.lock().expect("rdv lock poisoned");
+                    if self.is_closed() {
+                        return Err(ChannelError::Closed(self.id));
+                    }
+                    let mut payload = v;
+                    loop {
+                        match st.waiting_receivers.pop_front() {
+                            Some(rx_tx) => match rx_tx.send(payload) {
+                                Ok(()) => return Ok(()),
+                                Err(returned) => {
+                                    payload = returned;
+                                    continue;
+                                }
+                            },
+                            None => break,
+                        }
+                    }
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    st.waiting_senders.push_back((payload, ack_tx));
+                    ack_rx
+                };
+                return match ack_rx.await {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(ChannelError::Closed(self.id)),
+                };
+            }
         };
         if result.is_ok() {
             self.depth.fetch_add(1, Ordering::AcqRel);
@@ -200,6 +264,29 @@ impl Channel {
                     None => return Err(ChannelError::Closed(self.id)),
                 }
             }
+            ChannelInner::Rendezvous { state } => {
+                // try_send succeeds iff there's already a receiver
+                // parked. We DO NOT park the sender — try_send is
+                // non-blocking and gives up the ack confirmation;
+                // the receiver still gets the value.
+                let mut st = state.lock().expect("rdv lock poisoned");
+                if self.is_closed() {
+                    return Err(ChannelError::Closed(self.id));
+                }
+                let mut payload = v;
+                loop {
+                    match st.waiting_receivers.pop_front() {
+                        Some(rx_tx) => match rx_tx.send(payload) {
+                            Ok(()) => return Ok(true),
+                            Err(returned) => {
+                                payload = returned;
+                                continue;
+                            }
+                        },
+                        None => return Ok(false),
+                    }
+                }
+            }
         };
         if ok {
             self.depth.fetch_add(1, Ordering::AcqRel);
@@ -218,6 +305,30 @@ impl Channel {
             ChannelInner::Bounded { rx, .. } => {
                 let mut guard = rx.lock().await;
                 guard.recv().await
+            }
+            ChannelInner::Rendezvous { state } => {
+                // Take a parked sender if one is waiting; otherwise
+                // register a oneshot receiver and park here.
+                // Rendezvous depth is always 0 (the value never
+                // sits in a buffer); skip the depth bookkeeping at
+                // the bottom of this function by returning directly.
+                let val_rx = {
+                    let mut st = state.lock().expect("rdv lock poisoned");
+                    if let Some((payload, ack_tx)) = st.waiting_senders.pop_front() {
+                        let _ = ack_tx.send(());
+                        return Ok(Some(payload));
+                    }
+                    if self.is_closed() {
+                        return Ok(None);
+                    }
+                    let (val_tx, val_rx) = oneshot::channel();
+                    st.waiting_receivers.push_back(val_tx);
+                    val_rx
+                };
+                return Ok(match val_rx.await {
+                    Ok(payload) => Some(payload),
+                    Err(_) => None,
+                });
             }
         };
         if value.is_some() {
@@ -248,6 +359,15 @@ impl Channel {
                 },
                 Err(_) => return Err(ChannelError::WouldBlock(self.id)),
             },
+            ChannelInner::Rendezvous { state } => {
+                // try_recv succeeds iff a sender is currently parked.
+                let mut st = state.lock().expect("rdv lock poisoned");
+                if let Some((payload, ack_tx)) = st.waiting_senders.pop_front() {
+                    let _ = ack_tx.send(());
+                    return Ok(Some(payload));
+                }
+                return Ok(None);
+            }
         };
         if value.is_some() {
             self.depth.fetch_sub(1, Ordering::AcqRel);
@@ -269,6 +389,15 @@ impl Channel {
                 }
                 ChannelInner::Bounded { tx, .. } => {
                     *tx.lock().expect("tx lock poisoned") = None;
+                }
+                ChannelInner::Rendezvous { state } => {
+                    // Drop every parked waiter's oneshot end —
+                    // their .await sites wake with Err so blocking
+                    // send returns Closed and blocking recv returns
+                    // None.
+                    let mut st = state.lock().expect("rdv lock poisoned");
+                    st.waiting_senders.clear();
+                    st.waiting_receivers.clear();
                 }
             }
         }
@@ -297,12 +426,14 @@ impl ChannelRegistry {
     }
 
     /// Create a new channel. `capacity = None` → unbounded;
-    /// `Some(n)` → bounded with at-least-1 capacity (the spec's
-    /// "unbuffered" rendezvous (capacity 0) is a CH-C item).
+    /// `Some(0)` → unbuffered rendezvous (sender blocks until a
+    /// receiver picks up the value); `Some(n>=1)` → bounded
+    /// buffer.
     pub fn create(&self, capacity: Option<usize>) -> ChannelId {
         let id = self.fresh_id();
         let ch = match capacity {
             None => Channel::new_unbounded(id),
+            Some(0) => Channel::new_rendezvous(id),
             Some(n) => Channel::new_bounded(id, n),
         };
         self.chans.insert(id, Arc::new(ch));

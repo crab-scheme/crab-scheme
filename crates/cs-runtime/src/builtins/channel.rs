@@ -8,7 +8,7 @@
 //! ; Construct
 //! (make-channel)               ; unbounded
 //! (make-channel 100)           ; bounded, cap 100
-//! ;; capacity 0 (rendezvous) is a CH-C deliverable, not v1.
+//! (make-channel 0)             ; unbuffered rendezvous
 //!
 //! ; Send / recv
 //! (channel-send!     ch v)     ; blocking; unspec
@@ -179,13 +179,9 @@ pub fn b_make_channel(args: &[Value], syms: &mut SymbolTable) -> Result<Value, S
             if n < 0 {
                 return Err("make-channel: capacity must be non-negative".into());
             }
-            if n == 0 {
-                return Err(
-                    "make-channel: capacity 0 (unbuffered rendezvous) is a CH-C deliverable, \
-                     not implemented in v1. Use (make-channel) for unbounded or (make-channel n>0) for bounded."
-                        .into(),
-                );
-            }
+            // capacity 0 = unbuffered rendezvous (sender blocks
+            // until a receiver pairs up). capacity n>0 = bounded
+            // buffer. No-argument = unbounded.
             Some(n as usize)
         }
         _ => {
