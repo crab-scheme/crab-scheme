@@ -5334,6 +5334,20 @@ impl Lowerer {
         }
 
         let mut ctx = cranelift_codegen::Context::for_function(clif);
+        // Pre-codegen well-formedness gate (issue #16). For some
+        // control-flow shapes the uniform-NB lowering emits a
+        // function whose blocks never get linked into `func.layout`
+        // (a Cranelift FunctionBuilder state bug — issue #4: blocks
+        // and instructions land in the DFG but the layout stays
+        // empty). Handing such a function to `define_function`
+        // panics deep inside Cranelift's `remove_constant_phis`
+        // ("entry block unknown"), which the runtime can only
+        // contain with `catch_unwind` + a thread-wide JIT poison.
+        // Detect the malformed shape here and return a clean
+        // `JitError` instead: `jit_tier_up_hook` then declines this
+        // body to the VM tier without a panic, and JIT stays
+        // enabled for every other function on the thread.
+        verify_clif_lowerable(&ctx.func)?;
         self.module
             .define_function(inner_id, &mut ctx)
             .map_err(|e| JitError::Codegen(format!("define_function inner uniform_nb: {e}")))?;
@@ -6759,6 +6773,30 @@ fn detect_tail_call_self<'a>(
         }
         _ => None,
     }
+}
+
+/// Pre-codegen well-formedness gate for a lowered CLIF function
+/// (issue #16). Returns `JitError::Unsupported` for functions
+/// Cranelift's `define_function` / `optimize` pipeline cannot
+/// handle, so `jit_tier_up_hook` declines the body to the VM tier
+/// cleanly instead of catching a panic raised from inside
+/// Cranelift.
+///
+/// Currently checks the one malformed shape observed in practice
+/// (issue #4): a function whose block layout is empty. Cranelift's
+/// `remove_constant_phis` pass calls `func.layout.entry_block()`
+/// and `.expect("entry block unknown")`, aborting the host when it
+/// is `None`. A non-empty `rir` can still lower to an empty layout
+/// when a `FunctionBuilder` state bug leaves emitted blocks
+/// unlinked; rather than depend on identifying every such RIR
+/// shape up front, this gate inspects the actual lowered output.
+fn verify_clif_lowerable(func: &ClifFunction) -> Result<(), JitError> {
+    if func.layout.entry_block().is_none() {
+        return Err(JitError::Malformed(
+            "lowered CLIF has an empty block layout".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Bundle of `FuncRef`s for the Stage 3 NB-typed slow-path helpers
@@ -12205,6 +12243,33 @@ pub mod testing {
 mod tests {
     use super::*;
     use std::mem::transmute;
+
+    /// Issue #16 — the pre-codegen verifier rejects a function
+    /// with an empty block layout (the issue-#4 malformed shape)
+    /// as `Malformed`, and accepts one with a block.
+    #[test]
+    fn verify_clif_lowerable_rejects_empty_block_layout() {
+        use cranelift_codegen::ir::UserFuncName;
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(I64));
+        sig.returns.push(AbiParam::new(I64));
+        let mut func = ClifFunction::with_name_signature(UserFuncName::user(0, 0), sig);
+
+        // No blocks in the layout — `entry_block()` is None, the
+        // shape that panics Cranelift's `remove_constant_phis`.
+        assert!(
+            matches!(verify_clif_lowerable(&func), Err(JitError::Malformed(_))),
+            "empty block layout must be rejected as Malformed"
+        );
+
+        // Append a block — now `entry_block()` resolves.
+        let blk = func.dfg.make_block();
+        func.layout.append_block(blk);
+        assert!(
+            verify_clif_lowerable(&func).is_ok(),
+            "a function with a block in its layout must pass the verifier"
+        );
+    }
 
     #[test]
     fn lower_add_two_fixnums_runs_natively() {

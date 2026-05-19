@@ -219,18 +219,31 @@ impl SandboxRuntime {
                 .map_err(|e| SandboxError::Internal(format!("set_fuel: {}", e)))?;
         }
         // Wall-clock enforcement: arm an epoch deadline of
-        // current+1 and spawn a ticker thread that bumps the
-        // engine's epoch after `wall_clock_timeout`. On expiry
-        // the guest traps with `Trap::Interrupt`. The ticker
-        // continues sleeping if the call finishes first; that's
-        // wasted but harmless. A cancellable ticker is a
-        // future optimization.
+        // current+1 and spawn a *cancellable* ticker that bumps the
+        // engine's epoch after `wall_clock_timeout`. On expiry the
+        // guest traps with `Trap::Interrupt`.
+        //
+        // The ticker blocks on a cancellation channel rather than a
+        // bare `sleep` (issue #14). When the call finishes the eval
+        // drops `cancel_tx`, so `recv_timeout` returns
+        // `Disconnected` and the ticker exits at once *without*
+        // bumping the epoch. That fixes two bugs in the old
+        // detached-sleep ticker: (1) threads accumulating one per
+        // eval for the whole timeout window, and (2) a stale ticker
+        // bumping the shared engine's epoch into a later eval and
+        // tripping a spurious `Trap::Interrupt` → `Timeout`.
         store.set_epoch_deadline(1);
         let timeout = self.wall_clock_timeout;
         let engine_for_ticker = self.engine.clone();
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
         let ticker_handle = std::thread::spawn(move || {
-            std::thread::sleep(timeout);
-            engine_for_ticker.increment_epoch();
+            // `Timeout` => the wall-clock budget genuinely elapsed;
+            // bump the epoch. `Disconnected` => the eval finished
+            // and dropped the sender; exit, epoch untouched.
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = cancel_rx.recv_timeout(timeout)
+            {
+                engine_for_ticker.increment_epoch();
+            }
         });
 
         let mut linker: Linker<StoreData> = Linker::new(&self.engine);
@@ -250,10 +263,12 @@ impl SandboxRuntime {
         let out = stdout.contents();
         let err = stderr.contents();
 
-        // Don't wait on the ticker; it'll either fire harmlessly
-        // or already fired (in which case join is instant). join
-        // discards any panic from the ticker thread.
-        let _ = ticker_handle;
+        // Cancel + reap the ticker. Dropping `cancel_tx` wakes the
+        // ticker's `recv_timeout` with `Disconnected` so it exits
+        // at once (without bumping the epoch); `join` then returns
+        // immediately and no detached thread is left behind.
+        drop(cancel_tx);
+        let _ = ticker_handle.join();
 
         if let Err(e) = call_result {
             // Discriminate by trap kind (API-stable) before
