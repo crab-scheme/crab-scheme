@@ -711,6 +711,191 @@ fn scheme_http_helpers_and_middleware() {
         .expect("stop2");
 }
 
+/// Drives the macros from `lib/beam/web-server.scm`:
+/// - `define-server`        declarative server build
+/// - `define-handler`       middleware-chained handler
+/// - `web-forward!`         actor-chain middleware via `send`
+/// - pre-built middleware procs (require-header, require-auth-token,
+///   enforce-content-type)
+#[test]
+fn scheme_server_and_handler_macros() {
+    let mut rt = Runtime::new();
+
+    // Inline the library bodies the test needs (real callers
+    // `(import (lib beam web-server))`). Keep it focused so the
+    // test doesn't depend on the package loader.
+    rt.eval_str(
+        "<setup>",
+        r#"
+        (define (web-forward! h pid)
+          (send pid (list '*web-request* h)))
+
+        (define (run-middleware-chain h mws final)
+          (cond
+            [(null? mws) (final h)]
+            [else
+             (let ([rv ((car mws) h)])
+               (if (eq? rv 'continue)
+                   (run-middleware-chain h (cdr mws) final)
+                   rv))]))
+
+        (define-syntax define-handler
+          (syntax-rules (middleware)
+            [(_ name (middleware mw ...) body)
+             (define (name h) (run-middleware-chain h (list mw ...) body))]
+            [(_ name body)
+             (define (name h) (body h))]))
+
+        (define-syntax define-server
+          (syntax-rules ()
+            [(_ name addr action ...)
+             (define name
+               (let ([__sid (web-server-create addr)])
+                 (server-action __sid action) ...
+                 __sid))]))
+
+        (define-syntax server-action
+          (syntax-rules (middleware access-log route)
+            [(_ sid (middleware m ...))         (begin (server-mw sid m) ...)]
+            [(_ sid (access-log table-name))    (web-access-log! sid table-name)]
+            [(_ sid (route method path (static body)))
+             (web-route-static! sid method path body)]
+            [(_ sid (route method path (static body status)))
+             (web-route-static! sid method path body status)]
+            [(_ sid (route method path pid))
+             (web-route-actor! sid method path pid)]
+            [(_ sid (route method path pid timeout-ms))
+             (web-route-actor! sid method path pid timeout-ms)]))
+
+        (define-syntax server-mw
+          (syntax-rules (request-id trace catch-panic timeout)
+            [(_ sid request-id)        (web-layer-request-id! sid)]
+            [(_ sid trace)             (web-layer-trace! sid)]
+            [(_ sid catch-panic)       (web-layer-catch-panic! sid)]
+            [(_ sid (timeout ms))      (web-layer-timeout! sid ms)]))
+
+        (define server-start! web-server-start)
+        (define server-stop!  web-server-stop)
+
+        (define (require-auth-token expected)
+          (lambda (h)
+            (let ([got (web-request-header h "x-token")])
+              (if (and (string? got) (string=? got expected))
+                  'continue
+                  (begin (web-respond! h 401 "unauthorized") 'responded)))))
+
+        (define (require-header name)
+          (lambda (h)
+            (if (web-request-header h name)
+                'continue
+                (begin (web-respond! h 400
+                         (string-append "missing header: " name)) 'responded))))
+        "#,
+    )
+    .expect("setup");
+
+    // --- define-handler / middleware chain ------------------------
+    //
+    // Run two cases through a handler with auth + header
+    // middleware: one valid request (passes both → final body
+    // runs), one invalid (auth fails → 401 short-circuit, final
+    // body never runs).
+
+    use cs_actor::Payload;
+    use cs_runtime::builtins::beam::SendableValue;
+    use cs_runtime::builtins::web::try_intern_web_request;
+    use cs_web::actor::WebMessage;
+    use std::sync::Arc;
+
+    fn make(
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> (i64, tokio::sync::oneshot::Receiver<cs_web::Response>) {
+        let mut b = cs_web::http::Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let req: cs_web::Request = b.body(cs_web::Bytes::new()).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<cs_web::Response>();
+        let env: Arc<WebMessage> = Arc::new(WebMessage::new(req, tx));
+        let sv = try_intern_web_request(&(env as Payload)).unwrap();
+        let handle = match sv {
+            SendableValue::Pair(_, t) => match *t {
+                SendableValue::Pair(b, _) => match *b {
+                    SendableValue::Fixnum(n) => n,
+                    _ => panic!(),
+                },
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+        (handle, rx)
+    }
+
+    // Define the chained handler in Scheme.
+    rt.eval_str(
+        "<t>",
+        r#"
+        (define-handler protected
+          (middleware (require-auth-token "sekret")
+                      (require-header "x-trace"))
+          (lambda (h) (web-respond! h 200 "secret data")))
+        "#,
+    )
+    .expect("define-handler");
+
+    // 1) Valid request: token matches + x-trace present → 200.
+    let (h1, rx1) = make("GET", "/", &[("x-token", "sekret"), ("x-trace", "abc")]);
+    rt.eval_str("<t>", &format!("(protected {})", h1)).unwrap();
+    let r1 = rx1.blocking_recv().unwrap();
+    assert_eq!(r1.status(), 200);
+    assert_eq!(r1.body(), &cs_web::Bytes::from_static(b"secret data"));
+
+    // 2) Bad token: 401, final body never runs.
+    let (h2, rx2) = make("GET", "/", &[("x-token", "wrong")]);
+    rt.eval_str("<t>", &format!("(protected {})", h2)).unwrap();
+    let r2 = rx2.blocking_recv().unwrap();
+    assert_eq!(r2.status(), 401);
+    assert_eq!(r2.body(), &cs_web::Bytes::from_static(b"unauthorized"));
+
+    // 3) Auth ok but missing x-trace: chain reaches the second
+    //    middleware, which 400s.
+    let (h3, rx3) = make("GET", "/", &[("x-token", "sekret")]);
+    rt.eval_str("<t>", &format!("(protected {})", h3)).unwrap();
+    let r3 = rx3.blocking_recv().unwrap();
+    assert_eq!(r3.status(), 400);
+    assert!(std::str::from_utf8(r3.body()).unwrap().contains("x-trace"));
+
+    // --- define-server: declarative build ------------------------
+    rt.eval_str(
+        "<t>",
+        r#"
+        (define-server my-app "127.0.0.1:0"
+          (middleware request-id (timeout 5000))
+          (access-log "macro-access")
+          (route 'GET "/health" (static "ok"))
+          (route 'GET "/teapot" (static "tea" 418)))
+        "#,
+    )
+    .expect("define-server");
+
+    let bound = rt.eval_str("<t>", "(server-start! my-app)").expect("start");
+    let addr = disp(&rt, &bound);
+    std::thread::sleep(Duration::from_millis(50));
+
+    // /health
+    let (s, b) = http_get(&addr, "/health");
+    assert_eq!(s, 200);
+    assert_eq!(b, "ok");
+    // /teapot — custom status pulled through the macro
+    let (s, b) = http_get(&addr, "/teapot");
+    assert_eq!(s, 418);
+    assert_eq!(b, "tea");
+
+    rt.eval_str("<t>", "(server-stop! my-app)").expect("stop");
+}
+
 #[test]
 fn scheme_route_after_start_is_error() {
     let mut rt = Runtime::new();
