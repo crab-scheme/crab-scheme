@@ -176,6 +176,16 @@ impl TableStorage {
             TableStorage::OrderedSet(rw) => rw.write().expect("ordered_set poisoned").clear(),
         }
     }
+
+    /// Atomic take-smallest for OrderedSet (returns `None`
+    /// for Set tables). Used by `Mailbox::try_pop` on the
+    /// cached storage handle.
+    fn pop_first_ordered(&self) -> Option<(Key, Payload)> {
+        match self {
+            TableStorage::OrderedSet(rw) => rw.write().expect("ordered_set poisoned").pop_first(),
+            TableStorage::Set(_) => None,
+        }
+    }
 }
 
 // ---------- Registry ----------
@@ -321,6 +331,11 @@ impl TableRegistry {
 pub struct Mailbox {
     table_name: String,
     registry: TableRegistry,
+    /// Cached storage handle. Avoids re-doing the
+    /// `registry.lookup_storage(&name)` DashMap shard-lock
+    /// on every push / try_pop / len — those are hot-path
+    /// operations called per message.
+    storage: Arc<TableStorage>,
     next_seq: AtomicU64,
     /// Signaled by `push`. Wakers re-check `size()` after
     /// the wake and re-loop if the queue is still empty
@@ -344,23 +359,23 @@ pub enum MailboxError {
 
 impl Mailbox {
     /// Create a new mailbox under `name` (must be unique
-    /// across the registry). The caller is responsible for
-    /// uniqueness — typically the actor PID makes a good
-    /// namespace, e.g. `format!("__mailbox:{node}.{local}")`.
+    /// across the registry). Typically the actor PID names it —
+    /// e.g. `format!("__mailbox:{pid}")`.
     pub fn create(registry: TableRegistry, name: String) -> Result<Self, MailboxError> {
         registry.create(&name, TableType::OrderedSet)?;
+        let storage = registry
+            .lookup_storage(&name)
+            .expect("just-created table missing");
         Ok(Self {
             table_name: name,
             registry,
+            storage,
             next_seq: AtomicU64::new(0),
             notify: Arc::new((Mutex::new(()), Condvar::new())),
             open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
-    /// Push a payload at the tail of the FIFO. Returns
-    /// `Err(Closed)` if `close` has been called. Wakes one
-    /// blocked receiver via the Condvar.
     pub fn push(&self, payload: Payload) -> Result<(), MailboxError> {
         if !self.open.load(Ordering::Acquire) {
             return Err(MailboxError::Closed {
@@ -368,10 +383,8 @@ impl Mailbox {
             });
         }
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        self.registry
-            .insert(&self.table_name, Key::Fixnum(seq as i64), payload)?;
-        // Wake any blocked receiver. The lock acquire makes
-        // the notify visible to a parked receiver that's
+        self.storage.insert(Key::Fixnum(seq as i64), payload);
+        // Lock acquire publishes the insert to any receiver
         // mid-`wait_timeout`.
         let (lock, cv) = &*self.notify;
         let _g = lock.lock().expect("notify lock poisoned");
@@ -379,11 +392,8 @@ impl Mailbox {
         Ok(())
     }
 
-    /// Try to dequeue immediately. Returns `Ok(None)` if the
-    /// queue is empty.
     pub fn try_pop(&self) -> Result<Option<Payload>, MailboxError> {
-        let popped = self.registry.pop_first_ordered(&self.table_name)?;
-        Ok(popped.map(|(_k, v)| v))
+        Ok(self.storage.pop_first_ordered().map(|(_k, v)| v))
     }
 
     /// Blocking dequeue with optional timeout. `None` timeout
@@ -396,9 +406,6 @@ impl Mailbox {
                 return Ok(Some(payload));
             }
             if !self.open.load(Ordering::Acquire) {
-                // Closed + empty → return None (channel
-                // semantics: mirror tokio mpsc's recv on
-                // dropped sender).
                 return Ok(None);
             }
             let (lock, cv) = &*self.notify;
@@ -407,13 +414,13 @@ impl Mailbox {
                 None => Duration::from_millis(250),
                 Some(d) => match d.checked_duration_since(std::time::Instant::now()) {
                     Some(rem) => rem.min(Duration::from_millis(250)),
-                    None => return Ok(None), // deadline passed
+                    None => return Ok(None),
                 },
             };
             // Re-check inside the lock to avoid the
-            // missed-notify race. wait_timeout is fine as
-            // a safety-net heartbeat.
-            if self.registry.size(&self.table_name)? > 0 {
+            // missed-notify race. wait_timeout is a
+            // safety-net heartbeat.
+            if self.storage.len() > 0 {
                 drop(guard);
                 continue;
             }
@@ -427,8 +434,8 @@ impl Mailbox {
     }
 
     /// Mark the mailbox closed. Future `push` returns
-    /// `Closed`. Any parked receivers will wake (via timeout
-    /// or notify_all) and return `None`. Idempotent.
+    /// `Closed`. Any parked receivers will wake and return
+    /// `None`. Idempotent.
     pub fn close(&self) {
         self.open.store(false, Ordering::Release);
         let (lock, cv) = &*self.notify;
@@ -436,29 +443,16 @@ impl Mailbox {
         cv.notify_all();
     }
 
-    /// Current queue depth (approximate; readers can race
-    /// the next dequeue). Useful for backpressure decisions.
     pub fn len(&self) -> usize {
-        self.registry.size(&self.table_name).unwrap_or(0)
+        self.storage.len()
     }
 
-    /// `true` if `len() == 0`.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// `true` once `close` has been called. Senders that
-    /// race with close may still see `open` true and succeed;
-    /// the resulting payload sits in the table until a
-    /// drainer picks it up (or the Mailbox is dropped).
     pub fn is_closed(&self) -> bool {
         !self.open.load(Ordering::Acquire)
-    }
-
-    /// The underlying table name. Lets debug tools / Scheme
-    /// introspection query the queue contents directly.
-    pub fn table_name(&self) -> &str {
-        &self.table_name
     }
 }
 
@@ -481,14 +475,7 @@ impl TableRegistry {
         let storage = self.lookup_storage(name)?;
         match &*storage {
             TableStorage::OrderedSet(rw) => {
-                let mut guard = rw.write().expect("ordered_set poisoned");
-                if let Some((k, _)) = guard.iter().next() {
-                    let k = k.clone();
-                    let v = guard.remove(&k).expect("just observed");
-                    Ok(Some((k, v)))
-                } else {
-                    Ok(None)
-                }
+                Ok(rw.write().expect("ordered_set poisoned").pop_first())
             }
             TableStorage::Set(_) => Err(TableError::WrongType {
                 name: name.to_string(),

@@ -126,48 +126,59 @@ pub(crate) struct ActorMailbox {
 }
 
 enum MailboxBacking {
-    /// tokio mpsc with a single-owner receiver behind a
-    /// Mutex<Option<…>> so the receive side can be parked
-    /// during async block_in_place wrap without
-    /// the receiver vanishing under us.
+    /// tokio mpsc. Single-consumer (Actor body) + many
+    /// senders cloned from `ActorRef`. The receiver lives
+    /// behind a `Mutex` because `UnboundedReceiver` is
+    /// `!Sync` and `Actor::receive`/`try_receive` need
+    /// exclusive access; only one Actor body runs per
+    /// spawn so contention is zero in practice.
     Fast {
         sender: mpsc::UnboundedSender<Message>,
-        /// Receiver lives behind the Mutex so `Actor::receive`
-        /// can take exclusive access (mpsc::UnboundedReceiver
-        /// is `!Sync`). The Option allows close-without-drop.
-        receiver: Mutex<Option<mpsc::UnboundedReceiver<Message>>>,
-        /// Approximate pending count — tokio mpsc doesn't
-        /// expose len() on the unbounded sender, so we track
-        /// it here for the soft-cap mechanism.
+        receiver: Mutex<mpsc::UnboundedReceiver<Message>>,
+        /// Pending-count counter for the soft-cap check.
+        /// Bumped on push, decremented on every successful
+        /// pop. Used by `ActorState::send_with_cap` via
+        /// `ActorMailbox::len`. Dead atomic when soft_cap
+        /// == 0 (the default) but the alternatives — cap
+        /// load + conditional bump — are worse on the hot
+        /// path.
         pending: AtomicUsize,
     },
-    /// cs-table-backed FIFO. Multi-producer / single-consumer
-    /// via internal Condvar; same Arc-handle pattern works
-    /// for any number of senders.
-    Durable(Arc<DurableMailbox>),
+    /// cs-table-backed FIFO. `DurableMailbox`'s internals
+    /// (notify, open flag, storage handle) are already
+    /// `Arc`-shared, so we store the struct by value here
+    /// rather than `Arc<DurableMailbox>` — the outer
+    /// `Arc<MailboxBacking>` shares the whole thing.
+    Durable(DurableMailbox),
+}
+
+/// Unwrap a Durable-side payload back into a Message. The
+/// Mailbox always pushes `Arc::new(message)`, so a downcast
+/// failure means someone bypassed the wrapper — panic on
+/// the usage bug rather than corrupt the channel.
+fn unwrap_durable_payload(p: cs_table::Payload) -> Message {
+    Arc::downcast::<Message>(p)
+        .map(|am| Arc::try_unwrap(am).unwrap_or_else(|am| (*am).clone()))
+        .expect("durable mailbox payload was not a Message")
 }
 
 impl ActorMailbox {
-    /// Construct a Fast mailbox (default — tokio mpsc).
     pub(crate) fn new_fast() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
             inner: Arc::new(MailboxBacking::Fast {
                 sender: tx,
-                receiver: Mutex::new(Some(rx)),
+                receiver: Mutex::new(rx),
                 pending: AtomicUsize::new(0),
             }),
         }
     }
 
-    /// Construct a Durable mailbox backed by `cs-table` under
-    /// the given system's `TableRegistry`. The table name
-    /// uniquely identifies the mailbox (one per actor).
     pub(crate) fn new_durable(registry: TableRegistry, table_name: String) -> Self {
         let mb = DurableMailbox::create(registry, table_name)
             .expect("mailbox name collision — PID allocator misbehaved");
         Self {
-            inner: Arc::new(MailboxBacking::Durable(Arc::new(mb))),
+            inner: Arc::new(MailboxBacking::Durable(mb)),
         }
     }
 
@@ -179,8 +190,7 @@ impl ActorMailbox {
     }
 
     /// Push a message. Returns `Err(())` if the mailbox is
-    /// closed; otherwise `Ok(())`. Caller wraps the unit
-    /// error into `ActorError::SendFailed`.
+    /// closed; caller wraps that into `ActorError::SendFailed`.
     pub fn push(&self, msg: Message) -> Result<(), ()> {
         match &*self.inner {
             MailboxBacking::Fast {
@@ -190,58 +200,45 @@ impl ActorMailbox {
                 pending.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
-            MailboxBacking::Durable(mb) => {
-                let payload: cs_table::Payload = Arc::new(msg);
-                mb.push(payload).map_err(|_| ())
-            }
+            MailboxBacking::Durable(mb) => mb.push(Arc::new(msg)).map_err(|_| ()),
         }
     }
 
-    /// Non-blocking pop. Returns `Some(msg)` on hit, `None`
-    /// on empty. (Closed-state inspection lives in
-    /// `is_closed`.)
     pub fn try_pop(&self) -> Option<Message> {
         match &*self.inner {
             MailboxBacking::Fast {
                 receiver, pending, ..
             } => {
-                let mut guard = receiver.lock().expect("receiver lock poisoned");
-                let recv = guard.as_mut()?;
-                match recv.try_recv() {
-                    Ok(msg) => {
-                        pending.fetch_sub(1, Ordering::Relaxed);
-                        Some(msg)
-                    }
-                    Err(_) => None,
-                }
+                let msg = receiver
+                    .lock()
+                    .expect("receiver lock poisoned")
+                    .try_recv()
+                    .ok()?;
+                pending.fetch_sub(1, Ordering::Relaxed);
+                Some(msg)
             }
-            MailboxBacking::Durable(mb) => mb.try_pop().ok().flatten().map(|p| {
-                Arc::downcast::<Message>(p)
-                    .map(|am| (*am).clone())
-                    .expect("durable mailbox payload was not a Message")
-            }),
+            MailboxBacking::Durable(mb) => mb.try_pop().ok().flatten().map(unwrap_durable_payload),
         }
     }
 
-    /// Blocking pop with optional timeout. `None` timeout =
-    /// block until message OR mailbox closed-and-empty.
-    /// Returns `None` on timeout OR closed-and-empty.
+    /// Blocking pop with optional timeout. `None` = block
+    /// until message OR mailbox closed-and-empty. Returns
+    /// `None` on timeout OR closed-and-empty.
     pub fn pop_or_wait(&self, timeout: Option<Duration>) -> Option<Message> {
         match &*self.inner {
             MailboxBacking::Fast {
                 receiver, pending, ..
             } => {
                 let mut guard = receiver.lock().expect("receiver lock poisoned");
-                let recv = guard.as_mut()?;
                 let msg = match timeout {
-                    None => recv.blocking_recv(),
+                    None => guard.blocking_recv(),
+                    // tokio's UnboundedReceiver has no blocking
+                    // recv_timeout; poll + 1ms sleep until
+                    // deadline. Short-timeout callers only.
                     Some(d) => {
-                        // tokio UnboundedReceiver has no blocking
-                        // recv_timeout. Use try_recv in a sleep loop
-                        // — short timeouts only.
                         let deadline = std::time::Instant::now() + d;
                         loop {
-                            match recv.try_recv() {
+                            match guard.try_recv() {
                                 Ok(m) => break Some(m),
                                 Err(mpsc::error::TryRecvError::Disconnected) => break None,
                                 Err(mpsc::error::TryRecvError::Empty) => {
@@ -259,81 +256,80 @@ impl ActorMailbox {
                 }
                 msg
             }
-            MailboxBacking::Durable(mb) => mb.pop_or_wait(timeout).ok().flatten().map(|p| {
-                Arc::downcast::<Message>(p)
-                    .map(|am| (*am).clone())
-                    .expect("durable mailbox payload was not a Message")
-            }),
+            MailboxBacking::Durable(mb) => mb
+                .pop_or_wait(timeout)
+                .ok()
+                .flatten()
+                .map(unwrap_durable_payload),
         }
     }
 
-    /// Async pop. Used by `Actor::receive_async` so async-
-    /// body actors don't call `blocking_recv` (which panics
-    /// inside a multi_thread tokio runtime).
+    /// Async pop for `Actor::receive_async`. Fast uses
+    /// tokio's native `recv().await`; Durable falls back to
+    /// the Condvar-blocking path (callers expecting non-
+    /// blocking with a Durable backing should wrap in
+    /// `spawn_sync_body_on_task_with_kind` for
+    /// `block_in_place` semantics).
     ///
-    /// For Fast: temporarily takes the UnboundedReceiver out
-    /// of the Mutex, awaits one recv, then puts it back. The
-    /// take-and-replace serializes concurrent recv attempts
-    /// the same way `pop_or_wait` does — mpsc semantics
-    /// disallow multiple concurrent receivers anyway.
-    ///
-    /// For Durable: delegates to `pop_or_wait` (Condvar
-    /// blocking; safe under `block_in_place`).
+    /// **Caveat:** Fast take-and-replace the receiver around
+    /// the await. If the await is cancelled or the task is
+    /// dropped between the take and the put-back, the
+    /// receiver is leaked — subsequent recv attempts hit
+    /// `None`. Real fix is moving the receiver out of the
+    /// `Mutex` (e.g., to a `tokio::sync::Mutex`) but that's
+    /// a deeper restructure.
     pub async fn pop_or_wait_async(&self) -> Option<Message> {
         match &*self.inner {
             MailboxBacking::Fast {
                 receiver, pending, ..
             } => {
-                let mut rx = {
+                // Take the receiver out of the std Mutex so
+                // we can hold it across await (guard is
+                // !Send). Mem-replace with a fresh throwaway
+                // channel keeps the slot populated for any
+                // concurrent try_recv probe. Scope blocks
+                // guarantee no guard outlives its critical
+                // section.
+                let mut taken = {
                     let mut guard = receiver.lock().expect("receiver lock poisoned");
-                    guard.take()?
+                    let (_dummy_tx, dummy_rx) = mpsc::unbounded_channel();
+                    std::mem::replace(&mut *guard, dummy_rx)
                 };
-                let msg = rx.recv().await;
-                // Put the receiver back so subsequent recvs
-                // can re-take it. Drop case: if msg is None
-                // (sender closed), the receiver still goes
-                // back so try_receive can observe Disconnected.
+                let msg = taken.recv().await;
                 {
                     let mut guard = receiver.lock().expect("receiver lock poisoned");
-                    *guard = Some(rx);
+                    *guard = taken;
                 }
                 if msg.is_some() {
                     pending.fetch_sub(1, Ordering::Relaxed);
                 }
                 msg
             }
-            MailboxBacking::Durable(mb) => mb.pop_or_wait(None).ok().flatten().map(|p| {
-                Arc::downcast::<Message>(p)
-                    .map(|am| (*am).clone())
-                    .expect("durable mailbox payload was not a Message")
-            }),
-        }
-    }
-
-    /// Mark the mailbox closed. After close, `push` returns
-    /// `Err`. Any parked receivers wake and observe the
-    /// closed state.
-    pub fn close(&self) {
-        match &*self.inner {
-            MailboxBacking::Fast { receiver, .. } => {
-                // Drop the receiver so the sender's
-                // UnboundedSender::send returns Err. Parked
-                // blocking_recv calls wake with None.
-                receiver.lock().expect("receiver lock poisoned").take();
-            }
-            MailboxBacking::Durable(mb) => mb.close(),
+            MailboxBacking::Durable(mb) => mb
+                .pop_or_wait(None)
+                .ok()
+                .flatten()
+                .map(unwrap_durable_payload),
         }
     }
 
     pub fn is_closed(&self) -> bool {
         match &*self.inner {
-            MailboxBacking::Fast {
-                sender, receiver, ..
-            } => sender.is_closed() || receiver.lock().map(|g| g.is_none()).unwrap_or(true),
+            // Fast: `sender.is_closed()` is true iff every
+            // sender has dropped — which can't happen while
+            // the Arc<MailboxBacking> is alive (it owns one),
+            // so this is structurally always false for Fast.
+            // Kept as a defensive load for future variants.
+            MailboxBacking::Fast { sender, .. } => sender.is_closed(),
             MailboxBacking::Durable(mb) => mb.is_closed(),
         }
     }
 
+    /// Approximate message count (in-flight). Bumped on
+    /// push, decremented on successful pop. Used by the
+    /// soft-cap check; accurate for cap-enforcement use but
+    /// may briefly differ from the actual queue depth under
+    /// concurrent push/pop.
     pub fn len(&self) -> usize {
         match &*self.inner {
             MailboxBacking::Fast { pending, .. } => pending.load(Ordering::Relaxed),
@@ -342,9 +338,8 @@ impl ActorMailbox {
     }
 }
 
-/// Mirrors the shape of `tokio::sync::mpsc::error::TryRecvError`
-/// so downstream callers that already match on
-/// `Empty` / `Disconnected` keep working post-mailbox swap.
+/// Mirrors `tokio::sync::mpsc::error::TryRecvError` so
+/// downstream `match`es keep working post-mailbox swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum TryRecvError {
     #[error("mailbox is empty (no message available right now)")]
@@ -352,9 +347,6 @@ pub enum TryRecvError {
     #[error("mailbox is closed (sender side dropped)")]
     Disconnected,
 }
-
-// (unwrap_message helper removed — ActorMailbox::try_pop and
-// pop_or_wait now do the downcast at the boundary.)
 
 // ---------- Identifiers ----------
 
@@ -474,26 +466,18 @@ pub(crate) struct ActorState {
     /// receive_async to decide the disposition of incoming
     /// Exit messages.
     trap_exit: AtomicBool,
-    /// Soft mailbox cap (audit fix #5). `0` = unlimited (the
-    /// default, BEAM-style). When > 0, `send_with_cap`
-    /// checks `pending` before delivering and returns
-    /// `ActorError::MailboxFull` if at-or-above cap. This
-    /// rejects rather than blocks — backpressure is the
-    /// sender's policy decision (retry, drop, alert). True
-    /// awaiting backpressure would need switching the channel
-    /// type to `mpsc::Sender`; that's a heavier refactor.
+    /// Soft mailbox cap. `0` = unlimited (the default,
+    /// BEAM-style). When > 0, `send_with_cap` rejects new
+    /// sends once `mailbox.len()` reaches the cap.
+    /// Rejecting rather than blocking — backpressure is the
+    /// sender's policy decision (retry, drop, alert).
     ///
-    /// `ActorRef::send` (held directly, e.g., from Rust tests)
-    /// bypasses the cap check for the hot path. Production
-    /// senders should go through cs-runtime's `(send pid …)`
-    /// primop, which routes through `send_with_cap`.
+    /// `ActorRef::send` (held directly, e.g., from Rust
+    /// tests) bypasses the cap check for the hot path.
+    /// Production senders should go through cs-runtime's
+    /// `(send pid …)` primop, which routes through
+    /// `send_with_cap`.
     soft_cap: AtomicUsize,
-    /// In-flight message count (sent − received). Bumped by
-    /// `send_with_cap`; decremented by `primop_raw_receive`
-    /// after a successful recv. Approximate when used outside
-    /// the cap-enforcement path because non-capped `ActorRef::send`
-    /// bypasses the increment.
-    pending: AtomicUsize,
 }
 
 impl ActorState {
@@ -504,7 +488,6 @@ impl ActorState {
             monitored_by: Mutex::new(HashMap::new()),
             trap_exit: AtomicBool::new(false),
             soft_cap: AtomicUsize::new(0),
-            pending: AtomicUsize::new(0),
         }
     }
 
@@ -518,36 +501,19 @@ impl ActorState {
             .map_err(|_| ActorError::SendFailed { pid })
     }
 
-    /// Send with soft-cap enforcement. Returns `Err(MailboxFull)`
-    /// when `soft_cap > 0` and `pending >= soft_cap`; otherwise
-    /// behaves like the raw push. Increments `pending` on
-    /// success — the receiver decrements after a successful recv.
+    /// Send with soft-cap enforcement. Returns
+    /// `Err(MailboxFull)` when `soft_cap > 0` and the live
+    /// queue depth (`mailbox.len()`) is at or above the
+    /// cap. The pending count is maintained by the mailbox
+    /// itself (Fast: per-push atomic; Durable: cached
+    /// storage len), so the cap auto-clears as the receiver
+    /// drains.
     pub(crate) fn send_with_cap(&self, pid: ActorPid, msg: Message) -> Result<(), ActorError> {
         let cap = self.soft_cap.load(Ordering::Relaxed);
-        if cap > 0 && self.pending.load(Ordering::Relaxed) >= cap {
+        if cap > 0 && self.mailbox.len() >= cap {
             return Err(ActorError::MailboxFull { pid, cap });
         }
-        self.push_raw(pid, msg)?;
-        self.pending.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Called by `primop_raw_receive` after a successful
-    /// dequeue. Saturating-decrements `pending`; we tolerate
-    /// transient underflow if `send_with_cap` racing with
-    /// `ActorRef::send` (which bypasses pending) skewed the
-    /// count.
-    pub(crate) fn note_received(&self) {
-        let prev = self.pending.load(Ordering::Relaxed);
-        if prev > 0 {
-            // Best-effort decrement. Concurrent decrements
-            // are fine because we're saturating-subtracting.
-            self.pending.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    pub(crate) fn pending_count(&self) -> usize {
-        self.pending.load(Ordering::Relaxed)
+        self.push_raw(pid, msg)
     }
 }
 
@@ -826,7 +792,7 @@ impl Actor {
         self.state.trap_exit.load(Ordering::Relaxed)
     }
 
-    // ---- Bounded mailbox (audit fix #5) ----
+    // ---- Bounded mailbox ----
 
     /// Set the soft cap on this actor's mailbox. `0`
     /// (default) disables enforcement; positive `n` means
@@ -842,11 +808,9 @@ impl Actor {
         self.state.soft_cap.load(Ordering::Relaxed)
     }
 
-    /// Current approximate pending count. May be off if
-    /// some senders used the raw `ActorRef::send` path
-    /// instead of routing through `send_with_cap`.
+    /// Current queue depth (in-flight messages).
     pub fn mailbox_pending(&self) -> usize {
-        self.state.pending_count()
+        self.state.mailbox.len()
     }
 
     /// Send `payload` to `target` via the cap-checked path.
@@ -859,14 +823,6 @@ impl Actor {
             .map(|e| Arc::clone(e.value()))
             .ok_or(ActorError::SendFailed { pid: target })?;
         target_state.send_with_cap(target, Message::User(payload))
-    }
-
-    /// Decrement this actor's pending counter after a
-    /// successful receive. cs-runtime's `primop_raw_receive`
-    /// calls this so the mailbox cap reflects in-flight
-    /// vs. consumed messages.
-    pub fn note_received(&self) {
-        self.state.note_received();
     }
 }
 
@@ -895,7 +851,7 @@ struct ActorSystemRef {
     /// Signaled by `on_actor_termination` whenever an actor
     /// finishes. `wait_idle` blocks on the Condvar and
     /// rechecks `registry.is_empty()` instead of busy-
-    /// polling (audit fix #9). The Mutex<()> is just a
+    /// polling. The Mutex<()> is just a
     /// dummy required by Condvar's API; the source of truth
     /// is `registry.is_empty()`.
     idle_notify: Arc<(Mutex<()>, Condvar)>,
@@ -911,11 +867,17 @@ impl ActorSystemRef {
         match kind {
             MailboxKind::Fast => ActorMailbox::new_fast(),
             MailboxKind::Durable => {
-                let name = format!("__mailbox:{}.{}", pid.node, pid.local_id);
-                ActorMailbox::new_durable(self.tables.clone(), name)
+                ActorMailbox::new_durable(self.tables.clone(), mailbox_table_name(pid))
             }
         }
     }
+}
+
+/// Canonical table name for `pid`'s mailbox in cs-table.
+/// Single source of truth — used by the registry create and
+/// by Scheme introspection looking up `(table-size '__mailbox:0.42)`.
+pub fn mailbox_table_name(pid: ActorPid) -> String {
+    format!("__mailbox:{pid}")
 }
 
 impl ActorSystemRef {
@@ -1841,10 +1803,9 @@ mod tests {
         sys.wait_idle();
         let elapsed = t0.elapsed();
         assert_eq!(sys.live_actor_count(), 0);
-        // Sanity bound: shouldn't take more than a second.
-        // Pre-fix this took up to (registry_drain_time + 5ms)
-        // due to the 5ms sleep loop; post-fix the Condvar
-        // notifies as each actor terminates.
+        // Sanity bound — regression guard on the Condvar
+        // wakeup path: 32 no-op actors should finish in
+        // well under a second.
         assert!(
             elapsed < std::time::Duration::from_secs(1),
             "wait_idle took {:?} — should be ≪ 1s for 32 no-op actors",
