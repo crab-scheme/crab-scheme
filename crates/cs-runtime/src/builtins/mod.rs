@@ -3836,7 +3836,25 @@ fn b_with_region(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     }
     let region = std::rc::Rc::new(cs_gc::Region::new());
     let _guard = crate::regions::RegionScope::enter(std::rc::Rc::clone(&region));
-    let result = apply_procedure(&args[0], &[], ctx).map_err(|e| e.message())?;
+    let result = match apply_procedure(&args[0], &[], ctx) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = propagate_eval_err(e, ctx);
+            // `propagate_eval_err` stashed any Raised condition or
+            // Escape value into ctx.pending_raise / pending_escape.
+            // Those Values may contain Region-allocated Gc handles
+            // that would dangle once `_guard` drops the bump arena
+            // below, so promote them to Rc-backed storage first.
+            if let Some(cond) = ctx.pending_raise.take() {
+                ctx.pending_raise = Some(cs_core::promote::to_rc_deep(&cond));
+            }
+            if let Some((id, v)) = ctx.pending_escape.take() {
+                ctx.pending_escape = Some((id, cs_core::promote::to_rc_deep(&v)));
+            }
+            drop(_guard);
+            return Err(msg);
+        }
+    };
     // Build a fresh Rc-backed Value tree from the result.
     // `to_rc_deep` clones-by-value (it never mutates the
     // source), so even if the VM has parallel handles to
@@ -3873,7 +3891,7 @@ fn b_apply(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             v => return Err(type_err("apply", "proper list (last arg)", &v)),
         }
     }
-    apply_procedure(proc_val, &all, ctx).map_err(|e| e.message())
+    apply_procedure(proc_val, &all, ctx).map_err(|e| propagate_eval_err(e, ctx))
 }
 
 /// Convert an `EvalError` from `apply_procedure` into a `String` error that
@@ -6905,7 +6923,8 @@ fn b_hashtable_update_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| args[3].clone())
     };
-    let new_val = apply_procedure(&args[2], &[current], ctx).map_err(|e| e.message())?;
+    let new_val =
+        apply_procedure(&args[2], &[current], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     let mut items = h.items.borrow_mut();
     if let Some(slot) = items.iter_mut().find(|(k, _)| ht_eq(kind, k, &args[1])) {
         slot.1 = new_val;
@@ -6941,7 +6960,7 @@ fn b_hashtable_walk(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> 
     let proc_val = args[1].clone();
     let entries: Vec<(Value, Value)> = h.items.borrow().clone();
     for (k, v) in entries {
-        apply_procedure(&proc_val, &[k, v], ctx).map_err(|e| e.message())?;
+        apply_procedure(&proc_val, &[k, v], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(Value::Unspecified)
 }
@@ -6986,7 +7005,7 @@ fn b_call_cc(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             //     simple eval of an App)
             // (b) via the pending_escape side-channel + a Message error
             //     (when the invocation was buried inside a higher builtin
-            //      whose `.map_err(|e| e.message())` collapsed the kind)
+            //      whose `.map_err(|e| propagate_eval_err(e, ctx))` collapsed the kind)
             // Check both.
             let escape = match &e.kind {
                 crate::eval::EvalErrorKind::Escape(eid, v) => Some((*eid, v.clone())),
@@ -7022,14 +7041,14 @@ fn b_call_with_values(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String
     let producer = args[0].clone();
     let consumer = args[1].clone();
     let prev = ctx.pending_values.take();
-    let result = apply_procedure(&producer, &[], ctx).map_err(|e| e.message())?;
+    let result = apply_procedure(&producer, &[], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     let values = if let Some(vs) = ctx.pending_values.take() {
         vs
     } else {
         vec![result]
     };
     ctx.pending_values = prev;
-    apply_procedure(&consumer, &values, ctx).map_err(|e| e.message())
+    apply_procedure(&consumer, &values, ctx).map_err(|e| propagate_eval_err(e, ctx))
 }
 
 // ---- SRFI-1 / R6RS list-extras (pure) ----
@@ -7168,7 +7187,8 @@ fn b_filter(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let items = collect_proper_list("filter", &args[1])?;
     let mut out = Vec::new();
     for item in items {
-        let r = apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| e.message())?;
+        let r =
+            apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if r.is_truthy() {
             out.push(item);
         }
@@ -7186,7 +7206,8 @@ fn b_take_while(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let items = collect_proper_list("take-while", &args[1])?;
     let mut out = Vec::new();
     for item in items {
-        let r = apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| e.message())?;
+        let r =
+            apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if !r.is_truthy() {
             break;
         }
@@ -7205,7 +7226,8 @@ fn b_drop_while(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let items = collect_proper_list("drop-while", &args[1])?;
     let mut idx = 0;
     while idx < items.len() {
-        let r = apply_procedure(&pred, &[items[idx].clone()], ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&pred, &[items[idx].clone()], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
         if !r.is_truthy() {
             break;
         }
@@ -7224,7 +7246,8 @@ fn b_span(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let items = collect_proper_list("span", &args[1])?;
     let mut idx = 0;
     while idx < items.len() {
-        let r = apply_procedure(&pred, &[items[idx].clone()], ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&pred, &[items[idx].clone()], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
         if !r.is_truthy() {
             break;
         }
@@ -7246,7 +7269,8 @@ fn b_break(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let items = collect_proper_list("break", &args[1])?;
     let mut idx = 0;
     while idx < items.len() {
-        let r = apply_procedure(&pred, &[items[idx].clone()], ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&pred, &[items[idx].clone()], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
         if r.is_truthy() {
             break;
         }
@@ -7272,7 +7296,7 @@ fn b_list_index(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
     for i in 0..n {
         let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-        let r = apply_procedure(&pred, &row, ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&pred, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if r.is_truthy() {
             return Ok(Value::fixnum(i as i64));
         }
@@ -7295,7 +7319,7 @@ fn b_filter_map(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let mut out = Vec::new();
     for i in 0..n {
         let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if !matches!(r, Value::Boolean(false)) {
             out.push(r);
         }
@@ -7319,7 +7343,7 @@ fn b_append_map(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let mut out = Vec::new();
     for i in 0..n {
         let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         let inner = collect_proper_list("append-map", &r)?;
         out.extend(inner);
     }
@@ -7338,7 +7362,8 @@ fn b_list_tabulate(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let proc_val = args[1].clone();
     let mut out = Vec::with_capacity(n as usize);
     for i in 0..n {
-        let r = apply_procedure(&proc_val, &[Value::fixnum(i)], ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&proc_val, &[Value::fixnum(i)], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
         out.push(r);
     }
     Ok(Value::list(out))
@@ -7361,7 +7386,7 @@ fn b_fold_left(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         for l in &lists {
             row.push(l[i].clone());
         }
-        acc = apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        acc = apply_procedure(&proc_val, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(acc)
 }
@@ -7384,7 +7409,7 @@ fn b_fold_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             row.push(l[i].clone());
         }
         row.push(acc);
-        acc = apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        acc = apply_procedure(&proc_val, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(acc)
 }
@@ -7402,7 +7427,8 @@ fn b_reduce(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     }
     let mut acc = items[0].clone();
     for item in &items[1..] {
-        acc = apply_procedure(&proc_val, &[acc, item.clone()], ctx).map_err(|e| e.message())?;
+        acc = apply_procedure(&proc_val, &[acc, item.clone()], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(acc)
 }
@@ -7414,7 +7440,8 @@ fn b_find(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let pred = args[0].clone();
     let items = collect_proper_list("find", &args[1])?;
     for item in items {
-        let r = apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| e.message())?;
+        let r =
+            apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if r.is_truthy() {
             return Ok(item);
         }
@@ -7436,7 +7463,8 @@ fn b_find_tail(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             Value::Null => return Ok(Value::Boolean(false)),
             Value::Pair(p) => {
                 let car = p.car();
-                let r = apply_procedure(&pred, &[car], ctx).map_err(|e| e.message())?;
+                let r =
+                    apply_procedure(&pred, &[car], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
                 if r.is_truthy() {
                     return Ok(cur);
                 }
@@ -7462,7 +7490,8 @@ fn b_reduce_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     }
     let mut acc = items[items.len() - 1].clone();
     for item in items[..items.len() - 1].iter().rev() {
-        acc = apply_procedure(&proc_val, &[item.clone(), acc], ctx).map_err(|e| e.message())?;
+        acc = apply_procedure(&proc_val, &[item.clone(), acc], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(acc)
 }
@@ -7481,7 +7510,8 @@ fn b_pair_fold(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             Value::Null => return Ok(acc),
             Value::Pair(p) => {
                 let next = p.cdr();
-                acc = apply_procedure(&kons, &[cur.clone(), acc], ctx).map_err(|e| e.message())?;
+                acc = apply_procedure(&kons, &[cur.clone(), acc], ctx)
+                    .map_err(|e| propagate_eval_err(e, ctx))?;
                 cur = next;
             }
             _ => return Err("pair-fold: improper list".into()),
@@ -7513,7 +7543,7 @@ fn b_pair_fold_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String>
     }
     let mut acc = knil;
     for sub in subs.into_iter().rev() {
-        acc = apply_procedure(&kons, &[sub, acc], ctx).map_err(|e| e.message())?;
+        acc = apply_procedure(&kons, &[sub, acc], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(acc)
 }
@@ -7531,7 +7561,8 @@ fn b_pair_for_each(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             Value::Null => return Ok(Value::Unspecified),
             Value::Pair(p) => {
                 let next = p.cdr();
-                apply_procedure(&proc_val, &[cur.clone()], ctx).map_err(|e| e.message())?;
+                apply_procedure(&proc_val, &[cur.clone()], ctx)
+                    .map_err(|e| propagate_eval_err(e, ctx))?;
                 cur = next;
             }
             _ => return Err("pair-for-each: improper list".into()),
@@ -7567,7 +7598,8 @@ fn b_string_fold(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         return Err("string-fold: range out of bounds".into());
     }
     for c in &chars[start..end] {
-        acc = apply_procedure(&kons, &[Value::Character(*c), acc], ctx).map_err(|e| e.message())?;
+        acc = apply_procedure(&kons, &[Value::Character(*c), acc], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(acc)
 }
@@ -7600,7 +7632,8 @@ fn b_string_fold_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Strin
     }
     let mut acc = knil;
     for c in chars[start..end].iter().rev() {
-        acc = apply_procedure(&kons, &[Value::Character(*c), acc], ctx).map_err(|e| e.message())?;
+        acc = apply_procedure(&kons, &[Value::Character(*c), acc], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(acc)
 }
@@ -7618,7 +7651,8 @@ fn b_string_tabulate(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String>
     }
     let mut out = String::with_capacity(n as usize);
     for i in 0..n {
-        let r = apply_procedure(&proc_val, &[Value::fixnum(i)], ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&proc_val, &[Value::fixnum(i)], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
         match r {
             Value::Character(c) => out.push(c),
             v => return Err(type_err("string-tabulate", "character (proc result)", &v)),
@@ -7641,7 +7675,8 @@ fn b_vector_fold_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Strin
     };
     let mut acc = knil;
     for item in v.iter().rev() {
-        acc = apply_procedure(&kons, &[item.clone(), acc], ctx).map_err(|e| e.message())?;
+        acc = apply_procedure(&kons, &[item.clone(), acc], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(acc)
 }
@@ -7663,13 +7698,15 @@ fn b_unfold_right(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         Value::Null
     };
     loop {
-        let stop = apply_procedure(&pred, &[seed.clone()], ctx).map_err(|e| e.message())?;
+        let stop =
+            apply_procedure(&pred, &[seed.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if stop.is_truthy() {
             return Ok(acc);
         }
-        let elt = apply_procedure(&mapper, &[seed.clone()], ctx).map_err(|e| e.message())?;
+        let elt = apply_procedure(&mapper, &[seed.clone()], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
         acc = Value::Pair(Pair::new(elt, acc));
-        seed = apply_procedure(&advancer, &[seed], ctx).map_err(|e| e.message())?;
+        seed = apply_procedure(&advancer, &[seed], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     }
 }
 
@@ -7681,7 +7718,7 @@ fn b_count(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let items = collect_proper_list("count", &args[1])?;
     let mut n: i64 = 0;
     for item in items {
-        let r = apply_procedure(&pred, &[item], ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&pred, &[item], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if r.is_truthy() {
             n += 1;
         }
@@ -7701,7 +7738,7 @@ fn b_any(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
     for i in 0..n {
         let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-        let r = apply_procedure(&pred, &row, ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&pred, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if r.is_truthy() {
             return Ok(r);
         }
@@ -7725,7 +7762,7 @@ fn b_every(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let mut last_truthy = Value::Boolean(true);
     for i in 0..n {
         let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-        let r = apply_procedure(&pred, &row, ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&pred, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if !r.is_truthy() {
             return Ok(Value::Boolean(false));
         }
@@ -7744,7 +7781,8 @@ fn b_partition(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let mut yes = Vec::new();
     let mut no = Vec::new();
     for item in items {
-        let r = apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| e.message())?;
+        let r =
+            apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if r.is_truthy() {
             yes.push(item);
         } else {
@@ -9093,7 +9131,7 @@ fn b_dynamic_wind(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let before = args[0].clone();
     let thunk = args[1].clone();
     let after = args[2].clone();
-    apply_procedure(&before, &[], ctx).map_err(|e| e.message())?;
+    apply_procedure(&before, &[], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     let result = apply_procedure(&thunk, &[], ctx);
     // Always run after, even on error.
     let after_err = apply_procedure(&after, &[], ctx).err().map(|e| e.message());
@@ -9131,7 +9169,7 @@ fn b_with_input_from_string(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, 
     let port = Value::Port(Port::string_input(&s));
     let prev = ctx.current_input_port.take();
     ctx.current_input_port = Some(port);
-    let result = apply_procedure(&args[1], &[], ctx).map_err(|e| e.message());
+    let result = apply_procedure(&args[1], &[], ctx).map_err(|e| propagate_eval_err(e, ctx));
     ctx.current_input_port = prev;
     result
 }
@@ -9146,7 +9184,7 @@ fn b_with_output_to_string(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, S
     let port_val = Value::Port(port.clone());
     let prev = ctx.current_output_port.take();
     ctx.current_output_port = Some(port_val);
-    let result = apply_procedure(&args[0], &[], ctx).map_err(|e| e.message());
+    let result = apply_procedure(&args[0], &[], ctx).map_err(|e| propagate_eval_err(e, ctx));
     ctx.current_output_port = prev;
     result?;
     // Extract accumulated string from the port we kept a reference to.
@@ -9166,7 +9204,8 @@ fn b_call_with_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> 
         return Err(type_err("call-with-port", "port", &args[0]));
     }
     let port = args[0].clone();
-    let result = apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| e.message());
+    let result =
+        apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx));
     // Best-effort close — ignore close errors so they don't mask the
     // proc's return / error.
     let _ = b_close_port(&[port]);
@@ -9181,7 +9220,8 @@ fn b_call_with_input_file(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, St
         return Err(arity_err("call-with-input-file", "2", args.len()));
     }
     let port = b_open_input_file(&[args[0].clone()])?;
-    let result = apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| e.message());
+    let result =
+        apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx));
     let _ = b_close_port(&[port]);
     result
 }
@@ -9194,7 +9234,8 @@ fn b_call_with_output_file(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, S
         return Err(arity_err("call-with-output-file", "2", args.len()));
     }
     let port = b_open_output_file(&[args[0].clone()])?;
-    let result = apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| e.message());
+    let result =
+        apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx));
     let _ = b_close_port(&[port]);
     result
 }
@@ -9210,7 +9251,8 @@ fn b_call_with_input_string(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, 
         v => return Err(type_err("call-with-input-string", "string", v)),
     };
     let port = Value::Port(Port::string_input(&s));
-    let result = apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| e.message());
+    let result =
+        apply_procedure(&args[1], &[port.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx));
     let _ = b_close_port(&[port]);
     result
 }
@@ -9223,7 +9265,8 @@ fn b_call_with_output_string(args: &[Value], ctx: &mut EvalCtx) -> Result<Value,
     }
     let port = Port::string_output();
     let port_val = Value::Port(port.clone());
-    let result = apply_procedure(&args[0], &[port_val], ctx).map_err(|e| e.message());
+    let result =
+        apply_procedure(&args[0], &[port_val], ctx).map_err(|e| propagate_eval_err(e, ctx));
     result?;
     match &*port {
         Port::StringOutput(buf) => Ok(Value::string(buf.borrow().clone())),
@@ -9265,7 +9308,7 @@ fn b_with_output_to_file(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
                 .map_err(|e| format!("with-output-to-file: write {} failed: {}", path, e))?;
         }
     }
-    result.map_err(|e| e.message())
+    result.map_err(|e| propagate_eval_err(e, ctx))
 }
 
 /// `(with-input-from-file path thunk)` — read `path` into a string-input
@@ -9286,7 +9329,7 @@ fn b_with_input_from_file(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, St
     let port_val = Value::Port(port);
     let prev = ctx.current_input_port.take();
     ctx.current_input_port = Some(port_val);
-    let result = apply_procedure(&args[1], &[], ctx).map_err(|e| e.message());
+    let result = apply_procedure(&args[1], &[], ctx).map_err(|e| propagate_eval_err(e, ctx));
     ctx.current_input_port = prev;
     result
 }
@@ -9328,7 +9371,8 @@ fn b_force(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
                     PromiseState::Pending(t) => t.clone(),
                     PromiseState::Forced(_) => unreachable!(),
                 };
-                let v = apply_procedure(&thunk, &[], ctx).map_err(|e| e.message())?;
+                let v =
+                    apply_procedure(&thunk, &[], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
                 if matches!(v, Value::Promise(_)) {
                     // Thunk returned another promise — iterate. The
                     // intermediate promise `p` stays pending; the loop
@@ -11099,7 +11143,7 @@ fn b_load(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         .expand_program(&data)
         .map_err(|e| format!("load: expand error in {}: {}", path, e.message()))?;
     drop(expander);
-    crate::eval::eval(&core, ctx.top.clone(), ctx).map_err(|e| e.message())
+    crate::eval::eval(&core, ctx.top.clone(), ctx).map_err(|e| propagate_eval_err(e, ctx))
 }
 
 // ---- eval ----
@@ -11506,7 +11550,7 @@ fn b_with_active_optimizer_passes(args: &[Value], ctx: &mut EvalCtx) -> Result<V
     // panic; the Drop runs because `_guard` is dropped at scope
     // exit no matter how we leave.)
     cs_opt::with_scoped_active_passes(names, || apply_procedure(&thunk, &[], ctx))
-        .map_err(|e| e.message())
+        .map_err(|e| propagate_eval_err(e, ctx))
 }
 
 // ---- SRFI-1 extras ----
@@ -11912,7 +11956,8 @@ fn b_tabulate(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let proc_val = args[1].clone();
     let mut out = Vec::with_capacity(n as usize);
     for i in 0..n {
-        let r = apply_procedure(&proc_val, &[Value::fixnum(i)], ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&proc_val, &[Value::fixnum(i)], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
         out.push(r);
     }
     Ok(Value::list(out))
@@ -11927,7 +11972,8 @@ fn b_remove(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let items = collect_proper_list("remove", &args[1])?;
     let mut out = Vec::new();
     for item in items {
-        let r = apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| e.message())?;
+        let r =
+            apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if !r.is_truthy() {
             out.push(item);
         }
@@ -11945,7 +11991,8 @@ fn b_remp(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let items = collect_proper_list("remp", &args[1])?;
     let mut out = Vec::new();
     for item in items {
-        let r = apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| e.message())?;
+        let r =
+            apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if !r.is_truthy() {
             out.push(item);
         }
@@ -12104,7 +12151,7 @@ fn b_string_map(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let mut out = String::with_capacity(n);
     for i in 0..n {
         let row: Vec<Value> = strings.iter().map(|s| Value::Character(s[i])).collect();
-        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         match r {
             Value::Character(c) => out.push(c),
             other => {
@@ -12136,7 +12183,7 @@ fn b_string_for_each(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String>
     let n = strings.iter().map(|s| s.len()).min().unwrap_or(0);
     for i in 0..n {
         let row: Vec<Value> = strings.iter().map(|s| Value::Character(s[i])).collect();
-        apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        apply_procedure(&proc_val, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(Value::Unspecified)
 }
@@ -12154,7 +12201,8 @@ fn b_vector_filter(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     };
     let mut out = Vec::new();
     for item in items {
-        let r = apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| e.message())?;
+        let r =
+            apply_procedure(&pred, &[item.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if r.is_truthy() {
             out.push(item);
         }
@@ -12175,7 +12223,8 @@ fn b_vector_fold(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         v => return Err(type_err("vector-fold", "vector", v)),
     };
     for item in items {
-        acc = apply_procedure(&proc_val, &[acc, item], ctx).map_err(|e| e.message())?;
+        acc = apply_procedure(&proc_val, &[acc, item], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(acc)
 }
@@ -12242,7 +12291,7 @@ fn sort_with_predicate(
         let mut j = i;
         while j > 0 {
             let r = apply_procedure(cmp, &[items[j].clone(), items[j - 1].clone()], ctx)
-                .map_err(|e| e.message())?;
+                .map_err(|e| propagate_eval_err(e, ctx))?;
             if !r.is_truthy() {
                 break;
             }
@@ -12853,13 +12902,15 @@ fn b_unfold(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let mut out = Vec::new();
     // Bound by 1M iterations to prevent runaway loops.
     for _ in 0..1_000_000 {
-        let stop = apply_procedure(&pred, &[seed.clone()], ctx).map_err(|e| e.message())?;
+        let stop =
+            apply_procedure(&pred, &[seed.clone()], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         if stop.is_truthy() {
             return Ok(Value::list(out));
         }
-        let mapped = apply_procedure(&map_fn, &[seed.clone()], ctx).map_err(|e| e.message())?;
+        let mapped = apply_procedure(&map_fn, &[seed.clone()], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
         out.push(mapped);
-        seed = apply_procedure(&next_fn, &[seed], ctx).map_err(|e| e.message())?;
+        seed = apply_procedure(&next_fn, &[seed], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Err("unfold: exceeded 1,000,000 iterations".into())
 }
@@ -12886,7 +12937,8 @@ fn b_hashtable_fold(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> 
     let h = as_ht("hashtable-fold", &args[2])?;
     let entries: Vec<(Value, Value)> = h.items.borrow().clone();
     for (k, v) in entries {
-        acc = apply_procedure(&proc_val, &[k, v, acc], ctx).map_err(|e| e.message())?;
+        acc = apply_procedure(&proc_val, &[k, v, acc], ctx)
+            .map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(acc)
 }
@@ -12899,7 +12951,7 @@ fn b_hashtable_for_each(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Stri
     let h = as_ht("hashtable-for-each", &args[1])?;
     let entries: Vec<(Value, Value)> = h.items.borrow().clone();
     for (k, v) in entries {
-        apply_procedure(&proc_val, &[k, v], ctx).map_err(|e| e.message())?;
+        apply_procedure(&proc_val, &[k, v], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(Value::Unspecified)
 }
@@ -13855,7 +13907,7 @@ fn b_vector_map(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let row: Vec<Value> = snapshots.iter().map(|s| s[i].clone()).collect();
-        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         out.push(r);
     }
     Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(
@@ -13878,7 +13930,7 @@ fn b_vector_for_each(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String>
     let n = snapshots.iter().map(|v| v.len()).min().unwrap_or(0);
     for i in 0..n {
         let row: Vec<Value> = snapshots.iter().map(|s| s[i].clone()).collect();
-        apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        apply_procedure(&proc_val, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(Value::Unspecified)
 }
