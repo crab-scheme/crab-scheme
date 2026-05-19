@@ -23,3 +23,6 @@ rustc-hash = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Needed by examples/perf_spawn_echo.rs (starvation bench bridges
+# the cs-vm reduction counter through cs-actor's yield hook).
+cs-vm = { path = "../cs-vm" }
