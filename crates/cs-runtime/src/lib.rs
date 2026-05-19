@@ -71,6 +71,21 @@ pub struct Runtime {
     /// native codegen.)
     #[cfg(feature = "jit")]
     pub(crate) jit_lowerer: Option<cs_jit_cranelift::Lowerer>,
+    /// JIT poison flag. Set when a JIT compile panicked, or when the
+    /// pre-codegen verifier rejected a structurally-malformed
+    /// function (`JitError::Malformed`). Once set, `jit_tier_up_hook`
+    /// short-circuits and every closure stays on the bytecode VM
+    /// (correct by construction).
+    ///
+    /// Per-`Runtime`, not thread-local (issue #18): the post-1.0
+    /// work-stealing scheduler shares worker threads across
+    /// Runtimes, and a thread-local flag would let one Runtime's
+    /// panic poison JIT for unrelated Runtimes stolen onto the same
+    /// worker. `Rc<Cell<_>>` so `jit_tier_up_hook` can hold a handle
+    /// independent of the `&mut Runtime` borrow it takes for the
+    /// Lowerer. Cleared via [`Runtime::reset_jit_poison`] (issue #17).
+    #[cfg(feature = "jit")]
+    pub(crate) jit_poisoned: Rc<Cell<bool>>,
     /// Override for `(command-line)`. R6RS specifies that
     /// command-line returns `(<program-path> <arg> ...)` — the
     /// script path followed by the args passed after it. The
@@ -1746,6 +1761,8 @@ impl Runtime {
             ffi_ctx: None,
             #[cfg(feature = "jit")]
             jit_lowerer: None,
+            #[cfg(feature = "jit")]
+            jit_poisoned: Rc::new(Cell::new(false)),
             command_line: None,
             typer_hints_by_lambda_id: std::cell::RefCell::new(std::collections::HashMap::new()),
         }

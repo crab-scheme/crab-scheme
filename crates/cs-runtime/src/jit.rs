@@ -60,26 +60,20 @@ impl Runtime {
     pub fn jit_installed(&self) -> bool {
         self.jit_lowerer.is_some()
     }
-}
 
-/// Thread-local poison flag — set when any prior JIT compile on
-/// this thread panicked. Once set, `jit_tier_up_hook` returns
-/// early without touching the Lowerer. Rationale: a Cranelift
-/// panic indicates our lowering produced IR that violates
-/// Cranelift's invariants. Empirical (maze): the workload that
-/// triggers the panic ALSO has functions whose uniform-NB
-/// translation compiles "cleanly" but produces wrong native code
-/// (negative vector indices) — those don't panic at compile time
-/// but corrupt runtime state. The safest containment after seeing
-/// a panic is to stop attempting JIT compilation on this thread
-/// for the rest of the process. Functions stay on the bytecode VM
-/// (which is correct by construction).
-///
-/// Set never reset within a process: a panic indicates a JIT bug
-/// that won't be fixed at runtime. The runtime keeps running
-/// correctly on the VM tier.
-std::thread_local! {
-    static JIT_POISONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Clear the JIT poison flag so subsequent tier-up attempts
+    /// re-engage the JIT subsystem. Use after a workload that
+    /// triggered a JIT panic completes, and before starting an
+    /// unrelated workload (REPL switching files, a server between
+    /// plugin loads). No-op if not currently poisoned.
+    ///
+    /// Caller's responsibility: only call when confident the
+    /// panic-triggering workload is not about to re-run — the JIT
+    /// bug that poisoned the runtime is not fixed by resetting the
+    /// flag. (Issue #17.)
+    pub fn reset_jit_poison(&mut self) {
+        self.jit_poisoned.set(false);
+    }
 }
 
 /// Tier-up hook installed by [`Runtime::install_jit`]. Compiles
@@ -89,13 +83,11 @@ std::thread_local! {
 ///
 /// Silent on failure: any unsupported opcode, env access, or
 /// translation error leaves the closure on the bytecode VM. A
-/// Cranelift panic during lowering also leaves the closure on the
-/// VM, and sets [`JIT_POISONED`] so subsequent tier-up attempts on
-/// this thread short-circuit.
+/// Cranelift panic during lowering (or a `Malformed` verifier
+/// rejection) also leaves the closure on the VM and sets the
+/// runtime's `jit_poisoned` flag so subsequent tier-up attempts
+/// on that runtime short-circuit.
 fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
-    if JIT_POISONED.with(|p| p.get()) {
-        return;
-    }
     // SAFETY: The hook fires only inside the closure-call dispatch,
     // which runs inside `Runtime::with_active` (set by `eval_str` /
     // `eval_str_via_vm`). The active back-pointer is the unique
@@ -104,6 +96,13 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
         Some(rt) => rt,
         None => return,
     };
+    // Per-Runtime poison flag (issue #18). Clone the `Rc` handle
+    // up front so it stays usable after `rt` is mutably borrowed
+    // for the Lowerer below.
+    let poison = rt.jit_poisoned.clone();
+    if poison.get() {
+        return;
+    }
     let lowerer = match rt.jit_lowerer.as_mut() {
         Some(l) => l,
         None => return,
@@ -245,11 +244,11 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     let (ptr, return_tag_override) = match uniform_result {
         Ok(Ok(p)) => (p, Some(cs_vm::vm::JIT_RT_NB)),
         Err(_) => {
-            // uniform-NB panicked — poison the JIT subsystem.
-            // See the JIT_POISONED rationale above; the safest
-            // response is to stop attempting JIT on this thread
-            // entirely for the rest of the process.
-            JIT_POISONED.with(|p| p.set(true));
+            // uniform-NB panicked — poison the JIT for this runtime
+            // (see `Runtime::jit_poisoned`). A Cranelift panic means
+            // our lowering produced invalid IR; the safest response
+            // is to stop attempting JIT and run on the bytecode VM.
+            poison.set(true);
             return;
         }
         Ok(Err(e)) => {
@@ -264,7 +263,7 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
             // — the same outcome the caught-panic path produced,
             // minus the panic.
             if matches!(e, cs_jit::JitError::Malformed(_)) {
-                JIT_POISONED.with(|p| p.set(true));
+                poison.set(true);
                 return;
             }
             // Ordinary `Unsupported` / `Codegen` rejection — by-design
@@ -275,7 +274,7 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
             match pure_result {
                 Ok(Ok(p)) => (p, None),
                 Err(_) => {
-                    JIT_POISONED.with(|p| p.set(true));
+                    poison.set(true);
                     return;
                 }
                 Ok(Err(_)) => return,
@@ -316,4 +315,38 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     let rt_tag = return_tag_override.unwrap_or(semantic_tag);
     closure.set_jit_return_type(rt_tag);
     closure.set_jit_semantic_return_type(semantic_tag);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Runtime;
+
+    /// Issue #17 — `reset_jit_poison` round-trips the flag.
+    #[test]
+    fn reset_jit_poison_round_trip() {
+        let mut rt = Runtime::new();
+        assert!(!rt.jit_poisoned.get(), "a fresh runtime is not poisoned");
+        rt.jit_poisoned.set(true);
+        assert!(rt.jit_poisoned.get());
+        rt.reset_jit_poison();
+        assert!(!rt.jit_poisoned.get(), "reset clears the poison flag");
+        rt.reset_jit_poison(); // no-op when already clear
+        assert!(!rt.jit_poisoned.get());
+    }
+
+    /// Issue #18 — the poison flag is per-Runtime: poisoning one
+    /// Runtime must not poison another sharing the same thread
+    /// (the cross-contamination the work-stealing scheduler would
+    /// otherwise hit).
+    #[test]
+    fn jit_poison_is_per_runtime() {
+        let rt1 = Runtime::new();
+        let rt2 = Runtime::new();
+        rt1.jit_poisoned.set(true);
+        assert!(rt1.jit_poisoned.get());
+        assert!(
+            !rt2.jit_poisoned.get(),
+            "a second Runtime on the same thread must not inherit rt1's poison"
+        );
+    }
 }
