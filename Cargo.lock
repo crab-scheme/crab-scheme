@@ -796,6 +796,7 @@ name = "cs-channel"
 version = "0.0.1"
 dependencies = [
  "dashmap",
+ "futures-util",
  "thiserror 1.0.69",
  "tokio",
 ]

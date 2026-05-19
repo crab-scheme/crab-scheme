@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use dashmap::DashMap;
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 /// Type-erased payload type. Channels carry these; the cs-runtime
 /// bridge wraps `SendableValue` into one on send and downcasts on
@@ -330,6 +330,225 @@ impl ChannelRegistry {
 }
 
 impl Default for ChannelRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------
+// Broadcast channels — every subscriber sees every message.
+// Separate type from mpsc Channel because the underlying tokio
+// primitive is different (broadcast::channel) and the API
+// surface (subscribe) doesn't exist on mpsc.
+// ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriptionId(pub u64);
+
+impl std::fmt::Display for SubscriptionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<broadcast-sub:{}>", self.0)
+    }
+}
+
+/// Outcome of a broadcast `recv` / `try_recv` call.
+pub enum BroadcastRecv {
+    Value(Payload),
+    /// Receiver fell `n` messages behind the producer's ring
+    /// buffer; the missed messages are gone. Receiver can keep
+    /// consuming subsequent messages.
+    Lagged(u64),
+    /// Producer sender dropped + channel drained. Recv won't
+    /// produce any more values.
+    Closed,
+    /// `try_recv`-only: no value available right now but the
+    /// channel is still open.
+    Empty,
+}
+
+/// One broadcast channel. Holds the (one) tokio broadcast
+/// Sender; each `subscribe()` clones a fresh Receiver from the
+/// sender.
+pub struct BroadcastChannel {
+    id: ChannelId,
+    capacity: usize,
+    tx: StdMutex<Option<broadcast::Sender<Payload>>>,
+    closed: AtomicBool,
+}
+
+impl BroadcastChannel {
+    fn new(id: ChannelId, capacity: usize) -> Self {
+        // tokio broadcast::channel requires capacity >= 1.
+        let cap = capacity.max(1);
+        let (tx, _initial_rx) = broadcast::channel(cap);
+        // _initial_rx drops here — subscribers get fresh
+        // receivers from sender.subscribe() instead.
+        Self {
+            id,
+            capacity: cap,
+            tx: StdMutex::new(Some(tx)),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    pub fn id(&self) -> ChannelId {
+        self.id
+    }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Send to every current subscriber. Returns the number of
+    /// receivers the message was delivered to (zero is fine —
+    /// means no one's subscribed). Errors only if the channel
+    /// was closed before send.
+    pub fn send(&self, v: Payload) -> Result<usize, ChannelError> {
+        if self.is_closed() {
+            return Err(ChannelError::Closed(self.id));
+        }
+        let guard = self.tx.lock().expect("broadcast tx lock poisoned");
+        match guard.as_ref() {
+            Some(tx) => match tx.send(v) {
+                // SendError(_) means no active receivers. Not
+                // a fault — just report 0 deliveries.
+                Ok(n) => Ok(n),
+                Err(_) => Ok(0),
+            },
+            None => Err(ChannelError::Closed(self.id)),
+        }
+    }
+
+    /// Mark closed and drop the Sender so receivers see EOF on
+    /// their next recv after draining.
+    pub fn close(&self) -> bool {
+        let was_open = !self.closed.swap(true, Ordering::AcqRel);
+        if was_open {
+            *self.tx.lock().expect("broadcast tx lock poisoned") = None;
+        }
+        was_open
+    }
+
+    /// Create a new subscriber receiver. Returns None if the
+    /// channel is closed (no sender to subscribe from).
+    fn new_subscriber(&self) -> Option<broadcast::Receiver<Payload>> {
+        self.tx
+            .lock()
+            .expect("broadcast tx lock poisoned")
+            .as_ref()
+            .map(|tx| tx.subscribe())
+    }
+}
+
+/// One broadcast subscriber's view of a channel. Holds an
+/// independent `broadcast::Receiver` so each subscriber sees
+/// every message from the time they subscribed.
+pub struct BroadcastSubscription {
+    id: SubscriptionId,
+    channel_id: ChannelId,
+    rx: Mutex<broadcast::Receiver<Payload>>,
+}
+
+impl BroadcastSubscription {
+    pub fn id(&self) -> SubscriptionId {
+        self.id
+    }
+    pub fn channel_id(&self) -> ChannelId {
+        self.channel_id
+    }
+
+    pub async fn recv(&self) -> BroadcastRecv {
+        let mut guard = self.rx.lock().await;
+        match guard.recv().await {
+            Ok(p) => BroadcastRecv::Value(p),
+            Err(broadcast::error::RecvError::Lagged(n)) => BroadcastRecv::Lagged(n),
+            Err(broadcast::error::RecvError::Closed) => BroadcastRecv::Closed,
+        }
+    }
+
+    pub fn try_recv(&self) -> BroadcastRecv {
+        let mut guard = match self.rx.try_lock() {
+            Ok(g) => g,
+            Err(_) => return BroadcastRecv::Empty,
+        };
+        match guard.try_recv() {
+            Ok(p) => BroadcastRecv::Value(p),
+            Err(broadcast::error::TryRecvError::Empty) => BroadcastRecv::Empty,
+            Err(broadcast::error::TryRecvError::Lagged(n)) => BroadcastRecv::Lagged(n),
+            Err(broadcast::error::TryRecvError::Closed) => BroadcastRecv::Closed,
+        }
+    }
+}
+
+/// Process-global registry of broadcast channels + subscriptions.
+/// Separate from ChannelRegistry (mpsc) — different ID
+/// namespaces. Channels and subscriptions both live until
+/// explicitly dropped.
+pub struct BroadcastRegistry {
+    next_channel_id: AtomicU64,
+    next_sub_id: AtomicU64,
+    channels: DashMap<ChannelId, Arc<BroadcastChannel>>,
+    subs: DashMap<SubscriptionId, Arc<BroadcastSubscription>>,
+}
+
+impl BroadcastRegistry {
+    pub fn new() -> Self {
+        Self {
+            next_channel_id: AtomicU64::new(1),
+            next_sub_id: AtomicU64::new(1),
+            channels: DashMap::new(),
+            subs: DashMap::new(),
+        }
+    }
+
+    pub fn create(&self, capacity: usize) -> ChannelId {
+        let id = ChannelId(self.next_channel_id.fetch_add(1, Ordering::Relaxed));
+        let ch = BroadcastChannel::new(id, capacity);
+        self.channels.insert(id, Arc::new(ch));
+        id
+    }
+
+    pub fn lookup(&self, id: ChannelId) -> Option<Arc<BroadcastChannel>> {
+        self.channels.get(&id).map(|e| Arc::clone(e.value()))
+    }
+
+    pub fn lookup_sub(&self, id: SubscriptionId) -> Option<Arc<BroadcastSubscription>> {
+        self.subs.get(&id).map(|e| Arc::clone(e.value()))
+    }
+
+    /// Subscribe to a broadcast channel. Returns the new
+    /// subscription's ID, or None if the channel is closed /
+    /// missing.
+    pub fn subscribe(&self, channel_id: ChannelId) -> Option<SubscriptionId> {
+        let ch = self.channels.get(&channel_id)?;
+        let rx = ch.value().new_subscriber()?;
+        let id = SubscriptionId(self.next_sub_id.fetch_add(1, Ordering::Relaxed));
+        let sub = BroadcastSubscription {
+            id,
+            channel_id,
+            rx: Mutex::new(rx),
+        };
+        self.subs.insert(id, Arc::new(sub));
+        Some(id)
+    }
+
+    pub fn drop_channel(&self, id: ChannelId) -> bool {
+        self.channels.remove(&id).is_some()
+    }
+    pub fn drop_sub(&self, id: SubscriptionId) -> bool {
+        self.subs.remove(&id).is_some()
+    }
+    pub fn channels_len(&self) -> usize {
+        self.channels.len()
+    }
+    pub fn subs_len(&self) -> usize {
+        self.subs.len()
+    }
+}
+
+impl Default for BroadcastRegistry {
     fn default() -> Self {
         Self::new()
     }

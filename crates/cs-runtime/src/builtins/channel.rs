@@ -44,7 +44,8 @@ use std::sync::{Arc, OnceLock};
 use cs_actor::Payload;
 use cs_channel::{await_select, try_select};
 use cs_channel::{
-    ChannelError, ChannelId, ChannelRegistry, SelectClause, SelectKind, SelectOutcome,
+    BroadcastRecv, BroadcastRegistry, ChannelError, ChannelId, ChannelRegistry, SelectClause,
+    SelectKind, SelectOutcome, SubscriptionId,
 };
 use cs_core::{Number, Pair, SymbolTable, Value};
 
@@ -468,6 +469,194 @@ fn parse_select_clause(
     }
 }
 
+// ---------------------------------------------------------------
+// Broadcast channels — per interview decision 3, separate API
+// from mpsc. (broadcast <id>) and (broadcast-sub <id>) tagged
+// pairs are distinct from (channel <id>).
+// ---------------------------------------------------------------
+
+pub fn broadcast_registry() -> &'static BroadcastRegistry {
+    static R: OnceLock<BroadcastRegistry> = OnceLock::new();
+    R.get_or_init(BroadcastRegistry::new)
+}
+
+fn make_broadcast_value(id: ChannelId, syms: &mut SymbolTable) -> Value {
+    let tag = Value::Symbol(syms.intern("broadcast"));
+    let id_v = Value::Number(Number::Fixnum(id.0 as i64));
+    Value::Pair(Pair::new(tag, Value::Pair(Pair::new(id_v, Value::Null))))
+}
+
+fn make_sub_value(id: SubscriptionId, syms: &mut SymbolTable) -> Value {
+    let tag = Value::Symbol(syms.intern("broadcast-sub"));
+    let id_v = Value::Number(Number::Fixnum(id.0 as i64));
+    Value::Pair(Pair::new(tag, Value::Pair(Pair::new(id_v, Value::Null))))
+}
+
+fn value_to_tagged_id(
+    v: &Value,
+    expected_tag: &str,
+    syms: &SymbolTable,
+    who: &str,
+) -> Result<u64, String> {
+    let (head, tail) = match v {
+        Value::Pair(p) => (p.car.borrow(), p.cdr.borrow()),
+        other => {
+            return Err(format!(
+                "{}: expected a {} value, got {}",
+                who,
+                expected_tag,
+                other.type_name()
+            ));
+        }
+    };
+    match &*head {
+        Value::Symbol(s) if syms.name(*s) == expected_tag => {}
+        _ => return Err(format!("{}: not a {} value (wrong tag)", who, expected_tag)),
+    }
+    let (id, rest) = match &*tail {
+        Value::Pair(p) => (p.car.borrow(), p.cdr.borrow()),
+        _ => {
+            return Err(format!(
+                "{}: malformed {} value (no id slot)",
+                who, expected_tag
+            ))
+        }
+    };
+    match (&*id, &*rest) {
+        (Value::Number(Number::Fixnum(n)), Value::Null) if *n >= 0 => Ok(*n as u64),
+        _ => Err(format!(
+            "{}: malformed {} value (bad id)",
+            who, expected_tag
+        )),
+    }
+}
+
+pub fn b_make_broadcast_channel(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("make-broadcast-channel", args, 1)?;
+    let cap = value_to_i64(&args[0], "make-broadcast-channel")?;
+    if cap < 1 {
+        return Err(
+            "make-broadcast-channel: capacity must be at least 1 (tokio broadcast minimum)".into(),
+        );
+    }
+    let id = broadcast_registry().create(cap as usize);
+    Ok(make_broadcast_value(id, syms))
+}
+
+pub fn b_broadcast_p(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("broadcast?", args, 1)?;
+    Ok(Value::Boolean(
+        value_to_tagged_id(&args[0], "broadcast", syms, "").is_ok(),
+    ))
+}
+
+pub fn b_broadcast_sub_p(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("broadcast-sub?", args, 1)?;
+    Ok(Value::Boolean(
+        value_to_tagged_id(&args[0], "broadcast-sub", syms, "").is_ok(),
+    ))
+}
+
+pub fn b_broadcast_subscribe(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("broadcast-subscribe", args, 1)?;
+    let id = ChannelId(value_to_tagged_id(
+        &args[0],
+        "broadcast",
+        syms,
+        "broadcast-subscribe",
+    )?);
+    let sub_id = broadcast_registry()
+        .subscribe(id)
+        .ok_or_else(|| format!("broadcast-subscribe: channel {} not found or closed", id))?;
+    Ok(make_sub_value(sub_id, syms))
+}
+
+pub fn b_broadcast_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("broadcast-send!", args, 2)?;
+    let id = ChannelId(value_to_tagged_id(
+        &args[0],
+        "broadcast",
+        syms,
+        "broadcast-send!",
+    )?);
+    let ch = broadcast_registry()
+        .lookup(id)
+        .ok_or_else(|| format!("broadcast-send!: channel {} not found", id))?;
+    let payload_sv = to_sendable_in(&args[1], syms)?;
+    let payload: Payload = Arc::new(payload_sv);
+    let n = ch
+        .send(payload)
+        .map_err(|e| format!("broadcast-send!: {}", e))?;
+    Ok(Value::Number(Number::Fixnum(n as i64)))
+}
+
+fn broadcast_recv_to_value(r: BroadcastRecv, syms: &mut SymbolTable) -> Value {
+    match r {
+        BroadcastRecv::Value(p) => payload_to_value(p, syms),
+        BroadcastRecv::Lagged(_) => Value::Symbol(syms.intern("*lagged*")),
+        BroadcastRecv::Closed => Value::Symbol(syms.intern("*closed*")),
+        BroadcastRecv::Empty => Value::Symbol(syms.intern("*empty*")),
+    }
+}
+
+pub fn b_broadcast_recv(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("broadcast-recv", args, 1)?;
+    let sub_id = SubscriptionId(value_to_tagged_id(
+        &args[0],
+        "broadcast-sub",
+        syms,
+        "broadcast-recv",
+    )?);
+    let sub = broadcast_registry()
+        .lookup_sub(sub_id)
+        .ok_or_else(|| format!("broadcast-recv: subscription {} not found", sub_id))?;
+    let r = block_on("broadcast-recv", sub.recv())?;
+    Ok(broadcast_recv_to_value(r, syms))
+}
+
+pub fn b_broadcast_try_recv(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("broadcast-try-recv", args, 1)?;
+    let sub_id = SubscriptionId(value_to_tagged_id(
+        &args[0],
+        "broadcast-sub",
+        syms,
+        "broadcast-try-recv",
+    )?);
+    let sub = broadcast_registry()
+        .lookup_sub(sub_id)
+        .ok_or_else(|| format!("broadcast-try-recv: subscription {} not found", sub_id))?;
+    Ok(broadcast_recv_to_value(sub.try_recv(), syms))
+}
+
+pub fn b_broadcast_close(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("broadcast-close!", args, 1)?;
+    let id = ChannelId(value_to_tagged_id(
+        &args[0],
+        "broadcast",
+        syms,
+        "broadcast-close!",
+    )?);
+    let ch = broadcast_registry()
+        .lookup(id)
+        .ok_or_else(|| format!("broadcast-close!: channel {} not found", id))?;
+    ch.close();
+    Ok(Value::Unspecified)
+}
+
+pub fn b_broadcast_closed_p(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("broadcast-closed?", args, 1)?;
+    let id = ChannelId(value_to_tagged_id(
+        &args[0],
+        "broadcast",
+        syms,
+        "broadcast-closed?",
+    )?);
+    let ch = broadcast_registry()
+        .lookup(id)
+        .ok_or_else(|| format!("broadcast-closed?: channel {} not found", id))?;
+    Ok(Value::Boolean(ch.is_closed()))
+}
+
 pub fn channel_syms_builtins() -> Vec<(
     &'static str,
     fn(&[Value], &mut SymbolTable) -> Result<Value, String>,
@@ -484,5 +673,15 @@ pub fn channel_syms_builtins() -> Vec<(
         ("channel-len", b_channel_len),
         ("channel-capacity", b_channel_capacity),
         ("channel-select", b_channel_select),
+        // Broadcast channels
+        ("make-broadcast-channel", b_make_broadcast_channel),
+        ("broadcast?", b_broadcast_p),
+        ("broadcast-sub?", b_broadcast_sub_p),
+        ("broadcast-subscribe", b_broadcast_subscribe),
+        ("broadcast-send!", b_broadcast_send),
+        ("broadcast-recv", b_broadcast_recv),
+        ("broadcast-try-recv", b_broadcast_try_recv),
+        ("broadcast-close!", b_broadcast_close),
+        ("broadcast-closed?", b_broadcast_closed_p),
     ]
 }

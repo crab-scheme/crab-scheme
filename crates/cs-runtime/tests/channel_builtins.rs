@@ -269,6 +269,138 @@ fn select_macro_dispatches_correctly() {
     assert_eq!(disp(&rt, &r), "fallback");
 }
 
+/// Broadcast channels — separate API from mpsc per interview
+/// decision 3. Tests the try-* paths from REPL (no tokio
+/// context); blocking paths are exercised by the cross-actor
+/// test below.
+///
+/// Fan-out: one send! reaches every subscriber. The returned
+/// delivery count must match the number of live subscriptions.
+#[test]
+fn broadcast_fan_out_count_matches_subscriber_count() {
+    let mut rt = Runtime::new();
+    rt.eval_str("<t>", "(define bc (make-broadcast-channel 16))")
+        .unwrap();
+    assert_eq!(eval_disp(&mut rt, "(broadcast? bc)"), "#t");
+    assert_eq!(eval_disp(&mut rt, "(channel? bc)"), "#f");
+
+    // Zero subscribers — send! returns 0 delivered.
+    assert_eq!(eval_disp(&mut rt, "(broadcast-send! bc 'orphan)"), "0");
+
+    // One subscriber — delivery count is 1.
+    rt.eval_str("<t>", "(define s1 (broadcast-subscribe bc))")
+        .unwrap();
+    assert_eq!(eval_disp(&mut rt, "(broadcast-send! bc 'one)"), "1");
+
+    // Two more subscribers — delivery count is 3.
+    rt.eval_str("<t>", "(define s2 (broadcast-subscribe bc))")
+        .unwrap();
+    rt.eval_str("<t>", "(define s3 (broadcast-subscribe bc))")
+        .unwrap();
+    assert_eq!(eval_disp(&mut rt, "(broadcast-send! bc 'three)"), "3");
+}
+
+#[test]
+fn broadcast_predicates_distinguish_channels_subs_and_mpsc() {
+    let mut rt = Runtime::new();
+    rt.eval_str("<t>", "(define mpsc (make-channel))").unwrap();
+    rt.eval_str("<t>", "(define bc (make-broadcast-channel 4))")
+        .unwrap();
+    rt.eval_str("<t>", "(define sub (broadcast-subscribe bc))")
+        .unwrap();
+
+    // channel? matches only mpsc.
+    assert_eq!(eval_disp(&mut rt, "(channel? mpsc)"), "#t");
+    assert_eq!(eval_disp(&mut rt, "(channel? bc)"), "#f");
+    assert_eq!(eval_disp(&mut rt, "(channel? sub)"), "#f");
+
+    // broadcast? matches only broadcast channels.
+    assert_eq!(eval_disp(&mut rt, "(broadcast? mpsc)"), "#f");
+    assert_eq!(eval_disp(&mut rt, "(broadcast? bc)"), "#t");
+    assert_eq!(eval_disp(&mut rt, "(broadcast? sub)"), "#f");
+
+    // broadcast-sub? matches only subscriptions.
+    assert_eq!(eval_disp(&mut rt, "(broadcast-sub? mpsc)"), "#f");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-sub? bc)"), "#f");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-sub? sub)"), "#t");
+}
+
+#[test]
+fn broadcast_try_recv_round_trip() {
+    let mut rt = Runtime::new();
+    rt.eval_str("<t>", "(define bc (make-broadcast-channel 8))")
+        .unwrap();
+    rt.eval_str("<t>", "(define s1 (broadcast-subscribe bc))")
+        .unwrap();
+    rt.eval_str("<t>", "(define s2 (broadcast-subscribe bc))")
+        .unwrap();
+
+    // Send to all currently subscribed (2 of them).
+    let n = rt.eval_str("<t>", "(broadcast-send! bc 'event-1)").unwrap();
+    assert_eq!(disp(&rt, &n), "2"); // delivered to 2 receivers
+
+    // Both subscribers receive the message independently.
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv s1)"), "event-1");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv s2)"), "event-1");
+
+    // Empty after drain.
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv s1)"), "*empty*");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv s2)"), "*empty*");
+
+    // Send three more events — both subscribers see all of them.
+    rt.eval_str("<t>", "(broadcast-send! bc 'event-2)").unwrap();
+    rt.eval_str("<t>", "(broadcast-send! bc 'event-3)").unwrap();
+    rt.eval_str("<t>", "(broadcast-send! bc 'event-4)").unwrap();
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv s1)"), "event-2");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv s1)"), "event-3");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv s1)"), "event-4");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv s2)"), "event-2");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv s2)"), "event-3");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv s2)"), "event-4");
+}
+
+#[test]
+fn broadcast_late_subscriber_misses_prior_messages() {
+    let mut rt = Runtime::new();
+    rt.eval_str("<t>", "(define bc (make-broadcast-channel 8))")
+        .unwrap();
+    rt.eval_str("<t>", "(define early (broadcast-subscribe bc))")
+        .unwrap();
+
+    rt.eval_str("<t>", "(broadcast-send! bc 'before-1)")
+        .unwrap();
+    rt.eval_str("<t>", "(broadcast-send! bc 'before-2)")
+        .unwrap();
+
+    // late subscribes AFTER the sends.
+    rt.eval_str("<t>", "(define late (broadcast-subscribe bc))")
+        .unwrap();
+    rt.eval_str("<t>", "(broadcast-send! bc 'after-1)").unwrap();
+
+    // early sees all three.
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv early)"), "before-1");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv early)"), "before-2");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv early)"), "after-1");
+
+    // late only sees the post-subscription one.
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv late)"), "after-1");
+    assert_eq!(eval_disp(&mut rt, "(broadcast-try-recv late)"), "*empty*");
+}
+
+#[test]
+fn broadcast_close_marks_closed() {
+    let mut rt = Runtime::new();
+    rt.eval_str("<t>", "(define bc (make-broadcast-channel 4))")
+        .unwrap();
+    assert_eq!(eval_disp(&mut rt, "(broadcast-closed? bc)"), "#f");
+    rt.eval_str("<t>", "(broadcast-close! bc)").unwrap();
+    assert_eq!(eval_disp(&mut rt, "(broadcast-closed? bc)"), "#t");
+
+    // Send after close errors.
+    let err = rt.eval_str("<t>", "(broadcast-send! bc 'late)");
+    assert!(err.is_err(), "expected send-on-closed error");
+}
+
 /// End-to-end: actor A creates a channel, sends the handle to
 /// actor B via cs-actor's send/receive, then both produce + drain
 /// items through that shared channel.
