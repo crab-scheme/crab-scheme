@@ -1,0 +1,40 @@
+[package]
+name = "cs-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme tower-style async web framework: Service/Layer composition over hyper, with cs-actor / cs-table / cs-runtime integrations."
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time", "net", "io-util"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+# Module loading for `Handler` cdylib plugins. Native-only; falls
+# off automatically on WASM via the `modules` feature.
+libloading = { workspace = true, optional = true }
+# Optional integration crates — feature-gated so a pure-Rust
+# user can build cs-web without pulling actor/table/runtime.
+cs-actor = { workspace = true, optional = true }
+cs-table = { workspace = true, optional = true }
+# `tracing-log`-style structured logging would be nice; for now
+# the Trace layer just writes to stderr. Real tracing is a follow-up.
+
+[features]
+default = ["modules", "actor", "table"]
+modules = ["dep:libloading"]
+actor = ["dep:cs-actor"]
+table = ["dep:cs-table"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# Realistic e2e tests speak HTTP/1.1 over a loopback socket.
+# Using hyper's client side keeps the dep surface minimal.
+hyper = { workspace = true, features = ["client", "http1"] }

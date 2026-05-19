@@ -1381,6 +1381,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-web"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cs-actor",
+ "cs-table",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libloading",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "csv"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1868,6 +1886,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
