@@ -46,6 +46,9 @@ pub mod actor;
 #[cfg(feature = "table")]
 pub mod table;
 
+// Re-export `http` so downstream callers can `cs_web::http::Request::builder()`
+// without an explicit dep.
+pub use http;
 // Re-export http types so users don't need an explicit `http` dep.
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 

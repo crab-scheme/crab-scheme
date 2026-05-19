@@ -28,25 +28,34 @@
 //!
 //! ; Stop the server. Idempotent.
 //! (web-server-stop sid)
-//! ```
 //!
-//! Scope: the v1 surface supports static-body routes and module
-//! plugins. Scheme-defined dynamic handlers need a Value-typed
-//! payload bridge for `cs_web::actor::WebMessage` — that lives in
-//! cs-actor's payload layer and is a follow-up. Today's
-//! workaround: write the dynamic handler in Rust (a module
-//! plugin) and mount it via `web-route-module!`.
+//! ; Route a Scheme actor as a dynamic handler. The actor's
+//! ; receive loop sees `('*web-request* <handle>)` and replies
+//! ; via `(web-respond! handle status body)`.
+//! (web-route-actor! sid 'GET "/dynamic" actor-pid 2000)
+//!
+//! ; Inside an actor body, decode a received web request.
+//! (web-request-method handle)              => 'GET
+//! (web-request-path   handle)              => "/dynamic"
+//! (web-request-body   handle)              => "..."
+//! (web-request-header handle "x-token")    => "secret" or #f
+//! (web-respond!       handle 200 "ok")     => unspec
+//! ```
 
 #![cfg(feature = "web")]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use cs_actor::{ActorPid, Payload};
 use cs_core::{SymbolTable, Value};
 
+use cs_web::actor::{ActorHandler, WebMessage};
 use cs_web::handler::service_fn;
 use cs_web::{response, ArcService, Method, Router, ServerConfig, StatusCode};
+
+use crate::builtins::beam::SendableValue;
 
 // ---------------------------------------------------------------
 // Slab: global registry of in-flight server builders / handles.
@@ -78,6 +87,12 @@ struct Registry {
     /// install an access log share this so a Scheme caller can
     /// later read it with `(table-fold ...)`.
     tables: cs_table::TableRegistry,
+    /// Pending request envelopes. When a cs-actor receives a
+    /// `WebMessage` payload, the bridge interns it here and
+    /// hands the Scheme actor an opaque `(*web-request* handle)`
+    /// pair. `web-respond!` consumes the slot.
+    requests: HashMap<i64, Arc<WebMessage>>,
+    next_request_id: i64,
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -87,6 +102,8 @@ fn registry() -> &'static Mutex<Registry> {
             next_id: 1,
             slots: HashMap::new(),
             tables: cs_table::TableRegistry::new(),
+            requests: HashMap::new(),
+            next_request_id: 1,
         })
     })
 }
@@ -436,6 +453,238 @@ pub fn b_web_server_stop(args: &[Value], _syms: &mut SymbolTable) -> Result<Valu
 // Registration entry point.
 // ---------------------------------------------------------------
 
+// ---------------------------------------------------------------
+// WebMessage payload bridge — exposes Scheme-defined dynamic
+// handlers.
+//
+// When a cs-actor receives a `Message::User(payload)` where the
+// payload is a `WebMessage`, the bridge slabs the envelope and
+// returns a tagged pair `('*web-request* <handle>)` that Scheme
+// pattern-matches the same way it matches `('*exit* …)` /
+// `('*down* …)`. The Scheme handler then reads request data and
+// ships its response via the `web-request-*` / `web-respond!`
+// primops below.
+// ---------------------------------------------------------------
+
+/// Called by `crate::builtins::beam::message_to_sendable` when a
+/// User payload's primary `SendableValue` downcast fails. If the
+/// payload is in fact a [`WebMessage`], stash the envelope in the
+/// request slab and return the tagged pair Scheme will receive.
+///
+/// Returning `None` lets the caller fall through to the
+/// `*opaque-payload*` placeholder for genuinely-foreign payloads.
+pub fn try_intern_web_request(payload: &Payload) -> Option<SendableValue> {
+    let msg: Arc<WebMessage> = Arc::clone(payload).downcast::<WebMessage>().ok()?;
+    let mut reg = lock();
+    let id = reg.next_request_id;
+    reg.next_request_id += 1;
+    reg.requests.insert(id, msg);
+    Some(SendableValue::Pair(
+        Box::new(SendableValue::Symbol("*web-request*".into())),
+        Box::new(SendableValue::Pair(
+            Box::new(SendableValue::Fixnum(id)),
+            Box::new(SendableValue::Null),
+        )),
+    ))
+}
+
+/// Read-only access to a request slot. Returns Err if the handle
+/// has already been responded to or never existed.
+fn with_request<R>(who: &str, handle: i64, f: impl FnOnce(&WebMessage) -> R) -> Result<R, String> {
+    let reg = lock();
+    let msg = reg.requests.get(&handle).ok_or_else(|| {
+        format!(
+            "{}: web request #{} not found (already responded?)",
+            who, handle
+        )
+    })?;
+    Ok(f(msg.as_ref()))
+}
+
+/// Take a request slot out of the slab for the respond path.
+fn take_request(handle: i64) -> Result<Arc<WebMessage>, String> {
+    lock().requests.remove(&handle).ok_or_else(|| {
+        format!(
+            "web-respond!: web request #{} not found (already responded?)",
+            handle
+        )
+    })
+}
+
+pub fn primop_request_method(handle: i64) -> Result<String, String> {
+    with_request("web-request-method", handle, |m| m.req.method().to_string())
+}
+
+pub fn primop_request_path(handle: i64) -> Result<String, String> {
+    with_request("web-request-path", handle, |m| {
+        m.req.uri().path().to_string()
+    })
+}
+
+pub fn primop_request_body(handle: i64) -> Result<String, String> {
+    with_request("web-request-body", handle, |m| {
+        String::from_utf8_lossy(m.req.body()).into_owned()
+    })
+}
+
+pub fn primop_request_header(handle: i64, name: &str) -> Result<Option<String>, String> {
+    with_request("web-request-header", handle, |m| {
+        m.req
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+    })
+}
+
+pub fn primop_respond(handle: i64, status: u16, body: String) -> Result<(), String> {
+    let msg = take_request(handle)?;
+    let status = StatusCode::from_u16(status)
+        .map_err(|e| format!("web-respond!: invalid status {}: {}", status, e))?;
+    let resp = response(status, body);
+    if !msg.reply_with(resp) {
+        return Err("web-respond!: reply channel already consumed".into());
+    }
+    Ok(())
+}
+
+fn primop_route_actor(
+    sid: i64,
+    method: Method,
+    path: String,
+    pid: ActorPid,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let actor_ref = crate::builtins::beam::lookup_pid(pid)
+        .ok_or_else(|| format!("web-route-actor!: actor {} not found (terminated?)", pid))?;
+    let svc: ArcService =
+        ActorHandler::new(actor_ref, std::time::Duration::from_millis(timeout_ms)).into_service();
+    with_slot("web-route-actor!", sid, |slot| match slot {
+        Slot::Building { router, .. } => {
+            let r = std::mem::replace(router, Router::new());
+            *router = r.route(method, &path, svc);
+            Ok(())
+        }
+        _ => Err(format!(
+            "web-route-actor!: server #{} already started or stopped",
+            sid
+        )),
+    })
+}
+
+// ---------------------------------------------------------------
+// Scheme glue for the request bridge.
+// ---------------------------------------------------------------
+
+fn parse_pid_symbol(name: &str) -> Option<ActorPid> {
+    let inner = name.strip_prefix("<pid:<")?.strip_suffix(">>")?;
+    let (n, l) = inner.split_once('.')?;
+    Some(ActorPid {
+        node: n.parse().ok()?,
+        local_id: l.parse().ok()?,
+    })
+}
+
+fn value_to_pid(v: &Value, syms: &SymbolTable, who: &str) -> Result<ActorPid, String> {
+    match v {
+        Value::Symbol(s) => {
+            let name = syms.name(*s);
+            parse_pid_symbol(name).ok_or_else(|| {
+                format!(
+                    "{}: expected a PID symbol like <pid:<n.m>>, got '{}'",
+                    who, name
+                )
+            })
+        }
+        other => Err(format!(
+            "{}: expected a PID symbol, got {}",
+            who,
+            other.type_name()
+        )),
+    }
+}
+
+pub fn b_web_request_method(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-request-method", args, 1)?;
+    let h = value_to_i64(&args[0], "web-request-method")?;
+    let m = primop_request_method(h)?;
+    Ok(Value::Symbol(syms.intern(&m)))
+}
+
+pub fn b_web_request_path(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-request-path", args, 1)?;
+    let h = value_to_i64(&args[0], "web-request-path")?;
+    let p = primop_request_path(h)?;
+    let g = cs_gc::Gc::new(std::cell::RefCell::new(p));
+    Ok(Value::String(g))
+}
+
+pub fn b_web_request_body(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-request-body", args, 1)?;
+    let h = value_to_i64(&args[0], "web-request-body")?;
+    let b = primop_request_body(h)?;
+    let g = cs_gc::Gc::new(std::cell::RefCell::new(b));
+    Ok(Value::String(g))
+}
+
+pub fn b_web_request_header(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-request-header", args, 2)?;
+    let h = value_to_i64(&args[0], "web-request-header")?;
+    let name = value_to_str(&args[1], syms, "web-request-header")?;
+    match primop_request_header(h, &name)? {
+        Some(v) => {
+            let g = cs_gc::Gc::new(std::cell::RefCell::new(v));
+            Ok(Value::String(g))
+        }
+        None => Ok(Value::Boolean(false)),
+    }
+}
+
+pub fn b_web_respond(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(format!(
+            "web-respond!: expected 2 or 3 arguments, got {}",
+            args.len()
+        ));
+    }
+    let h = value_to_i64(&args[0], "web-respond!")?;
+    let (status, body) = if args.len() == 3 {
+        (
+            value_to_u16(&args[1], "web-respond!")?,
+            value_to_str(&args[2], syms, "web-respond!")?,
+        )
+    } else {
+        (200, value_to_str(&args[1], syms, "web-respond!")?)
+    };
+    primop_respond(h, status, body)?;
+    Ok(Value::Unspecified)
+}
+
+pub fn b_web_route_actor(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 4 && args.len() != 5 {
+        return Err(format!(
+            "web-route-actor!: expected 4 or 5 arguments, got {}",
+            args.len()
+        ));
+    }
+    let sid = value_to_i64(&args[0], "web-route-actor!")?;
+    let method_name = value_to_str(&args[1], syms, "web-route-actor!")?;
+    let method =
+        method_from_symbol(&method_name).map_err(|e| format!("web-route-actor!: {}", e))?;
+    let path = value_to_str(&args[2], syms, "web-route-actor!")?;
+    let pid = value_to_pid(&args[3], syms, "web-route-actor!")?;
+    let timeout_ms = if args.len() == 5 {
+        let n = value_to_i64(&args[4], "web-route-actor!")?;
+        if n < 0 {
+            return Err("web-route-actor!: timeout-ms must be non-negative".into());
+        }
+        n as u64
+    } else {
+        30_000
+    };
+    primop_route_actor(sid, method, path, pid, timeout_ms)?;
+    Ok(Value::Unspecified)
+}
+
 pub fn web_syms_builtins() -> Vec<(
     &'static str,
     fn(&[Value], &mut SymbolTable) -> Result<Value, String>,
@@ -447,9 +696,15 @@ pub fn web_syms_builtins() -> Vec<(
     )> = vec![
         ("web-server-create", b_web_server_create),
         ("web-route-static!", b_web_route_static),
+        ("web-route-actor!", b_web_route_actor),
         ("web-access-log!", b_web_access_log),
         ("web-server-start", b_web_server_start),
         ("web-server-stop", b_web_server_stop),
+        ("web-request-method", b_web_request_method),
+        ("web-request-path", b_web_request_path),
+        ("web-request-body", b_web_request_body),
+        ("web-request-header", b_web_request_header),
+        ("web-respond!", b_web_respond),
     ];
     #[cfg(feature = "web-modules")]
     {
@@ -549,6 +804,66 @@ mod tests {
         let res = primop_route_static(sid, Method::GET, "/late".into(), "no".into(), 200);
         assert!(res.is_err());
         primop_server_stop(sid).expect("stop");
+    }
+
+    #[test]
+    fn bridge_interns_web_message_payload() {
+        // Build a WebMessage envelope by hand and run it through
+        // the bridge — no need to spin up a server.
+        let req: cs_web::Request = cs_web::http::Request::builder()
+            .method(Method::POST)
+            .uri("/things/42")
+            .header("x-token", "secret")
+            .body(cs_web::Bytes::from_static(b"payload"))
+            .unwrap();
+
+        let (tx, _rx) = tokio::sync::oneshot::channel::<cs_web::Response>();
+        let envelope: Arc<WebMessage> = Arc::new(WebMessage::new(req, tx));
+        let payload: Payload = envelope;
+
+        // Bridge produces ('*web-request* <handle>) and registers
+        // the envelope.
+        let sv = try_intern_web_request(&payload).expect("bridge should match");
+        let handle = match sv {
+            SendableValue::Pair(head, tail) => {
+                assert!(matches!(*head, SendableValue::Symbol(ref s) if s == "*web-request*"));
+                match *tail {
+                    SendableValue::Pair(boxed_id, boxed_nil) => {
+                        assert!(matches!(*boxed_nil, SendableValue::Null));
+                        match *boxed_id {
+                            SendableValue::Fixnum(n) => n,
+                            _ => panic!("handle was not a fixnum"),
+                        }
+                    }
+                    _ => panic!("tag pair tail was not a pair"),
+                }
+            }
+            _ => panic!("bridge did not return a pair"),
+        };
+
+        // Inspect the request via the same primops Scheme will use.
+        assert_eq!(primop_request_method(handle).unwrap(), "POST");
+        assert_eq!(primop_request_path(handle).unwrap(), "/things/42");
+        assert_eq!(primop_request_body(handle).unwrap(), "payload");
+        assert_eq!(
+            primop_request_header(handle, "x-token").unwrap().as_deref(),
+            Some("secret")
+        );
+        assert!(primop_request_header(handle, "missing").unwrap().is_none());
+
+        // Respond. The slot is consumed.
+        primop_respond(handle, 200, "ok".into()).unwrap();
+        // Second respond / inspect must error — slot was taken.
+        assert!(primop_respond(handle, 200, "again".into()).is_err());
+        assert!(primop_request_method(handle).is_err());
+    }
+
+    #[test]
+    fn bridge_ignores_foreign_payload() {
+        // Wrap a String in the payload — not a WebMessage. Bridge
+        // returns None, leaving the *opaque-payload* path intact.
+        let payload: Payload = Arc::new("not-a-web-request".to_string());
+        assert!(try_intern_web_request(&payload).is_none());
     }
 
     #[test]

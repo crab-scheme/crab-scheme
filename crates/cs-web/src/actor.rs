@@ -34,6 +34,17 @@ pub struct WebMessage {
 }
 
 impl WebMessage {
+    /// Build a new envelope from a request and a reply channel.
+    /// Used by integration points that ship a `WebMessage` to a
+    /// downstream actor (cs-runtime's payload bridge, or third-
+    /// party adapters that wrap a non-tower transport).
+    pub fn new(req: Request, reply: oneshot::Sender<Response>) -> Self {
+        Self {
+            req,
+            reply: Mutex::new(Some(reply)),
+        }
+    }
+
     /// Take the reply sender out of the envelope. Returns `None`
     /// on the second call — actors that reply twice silently
     /// drop the second response.
@@ -78,10 +89,7 @@ impl ActorHandler {
 impl Service for ActorHandler {
     fn call(&self, req: Request) -> BoxFuture<'static, Response> {
         let (tx, rx) = oneshot::channel();
-        let envelope = Arc::new(WebMessage {
-            req,
-            reply: Mutex::new(Some(tx)),
-        });
+        let envelope = Arc::new(WebMessage::new(req, tx));
         let payload: Payload = envelope;
         let send_result = self.target.send(payload);
         let timeout = self.timeout;

@@ -523,13 +523,23 @@ pub fn primop_raw_receive(
 
 fn message_to_sendable(msg: Message) -> SendableValue {
     match msg {
-        Message::User(payload) => payload_to_sendable(&payload).unwrap_or_else(|| {
-            // Payloads from Rust-side test fixtures that don't
-            // use SendableValue come through as opaque-tagged
-            // values. Wrap as a placeholder symbol so Scheme
-            // pattern-match still has something to compare.
+        Message::User(payload) => {
+            if let Some(sv) = payload_to_sendable(&payload) {
+                return sv;
+            }
+            // cs-web sends `Arc<WebMessage>` payloads from hyper's
+            // request task to a registered actor's mailbox. The
+            // bridge stashes the envelope and returns a tagged
+            // pair the Scheme handler pattern-matches.
+            #[cfg(feature = "web")]
+            if let Some(sv) = crate::builtins::web::try_intern_web_request(&payload) {
+                return sv;
+            }
+            // Genuinely-foreign payload (Rust test fixture, third-
+            // party plugin, ...). Wrap as a placeholder symbol so
+            // Scheme pattern-match still has something to compare.
             SendableValue::Symbol("*opaque-payload*".into())
-        }),
+        }
         Message::Exit { from, reason } => sendable_list(vec![
             SendableValue::Symbol("*exit*".into()),
             SendableValue::Pid(from),
