@@ -3,6 +3,9 @@
 #[cfg(feature = "actor")]
 pub mod beam;
 
+#[cfg(feature = "channel")]
+pub mod channel;
+
 #[cfg(feature = "sandbox")]
 pub mod sandbox;
 
@@ -1139,6 +1142,15 @@ pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
     #[cfg(feature = "web")]
     {
         for (name, f) in web::web_syms_builtins() {
+            let sym = syms.intern(name);
+            env.define(sym, crate::proc::make_builtin_syms(name, f));
+        }
+    }
+    // cs-channel first-class MPMC channels. Gated on `channel`
+    // (implies `actor` — shares the tokio runtime).
+    #[cfg(feature = "channel")]
+    {
+        for (name, f) in channel::channel_syms_builtins() {
             let sym = syms.intern(name);
             env.define(sym, crate::proc::make_builtin_syms(name, f));
         }

@@ -62,6 +62,10 @@ tracing-cycle-collector = [
 # real threads) and on bare-AOT builds. The `lib/beam/prelude.scm`
 # library only loads when this feature is on.
 actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload", "dep:tokio"]
+# First-class MPMC channels (spec: docs/research/channels_spec.md).
+# Implies `actor` because cs-channel shares the cs-actor tokio
+# runtime + the SendableValue boundary.
+channel = ["actor", "dep:cs-channel"]
 # ADR 0015 L2 — WASM-instance sandbox builtins. Pulls in
 # cs-sandbox-wasm + wasmtime. Default off because the wasmtime
 # dep is ~30s of compile time and not useful for non-sandbox
@@ -177,6 +181,7 @@ libloading = { workspace = true, optional = true }
 num-traits = { workspace = true }
 thiserror = { workspace = true }
 cs-actor = { workspace = true, optional = true }
+cs-channel = { workspace = true, optional = true }
 cs-table = { workspace = true, optional = true }
 # tokio is pulled in transitively by cs-actor under the `actor`
 # feature, but cs-runtime needs a direct dep so it can use

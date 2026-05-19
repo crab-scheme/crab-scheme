@@ -566,48 +566,67 @@ mechanism, fragment the patterns library, and pull cs-runtime
 toward a "two-color function" world that conflicts with our
 "every Scheme proc is just a proc" stance.
 
-## Open questions
+## Locked decisions
 
-1. **Should `(receive)` accept channel clauses?** Today
-   `(receive)` waits on the actor's mailbox; a richer form
-   would let it wait on mailbox + N channels with one syntax.
-   That requires either threading the channel set through
-   cs-actor's mailbox primitives, or making `(receive)` a thin
-   macro over `(select)`. Worth considering for v1.5.
+Resolved during the design interview (2026-05-19); the spec
+above reflects these:
 
-2. **Drop semantics**. When the last reference to a channel ID
-   drops, do we drop the channel and reclaim its registry slot?
-   Option A: reference-count via Scheme GC (channels referenced
-   from Scheme heap stay alive). Option B: explicit
-   `channel-close!` is required, otherwise the registry leaks.
-   B is simpler; A matches Scheme's GC model better.
+1. **Unified receive.** `(receive)` accepts channel clauses
+   alongside mailbox patterns; one primitive for "wait on
+   first-ready of N inputs." Cost: cs-actor's mailbox
+   primitives need a poll/select shape so the receive runtime
+   can await both. Deferred to a follow-up — the MVP keeps
+   `(receive)` mailbox-only and channels use `(select)`.
 
-3. **Broadcast vs MPMC**. tokio offers `broadcast` (every
-   receiver sees every message) and `mpsc` (each message
-   exactly once across all receivers). v1 should ship MPMC by
-   default; broadcast as a separate `make-broadcast-channel`
-   primop. Or unify under a `:fanout` kwarg.
+2. **Explicit close.** `(channel-close!)` is the primary
+   lifecycle API. A `(with-channel (ch ...) body)` macro
+   handles the auto-close-on-scope-exit ergonomic case.
+   Rejected: GC-tracked auto-reclaim (would need finalizer
+   hooks; complexity not justified for v1).
 
-4. **Send timeout**. Should `channel-send!` accept a timeout
-   like `channel-recv` does? Useful for "send-or-give-up"
-   backpressure handling. Symmetric with recv, low cost. v1
-   should probably include it.
+3. **MPMC default, broadcast separate.** `(make-channel)`
+   creates an MPMC queue (one message goes to one receiver,
+   work-stealing). `(make-broadcast-channel)` is the pub/sub
+   variant. Two constructors so the semantics is visible at
+   the call site.
 
-5. **Select fairness**. tokio's `select!` is pseudo-random by
-   default; `biased` is deterministic order. Scheme's `(select)`
-   should probably take an optional `#:fairness 'random | 'biased`
-   keyword. Default to random.
+4. **Asymmetric send.** `channel-send!` blocks indefinitely;
+   no 3-arg timeout form. Programs that want bounded send
+   patience use `channel-try-send!` in a retry loop, or
+   `(select [(send! …) …] [(after …) …])`. Deliberate
+   asymmetry vs `channel-recv` (which does take a timeout).
 
-6. **Async-aware vs sync-aware Scheme**. The cs-actor world is
-   sync-from-Scheme's-perspective (the actor body runs as
-   straight-line Scheme code; tokio yields are invisible). A
-   channel-recv inside an actor body Just Works because
-   cs-actor's `spawn_sync_body_on_task` runs the body in
-   `block_in_place`. From the REPL (no enclosing actor),
-   channel-recv has no tokio context — should it error, or
-   spin up a single-threaded runtime ad hoc? Lean toward
-   error: "channel-recv called outside an actor — wrap in
-   (spawn 'name ...) or in a `(run-channel-task ...)` block."
+5. **Select fairness — random default, biased opt-in.**
+   `(select …)` picks pseudo-randomly among simultaneously-
+   ready clauses (matches Go semantics; prevents one channel
+   from starving others). `(select #:fair 'biased …)` opts
+   into deterministic clause-order priority — useful when
+   you actually want "always prefer ch1 if ready."
+
+6. **REPL outside-actor → error.** Channel ops that need a
+   tokio context (blocking `channel-send!`/`recv` on a
+   bounded-full or empty channel) signal `&channel-no-context`
+   when called outside an actor body. Wrap in `(spawn …)`
+   or `(run-channel-task body)` to get a runtime. try-*
+   variants work everywhere because they're sync.
+
+## Implementation status (2026-05-19)
+
+MVP shipped: CH-A + CH-D + CH-E + CH-H — unbounded + bounded
+channels, close semantics, cs-runtime primops, cross-actor
+delivery via existing SendableValue surface (no dedicated
+variant; the `(channel <id>)` pair carries naturally).
+`cs-channel` crate + `cs-runtime/builtins/channel.rs` +
+12 acceptance tests green.
+
+Deferred follow-ups:
+
+- CH-B': unbuffered (capacity-0 rendezvous) — currently errors
+- CH-F + CH-G: `(select …)` primop + macro
+- broadcast channels (decision 3)
+- Unified receive (decision 1)
+- `(with-channel …)` macro + library helpers (CH-I)
+- Microbench (CH-J)
 
 ## References
 

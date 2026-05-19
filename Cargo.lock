@@ -792,6 +792,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-channel"
+version = "0.0.1"
+dependencies = [
+ "dashmap",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "cs-cli"
 version = "0.0.1"
 dependencies = [
@@ -991,6 +1000,7 @@ name = "cs-runtime"
 version = "0.0.1"
 dependencies = [
  "cs-actor",
+ "cs-channel",
  "cs-core",
  "cs-diag",
  "cs-expand",

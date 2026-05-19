@@ -54,6 +54,11 @@ pub enum SendableValue {
     ByteVector(Vec<u8>),
     /// An actor PID is the canonical sendable handle.
     Pid(ActorPid),
+    // Channel handles ride as the tagged pair `(channel <id>)`
+    // through the existing Pair/Symbol/Fixnum surface — no
+    // dedicated variant needed. cs-runtime/builtins/channel.rs
+    // recognizes the shape on inspection and looks the ID up in
+    // the process-global ChannelRegistry.
 }
 
 /// Project a Scheme `Value` onto a `SendableValue`. Symbols

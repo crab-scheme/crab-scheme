@@ -30,6 +30,7 @@ members = [
     # trees live in lib/beam/prelude.scm on top of the four cs-actor
     # primops — pure dispatch logic, no system calls.
     "crates/cs-actor",
+    "crates/cs-channel",
     "crates/cs-table",
     "crates/cs-hotreload",
     # Tower-style async web framework. Builds on tokio/hyper, integrates
@@ -111,6 +112,7 @@ cs-ffi-macros = { path = "crates/cs-ffi-macros" }
 # `actor` feature so non-actor builds (WASM, AOT) skip the tokio +
 # dashmap pull.
 cs-actor = { path = "crates/cs-actor" }
+cs-channel = { path = "crates/cs-channel" }
 cs-table = { path = "crates/cs-table" }
 cs-hotreload = { path = "crates/cs-hotreload" }
 # cs-web declares `default-features = false` here so downstream
