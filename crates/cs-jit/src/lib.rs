@@ -134,6 +134,14 @@ pub enum JitError {
     Codegen(String),
     /// Memory allocation for executable code failed.
     OutOfMemory,
+    /// The backend produced a structurally malformed function the
+    /// codegen pipeline cannot accept (e.g. an empty block layout).
+    /// Distinct from `Unsupported` / `Codegen`: those are by-design
+    /// tier routing, while `Malformed` signals a lowering bug. The
+    /// runtime treats it like a caught codegen panic — disable JIT
+    /// for the thread rather than route the body to another tier
+    /// whose lowering shares the same defect.
+    Malformed(String),
 }
 
 impl std::fmt::Display for JitError {
@@ -142,6 +150,7 @@ impl std::fmt::Display for JitError {
             JitError::Unsupported(s) => write!(f, "unsupported: {}", s),
             JitError::Codegen(s) => write!(f, "codegen: {}", s),
             JitError::OutOfMemory => write!(f, "out of memory"),
+            JitError::Malformed(s) => write!(f, "malformed lowering: {}", s),
         }
     }
 }

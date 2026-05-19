@@ -252,11 +252,25 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
             JIT_POISONED.with(|p| p.set(true));
             return;
         }
-        Ok(Err(_)) => {
-            // Clean rejection from uniform-NB — try the
-            // specialized tier. pure_fixnum can also panic
-            // (its codegen path overlaps cranelift's), so wrap
-            // it the same way and poison on panic.
+        Ok(Err(e)) => {
+            // `Malformed` means uniform-NB produced structurally
+            // invalid IR — a lowering bug (issue #4), caught by the
+            // pre-codegen verifier instead of via a Cranelift panic
+            // (issue #16). The specialized tier shares the same
+            // lowering substrate, so routing the body there isn't
+            // safe; and a body the JIT can't lower correctly is a
+            // signal the JIT is unreliable for this workload. Poison
+            // the subsystem so the rest of the thread runs on the VM
+            // — the same outcome the caught-panic path produced,
+            // minus the panic.
+            if matches!(e, cs_jit::JitError::Malformed(_)) {
+                JIT_POISONED.with(|p| p.set(true));
+                return;
+            }
+            // Ordinary `Unsupported` / `Codegen` rejection — by-design
+            // tier routing. Try the specialized tier. pure_fixnum can
+            // also panic (its codegen path overlaps cranelift's), so
+            // wrap it the same way and poison on panic.
             let pure_result = catch_unwind(AssertUnwindSafe(|| lowerer.compile_pure_fixnum(&rir)));
             match pure_result {
                 Ok(Ok(p)) => (p, None),
