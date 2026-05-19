@@ -335,6 +335,179 @@ impl Default for ChannelRegistry {
     }
 }
 
+// ---------------------------------------------------------------
+// channel-select — wait on first-ready of several clauses.
+// ---------------------------------------------------------------
+
+/// One clause of a `(select …)` form. cs-runtime parses the
+/// Scheme-side clause list into this Rust enum before calling
+/// `select_async`.
+pub enum SelectClause {
+    /// Wait for a value on the channel. On success, the
+    /// SelectOutcome's `value` is the payload; if the channel
+    /// closed-and-drained, `value` is `None` and outcome.kind
+    /// is still `Recv`.
+    Recv(Arc<Channel>),
+    /// Wait for capacity to send `payload`. On success, value is
+    /// `None` (the send happened); on closed-channel error,
+    /// returned as `outcome.kind = SendClosed`.
+    Send(Arc<Channel>, Payload),
+    /// Fire after `duration` if nothing else is ready.
+    After(std::time::Duration),
+    /// Pseudo-clause: fire immediately if every other clause
+    /// would block. Handled by a pre-pass before `select_all`.
+    Else,
+}
+
+/// The shape of an awaited select clause's result.
+pub enum SelectKind {
+    Recv,
+    Send,
+    After,
+    Else,
+    /// Send clause hit a closed channel (counts as ready —
+    /// the clause "fired" but couldn't deliver).
+    SendClosed,
+}
+
+pub struct SelectOutcome {
+    pub index: usize,
+    pub kind: SelectKind,
+    pub value: Option<Payload>,
+}
+
+/// Pre-pass: try every non-blocking clause synchronously. If any
+/// is ready (recv has a value or is closed-drained), pick one and
+/// return it. Otherwise: if an `Else` clause exists, fire it. If
+/// neither, return `None` — caller must fall through to
+/// `await_select` to actually block. This is sync, callable from
+/// any context (REPL, top-level, no tokio runtime needed).
+///
+/// `clauses` is consumed; on Some, the chosen clause's payload
+/// is moved out and the rest dropped; on None, all clauses move
+/// into the returned Vec for await.
+pub fn try_select(
+    mut clauses: Vec<SelectClause>,
+    biased: bool,
+) -> Result<SelectOutcome, Vec<SelectClause>> {
+    let mut else_idx: Option<usize> = None;
+    let mut ready_indices: Vec<usize> = Vec::new();
+    let mut ready_values: Vec<Option<Payload>> = Vec::new();
+    let mut ready_kinds: Vec<SelectKind> = Vec::new();
+    for (i, c) in clauses.iter().enumerate() {
+        match c {
+            SelectClause::Else => {
+                if else_idx.is_none() {
+                    else_idx = Some(i);
+                }
+            }
+            SelectClause::Recv(ch) => match ch.try_recv() {
+                Ok(Some(v)) => {
+                    ready_indices.push(i);
+                    ready_values.push(Some(v));
+                    ready_kinds.push(SelectKind::Recv);
+                }
+                Ok(None) if ch.is_closed() => {
+                    ready_indices.push(i);
+                    ready_values.push(None);
+                    ready_kinds.push(SelectKind::Recv);
+                }
+                _ => {} // WouldBlock / Empty — falls through.
+            },
+            SelectClause::Send(_, _) | SelectClause::After(_) => {
+                // Send pre-pass would move the payload out under
+                // try_send; skip and handle in the await branch.
+                // After fires only as part of the await.
+            }
+        }
+    }
+
+    if !ready_indices.is_empty() {
+        let pick = if biased {
+            0
+        } else {
+            let now_ns = std::time::Instant::now().elapsed().as_nanos() as usize;
+            now_ns % ready_indices.len()
+        };
+        return Ok(SelectOutcome {
+            index: ready_indices[pick],
+            kind: std::mem::replace(&mut ready_kinds[pick], SelectKind::Else),
+            value: ready_values[pick].take(),
+        });
+    }
+
+    if let Some(idx) = else_idx {
+        // Drop everything (no more references needed).
+        clauses.clear();
+        return Ok(SelectOutcome {
+            index: idx,
+            kind: SelectKind::Else,
+            value: None,
+        });
+    }
+
+    Err(clauses)
+}
+
+/// Block until at least one clause is ready. Must be called
+/// inside a tokio runtime context. Use [`try_select`] first to
+/// short-circuit synchronous cases.
+pub async fn await_select(clauses: Vec<SelectClause>, _biased: bool) -> SelectOutcome {
+    use futures_util::future::select_all;
+    let mut futs: Vec<futures_util::future::BoxFuture<'_, SelectOutcome>> =
+        Vec::with_capacity(clauses.len());
+    for (i, c) in clauses.into_iter().enumerate() {
+        let fut: futures_util::future::BoxFuture<'_, SelectOutcome> = match c {
+            SelectClause::Recv(ch) => Box::pin(async move {
+                let v = ch.recv().await.ok().flatten();
+                SelectOutcome {
+                    index: i,
+                    kind: SelectKind::Recv,
+                    value: v,
+                }
+            }),
+            SelectClause::Send(ch, v) => Box::pin(async move {
+                let kind = match ch.send(v).await {
+                    Ok(()) => SelectKind::Send,
+                    Err(_) => SelectKind::SendClosed,
+                };
+                SelectOutcome {
+                    index: i,
+                    kind,
+                    value: None,
+                }
+            }),
+            SelectClause::After(d) => Box::pin(async move {
+                tokio::time::sleep(d).await;
+                SelectOutcome {
+                    index: i,
+                    kind: SelectKind::After,
+                    value: None,
+                }
+            }),
+            SelectClause::Else => {
+                // try_select should have caught this — defensive
+                // pending future so it doesn't win the race.
+                Box::pin(std::future::pending::<SelectOutcome>())
+            }
+        };
+        futs.push(fut);
+    }
+
+    let (out, _, _) = select_all(futs).await;
+    out
+}
+
+/// Convenience: combine `try_select` + `await_select`. Caller
+/// must be inside a tokio runtime context if any clause might
+/// block.
+pub async fn select_async(clauses: Vec<SelectClause>, biased: bool) -> SelectOutcome {
+    match try_select(clauses, biased) {
+        Ok(outcome) => outcome,
+        Err(remaining) => await_select(remaining, biased).await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

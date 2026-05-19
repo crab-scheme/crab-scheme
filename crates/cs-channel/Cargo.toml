@@ -8,6 +8,10 @@ repository.workspace = true
 description = "First-class MPMC channels for CrabScheme: tokio mpsc-backed FIFOs with close semantics, blocking + try variants. Cross actor boundaries as SendableValue::Channel(ChannelId)."
 
 [dependencies]
-tokio = { workspace = true, features = ["sync", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "time"] }
 dashmap = { workspace = true }
 thiserror = { workspace = true }
+# `select_all` over a Vec<BoxFuture> drives the dynamic-clause-
+# count `channel-select` primop. tokio's `select!` macro is
+# fixed-arity at compile time.
+futures-util = { workspace = true }

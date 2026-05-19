@@ -42,7 +42,10 @@
 use std::sync::{Arc, OnceLock};
 
 use cs_actor::Payload;
-use cs_channel::{ChannelError, ChannelId, ChannelRegistry};
+use cs_channel::{await_select, try_select};
+use cs_channel::{
+    ChannelError, ChannelId, ChannelRegistry, SelectClause, SelectKind, SelectOutcome,
+};
 use cs_core::{Number, Pair, SymbolTable, Value};
 
 use crate::builtins::beam::{from_sendable, to_sendable_in, SendableValue};
@@ -292,6 +295,179 @@ pub fn b_channel_capacity(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
     })
 }
 
+/// `(channel-select clauses biased?)` — wait on the first-ready
+/// of N clauses. Returns `(<index> . <value>)` where index is
+/// the 0-based position in the input list. value is the
+/// received payload for recv clauses (`*closed*` if the channel
+/// drained), `#t` for send/after/else success, or `*send-closed*`
+/// for send clauses that hit a closed channel.
+///
+/// The Scheme `(select ...)` macro emits this call. Clauses
+/// list shape:
+///
+///   ((recv ch))
+///   ((send! ch v))
+///   ((after ms))
+///   ((else))
+pub fn b_channel_select(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 && args.len() != 2 {
+        return Err(format!(
+            "channel-select: expected 1 or 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let clauses_v = &args[0];
+    let biased = match args.get(1) {
+        Some(Value::Boolean(b)) => *b,
+        Some(other) => {
+            return Err(format!(
+                "channel-select: biased? must be a boolean, got {}",
+                other.type_name()
+            ));
+        }
+        None => false,
+    };
+
+    let raw_clauses = collect_list("channel-select", clauses_v)?;
+    let mut clauses: Vec<SelectClause> = Vec::with_capacity(raw_clauses.len());
+    for (i, c) in raw_clauses.into_iter().enumerate() {
+        clauses.push(parse_select_clause(i, &c, syms)?);
+    }
+
+    // Pre-pass first — sync, callable from anywhere. Falls
+    // through to block_on only if every clause would actually
+    // block. That way `(select [(else) …])`-style probing works
+    // from the REPL too (no tokio context required).
+    let outcome: SelectOutcome = match try_select(clauses, biased) {
+        Ok(o) => o,
+        Err(remaining) => block_on("channel-select", await_select(remaining, biased))?,
+    };
+
+    let value_v = match outcome.kind {
+        SelectKind::Recv => match outcome.value {
+            Some(p) => payload_to_value(p, syms),
+            None => Value::Symbol(syms.intern("*closed*")),
+        },
+        SelectKind::Send => Value::Boolean(true),
+        SelectKind::After => Value::Boolean(true),
+        SelectKind::Else => Value::Boolean(true),
+        SelectKind::SendClosed => Value::Symbol(syms.intern("*send-closed*")),
+    };
+
+    let idx_v = Value::Number(Number::Fixnum(outcome.index as i64));
+    Ok(Value::Pair(Pair::new(idx_v, value_v)))
+}
+
+/// Walk a Scheme proper list into a Vec<Value>. Errors on
+/// non-list shapes (dotted pair, non-pair).
+fn collect_list(who: &str, v: &Value) -> Result<Vec<Value>, String> {
+    let mut out = Vec::new();
+    let mut cur = v.clone();
+    loop {
+        // Two-step: pull out the car/cdr clones in their own scope
+        // so the Ref<> guards drop before we reassign `cur`.
+        let next = match cur {
+            Value::Null => return Ok(out),
+            Value::Pair(p) => {
+                let car = p.car.borrow().clone();
+                let cdr = p.cdr.borrow().clone();
+                out.push(car);
+                cdr
+            }
+            other => {
+                return Err(format!(
+                    "{}: expected proper list, got {}",
+                    who,
+                    other.type_name()
+                ));
+            }
+        };
+        cur = next;
+    }
+}
+
+/// Parse one clause `(recv ch)` / `(send! ch v)` / `(after ms)`
+/// / `(else)` into a SelectClause.
+fn parse_select_clause(
+    idx: usize,
+    v: &Value,
+    syms: &mut SymbolTable,
+) -> Result<SelectClause, String> {
+    let items = collect_list("channel-select clause", v)?;
+    if items.is_empty() {
+        return Err(format!("channel-select: clause #{} is empty", idx));
+    }
+    let head_name = match &items[0] {
+        Value::Symbol(s) => syms.name(*s).to_string(),
+        other => {
+            return Err(format!(
+                "channel-select: clause #{} head must be a symbol, got {}",
+                idx,
+                other.type_name()
+            ));
+        }
+    };
+    match head_name.as_str() {
+        "recv" => {
+            if items.len() != 2 {
+                return Err(format!(
+                    "channel-select: (recv ch) takes 1 arg, clause #{} has {}",
+                    idx,
+                    items.len() - 1
+                ));
+            }
+            let id = channel_value_to_id(&items[1], syms, "channel-select recv")?;
+            let ch = fetch(id, "channel-select recv")?;
+            Ok(SelectClause::Recv(ch))
+        }
+        "send!" => {
+            if items.len() != 3 {
+                return Err(format!(
+                    "channel-select: (send! ch v) takes 2 args, clause #{} has {}",
+                    idx,
+                    items.len() - 1
+                ));
+            }
+            let id = channel_value_to_id(&items[1], syms, "channel-select send!")?;
+            let ch = fetch(id, "channel-select send!")?;
+            let payload_sv = to_sendable_in(&items[2], syms)?;
+            let payload: Payload = Arc::new(payload_sv);
+            Ok(SelectClause::Send(ch, payload))
+        }
+        "after" => {
+            if items.len() != 2 {
+                return Err(format!(
+                    "channel-select: (after ms) takes 1 arg, clause #{} has {}",
+                    idx,
+                    items.len() - 1
+                ));
+            }
+            let ms = value_to_i64(&items[1], "channel-select after")?;
+            if ms < 0 {
+                return Err("channel-select: after-ms must be non-negative".into());
+            }
+            Ok(SelectClause::After(std::time::Duration::from_millis(
+                ms as u64,
+            )))
+        }
+        "else" => {
+            if items.len() != 1 {
+                return Err(format!(
+                    "channel-select: (else) takes no args, clause #{} has {}",
+                    idx,
+                    items.len() - 1
+                ));
+            }
+            Ok(SelectClause::Else)
+        }
+        other => Err(format!(
+            "channel-select: unknown clause head '{}' in clause #{} \
+             (expected recv / send! / after / else)",
+            other, idx
+        )),
+    }
+}
+
 pub fn channel_syms_builtins() -> Vec<(
     &'static str,
     fn(&[Value], &mut SymbolTable) -> Result<Value, String>,
@@ -307,5 +483,6 @@ pub fn channel_syms_builtins() -> Vec<(
         ("channel-closed?", b_channel_closed_p),
         ("channel-len", b_channel_len),
         ("channel-capacity", b_channel_capacity),
+        ("channel-select", b_channel_select),
     ]
 }
