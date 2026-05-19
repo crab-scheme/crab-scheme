@@ -46,6 +46,12 @@ pub mod actor;
 #[cfg(feature = "table")]
 pub mod table;
 
+#[cfg(feature = "tls")]
+pub mod tls;
+
+#[cfg(feature = "http3")]
+pub mod h3;
+
 // Re-export `http` so downstream callers can `cs_web::http::Request::builder()`
 // without an explicit dep.
 pub use http;
@@ -62,6 +68,12 @@ pub use router::{RouteSink, Router};
 
 #[cfg(feature = "modules")]
 pub use module::{Module, ENTRY_POINT};
+
+#[cfg(feature = "tls")]
+pub use tls::{run_tls, serve_tls, TlsConfig};
+
+#[cfg(feature = "http3")]
+pub use h3::{run_h3, serve_h3};
 
 /// Owned request body — fully buffered. Streaming bodies are a
 /// follow-up; the dominant CrabScheme use case is small JSON.
@@ -94,6 +106,14 @@ pub enum WebError {
     #[cfg(feature = "modules")]
     #[error("module: {0}")]
     Module(String),
+
+    #[cfg(feature = "tls")]
+    #[error("tls: {0}")]
+    Tls(String),
+
+    #[cfg(feature = "http3")]
+    #[error("http3: {0}")]
+    Http3(String),
 }
 
 /// Async `(Request) -> Response` — the core abstraction. `&self`
@@ -222,8 +242,12 @@ where
 /// Glue: read the incoming body to bytes, hand it to the service,
 /// translate panics into 500 (defensive — handlers should already
 /// be wrapped in CatchPanic, but we double up so a panic on the
-/// boundary cannot crash the connection).
-async fn dispatch(svc: ArcService, req: http::Request<hyper::body::Incoming>) -> Response {
+/// boundary cannot crash the connection). `pub(crate)` because
+/// the TLS path needs it too.
+pub(crate) async fn dispatch(
+    svc: ArcService,
+    req: http::Request<hyper::body::Incoming>,
+) -> Response {
     let (parts, body) = req.into_parts();
     let bytes = match body.collect().await {
         Ok(c) => c.to_bytes(),

@@ -197,7 +197,7 @@ dashmap = "6"
 # tower/hyper/axum; http-body-util gives us Full<Bytes> for fixed
 # bodies; hyper-util's TokioIo adapts tokio streams to hyper's IO
 # traits in 1.x (the split was 1.0's big breaking change).
-hyper = { version = "1.5", features = ["server", "http1"] }
+hyper = { version = "1.5", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http = "1.1"
 http-body-util = "0.1"
@@ -206,6 +206,23 @@ bytes = "1"
 # Smaller surface than the full `futures` crate.
 futures-util = "0.3"
 async-trait = "0.1"
+# TLS for ALPN-negotiated h1/h2 + h3. rustls 0.23 is the
+# baseline — h3-quinn requires it. `ring` is the default crypto
+# provider; we set it explicitly so feature-flag combinations
+# elsewhere in the workspace don't end up with no provider.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+# HTTP/3 stack. h3 + h3-quinn + quinn give us a QUIC transport
+# implementing draft-34+ / RFC 9114 compatible h3. Versions move
+# in lockstep — h3 0.0.x is still pre-1.0.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+# Dev-only: generate a self-signed cert in tests so we can
+# verify TLS round trips without provisioning real certs.
+rcgen = "0.13"
 
 [profile.release]
 lto = "thin"

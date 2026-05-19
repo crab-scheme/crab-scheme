@@ -10,7 +10,7 @@ description = "CrabScheme tower-style async web framework: Service/Layer composi
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time", "net", "io-util"] }
 hyper = { workspace = true }
-hyper-util = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio", "server"] }
 http = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
@@ -24,17 +24,41 @@ libloading = { workspace = true, optional = true }
 # user can build cs-web without pulling actor/table/runtime.
 cs-actor = { workspace = true, optional = true }
 cs-table = { workspace = true, optional = true }
-# `tracing-log`-style structured logging would be nice; for now
-# the Trace layer just writes to stderr. Real tracing is a follow-up.
+# TLS — required for h2 (ALPN) and h3 (QUIC mandates TLS 1.3).
+# Plain HTTP/1.1 doesn't need it; keep all of TLS behind the
+# `tls` feature so non-TLS embedders don't pull rustls.
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+# HTTP/3 (QUIC). Pulls in quinn for the transport.
+quinn = { workspace = true, optional = true }
+h3 = { workspace = true, optional = true }
+h3-quinn = { workspace = true, optional = true }
 
 [features]
 default = ["modules", "actor", "table"]
 modules = ["dep:libloading"]
 actor = ["dep:cs-actor"]
 table = ["dep:cs-table"]
+# Enables `TlsConfig`, `serve_tls`, and ALPN-negotiated HTTP/1.1
+# + HTTP/2 over TLS. Pulls in rustls + tokio-rustls; default off
+# because most local deployments don't terminate TLS in the app.
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]
+# Enables `serve_h3` — HTTP/3 over QUIC. Implies `tls` because
+# QUIC mandates TLS 1.3.
+http3 = ["tls", "dep:quinn", "dep:h3", "dep:h3-quinn"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 # Realistic e2e tests speak HTTP/1.1 over a loopback socket.
 # Using hyper's client side keeps the dep surface minimal.
-hyper = { workspace = true, features = ["client", "http1"] }
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
+# Generate self-signed certs in TLS tests.
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+quinn = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
