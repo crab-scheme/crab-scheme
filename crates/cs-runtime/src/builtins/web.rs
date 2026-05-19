@@ -527,6 +527,89 @@ pub fn primop_request_body(handle: i64) -> Result<String, String> {
     })
 }
 
+/// Parse the request URI's query string into an ordered list of
+/// `(name . value)` pairs. URL-decodes both. Empty / missing
+/// query → empty list. Values without `=` decode to the empty
+/// string. Order is preserved so `(assv ...)` returns the first
+/// match when a key repeats.
+pub fn primop_request_params(handle: i64) -> Result<Vec<(String, String)>, String> {
+    with_request("web-request-params", handle, |m| {
+        m.req.uri().query().map(parse_query).unwrap_or_default()
+    })
+}
+
+/// Single named query param. `None` if the query string is
+/// missing or doesn't contain `name`. Returns the FIRST match if
+/// the key repeats — same convention as `(assv name (params))`.
+pub fn primop_request_param(handle: i64, name: &str) -> Result<Option<String>, String> {
+    with_request("web-request-param", handle, |m| {
+        let q = m.req.uri().query()?;
+        parse_query(q)
+            .into_iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+    })
+}
+
+/// Every request header as an alist of `(name . value)` pairs.
+/// Header names lowercased (http::HeaderName is case-insensitive
+/// internally). Multi-valued headers appear once per value.
+pub fn primop_request_headers(handle: i64) -> Result<Vec<(String, String)>, String> {
+    with_request("web-request-headers", handle, |m| {
+        m.req
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+            .collect()
+    })
+}
+
+fn parse_query(q: &str) -> Vec<(String, String)> {
+    q.split('&')
+        .filter(|s| !s.is_empty())
+        .map(|kv| match kv.find('=') {
+            Some(i) => (url_decode(&kv[..i]), url_decode(&kv[i + 1..])),
+            None => (url_decode(kv), String::new()),
+        })
+        .collect()
+}
+
+/// Basic percent decoder. `+` → space (form-encoded convention),
+/// `%XX` → byte XX. Falls back to literal bytes on malformed
+/// escapes.
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub fn primop_request_header(handle: i64, name: &str) -> Result<Option<String>, String> {
     with_request("web-request-header", handle, |m| {
         m.req
@@ -626,6 +709,44 @@ pub fn b_web_request_body(args: &[Value], _syms: &mut SymbolTable) -> Result<Val
     Ok(Value::String(g))
 }
 
+fn alist_to_scheme(pairs: Vec<(String, String)>) -> Value {
+    let mut acc = Value::Null;
+    for (k, v) in pairs.into_iter().rev() {
+        let k_g = cs_gc::Gc::new(std::cell::RefCell::new(k));
+        let v_g = cs_gc::Gc::new(std::cell::RefCell::new(v));
+        let pair = Value::Pair(cs_core::Pair::new(Value::String(k_g), Value::String(v_g)));
+        acc = Value::Pair(cs_core::Pair::new(pair, acc));
+    }
+    acc
+}
+
+pub fn b_web_request_params(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-request-params", args, 1)?;
+    let h = value_to_i64(&args[0], "web-request-params")?;
+    let pairs = primop_request_params(h)?;
+    Ok(alist_to_scheme(pairs))
+}
+
+pub fn b_web_request_param(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-request-param", args, 2)?;
+    let h = value_to_i64(&args[0], "web-request-param")?;
+    let name = value_to_str(&args[1], syms, "web-request-param")?;
+    match primop_request_param(h, &name)? {
+        Some(v) => {
+            let g = cs_gc::Gc::new(std::cell::RefCell::new(v));
+            Ok(Value::String(g))
+        }
+        None => Ok(Value::Boolean(false)),
+    }
+}
+
+pub fn b_web_request_headers(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-request-headers", args, 1)?;
+    let h = value_to_i64(&args[0], "web-request-headers")?;
+    let pairs = primop_request_headers(h)?;
+    Ok(alist_to_scheme(pairs))
+}
+
 pub fn b_web_request_header(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("web-request-header", args, 2)?;
     let h = value_to_i64(&args[0], "web-request-header")?;
@@ -704,6 +825,9 @@ pub fn web_syms_builtins() -> Vec<(
         ("web-request-path", b_web_request_path),
         ("web-request-body", b_web_request_body),
         ("web-request-header", b_web_request_header),
+        ("web-request-headers", b_web_request_headers),
+        ("web-request-param", b_web_request_param),
+        ("web-request-params", b_web_request_params),
         ("web-respond!", b_web_respond),
     ];
     #[cfg(feature = "web-modules")]
@@ -856,6 +980,98 @@ mod tests {
         // Second respond / inspect must error — slot was taken.
         assert!(primop_respond(handle, 200, "again".into()).is_err());
         assert!(primop_request_method(handle).is_err());
+    }
+
+    #[test]
+    fn params_headers_round_trip() {
+        let req: cs_web::Request = cs_web::http::Request::builder()
+            .method(Method::GET)
+            .uri("/items?id=42&name=alice&tag=red&tag=blue&empty=")
+            .header("x-token", "sekret")
+            .header("accept", "application/json")
+            .body(cs_web::Bytes::new())
+            .unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel::<cs_web::Response>();
+        let envelope: Arc<WebMessage> = Arc::new(WebMessage::new(req, tx));
+        let payload: Payload = envelope;
+        let sv = try_intern_web_request(&payload).expect("bridge");
+        let handle = match sv {
+            SendableValue::Pair(_, tail) => match *tail {
+                SendableValue::Pair(boxed_id, _) => match *boxed_id {
+                    SendableValue::Fixnum(n) => n,
+                    _ => panic!("not fixnum"),
+                },
+                _ => panic!("tail not pair"),
+            },
+            _ => panic!("sv not pair"),
+        };
+
+        let params = primop_request_params(handle).unwrap();
+        assert_eq!(
+            params,
+            vec![
+                ("id".into(), "42".into()),
+                ("name".into(), "alice".into()),
+                ("tag".into(), "red".into()),
+                ("tag".into(), "blue".into()),
+                ("empty".into(), "".into()),
+            ]
+        );
+
+        // Single-param lookup picks the first occurrence — matches
+        // `(assv 'tag ...)` semantics in Scheme.
+        assert_eq!(
+            primop_request_param(handle, "id").unwrap().as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            primop_request_param(handle, "tag").unwrap().as_deref(),
+            Some("red")
+        );
+        assert!(primop_request_param(handle, "missing").unwrap().is_none());
+
+        let headers = primop_request_headers(handle).unwrap();
+        assert!(headers.iter().any(|(k, v)| k == "x-token" && v == "sekret"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "accept" && v == "application/json"));
+
+        primop_respond(handle, 200, "ok".into()).unwrap();
+    }
+
+    #[test]
+    fn params_url_decode() {
+        let req: cs_web::Request = cs_web::http::Request::builder()
+            .method(Method::GET)
+            // %20 → space, + → space, %2B → +, %3D → =
+            .uri("/search?q=hello+world&filter=a%2Bb%3Dc&path=/a%20b")
+            .body(cs_web::Bytes::new())
+            .unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel::<cs_web::Response>();
+        let envelope: Arc<WebMessage> = Arc::new(WebMessage::new(req, tx));
+        let sv = try_intern_web_request(&(envelope as Payload)).expect("bridge");
+        let handle = match sv {
+            SendableValue::Pair(_, tail) => match *tail {
+                SendableValue::Pair(boxed_id, _) => match *boxed_id {
+                    SendableValue::Fixnum(n) => n,
+                    _ => panic!(),
+                },
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+
+        let params = primop_request_params(handle).unwrap();
+        assert_eq!(
+            params,
+            vec![
+                ("q".into(), "hello world".into()),
+                ("filter".into(), "a+b=c".into()),
+                ("path".into(), "/a b".into()),
+            ]
+        );
+
+        primop_respond(handle, 200, "ok".into()).unwrap();
     }
 
     #[test]

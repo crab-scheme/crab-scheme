@@ -252,6 +252,178 @@ fn actor_handles_request_via_bridged_message() {
         .expect("stop");
 }
 
+/// Contract-driven request validation, end-to-end through
+/// rt.eval_str. Creates a WebMessage from Rust, hands its
+/// handle to Scheme, runs predicate-based validation on params
+/// + headers + body, and asserts the response.
+#[test]
+fn scheme_contracts_validate_request_fields() {
+    use cs_actor::Payload;
+    use cs_runtime::builtins::beam::SendableValue;
+    use cs_runtime::builtins::web::try_intern_web_request;
+    use cs_web::actor::WebMessage;
+    use std::sync::Arc;
+
+    fn make_request(
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (i64, tokio::sync::oneshot::Receiver<cs_web::Response>) {
+        let mut b = cs_web::http::Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let req: cs_web::Request = b
+            .body(cs_web::Bytes::copy_from_slice(body.as_bytes()))
+            .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<cs_web::Response>();
+        let envelope: Arc<WebMessage> = Arc::new(WebMessage::new(req, tx));
+        let sv = try_intern_web_request(&(envelope as Payload)).expect("bridge");
+        let handle = match sv {
+            SendableValue::Pair(_, tail) => match *tail {
+                SendableValue::Pair(boxed_id, _) => match *boxed_id {
+                    SendableValue::Fixnum(n) => n,
+                    _ => panic!("handle not fixnum"),
+                },
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+        (handle, rx)
+    }
+
+    let mut rt = Runtime::new();
+
+    // Define the same predicates the lib/beam/web-contracts.scm
+    // library exports. The library itself is loaded explicitly by
+    // most callers via `(import ...)`; here we inline so the test
+    // doesn't depend on the package loader.
+    rt.eval_str(
+        "<setup>",
+        r#"
+        (define (non-empty-string? v)
+          (and (string? v) (> (string-length v) 0)))
+        (define (integer-string? v)
+          (and (string? v)
+               (let ((n (string->number v)))
+                 (and n (integer? n)))))
+        (define (json-string? v)
+          (and (string? v)
+               (> (string-length v) 0)
+               (let ((c (string-ref v 0)))
+                 (or (char=? c #\{) (char=? c #\[) (char=? c #\")))))
+        ;; or/c composed by hand for the test — same logic as
+        ;; lib/contract/contract.scm.
+        (define (or-c p1 p2) (lambda (v) (or (p1 v) (p2 v))))
+        ;; nullable-of-c — common contract for "either missing or
+        ;; matches predicate". Web params are nullable (#f when
+        ;; absent).
+        (define (nullable-of-c p) (or-c not p))
+        "#,
+    )
+    .expect("setup");
+
+    // --- Case 1: valid POST /users with id=42, x-token=sekret,
+    //     JSON body. Expect 200.
+    let (h1, rx1) = make_request(
+        "POST",
+        "/users?id=42",
+        &[("x-token", "sekret"), ("content-type", "application/json")],
+        r#"{"name":"alice"}"#,
+    );
+    rt.eval_str("<t>", &format!("(define h {})", h1)).unwrap();
+    rt.eval_str(
+        "<t>",
+        r#"
+        (let ((id (web-request-param  h "id"))
+              (tok (web-request-header h "x-token"))
+              (body (web-request-body  h)))
+          (cond
+            ((not (integer-string? id))
+             (web-respond! h 400 "invalid id"))
+            ((not (non-empty-string? tok))
+             (web-respond! h 400 "missing x-token"))
+            ((not (json-string? body))
+             (web-respond! h 400 "body must be JSON"))
+            (else
+             (web-respond! h 200 (string-append "ok id=" id)))))
+        "#,
+    )
+    .expect("validate ok request");
+    let resp1 = rx1.blocking_recv().expect("reply");
+    assert_eq!(resp1.status(), 200);
+    assert_eq!(resp1.body(), &cs_web::Bytes::from_static(b"ok id=42"));
+
+    // --- Case 2: same shape but id is non-numeric. Expect 400.
+    let (h2, rx2) = make_request(
+        "POST",
+        "/users?id=not-a-number",
+        &[("x-token", "sekret"), ("content-type", "application/json")],
+        r#"{"name":"alice"}"#,
+    );
+    rt.eval_str("<t>", &format!("(define h2 {})", h2)).unwrap();
+    rt.eval_str(
+        "<t>",
+        r#"
+        (let ((id (web-request-param h2 "id")))
+          (if (integer-string? id)
+              (web-respond! h2 200 "ok")
+              (web-respond! h2 400 "invalid id")))
+        "#,
+    )
+    .expect("validate bad id");
+    let resp2 = rx2.blocking_recv().expect("reply");
+    assert_eq!(resp2.status(), 400);
+    assert_eq!(resp2.body(), &cs_web::Bytes::from_static(b"invalid id"));
+
+    // --- Case 3: missing x-token header. The header primop
+    //     returns #f; `(nullable-of-c non-empty-string?)` accepts
+    //     #f, so a "lenient" contract still passes — exercise the
+    //     `or-c` combinator.
+    let (h3, rx3) = make_request("GET", "/items", &[], "");
+    rt.eval_str("<t>", &format!("(define h3 {})", h3)).unwrap();
+    let res = rt
+        .eval_str(
+            "<t>",
+            r#"
+            (let* ((tok (web-request-header h3 "x-token"))
+                   (lenient (nullable-of-c non-empty-string?))
+                   (strict  non-empty-string?))
+              (cond
+                ((not (lenient tok))
+                 (web-respond! h3 400 "tok failed lenient"))
+                ((not (strict tok))
+                 (web-respond! h3 200 "lenient passed; strict would have rejected"))
+                (else
+                 (web-respond! h3 200 "all good"))))
+            "#,
+        )
+        .expect("lenient validation");
+    let _ = res;
+    let resp3 = rx3.blocking_recv().expect("reply");
+    assert_eq!(resp3.status(), 200);
+    let body = std::str::from_utf8(resp3.body()).unwrap();
+    assert!(
+        body.contains("lenient passed"),
+        "expected lenient/strict branch, got {:?}",
+        body
+    );
+
+    // --- Case 4: params alist round-trip. Multiple repeated
+    //     keys, URL-decoded values.
+    let (h4, rx4) = make_request("GET", "/search?q=hello+world&tag=red&tag=blue", &[], "");
+    rt.eval_str("<t>", &format!("(define h4 {})", h4)).unwrap();
+    let n = rt
+        .eval_str("<t>", "(length (web-request-params h4))")
+        .expect("params");
+    assert_eq!(disp(&rt, &n), "3");
+    rt.eval_str("<t>", r#"(web-respond! h4 200 "checked")"#)
+        .unwrap();
+    let resp4 = rx4.blocking_recv().expect("reply");
+    assert_eq!(resp4.status(), 200);
+}
+
 #[test]
 fn scheme_route_after_start_is_error() {
     let mut rt = Runtime::new();
