@@ -7,7 +7,8 @@
 use std::time::Duration;
 
 use cs_sandbox_wasm::{
-    verify_wasmtime_integration, SandboxConfig, SandboxError, SandboxInstance, SandboxRuntime,
+    run_epoch_tick_loop_test, verify_wasmtime_integration, SandboxConfig, SandboxError,
+    SandboxInstance, SandboxRuntime,
 };
 
 // ---- Preset defaults ----
@@ -156,11 +157,41 @@ fn wasmtime_integration_runs_with_adversarial_preset_fuel() {
     assert_eq!(sum, 4);
 }
 
+// ---- Epoch-tick CPU-bound enforcement ----
+
+#[test]
+fn epoch_tick_interval_traps_with_cpu_limit_exceeded() {
+    // Verify that a tight WAT loop interrupted by the epoch ticker
+    // returns CpuLimitExceeded (not Timeout or FuelExhausted).
+    // Uses a 10ms tick — short enough to trap quickly in CI while
+    // still requiring the loop to actually run long enough to be
+    // interrupted.
+    let mut config = SandboxConfig::hygiene();
+    config.fuel = None;
+    config.epoch_tick_interval = Some(Duration::from_millis(10));
+    let runtime = SandboxRuntime::new(&config).unwrap();
+    let err = run_epoch_tick_loop_test(&runtime);
+    assert!(
+        matches!(err, SandboxError::CpuLimitExceeded),
+        "expected CpuLimitExceeded, got: {}",
+        err
+    );
+}
+
+#[test]
+fn epoch_tick_interval_config_validates() {
+    // epoch_tick_interval alone (no fuel) is valid.
+    let mut config = SandboxConfig::hygiene();
+    config.epoch_tick_interval = Some(Duration::from_millis(50));
+    config.validate().unwrap();
+}
+
 // ---- Error display ----
 
 #[test]
 fn sandbox_error_display_includes_variant_info() {
     assert!(format!("{}", SandboxError::FuelExhausted).contains("fuel"));
+    assert!(format!("{}", SandboxError::CpuLimitExceeded).contains("cpu"));
     assert!(format!("{}", SandboxError::Timeout).contains("timeout"));
     assert!(format!("{}", SandboxError::MemoryExhausted).contains("memory"));
     assert!(

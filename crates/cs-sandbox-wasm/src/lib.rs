@@ -62,7 +62,7 @@ use std::time::Duration;
 
 mod runtime;
 
-pub use runtime::{verify_wasmtime_integration, SandboxRuntime};
+pub use runtime::{run_epoch_tick_loop_test, verify_wasmtime_integration, SandboxRuntime};
 
 // ---- SandboxConfig ----
 
@@ -86,14 +86,17 @@ pub struct SandboxConfig {
 
     /// Cheaper-than-fuel CPU bound via epoch interruption.
     ///
-    /// **Currently a stub.** Cluster A made
-    /// `Config::epoch_interruption(true)` unconditional to wire
-    /// `wall_clock_timeout`, but the epoch ticker for a separate
-    /// CPU-bound is not yet implemented — this field is held for
-    /// forward compatibility and rejected only when combined with
-    /// `fuel` (so callers don't think they're getting both).
-    /// Wire-up tracked as a post-1.0 follow-up. `None` for now.
-    /// Mutually exclusive with `fuel`.
+    /// When set, a recurring per-eval ticker thread bumps
+    /// `engine.increment_epoch()` every `N`; the store's epoch
+    /// deadline is armed to 1 so the guest traps on the first
+    /// tick. The ticker uses the same cancellation-channel pattern
+    /// as `wall_clock_timeout` (no detached/leaked threads).
+    /// On the resulting `Trap::Interrupt` the call returns
+    /// `SandboxError::CpuLimitExceeded`.
+    ///
+    /// Non-deterministic but zero hot-path overhead (unlike fuel).
+    /// Ideal for plugins where exact instruction counts don't
+    /// matter. Mutually exclusive with `fuel`.
     pub epoch_tick_interval: Option<Duration>,
 
     /// Paths the guest can read/write. Empty = no filesystem.
@@ -235,6 +238,8 @@ pub enum SandboxError {
     GuestRaised(String),
     /// Fuel exhausted before the eval completed.
     FuelExhausted,
+    /// Epoch-tick CPU budget exceeded (epoch_tick_interval path).
+    CpuLimitExceeded,
     /// Wall-clock timeout exceeded.
     Timeout,
     /// Memory limit exceeded.
@@ -258,6 +263,7 @@ impl std::fmt::Display for SandboxError {
         match self {
             SandboxError::GuestRaised(s) => write!(f, "guest raised: {}", s),
             SandboxError::FuelExhausted => write!(f, "fuel exhausted"),
+            SandboxError::CpuLimitExceeded => write!(f, "cpu limit exceeded"),
             SandboxError::Timeout => write!(f, "wall-clock timeout"),
             SandboxError::MemoryExhausted => write!(f, "memory exhausted"),
             SandboxError::CapabilityDenied(s) => write!(f, "capability denied: {}", s),

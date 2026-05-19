@@ -522,6 +522,18 @@ pub fn clear_active_passes() {
     ACTIVE_PASSES.with(|c| c.borrow_mut().clear());
 }
 
+/// Replace the current thread's active-pass list with `names`.
+/// Used by the `active-optimizer-passes` Scheme parameter setter
+/// (cs-runtime) so `parameterize` can back the parameter with
+/// this thread-local without cs-opt depending on cs-runtime.
+pub fn set_active_passes(names: &[&str]) {
+    ACTIVE_PASSES.with(|c| {
+        let mut list = c.borrow_mut();
+        list.clear();
+        list.extend(names.iter().map(|s| s.to_string()));
+    });
+}
+
 /// Run `f` with the active-pass list temporarily replaced by
 /// `names`. The previous list is restored when `f` returns —
 /// even if `f` panics (RAII guard). This is the lexical-scoping
@@ -576,33 +588,37 @@ where
 /// `cs-vm::jit_translate::bytecode_to_rir_full` just before the
 /// translated `Function` flows on to codegen.
 ///
-/// Iter 3 implementation: resolves the current thread's active
-/// pass list against the global registry, runs the resulting
-/// pipeline. When the active list is empty (the typical case),
-/// short-circuits to a single thread-local read — the cost
-/// measured at the empty-pipeline path is sub-100ns.
-///
-/// Pipeline-construction failures (unknown pass names) are
-/// silently skipped here — they shouldn't happen because
-/// install-optimizer-pass! validates against the registry at
-/// install time. A future iter could plumb the diagnostic
-/// through, but right now there's no error channel from
-/// jit_translate back to user code at this point in the
-/// pipeline.
-///
-/// SymbolTable and typer hints are stubbed because the cs-vm
-/// integration doesn't currently carry them through to this
-/// call. Passes that need them today must check `ctx.syms.len()
-/// == 0` (the empty stub) as a sentinel; iter 5+ may widen the
-/// integration signature.
+/// Reads the current thread's active-pass list from the
+/// `ACTIVE_PASSES` thread-local and delegates to
+/// [`run_active_pipeline_with`]. The thread-local is owned by
+/// cs-opt and written by cs-runtime's `active-optimizer-passes`
+/// Scheme parameter setter, so `parameterize` over that parameter
+/// propagates into every subsequent JIT compile on the same thread
+/// without cs-vm needing to know about Scheme parameters.
 pub fn run_active_pipeline(func: &mut Function) {
     let names = active_passes();
     if names.is_empty() {
         return;
     }
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    run_active_pipeline_with(func, &refs);
+}
+
+/// Run the optimizer pipeline with an explicit pass list rather
+/// than reading `ACTIVE_PASSES`. Callers that already hold the
+/// names (e.g. a future AOT driver that supplies them via CLI)
+/// call this directly to avoid the thread-local round-trip.
+///
+/// Pipeline-construction failures (unknown pass names) are
+/// silently skipped — they shouldn't happen because
+/// `install-optimizer-pass!` validates against the registry at
+/// install time.
+pub fn run_active_pipeline_with(func: &mut Function, names: &[&str]) {
+    if names.is_empty() {
+        return;
+    }
     let registry = PassRegistry::global().lock().expect("registry poisoned");
-    let Ok(pipeline) = PassPipeline::from_names(&registry, &refs) else {
+    let Ok(pipeline) = PassPipeline::from_names(&registry, names) else {
         return;
     };
     drop(registry);

@@ -1096,6 +1096,12 @@ pub fn syms_builtins() -> Vec<SymsEntry> {
         ("install-optimizer-pass!", b_install_optimizer_pass),
         ("remove-optimizer-pass!", b_remove_optimizer_pass),
         ("installed-optimizer-passes", b_installed_optimizer_passes),
+        // ADR 0014 §5 — the `active-optimizer-passes` parameter-like
+        // procedure. 0-arg form reads; 1-arg form (a list of symbols)
+        // replaces the backing thread-local. `parameterize` over this
+        // procedure works because parameterize desugars to dynamic-wind
+        // with setter calls that go through this same dispatch path.
+        ("active-optimizer-passes", b_active_optimizer_passes),
     ];
     // ADR 0015 L2 sandbox builtins. Gated on the `sandbox`
     // feature; folded into the Syms list (not HoBuiltins) so
@@ -10701,6 +10707,47 @@ const RNRS_LISTS_EXPORTS: &[&str] = &[
     "cons*",
 ];
 
+/// Normalise an import-spec string from `SandboxConfig.imports` (e.g.
+/// `"(rnrs base)"`) to the space-joined form used internally (e.g.
+/// `"rnrs base"`). Used for policy comparison in `b_environment`.
+fn normalize_allowed_spec(s: &str) -> String {
+    let s = s.trim();
+    let inner = if s.starts_with('(') && s.ends_with(')') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    };
+    // Collapse whitespace the same way `resolve_import_spec` does.
+    inner.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Extract the space-joined canonical name from a `(rnrs base)`-style
+/// import-spec Value (e.g. returns `"rnrs base"`). Version sublists are
+/// stripped, matching the logic in `resolve_import_spec`. Returns `Err`
+/// on malformed input.
+fn import_spec_canonical_name(spec: &Value, syms: &SymbolTable) -> Result<String, String> {
+    let parts = collect_proper_list("environment", spec)?;
+    let symbol_parts: Vec<&Value> = parts
+        .iter()
+        .take_while(|v| matches!(v, Value::Symbol(_)))
+        .collect();
+    let tail = &parts[symbol_parts.len()..];
+    if !tail.is_empty() && (tail.len() != 1 || !matches!(&tail[0], Value::Pair(_) | Value::Null)) {
+        return Err(format!(
+            "environment: import-spec part must be a symbol, got {:?}",
+            tail[0]
+        ));
+    }
+    Ok(symbol_parts
+        .iter()
+        .map(|v| match v {
+            Value::Symbol(s) => syms.name(*s).to_string(),
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
 /// Resolve an import-spec datum (a list like `'(rnrs base)`) into
 /// the set of names it exports. Returns `Err` for any spec we
 /// don't yet know about; user code gets a clear "unknown library"
@@ -10709,36 +10756,7 @@ fn resolve_import_spec(
     spec: &Value,
     syms: &SymbolTable,
 ) -> Result<&'static [&'static str], String> {
-    // Per R6RS, an import-spec can carry a trailing version
-    // sublist (e.g. `(rnrs base (6))`). Strip it. L1.1 also
-    // aliases `(rnrs lists)` and `(rnrs)` to the same approved-
-    // base set — permissive but preserves R6RS conformance; L1.3
-    // splits them via per-library binding metadata.
-    let parts = collect_proper_list("environment", spec)?;
-    let symbol_parts: Vec<&Value> = parts
-        .iter()
-        .take_while(|v| matches!(v, Value::Symbol(_)))
-        .collect();
-    let tail_len = parts.len() - symbol_parts.len();
-    if tail_len > 0 {
-        // Only acceptable tail: a single trailing version
-        // sublist (which is a Pair or Null).
-        let tail = &parts[symbol_parts.len()..];
-        if tail_len != 1 || !matches!(&tail[0], Value::Pair(_) | Value::Null) {
-            return Err(format!(
-                "environment: import-spec part must be a symbol, got {:?}",
-                tail[0]
-            ));
-        }
-    }
-    let names: Vec<String> = symbol_parts
-        .iter()
-        .map(|v| match v {
-            Value::Symbol(s) => syms.name(*s).to_string(),
-            _ => unreachable!("take_while filter"),
-        })
-        .collect();
-    let joined = names.join(" ");
+    let joined = import_spec_canonical_name(spec, syms)?;
     match joined.as_str() {
         "rnrs base" | "scheme base" => Ok(RNRS_BASE_EXPORTS),
         "rnrs lists" => Ok(RNRS_LISTS_EXPORTS),
@@ -10752,6 +10770,23 @@ fn resolve_import_spec(
 }
 
 fn b_environment(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    // L1 sandbox policy (ADR 0015 issue #15): if the EvalCtx carries an
+    // approved import set, reject any spec not in that list before even
+    // trying to resolve it. The check uses the canonical space-joined name
+    // so `(rnrs base (6))` and `(rnrs base)` both match `"rnrs base"`.
+    if let Some(allowed) = &ctx.sandbox_allowed_imports {
+        let normalized_allowed: Vec<String> =
+            allowed.iter().map(|s| normalize_allowed_spec(s)).collect();
+        for spec in args {
+            let canon = import_spec_canonical_name(spec, ctx.syms)?;
+            if !normalized_allowed.iter().any(|a| a == &canon) {
+                return Err(format!(
+                    "environment: library ({}) is not in the sandbox's approved import set {:?}",
+                    canon, allowed
+                ));
+            }
+        }
+    }
     // Collect the visible names across all requested import specs.
     let mut visible: Vec<String> = Vec::new();
     for spec in args {
@@ -11356,6 +11391,63 @@ fn b_installed_optimizer_passes(args: &[Value], syms: &mut SymbolTable) -> Resul
         .map(|s| Value::Symbol(syms.intern(&s)))
         .collect();
     Ok(Value::list(result))
+}
+
+/// `(active-optimizer-passes)` — read the current thread's active-pass
+/// list as a Scheme list of symbols.
+///
+/// `(active-optimizer-passes '(name ...))` — replace the current
+/// thread's active-pass list with the given names, each validated
+/// against the global pass registry.
+///
+/// This is the R6RS Scheme `parameter`-like procedure for the
+/// optimizer's active-pass list (ADR 0014 §5). Unlike a plain
+/// `make-parameter` value, the backing storage is cs-opt's
+/// `ACTIVE_PASSES` thread-local so cs-vm's JIT translator reads
+/// the same list without depending on cs-runtime.
+///
+/// `parameterize` over this procedure works correctly because
+/// `parameterize` desugars to `dynamic-wind` with calls of the form
+/// `(active-optimizer-passes old-value)` in the after-thunk, which
+/// restores the thread-local just as `with-active-optimizer-passes`
+/// does via its RAII guard.
+fn b_active_optimizer_passes(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    match args.len() {
+        0 => {
+            let names = cs_opt::active_passes();
+            let result: Vec<Value> = names
+                .into_iter()
+                .map(|s| Value::Symbol(syms.intern(&s)))
+                .collect();
+            Ok(Value::list(result))
+        }
+        1 => {
+            let items = collect_proper_list("active-optimizer-passes", &args[0])?;
+            let mut names: Vec<String> = Vec::with_capacity(items.len());
+            for v in &items {
+                match v {
+                    Value::Symbol(s) => names.push(syms.name(*s).to_string()),
+                    _ => return Err(type_err("active-optimizer-passes", "symbol (pass name)", v)),
+                }
+            }
+            // Validate all names before mutating so a typo doesn't
+            // leave the list in a half-updated state.
+            {
+                let registry = cs_opt::PassRegistry::global()
+                    .lock()
+                    .map_err(|_| "active-optimizer-passes: registry mutex poisoned".to_string())?;
+                for name in &names {
+                    if registry.get(name).is_none() {
+                        return Err(format!("active-optimizer-passes: unknown pass {:?}", name));
+                    }
+                }
+            }
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            cs_opt::set_active_passes(&refs);
+            Ok(Value::Unspecified)
+        }
+        n => Err(arity_err("active-optimizer-passes", "0 or 1", n)),
+    }
 }
 
 /// `(with-active-optimizer-passes '(name ...) thunk)` —

@@ -214,3 +214,141 @@ fn rejects_wrong_arity() {
         )
         .is_err());
 }
+
+// ---- active-optimizer-passes parameter-like procedure (ADR 0014 §5) ----
+//
+// These tests exercise the new `active-optimizer-passes` builtin
+// whose getter/setter are backed by cs_opt::ACTIVE_PASSES. They
+// verify that `parameterize` over this procedure gives the same
+// lexical-scoping semantics as `with-active-optimizer-passes`.
+
+#[test]
+fn param_proc_getter_reads_empty_list() {
+    cs_opt::clear_active_passes();
+    let mut rt = Runtime::new();
+    let v = rt.eval_str("<t>", "(active-optimizer-passes)").unwrap();
+    assert_eq!(disp(&rt, &v), "()");
+}
+
+#[test]
+fn param_proc_setter_installs_pass_list() {
+    cs_opt::clear_active_passes();
+    let mut rt = Runtime::new();
+    rt.eval_str("<t>", "(active-optimizer-passes '(constant-fold))")
+        .unwrap();
+    let v = rt.eval_str("<t>", "(active-optimizer-passes)").unwrap();
+    assert_eq!(disp(&rt, &v), "(constant-fold)");
+    // cleanup
+    cs_opt::clear_active_passes();
+}
+
+#[test]
+fn parameterize_body_sees_scoped_list() {
+    cs_opt::clear_active_passes();
+    let mut rt = Runtime::new();
+    let v = rt
+        .eval_str(
+            "<t>",
+            "(parameterize ((active-optimizer-passes '(constant-fold)))
+               (active-optimizer-passes))",
+        )
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "(constant-fold)");
+}
+
+#[test]
+fn parameterize_restores_outer_list_after_body() {
+    cs_opt::clear_active_passes();
+    let mut rt = Runtime::new();
+    // Pre-install on outer scope via the setter.
+    rt.eval_str("<t>", "(active-optimizer-passes '(inst-stats))")
+        .unwrap();
+    rt.eval_str(
+        "<t>",
+        "(parameterize ((active-optimizer-passes '(constant-fold)))
+           'inner-done)",
+    )
+    .unwrap();
+    let v = rt.eval_str("<t>", "(active-optimizer-passes)").unwrap();
+    assert_eq!(disp(&rt, &v), "(inst-stats)");
+    cs_opt::clear_active_passes();
+}
+
+#[test]
+fn parameterize_restores_empty_list_after_body() {
+    cs_opt::clear_active_passes();
+    let mut rt = Runtime::new();
+    rt.eval_str(
+        "<t>",
+        "(parameterize ((active-optimizer-passes '(constant-fold)))
+           'inner-done)",
+    )
+    .unwrap();
+    // Outer was empty; must be restored to empty.
+    let v = rt.eval_str("<t>", "(active-optimizer-passes)").unwrap();
+    assert_eq!(disp(&rt, &v), "()");
+}
+
+#[test]
+fn parameterize_nested_scopes() {
+    cs_opt::clear_active_passes();
+    let mut rt = Runtime::new();
+    let v = rt
+        .eval_str(
+            "<t>",
+            "(parameterize ((active-optimizer-passes '(constant-fold)))
+               (let ((outer (active-optimizer-passes))
+                     (inner
+                       (parameterize ((active-optimizer-passes '(dead-block-elim)))
+                         (active-optimizer-passes)))
+                     (back (active-optimizer-passes)))
+                 (list outer inner back)))",
+        )
+        .unwrap();
+    assert_eq!(
+        disp(&rt, &v),
+        "((constant-fold) (dead-block-elim) (constant-fold))"
+    );
+}
+
+#[test]
+fn param_proc_rejects_unknown_pass() {
+    cs_opt::clear_active_passes();
+    let mut rt = Runtime::new();
+    let err = rt
+        .eval_str("<t>", "(active-optimizer-passes '(no-such-pass))")
+        .expect_err("unknown pass should fail");
+    let s = format!("{}", err);
+    assert!(
+        s.contains("unknown pass") || s.contains("no-such-pass"),
+        "got: {}",
+        s
+    );
+    // State must not have changed.
+    let v = rt.eval_str("<t>", "(active-optimizer-passes)").unwrap();
+    assert_eq!(disp(&rt, &v), "()");
+}
+
+#[test]
+fn param_proc_rejects_non_symbol_in_list() {
+    cs_opt::clear_active_passes();
+    let mut rt = Runtime::new();
+    let err = rt
+        .eval_str("<t>", "(active-optimizer-passes '(42))")
+        .expect_err("non-symbol should fail");
+    let s = format!("{}", err);
+    assert!(
+        s.contains("symbol") || s.contains("pass name"),
+        "got: {}",
+        s
+    );
+}
+
+#[test]
+fn param_proc_rejects_wrong_arity() {
+    cs_opt::clear_active_passes();
+    let mut rt = Runtime::new();
+    assert!(rt
+        .eval_str("<t>", "(active-optimizer-passes '(constant-fold) 'extra)",)
+        .is_err());
+}
