@@ -579,6 +579,138 @@ fn scheme_short_aliases_and_with_request_macro() {
     );
 }
 
+/// HTTP code helpers + Scheme-side middleware install. Exercises
+/// the `http/*` constants, the named response helpers
+/// (`ok`/`created`/`not-found`/etc.), and the four
+/// `web-layer-*!` primops by registering them on a building
+/// server, hitting it, and confirming the response shape +
+/// injected headers.
+#[test]
+fn scheme_http_helpers_and_middleware() {
+    let mut rt = Runtime::new();
+
+    // Pull in the helpers we need (these live in
+    // lib/beam/web-contracts.scm; inlined here so the test
+    // doesn't depend on the package loader).
+    rt.eval_str(
+        "<setup>",
+        r#"
+        (define http/ok               200)
+        (define http/created          201)
+        (define http/no-content       204)
+        (define http/bad-request      400)
+        (define http/teapot           418)
+        (define http/unprocessable    422)
+        (define http/internal-error   500)
+        (define (http-success?      n) (and (integer? n) (>= n 200) (<= n 299)))
+        (define (http-client-error? n) (and (integer? n) (>= n 400) (<= n 499)))
+        (define (http-server-error? n) (and (integer? n) (>= n 500) (<= n 599)))
+        "#,
+    )
+    .expect("setup");
+
+    // --- Range predicates work as advertised. Two-step the
+    //     eval/disp so we don't borrow `rt` twice in one
+    //     expression.
+    fn check_pred(rt: &mut Runtime, expr: &str, want: &str) {
+        let v = rt.eval_str("<t>", expr).expect(expr);
+        assert_eq!(disp(rt, &v), want, "{expr}");
+    }
+    check_pred(&mut rt, "(http-success? http/ok)", "#t");
+    check_pred(&mut rt, "(http-success? http/created)", "#t");
+    check_pred(&mut rt, "(http-success? http/no-content)", "#t");
+    check_pred(&mut rt, "(http-success? http/teapot)", "#f");
+    check_pred(&mut rt, "(http-client-error? http/bad-request)", "#t");
+    check_pred(&mut rt, "(http-client-error? http/unprocessable)", "#t");
+    check_pred(&mut rt, "(http-server-error? http/internal-error)", "#t");
+    check_pred(&mut rt, "(http-client-error? http/internal-error)", "#f");
+
+    // --- Build a server with three layers + one static route.
+    let sid_val = rt
+        .eval_str("<t>", r#"(web-server-create "127.0.0.1:0")"#)
+        .expect("create");
+    let sid = disp(&rt, &sid_val);
+
+    // Install middleware. Order matters — first call ends up
+    // outermost. The request-id layer must be outside any handler
+    // that wants to read it; install it first so the route below
+    // sees a stable x-request-id at handler time.
+    rt.eval_str("<t>", &format!("(web-layer-request-id! {})", sid))
+        .expect("req-id");
+    rt.eval_str("<t>", &format!("(web-layer-timeout! {} 5000)", sid))
+        .expect("timeout");
+    rt.eval_str("<t>", &format!("(web-layer-catch-panic! {})", sid))
+        .expect("panic");
+
+    // A simple static route — exercises the path through all
+    // installed layers + the always-on outer CatchPanic.
+    rt.eval_str(
+        "<t>",
+        &format!(r#"(web-route-static! {} 'GET "/h" "hello")"#, sid),
+    )
+    .expect("route");
+
+    let bound_val = rt
+        .eval_str("<t>", &format!("(web-server-start {})", sid))
+        .expect("start");
+    let addr = parse_addr(&rt, &bound_val);
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Full HTTP/1.1 reply so we can inspect headers.
+    fn http_raw(addr: &str, path: &str) -> Vec<u8> {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            path
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        buf
+    }
+    let raw = http_raw(&addr, "/h");
+    let raw_str = String::from_utf8_lossy(&raw);
+
+    // Status line.
+    assert!(raw_str.starts_with("HTTP/1.1 200"), "got: {raw_str}");
+    // RequestId layer injected an x-request-id header on the response.
+    let has_req_id = raw_str
+        .lines()
+        .any(|l| l.to_ascii_lowercase().starts_with("x-request-id:"));
+    assert!(
+        has_req_id,
+        "expected x-request-id header from middleware, got: {raw_str}"
+    );
+    // Body.
+    assert!(raw_str.ends_with("\r\n\r\nhello") || raw_str.contains("\r\n\r\nhello"));
+
+    rt.eval_str("<t>", &format!("(web-server-stop {})", sid))
+        .expect("stop");
+
+    // --- A second server installs middleware AFTER start — must
+    //     error (Building state has already transitioned).
+    let sid2_val = rt
+        .eval_str("<t>", r#"(web-server-create "127.0.0.1:0")"#)
+        .expect("create2");
+    let sid2 = disp(&rt, &sid2_val);
+    rt.eval_str(
+        "<t>",
+        &format!(r#"(web-route-static! {} 'GET "/" "x")"#, sid2),
+    )
+    .expect("route2");
+    rt.eval_str("<t>", &format!("(web-server-start {})", sid2))
+        .expect("start2");
+    let res = rt.eval_str("<t>", &format!("(web-layer-trace! {})", sid2));
+    assert!(res.is_err(), "post-start layer install must error");
+    rt.eval_str("<t>", &format!("(web-server-stop {})", sid2))
+        .expect("stop2");
+}
+
 #[test]
 fn scheme_route_after_start_is_error() {
     let mut rt = Runtime::new();

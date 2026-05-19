@@ -65,11 +65,26 @@ use crate::builtins::beam::SendableValue;
 /// states: `Building` (mutable while the user registers routes,
 /// owns a Router and a list of layers) and `Running` (immutable,
 /// owns the tokio JoinHandle so `web-server-stop` can abort).
+/// One layer the user has installed on a building server. Each
+/// variant maps to a built-in cs-web Layer; `start` builds them
+/// outside-in (first-pushed wraps the outermost). The variant set
+/// is closed because Scheme can't supply arbitrary Layer impls
+/// without a Value-typed bridge for !Send Scheme procs inside
+/// tokio tasks — Scheme-defined custom middleware is an actor
+/// chain, not a Layer.
+enum LayerSpec {
+    Trace,
+    RequestId,
+    CatchPanic,
+    Timeout(std::time::Duration),
+}
+
 enum Slot {
     Building {
         addr: SocketAddr,
         router: Router,
         access_log: Option<cs_web::table::AccessLog>,
+        layers: Vec<LayerSpec>,
     },
     Running {
         shutdown_tx: tokio::sync::oneshot::Sender<()>,
@@ -236,9 +251,23 @@ fn primop_server_create(addr: &str) -> Result<i64, String> {
             addr,
             router: Router::new(),
             access_log: None,
+            layers: Vec::new(),
         },
     );
     Ok(id)
+}
+
+fn primop_layer_push(sid: i64, who: &'static str, spec: LayerSpec) -> Result<(), String> {
+    with_slot(who, sid, |slot| match slot {
+        Slot::Building { layers, .. } => {
+            layers.push(spec);
+            Ok(())
+        }
+        _ => Err(format!(
+            "{}: server #{} already started or stopped",
+            who, sid
+        )),
+    })
 }
 
 fn primop_route_static(
@@ -320,6 +349,7 @@ fn primop_server_start(sid: i64) -> Result<String, String> {
             addr,
             router,
             access_log,
+            layers,
         } = std::mem::replace(slot, Slot::Stopped)
         else {
             // Restore and report.
@@ -332,8 +362,24 @@ fn primop_server_start(sid: i64) -> Result<String, String> {
         if let Some(log) = access_log {
             service = cs_web::Stack::new().push(log).wrap(service);
         }
-        // Always wrap with CatchPanic so a panicking handler
-        // never crashes the connection task.
+        // Apply user-installed layers in reverse-push order so
+        // the first `web-layer-*!` call ends up the OUTERMOST
+        // wrapper (matches the cs_web::Stack semantics).
+        let mut stack = cs_web::Stack::new();
+        for spec in layers {
+            stack = match spec {
+                LayerSpec::Trace => stack.push(cs_web::Trace),
+                LayerSpec::RequestId => stack.push(cs_web::RequestId::new()),
+                LayerSpec::CatchPanic => stack.push(cs_web::CatchPanic),
+                LayerSpec::Timeout(d) => stack.push(cs_web::Timeout::new(d)),
+            };
+        }
+        service = stack.wrap(service);
+        // Always-on outermost CatchPanic so a panicking handler
+        // (or middleware) never crashes the connection task. A
+        // user-installed CatchPanic stacks INSIDE this one —
+        // double-wrap is harmless because a panic in a higher
+        // layer is also caught.
         service = cs_web::Stack::new().push(cs_web::CatchPanic).wrap(service);
         (addr, service)
     };
@@ -422,6 +468,42 @@ pub fn b_web_route_module(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
     let path = value_to_str(&args[1], syms, "web-route-module!")?;
     let n = primop_route_module(sid, path)?;
     Ok(Value::Number(cs_core::Number::Fixnum(n as i64)))
+}
+
+pub fn b_web_layer_trace(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-layer-trace!", args, 1)?;
+    let sid = value_to_i64(&args[0], "web-layer-trace!")?;
+    primop_layer_push(sid, "web-layer-trace!", LayerSpec::Trace)?;
+    Ok(Value::Unspecified)
+}
+
+pub fn b_web_layer_request_id(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-layer-request-id!", args, 1)?;
+    let sid = value_to_i64(&args[0], "web-layer-request-id!")?;
+    primop_layer_push(sid, "web-layer-request-id!", LayerSpec::RequestId)?;
+    Ok(Value::Unspecified)
+}
+
+pub fn b_web_layer_catch_panic(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-layer-catch-panic!", args, 1)?;
+    let sid = value_to_i64(&args[0], "web-layer-catch-panic!")?;
+    primop_layer_push(sid, "web-layer-catch-panic!", LayerSpec::CatchPanic)?;
+    Ok(Value::Unspecified)
+}
+
+pub fn b_web_layer_timeout(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-layer-timeout!", args, 2)?;
+    let sid = value_to_i64(&args[0], "web-layer-timeout!")?;
+    let ms = value_to_i64(&args[1], "web-layer-timeout!")?;
+    if ms < 0 {
+        return Err("web-layer-timeout!: timeout-ms must be non-negative".into());
+    }
+    primop_layer_push(
+        sid,
+        "web-layer-timeout!",
+        LayerSpec::Timeout(std::time::Duration::from_millis(ms as u64)),
+    )?;
+    Ok(Value::Unspecified)
 }
 
 pub fn b_web_access_log(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
@@ -819,6 +901,10 @@ pub fn web_syms_builtins() -> Vec<(
         ("web-route-static!", b_web_route_static),
         ("web-route-actor!", b_web_route_actor),
         ("web-access-log!", b_web_access_log),
+        ("web-layer-trace!", b_web_layer_trace),
+        ("web-layer-request-id!", b_web_layer_request_id),
+        ("web-layer-catch-panic!", b_web_layer_catch_panic),
+        ("web-layer-timeout!", b_web_layer_timeout),
         ("web-server-start", b_web_server_start),
         ("web-server-stop", b_web_server_stop),
         ("web-request-method", b_web_request_method),
