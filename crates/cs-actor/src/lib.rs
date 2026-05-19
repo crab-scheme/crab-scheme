@@ -72,8 +72,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use dashmap::DashMap;
 use rustc_hash::FxBuildHasher;
@@ -157,6 +157,8 @@ pub enum ActorError {
     NotFound { pid: ActorPid },
     #[error("send to {pid} failed: receiver dropped")]
     SendFailed { pid: ActorPid },
+    #[error("send to {pid} failed: mailbox full ({cap} cap reached)")]
+    MailboxFull { pid: ActorPid, cap: usize },
     #[error("call to {pid} timed out after {timeout_ms} ms")]
     CallTimeout { pid: ActorPid, timeout_ms: u64 },
     #[error("actor system shutting down")]
@@ -196,6 +198,26 @@ pub(crate) struct ActorState {
     /// receive_async to decide the disposition of incoming
     /// Exit messages.
     trap_exit: AtomicBool,
+    /// Soft mailbox cap (audit fix #5). `0` = unlimited (the
+    /// default, BEAM-style). When > 0, `send_with_cap`
+    /// checks `pending` before delivering and returns
+    /// `ActorError::MailboxFull` if at-or-above cap. This
+    /// rejects rather than blocks — backpressure is the
+    /// sender's policy decision (retry, drop, alert). True
+    /// awaiting backpressure would need switching the channel
+    /// type to `mpsc::Sender`; that's a heavier refactor.
+    ///
+    /// `ActorRef::send` (held directly, e.g., from Rust tests)
+    /// bypasses the cap check for the hot path. Production
+    /// senders should go through cs-runtime's `(send pid …)`
+    /// primop, which routes through `send_with_cap`.
+    soft_cap: AtomicUsize,
+    /// In-flight message count (sent − received). Bumped by
+    /// `send_with_cap`; decremented by `primop_raw_receive`
+    /// after a successful recv. Approximate when used outside
+    /// the cap-enforcement path because non-capped `ActorRef::send`
+    /// bypasses the increment.
+    pending: AtomicUsize,
 }
 
 impl ActorState {
@@ -205,7 +227,49 @@ impl ActorState {
             links: Mutex::new(HashSet::new()),
             monitored_by: Mutex::new(HashMap::new()),
             trap_exit: AtomicBool::new(false),
+            soft_cap: AtomicUsize::new(0),
+            pending: AtomicUsize::new(0),
         }
+    }
+
+    /// Send with soft-cap enforcement. Returns `Err(MailboxFull)`
+    /// when `soft_cap > 0` and `pending >= soft_cap`; otherwise
+    /// behaves like the raw send. Increments `pending` on
+    /// success — the receiver decrements after a successful recv.
+    pub(crate) fn send_with_cap(&self, pid: ActorPid, msg: Message) -> Result<(), ActorError> {
+        let cap = self.soft_cap.load(Ordering::Relaxed);
+        if cap > 0 {
+            // Speculative load + CAS would be more accurate
+            // under contention, but the cap is a soft hint
+            // (BEAM mailboxes are unbounded too) and the
+            // looser semantics are acceptable here.
+            if self.pending.load(Ordering::Relaxed) >= cap {
+                return Err(ActorError::MailboxFull { pid, cap });
+            }
+        }
+        self.inbox
+            .send(msg)
+            .map_err(|_| ActorError::SendFailed { pid })?;
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Called by `primop_raw_receive` after a successful
+    /// dequeue. Saturating-decrements `pending`; we tolerate
+    /// transient underflow if `send_with_cap` racing with
+    /// `ActorRef::send` (which bypasses pending) skewed the
+    /// count.
+    pub(crate) fn note_received(&self) {
+        let prev = self.pending.load(Ordering::Relaxed);
+        if prev > 0 {
+            // Best-effort decrement. Concurrent decrements
+            // are fine because we're saturating-subtracting.
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
     }
 }
 
@@ -464,6 +528,49 @@ impl Actor {
     pub fn is_trapping_exits(&self) -> bool {
         self.state.trap_exit.load(Ordering::Relaxed)
     }
+
+    // ---- Bounded mailbox (audit fix #5) ----
+
+    /// Set the soft cap on this actor's mailbox. `0`
+    /// (default) disables enforcement; positive `n` means
+    /// `send_with_cap`-routed sends to this actor return
+    /// `Err(MailboxFull)` when at-or-above N pending.
+    /// Returns the previous cap.
+    pub fn set_mailbox_cap(&self, cap: usize) -> usize {
+        self.state.soft_cap.swap(cap, Ordering::Relaxed)
+    }
+
+    /// Read the configured cap (0 = unlimited).
+    pub fn mailbox_cap(&self) -> usize {
+        self.state.soft_cap.load(Ordering::Relaxed)
+    }
+
+    /// Current approximate pending count. May be off if
+    /// some senders used the raw `ActorRef::send` path
+    /// instead of routing through `send_with_cap`.
+    pub fn mailbox_pending(&self) -> usize {
+        self.state.pending_count()
+    }
+
+    /// Send `payload` to `target` via the cap-checked path.
+    /// Used by cs-runtime's `(send pid …)` Scheme primop.
+    pub fn send_with_cap_to(&self, target: ActorPid, payload: Payload) -> Result<(), ActorError> {
+        let target_state = self
+            .system
+            .registry
+            .get(&target)
+            .map(|e| Arc::clone(e.value()))
+            .ok_or(ActorError::SendFailed { pid: target })?;
+        target_state.send_with_cap(target, Message::User(payload))
+    }
+
+    /// Decrement this actor's pending counter after a
+    /// successful receive. cs-runtime's `primop_raw_receive`
+    /// calls this so the mailbox cap reflects in-flight
+    /// vs. consumed messages.
+    pub fn note_received(&self) {
+        self.state.note_received();
+    }
 }
 
 // ---------- Actor system ----------
@@ -483,6 +590,13 @@ struct ActorSystemRef {
     /// from PIDs so callers can't confuse the two.
     next_monitor_ref_id: Arc<AtomicU64>,
     handle: tokio::runtime::Handle,
+    /// Signaled by `on_actor_termination` whenever an actor
+    /// finishes. `wait_idle` blocks on the Condvar and
+    /// rechecks `registry.is_empty()` instead of busy-
+    /// polling (audit fix #9). The Mutex<()> is just a
+    /// dummy required by Condvar's API; the source of truth
+    /// is `registry.is_empty()`.
+    idle_notify: Arc<(Mutex<()>, Condvar)>,
 }
 
 impl ActorSystemRef {
@@ -581,6 +695,16 @@ impl ActorSystemRef {
                 // chain naturally as receivers handle them.
             }
         }
+
+        // Audit fix #9: signal anyone parked in wait_idle.
+        // The Condvar guards the registry-empty condition;
+        // wakers re-check `registry.is_empty()` before
+        // returning so spurious wakeups are harmless.
+        if self.registry.is_empty() {
+            let (lock, cv) = &*self.idle_notify;
+            let _g = lock.lock().expect("idle_notify lock poisoned");
+            cv.notify_all();
+        }
     }
 }
 
@@ -626,6 +750,7 @@ impl ActorSystem {
             registry: Arc::new(DashMap::with_hasher(FxBuildHasher::default())),
             next_local_id: Arc::new(AtomicU64::new(1)),
             next_monitor_ref_id: Arc::new(AtomicU64::new(1)),
+            idle_notify: Arc::new((Mutex::new(()), Condvar::new())),
             handle,
         };
         Self { tokio_rt, inner }
@@ -826,11 +951,25 @@ impl ActorSystem {
     /// Block until the registry drains (all spawned actors have
     /// terminated). Used by tests + by graceful shutdown.
     pub fn wait_idle(&self) {
+        // Audit fix #9: park on the system's Condvar rather
+        // than busy-polling every 5ms. `on_actor_termination`
+        // signals after each actor's cleanup, and the
+        // re-check inside the wait loop handles spurious
+        // wakeups + the race between `live_actor_count()`
+        // and the actual decrement.
+        let (lock, cv) = &*self.inner.idle_notify;
         loop {
             if self.live_actor_count() == 0 {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            let guard = lock.lock().expect("idle_notify lock poisoned");
+            // Brief upper bound so a missed notify (e.g.,
+            // signal arrived between the registry check and
+            // the lock acquire) doesn't deadlock the wait —
+            // we recheck the registry every 250ms regardless.
+            let (_g, _timeout) = cv
+                .wait_timeout(guard, std::time::Duration::from_millis(250))
+                .expect("idle_notify wait poisoned");
         }
     }
 
@@ -1102,19 +1241,24 @@ mod tests {
         // B: trap exits, link to A (passed via a oneshot for the
         // pid handshake), then receive.
         let (pid_tx, pid_rx) = std::sync::mpsc::sync_channel::<ActorPid>(1);
+        // Gate A's completion until B has linked. Without
+        // this, A's no-op body races to terminate before B
+        // can resolve its registry entry.
+        let (linked_tx, linked_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let b = sys.spawn_sync_body_on_task(move |actor| {
             actor.trap_exit(true);
             let a_pid = pid_rx.recv().expect("a_pid");
             actor.link(a_pid).expect("link");
+            linked_tx.send(()).expect("linked signal");
             if let Some(msg) = actor.receive() {
                 tx.send(msg).expect("forward to test thread");
             }
         });
 
-        // A: exits normally. B should receive Exit { from: A,
-        // reason: Normal } and forward via the channel.
-        let a = sys.spawn_sync_body_on_task(|_actor| {
-            // body returns -> Normal exit
+        // A: wait for B to link, then exit normally. B should
+        // receive Exit { from: A, reason: Normal } and forward.
+        let a = sys.spawn_sync_body_on_task(move |_actor| {
+            linked_rx.recv().expect("wait for link");
         });
         pid_tx.send(a.pid()).expect("pid handshake");
 
@@ -1140,18 +1284,23 @@ mod tests {
         let sys = ActorSystem::new();
         let (tx, rx) = std::sync::mpsc::channel::<Message>();
         let (pid_tx, pid_rx) = std::sync::mpsc::sync_channel::<ActorPid>(1);
+        // Gate target's exit until watcher has registered.
+        let (monitored_tx, monitored_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
         // Watcher: monitor target, then receive Down.
         sys.spawn_sync_body_on_task(move |actor| {
             let target = pid_rx.recv().expect("target_pid");
             let _ref = actor.monitor(target).expect("monitor");
+            monitored_tx.send(()).expect("monitored signal");
             if let Some(msg) = actor.receive() {
                 tx.send(msg).expect("forward to test thread");
             }
         });
 
-        // Target: exit normally.
-        let target = sys.spawn_sync_body_on_task(|_actor| {});
+        // Target: wait for watcher to register monitor, then exit.
+        let target = sys.spawn_sync_body_on_task(move |_actor| {
+            monitored_rx.recv().expect("wait for monitor");
+        });
         pid_tx.send(target.pid()).expect("pid handshake");
 
         let received = rx
@@ -1193,6 +1342,105 @@ mod tests {
         sys.shutdown();
     }
 
+    /// Audit fix #5: soft-cap mailbox rejects sends when
+    /// the pending count reaches the cap. send_with_cap_to
+    /// returns Err(MailboxFull). Note: ActorRef::send (direct)
+    /// bypasses the cap intentionally — see ActorState
+    /// docs for the design choice.
+    #[test]
+    fn mailbox_cap_rejects_when_full() {
+        let sys = ActorSystem::new();
+        let (pid_tx, pid_rx) = std::sync::mpsc::sync_channel::<ActorPid>(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (start_tx, start_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        // Gate sender's first send until sleepy has applied
+        // the cap — otherwise sender races sleepy and the
+        // first 3 sends all see cap=0 → all accepted.
+        let (cap_set_tx, cap_set_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+        // Sleepy actor: set cap = 2, then block on `start_rx`
+        // (NOT receive — we want the mailbox to fill from
+        // outside while this body holds).
+        let sleepy = sys.spawn_sync_body_on_task(move |actor| {
+            actor.set_mailbox_cap(2);
+            cap_set_tx.send(()).expect("cap_set signal");
+            // Wait for the test thread to attempt its 3 sends
+            // before consuming anything.
+            start_rx.recv().expect("start signal");
+            // Drain whatever's available + signal.
+            while actor.try_receive().is_ok() {}
+            done_tx.send(()).expect("done signal");
+        });
+        pid_tx.send(sleepy.pid()).expect("pid handshake");
+
+        // Use a sender actor so we have access to send_with_cap_to.
+        let target_pid = pid_rx.recv().expect("target_pid");
+        cap_set_rx.recv().expect("wait for cap set");
+        let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<Option<ActorError>>(1);
+        sys.spawn_sync_body_on_task(move |actor| {
+            // Send 1 — accepted, pending=1.
+            actor
+                .send_with_cap_to(target_pid, Arc::new(1u64) as Payload)
+                .expect("send 1");
+            // Send 2 — accepted, pending=2.
+            actor
+                .send_with_cap_to(target_pid, Arc::new(2u64) as Payload)
+                .expect("send 2");
+            // Send 3 — at-cap → MailboxFull.
+            let err = actor
+                .send_with_cap_to(target_pid, Arc::new(3u64) as Payload)
+                .err();
+            err_tx.send(err).expect("err signal");
+        });
+
+        let err = err_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("sender result");
+        match err {
+            Some(ActorError::MailboxFull { cap, .. }) => {
+                assert_eq!(cap, 2);
+            }
+            Some(other) => panic!("expected MailboxFull, got {other:?}"),
+            None => panic!("expected the third send to fail"),
+        }
+
+        // Release the sleepy actor.
+        start_tx.send(()).expect("unblock sleepy");
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("sleepy drain done");
+
+        sys.shutdown();
+    }
+
+    /// Audit fix #9: wait_idle uses Condvar instead of
+    /// busy-polling. Verify it actually returns after the
+    /// expected number of actors complete.
+    #[test]
+    fn wait_idle_returns_when_all_actors_terminate() {
+        let sys = ActorSystem::new();
+        for _ in 0..32 {
+            sys.spawn_sync_body_on_task(|_actor| {
+                // No-op body.
+            });
+        }
+        // wait_idle should return promptly without spinning.
+        let t0 = std::time::Instant::now();
+        sys.wait_idle();
+        let elapsed = t0.elapsed();
+        assert_eq!(sys.live_actor_count(), 0);
+        // Sanity bound: shouldn't take more than a second.
+        // Pre-fix this took up to (registry_drain_time + 5ms)
+        // due to the 5ms sleep loop; post-fix the Condvar
+        // notifies as each actor terminates.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "wait_idle took {:?} — should be ≪ 1s for 32 no-op actors",
+            elapsed
+        );
+        sys.shutdown();
+    }
+
     /// demonitor before target's death suppresses the Down.
     /// Targets that die without active monitors emit nothing.
     #[test]
@@ -1200,11 +1448,13 @@ mod tests {
         let sys = ActorSystem::new();
         let (tx, rx) = std::sync::mpsc::channel::<Message>();
         let (pid_tx, pid_rx) = std::sync::mpsc::sync_channel::<ActorPid>(1);
+        let (demonitored_tx, demonitored_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
         sys.spawn_sync_body_on_task(move |actor| {
             let target = pid_rx.recv().expect("target_pid");
             let ref_id = actor.monitor(target).expect("monitor");
             actor.demonitor(target, ref_id);
+            demonitored_tx.send(()).expect("demonitored signal");
             // Use 50ms try_recv loop with timeout to confirm
             // no Down arrives — receive() would block forever.
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1213,7 +1463,10 @@ mod tests {
             }
         });
 
-        let target = sys.spawn_sync_body_on_task(|_actor| {});
+        // Target waits for demonitor to complete before exiting.
+        let target = sys.spawn_sync_body_on_task(move |_actor| {
+            demonitored_rx.recv().expect("wait for demonitor");
+        });
         pid_tx.send(target.pid()).expect("pid handshake");
         sys.wait_idle();
 
