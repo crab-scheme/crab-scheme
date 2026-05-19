@@ -113,7 +113,12 @@ cs-ffi-macros = { path = "crates/cs-ffi-macros" }
 cs-actor = { path = "crates/cs-actor" }
 cs-table = { path = "crates/cs-table" }
 cs-hotreload = { path = "crates/cs-hotreload" }
-cs-web = { path = "crates/cs-web", default-features = true }
+# cs-web declares `default-features = false` here so downstream
+# crates (like cs-web-mod-example, which compiles AS a cs-web
+# plugin and does NOT need libloading/cs-actor) can opt out.
+# Crates that need the full feature set re-enable them via the
+# `features = [...]` list at the dep site.
+cs-web = { path = "crates/cs-web", default-features = false, features = ["modules", "actor", "table"] }
 # R6RS++ package manager. Spec §10.
 cs-pkg = { path = "crates/cs-pkg" }
 cs-stdlib-path = { path = "crates/cs-stdlib-path" }
