@@ -13139,6 +13139,39 @@ fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
         // always-zero stub.
         let bytes = cs_gc::alloc_telemetry::bytes_allocated_total();
         let allocs = cs_gc::alloc_telemetry::alloc_count_total();
+        // parallel-runtime C4.4: surface the layer-4 BR sweep
+        // counters from `cs_gc::cycle_registry`. Three keys:
+        //
+        // - sweep-candidates-checked: registry size at the
+        //   start of the most recent run_sweep (after dead-
+        //   entry prune).
+        // - sweep-cycles-collected: candidates the BR pass
+        //   broke during that sweep.
+        // - sweep-time-us: wall time of that sweep in
+        //   microseconds.
+        //
+        // Cumulative break count across all sweeps lives in
+        // `sweep-broken-total` (matches the pre-C4.4
+        // SWEEP_BROKEN_COUNT semantics). Gated on the
+        // `tracing-cycle-collector` feature; zeroed when off.
+        #[cfg(feature = "tracing-cycle-collector")]
+        let (sweep_candidates, sweep_cycles, sweep_time_us, sweep_total) = {
+            let s = cs_gc::cycle_registry::last_sweep_stats();
+            (
+                s.candidates_checked,
+                s.cycles_collected,
+                s.time_micros,
+                cs_gc::cycle_registry::sweep_broken_count(),
+            )
+        };
+        #[cfg(not(feature = "tracing-cycle-collector"))]
+        let (sweep_candidates, sweep_cycles, sweep_time_us, sweep_total): (
+            usize,
+            usize,
+            u64,
+            u64,
+        ) = (0, 0, 0, 0);
+
         Ok(Value::list(vec![
             pair("bytes-allocated-total", fixnum_or_bigint(bytes)),
             pair("alloc-count-total", fixnum_or_bigint(allocs)),
@@ -13153,6 +13186,14 @@ fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
             // cycles (which is interesting independent of
             // whether they were also broken).
             pair("cycles-detected", Value::fixnum(cycles_seen as i64)),
+            // C4.4 layer-4 BR-sweep counters.
+            pair(
+                "sweep-candidates-checked",
+                Value::fixnum(sweep_candidates as i64),
+            ),
+            pair("sweep-cycles-collected", Value::fixnum(sweep_cycles as i64)),
+            pair("sweep-time-us", fixnum_or_bigint(sweep_time_us)),
+            pair("sweep-broken-total", fixnum_or_bigint(sweep_total)),
         ]))
     }
 }

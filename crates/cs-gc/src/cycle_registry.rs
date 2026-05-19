@@ -497,31 +497,68 @@ pub fn take_sweep_pending() -> bool {
 /// - Periodic via the embedder API (`Runtime::start_background_sweep`,
 ///   iter 5).
 pub fn run_sweep() {
+    // Phase 1: drop dead entries (those whose Weak no longer
+    // upgrades). This both shrinks the worklist for the BR
+    // walk below and accounts for candidates the layer-2
+    // detector or a prior sweep already reclaimed.
     REGISTRY.with(|r| {
         let mut r = r.borrow_mut();
-        // Phase 1: drop dead entries.
         r.retain(|_, entry| entry.weak.upgrade_addr().is_some());
-        // Phase 2 (Gap C-3): attempt per-candidate break.
-        // Iterate addresses separately so we can mutate the
-        // map (drop succeeded entries) after each break. We
-        // collect addrs first to avoid borrow conflicts.
-        let addrs: Vec<usize> = r.keys().copied().collect();
-        for addr in addrs {
-            let broke = r
-                .get(&addr)
-                .map(|e| e.weak.upgrade_and_try_break())
-                .unwrap_or(false);
-            if broke {
-                SWEEP_BROKEN_COUNT.with(|c| c.set(c.get().saturating_add(1)));
-                // Don't drop the entry immediately — the
-                // break demoted one slot to Weak, but the
-                // Pair may still be referenced from
-                // elsewhere. Let the next sweep prune via
-                // Phase 1.
-            }
-        }
+    });
+    // Phase 2 (parallel-runtime C4.4): the full Bacon-Rajan
+    // trial-deletion walk replaces the per-candidate break
+    // loop. Each pass classifies candidates Black (external
+    // anchor — keep) vs White (truly garbage — break). The
+    // `bump_sweep_broken_count` hook keeps
+    // `SWEEP_BROKEN_COUNT` accurate so cs-runtime's gc-stats
+    // attributes BR-broken cycles to the same counter the
+    // pre-C4.4 per-candidate path used.
+    let t_start = std::time::Instant::now();
+    let candidates_before = candidate_count();
+    let mut td = crate::cycle_collector::TrialDeletion::new();
+    let cycles_collected = td.run();
+    let elapsed = t_start.elapsed();
+    LAST_SWEEP_STATS.with(|s| {
+        s.set(SweepStats {
+            candidates_checked: candidates_before,
+            cycles_collected,
+            time_micros: elapsed.as_micros() as u64,
+        });
     });
     SWEEP_PENDING.with(|f| f.set(false));
+}
+
+/// parallel-runtime C4.4: per-sweep summary stats.
+/// Surfaced to cs-runtime via [`last_sweep_stats`] and woven
+/// into `(gc-stats)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepStats {
+    /// How many entries were in the registry at the start of
+    /// the BR walk (after the Phase-1 dead-entry prune).
+    pub candidates_checked: usize,
+    /// How many candidates `try_break_candidate` succeeded on
+    /// during this pass. Lower bound on actually-reclaimed
+    /// cycles (a Hashtable with default no-op BreakCycle
+    /// returns false even when classified White).
+    pub cycles_collected: usize,
+    /// Wall time the BR walk took, in microseconds.
+    pub time_micros: u64,
+}
+
+thread_local! {
+    /// Stats from the most recent `run_sweep`. Default zeroed.
+    /// Read by `last_sweep_stats`; written by `run_sweep`.
+    static LAST_SWEEP_STATS: std::cell::Cell<SweepStats> =
+        const { std::cell::Cell::new(SweepStats {
+            candidates_checked: 0,
+            cycles_collected: 0,
+            time_micros: 0,
+        }) };
+}
+
+/// Snapshot of the last sweep's summary stats.
+pub fn last_sweep_stats() -> SweepStats {
+    LAST_SWEEP_STATS.with(|s| s.get())
 }
 
 /// Cumulative count of candidates the layer-4 sweep has
