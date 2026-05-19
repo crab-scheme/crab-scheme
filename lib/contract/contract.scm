@@ -76,12 +76,37 @@
           (make-contract (reverse doms-acc) (car rest))
           (loop (cdr rest) (cons (car rest) doms-acc))))))
 
+; parallel-runtime spec C5.3 — region values escape their
+; lifetime when they cross a contract boundary. A region
+; pair returned from a contracted proc may be reached
+; through the contract wrapper after the underlying region
+; drops, leaving a dangling handle. We reject region values
+; with a clear &contract violation rather than letting them
+; through to silently corrupt memory later.
+;
+; `(gc-allocator v)` returns 'region for region-backed
+; heaps, 'rc for the default, 'leaf for non-heap values.
+; The check fires only on heap values; leaf values pass
+; through unchanged.
+(define (__reject-region-or v blame name contract-desc)
+  (if (eq? (gc-allocator v) 'region)
+      (raise (make-contract-violation
+              blame name
+              (cons 'no-region-escape contract-desc)
+              v))
+      v))
+
 ; Internal: check / wrap one arg through a domain spec. A spec
 ; that's a contract gets used to wrap (if arg is a procedure);
 ; a spec that's a predicate gets called for a boolean check.
 ; Returns the (possibly wrapped) arg on success; raises on
 ; failure.
 (define (__apply-domain spec arg name contract-desc)
+  ; C5.3: callee→caller flow (an arg's region-ness applies
+  ; symmetrically: a callee shouldn't accept a region value
+  ; either, because the contract wrapper retains the
+  ; reference past the call boundary).
+  (__reject-region-or arg 'caller name contract-desc)
   (cond
     ((contract? spec)
      (if (procedure? arg)
@@ -95,6 +120,10 @@
      (error 'apply-contract "domain spec must be predicate or contract" spec))))
 
 (define (__apply-range spec result name contract-desc)
+  ; C5.3: caller→callee flow — a returned region value would
+  ; outlive its `(with-region …)` scope as soon as the
+  ; caller stores it, so we refuse here.
+  (__reject-region-or result 'callee name contract-desc)
   (cond
     ((contract? spec)
      (if (procedure? result)
