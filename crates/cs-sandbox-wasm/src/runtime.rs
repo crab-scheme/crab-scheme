@@ -28,6 +28,8 @@
 //! interactively.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
@@ -60,6 +62,10 @@ pub struct SandboxRuntime {
     /// wasmtime epoch interruption + a one-shot ticker thread
     /// per call. Validated > 0 at SandboxConfig::validate.
     wall_clock_timeout: Duration,
+    /// Recurring epoch-tick interval for CPU-bound enforcement.
+    /// When `Some(N)`, a per-eval ticker bumps the engine epoch
+    /// every N. Mutually exclusive with `fuel`.
+    epoch_tick_interval: Option<Duration>,
 }
 
 /// Per-Store data: the WASI ctx + the resource limiter.
@@ -83,13 +89,12 @@ impl SandboxRuntime {
     pub fn new(config: &SandboxConfig) -> Result<Self, SandboxError> {
         let mut wasm_config = Config::new();
         wasm_config.consume_fuel(config.fuel.is_some());
-        // Epoch interruption is wired ONLY for the mandatory
-        // wall-clock timeout enforcement. The `epoch_tick_interval`
-        // field on SandboxConfig is currently a stub — held for
-        // forward compatibility but no separate CPU-bound ticker
-        // is spawned. Always-on so the per-call wall-clock ticker
-        // can bump it; every Store must call `set_epoch_deadline`
-        // (the inline-WAT smoke pushes its deadline to u64::MAX).
+        // Epoch interruption is always-on: used by both the
+        // mandatory wall-clock one-shot ticker and (when configured)
+        // the recurring epoch_tick_interval CPU-bound ticker.
+        // Every Store must call `set_epoch_deadline`; the inline-WAT
+        // smoke pushes its deadline to u64::MAX to avoid spurious
+        // traps.
         wasm_config.epoch_interruption(true);
         let engine = Engine::new(&wasm_config)
             .map_err(|e| SandboxError::Internal(format!("wasmtime Engine::new failed: {}", e)))?;
@@ -109,6 +114,7 @@ impl SandboxRuntime {
             allow_paths: config.allow_paths.clone(),
             imports: config.imports.clone(),
             wall_clock_timeout: config.wall_clock_timeout,
+            epoch_tick_interval: config.epoch_tick_interval,
         })
     }
 
@@ -232,7 +238,15 @@ impl SandboxRuntime {
         // eval for the whole timeout window, and (2) a stale ticker
         // bumping the shared engine's epoch into a later eval and
         // tripping a spurious `Trap::Interrupt` → `Timeout`.
+        //
+        // When `epoch_tick_interval` is also configured a second
+        // recurring ticker is spawned. Both tickers share the same
+        // engine epoch; `epoch_fired` distinguishes attribution: if
+        // the recurring ticker fires first, the trap is
+        // `CpuLimitExceeded`; if the one-shot wall-clock fires
+        // first (or epoch_fired is still false), it's `Timeout`.
         store.set_epoch_deadline(1);
+        let epoch_fired = Arc::new(AtomicBool::new(false));
         let timeout = self.wall_clock_timeout;
         let engine_for_ticker = self.engine.clone();
         let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
@@ -245,6 +259,31 @@ impl SandboxRuntime {
                 engine_for_ticker.increment_epoch();
             }
         });
+
+        // Epoch-tick CPU-bound ticker. When configured, loop every
+        // `interval` bumping the engine epoch until the cancellation
+        // channel is disconnected (eval finished). The first bump
+        // sets `epoch_fired` so the trap is attributed correctly.
+        let epoch_ticker_handle = if let Some(interval) = self.epoch_tick_interval {
+            let engine_for_epoch = self.engine.clone();
+            let epoch_fired_clone = Arc::clone(&epoch_fired);
+            let (epoch_cancel_tx, epoch_cancel_rx) = std::sync::mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                loop {
+                    match epoch_cancel_rx.recv_timeout(interval) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            epoch_fired_clone.store(true, Ordering::Relaxed);
+                            engine_for_epoch.increment_epoch();
+                        }
+                        // Disconnected: eval finished; exit cleanly.
+                        _ => break,
+                    }
+                }
+            });
+            Some((epoch_cancel_tx, handle))
+        } else {
+            None
+        };
 
         let mut linker: Linker<StoreData> = Linker::new(&self.engine);
         preview1::add_to_linker_sync(&mut linker, |d: &mut StoreData| &mut d.wasi)
@@ -263,12 +302,16 @@ impl SandboxRuntime {
         let out = stdout.contents();
         let err = stderr.contents();
 
-        // Cancel + reap the ticker. Dropping `cancel_tx` wakes the
-        // ticker's `recv_timeout` with `Disconnected` so it exits
-        // at once (without bumping the epoch); `join` then returns
-        // immediately and no detached thread is left behind.
+        // Cancel + reap both tickers. Dropping the senders wakes
+        // each ticker's `recv_timeout` with `Disconnected` so they
+        // exit at once without bumping the epoch; `join` returns
+        // immediately and no detached threads are left behind.
         drop(cancel_tx);
         let _ = ticker_handle.join();
+        if let Some((epoch_cancel_tx, epoch_handle)) = epoch_ticker_handle {
+            drop(epoch_cancel_tx);
+            let _ = epoch_handle.join();
+        }
 
         if let Err(e) = call_result {
             // Discriminate by trap kind (API-stable) before
@@ -277,7 +320,16 @@ impl SandboxRuntime {
                 match *trap {
                     Trap::OutOfFuel => return Err(SandboxError::FuelExhausted),
                     Trap::MemoryOutOfBounds => return Err(SandboxError::MemoryExhausted),
-                    Trap::Interrupt => return Err(SandboxError::Timeout),
+                    Trap::Interrupt => {
+                        // Both tickers share the engine epoch. If the
+                        // recurring epoch ticker fired first, classify
+                        // as CpuLimitExceeded; otherwise it was the
+                        // wall-clock one-shot, so Timeout.
+                        if epoch_fired.load(Ordering::Relaxed) {
+                            return Err(SandboxError::CpuLimitExceeded);
+                        }
+                        return Err(SandboxError::Timeout);
+                    }
                     _ => { /* fall through to abort/Rust-OOM heuristic + generic Internal */ }
                 }
             }
@@ -385,6 +437,66 @@ fn escape_scheme_string(s: &str) -> String {
         }
     }
     out
+}
+
+/// Test helper: run a WAT infinite-loop module against the
+/// runtime's engine with epoch interruption armed. Returns the
+/// `SandboxError` the loop triggers. Used by the epoch-tick tests
+/// to verify `CpuLimitExceeded` fires without needing a
+/// crabscheme.wasm binary.
+pub fn run_epoch_tick_loop_test(runtime: &SandboxRuntime) -> SandboxError {
+    // A WAT module that loops forever: call itself recursively.
+    // Wasmtime compiles this to native code; the epoch ticker will
+    // interrupt it after the configured interval.
+    const WAT_LOOP: &str = r#"
+        (module
+          (func $loop (export "loop")
+            (loop $top
+              br $top)))
+    "#;
+    let module = Module::new(runtime.engine(), WAT_LOOP.as_bytes()).expect("WAT_LOOP compile");
+
+    let interval = runtime
+        .epoch_tick_interval
+        .expect("epoch_tick_interval must be set to use run_epoch_tick_loop_test");
+
+    let mut store = Store::new(runtime.engine(), ());
+    store.set_epoch_deadline(1);
+
+    let epoch_fired = Arc::new(AtomicBool::new(false));
+    let epoch_fired_clone = Arc::clone(&epoch_fired);
+    let engine_for_epoch = runtime.engine().clone();
+    let (epoch_cancel_tx, epoch_cancel_rx) = std::sync::mpsc::channel::<()>();
+    let epoch_handle = std::thread::spawn(move || loop {
+        match epoch_cancel_rx.recv_timeout(interval) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                epoch_fired_clone.store(true, Ordering::Relaxed);
+                engine_for_epoch.increment_epoch();
+            }
+            _ => break,
+        }
+    });
+
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiate WAT_LOOP");
+    let loop_fn = instance
+        .get_typed_func::<(), ()>(&mut store, "loop")
+        .expect("get loop export");
+
+    let result = loop_fn.call(&mut store, ());
+
+    drop(epoch_cancel_tx);
+    let _ = epoch_handle.join();
+
+    let err = result.expect_err("loop must trap");
+    if let Some(trap) = err.downcast_ref::<Trap>() {
+        if *trap == Trap::Interrupt {
+            if epoch_fired.load(Ordering::Relaxed) {
+                return SandboxError::CpuLimitExceeded;
+            }
+            return SandboxError::Timeout;
+        }
+    }
+    SandboxError::Internal(format!("unexpected trap: {}", err))
 }
 
 /// Iter 1 smoke: compile + instantiate a trivial WAT module
