@@ -346,8 +346,22 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
     // contexts never reach here, so the hook stays None and
     // the dispatch loop's per-op tick is a pure counter no-op.
     let prev_hook = cs_vm::vm::install_yield_hook(Some(cs_actor::tokio_yield_hook));
+    // parallel-runtime C4.5: bridge the BR sweep's yield
+    // hook to cs-vm's reduction counter. The same
+    // per-iteration tick the bytecode dispatch loop uses
+    // (cs_vm::vm::vm_tick_reductions) now also fires once
+    // per candidate processed by cs_gc::cycle_collector,
+    // so a long sweep on this tokio worker yields when the
+    // reduction budget exhausts. Non-actor contexts (REPL,
+    // crabscheme run) leave the hook unset → sweep runs at
+    // full speed, same as pre-C4.5.
+    #[cfg(feature = "tracing-cycle-collector")]
+    let prev_sweep_hook =
+        cs_gc::cycle_collector::install_sweep_yield_hook(Some(cs_vm::vm::vm_tick_reductions));
     struct Guard {
         prev_hook: Option<cs_vm::vm::VmYieldHook>,
+        #[cfg(feature = "tracing-cycle-collector")]
+        prev_sweep_hook: Option<cs_gc::cycle_collector::SweepYieldHook>,
     }
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -357,9 +371,15 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
             // pooled worker thread reused by a non-actor caller
             // doesn't see our hook.
             cs_vm::vm::install_yield_hook(self.prev_hook);
+            #[cfg(feature = "tracing-cycle-collector")]
+            cs_gc::cycle_collector::install_sweep_yield_hook(self.prev_sweep_hook);
         }
     }
-    let _g = Guard { prev_hook };
+    let _g = Guard {
+        prev_hook,
+        #[cfg(feature = "tracing-cycle-collector")]
+        prev_sweep_hook,
+    };
     entry(actor, args);
 }
 

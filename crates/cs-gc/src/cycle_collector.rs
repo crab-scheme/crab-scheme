@@ -33,12 +33,59 @@
 
 #![cfg(feature = "tracing-cycle-collector")]
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use crate::cycle_registry::{
     bump_sweep_broken_count, candidate_addresses, candidate_color, candidate_strong_count,
     set_candidate_color, try_break_candidate, walk_candidate_children, Color,
 };
+
+// ---- parallel-runtime spec C4.5: sweep yield hook ----
+
+/// Per-candidate hook the BR walker invokes during each phase
+/// to give the scheduler a chance to yield. cs-runtime
+/// installs this to point at `cs_vm::vm::vm_tick_reductions`,
+/// so a long sweep on a tokio worker thread won't starve
+/// other actors — the same reduction-budget mechanism the
+/// bytecode dispatch loop uses (parallel-runtime C2.1+C2.2)
+/// drives the yield decision.
+///
+/// `None` (the default) is the no-op: the walker runs as
+/// fast as it can. Non-actor / non-tokio embedders leave it
+/// unset; actor-mode embedders set it on Runtime startup.
+pub type SweepYieldHook = fn();
+
+thread_local! {
+    /// Thread-local because: the BR walk is single-threaded
+    /// (one TrialDeletion per `run_sweep` call), and the
+    /// cs-vm reductions counter it bridges to is also
+    /// thread-local. Tying them together avoids any
+    /// cross-thread synchronization on the hot path.
+    static SWEEP_YIELD_HOOK: Cell<Option<SweepYieldHook>> = const { Cell::new(None) };
+}
+
+/// Install (or clear) the sweep yield hook. Returns the
+/// previous value so callers can stack/restore for tests.
+pub fn install_sweep_yield_hook(hook: Option<SweepYieldHook>) -> Option<SweepYieldHook> {
+    SWEEP_YIELD_HOOK.with(|h| h.replace(hook))
+}
+
+/// Get the currently-installed sweep yield hook (mostly for
+/// tests; production code rarely reads this).
+pub fn sweep_yield_hook() -> Option<SweepYieldHook> {
+    SWEEP_YIELD_HOOK.with(|h| h.get())
+}
+
+/// Call the installed hook, if any. Inline so it compiles to
+/// a single load+branch+call (the same shape cs-vm uses for
+/// its dispatch-loop yield check).
+#[inline]
+fn sweep_tick() {
+    if let Some(hook) = SWEEP_YIELD_HOOK.with(|h| h.get()) {
+        hook();
+    }
+}
 
 /// One trial-deletion pass over the current candidate set.
 ///
@@ -100,10 +147,12 @@ impl TrialDeletion {
 
     /// Phase 1: walk from `root`, virtually decrement each
     /// child, color it Gray. Iterative to avoid deep recursion
-    /// on long cyclic chains.
+    /// on long cyclic chains. Calls the installed
+    /// [`SweepYieldHook`] once per processed candidate (C4.5).
     pub fn mark_gray(&mut self, root: usize) {
         let mut stack = vec![root];
         while let Some(addr) = stack.pop() {
+            sweep_tick();
             if candidate_color(addr) == Color::Gray {
                 continue;
             }
@@ -125,9 +174,11 @@ impl TrialDeletion {
 
     /// Phase 2: classify each Gray node as restored (external
     /// anchor exists) or White (truly garbage). Iterative.
+    /// Yields via [`SweepYieldHook`] once per candidate.
     pub fn scan(&mut self, root: usize) {
         let mut stack = vec![root];
         while let Some(addr) = stack.pop() {
+            sweep_tick();
             if candidate_color(addr) != Color::Gray {
                 continue;
             }
@@ -176,6 +227,7 @@ impl TrialDeletion {
         let mut broken = 0usize;
         let mut stack = vec![root];
         while let Some(addr) = stack.pop() {
+            sweep_tick();
             if candidate_color(addr) != Color::White {
                 continue;
             }
@@ -344,6 +396,74 @@ mod tests {
         // doesn't recurse through the cycle.
         *a.next.borrow_mut() = None;
         drop(a);
+    }
+
+    // ---- parallel-runtime C4.5 — yield hook ----
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+
+    /// Module-level fn pointer the test installs as the
+    /// `SweepYieldHook` (the hook signature is `fn()`, so
+    /// closures with captures aren't allowed). Counts how
+    /// many times the hook fires during one BR pass.
+    static HOOK_FIRES: OnceLock<AtomicUsize> = OnceLock::new();
+    fn hook_counter() -> &'static AtomicUsize {
+        HOOK_FIRES.get_or_init(|| AtomicUsize::new(0))
+    }
+    fn yield_hook_increment() {
+        hook_counter().fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn yield_hook_fires_per_candidate_during_sweep() {
+        use crate::cycle_registry::register_cycle_candidate;
+        // Reset counter for this test.
+        hook_counter().store(0, Ordering::Relaxed);
+        // Install hook; remember the old one to restore.
+        let prev = super::install_sweep_yield_hook(Some(yield_hook_increment));
+
+        // Build a 10-node cycle. After mark_gray walks 10
+        // candidates, scan walks 10 more, collect_white walks
+        // 10 more — so the hook should fire >= 30 times.
+        reset_for_tests();
+        const N: usize = 10;
+        let nodes: Vec<Gc<Node>> = (0..N).map(|_| Node::new()).collect();
+        for i in 0..N {
+            link(&nodes[i], nodes[(i + 1) % N].clone());
+        }
+        for n in &nodes {
+            register(n);
+        }
+        drop(nodes);
+
+        let mut td = TrialDeletion::new();
+        td.run();
+
+        let fires = hook_counter().load(Ordering::Relaxed);
+        assert!(
+            fires >= N as usize * 3,
+            "hook should fire ≥ N*3 times (saw {fires}); BR has 3 phases each \
+             iterating ≥ N steps for a fully-internal cycle"
+        );
+
+        // Restore previous hook (None in tests, but be polite).
+        super::install_sweep_yield_hook(prev);
+    }
+
+    #[test]
+    fn no_hook_installed_means_no_call() {
+        // Confirm there's no implicit hook leaking from prior
+        // test ordering: clear, then verify a fresh sweep
+        // doesn't blow up.
+        super::install_sweep_yield_hook(None);
+        reset_for_tests();
+        let a = Node::new();
+        register(&a);
+        drop(a);
+        let mut td = TrialDeletion::new();
+        td.run(); // no panic, hook is None
+        assert!(super::sweep_yield_hook().is_none());
     }
 
     /// Two-node mutual cycle, no external refs — broken in one
