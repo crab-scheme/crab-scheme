@@ -136,12 +136,74 @@
     (else
      (error 'apply-contract "range spec must be predicate or contract" spec))))
 
+; ---- eta-elision fast path (Phase 2B.7) ----
+;
+; When every domain spec and the range spec are plain predicates
+; (not sub-contracts), we skip the `cond (contract? spec)` branch
+; inside __apply-domain / __apply-range on every call. Detection
+; happens once at apply-contract time so the per-call hot path only
+; calls the predicate directly.
+
+(define (__all-simple-preds? doms rng)
+  (and (procedure? rng)
+       (not (contract? rng))
+       (let loop ((ds doms))
+         (cond
+           ((null? ds) #t)
+           ((contract? (car ds)) #f)
+           ((procedure? (car ds)) (loop (cdr ds)))
+           (else #f)))))
+
+; Fast wrapper — single-domain variadic, all specs are plain preds.
+(define (__apply-contract-fast-variadic proc name desc dom rng)
+  (lambda args
+    (let* ((checked
+            (let loop ((rest args) (acc '()))
+              (if (null? rest)
+                  (reverse acc)
+                  (let ((v (car rest)))
+                    (__reject-region-or v 'caller name desc)
+                    (if (dom v)
+                        (loop (cdr rest) (cons v acc))
+                        (raise (make-contract-violation
+                                 'caller name desc v))))))))
+      (let ((result (apply proc checked)))
+        (__reject-region-or result 'callee name desc)
+        (if (rng result)
+            result
+            (raise (make-contract-violation 'callee name desc result)))))))
+
+; Fast wrapper — fixed-arity, all specs are plain preds.
+(define (__apply-contract-fast-fixed proc name desc doms rng n-doms)
+  (lambda args
+    (if (not (= (length args) n-doms))
+        (raise (make-contract-violation
+                 'caller name desc
+                 (list 'arity-mismatch 'expected n-doms 'got (length args)))))
+    (let* ((checked
+            (let loop ((ds doms) (as args) (acc '()))
+              (if (null? ds)
+                  (reverse acc)
+                  (let ((v (car as)))
+                    (__reject-region-or v 'caller name desc)
+                    (if ((car ds) v)
+                        (loop (cdr ds) (cdr as) (cons v acc))
+                        (raise (make-contract-violation
+                                 'caller name desc v))))))))
+      (let ((result (apply proc checked)))
+        (__reject-region-or result 'callee name desc)
+        (if (rng result)
+            result
+            (raise (make-contract-violation 'callee name desc result)))))))
+
 ; Wrap proc with the contract c. `name` identifies the wrapped
 ; procedure in blame messages.
 ;
 ; If the contract has a rest-pred slot (set by `->*`), dispatch
 ; to the variadic-tail wrapper; otherwise use the standard arrow
 ; semantics (single-domain variadic OR multi-domain fixed-arity).
+; Within the arrow path, a monomorphic contract (all specs plain
+; predicates, no sub-contracts) takes the eta-elision fast path.
 (define (apply-contract c proc name)
   (if (not (contract? c))
       (error 'apply-contract "not a contract" c))
@@ -155,44 +217,42 @@
   (let* ((doms (contract-domains c))
          (rng (contract-range c))
          (desc (list '-> doms rng)))
-    (lambda args
-      ; Build checked-args via an explicit loop. We avoid `map`
-      ; here because at the time of writing, our `map` builtin
-      ; doesn't reliably propagate exceptions raised from inside
-      ; its callback (raised conditions become uncaught even
-      ; when the call is wrapped in `guard`). The explicit loop
-      ; lets `raise` unwind cleanly back to the user's `guard`.
-      (let* ((checked-args
-              (cond
-                ; Single-domain variadic: apply dom to every arg.
-                ((= (length doms) 1)
-                 (let ((dom (car doms)))
-                   (let loop ((rest args) (acc '()))
-                     (if (null? rest)
-                         (reverse acc)
-                         (loop (cdr rest)
-                               (cons (__apply-domain dom (car rest) name desc)
-                                     acc))))))
-                ; Multi-domain fixed-arity: arity must match
-                ; len(doms), each arg checked against its position.
-                (else
-                 (if (not (= (length args) (length doms)))
-                     (raise (make-contract-violation
-                              'caller
-                              name
-                              desc
-                              (list 'arity-mismatch
-                                    'expected (length doms)
-                                    'got (length args)))))
-                 (let loop ((ds doms) (as args) (acc '()))
-                   (if (null? ds)
-                       (reverse acc)
-                       (loop (cdr ds)
-                             (cdr as)
-                             (cons (__apply-domain (car ds) (car as) name desc)
-                                   acc)))))))
-             (result (apply proc checked-args)))
-        (__apply-range rng result name desc)))))
+    ; Phase 2B.7: take the fast path when all specs are plain preds.
+    (if (__all-simple-preds? doms rng)
+        (if (= (length doms) 1)
+            (__apply-contract-fast-variadic proc name desc (car doms) rng)
+            (__apply-contract-fast-fixed proc name desc doms rng (length doms)))
+        (lambda args
+          ; Slow path: full __apply-domain / __apply-range dispatch.
+          ; Needed when at least one spec is a sub-contract (higher-order).
+          (let* ((checked-args
+                  (cond
+                    ; Single-domain variadic: apply dom to every arg.
+                    ((= (length doms) 1)
+                     (let ((dom (car doms)))
+                       (let loop ((rest args) (acc '()))
+                         (if (null? rest)
+                             (reverse acc)
+                             (loop (cdr rest)
+                                   (cons (__apply-domain dom (car rest) name desc)
+                                         acc))))))
+                    ; Multi-domain fixed-arity.
+                    (else
+                     (if (not (= (length args) (length doms)))
+                         (raise (make-contract-violation
+                                  'caller name desc
+                                  (list 'arity-mismatch
+                                        'expected (length doms)
+                                        'got (length args)))))
+                     (let loop ((ds doms) (as args) (acc '()))
+                       (if (null? ds)
+                           (reverse acc)
+                           (loop (cdr ds)
+                                 (cdr as)
+                                 (cons (__apply-domain (car ds) (car as) name desc)
+                                       acc)))))))
+                 (result (apply proc checked-args)))
+            (__apply-range rng result name desc))))))
 
 ; (->* (dom1 dom2 ... domN) rest-pred rng)
 ;
