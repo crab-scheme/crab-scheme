@@ -60,9 +60,14 @@ fn expect_string(name: &str, args: &[Value], idx: usize) -> Result<String, FfiEr
             expected: "string".into(),
             got: other.type_name().to_string(),
         }),
+        // The upstream `ArityError` formatter at
+        // `cs-runtime/src/lib.rs` wraps `expected` as
+        // `"expected {} args, got {}"`, so the value supplied here
+        // must NOT itself contain "args" — otherwise the result
+        // doubles ("expected at least 2 args args, got 1").
         None => Err(FfiError::ArityError {
             name: name.into(),
-            expected: format!("at least {} args", idx + 1),
+            expected: format!("at least {}", idx + 1),
             got: args.len(),
         }),
     }
@@ -101,13 +106,23 @@ fn string_split(args: &[Value]) -> Result<Value, FfiError> {
 }
 
 fn string_join(args: &[Value]) -> Result<Value, FfiError> {
-    // First arg: a Scheme list of strings.
+    // R7RS-large / SRFI-13: (string-join list-of-strings [separator]).
+    // Separator defaults to "" when omitted.
     let mut cur = args.first().cloned().ok_or(FfiError::ArityError {
         name: "string-join".into(),
-        expected: "at least 1".into(),
+        expected: "1 or 2".into(),
         got: 0,
     })?;
-    let sep = expect_string("string-join", args, 1)?;
+    let sep = match args.get(1) {
+        None => String::new(),
+        Some(Value::String(s)) => s.borrow().clone(),
+        Some(other) => {
+            return Err(FfiError::TypeMismatch {
+                expected: "string".into(),
+                got: other.type_name().to_string(),
+            })
+        }
+    };
 
     let mut parts: Vec<String> = Vec::new();
     loop {
