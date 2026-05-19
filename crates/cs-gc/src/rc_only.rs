@@ -233,27 +233,37 @@ impl<T: 'static> Gc<T> {
     /// drop handles reclamation, not weak edges).
     ///
     /// Note: only Rc-backed `Gc<T>` can be downgraded.
-    /// Calling `downgrade` on a region-backed `Gc<T>` panics
-    /// in debug builds and returns a non-upgradable Weak in
-    /// release. Layer 5 (escape analysis) prevents this from
-    /// happening in compiled code; manual region users must
-    /// avoid the path themselves.
+    /// Calling `downgrade` on a region-backed `Gc<T>` **panics
+    /// in all builds** (parallel-runtime C5.1 hardening,
+    /// previously debug-only): region cells have no defined
+    /// weak-ref semantics — the region's bulk drop is the
+    /// reclamation event, not a refcount transition. Layer 5
+    /// escape analysis is supposed to make this unreachable in
+    /// compiled code; manual region users (and callers like
+    /// `cs_core::WeakValue::from_value`) must `is_region`-check
+    /// before calling.
+    ///
+    /// The previous "silently return a dead Weak" behavior
+    /// masked latent bugs — values would appear reclaimed when
+    /// they were actually still alive in the region. The
+    /// upgrade-to-panic mirrors how `Vec::index` reports OOB.
     pub fn downgrade(this: &Self) -> Weak<T> {
         match &this.0 {
             GcRepr::Rc(rc) => Weak {
                 inner: Rc::downgrade(rc),
             },
             #[cfg(feature = "regions")]
-            GcRepr::Region { .. } => {
-                debug_assert!(
-                    false,
-                    "Gc<T>::downgrade: region-backed Gc cannot be downgraded \
-                     (region drop handles reclamation; weak refs to region \
-                     allocations have no defined semantics)"
+            GcRepr::Region { region_id, .. } => {
+                panic!(
+                    "Gc<T>::downgrade: region-backed Gc (region_id={:?}) \
+                     cannot be downgraded — region drop handles reclamation; \
+                     weak refs to region allocations have no defined semantics. \
+                     If you reached this from a layer-2 cycle-break path, the \
+                     caller should `is_region`-check first \
+                     (see WeakValue::from_value for the pattern); for direct \
+                     region access use to_rc_deep + the resulting Rc-backed Gc.",
+                    region_id
                 );
-                Weak {
-                    inner: RawWeak::new(),
-                }
             }
         }
     }
@@ -609,6 +619,16 @@ impl<T: ?Sized> Weak<T> {
     pub fn upgrade(&self) -> Option<Gc<T>> {
         self.inner.upgrade().map(|rc| Gc(GcRepr::Rc(rc)))
     }
+
+    /// Strong count of the underlying allocation, without
+    /// upgrading. Unlike `upgrade().map(|g| Gc::strong_count(&g))`,
+    /// this does NOT transiently add a strong reference — so the
+    /// returned value is the true reachable strong count, which
+    /// the Bacon-Rajan trial-deletion walk needs for correct
+    /// external-vs-internal classification (parallel-runtime C4.3).
+    pub fn strong_count(&self) -> usize {
+        self.inner.strong_count()
+    }
 }
 
 #[cfg(test)]
@@ -678,6 +698,28 @@ mod tests {
     fn weak_default_never_upgrades() {
         let w: Weak<Leaf> = Weak::default();
         assert!(w.upgrade().is_none());
+    }
+
+    /// parallel-runtime C5.1: `Gc::downgrade` on a region-backed
+    /// Gc panics in all builds with a message that names the
+    /// region_id and points at the recommended fix.
+    #[cfg(feature = "regions")]
+    #[test]
+    #[should_panic(expected = "Gc<T>::downgrade: region-backed Gc")]
+    fn downgrade_region_handle_panics() {
+        let region = crate::Region::new();
+        let g: Gc<Leaf> = Gc::new_in(&region, Leaf { n: 7 });
+        // Should panic; the test catches it.
+        let _ = Gc::downgrade(&g);
+    }
+
+    #[cfg(feature = "regions")]
+    #[test]
+    #[should_panic(expected = "weak refs to region allocations")]
+    fn downgrade_region_panic_message_explains_why() {
+        let region = crate::Region::new();
+        let g: Gc<Leaf> = Gc::new_in(&region, Leaf { n: 11 });
+        let _ = Gc::downgrade(&g);
     }
 
     #[test]

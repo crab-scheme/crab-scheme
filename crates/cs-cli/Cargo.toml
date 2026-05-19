@@ -99,6 +99,10 @@ stdlib-math = ["cs-runtime/stdlib-math"]
 stdlib-tty = ["cs-runtime/stdlib-tty"]
 stdlib-signal = ["cs-runtime/stdlib-signal"]
 stdlib-meta = ["cs-runtime/stdlib-meta"]
+# cs-web tower-style framework + Scheme-actor-as-Layer primops.
+# Implies `actor` via the cs-runtime forwarding chain.
+web = ["actor", "cs-runtime/web"]
+web-modules = ["web", "cs-runtime/web-modules"]
 # WASM-safe subset — 21 modules that build clean for
 # `wasm32-wasip1`. Excludes: os/process (no Unix syscalls),
 # net/http/websocket (no real sockets in WASI), signal/tty

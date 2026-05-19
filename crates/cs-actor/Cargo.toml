@@ -14,8 +14,24 @@ description = "CrabScheme BEAM-style actor system: per-actor Runtime + tokio mps
 # design. Real Value transport lands when Scheme primops
 # integrate (post-B3) via copy-on-send wrappers.
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
+# `futures` provides FutureExt::catch_unwind for the async-task
+# panic capture in spawn_async (parallel-runtime C1.1). Smaller
+# pull than tokio-util; the cost is one extra dep.
+futures = "0.3"
 thiserror = { workspace = true }
 rustc-hash = { workspace = true }
+# Sharded concurrent HashMap for the actor registry (perf-arc
+# follow-up: parallel-runtime spec showed `Mutex<HashMap>`
+# contention dropped spawn rate ~10× at 1M live actors).
+dashmap = { workspace = true }
+# Mnesia-style table fabric used as the Durable mailbox
+# backing — uniform storage primitive across mailboxes +
+# ETS-style shared tables, queue depth inspectable via the
+# regular table-size primop.
+cs-table = { path = "../cs-table" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Needed by examples/perf_spawn_echo.rs (starvation bench bridges
+# the cs-vm reduction counter through cs-actor's yield hook).
+cs-vm = { path = "../cs-vm" }

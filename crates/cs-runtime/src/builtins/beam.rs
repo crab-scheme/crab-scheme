@@ -54,6 +54,11 @@ pub enum SendableValue {
     ByteVector(Vec<u8>),
     /// An actor PID is the canonical sendable handle.
     Pid(ActorPid),
+    // Channel handles ride as the tagged pair `(channel <id>)`
+    // through the existing Pair/Symbol/Fixnum surface — no
+    // dedicated variant needed. cs-runtime/builtins/channel.rs
+    // recognizes the shape on inspection and looks the ID up in
+    // the process-global ChannelRegistry.
 }
 
 /// Project a Scheme `Value` onto a `SendableValue`. Symbols
@@ -304,29 +309,83 @@ pub fn primop_spawn(name: &str, args: Vec<SendableValue>) -> Result<ActorPid, St
         .procs
         .lookup(name)
         .ok_or_else(|| format!("spawn: no procedure registered under {:?}", name))?;
-    let actor_ref = st.actors.spawn(move |actor| {
-        // Hold a raw pointer to `actor` for the duration of the
-        // body so the (self) / (raw-receive) Scheme builtins can
-        // reach it via ACTOR_CTX. Safety: the pointer lives only
-        // on this blocking thread, and the Guard clears it before
-        // the closure returns (or unwinds), so a thread-pool
-        // worker reused for a later actor never sees a stale ptr.
-        // The Guard also zeros REDUCTIONS so a reused worker
-        // doesn't inherit the prior actor's count.
-        let ptr: *mut cs_actor::Actor = actor;
-        ACTOR_CTX.with(|c| c.set(ptr));
-        REDUCTIONS.with(|c| c.set(0));
-        struct Guard;
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
-                REDUCTIONS.with(|c| c.set(0));
-            }
-        }
-        let _g = Guard;
-        entry(actor, args);
-    });
+    // parallel-runtime C1.2 + C3.2 (partial): use spawn_sync_
+    // body_on_task so the actor runs as a tokio task. The full
+    // C3.2 wiring of `REGION_STACK_TASK.scope(...)` is BLOCKED
+    // on making `cs_gc::Region` Send — its Rc-internals can't
+    // cross an `await` point on the multi_thread runtime. The
+    // task-local infrastructure exists (C3.1's dual-stack) and
+    // its tests pass synthetically, but the actor's body can't
+    // .scope() over an Rc-bearing stack without Region: Send.
+    //
+    // Today's behavior: an actor's `(with-region …)` still
+    // rides the TLS path. Works correctly as long as the body
+    // doesn't yield between `enter` and `Drop` (the common
+    // case — yield budget is 2000 ops, region scopes are
+    // typically much shorter). Migration WITH an open region
+    // scope is a documented limitation; filed as a separate
+    // gap. The non-actor REPL path is unaffected.
+    let actor_ref = st
+        .actors
+        .spawn_sync_body_on_task(move |actor| run_actor_body(actor, entry, args));
     Ok(actor_ref.pid())
+}
+
+/// Sync inner of the actor body: installs the yield hook,
+/// ACTOR_CTX, REDUCTIONS counter, runs `entry`, cleans up via
+/// RAII Guard. Factored out so the spawn_async closure shape
+/// stays readable.
+fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<SendableValue>) {
+    // Hold a raw pointer to `actor` for the body's duration so
+    // the (self) / (raw-receive) Scheme builtins can reach it
+    // via ACTOR_CTX. Safety: this pointer lives only on the
+    // worker thread inside block_in_place; the Guard clears it
+    // before the closure returns or unwinds.
+    let ptr: *mut cs_actor::Actor = actor;
+    ACTOR_CTX.with(|c| c.set(ptr));
+    REDUCTIONS.with(|c| c.set(0));
+    // parallel-runtime C2.2: install the reduction-yield hook
+    // for this worker thread. cs-actor::tokio_yield_hook
+    // routes through tokio::task::yield_now so CPU-bound actor
+    // bodies release their worker cooperatively. Non-actor
+    // contexts never reach here, so the hook stays None and
+    // the dispatch loop's per-op tick is a pure counter no-op.
+    let prev_hook = cs_vm::vm::install_yield_hook(Some(cs_actor::tokio_yield_hook));
+    // parallel-runtime C4.5: bridge the BR sweep's yield
+    // hook to cs-vm's reduction counter. The same
+    // per-iteration tick the bytecode dispatch loop uses
+    // (cs_vm::vm::vm_tick_reductions) now also fires once
+    // per candidate processed by cs_gc::cycle_collector,
+    // so a long sweep on this tokio worker yields when the
+    // reduction budget exhausts. Non-actor contexts (REPL,
+    // crabscheme run) leave the hook unset → sweep runs at
+    // full speed, same as pre-C4.5.
+    #[cfg(feature = "tracing-cycle-collector")]
+    let prev_sweep_hook =
+        cs_gc::cycle_collector::install_sweep_yield_hook(Some(cs_vm::vm::vm_tick_reductions));
+    struct Guard {
+        prev_hook: Option<cs_vm::vm::VmYieldHook>,
+        #[cfg(feature = "tracing-cycle-collector")]
+        prev_sweep_hook: Option<cs_gc::cycle_collector::SweepYieldHook>,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
+            REDUCTIONS.with(|c| c.set(0));
+            // Restore the previous hook (typically None) so a
+            // pooled worker thread reused by a non-actor caller
+            // doesn't see our hook.
+            cs_vm::vm::install_yield_hook(self.prev_hook);
+            #[cfg(feature = "tracing-cycle-collector")]
+            cs_gc::cycle_collector::install_sweep_yield_hook(self.prev_sweep_hook);
+        }
+    }
+    let _g = Guard {
+        prev_hook,
+        #[cfg(feature = "tracing-cycle-collector")]
+        prev_sweep_hook,
+    };
+    entry(actor, args);
 }
 
 // ActorContext: thread-local pointer to the currently-running
@@ -448,18 +507,44 @@ pub fn primop_raw_receive(
         None => return Err("raw-receive: mailbox closed".into()),
     };
 
+    // BEAM trap-exit enforcement: a non-Normal Exit delivered
+    // to a non-trapping actor terminates the receiver. Surface
+    // as a Rust Err — the actor body's catch_unwind turns that
+    // into the actor's exit reason, and any actors LINKED to
+    // this one get a chained Exit propagation through
+    // on_actor_termination.
+    if let Message::Exit { from, reason } = &msg {
+        if !actor.is_trapping_exits() && !matches!(reason, ExitReason::Normal) {
+            return Err(format!(
+                "linked actor {} exited abnormally: {}",
+                from,
+                exit_reason_str(reason)
+            ));
+        }
+    }
+
     Ok(Some(message_to_sendable(msg)))
 }
 
 fn message_to_sendable(msg: Message) -> SendableValue {
     match msg {
-        Message::User(payload) => payload_to_sendable(&payload).unwrap_or_else(|| {
-            // Payloads from Rust-side test fixtures that don't
-            // use SendableValue come through as opaque-tagged
-            // values. Wrap as a placeholder symbol so Scheme
-            // pattern-match still has something to compare.
+        Message::User(payload) => {
+            if let Some(sv) = payload_to_sendable(&payload) {
+                return sv;
+            }
+            // cs-web sends `Arc<WebMessage>` payloads from hyper's
+            // request task to a registered actor's mailbox. The
+            // bridge stashes the envelope and returns a tagged
+            // pair the Scheme handler pattern-matches.
+            #[cfg(feature = "web")]
+            if let Some(sv) = crate::builtins::web::try_intern_web_request(&payload) {
+                return sv;
+            }
+            // Genuinely-foreign payload (Rust test fixture, third-
+            // party plugin, ...). Wrap as a placeholder symbol so
+            // Scheme pattern-match still has something to compare.
             SendableValue::Symbol("*opaque-payload*".into())
-        }),
+        }
         Message::Exit { from, reason } => sendable_list(vec![
             SendableValue::Symbol("*exit*".into()),
             SendableValue::Pid(from),
@@ -776,6 +861,91 @@ pub fn b_beam_self(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
     Ok(from_sendable(&SendableValue::Pid(pid), syms))
 }
 
+// ---- Supervision primops (lib/beam/prelude.scm bridges these
+// to the user-facing `(link)`, `(monitor)`, `(unlink)`,
+// `(demonitor)`, `(trap-exit!)`) ----
+
+/// `(system-link! pid)` — bidirectional link from calling
+/// actor to `pid`. When either dies, the other gets a
+/// `Message::Exit` (delivered as `'(*exit* <from> <reason>)`
+/// to a trap-exit actor, fatal otherwise).
+///
+/// Returns `#t` on success, raises if not inside an actor or
+/// target is dead.
+pub fn b_beam_system_link(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("system-link!", args, 1)?;
+    let target = value_to_pid(&args[0], syms, "system-link!")?;
+    let res = with_current_actor(|a| a.link(target))
+        .ok_or_else(|| "system-link!: not inside an actor body".to_string())?;
+    res.map_err(|e| format!("system-link!: {e}"))?;
+    Ok(Value::Boolean(true))
+}
+
+/// `(system-unlink! pid)` — tear down a link. Silent no-op if
+/// no link existed. Returns `#t`.
+pub fn b_beam_system_unlink(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("system-unlink!", args, 1)?;
+    let target = value_to_pid(&args[0], syms, "system-unlink!")?;
+    with_current_actor(|a| a.unlink(target))
+        .ok_or_else(|| "system-unlink!: not inside an actor body".to_string())?;
+    Ok(Value::Boolean(true))
+}
+
+/// `(system-monitor! pid)` — one-way monitor. Returns the
+/// fresh ref_id as a fixnum the caller passes to
+/// `(system-demonitor! pid ref)` to cancel. When `pid` dies,
+/// the calling actor's mailbox receives
+/// `'(*down* <ref-id> <pid> <reason>)`.
+pub fn b_beam_system_monitor(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("system-monitor!", args, 1)?;
+    let target = value_to_pid(&args[0], syms, "system-monitor!")?;
+    let ref_id = with_current_actor(|a| a.monitor(target))
+        .ok_or_else(|| "system-monitor!: not inside an actor body".to_string())?
+        .map_err(|e| format!("system-monitor!: {e}"))?;
+    Ok(Value::Number(Number::Fixnum(ref_id as i64)))
+}
+
+/// `(system-demonitor! pid ref-id)` — cancel a prior monitor.
+/// Silent no-op if either argument no longer matches. Returns
+/// `#t`.
+pub fn b_beam_system_demonitor(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("system-demonitor!", args, 2)?;
+    let target = value_to_pid(&args[0], syms, "system-demonitor!")?;
+    let ref_id = match &args[1] {
+        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as u64,
+        other => {
+            return Err(format!(
+                "system-demonitor!: ref_id must be a non-negative integer, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    with_current_actor(|a| a.demonitor(target, ref_id))
+        .ok_or_else(|| "system-demonitor!: not inside an actor body".to_string())?;
+    Ok(Value::Boolean(true))
+}
+
+/// `(system-trap-exit! enabled?)` — set the calling actor's
+/// trap-exit flag. When enabled, incoming `Exit` messages
+/// arrive as `'(*exit* <from> <reason>)` user messages
+/// instead of terminating the actor. Returns the previous
+/// value (`#t` or `#f`).
+pub fn b_beam_system_trap_exit(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("system-trap-exit!", args, 1)?;
+    let enabled = match &args[0] {
+        Value::Boolean(b) => *b,
+        other => {
+            return Err(format!(
+                "system-trap-exit!: expected #t or #f, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    let prev = with_current_actor(|a| a.trap_exit(enabled))
+        .ok_or_else(|| "system-trap-exit!: not inside an actor body".to_string())?;
+    Ok(Value::Boolean(prev))
+}
+
 /// `(reductions)` — return the calling actor's current
 /// reduction count. Erlang-flavored: a proxy for "work done"
 /// the scheduler tracks per actor. B3's scheduler-swap half
@@ -859,7 +1029,15 @@ pub fn b_beam_raw_receive(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
 
     match outcome {
         Some(sv) => Ok(from_sendable(&sv, syms)),
-        None => Ok(Value::Boolean(false)),
+        // Timeout: return the symbol `'*timeout*` instead of
+        // `#f`. Pre-fix, raw-receive returned `#f` which
+        // collided with a legitimate `(send pid #f)` payload —
+        // the receiver couldn't distinguish "timed out" from
+        // "got #f". The `*timeout*` symbol matches the
+        // existing `*exit*` / `*down*` system-message tag
+        // convention; the `(timeout? msg)` predicate in
+        // lib/beam/prelude.scm normalizes the check.
+        None => Ok(Value::Symbol(syms.intern("*timeout*"))),
     }
 }
 
@@ -1018,6 +1196,14 @@ pub fn beam_syms_builtins() -> Vec<(
         ("reductions", b_beam_reductions),
         ("bump-reductions!", b_beam_bump_reductions),
         ("yield", b_beam_yield),
+        // supervision (bridges to lib/beam/prelude.scm's
+        // user-facing (link), (monitor), (unlink), (demonitor),
+        // (trap-exit!) wrappers)
+        ("system-link!", b_beam_system_link),
+        ("system-unlink!", b_beam_system_unlink),
+        ("system-monitor!", b_beam_system_monitor),
+        ("system-demonitor!", b_beam_system_demonitor),
+        ("system-trap-exit!", b_beam_system_trap_exit),
         // table
         ("make-table", b_beam_make_table),
         ("table-insert!", b_beam_table_insert),

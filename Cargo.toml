@@ -30,8 +30,14 @@ members = [
     # trees live in lib/beam/prelude.scm on top of the four cs-actor
     # primops — pure dispatch logic, no system calls.
     "crates/cs-actor",
+    "crates/cs-channel",
     "crates/cs-table",
     "crates/cs-hotreload",
+    # Tower-style async web framework. Builds on tokio/hyper, integrates
+    # with cs-actor (actor-backed handlers), cs-table (access log +
+    # sessions), and cs-runtime (Scheme route registration).
+    "crates/cs-web",
+    "crates/cs-web-mod-example",
     # R6RS++ (see docs/research/r6rs_extensions_spec.md).
     "crates/cs-pkg",
     # stdlib-modules (see .spec-workflow/specs/stdlib-modules/).
@@ -106,8 +112,15 @@ cs-ffi-macros = { path = "crates/cs-ffi-macros" }
 # `actor` feature so non-actor builds (WASM, AOT) skip the tokio +
 # dashmap pull.
 cs-actor = { path = "crates/cs-actor" }
+cs-channel = { path = "crates/cs-channel" }
 cs-table = { path = "crates/cs-table" }
 cs-hotreload = { path = "crates/cs-hotreload" }
+# cs-web declares `default-features = false` here so downstream
+# crates (like cs-web-mod-example, which compiles AS a cs-web
+# plugin and does NOT need libloading/cs-actor) can opt out.
+# Crates that need the full feature set re-enable them via the
+# `features = [...]` list at the dep site.
+cs-web = { path = "crates/cs-web", default-features = false, features = ["modules", "actor", "table"] }
 # R6RS++ package manager. Spec §10.
 cs-pkg = { path = "crates/cs-pkg" }
 cs-stdlib-path = { path = "crates/cs-stdlib-path" }
@@ -181,6 +194,37 @@ tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "macros", "ti
 # reads, fine-grained locks on writes. We may swap for a custom
 # lock-free B-tree later if the contention test demands it.
 dashmap = "6"
+# cs-web stack — hyper 1.x is the canonical async HTTP transport;
+# the `http` crate provides Request/Response types reused across
+# tower/hyper/axum; http-body-util gives us Full<Bytes> for fixed
+# bodies; hyper-util's TokioIo adapts tokio streams to hyper's IO
+# traits in 1.x (the split was 1.0's big breaking change).
+hyper = { version = "1.5", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1.1"
+http-body-util = "0.1"
+bytes = "1"
+# futures-util gives us BoxFuture for trait-object Future returns.
+# Smaller surface than the full `futures` crate.
+futures-util = "0.3"
+async-trait = "0.1"
+# TLS for ALPN-negotiated h1/h2 + h3. rustls 0.23 is the
+# baseline — h3-quinn requires it. `ring` is the default crypto
+# provider; we set it explicitly so feature-flag combinations
+# elsewhere in the workspace don't end up with no provider.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+# HTTP/3 stack. h3 + h3-quinn + quinn give us a QUIC transport
+# implementing draft-34+ / RFC 9114 compatible h3. Versions move
+# in lockstep — h3 0.0.x is still pre-1.0.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+# Dev-only: generate a self-signed cert in tests so we can
+# verify TLS round trips without provisioning real certs.
+rcgen = "0.13"
 
 [profile.release]
 lto = "thin"

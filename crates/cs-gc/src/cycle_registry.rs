@@ -38,9 +38,161 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::cycle::{BreakCycle, CycleVisit};
 use crate::{Gc, Weak};
+
+// ---- parallel-runtime spec C4.1: Bacon-Rajan colors ----
+
+/// Bacon-Rajan trial-deletion color.
+///
+/// In the canonical algorithm every "Slot" (heap cell) carries
+/// a color. CrabScheme's `Gc<T>` wraps `std::rc::Rc<T>` whose
+/// allocation layout we don't control, so the color lives in a
+/// **side table** alongside the existing cycle-candidate
+/// registry. The semantics are equivalent:
+///
+/// - Any address **not** in the registry is implicitly
+///   [`Color::Black`] (in-use, not a cycle candidate).
+/// - Registering an address as a cycle candidate sets it to
+///   [`Color::Purple`] (the BR convention for "decremented but
+///   still alive — needs trial deletion").
+/// - The C4.3 sweep phases transition Purple → Gray → White
+///   (or back to Black via `scan_black`).
+///
+/// This side-table approach keeps the allocation hot path
+/// **unchanged**: only cycle candidates pay the cost of a
+/// color slot, which is just one byte per registered entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Color {
+    /// In-use; not a cycle candidate. Default for everything.
+    Black = 0,
+    /// Being tested for garbage (mark_gray walked through).
+    Gray = 1,
+    /// Candidate for collection (scan_gray confirmed garbage).
+    White = 2,
+    /// Buffered as cycle root — decremented but still alive,
+    /// awaiting the next sweep's mark_gray phase.
+    Purple = 3,
+}
+
+impl Color {
+    /// Decode a `u8` (e.g., read from `AtomicU8`) back to a
+    /// `Color`. Any unknown value collapses to `Black` — the
+    /// safe default. Used by the C4.3 sweep phases when
+    /// loading colors from the registry's `AtomicU8` slots.
+    #[inline]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Color::Gray,
+            2 => Color::White,
+            3 => Color::Purple,
+            _ => Color::Black,
+        }
+    }
+}
+
+// ---- parallel-runtime spec C4.2: CycleChildren trait ----
+
+/// Enumerate the direct heap-cell children of `self` by
+/// allocation address, for the Bacon-Rajan trial-deletion
+/// walk (C4.3).
+///
+/// Distinct from [`crate::cycle::CycleVisit`] in two ways:
+///
+/// 1. **Scope.** `CycleVisit` is for cycle *detection* and
+///    walks via a stateful [`CycleVisitor`] that dedups
+///    visited nodes. `CycleChildren` is for the BR trial-
+///    deletion walk which needs raw child addresses so it
+///    can transition colors and adjust refcounts in the
+///    side-table registry.
+/// 2. **Granularity.** `CycleVisit` descends *through* leaf
+///    values (numbers, symbols) without visiting them.
+///    `CycleChildren` emits only addresses of heap-allocated
+///    container slots that could themselves be cycle
+///    candidates (Pair, Vector, Hashtable, Promise,
+///    Procedure). Leaves yield no addresses.
+///
+/// The visitor is `&mut dyn FnMut(usize)` rather than a
+/// concrete type so the BR walker can carry whatever state
+/// it wants (worklist, refcount delta map) on the heap-free
+/// closure path.
+pub trait CycleChildren {
+    /// Call `visit(addr)` for each direct heap-container
+    /// child of `self`. Implementations should walk every
+    /// reachable Pair/Vector/Hashtable/Promise/Procedure
+    /// slot and emit its `Gc::as_addr` once. Leaves
+    /// (numbers, symbols, strings) are skipped.
+    fn cycle_children(&self, visit: &mut dyn FnMut(usize));
+}
+
+// Blanket impls that let cs-core's `Vec<Value>` /
+// `RefCell<Vec<Value>>` storage participate without
+// running into orphan-rule violations: those wrappers are
+// not local to cs-core, but the trait lives here in cs-gc,
+// so we can hang the forwarding impls off the trait's home
+// crate.
+
+impl<T: CycleChildren + ?Sized> CycleChildren for std::cell::RefCell<T> {
+    fn cycle_children(&self, visit: &mut dyn FnMut(usize)) {
+        self.borrow().cycle_children(visit);
+    }
+}
+
+impl<T: CycleChildren> CycleChildren for Vec<T> {
+    fn cycle_children(&self, visit: &mut dyn FnMut(usize)) {
+        for item in self {
+            item.cycle_children(visit);
+        }
+    }
+}
+
+// Leaf blanket impls so primitives behind `Gc<T>` (e.g.
+// `Gc<i64>` in tests, or any future Gc-wrapped POD) can
+// register as candidates. No children to walk.
+macro_rules! cycle_children_leaf {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl CycleChildren for $t {
+                fn cycle_children(&self, _visit: &mut dyn FnMut(usize)) {}
+            }
+        )*
+    };
+}
+cycle_children_leaf!(
+    bool, char, u8, i8, u16, i16, u32, i32, u64, i64, usize, isize, f32, f64, String,
+);
+
+/// Per-candidate registry entry: the existing `AnyWeak` handle
+/// plus a Bacon-Rajan color (C4.1).
+///
+/// `color` is an `AtomicU8` so the C4.3 phases can mutate it
+/// during the walk without needing `&mut` access to the
+/// whole entry — the registry is wrapped in a `RefCell` so a
+/// `&Entry` from a borrowed map is the natural shape.
+struct Entry {
+    weak: Box<dyn AnyWeak>,
+    color: AtomicU8,
+}
+
+impl Entry {
+    fn new(weak: Box<dyn AnyWeak>, initial: Color) -> Self {
+        Entry {
+            weak,
+            color: AtomicU8::new(initial as u8),
+        }
+    }
+
+    fn color(&self) -> Color {
+        Color::from_u8(self.color.load(Ordering::Relaxed))
+    }
+
+    fn set_color(&self, c: Color) {
+        self.color.store(c as u8, Ordering::Relaxed);
+    }
+}
 
 /// Erased Weak handle so the registry can hold mixed `T`
 /// types in one map. Only the upgradability check and the
@@ -64,9 +216,19 @@ pub trait AnyWeak: Any {
     /// [`BreakCycle::try_break_cycle`] impl. Returns `true`
     /// if a slot was successfully demoted to `Weak`.
     fn upgrade_and_try_break(&self) -> bool;
+    /// parallel-runtime C4.2/C4.3: upgrade and walk
+    /// `CycleChildren`, emitting each child's heap address
+    /// to `visit`. Returns `true` if the walk happened.
+    fn upgrade_and_walk_children(&self, visit: &mut dyn FnMut(usize)) -> bool;
+    /// parallel-runtime C4.3: strong count of the underlying
+    /// allocation WITHOUT upgrading the Weak first.
+    /// `strong_count` above upgrades and is +1 biased; the BR
+    /// walk needs the true count for correct external-vs-
+    /// internal classification.
+    fn unbiased_strong_count(&self) -> usize;
 }
 
-impl<T: 'static + CycleVisit + BreakCycle> AnyWeak for Weak<T> {
+impl<T: 'static + CycleVisit + BreakCycle + CycleChildren> AnyWeak for Weak<T> {
     fn upgrade_addr(&self) -> Option<usize> {
         self.upgrade().map(|g| Gc::as_addr(&g))
     }
@@ -91,6 +253,18 @@ impl<T: 'static + CycleVisit + BreakCycle> AnyWeak for Weak<T> {
             None => false,
         }
     }
+    fn upgrade_and_walk_children(&self, visit: &mut dyn FnMut(usize)) -> bool {
+        match self.upgrade() {
+            Some(g) => {
+                g.cycle_children(visit);
+                true
+            }
+            None => false,
+        }
+    }
+    fn unbiased_strong_count(&self) -> usize {
+        Weak::strong_count(self)
+    }
 }
 
 thread_local! {
@@ -98,7 +272,11 @@ thread_local! {
     /// allocation address. Multi-thread Scheme isn't in
     /// scope; if it ever lands the registry stays per-thread
     /// and each runtime instance gets its own.
-    static REGISTRY: RefCell<HashMap<usize, Box<dyn AnyWeak>>> = RefCell::new(HashMap::new());
+    ///
+    /// C4.1: values are `Entry` (Weak + Bacon-Rajan color),
+    /// not a bare `Box<dyn AnyWeak>` — the color participates
+    /// in the C4.3 trial-deletion walk.
+    static REGISTRY: RefCell<HashMap<usize, Entry>> = RefCell::new(HashMap::new());
 
     /// Auto-sweep threshold. Default 10_000 means the next
     /// `Gc::new` after registry crosses this size triggers a
@@ -126,14 +304,117 @@ thread_local! {
 /// invoke `try_break_cycle` per-candidate. Existing call
 /// sites in cs-runtime pass `Weak<Pair>` etc., which already
 /// have impls in cs-core.
-pub fn register_cycle_candidate<T: 'static + CycleVisit + BreakCycle>(addr: usize, weak: Weak<T>) {
+pub fn register_cycle_candidate<T: 'static + CycleVisit + BreakCycle + CycleChildren>(
+    addr: usize,
+    weak: Weak<T>,
+) {
     REGISTRY.with(|r| {
         let mut r = r.borrow_mut();
-        r.entry(addr).or_insert_with(|| Box::new(weak));
+        // C4.1: newly-registered candidates start at PURPLE —
+        // "decremented but still alive, awaiting trial deletion."
+        r.entry(addr)
+            .or_insert_with(|| Entry::new(Box::new(weak), Color::Purple));
         if r.len() >= AUTO_TRIGGER_THRESHOLD.with(|t| t.get()) {
             SWEEP_PENDING.with(|f| f.set(true));
         }
     });
+}
+
+// ---- parallel-runtime spec C4.1: public color accessors ----
+
+/// Read the Bacon-Rajan color of a registered candidate.
+/// Returns [`Color::Black`] for any address not in the
+/// registry — that's the implicit default state.
+///
+/// Used by the C4.3 sweep phases (`mark_gray`, `scan_gray`,
+/// `collect_white`) to drive the trial-deletion walk.
+pub fn candidate_color(addr: usize) -> Color {
+    REGISTRY.with(|r| {
+        r.borrow()
+            .get(&addr)
+            .map(|e| e.color())
+            .unwrap_or(Color::Black)
+    })
+}
+
+/// Set the Bacon-Rajan color of a registered candidate.
+/// Silently no-ops if `addr` is not in the registry — the
+/// caller is presumed to have a live `Weak` for it via the
+/// sweep walk, and non-registered addresses don't have a
+/// color slot to mutate.
+///
+/// Used by the C4.3 sweep phases to transition colors.
+pub fn set_candidate_color(addr: usize, c: Color) {
+    REGISTRY.with(|r| {
+        if let Some(e) = r.borrow().get(&addr) {
+            e.set_color(c);
+        }
+    });
+}
+
+// ---- parallel-runtime spec C4.3: helpers for cycle_collector ----
+
+/// Strong-reference count of the registered candidate at
+/// `addr`, or `None` if the address isn't registered. Returns
+/// `Some(0)` for a registered-but-dead candidate (the Weak no
+/// longer points to a live allocation).
+///
+/// Critically, this reads strong_count via the `Weak`'s native
+/// API (no upgrade, no transient strong-ref bump). The earlier
+/// `AnyWeak::strong_count` upgrades first and was +1 biased,
+/// which broke Bacon-Rajan's external-vs-internal
+/// classification. The BR walker needs the unbiased count.
+pub fn candidate_strong_count(addr: usize) -> Option<usize> {
+    REGISTRY.with(|r| {
+        let r = r.borrow();
+        r.get(&addr).map(|e| e.weak.unbiased_strong_count())
+    })
+}
+
+/// Walk the `CycleChildren` of the candidate at `addr`,
+/// calling `visit` with each child's heap address. Silently
+/// no-ops if the address isn't registered or its Weak has
+/// died. Used by the BR mark/scan/collect phases.
+pub fn walk_candidate_children(addr: usize, visit: &mut dyn FnMut(usize)) {
+    // Collect outside the borrow so the visitor can re-enter
+    // the registry (necessary for recursive walks).
+    let mut children: Vec<usize> = Vec::new();
+    REGISTRY.with(|r| {
+        if let Some(e) = r.borrow().get(&addr) {
+            e.weak.upgrade_and_walk_children(&mut |c| children.push(c));
+        }
+    });
+    for c in children {
+        visit(c);
+    }
+}
+
+/// Attempt to break a cycle at `addr` via the type's
+/// `BreakCycle::try_break_cycle` impl. Returns `true` if a
+/// slot was demoted to Weak.
+pub fn try_break_candidate(addr: usize) -> bool {
+    REGISTRY.with(|r| {
+        r.borrow()
+            .get(&addr)
+            .map(|e| e.weak.upgrade_and_try_break())
+            .unwrap_or(false)
+    })
+}
+
+/// Snapshot all registered candidate addresses (cheap copy of
+/// the `usize` keys). Used by the BR sweep to build the
+/// initial worklist of Purple candidates without holding the
+/// registry borrow during the walk.
+pub fn candidate_addresses() -> Vec<usize> {
+    REGISTRY.with(|r| r.borrow().keys().copied().collect())
+}
+
+/// Bump `SWEEP_BROKEN_COUNT` by one. Called by the BR
+/// collector when `collect_white` successfully breaks a
+/// cycle, so the cs-runtime sweep stats include collector-
+/// initiated reclamation alongside the layer-2 detector.
+pub fn bump_sweep_broken_count() {
+    SWEEP_BROKEN_COUNT.with(|c| c.set(c.get().saturating_add(1)));
 }
 
 /// Remove `addr` from the registry. Called when the
@@ -216,31 +497,68 @@ pub fn take_sweep_pending() -> bool {
 /// - Periodic via the embedder API (`Runtime::start_background_sweep`,
 ///   iter 5).
 pub fn run_sweep() {
+    // Phase 1: drop dead entries (those whose Weak no longer
+    // upgrades). This both shrinks the worklist for the BR
+    // walk below and accounts for candidates the layer-2
+    // detector or a prior sweep already reclaimed.
     REGISTRY.with(|r| {
         let mut r = r.borrow_mut();
-        // Phase 1: drop dead entries.
-        r.retain(|_, weak| weak.upgrade_addr().is_some());
-        // Phase 2 (Gap C-3): attempt per-candidate break.
-        // Iterate addresses separately so we can mutate the
-        // map (drop succeeded entries) after each break. We
-        // collect addrs first to avoid borrow conflicts.
-        let addrs: Vec<usize> = r.keys().copied().collect();
-        for addr in addrs {
-            let broke = r
-                .get(&addr)
-                .map(|w| w.upgrade_and_try_break())
-                .unwrap_or(false);
-            if broke {
-                SWEEP_BROKEN_COUNT.with(|c| c.set(c.get().saturating_add(1)));
-                // Don't drop the entry immediately — the
-                // break demoted one slot to Weak, but the
-                // Pair may still be referenced from
-                // elsewhere. Let the next sweep prune via
-                // Phase 1.
-            }
-        }
+        r.retain(|_, entry| entry.weak.upgrade_addr().is_some());
+    });
+    // Phase 2 (parallel-runtime C4.4): the full Bacon-Rajan
+    // trial-deletion walk replaces the per-candidate break
+    // loop. Each pass classifies candidates Black (external
+    // anchor — keep) vs White (truly garbage — break). The
+    // `bump_sweep_broken_count` hook keeps
+    // `SWEEP_BROKEN_COUNT` accurate so cs-runtime's gc-stats
+    // attributes BR-broken cycles to the same counter the
+    // pre-C4.4 per-candidate path used.
+    let t_start = std::time::Instant::now();
+    let candidates_before = candidate_count();
+    let mut td = crate::cycle_collector::TrialDeletion::new();
+    let cycles_collected = td.run();
+    let elapsed = t_start.elapsed();
+    LAST_SWEEP_STATS.with(|s| {
+        s.set(SweepStats {
+            candidates_checked: candidates_before,
+            cycles_collected,
+            time_micros: elapsed.as_micros() as u64,
+        });
     });
     SWEEP_PENDING.with(|f| f.set(false));
+}
+
+/// parallel-runtime C4.4: per-sweep summary stats.
+/// Surfaced to cs-runtime via [`last_sweep_stats`] and woven
+/// into `(gc-stats)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepStats {
+    /// How many entries were in the registry at the start of
+    /// the BR walk (after the Phase-1 dead-entry prune).
+    pub candidates_checked: usize,
+    /// How many candidates `try_break_candidate` succeeded on
+    /// during this pass. Lower bound on actually-reclaimed
+    /// cycles (a Hashtable with default no-op BreakCycle
+    /// returns false even when classified White).
+    pub cycles_collected: usize,
+    /// Wall time the BR walk took, in microseconds.
+    pub time_micros: u64,
+}
+
+thread_local! {
+    /// Stats from the most recent `run_sweep`. Default zeroed.
+    /// Read by `last_sweep_stats`; written by `run_sweep`.
+    static LAST_SWEEP_STATS: std::cell::Cell<SweepStats> =
+        const { std::cell::Cell::new(SweepStats {
+            candidates_checked: 0,
+            cycles_collected: 0,
+            time_micros: 0,
+        }) };
+}
+
+/// Snapshot of the last sweep's summary stats.
+pub fn last_sweep_stats() -> SweepStats {
+    LAST_SWEEP_STATS.with(|s| s.get())
 }
 
 /// Cumulative count of candidates the layer-4 sweep has
@@ -275,6 +593,10 @@ mod tests {
         fn visit_children(&self, _ctx: &mut crate::cycle::CycleVisitor) {}
     }
     impl BreakCycle for Leaf {}
+    // C4.2: test-stub also satisfies CycleChildren.
+    impl CycleChildren for Leaf {
+        fn cycle_children(&self, _visit: &mut dyn FnMut(usize)) {}
+    }
 
     #[test]
     fn empty_registry() {
@@ -369,5 +691,78 @@ mod tests {
         let _ = take_sweep_pending();
         // Test passes either way; this just documents the
         // contract.
+    }
+
+    // ---- parallel-runtime C4.1 — Bacon-Rajan color tests ----
+
+    #[test]
+    fn unregistered_addr_reads_black() {
+        reset_for_tests();
+        // Any address not in the registry is implicitly BLACK.
+        assert_eq!(candidate_color(0xdeadbeef), Color::Black);
+        assert_eq!(candidate_color(0), Color::Black);
+    }
+
+    #[test]
+    fn register_starts_purple() {
+        reset_for_tests();
+        let g = Gc::new(Leaf { n: 1 });
+        let addr = Gc::as_addr(&g);
+        register_cycle_candidate(addr, Gc::downgrade(&g));
+        assert_eq!(
+            candidate_color(addr),
+            Color::Purple,
+            "newly-registered candidates start at Purple per BR"
+        );
+    }
+
+    #[test]
+    fn set_color_round_trips() {
+        reset_for_tests();
+        let g = Gc::new(Leaf { n: 7 });
+        let addr = Gc::as_addr(&g);
+        register_cycle_candidate(addr, Gc::downgrade(&g));
+        for c in [Color::Black, Color::Gray, Color::White, Color::Purple] {
+            set_candidate_color(addr, c);
+            assert_eq!(candidate_color(addr), c);
+        }
+    }
+
+    #[test]
+    fn set_color_on_unregistered_is_no_op() {
+        reset_for_tests();
+        // Should not panic; just silently does nothing.
+        set_candidate_color(0xfeedface, Color::Gray);
+        assert_eq!(candidate_color(0xfeedface), Color::Black);
+    }
+
+    #[test]
+    fn color_from_u8_unknown_falls_to_black() {
+        assert_eq!(Color::from_u8(0), Color::Black);
+        assert_eq!(Color::from_u8(1), Color::Gray);
+        assert_eq!(Color::from_u8(2), Color::White);
+        assert_eq!(Color::from_u8(3), Color::Purple);
+        // Unknown / future values clamp to Black — safe default.
+        assert_eq!(Color::from_u8(4), Color::Black);
+        assert_eq!(Color::from_u8(255), Color::Black);
+    }
+
+    #[test]
+    fn register_idempotent_preserves_color() {
+        // Re-registering an address must not reset its color
+        // back to Purple — the sweep may have transitioned it
+        // to Gray/White mid-walk, and clobbering would corrupt
+        // the trial-deletion algorithm.
+        reset_for_tests();
+        let g = Gc::new(Leaf { n: 11 });
+        let addr = Gc::as_addr(&g);
+        register_cycle_candidate(addr, Gc::downgrade(&g));
+        set_candidate_color(addr, Color::Gray);
+        register_cycle_candidate(addr, Gc::downgrade(&g));
+        assert_eq!(
+            candidate_color(addr),
+            Color::Gray,
+            "re-register on existing addr must preserve color"
+        );
     }
 }

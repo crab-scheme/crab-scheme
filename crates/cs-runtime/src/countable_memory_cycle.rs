@@ -74,25 +74,35 @@ pub fn reset_cycle_detection_count() {
 /// `vector-set!`, `hashtable-set!`) call this unconditionally
 /// from their cycle-break callbacks; the feature flag
 /// controls whether the candidate is also registered.
+/// `tracing-cycle-collector` ON: full bounds + registry call.
+#[cfg(feature = "tracing-cycle-collector")]
+pub fn record_cycle_with_candidate<T>(p: &cs_gc::Gc<T>)
+where
+    T: 'static
+        + cs_gc::cycle::CycleVisit
+        + cs_gc::cycle::BreakCycle
+        + cs_gc::cycle_registry::CycleChildren,
+{
+    record_cycle_detected();
+    #[cfg(feature = "regions")]
+    if cs_gc::Gc::is_region(p) {
+        // Region cycle — bulk-free handles it; no need to
+        // register for the layer-4 sweep.
+        return;
+    }
+    let addr = cs_gc::Gc::as_addr(p);
+    let weak = cs_gc::Gc::downgrade(p);
+    cs_gc::cycle_registry::register_cycle_candidate(addr, weak);
+}
+
+/// `tracing-cycle-collector` OFF: detection telemetry only,
+/// no CycleChildren requirement on `T` (the trait doesn't
+/// even exist in this build).
+#[cfg(not(feature = "tracing-cycle-collector"))]
 pub fn record_cycle_with_candidate<T>(p: &cs_gc::Gc<T>)
 where
     T: 'static + cs_gc::cycle::CycleVisit + cs_gc::cycle::BreakCycle,
 {
     record_cycle_detected();
-    #[cfg(feature = "tracing-cycle-collector")]
-    {
-        #[cfg(feature = "regions")]
-        if cs_gc::Gc::is_region(p) {
-            // Region cycle — bulk-free handles it; no
-            // need to register for the layer-4 sweep.
-            return;
-        }
-        let addr = cs_gc::Gc::as_addr(p);
-        let weak = cs_gc::Gc::downgrade(p);
-        cs_gc::cycle_registry::register_cycle_candidate(addr, weak);
-    }
-    // Suppress unused-var warning when the
-    // tracing-cycle-collector feature is off.
-    #[cfg(not(feature = "tracing-cycle-collector"))]
     let _ = p;
 }

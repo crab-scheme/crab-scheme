@@ -1,0 +1,19 @@
+[package]
+name = "cs-web-mod-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+description = "Example cs-web cdylib plugin. Exports the `cs_web_register` entry point that fills a RouteSink with two demonstration routes."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Plugins only need the public types (RouteSink, ok, service_fn,
+# ...); they do NOT need the module loader or any integrations,
+# so we strip default features to keep the cdylib slim and avoid
+# pulling libloading.
+cs-web = { workspace = true, default-features = false }

@@ -36,7 +36,9 @@
 //! assert_eq!(v.and_then(|p| p.downcast_ref::<i64>().copied()), Some(42));
 //! ```
 
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use thiserror::Error;
@@ -174,6 +176,16 @@ impl TableStorage {
             TableStorage::OrderedSet(rw) => rw.write().expect("ordered_set poisoned").clear(),
         }
     }
+
+    /// Atomic take-smallest for OrderedSet (returns `None`
+    /// for Set tables). Used by `Mailbox::try_pop` on the
+    /// cached storage handle.
+    fn pop_first_ordered(&self) -> Option<(Key, Payload)> {
+        match self {
+            TableStorage::OrderedSet(rw) => rw.write().expect("ordered_set poisoned").pop_first(),
+            TableStorage::Set(_) => None,
+        }
+    }
 }
 
 // ---------- Registry ----------
@@ -283,6 +295,194 @@ impl TableRegistry {
             .ok_or_else(|| TableError::NotFound {
                 name: name.to_string(),
             })
+    }
+}
+
+// ---------- Mailbox (cs-actor's per-actor inbox, backed by
+//            an OrderedSet table) ----------
+
+/// A FIFO mailbox built on top of cs-table's OrderedSet
+/// storage. Used by cs-actor as the per-actor inbox so all
+/// mailboxes live in the same table fabric as ETS-style
+/// shared state — uniform inspect / persistence story.
+///
+/// Mechanics:
+///
+/// - Each mailbox owns an `OrderedSet` table named like
+///   `__mailbox:<some-id>`. The Mailbox struct owns the
+///   name; the registry holds the storage.
+/// - Enqueue allocates a fresh monotonic sequence number
+///   (`next_seq: AtomicU64`) and inserts at
+///   `Key::Fixnum(seq) → payload`.
+/// - Dequeue uses `pop_first` which atomically takes the
+///   smallest-key entry. Ordering = insert order because
+///   sequences are monotonic.
+/// - Blocking dequeue waits on a per-mailbox `Condvar`
+///   signaled by every `push`. Wait_timeout returns
+///   `Ok(None)` on timeout.
+/// - Drop removes the underlying table from the registry,
+///   freeing all queued payloads.
+///
+/// **Why not just put a Notify inside the table directly?**
+/// The notify state is mailbox-specific (a generic ETS
+/// table doesn't want recv-blocking semantics). Wrapping
+/// here keeps the registry's general-purpose ops free of
+/// mailbox-specific bookkeeping.
+pub struct Mailbox {
+    table_name: String,
+    registry: TableRegistry,
+    /// Cached storage handle. Avoids re-doing the
+    /// `registry.lookup_storage(&name)` DashMap shard-lock
+    /// on every push / try_pop / len — those are hot-path
+    /// operations called per message.
+    storage: Arc<TableStorage>,
+    next_seq: AtomicU64,
+    /// Signaled by `push`. Wakers re-check `size()` after
+    /// the wake and re-loop if the queue is still empty
+    /// (handles spurious wakeups).
+    notify: Arc<(Mutex<()>, Condvar)>,
+    /// Tracks whether this mailbox is still attached to a
+    /// live receiver. Once `close` runs, future `push`
+    /// returns `Err(MailboxClosed)`. Multi-sender semantics
+    /// match tokio's UnboundedSender: any sender can push
+    /// until the receiver side closes.
+    open: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug, Error)]
+pub enum MailboxError {
+    #[error("mailbox {name:?} is closed (receiver dropped)")]
+    Closed { name: String },
+    #[error("underlying table error: {0}")]
+    Table(#[from] TableError),
+}
+
+impl Mailbox {
+    /// Create a new mailbox under `name` (must be unique
+    /// across the registry). Typically the actor PID names it —
+    /// e.g. `format!("__mailbox:{pid}")`.
+    pub fn create(registry: TableRegistry, name: String) -> Result<Self, MailboxError> {
+        registry.create(&name, TableType::OrderedSet)?;
+        let storage = registry
+            .lookup_storage(&name)
+            .expect("just-created table missing");
+        Ok(Self {
+            table_name: name,
+            registry,
+            storage,
+            next_seq: AtomicU64::new(0),
+            notify: Arc::new((Mutex::new(()), Condvar::new())),
+            open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        })
+    }
+
+    pub fn push(&self, payload: Payload) -> Result<(), MailboxError> {
+        if !self.open.load(Ordering::Acquire) {
+            return Err(MailboxError::Closed {
+                name: self.table_name.clone(),
+            });
+        }
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        self.storage.insert(Key::Fixnum(seq as i64), payload);
+        // Lock acquire publishes the insert to any receiver
+        // mid-`wait_timeout`.
+        let (lock, cv) = &*self.notify;
+        let _g = lock.lock().expect("notify lock poisoned");
+        cv.notify_one();
+        Ok(())
+    }
+
+    pub fn try_pop(&self) -> Result<Option<Payload>, MailboxError> {
+        Ok(self.storage.pop_first_ordered().map(|(_k, v)| v))
+    }
+
+    /// Blocking dequeue with optional timeout. `None` timeout
+    /// = block forever. Returns `Ok(None)` on timeout or
+    /// once the mailbox is closed AND empty.
+    pub fn pop_or_wait(&self, timeout: Option<Duration>) -> Result<Option<Payload>, MailboxError> {
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+        loop {
+            if let Some(payload) = self.try_pop()? {
+                return Ok(Some(payload));
+            }
+            if !self.open.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let (lock, cv) = &*self.notify;
+            let guard = lock.lock().expect("notify lock poisoned");
+            let remaining = match deadline {
+                None => Duration::from_millis(250),
+                Some(d) => match d.checked_duration_since(std::time::Instant::now()) {
+                    Some(rem) => rem.min(Duration::from_millis(250)),
+                    None => return Ok(None),
+                },
+            };
+            // Re-check inside the lock to avoid the
+            // missed-notify race. wait_timeout is a
+            // safety-net heartbeat.
+            if self.storage.len() > 0 {
+                drop(guard);
+                continue;
+            }
+            if !self.open.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let (_g, _t) = cv
+                .wait_timeout(guard, remaining)
+                .expect("notify wait poisoned");
+        }
+    }
+
+    /// Mark the mailbox closed. Future `push` returns
+    /// `Closed`. Any parked receivers will wake and return
+    /// `None`. Idempotent.
+    pub fn close(&self) {
+        self.open.store(false, Ordering::Release);
+        let (lock, cv) = &*self.notify;
+        let _g = lock.lock().expect("notify lock poisoned");
+        cv.notify_all();
+    }
+
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn is_closed(&self) -> bool {
+        !self.open.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for Mailbox {
+    fn drop(&mut self) {
+        // Mark closed first so any concurrent push errors
+        // out cleanly instead of inserting into a
+        // soon-dropped table.
+        self.close();
+        self.registry.drop_table(&self.table_name);
+    }
+}
+
+impl TableRegistry {
+    /// Atomic OrderedSet "take the smallest key" — used by
+    /// `Mailbox::try_pop`. Returns `Ok(None)` on empty,
+    /// `Ok(Some((key, value)))` on success. Errors only if
+    /// the table doesn't exist or is the wrong type.
+    pub fn pop_first_ordered(&self, name: &str) -> Result<Option<(Key, Payload)>, TableError> {
+        let storage = self.lookup_storage(name)?;
+        match &*storage {
+            TableStorage::OrderedSet(rw) => {
+                Ok(rw.write().expect("ordered_set poisoned").pop_first())
+            }
+            TableStorage::Set(_) => Err(TableError::WrongType {
+                name: name.to_string(),
+                actual: TableType::Set,
+                expected: TableType::OrderedSet,
+            }),
+        }
     }
 }
 
@@ -422,5 +622,108 @@ mod tests {
         assert_eq!(r.size("t").unwrap(), 0);
         // Table itself still exists.
         assert!(r.lookup("t", &Key::Fixnum(1)).is_ok());
+    }
+
+    // ---- Mailbox (cs-actor inbox backing) ----
+
+    #[test]
+    fn pop_first_ordered_takes_smallest() {
+        let r = TableRegistry::new();
+        r.create("os", TableType::OrderedSet).unwrap();
+        r.insert("os", Key::Fixnum(5), val(50)).unwrap();
+        r.insert("os", Key::Fixnum(1), val(10)).unwrap();
+        r.insert("os", Key::Fixnum(3), val(30)).unwrap();
+
+        let (k1, v1) = r.pop_first_ordered("os").unwrap().unwrap();
+        assert_eq!(k1, Key::Fixnum(1));
+        assert_eq!(as_i64(Some(v1)), Some(10));
+
+        let (k2, _) = r.pop_first_ordered("os").unwrap().unwrap();
+        assert_eq!(k2, Key::Fixnum(3));
+
+        let (k3, _) = r.pop_first_ordered("os").unwrap().unwrap();
+        assert_eq!(k3, Key::Fixnum(5));
+
+        assert!(r.pop_first_ordered("os").unwrap().is_none());
+    }
+
+    #[test]
+    fn pop_first_ordered_rejects_set_table() {
+        let r = TableRegistry::new();
+        r.create("s", TableType::Set).unwrap();
+        let err = r.pop_first_ordered("s").unwrap_err();
+        assert!(matches!(err, TableError::WrongType { .. }));
+    }
+
+    #[test]
+    fn mailbox_push_pop_fifo() {
+        let r = TableRegistry::new();
+        let mb = Mailbox::create(r, "__mb:fifo".to_string()).unwrap();
+        mb.push(val(1)).unwrap();
+        mb.push(val(2)).unwrap();
+        mb.push(val(3)).unwrap();
+        assert_eq!(mb.len(), 3);
+        let a = mb.try_pop().unwrap();
+        let b = mb.try_pop().unwrap();
+        let c = mb.try_pop().unwrap();
+        assert_eq!(as_i64(a), Some(1));
+        assert_eq!(as_i64(b), Some(2));
+        assert_eq!(as_i64(c), Some(3));
+        assert!(mb.is_empty());
+        assert!(mb.try_pop().unwrap().is_none());
+    }
+
+    #[test]
+    fn mailbox_pop_or_wait_blocks_then_receives() {
+        let r = TableRegistry::new();
+        let mb = Arc::new(Mailbox::create(r, "__mb:wait".to_string()).unwrap());
+        let mb_clone = Arc::clone(&mb);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            mb_clone.push(val(42)).unwrap();
+        });
+        let v = mb.pop_or_wait(Some(Duration::from_secs(2))).unwrap();
+        t.join().unwrap();
+        assert_eq!(as_i64(v), Some(42));
+    }
+
+    #[test]
+    fn mailbox_pop_or_wait_returns_none_on_timeout() {
+        let r = TableRegistry::new();
+        let mb = Mailbox::create(r, "__mb:timeout".to_string()).unwrap();
+        let v = mb.pop_or_wait(Some(Duration::from_millis(30))).unwrap();
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn mailbox_close_then_pop_returns_none() {
+        let r = TableRegistry::new();
+        let mb = Mailbox::create(r, "__mb:close".to_string()).unwrap();
+        mb.push(val(7)).unwrap();
+        mb.close();
+        // Drain ok.
+        let v = mb.pop_or_wait(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(as_i64(v), Some(7));
+        // Now empty + closed → None immediately.
+        let v = mb.pop_or_wait(None).unwrap();
+        assert!(v.is_none());
+        // Subsequent push errors.
+        let err = mb.push(val(1)).unwrap_err();
+        assert!(matches!(err, MailboxError::Closed { .. }));
+    }
+
+    #[test]
+    fn mailbox_drop_removes_table() {
+        let r = TableRegistry::new();
+        {
+            let mb = Mailbox::create(r.clone(), "__mb:dropper".to_string()).unwrap();
+            mb.push(val(1)).unwrap();
+            assert_eq!(r.size("__mb:dropper").unwrap(), 1);
+        }
+        // After mb's Drop runs, the table is gone.
+        assert!(matches!(
+            r.size("__mb:dropper"),
+            Err(TableError::NotFound { .. })
+        ));
     }
 }
