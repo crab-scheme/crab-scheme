@@ -1014,7 +1014,15 @@ pub fn b_beam_raw_receive(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
 
     match outcome {
         Some(sv) => Ok(from_sendable(&sv, syms)),
-        None => Ok(Value::Boolean(false)),
+        // Timeout: return the symbol `'*timeout*` instead of
+        // `#f`. Pre-fix, raw-receive returned `#f` which
+        // collided with a legitimate `(send pid #f)` payload —
+        // the receiver couldn't distinguish "timed out" from
+        // "got #f". The `*timeout*` symbol matches the
+        // existing `*exit*` / `*down*` system-message tag
+        // convention; the `(timeout? msg)` predicate in
+        // lib/beam/prelude.scm normalizes the check.
+        None => Ok(Value::Symbol(syms.intern("*timeout*"))),
     }
 }
 

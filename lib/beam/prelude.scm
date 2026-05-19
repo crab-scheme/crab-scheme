@@ -6,7 +6,7 @@
 ;
 ;   (spawn thunk)            ; -> ActorPid
 ;   (send pid value)         ; cast, fire-and-forget
-;   (raw-receive [timeout])  ; -> Message (User|Exit|Down) or #f
+;   (raw-receive [timeout])  ; -> Message (User|Exit|Down) or '*timeout*
 ;   (self)                   ; -> ActorPid of calling actor
 ;
 ; Plus cs-table primops:
@@ -72,9 +72,18 @@
                                             (jiffies-per-second))))
                 (msg (raw-receive remaining-ms)))
            (cond
-             ((not msg) timeout-action)
+             ; Raw-receive uses the sentinel symbol `'*timeout*`
+             ; (introduced post-#6) rather than `#f` so a legit
+             ; `(send pid #f)` payload doesn't collide with the
+             ; timeout case. Old `(not msg)` check would have
+             ; misclassified `#f` payload as timeout.
+             ((eq? msg '*timeout*) timeout-action)
              ((match-and-bind msg pat) body ...) ...
              (else (loop)))))))))
+
+; Predicate for the receive sentinel. Use in user code when
+; not going through the `(receive … (after …))` macro.
+(define (timeout? msg) (eq? msg '*timeout*))
 
 ; Stub matcher: a real impl is a pattern compiler. For the
 ; prelude draft we expand to a simple equal? check on a quoted
