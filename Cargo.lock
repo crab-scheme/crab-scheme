@@ -1038,6 +1038,7 @@ dependencies = [
  "cs-stdlib-websocket",
  "cs-table",
  "cs-vm",
+ "cs-web",
  "libloading",
  "num-traits",
  "thiserror 1.0.69",

@@ -26,7 +26,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
@@ -49,6 +48,10 @@ pub mod table;
 
 // Re-export http types so users don't need an explicit `http` dep.
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
+
+// Re-export `bytes::Bytes` so handler-side code can build bodies
+// without a separate `bytes` dep.
+pub use bytes::Bytes;
 
 pub use handler::{handler_fn, Handler, HandlerFn};
 pub use layers::{CatchPanic, Layer, RequestId, Stack, Timeout, Trace};

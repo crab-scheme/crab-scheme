@@ -6,6 +6,9 @@ pub mod beam;
 #[cfg(feature = "sandbox")]
 pub mod sandbox;
 
+#[cfg(feature = "web")]
+pub mod web;
+
 use cs_core::{
     eq, Hashtable, HtEqKind, Number, Pair, Port, Promise, PromiseState, SymbolTable, Value,
     WriteMode,
@@ -1127,6 +1130,15 @@ pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
     #[cfg(feature = "actor")]
     {
         for (name, f) in beam::beam_syms_builtins() {
+            let sym = syms.intern(name);
+            env.define(sym, crate::proc::make_builtin_syms(name, f));
+        }
+    }
+    // cs-web Tower-style web framework primops. Gated on `web`
+    // (implies `actor` for shared cs-actor / cs-table fabric).
+    #[cfg(feature = "web")]
+    {
+        for (name, f) in web::web_syms_builtins() {
             let sym = syms.intern(name);
             env.define(sym, crate::proc::make_builtin_syms(name, f));
         }
