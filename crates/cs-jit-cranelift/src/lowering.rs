@@ -4820,6 +4820,17 @@ impl Lowerer {
         id
     }
 
+    /// Replace `func_ctx` with a fresh context after any compilation
+    /// function returns an error without calling `builder.finalize()`.
+    /// Without this reset, stale block-status entries from the aborted
+    /// function collide with fresh block IDs in the next compilation
+    /// (Cranelift block IDs restart from 0 per `ClifFunction`), causing
+    /// `ensure_inserted_block` to skip layout insertion and producing an
+    /// empty `func.layout` that panics inside `remove_constant_phis`.
+    fn reset_func_ctx(&mut self) {
+        self.func_ctx = FunctionBuilderContext::new();
+    }
+
     /// Compile a pure-fixnum RIR `Function` into a callable
     /// `extern "C" fn(i64, ..., i64) -> i64`. Returns the function
     /// pointer; the lowerer retains ownership of the underlying
@@ -4893,9 +4904,17 @@ impl Lowerer {
         // Compile inner first — the actual body. inner's CallSelf
         // points back at inner via its own FuncRef so tail recursion
         // self-loops on the same Tail-conv function.
-        self.compile_inner_body(rir, inner_id, inner_seq, &inner_sig)?;
+        if let Err(e) = self.compile_inner_body(rir, inner_id, inner_seq, &inner_sig) {
+            self.reset_func_ctx();
+            return Err(e);
+        }
         // Compile outer — a plain SystemV trampoline that calls inner.
-        self.compile_outer_trampoline(rir, outer_id, outer_seq, &outer_sig, inner_id)?;
+        if let Err(e) =
+            self.compile_outer_trampoline(rir, outer_id, outer_seq, &outer_sig, inner_id)
+        {
+            self.reset_func_ctx();
+            return Err(e);
+        }
         self.module
             .finalize_definitions()
             .map_err(|e| JitError::Codegen(format!("finalize_definitions: {e}")))?;
@@ -4963,7 +4982,6 @@ impl Lowerer {
                     | Inst::FlonumTrunc(_, _)
                     | Inst::FlonumRound(_, _)
                     | Inst::Cons(_, _, _, _, _)
-                    | Inst::ConsRegion(_, _, _, _, _)
                     | Inst::Car(_, _)
                     | Inst::Cdr(_, _)
                     | Inst::PairP(_, _)
@@ -5084,11 +5102,19 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function {}: {e}", inner_module_name))
             })?;
 
-        self.compile_inner_body_uniform_nb(rir, inner_id, inner_seq, &inner_sig)?;
+        if let Err(e) = self.compile_inner_body_uniform_nb(rir, inner_id, inner_seq, &inner_sig) {
+            self.reset_func_ctx();
+            return Err(e);
+        }
         // Re-use the existing trampoline: it's tier-agnostic — just
         // forwards i64 args to inner. Same shape works for NB-typed
         // bodies.
-        self.compile_outer_trampoline(rir, outer_id, outer_seq, &outer_sig, inner_id)?;
+        if let Err(e) =
+            self.compile_outer_trampoline(rir, outer_id, outer_seq, &outer_sig, inner_id)
+        {
+            self.reset_func_ctx();
+            return Err(e);
+        }
         self.module
             .finalize_definitions()
             .map_err(|e| JitError::Codegen(format!("finalize_definitions: {e}")))?;
