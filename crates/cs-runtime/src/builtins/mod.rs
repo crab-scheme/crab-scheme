@@ -1078,6 +1078,11 @@ pub fn syms_builtins() -> Vec<SymsEntry> {
         // type-tag symbols.
         ("jit-status", b_jit_status),
         ("gc-stats", b_gc_stats),
+        // parallel-runtime C5.2 — introspect a value's
+        // allocator tier ('rc | 'region | 'traced). Lives
+        // here (SymsEntry) because the return is an interned
+        // symbol.
+        ("gc-allocator", b_gc_allocator),
         // ADR 0014 — optimizer-pass installation (simple primops
         // that only need the symbol table for name lookup; the
         // higher-order `with-active-optimizer-passes` lives in
@@ -13195,6 +13200,68 @@ fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
             pair("sweep-time-us", fixnum_or_bigint(sweep_time_us)),
             pair("sweep-broken-total", fixnum_or_bigint(sweep_total)),
         ]))
+    }
+}
+
+/// `(gc-allocator v)` — parallel-runtime C5.2. Returns a
+/// symbol identifying the allocator tier of `v`'s underlying
+/// heap object:
+///
+/// - `'rc` — Rc-backed (the default for `cons`, `vector`, …).
+/// - `'region` — region-backed (allocated via
+///   `cons-in-region` / `make-vector-in-region` / etc.).
+/// - `'traced` — the future tracing-revival path; currently
+///   nothing returns this, kept stable for forward compat.
+/// - For leaf values (numbers, symbols, booleans) returns
+///   `'leaf` so callers can detect "no allocation here".
+///
+/// Used by the C5.3 contract boundary to refuse region values
+/// at procedure return / argument positions where they could
+/// outlive their region.
+fn b_gc_allocator(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("gc-allocator", "1", args.len()));
+    }
+    let tier = allocator_tier(&args[0]);
+    Ok(Value::Symbol(syms.intern(tier)))
+}
+
+/// Classify a Value by its allocator tier. Pure helper —
+/// safe to call from anywhere, no allocation, no side
+/// effects. Used by [`b_gc_allocator`] and (post-C5.3) the
+/// contract boundary.
+pub fn allocator_tier(v: &Value) -> &'static str {
+    // Per-variant check via the heap accessors. Each heap
+    // variant is either Rc-backed (default) or region-backed
+    // (set via `*_in_region` builtins + cs-gc's Region/Slot).
+    macro_rules! heap_arm {
+        ($g:expr) => {{
+            #[cfg(feature = "regions")]
+            {
+                if cs_gc::Gc::is_region($g) {
+                    return "region";
+                }
+            }
+            return "rc";
+        }};
+    }
+    match v {
+        Value::String(g) => heap_arm!(g),
+        Value::Pair(g) => heap_arm!(g),
+        Value::Vector(g) => heap_arm!(g),
+        Value::ByteVector(g) => heap_arm!(g),
+        Value::Hashtable(g) => heap_arm!(g),
+        Value::Port(g) => heap_arm!(g),
+        Value::Promise(g) => heap_arm!(g),
+        Value::Procedure(_) => "rc",
+        Value::Null
+        | Value::Unspecified
+        | Value::Eof
+        | Value::Boolean(_)
+        | Value::Character(_)
+        | Value::Symbol(_)
+        | Value::Identifier { .. }
+        | Value::Number(_) => "leaf",
     }
 }
 
