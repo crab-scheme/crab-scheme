@@ -79,6 +79,68 @@
            (web-respond! h 400
                          (string-append "invalid " (symbol->string 'name)))))]))
 
+;;; --- Short aliases ------------------------------------------------
+;;;
+;;; The canonical primops are spelled `web-request-*` / `web-respond!`
+;;; for discoverability — embedders grep the codebase and find them.
+;;; Inside a Scheme handler the long names get tedious, so these
+;;; aliases are exported alongside. Pick whichever you prefer; both
+;;; resolve to the same procedure at the same call cost.
+
+(define req-method  web-request-method)
+(define req-path    web-request-path)
+(define req-body    web-request-body)
+(define req-param   web-request-param)
+(define req-params  web-request-params)
+(define req-header  web-request-header)
+(define req-headers web-request-headers)
+(define respond!    web-respond!)
+
+;;; `with-request` — drop the explicit handle inside a lexical
+;;; scope by binding local macros that capture it. Zero runtime
+;;; cost (each `(param "k")` expands to a direct
+;;; `(web-request-param h "k")` call at compile time) and the
+;;; short names disappear cleanly outside the form, so nothing
+;;; pollutes the surrounding namespace.
+;;;
+;;; Example:
+;;;
+;;;   (receive
+;;;     [('*web-request* h)
+;;;      (with-request h
+;;;        (let ((id  (param  "id"))
+;;;              (tok (header "x-token")))
+;;;          (if (integer-string? id)
+;;;              (respond! 200 (string-append "ok " id))
+;;;              (respond! 400 "bad id"))))])
+;;;
+;;; The local names bound inside `body ...`:
+;;;
+;;;   (method)      => (web-request-method  h)
+;;;   (path)        => (web-request-path    h)
+;;;   (body)        => (web-request-body    h)
+;;;   (param "k")   => (web-request-param   h "k")
+;;;   (params)      => (web-request-params  h)
+;;;   (header "k")  => (web-request-header  h "k")
+;;;   (headers)     => (web-request-headers h)
+;;;   (respond! s b) => (web-respond!       h s b)
+;;;
+;;; `body` is both a top-level alias and a local nullary form — the
+;;; local one wins inside the macro's scope by hygienic shadowing.
+
+(define-syntax with-request
+  (syntax-rules ()
+    [(_ h body* ...)
+     (let-syntax ([method   (syntax-rules () [(_)    (web-request-method  h)])]
+                  [path     (syntax-rules () [(_)    (web-request-path    h)])]
+                  [body     (syntax-rules () [(_)    (web-request-body    h)])]
+                  [param    (syntax-rules () [(_ k)  (web-request-param   h k)])]
+                  [params   (syntax-rules () [(_)    (web-request-params  h)])]
+                  [header   (syntax-rules () [(_ k)  (web-request-header  h k)])]
+                  [headers  (syntax-rules () [(_)    (web-request-headers h)])]
+                  [respond! (syntax-rules () [(_ s b*) (web-respond!      h s b*)])])
+       body* ...)]))
+
 ;;; `with-validated-request` — sugar over `check-request` for the
 ;;; common case where every clause has the same shape: a
 ;;; required field extracted by one of the inspector primops,

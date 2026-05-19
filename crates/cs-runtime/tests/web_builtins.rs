@@ -424,6 +424,161 @@ fn scheme_contracts_validate_request_fields() {
     assert_eq!(resp4.status(), 200);
 }
 
+/// Both ergonomic forms from `lib/beam/web-contracts.scm`:
+///
+/// - the `req-*` / `respond!` short aliases (option 1)
+/// - the `with-request` macro that locally binds short accessors
+///   capturing the handle (option 3)
+///
+/// Each test crafts a WebMessage, hands the handle to Scheme,
+/// runs the ergonomic form, and asserts the reply.
+#[test]
+fn scheme_short_aliases_and_with_request_macro() {
+    use cs_actor::Payload;
+    use cs_runtime::builtins::beam::SendableValue;
+    use cs_runtime::builtins::web::try_intern_web_request;
+    use cs_web::actor::WebMessage;
+    use std::sync::Arc;
+
+    fn make_request(
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (i64, tokio::sync::oneshot::Receiver<cs_web::Response>) {
+        let mut b = cs_web::http::Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let req: cs_web::Request = b
+            .body(cs_web::Bytes::copy_from_slice(body.as_bytes()))
+            .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<cs_web::Response>();
+        let envelope: Arc<WebMessage> = Arc::new(WebMessage::new(req, tx));
+        let sv = try_intern_web_request(&(envelope as Payload)).expect("bridge");
+        let handle = match sv {
+            SendableValue::Pair(_, tail) => match *tail {
+                SendableValue::Pair(boxed_id, _) => match *boxed_id {
+                    SendableValue::Fixnum(n) => n,
+                    _ => panic!("handle not fixnum"),
+                },
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+        (handle, rx)
+    }
+
+    let mut rt = Runtime::new();
+
+    // Inline the two pieces from lib/beam/web-contracts.scm we need —
+    // the short aliases and the with-request macro. The library
+    // itself is loaded by users via `(import (lib beam web-contracts))`;
+    // the test inlines so it doesn't depend on the package loader.
+    rt.eval_str(
+        "<setup>",
+        r#"
+        (define req-method  web-request-method)
+        (define req-param   web-request-param)
+        (define req-header  web-request-header)
+        (define respond!    web-respond!)
+        (define-syntax with-request
+          (syntax-rules ()
+            [(_ h body* ...)
+             (let-syntax ([method   (syntax-rules () [(_)    (web-request-method  h)])]
+                          [path     (syntax-rules () [(_)    (web-request-path    h)])]
+                          [body     (syntax-rules () [(_)    (web-request-body    h)])]
+                          [param    (syntax-rules () [(_ k)  (web-request-param   h k)])]
+                          [header   (syntax-rules () [(_ k)  (web-request-header  h k)])]
+                          [respond! (syntax-rules () [(_ s b2) (web-respond!      h s b2)])])
+               body* ...)]))
+        (define (integer-string? v)
+          (and (string? v)
+               (let ((n (string->number v)))
+                 (and n (integer? n)))))
+        "#,
+    )
+    .expect("setup");
+
+    // --- Short aliases: handle still passed explicitly, but the
+    //     procedure names are 4× shorter.
+    let (h1, rx1) = make_request("GET", "/items?id=42", &[("x-token", "tok")], "");
+    rt.eval_str("<t>", &format!("(define h {})", h1)).unwrap();
+    rt.eval_str(
+        "<t>",
+        r#"
+        (let ((id  (req-param  h "id"))
+              (tok (req-header h "x-token"))
+              (m   (req-method h)))
+          (respond! h 200
+            (string-append (symbol->string m) " id=" id " tok=" tok)))
+        "#,
+    )
+    .expect("aliases");
+    let r1 = rx1.blocking_recv().expect("reply");
+    assert_eq!(r1.status(), 200);
+    assert_eq!(r1.body(), &cs_web::Bytes::from_static(b"GET id=42 tok=tok"));
+
+    // --- with-request: handle disappears inside the form.
+    let (h2, rx2) = make_request("POST", "/users?id=7", &[("x-auth", "secret")], "{}");
+    rt.eval_str("<t>", &format!("(define h2 {})", h2)).unwrap();
+    rt.eval_str(
+        "<t>",
+        r#"
+        (with-request h2
+          (let ((id  (param  "id"))
+                (a   (header "x-auth")))
+            (if (integer-string? id)
+                (respond! 200 (string-append "ok " id " auth=" a))
+                (respond! 400 "bad id"))))
+        "#,
+    )
+    .expect("with-request happy path");
+    let r2 = rx2.blocking_recv().expect("reply");
+    assert_eq!(r2.status(), 200);
+    assert_eq!(r2.body(), &cs_web::Bytes::from_static(b"ok 7 auth=secret"));
+
+    // --- with-request: failing contract path through the macro.
+    let (h3, rx3) = make_request("GET", "/users?id=abc", &[], "");
+    rt.eval_str("<t>", &format!("(define h3 {})", h3)).unwrap();
+    rt.eval_str(
+        "<t>",
+        r#"
+        (with-request h3
+          (let ((id (param "id")))
+            (if (integer-string? id)
+                (respond! 200 "ok")
+                (respond! 400 "bad id"))))
+        "#,
+    )
+    .expect("with-request reject path");
+    let r3 = rx3.blocking_recv().expect("reply");
+    assert_eq!(r3.status(), 400);
+    assert_eq!(r3.body(), &cs_web::Bytes::from_static(b"bad id"));
+
+    // --- with-request: `(method)` / `(path)` / `(body)` shadow any
+    //     outer bindings. Verify all three nullary forms work.
+    let (h4, rx4) = make_request("PUT", "/x", &[], "payload-here");
+    rt.eval_str("<t>", &format!("(define h4 {})", h4)).unwrap();
+    rt.eval_str(
+        "<t>",
+        r#"
+        (with-request h4
+          (respond! 200
+            (string-append (symbol->string (method))
+                           " " (path)
+                           " body=" (body))))
+        "#,
+    )
+    .expect("with-request all-nullary");
+    let r4 = rx4.blocking_recv().expect("reply");
+    assert_eq!(r4.status(), 200);
+    assert_eq!(
+        r4.body(),
+        &cs_web::Bytes::from_static(b"PUT /x body=payload-here")
+    );
+}
+
 #[test]
 fn scheme_route_after_start_is_error() {
     let mut rt = Runtime::new();
