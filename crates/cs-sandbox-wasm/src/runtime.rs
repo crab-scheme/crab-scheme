@@ -190,9 +190,14 @@ impl SandboxRuntime {
             .stdin(stdin)
             .stdout(stdout.clone())
             .stderr(stderr.clone())
-            .arg("crabscheme")
-            .arg("--eval")
-            .arg(&wrapper);
+            .arg("crabscheme");
+        // Pass each approved import spec as a --sandbox-imports flag so the
+        // guest runtime enforces the host's policy on nested (environment ...)
+        // calls (ADR 0015 issue #15).
+        for spec in &self.imports {
+            wasi_builder.arg("--sandbox-imports").arg(spec);
+        }
+        wasi_builder.arg("--eval").arg(&wrapper);
         for path in &self.allow_paths {
             // Map each allow_path to itself in the guest's
             // filesystem namespace. Full DirPerms + FilePerms
