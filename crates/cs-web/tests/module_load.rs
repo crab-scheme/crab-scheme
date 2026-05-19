@@ -156,10 +156,11 @@ async fn missing_module_yields_error() {
 
 #[tokio::test]
 async fn dropping_module_still_lets_us_observe_dispatch_via_held_handle() {
-    // Regression guard: a module dropped before its routes are
-    // called would leave dangling fn pointers. We exercise the
-    // ordering by holding the Module for the lifetime of the
-    // service.
+    // Regression guard for the use-after-dlclose crash: the loader
+    // keeps plugin libraries mapped for the process lifetime, so
+    // dropping the `Module` handle must NOT unmap the code its
+    // routes call into. We drop the module while the service is
+    // still live and confirm dispatch is unaffected.
     let path = build_and_locate_fixture();
     let module = unsafe { Module::load(&path) }.expect("load plugin");
     let mut sink = RouteSink::new();

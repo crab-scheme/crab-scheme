@@ -32,11 +32,20 @@
 //!
 //! ## Lifetime
 //!
-//! The loaded library is held alive for as long as the [`Module`]
-//! handle exists. Dropping the handle `dlclose`s the library —
-//! any Service still pointing into it (the routes drained into a
-//! Router) will dangle. Hold the [`Module`] for at least as long
-//! as the routes it produced live.
+//! A plugin's code and drop-glue live in the loaded library's text
+//! segment, and the routes it produces (`ArcService`s drained into
+//! a Router, frequently held by detached server tasks) reference
+//! that code indefinitely. `dlclose`ing the library while any such
+//! route is still alive unmaps that code — undefined behavior, and
+//! a hard crash on Linux where `dlclose` actually unmaps. macOS
+//! keeps dylibs resident even after `dlclose`, which makes the bug
+//! easy to miss there.
+//!
+//! Pinning the library to the lifetime of every route it produced
+//! is impractical, so [`Module::load`] keeps the library mapped
+//! for the process lifetime — the handle is never `dlclose`d. This
+//! matches how plugin loaders generally behave: plugins are not
+//! unloaded mid-process.
 
 use std::path::Path;
 
@@ -47,12 +56,11 @@ use crate::{router::RouteSink, WebError};
 /// Symbol name the cdylib must export.
 pub const ENTRY_POINT: &[u8] = b"cs_web_register";
 
-/// A loaded cdylib plugin. Owns the [`Library`] handle so the
-/// `.dylib` stays mapped for the lifetime of any routes it
-/// produced.
+/// A loaded cdylib plugin. The underlying [`Library`] is leaked at
+/// load time (kept mapped for the process lifetime — see the
+/// "Lifetime" section above), so this handle only needs to carry
+/// the entry-point pointer.
 pub struct Module {
-    #[allow(dead_code)] // held for liveness — the symbol calls into this lib
-    library: Library,
     register: unsafe extern "Rust" fn(&mut RouteSink),
 }
 
@@ -71,13 +79,21 @@ impl Module {
         let path = path.as_ref();
         let library = Library::new(path)
             .map_err(|e| WebError::Module(format!("open {}: {e}", path.display())))?;
-        let symbol: Symbol<unsafe extern "Rust" fn(&mut RouteSink)> = library
-            .get(ENTRY_POINT)
-            .map_err(|e| WebError::Module(format!("lookup cs_web_register: {e}")))?;
-        // Detach the symbol's lifetime: the Library itself outlives
-        // it because we keep it in `Module`.
-        let register = *symbol.into_raw();
-        Ok(Self { library, register })
+        let register = {
+            let symbol: Symbol<unsafe extern "Rust" fn(&mut RouteSink)> = library
+                .get(ENTRY_POINT)
+                .map_err(|e| WebError::Module(format!("lookup cs_web_register: {e}")))?;
+            // Detach the symbol's lifetime from the borrow of
+            // `library` so the handle can be leaked just below.
+            *symbol.into_raw()
+        };
+        // Keep the library mapped for the process lifetime — see
+        // the "Lifetime" section in the module docs. Plugin routes
+        // (and detached server tasks holding them) call into this
+        // code long after `Module` itself is dropped, so `dlclose`
+        // must never run.
+        std::mem::forget(library);
+        Ok(Self { register })
     }
 
     /// Call the plugin's entry point against `sink`, accumulating
