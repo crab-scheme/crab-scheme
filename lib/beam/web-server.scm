@@ -158,17 +158,60 @@
      (web-route-actor! sid method path pid timeout-ms)]))
 
 (define-syntax server-mw
-  (syntax-rules (request-id trace catch-panic timeout)
-    [(_ sid request-id)        (web-layer-request-id! sid)]
-    [(_ sid trace)             (web-layer-trace! sid)]
-    [(_ sid catch-panic)       (web-layer-catch-panic! sid)]
-    [(_ sid (timeout ms))      (web-layer-timeout! sid ms)]))
+  (syntax-rules (request-id trace catch-panic timeout layer-actor)
+    [(_ sid request-id)            (web-layer-request-id! sid)]
+    [(_ sid trace)                 (web-layer-trace! sid)]
+    [(_ sid catch-panic)           (web-layer-catch-panic! sid)]
+    [(_ sid (timeout ms))          (web-layer-timeout! sid ms)]
+    ;; (layer-actor pid)            uses the default 30s decision
+    ;; (layer-actor pid ms)         caps decisions at ms milliseconds
+    [(_ sid (layer-actor pid))     (web-layer-actor! sid pid)]
+    [(_ sid (layer-actor pid ms))  (web-layer-actor! sid pid ms)]))
 
 ;;; Tidy aliases over the canonical primops — matches the
 ;;; `req-*` style used elsewhere in this library.
 
 (define server-start! web-server-start)
 (define server-stop!  web-server-stop)
+
+;;; ----- Scheme actor as a Rust Layer ------------------------------
+;;;
+;;; A layer actor receives `('*web-request* h)` BEFORE the route's
+;;; handler runs. It picks one of two outcomes per request:
+;;;
+;;;   (web-respond! h status body)   ; short-circuit — handler never runs
+;;;   (web-continue! h)              ; pass through to the inner service
+;;;
+;;; Failing to call either within the timeout returns 504 to the
+;;; client and the inner service is not called.
+;;;
+;;; A layer actor is "real" middleware in the Tower sense — it
+;;; wraps the whole sub-service, can short-circuit independent of
+;;; the actor handling the route, and composes with the built-in
+;;; Rust layers (request-id, trace, timeout, catch-panic). Use
+;;; via the (layer-actor pid [timeout-ms]) clause of
+;;; define-server.
+;;;
+;;; Example:
+;;;
+;;;   (define (auth-layer)
+;;;     (let loop ()
+;;;       (receive
+;;;         [('*web-request* h)
+;;;          (if (eq? (web-request-header h "x-token") "sekret")
+;;;              (web-continue! h)              ; pass through
+;;;              (web-respond! h 401 "no"))])   ; short-circuit
+;;;       (loop)))
+;;;
+;;;   (define auth-pid (spawn 'auth-layer))
+;;;   (define-server my-app "127.0.0.1:8080"
+;;;     (middleware request-id (layer-actor auth-pid 2000))
+;;;     (route 'GET "/secure" handler-pid))
+;;;
+;;; The layer actor runs `web-continue!` for valid tokens; the
+;;; framework then dispatches to handler-pid via the next layer.
+;;; For invalid tokens, web-respond! short-circuits and the
+;;; handler actor is never contacted.
 
 ;;; ----- Pre-built middleware --------------------------------------
 ;;;

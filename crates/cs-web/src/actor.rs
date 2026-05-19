@@ -24,24 +24,52 @@ use tokio::sync::oneshot;
 
 use crate::{response, ArcService, Request, Response, Service};
 
-/// Envelope sent to an actor by an [`ActorHandler`]. The reply
-/// slot is a `Mutex<Option<…>>` because tokio's `oneshot::Sender`
-/// is `Send` but not `Sync` — the Mutex lets the envelope cross
+/// Envelope sent to an actor by an [`ActorHandler`] or
+/// [`ActorLayer`]. Two `Mutex<Option<…>>` slots:
+///
+/// - `reply` — present on every envelope; carries the
+///   `Response` back to the requester when the actor calls
+///   `reply_with`. Acts as the short-circuit channel for layer
+///   actors.
+/// - `cont` — present ONLY when the envelope is destined for a
+///   layer actor. Firing it signals the wrapping `ActorLayer`
+///   to call the inner service (i.e., pass the request
+///   through). `signal_continue` consumes this slot in addition
+///   to `reply` so the layer doesn't waste budget waiting for a
+///   redundant response after the actor decided to pass.
+///
+/// `Mutex<Option<…>>` is required because tokio oneshot senders
+/// are `Send` but not `Sync`; the Mutex lets the envelope cross
 /// the `Arc<dyn Any + Send + Sync>` payload boundary.
 pub struct WebMessage {
     pub req: Request,
     reply: Mutex<Option<oneshot::Sender<Response>>>,
+    cont: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl WebMessage {
-    /// Build a new envelope from a request and a reply channel.
-    /// Used by integration points that ship a `WebMessage` to a
-    /// downstream actor (cs-runtime's payload bridge, or third-
-    /// party adapters that wrap a non-tower transport).
+    /// Build an envelope for a handler (no pass-through channel).
+    /// Used by `ActorHandler` and cs-runtime's bridge.
     pub fn new(req: Request, reply: oneshot::Sender<Response>) -> Self {
         Self {
             req,
             reply: Mutex::new(Some(reply)),
+            cont: Mutex::new(None),
+        }
+    }
+
+    /// Build an envelope for a layer actor — two channels:
+    /// `reply` for short-circuit, `cont` for pass-through.
+    /// Used by [`ActorLayer`].
+    pub fn new_for_layer(
+        req: Request,
+        reply: oneshot::Sender<Response>,
+        cont: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            req,
+            reply: Mutex::new(Some(reply)),
+            cont: Mutex::new(Some(cont)),
         }
     }
 
@@ -62,6 +90,33 @@ impl WebMessage {
         } else {
             false
         }
+    }
+
+    /// Signal the wrapping `ActorLayer` to pass the request to
+    /// the inner service. Returns `true` if the envelope was a
+    /// layer envelope and the continue channel hadn't already
+    /// been consumed; `false` otherwise (including for envelopes
+    /// produced by `new` — handler envelopes have no continue
+    /// channel).
+    ///
+    /// Also takes the reply channel so the layer doesn't keep
+    /// waiting for a response after the actor decided to pass.
+    pub fn signal_continue(&self) -> bool {
+        let cont = self.cont.lock().expect("cont lock poisoned").take();
+        // Drop the reply slot too — the layer's `select!`
+        // already moved on; keeping the sender alive just delays
+        // the dispatcher's drop of the reply task.
+        let _ = self.reply.lock().expect("reply lock poisoned").take();
+        match cont {
+            Some(tx) => tx.send(()).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Whether this envelope carries a continue channel — true
+    /// for layer messages, false for handler messages.
+    pub fn is_layer(&self) -> bool {
+        self.cont.lock().expect("cont lock poisoned").is_some()
     }
 }
 
@@ -110,6 +165,107 @@ impl Service for ActorHandler {
             }
         })
     }
+}
+
+/// A [`Layer`] that hands every request off to a Scheme actor
+/// before reaching the inner service. The actor decides per
+/// request whether to short-circuit (call `reply_with` with a
+/// response) or pass through (call `signal_continue` — the
+/// `(web-continue! h)` primop on the Scheme side). On
+/// pass-through the layer calls the inner service with the
+/// original request.
+///
+/// Failure modes:
+///
+/// - actor send fails (mailbox closed) → 503
+/// - actor drops both channels without calling either → 500
+/// - actor takes longer than `timeout` to decide → 504
+///
+/// Construct via [`actor_layer`].
+pub struct ActorLayer {
+    target: ActorRef,
+    timeout: Duration,
+}
+
+impl ActorLayer {
+    pub fn new(target: ActorRef, timeout: Duration) -> Self {
+        Self { target, timeout }
+    }
+}
+
+impl crate::Layer for ActorLayer {
+    fn layer(&self, inner: ArcService) -> ArcService {
+        Arc::new(ActorLayerService {
+            target: self.target.clone(),
+            inner,
+            timeout: self.timeout,
+        })
+    }
+}
+
+struct ActorLayerService {
+    target: ActorRef,
+    inner: ArcService,
+    timeout: Duration,
+}
+
+impl Service for ActorLayerService {
+    fn call(&self, req: Request) -> BoxFuture<'static, Response> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let (cont_tx, cont_rx) = oneshot::channel();
+        let envelope = Arc::new(WebMessage::new_for_layer(req.clone(), resp_tx, cont_tx));
+        // Keep a clone in scope across the `select!` so the
+        // WebMessage's reply sender doesn't drop when the slab
+        // releases its Arc (i.e., when the actor calls
+        // `web-continue!`, which removes the slab entry). Without
+        // this, dropping the reply sender races with `cont_rx`
+        // firing — `select!` sees both ready, picks resp's Err,
+        // returns 500 even though continue was the actor's
+        // decision. The `biased` keyword in `select!` additionally
+        // ensures cont wins in any remaining tie.
+        let envelope_guard = Arc::clone(&envelope);
+        let payload: Payload = envelope;
+        let send_result = self.target.send(payload);
+        let inner = Arc::clone(&self.inner);
+        let timeout = self.timeout;
+        Box::pin(async move {
+            if let Err(e) = send_result {
+                return response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("layer actor send failed: {e}"),
+                );
+            }
+            let result = tokio::select! {
+                biased;
+                cont = cont_rx => match cont {
+                    Ok(()) => inner.call(req).await,
+                    Err(_) => response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "layer actor dropped continue",
+                    ),
+                },
+                resp = resp_rx => match resp {
+                    Ok(r) => r,
+                    Err(_) => response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "layer actor dropped reply",
+                    ),
+                },
+                _ = tokio::time::sleep(timeout) => response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "layer actor decision timeout",
+                ),
+            };
+            drop(envelope_guard);
+            result
+        })
+    }
+}
+
+/// Build an [`ActorLayer`] that dispatches to `target` with the
+/// given decision timeout.
+pub fn actor_layer(target: ActorRef, timeout: Duration) -> ActorLayer {
+    ActorLayer::new(target, timeout)
 }
 
 /// Spawn a long-running actor that runs a request → response

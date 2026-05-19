@@ -896,6 +896,186 @@ fn scheme_server_and_handler_macros() {
     rt.eval_str("<t>", "(server-stop! my-app)").expect("stop");
 }
 
+/// End-to-end: a Scheme actor acts as a Rust Layer wrapping
+/// the route's handler. Two clients hit the server — one with a
+/// valid auth header (layer `web-continue!`s, handler responds),
+/// one with a bad header (layer short-circuits with 401, handler
+/// never runs). Closes the M3c documented limitation that
+/// Scheme procs couldn't run BEFORE the actor receives.
+#[test]
+fn scheme_actor_as_layer_short_circuits_or_continues() {
+    use cs_actor::Actor;
+    use cs_runtime::builtins::beam::{beam_state, primop_raw_receive, ActorEntry, SendableValue};
+    use cs_runtime::builtins::web::{primop_continue, primop_request_header, primop_respond};
+    use std::sync::{Arc, Mutex};
+
+    // Counter of how many requests reached the inner handler.
+    // Lets us prove that short-circuited requests never made it
+    // past the layer.
+    let handler_hits = Arc::new(Mutex::new(0u32));
+
+    // --- Layer actor body: read x-token. If "sekret", continue.
+    //     Otherwise respond 401 immediately. Loops forever.
+    let layer_body: ActorEntry = Arc::new(|actor: &mut Actor, _args: Vec<SendableValue>| loop {
+        let msg = match primop_raw_receive(actor, None) {
+            Ok(Some(m)) => m,
+            _ => return,
+        };
+        let handle = match handle_from_msg(msg) {
+            Some(h) => h,
+            None => continue,
+        };
+        let tok = primop_request_header(handle, "x-token").unwrap_or_default();
+        if tok.as_deref() == Some("sekret") {
+            let _ = primop_continue(handle);
+        } else {
+            let _ = primop_respond(handle, 401, "no token".into());
+        }
+    });
+    beam_state().procs.register("test:layer-auth", layer_body);
+
+    // --- Handler actor body: bump hits counter, respond 200.
+    let hits_for_handler = Arc::clone(&handler_hits);
+    let handler_body: ActorEntry = Arc::new(move |actor: &mut Actor, _args: Vec<SendableValue>| {
+        let hits = Arc::clone(&hits_for_handler);
+        loop {
+            let msg = match primop_raw_receive(actor, None) {
+                Ok(Some(m)) => m,
+                _ => return,
+            };
+            let handle = match handle_from_msg(msg) {
+                Some(h) => h,
+                None => continue,
+            };
+            *hits.lock().unwrap() += 1;
+            let _ = primop_respond(handle, 200, "secret data".into());
+        }
+    });
+    beam_state()
+        .procs
+        .register("test:handler-secret", handler_body);
+
+    fn handle_from_msg(msg: SendableValue) -> Option<i64> {
+        match msg {
+            SendableValue::Pair(head, tail) => match (*head, *tail) {
+                (SendableValue::Symbol(s), SendableValue::Pair(boxed_id, boxed_nil))
+                    if s == "*web-request*" && matches!(*boxed_nil, SendableValue::Null) =>
+                {
+                    match *boxed_id {
+                        SendableValue::Fixnum(n) => Some(n),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    let mut rt = Runtime::new();
+    let layer_pid = rt
+        .eval_str("<t>", "(spawn 'test:layer-auth)")
+        .expect("spawn layer");
+    let handler_pid = rt
+        .eval_str("<t>", "(spawn 'test:handler-secret)")
+        .expect("spawn handler");
+    let layer_pid_s = disp(&rt, &layer_pid);
+    let handler_pid_s = disp(&rt, &handler_pid);
+
+    let sid_val = rt
+        .eval_str("<t>", r#"(web-server-create "127.0.0.1:0")"#)
+        .expect("create");
+    let sid = disp(&rt, &sid_val);
+
+    // Install the Scheme actor as a Layer wrapping the route.
+    rt.eval_str(
+        "<t>",
+        &format!("(web-layer-actor! {} '{} 2000)", sid, layer_pid_s),
+    )
+    .expect("layer-actor");
+
+    rt.eval_str(
+        "<t>",
+        &format!(
+            r#"(web-route-actor! {} 'GET "/secret" '{} 2000)"#,
+            sid, handler_pid_s
+        ),
+    )
+    .expect("route");
+
+    let bound_val = rt
+        .eval_str("<t>", &format!("(web-server-start {})", sid))
+        .expect("start");
+    let addr = parse_addr(&rt, &bound_val);
+    std::thread::sleep(Duration::from_millis(80));
+
+    // --- Case 1: bad token → 401, handler NOT called.
+    fn http_get_with(addr: &str, path: &str, header: Option<(&str, &str)>) -> (u16, String) {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let header_line = match header {
+            Some((k, v)) => format!("{k}: {v}\r\n"),
+            None => String::new(),
+        };
+        write!(
+            stream,
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{}\r\n",
+            path, header_line
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        let raw = String::from_utf8_lossy(&buf);
+        let status = raw
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        let body_start = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| i + 4)
+            .unwrap_or(buf.len());
+        let body = String::from_utf8_lossy(&buf[body_start..]).to_string();
+        (status, body)
+    }
+
+    let (status, body) = http_get_with(&addr, "/secret", Some(("x-token", "wrong")));
+    assert_eq!(status, 401);
+    assert_eq!(body, "no token");
+    assert_eq!(
+        *handler_hits.lock().unwrap(),
+        0,
+        "handler must not run when layer 401s"
+    );
+
+    // --- Case 2: valid token → layer continues, handler runs,
+    //     200 with the handler's body.
+    let (status, body) = http_get_with(&addr, "/secret", Some(("x-token", "sekret")));
+    assert_eq!(status, 200);
+    assert_eq!(body, "secret data");
+    assert_eq!(
+        *handler_hits.lock().unwrap(),
+        1,
+        "handler must run exactly once"
+    );
+
+    // --- Case 3: no token at all → 401 again, hits still 1.
+    let (status, _) = http_get_with(&addr, "/secret", None);
+    assert_eq!(status, 401);
+    assert_eq!(
+        *handler_hits.lock().unwrap(),
+        1,
+        "handler must still not have run again"
+    );
+
+    rt.eval_str("<t>", &format!("(web-server-stop {})", sid))
+        .expect("stop");
+}
+
 #[test]
 fn scheme_route_after_start_is_error() {
     let mut rt = Runtime::new();

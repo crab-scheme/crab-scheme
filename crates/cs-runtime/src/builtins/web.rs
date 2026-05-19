@@ -77,6 +77,13 @@ enum LayerSpec {
     RequestId,
     CatchPanic,
     Timeout(std::time::Duration),
+    /// Scheme actor acting as a Layer. On each request the
+    /// actor receives `('*web-request* h)` and decides via
+    /// `web-respond!` (short-circuit) or `web-continue!`
+    /// (pass to the inner service). `Duration` is the decision
+    /// timeout — exceeding it returns 504 without reaching the
+    /// inner service.
+    ActorLayer(ActorPid, std::time::Duration),
 }
 
 enum Slot {
@@ -372,6 +379,18 @@ fn primop_server_start(sid: i64) -> Result<String, String> {
                 LayerSpec::RequestId => stack.push(cs_web::RequestId::new()),
                 LayerSpec::CatchPanic => stack.push(cs_web::CatchPanic),
                 LayerSpec::Timeout(d) => stack.push(cs_web::Timeout::new(d)),
+                LayerSpec::ActorLayer(pid, d) => {
+                    let actor_ref = match crate::builtins::beam::lookup_pid(pid) {
+                        Some(r) => r,
+                        None => {
+                            return Err(format!(
+                                "web-server-start: layer actor {} not found (terminated?)",
+                                pid
+                            ));
+                        }
+                    };
+                    stack.push(cs_web::actor::actor_layer(actor_ref, d))
+                }
             };
         }
         service = stack.wrap(service);
@@ -489,6 +508,54 @@ pub fn b_web_layer_catch_panic(args: &[Value], _syms: &mut SymbolTable) -> Resul
     let sid = value_to_i64(&args[0], "web-layer-catch-panic!")?;
     primop_layer_push(sid, "web-layer-catch-panic!", LayerSpec::CatchPanic)?;
     Ok(Value::Unspecified)
+}
+
+/// Push an actor-backed Layer onto the building stack. Scheme:
+/// `(web-layer-actor! sid pid [timeout-ms])`. Timeout defaults
+/// to 30 s.
+pub fn b_web_layer_actor(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(format!(
+            "web-layer-actor!: expected 2 or 3 arguments, got {}",
+            args.len()
+        ));
+    }
+    let sid = value_to_i64(&args[0], "web-layer-actor!")?;
+    let pid = value_to_pid(&args[1], syms, "web-layer-actor!")?;
+    let timeout_ms = if args.len() == 3 {
+        let n = value_to_i64(&args[2], "web-layer-actor!")?;
+        if n < 0 {
+            return Err("web-layer-actor!: timeout-ms must be non-negative".into());
+        }
+        n as u64
+    } else {
+        30_000
+    };
+    primop_layer_push(
+        sid,
+        "web-layer-actor!",
+        LayerSpec::ActorLayer(pid, std::time::Duration::from_millis(timeout_ms)),
+    )?;
+    Ok(Value::Unspecified)
+}
+
+/// `(web-continue! handle)` — signal a layer actor's decision
+/// to pass the request through to the inner service. Consumes
+/// the slab entry; subsequent inspection / respond against the
+/// same handle errors. Returns `#f` (without erroring) if the
+/// handle was a handler envelope rather than a layer envelope —
+/// makes it safe to call optimistically in middleware that
+/// could be invoked in either context.
+pub fn primop_continue(handle: i64) -> Result<bool, String> {
+    let msg = take_request(handle)?;
+    Ok(msg.signal_continue())
+}
+
+pub fn b_web_continue(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("web-continue!", args, 1)?;
+    let h = value_to_i64(&args[0], "web-continue!")?;
+    let ok = primop_continue(h)?;
+    Ok(Value::Boolean(ok))
 }
 
 pub fn b_web_layer_timeout(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
@@ -905,6 +972,8 @@ pub fn web_syms_builtins() -> Vec<(
         ("web-layer-request-id!", b_web_layer_request_id),
         ("web-layer-catch-panic!", b_web_layer_catch_panic),
         ("web-layer-timeout!", b_web_layer_timeout),
+        ("web-layer-actor!", b_web_layer_actor),
+        ("web-continue!", b_web_continue),
         ("web-server-start", b_web_server_start),
         ("web-server-stop", b_web_server_stop),
         ("web-request-method", b_web_request_method),
