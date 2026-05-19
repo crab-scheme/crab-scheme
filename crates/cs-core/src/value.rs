@@ -335,21 +335,58 @@ pub enum WeakValue {
 }
 
 impl WeakValue {
-    /// Construct a `WeakValue` from `v` if `v` carries a heap
-    /// pointer. Returns `None` for leaf values (Null, Boolean,
-    /// Fixnum, Character, Symbol, Eof, Unspecified, immediate
-    /// Numbers) — those don't need weak storage because they
-    /// have no allocation to leak.
+    /// Construct a `WeakValue` from `v` if `v` carries a
+    /// downgradeable heap pointer. Returns `None` for:
+    ///
+    /// - Leaf values (Null, Boolean, Fixnum, Character,
+    ///   Symbol, Eof, Unspecified, immediate Numbers) —
+    ///   those don't need weak storage because they have no
+    ///   allocation to leak.
+    /// - **Region-allocated heap values** (parallel-runtime
+    ///   C5.1): `Gc::downgrade` on a region-backed `Gc<T>`
+    ///   panics, because region cells have no defined
+    ///   weak-ref semantics (the region's bulk drop is the
+    ///   reclamation, not refcount → 0). The cycle-break
+    ///   path used to silently produce a dead Weak; now it
+    ///   skips the slot entirely (`break_car_cycle` /
+    ///   `break_cdr_cycle` return `false`, leaving the
+    ///   region value in place). Layer-5 escape analysis is
+    ///   supposed to make this case unreachable, but the
+    ///   guard here closes the manual `(cons rc-pair
+    ///   region-pair)` escape hatch safely.
     pub fn from_value(v: &Value) -> Option<Self> {
         match v {
-            Value::String(s) => Some(WeakValue::String(cs_gc::Gc::downgrade(s))),
-            Value::Pair(p) => Some(WeakValue::Pair(cs_gc::Gc::downgrade(p))),
-            Value::Vector(v) => Some(WeakValue::Vector(cs_gc::Gc::downgrade(v))),
-            Value::ByteVector(b) => Some(WeakValue::ByteVector(cs_gc::Gc::downgrade(b))),
-            Value::Hashtable(h) => Some(WeakValue::Hashtable(cs_gc::Gc::downgrade(h))),
-            Value::Port(p) => Some(WeakValue::Port(cs_gc::Gc::downgrade(p))),
-            Value::Promise(p) => Some(WeakValue::Promise(cs_gc::Gc::downgrade(p))),
+            Value::String(s) if !cs_gc::Gc::is_region(s) => {
+                Some(WeakValue::String(cs_gc::Gc::downgrade(s)))
+            }
+            Value::Pair(p) if !cs_gc::Gc::is_region(p) => {
+                Some(WeakValue::Pair(cs_gc::Gc::downgrade(p)))
+            }
+            Value::Vector(v) if !cs_gc::Gc::is_region(v) => {
+                Some(WeakValue::Vector(cs_gc::Gc::downgrade(v)))
+            }
+            Value::ByteVector(b) if !cs_gc::Gc::is_region(b) => {
+                Some(WeakValue::ByteVector(cs_gc::Gc::downgrade(b)))
+            }
+            Value::Hashtable(h) if !cs_gc::Gc::is_region(h) => {
+                Some(WeakValue::Hashtable(cs_gc::Gc::downgrade(h)))
+            }
+            Value::Port(p) if !cs_gc::Gc::is_region(p) => {
+                Some(WeakValue::Port(cs_gc::Gc::downgrade(p)))
+            }
+            Value::Promise(p) if !cs_gc::Gc::is_region(p) => {
+                Some(WeakValue::Promise(cs_gc::Gc::downgrade(p)))
+            }
             Value::Procedure(p) => Some(WeakValue::Procedure(Rc::downgrade(p))),
+            // C5.1 guard: region-backed heap variants fall
+            // through here. The cycle-break path skips them.
+            Value::String(_)
+            | Value::Pair(_)
+            | Value::Vector(_)
+            | Value::ByteVector(_)
+            | Value::Hashtable(_)
+            | Value::Port(_)
+            | Value::Promise(_) => None,
             // Leaf values — no heap allocation to weaken.
             // `Value::Identifier` is leaf-shaped (Symbol + u64 mark),
             // no heap pointer to downgrade.
