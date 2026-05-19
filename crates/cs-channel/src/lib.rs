@@ -26,7 +26,7 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use dashmap::DashMap;
 use thiserror::Error;
@@ -70,12 +70,18 @@ pub struct Channel {
 }
 
 enum ChannelInner {
+    // Senders live behind a `Mutex<Option<…>>` so `close()` can
+    // *drop* them — receivers see EOF only when every Sender
+    // drops, so a soft close-flag alone leaves a blocking `recv`
+    // hanging forever. Hot-path sends clone the Sender out under
+    // the lock, drop the lock, then `.await` the clone — no lock
+    // crosses the await point.
     Unbounded {
-        tx: mpsc::UnboundedSender<Payload>,
+        tx: StdMutex<Option<mpsc::UnboundedSender<Payload>>>,
         rx: Mutex<mpsc::UnboundedReceiver<Payload>>,
     },
     Bounded {
-        tx: mpsc::Sender<Payload>,
+        tx: StdMutex<Option<mpsc::Sender<Payload>>>,
         rx: Mutex<mpsc::Receiver<Payload>>,
     },
 }
@@ -89,7 +95,7 @@ impl Channel {
             depth: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             inner: ChannelInner::Unbounded {
-                tx,
+                tx: StdMutex::new(Some(tx)),
                 rx: Mutex::new(rx),
             },
         }
@@ -107,7 +113,7 @@ impl Channel {
             depth: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             inner: ChannelInner::Bounded {
-                tx,
+                tx: StdMutex::new(Some(tx)),
                 rx: Mutex::new(rx),
             },
         }
@@ -135,12 +141,26 @@ impl Channel {
         if self.is_closed() {
             return Err(ChannelError::Closed(self.id));
         }
+        // Clone the sender out under the std lock, drop the
+        // lock, then await on the clone — never hold a lock
+        // across an .await point.
         let result = match &self.inner {
             ChannelInner::Unbounded { tx, .. } => {
-                tx.send(v).map_err(|_| ChannelError::Closed(self.id))
+                let tx_clone = match tx.lock().expect("tx lock poisoned").as_ref() {
+                    Some(s) => s.clone(),
+                    None => return Err(ChannelError::Closed(self.id)),
+                };
+                tx_clone.send(v).map_err(|_| ChannelError::Closed(self.id))
             }
             ChannelInner::Bounded { tx, .. } => {
-                tx.send(v).await.map_err(|_| ChannelError::Closed(self.id))
+                let tx_clone = match tx.lock().expect("tx lock poisoned").as_ref() {
+                    Some(s) => s.clone(),
+                    None => return Err(ChannelError::Closed(self.id)),
+                };
+                tx_clone
+                    .send(v)
+                    .await
+                    .map_err(|_| ChannelError::Closed(self.id))
             }
         };
         if result.is_ok() {
@@ -157,17 +177,29 @@ impl Channel {
             return Err(ChannelError::Closed(self.id));
         }
         let ok = match &self.inner {
-            ChannelInner::Unbounded { tx, .. } => match tx.send(v) {
-                Ok(()) => true,
-                Err(_) => return Err(ChannelError::Closed(self.id)),
-            },
-            ChannelInner::Bounded { tx, .. } => match tx.try_send(v) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) => false,
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(ChannelError::Closed(self.id));
+            ChannelInner::Unbounded { tx, .. } => {
+                let guard = tx.lock().expect("tx lock poisoned");
+                match guard.as_ref() {
+                    Some(s) => match s.send(v) {
+                        Ok(()) => true,
+                        Err(_) => return Err(ChannelError::Closed(self.id)),
+                    },
+                    None => return Err(ChannelError::Closed(self.id)),
                 }
-            },
+            }
+            ChannelInner::Bounded { tx, .. } => {
+                let guard = tx.lock().expect("tx lock poisoned");
+                match guard.as_ref() {
+                    Some(s) => match s.try_send(v) {
+                        Ok(()) => true,
+                        Err(mpsc::error::TrySendError::Full(_)) => false,
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            return Err(ChannelError::Closed(self.id));
+                        }
+                    },
+                    None => return Err(ChannelError::Closed(self.id)),
+                }
+            }
         };
         if ok {
             self.depth.fetch_add(1, Ordering::AcqRel);
@@ -224,16 +256,22 @@ impl Channel {
     }
 
     /// Mark the channel closed. Returns true if it transitioned
-    /// from open to closed, false if already closed. Pending
-    /// sends through tokio still drain; subsequent try_send /
-    /// send returns Closed.
+    /// from open to closed, false if already closed. Drops the
+    /// Channel's owned Sender so that, once any in-flight send
+    /// clone is also dropped, receivers see EOF (`recv().await`
+    /// returns None) after draining the buffered messages.
     pub fn close(&self) -> bool {
         let was_open = !self.closed.swap(true, Ordering::AcqRel);
-        // Drop our local sender clones so receivers see EOF after
-        // draining. We can't actually drop the sender from inside
-        // an `&self` method without a Mutex<Option<Sender>>; the
-        // closed flag is sufficient for our semantics because
-        // try_send / send check it first.
+        if was_open {
+            match &self.inner {
+                ChannelInner::Unbounded { tx, .. } => {
+                    *tx.lock().expect("tx lock poisoned") = None;
+                }
+                ChannelInner::Bounded { tx, .. } => {
+                    *tx.lock().expect("tx lock poisoned") = None;
+                }
+            }
+        }
         was_open
     }
 }
@@ -399,12 +437,16 @@ mod tests {
         let id = reg.create(None);
         let ch = reg.lookup(id).unwrap();
 
-        // Producer fires 100 messages from another task.
+        // Producer fires 100 messages from another task then
+        // closes — required so the consumers' `recv().await`
+        // returns None on the empty-and-closed condition and
+        // they break out cleanly.
         let prod_ch = Arc::clone(&ch);
         r.spawn(async move {
             for i in 0..100i32 {
                 prod_ch.send(p(i)).await.unwrap();
             }
+            prod_ch.close();
         });
 
         // Two consumers each pull until they collectively see 100.
