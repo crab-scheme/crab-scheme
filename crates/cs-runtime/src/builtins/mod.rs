@@ -3870,6 +3870,34 @@ fn b_apply(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     apply_procedure(proc_val, &all, ctx).map_err(|e| e.message())
 }
 
+/// Convert an `EvalError` from `apply_procedure` into a `String` error that
+/// a higher-order builtin can return, while preserving the full error kind so
+/// `builtin_err_to_eval` can reconstruct it on the other side.
+///
+/// `EvalErrorKind::Raised` stashes the condition in `ctx.pending_raise` and
+/// returns `"__raised__"` — the same sentinel `with-exception-handler` uses,
+/// so an enclosing `guard` / `with-exception-handler` sees the original
+/// condition rather than a plain-string reconstruction of it.
+///
+/// `EvalErrorKind::Escape` stashes into `ctx.pending_escape` and returns
+/// `"__escape__"` so a matching `call/cc` can intercept it.
+///
+/// `EvalErrorKind::Message` returns the message string unchanged (no
+/// condition to preserve).
+fn propagate_eval_err(e: crate::eval::EvalError, ctx: &mut EvalCtx) -> String {
+    match e.kind {
+        crate::eval::EvalErrorKind::Raised(cond) => {
+            ctx.pending_raise = Some(cond);
+            "__raised__".to_string()
+        }
+        crate::eval::EvalErrorKind::Escape(id, v) => {
+            ctx.pending_escape = Some((id, v));
+            "__escape__".to_string()
+        }
+        crate::eval::EvalErrorKind::Message(m) => m,
+    }
+}
+
 fn b_map(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() < 2 {
         return Err(arity_err("map", "at least 2", args.len()));
@@ -3883,7 +3911,7 @@ fn b_map(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        let r = apply_procedure(&proc_val, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
         out.push(r);
     }
     Ok(Value::list(out))
@@ -3901,7 +3929,7 @@ fn b_for_each(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
     for i in 0..n {
         let row: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-        apply_procedure(&proc_val, &row, ctx).map_err(|e| e.message())?;
+        apply_procedure(&proc_val, &row, ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     }
     Ok(Value::Unspecified)
 }
