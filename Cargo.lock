@@ -1399,6 +1399,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-web-mod-example"
+version = "0.0.1"
+dependencies = [
+ "cs-web",
+]
+
+[[package]]
 name = "csv"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

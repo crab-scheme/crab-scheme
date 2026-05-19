@@ -38,12 +38,18 @@ pub mod handler;
 pub mod layers;
 pub mod router;
 
+#[cfg(feature = "modules")]
+pub mod module;
+
 // Re-export http types so users don't need an explicit `http` dep.
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 
 pub use handler::{handler_fn, Handler, HandlerFn};
 pub use layers::{CatchPanic, Layer, RequestId, Stack, Timeout, Trace};
-pub use router::Router;
+pub use router::{RouteSink, Router};
+
+#[cfg(feature = "modules")]
+pub use module::{Module, ENTRY_POINT};
 
 /// Owned request body — fully buffered. Streaming bodies are a
 /// follow-up; the dominant CrabScheme use case is small JSON.
