@@ -4,6 +4,9 @@
 //! Foundation milestone has only the tree-walker as a consumer; later tiers
 //! (bytecode VM, JIT) will share this type.
 
+pub mod effects;
+pub use effects::{Effect, EffectSet, WORKFLOW_FORBIDDEN};
+
 use std::rc::Rc;
 
 use cs_core::{Symbol, Value};
