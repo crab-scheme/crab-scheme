@@ -4987,6 +4987,21 @@ impl Lowerer {
         //    plus Inst::Call and DeoptCheck).
         //  - Non-tail-position `CallSelf` which would emit a regular
         //    Cranelift `call` and burn host stack on deep recursions.
+        //
+        // #47 — exception to the non-tail-CallSelf rejection: when the
+        // body makes a cross-function call (`Call`/`CallGeneral`), allow
+        // it through. Such bodies can't fall back to the specialized
+        // (SystemV) tier — that tier miscompiles cross-function calls
+        // (issue #19), so they'd otherwise drop to the VM with no JIT at
+        // all. uniform-NB lowers them correctly (proper IC dispatch).
+        // The host-stack guard targets pathological pure-arithmetic
+        // recursion (tak), which has no cross-call and still routes to
+        // the SystemV tier; map-style helpers recurse to data depth.
+        let has_cross_call = rir.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i, Inst::Call(_, _, _) | Inst::CallGeneral(_, _, _)))
+        });
         for blk in &rir.blocks {
             let last_idx = blk.insts.len().saturating_sub(1);
             for (i, inst) in blk.insts.iter().enumerate() {
@@ -5074,7 +5089,7 @@ impl Lowerer {
                         let last_check = last_check_ab || pattern_c;
                         let tail_check = detect_tail_call_self(rir, blk).is_some() || pattern_c;
                         let is_tail = last_check && tail_check;
-                        if !is_tail {
+                        if !is_tail && !has_cross_call {
                             return Err(JitError::Unsupported(
                                 "uniform-nb: non-tail CallSelf would burn host stack".into(),
                             ));
@@ -5107,8 +5122,28 @@ impl Lowerer {
             sig.returns.push(AbiParam::new(I64));
             sig
         };
+        // Choose the inner calling convention by whether the body needs
+        // guaranteed tail calls. `return_call` — emitted only for a
+        // tail-position self-`CallSelf` — requires `CallConv::Tail`.
+        // When the body has no tail self-recursion (e.g. a map-style
+        // helper whose self-call is non-tail, an argument to `cons`),
+        // `CallConv::SystemV` is both sufficient and preferable: SystemV
+        // frames are smaller (Tail makes every register caller-save), so
+        // the non-tail recursion gets a higher host-stack ceiling and
+        // avoids the Tail-conv spill overhead. This is what lets #47's
+        // map-style cross-function bodies JIT here (correct IC dispatch)
+        // instead of dropping to the VM, with no depth regression.
+        let needs_tail_conv = rir
+            .blocks
+            .iter()
+            .any(|b| detect_uniform_nb_tail_self(rir, b).0.is_some());
+        let inner_conv = if needs_tail_conv {
+            CallConv::Tail
+        } else {
+            CallConv::SystemV
+        };
         let inner_sig = {
-            let mut sig = Signature::new(CallConv::Tail);
+            let mut sig = Signature::new(inner_conv);
             for _ in &rir.params {
                 sig.params.push(AbiParam::new(I64));
             }
@@ -5314,53 +5349,10 @@ impl Lowerer {
                 // _) before the trivial Jump-to-Return. BoxTyped is a
                 // no-op in uniform-NB (all values are NB), so we can
                 // treat the pair as tail-position together.
-                let (tail_args, trim_extra): (Option<&[RirValue]>, usize) = {
-                    let n = blk.insts.len();
-                    if n >= 2 {
-                        if let (
-                            Some(Inst::CallSelf(call_dst, call_args)),
-                            Some(Inst::BoxTyped(box_dst, box_src, _)),
-                        ) = (blk.insts.get(n - 2), blk.insts.get(n - 1))
-                        {
-                            if box_src == call_dst {
-                                // Pattern (c) — extend the trivial-
-                                // join/return check using box_dst as
-                                // the value being passed forward.
-                                let ok = match &blk.terminator {
-                                    Term::Return(ret_v) => ret_v == box_dst,
-                                    Term::Jump(target, jump_args)
-                                        if jump_args.len() == 1 && jump_args[0] == *box_dst =>
-                                    {
-                                        rir.blocks.iter().find(|b| b.id == *target).map_or(
-                                            false,
-                                            |tb| {
-                                                tb.insts.is_empty()
-                                                    && matches!(
-                                                        &tb.terminator,
-                                                        Term::Return(rv)
-                                                            if tb.params.first()
-                                                                .map_or(false, |(p, _)| rv == p)
-                                                    )
-                                            },
-                                        )
-                                    }
-                                    _ => false,
-                                };
-                                if ok {
-                                    (Some(call_args.as_slice()), 1)
-                                } else {
-                                    (detect_tail_call_self(rir, blk), 0)
-                                }
-                            } else {
-                                (detect_tail_call_self(rir, blk), 0)
-                            }
-                        } else {
-                            (detect_tail_call_self(rir, blk), 0)
-                        }
-                    } else {
-                        (detect_tail_call_self(rir, blk), 0)
-                    }
-                };
+                // Tail self-recursion → `return_call` (legal only under
+                // the Tail conv chosen above when this is `Some`). See
+                // `detect_uniform_nb_tail_self`.
+                let (tail_args, trim_extra) = detect_uniform_nb_tail_self(rir, blk);
                 if tail_args.is_some() {
                     // Drop the CallSelf and (if pattern (c)) the
                     // trailing BoxTyped.
@@ -6890,6 +6882,60 @@ fn detect_tail_call_general<'a>(
         }
         _ => None,
     }
+}
+
+/// Uniform-NB tail self-recursion detection. Mirrors
+/// [`detect_tail_call_self`] but also recognizes the
+/// `CallSelf`-then-no-op-`BoxTyped` shape the uniform-NB translator
+/// emits when a recursive arm's value widens to `Any` to merge with a
+/// sibling typed branch (`BoxTyped` is an identity under the NB ABI).
+///
+/// Returns `(Some(tail_args), trim_extra)` when the block ends in a
+/// tail-position self-call — `trim_extra` is the count of trailing
+/// no-op insts (the `BoxTyped`) to drop alongside the `CallSelf` — or
+/// `(None, 0)` otherwise. Used both to choose the inner `CallConv`
+/// (`Tail` iff any block tail-self-recurses, so `return_call` is legal)
+/// and to drive codegen at the call site.
+fn detect_uniform_nb_tail_self<'a>(
+    rir: &'a RirFunction,
+    block: &'a cs_rir::Block,
+) -> (Option<&'a [RirValue]>, usize) {
+    let n = block.insts.len();
+    if n >= 2 {
+        if let (
+            Some(Inst::CallSelf(call_dst, call_args)),
+            Some(Inst::BoxTyped(box_dst, box_src, _)),
+        ) = (block.insts.get(n - 2), block.insts.get(n - 1))
+        {
+            if box_src == call_dst {
+                // Pattern (c) — trivial-join/return check using box_dst
+                // as the value passed forward.
+                let ok = match &block.terminator {
+                    Term::Return(ret_v) => ret_v == box_dst,
+                    Term::Jump(target, jump_args)
+                        if jump_args.len() == 1 && jump_args[0] == *box_dst =>
+                    {
+                        rir.blocks
+                            .iter()
+                            .find(|b| b.id == *target)
+                            .map_or(false, |tb| {
+                                tb.insts.is_empty()
+                                    && matches!(
+                                        &tb.terminator,
+                                        Term::Return(rv)
+                                            if tb.params.first().map_or(false, |(p, _)| rv == p)
+                                    )
+                            })
+                    }
+                    _ => false,
+                };
+                if ok {
+                    return (Some(call_args.as_slice()), 1);
+                }
+            }
+        }
+    }
+    (detect_tail_call_self(rir, block), 0)
 }
 
 fn detect_tail_call_self_inner<'a>(
