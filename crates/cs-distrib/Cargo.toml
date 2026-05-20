@@ -1,0 +1,22 @@
+[package]
+name = "cs-distrib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme distributed runtime: NodeId, RemoteRef, gossip, phi-accrual failure detector, membership state machine. Builds on cs-actor (local actors) and cs-net (transport). See docs/research/sdk_spec/distributed.md § M02-M04."
+
+[dependencies]
+cs-net = { path = "../cs-net", default-features = false, features = ["tcp", "sim"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
+thiserror = "1"
+tracing = "0.1"
+
+[features]
+default = []
+# Re-export cs-net's QUIC transport feature.
+quic = ["cs-net/quic"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "sync", "macros", "test-util", "time"] }

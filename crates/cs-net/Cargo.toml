@@ -1,0 +1,54 @@
+[package]
+name = "cs-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme cluster transport layer: TCP+TLS / QUIC / WebSocket / Unix / Sim, per-peer multiplexed logical channels (control / consensus / messages / workflow / bulk / observability). Substrate for cs-distrib / cs-consensus / cs-workflow. See docs/research/sdk_spec/distributed.md § M02."
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "net", "io-util", "macros"] }
+bytes = "1"
+thiserror = "1"
+tracing = "0.1"
+
+[features]
+default = ["tcp", "sim"]
+# Sync TCP+TLS transport (rustls). The default production transport
+# for M02. mTLS is wired in alongside the handshake in cs-distrib.
+tcp = ["dep:rustls", "dep:tokio-rustls"]
+# QUIC transport via quinn. Cheaper stream creation than TCP, true
+# multiplexing without head-of-line blocking. Default-off until the
+# transport selection plumbing is wired into the cluster bootstrap.
+quic = ["dep:quinn"]
+# WebSocket transport for browser-edge clusters.
+ws = ["dep:tokio-tungstenite"]
+# In-memory simulation transport: deterministic, no syscalls. Used by
+# the unit-test suite and the future cs-sim deterministic simulator.
+sim = []
+
+[dependencies.rustls]
+version = "0.23"
+optional = true
+default-features = false
+features = ["std", "ring"]
+
+[dependencies.tokio-rustls]
+version = "0.26"
+optional = true
+default-features = false
+features = ["tls12"]
+
+[dependencies.quinn]
+version = "0.11"
+optional = true
+default-features = false
+features = ["runtime-tokio", "rustls"]
+
+[dependencies.tokio-tungstenite]
+version = "0.24"
+optional = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "sync", "macros", "test-util", "time"] }

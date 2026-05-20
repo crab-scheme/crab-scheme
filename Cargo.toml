@@ -33,6 +33,14 @@ members = [
     "crates/cs-channel",
     "crates/cs-table",
     "crates/cs-hotreload",
+    # Distributed runtime — Phase B of the SDK spec
+    # (docs/research/sdk_spec/distributed.md). cs-net is the transport
+    # substrate; cs-distrib adds NodeId, gossip, phi-accrual, membership;
+    # cs-discovery is the pluggable provider interface. All three ship
+    # as scaffolds initially; M02-M04 fill them in.
+    "crates/cs-net",
+    "crates/cs-distrib",
+    "crates/cs-discovery",
     # Tower-style async web framework. Builds on tokio/hyper, integrates
     # with cs-actor (actor-backed handlers), cs-table (access log +
     # sessions), and cs-runtime (Scheme route registration).

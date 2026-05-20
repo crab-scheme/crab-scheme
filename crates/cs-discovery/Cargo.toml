@@ -1,0 +1,35 @@
+[package]
+name = "cs-discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme pluggable discovery providers (Static, DNS, Kubernetes, DbBacked, etcd, Consul, CloudMap, mDNS, Gossip) with first-success combinator. Modeled on Akka ServiceDiscovery. See docs/research/sdk_spec/distributed.md § M03."
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "1"
+tokio = { workspace = true, features = ["sync", "macros", "time"] }
+
+[features]
+default = ["static", "file"]
+# Always-on: static config + file-backed (Nomad-style).
+static = []
+file = []
+# Optional providers behind features so embedders pay only for what they need.
+dns = []
+kubernetes = []
+db-postgres = []
+db-sqlite = []
+etcd = []
+consul = []
+nomad = []
+aws-cloudmap = []
+gcp-instance-groups = []
+azure-vmss = []
+mdns = []
+gossip = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "sync", "macros", "test-util", "time"] }
