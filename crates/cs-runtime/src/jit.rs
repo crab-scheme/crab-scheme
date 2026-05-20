@@ -35,6 +35,23 @@ use cs_core::{Number, Value};
 
 use crate::Runtime;
 
+/// Whether a RIR body makes a cross-function call (`Inst::Call` or
+/// `Inst::CallGeneral`) — i.e. calls a procedure other than itself.
+///
+/// Used to keep such bodies off the legacy pure-fixnum tier, which
+/// miscompiles them (issue #19). `Inst::CallSelf` (self-recursion) is
+/// fine and intentionally not matched.
+fn rir_has_cross_function_call(rir: &cs_rir::Function) -> bool {
+    rir.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                cs_rir::Inst::Call(_, _, _) | cs_rir::Inst::CallGeneral(_, _, _)
+            )
+        })
+    })
+}
+
 impl Runtime {
     /// Install the JIT for this runtime: build a [`Lowerer`] and
     /// register the tier-up hook on the calling thread.
@@ -270,6 +287,23 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
             // tier routing. Try the specialized tier. pure_fixnum can
             // also panic (its codegen path overlaps cranelift's), so
             // wrap it the same way and poison on panic.
+            //
+            // Issue #19 — the legacy pure-fixnum tier silently
+            // MISCOMPILES bodies containing a cross-function call
+            // (`Inst::Call` / `Inst::CallGeneral`): the call clobbers
+            // state so a following `Car`/`Cdr`/`Cons`/`CallSelf` reads
+            // garbage and returns `Null` where the caller expects a
+            // pair (nboyer/sboyer's `(caddr (car lst))`). Self-recursive
+            // pointer bodies (binary-trees, alloc-stress) use only
+            // `CallSelf` and compile correctly, so the precise, no-
+            // measured-regression fix is: when uniform-NB declined a
+            // body that makes a cross-function call, route it to the VM
+            // rather than miscompile it on the legacy tier. Cross-
+            // function calls belong on the uniform-NB tier (which has
+            // proper IC dispatch); the VM is always a correct fallback.
+            if rir_has_cross_function_call(&rir) {
+                return;
+            }
             let pure_result = catch_unwind(AssertUnwindSafe(|| lowerer.compile_pure_fixnum(&rir)));
             match pure_result {
                 Ok(Ok(p)) => (p, None),
