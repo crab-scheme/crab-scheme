@@ -198,6 +198,10 @@ pub struct Lowerer {
     /// the dispatch trampoline re-runs the callee in constant stack
     /// (ADR 0019).
     set_tailcall_func: cranelift_module::FuncId,
+    /// FuncId of `vm_jit_request_deopt(reason: i64) -> i64` (ADR 0020
+    /// Strategy C). Called by speculatively-unboxed Fixnum arithmetic on
+    /// 47-bit overflow to request a deopt to bytecode.
+    request_deopt_func: cranelift_module::FuncId,
     /// FuncId of `vm_closure_id_peek(callee: i64) -> u32`. Used by
     /// the IC hot path (ADR 0012 D-1, iter BY) to read a callee's
     /// closure id without consuming the Gc handle.
@@ -950,6 +954,13 @@ impl Lowerer {
         builder.symbol(
             "vm_jit_set_tailcall",
             cs_vm::vm::vm_jit_set_tailcall as *const u8,
+        );
+        // ADR 0020 Strategy C — speculative Fixnum unboxing requests a
+        // deopt (and continues with a benign placeholder) when an
+        // unboxed Add/Sub/Mul overflows the 47-bit Fixnum range.
+        builder.symbol(
+            "vm_jit_request_deopt",
+            cs_vm::vm::vm_jit_request_deopt as *const u8,
         );
         builder.symbol(
             "vm_closure_id_peek",
@@ -2198,6 +2209,22 @@ impl Lowerer {
                 &set_tailcall_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_jit_set_tailcall: {e}")))?;
+
+        // ADR 0020 Strategy C — vm_jit_request_deopt(reason: i64) -> i64.
+        // Sets the deopt sentinel on unboxed-Fixnum overflow; returns a
+        // placeholder the body discards.
+        let mut request_deopt_sig = module.make_signature();
+        request_deopt_sig.params.push(AbiParam::new(I64)); // reason code
+        request_deopt_sig.returns.push(AbiParam::new(I64));
+        let request_deopt_func = module
+            .declare_function(
+                "vm_jit_request_deopt",
+                cranelift_module::Linkage::Import,
+                &request_deopt_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_jit_request_deopt: {e}"))
+            })?;
 
         // vm_closure_id_peek(i64) -> i32 (u32 zero-extends).
         let mut closure_id_peek_sig = module.make_signature();
@@ -4577,6 +4604,7 @@ impl Lowerer {
             call_general_func,
             ic_dispatch_func,
             set_tailcall_func,
+            request_deopt_func,
             closure_id_peek_func,
             alloc_vector_func,
             vector_ref_func,
@@ -5204,6 +5232,11 @@ impl Lowerer {
         let func_name = UserFuncName::user(0, inner_seq as u32);
         let mut clif = ClifFunction::with_name_signature(func_name, inner_sig.clone());
         let mut value_map: HashMap<RirValue, cranelift_codegen::ir::Value> = HashMap::new();
+        // ADR 0020 Strategy C — raw (unboxed, sign-extended i64) lane,
+        // parallel to value_map's NB lane. A value is present here iff it
+        // is a proven raw Fixnum (a Fixnum param/const or an unboxed
+        // arith result); consumers needing an NB carrier read value_map.
+        let mut raw_map: HashMap<RirValue, cranelift_codegen::ir::Value> = HashMap::new();
         {
             let mut builder = FunctionBuilder::new(&mut clif, &mut self.func_ctx);
             let nb_helpers = NbHelpers {
@@ -5277,6 +5310,9 @@ impl Lowerer {
                 set_tailcall: self
                     .module
                     .declare_func_in_func(self.set_tailcall_func, builder.func),
+                request_deopt: self
+                    .module
+                    .declare_func_in_func(self.request_deopt_func, builder.func),
                 env_lookup_any: self
                     .module
                     .declare_func_in_func(self.env_lookup_any_func, builder.func),
@@ -5312,9 +5348,17 @@ impl Lowerer {
             }
             builder.switch_to_block(entry_block);
             builder.seal_block(entry_block);
-            for (i, (rv, _ty)) in rir.params.iter().enumerate() {
+            for (i, (rv, ty)) in rir.params.iter().enumerate() {
                 let p = builder.block_params(entry_block)[i];
                 value_map.insert(*rv, p);
+                // ADR 0020 Strategy C — unbox Fixnum params into the raw
+                // lane once at entry. run_jit_body_once has already
+                // validated the Fixnum tag (deopting on a miss), so the
+                // raw payload is trustworthy without a per-op check.
+                if matches!(ty, cs_rir::Type::Fixnum) {
+                    let r = unbox_nb_fixnum(&mut builder, p);
+                    raw_map.insert(*rv, r);
+                }
             }
 
             for blk in &rir.blocks {
@@ -5364,7 +5408,13 @@ impl Lowerer {
                         insts: blk.insts[..n - trim].to_vec(),
                         terminator: blk.terminator.clone(),
                     };
-                    lower_inst_uniform_nb(&mut builder, &mut value_map, &nb_helpers, &truncated)?;
+                    lower_inst_uniform_nb(
+                        &mut builder,
+                        &mut value_map,
+                        &mut raw_map,
+                        &nb_helpers,
+                        &truncated,
+                    )?;
                     let args = tail_args.unwrap();
                     let cargs: Vec<cranelift_codegen::ir::Value> = args
                         .iter()
@@ -5388,7 +5438,13 @@ impl Lowerer {
                         insts: blk.insts[..n - 1].to_vec(),
                         terminator: blk.terminator.clone(),
                     };
-                    lower_inst_uniform_nb(&mut builder, &mut value_map, &nb_helpers, &truncated)?;
+                    lower_inst_uniform_nb(
+                        &mut builder,
+                        &mut value_map,
+                        &mut raw_map,
+                        &nb_helpers,
+                        &truncated,
+                    )?;
                     let callee_v = lookup(&value_map, callee)?;
                     let arg_vs: Vec<cranelift_codegen::ir::Value> = gargs
                         .iter()
@@ -5412,7 +5468,13 @@ impl Lowerer {
                     let placeholder = builder.inst_results(call)[0];
                     builder.ins().return_(&[placeholder]);
                 } else {
-                    lower_inst_uniform_nb(&mut builder, &mut value_map, &nb_helpers, blk)?;
+                    lower_inst_uniform_nb(
+                        &mut builder,
+                        &mut value_map,
+                        &mut raw_map,
+                        &nb_helpers,
+                        blk,
+                    )?;
                     lower_terminator_uniform_nb(
                         &mut builder,
                         &value_map,
@@ -7037,6 +7099,7 @@ struct NbHelpers {
     // args_ptr, n_args) -> i64`. Emitted for tail-position Call /
     // CallGeneral instead of the IC dispatch.
     set_tailcall: cranelift_codegen::ir::FuncRef,
+    request_deopt: cranelift_codegen::ir::FuncRef,
     // Env access. EnvLookup variants share `vm_env_lookup_any` for
     // uniform-NB (it returns an NB-shaped Gc<Value> wrap); EnvSet
     // uses the new `vm_env_set_nb`. `MakeClosure` invokes
@@ -7065,6 +7128,7 @@ struct NbHelpers {
 fn lower_inst_uniform_nb(
     b: &mut FunctionBuilder,
     map: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
+    raw: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
     helpers: &NbHelpers,
     blk: &cs_rir::Block,
 ) -> Result<(), JitError> {
@@ -7074,27 +7138,52 @@ fn lower_inst_uniform_nb(
                 let nb = encode_const_as_nb(c);
                 let v = b.ins().iconst(I64, nb);
                 map.insert(*dst, v);
+                // ADR 0020 Strategy C — seed the raw lane for Fixnum
+                // consts so downstream unboxed arith can consume them
+                // without re-extracting a payload.
+                if let Const::Fixnum(n) = c {
+                    let rv = b.ins().iconst(I64, *n);
+                    raw.insert(*dst, rv);
+                }
             }
             &Inst::Add(dst, lhs, rhs) => {
-                let a = lookup(map, lhs)?;
-                let bv = lookup(map, rhs)?;
-                let r =
-                    emit_nb_arith_fixnum_fast(b, helpers.add, a, bv, |b, l, r| b.ins().iadd(l, r));
-                map.insert(dst, r);
+                lower_nb_arith(
+                    b,
+                    map,
+                    raw,
+                    helpers,
+                    helpers.add,
+                    dst,
+                    lhs,
+                    rhs,
+                    |b, l, r| b.ins().iadd(l, r),
+                )?;
             }
             &Inst::Sub(dst, lhs, rhs) => {
-                let a = lookup(map, lhs)?;
-                let bv = lookup(map, rhs)?;
-                let r =
-                    emit_nb_arith_fixnum_fast(b, helpers.sub, a, bv, |b, l, r| b.ins().isub(l, r));
-                map.insert(dst, r);
+                lower_nb_arith(
+                    b,
+                    map,
+                    raw,
+                    helpers,
+                    helpers.sub,
+                    dst,
+                    lhs,
+                    rhs,
+                    |b, l, r| b.ins().isub(l, r),
+                )?;
             }
             &Inst::Mul(dst, lhs, rhs) => {
-                let a = lookup(map, lhs)?;
-                let bv = lookup(map, rhs)?;
-                let r =
-                    emit_nb_arith_fixnum_fast(b, helpers.mul, a, bv, |b, l, r| b.ins().imul(l, r));
-                map.insert(dst, r);
+                lower_nb_arith(
+                    b,
+                    map,
+                    raw,
+                    helpers,
+                    helpers.mul,
+                    dst,
+                    lhs,
+                    rhs,
+                    |b, l, r| b.ins().imul(l, r),
+                )?;
             }
             // Phase 6 Stage B1 — Inst::Div uses a speculative
             // exact-integer fast path for the (NB Fixnum) / (NB
@@ -7627,6 +7716,117 @@ fn lower_terminator_uniform_nb(
             Ok(())
         }
     }
+}
+
+/// ADR 0020 Strategy C — unbox an NB Fixnum carrier to a raw
+/// sign-extended i64. Emitted once at function entry for `Type::Fixnum`
+/// params (the dispatcher in `run_jit_body_once` already validated the
+/// Fixnum tag and deopts on a miss, so no per-op check is needed).
+/// Mirrors the payload-extract in `emit_nb_arith_fixnum_fast`.
+fn unbox_nb_fixnum(
+    b: &mut FunctionBuilder,
+    nb: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    use cs_vm::vm::NB_PAYLOAD_MASK;
+    let payload = b.ins().band_imm(nb, NB_PAYLOAD_MASK as i64);
+    let shl = b.ins().ishl_imm(payload, 17);
+    b.ins().sshr_imm(shl, 17)
+}
+
+/// ADR 0020 Strategy C — box a raw sign-extended i64 back into an NB
+/// Fixnum carrier. Emitted where an unboxed value flows into an NB
+/// consumer (return, call args, cons, …); when the only consumers are
+/// further unboxed arith, Cranelift DCE removes it.
+fn box_raw_fixnum(
+    b: &mut FunctionBuilder,
+    raw: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    use cs_vm::vm::{NB_PAYLOAD_MASK, NB_SIGNATURE_BITS};
+    let payload = b.ins().band_imm(raw, NB_PAYLOAD_MASK as i64);
+    b.ins().bor_imm(payload, NB_SIGNATURE_BITS as i64)
+}
+
+/// ADR 0020 Strategy C — unboxed Fixnum arithmetic. `a`/`bv` are raw
+/// sign-extended operands already proven Fixnum (no tag check).
+/// Computes `op(a, bv)`, verifies the result fits the 47-bit NB Fixnum
+/// range, and on overflow calls `vm_jit_request_deopt` — continuing
+/// with the 47-bit-truncated value as a benign placeholder, since the
+/// dispatcher discards the body's result once the sentinel is set and
+/// retries on bytecode (which promotes to bignum). Returns raw.
+fn emit_unboxed_fixnum_arith(
+    b: &mut FunctionBuilder,
+    request_deopt: cranelift_codegen::ir::FuncRef,
+    a: cranelift_codegen::ir::Value,
+    bv: cranelift_codegen::ir::Value,
+    op: impl FnOnce(
+        &mut FunctionBuilder,
+        cranelift_codegen::ir::Value,
+        cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let raw = op(b, a, bv);
+    // 47-bit fit check: round-trip through a 17-bit sign extension.
+    let raw_shl = b.ins().ishl_imm(raw, 17);
+    let raw_ext = b.ins().sshr_imm(raw_shl, 17);
+    let fits = b.ins().icmp(IntCC::Equal, raw, raw_ext);
+    let ok_bb = b.create_block();
+    let ov_bb = b.create_block();
+    let join_bb = b.create_block();
+    b.append_block_param(join_bb, I64);
+    b.ins().brif(fits, ok_bb, &[], ov_bb, &[]);
+
+    b.switch_to_block(ok_bb);
+    b.seal_block(ok_bb);
+    b.ins()
+        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(raw)]);
+
+    b.switch_to_block(ov_bb);
+    b.seal_block(ov_bb);
+    let reason = b
+        .ins()
+        .iconst(I64, cs_vm::vm::DEOPT_REASON_FIXNUM_OVERFLOW as i64);
+    b.ins().call(request_deopt, &[reason]);
+    b.ins()
+        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(raw_ext)]);
+
+    b.switch_to_block(join_bb);
+    b.seal_block(join_bb);
+    b.block_params(join_bb)[0]
+}
+
+/// ADR 0020 Strategy C — lower one NB binary arith op (`Add`/`Sub`/
+/// `Mul`). When both operands are in the raw lane (proven Fixnum) the
+/// op is unboxed: `dst` joins the raw lane and its NB carrier is
+/// materialized lazily (DCE'd if only unboxed arith consumes it).
+/// Otherwise the standard NB Fixnum fast path runs.
+#[allow(clippy::too_many_arguments)]
+fn lower_nb_arith(
+    b: &mut FunctionBuilder,
+    map: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
+    raw: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
+    helpers: &NbHelpers,
+    slow_fnref: cranelift_codegen::ir::FuncRef,
+    dst: RirValue,
+    lhs: RirValue,
+    rhs: RirValue,
+    op: impl FnOnce(
+        &mut FunctionBuilder,
+        cranelift_codegen::ir::Value,
+        cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value,
+) -> Result<(), JitError> {
+    if let (Some(&ra), Some(&rb)) = (raw.get(&lhs), raw.get(&rhs)) {
+        let rr = emit_unboxed_fixnum_arith(b, helpers.request_deopt, ra, rb, op);
+        raw.insert(dst, rr);
+        let nb = box_raw_fixnum(b, rr);
+        map.insert(dst, nb);
+    } else {
+        let a = lookup(map, lhs)?;
+        let bv = lookup(map, rhs)?;
+        let r = emit_nb_arith_fixnum_fast(b, slow_fnref, a, bv, op);
+        map.insert(dst, r);
+    }
+    Ok(())
 }
 
 /// Emit the inline Fixnum-Fixnum fast path for an NB-typed binary

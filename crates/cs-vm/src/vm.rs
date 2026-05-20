@@ -639,6 +639,13 @@ pub const DEOPT_REASON_NULL_MISS: u8 = 5;
 /// the dispatch boundary catches it and retries through bytecode
 /// so the error is raised with the correct span.
 pub const DEOPT_REASON_ARITH_MISS: u8 = 6;
+/// Speculative Fixnum unboxing (ADR 0020 Strategy C) hit a 47-bit
+/// overflow on an unboxed `Add`/`Sub`/`Mul`. The exact result is a
+/// bignum, which the raw-i64 lane cannot represent, so the body
+/// requests deopt and continues with a benign truncated placeholder;
+/// `run_jit_body_once` discards the result and retries through
+/// bytecode, which promotes to bignum correctly.
+pub const DEOPT_REASON_FIXNUM_OVERFLOW: u8 = 7;
 
 /// Set the deopt sentinel. Called by JIT runtime helpers on a
 /// type miss before they return a placeholder value.
@@ -662,6 +669,18 @@ pub fn jit_take_deopt() -> u8 {
 #[inline]
 pub fn jit_peek_deopt() -> u8 {
     JIT_DEOPT_REQUESTED.with(|c| c.get())
+}
+
+/// Set the deopt sentinel from a JIT body (exposed to native code as
+/// the `vm_jit_request_deopt` symbol). Used by speculatively-unboxed
+/// Fixnum arithmetic (ADR 0020 Strategy C) on overflow: the body calls
+/// this with a reason code, continues with a benign placeholder, and
+/// `run_jit_body_once` discards the result once `jit_take_deopt`
+/// observes the sentinel. Returns a placeholder the caller discards.
+#[no_mangle]
+pub extern "C" fn vm_jit_request_deopt(reason: i64) -> i64 {
+    jit_request_deopt(reason as u8);
+    0
 }
 
 // ---- ADR 0019 — JIT proper-tail-call bounce trampoline -------------

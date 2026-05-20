@@ -116,6 +116,38 @@ fn diff_ack_3_5() {
 }
 
 #[test]
+fn diff_unboxed_sum_of_squares() {
+    // ADR 0020 Strategy C — arith-heavy body that exercises the
+    // speculative Fixnum unboxing path: `a`/`b` are Fixnum params,
+    // `(* a a)`/`(* b b)` lower to unboxed Mul, and the `(+ ...)` of two
+    // unboxed results stays unboxed. Differential agreement confirms the
+    // unboxed lowering computes the same value as the VM/walker.
+    let defines = &[
+        "(define ss (lambda (a b) (+ (* a a) (* b b))))",
+        "(define warm (lambda (n) \
+            (let loop ((i 0) (acc 0)) (if (> i n) acc (loop (+ i 1) (ss i i))))))",
+    ];
+    assert_three_tier_agreement(defines, Some("(warm 3000)"), "(ss 123 456)");
+}
+
+#[test]
+fn diff_unboxed_fixnum_overflow_deopts_to_bignum() {
+    // ADR 0020 Strategy C — the unboxed Mul must request a deopt when
+    // its result overflows the 47-bit Fixnum range, so the VM promotes
+    // to a bignum. `sq` is warmed with small (Fixnum) inputs to tier it
+    // up, then called with an input whose square overflows: 47-bit max
+    // is ~7.04e13, and (sq 10000000) = 1e14 > that. Pre-deopt this would
+    // silently return a wrapped/garbage Fixnum; correct behavior agrees
+    // with the walker's bignum (1e14 is exact in f64).
+    let defines = &[
+        "(define sq (lambda (x) (* x x)))",
+        "(define warm (lambda (n) \
+            (let loop ((i 0)) (if (> i n) 'done (begin (sq i) (loop (+ i 1)))))))",
+    ];
+    assert_three_tier_agreement(defines, Some("(warm 3000)"), "(sq 10000000)");
+}
+
+#[test]
 fn diff_loop_sum_1_to_n() {
     // Iterative-style sum via tail recursion.
     let defines = &["(define loop-sum (lambda (n) \
