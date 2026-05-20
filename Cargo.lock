@@ -844,6 +844,25 @@ name = "cs-diag"
 version = "0.0.1"
 
 [[package]]
+name = "cs-discovery"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "cs-distrib"
+version = "0.0.1"
+dependencies = [
+ "cs-net",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cs-expand"
 version = "0.0.1"
 dependencies = [
@@ -951,6 +970,20 @@ dependencies = [
  "cs-diag",
  "logos",
  "unicode-normalization",
+]
+
+[[package]]
+name = "cs-net"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "quinn",
+ "rustls",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
 ]
 
 [[package]]
@@ -3424,6 +3457,18 @@ checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
  "tokio",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
 ]
 
 [[package]]
