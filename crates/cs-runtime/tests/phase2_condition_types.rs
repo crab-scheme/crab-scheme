@@ -192,3 +192,83 @@ fn condition_predicate_recognizes_all_three() {
         .unwrap();
     assert_eq!(disp(&rt, &v), "(#t #t #t)");
 }
+
+// ---- raise propagation through higher-order builtins (issue #34) ----
+//
+// Higher-order builtins (map, for-each, filter, fold, ...) previously
+// swallowed `raise` conditions raised inside their callbacks by
+// converting `EvalError` to a plain `String` via `e.message()`. The
+// original condition was lost, so an enclosing `guard` or
+// `with-exception-handler` saw a generic reconstructed error rather
+// than the user's condition value. The fix routes `EvalErrorKind::Raised`
+// and `EvalErrorKind::Escape` through the `pending_raise` /
+// `pending_escape` side-channels via the `propagate_eval_err` helper.
+
+#[test]
+fn raise_inside_map_propagates_through_guard() {
+    let mut rt = Runtime::new();
+    let v = rt
+        .eval_str(
+            "<t>",
+            "(guard (c (#t 'caught))
+               (map (lambda (x) (raise 'oops)) '(1)))",
+        )
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "caught");
+}
+
+#[test]
+fn raise_inside_map_preserves_condition_value() {
+    let mut rt = Runtime::new();
+    let v = rt
+        .eval_str(
+            "<t>",
+            "(guard (c (#t c))
+               (map (lambda (x) (raise 42)) '(1)))",
+        )
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "42");
+}
+
+#[test]
+fn raise_inside_for_each_propagates_through_guard() {
+    let mut rt = Runtime::new();
+    let v = rt
+        .eval_str(
+            "<t>",
+            "(guard (c (#t 'caught))
+               (for-each (lambda (x) (raise 'oops)) '(1 2 3)))",
+        )
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "caught");
+}
+
+#[test]
+fn raise_inside_for_each_preserves_condition_value() {
+    let mut rt = Runtime::new();
+    let v = rt
+        .eval_str(
+            "<t>",
+            "(guard (c (#t c))
+               (for-each (lambda (x) (raise x)) '(99)))",
+        )
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "99");
+}
+
+#[test]
+fn with_exception_handler_catches_raise_inside_map() {
+    let mut rt = Runtime::new();
+    let v = rt
+        .eval_str(
+            "<t>",
+            r#"(call-with-current-continuation
+                 (lambda (k)
+                   (with-exception-handler
+                     (lambda (c) (k (list 'caught c)))
+                     (lambda ()
+                       (map (lambda (x) (raise 'boom)) '(1))))))"#,
+        )
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "(caught boom)");
+}
