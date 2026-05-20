@@ -5,7 +5,7 @@
 //! (bytecode VM, JIT) will share this type.
 
 pub mod effects;
-pub use effects::{Effect, EffectSet, WORKFLOW_FORBIDDEN};
+pub use effects::{Effect, EffectAnnotations, EffectSet, WORKFLOW_FORBIDDEN};
 
 use std::rc::Rc;
 

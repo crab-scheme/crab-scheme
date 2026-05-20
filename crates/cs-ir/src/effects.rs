@@ -217,6 +217,58 @@ pub const WORKFLOW_FORBIDDEN: EffectSet = EffectSet(
     Effect::Net.mask() | Effect::Io.mask() | Effect::WallClock.mask() | Effect::Random.mask(),
 );
 
+/// Symbol → declared-effect-set table populated by the macro expander
+/// as it walks `(define name #:effects '(…) …)` forms. The effect-check
+/// pass (M01 iter D) and the workflow expander (M08) consume this table
+/// to reject bodies that exceed their declared bounds or include
+/// forbidden effects.
+///
+/// Keyed by the top-level binding's `Symbol`. Anonymous lambdas have
+/// no entry (they inherit their enclosing binding's annotation when
+/// one exists; otherwise their effect set is whatever inference
+/// computes).
+///
+/// The table travels with the `Expander` for the duration of a single
+/// expansion session and is exposed to consumers (cs-runtime, the
+/// future cs-workflow expander pass in M08) via a getter so they do
+/// not need to depend on cs-expand internals.
+#[derive(Debug, Clone, Default)]
+pub struct EffectAnnotations {
+    by_symbol: std::collections::HashMap<cs_core::Symbol, EffectSet>,
+}
+
+impl EffectAnnotations {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a declared effect set for a top-level binding. Returns the
+    /// previously declared set, if any, so the caller can detect
+    /// duplicate declarations.
+    pub fn declare(&mut self, name: cs_core::Symbol, effects: EffectSet) -> Option<EffectSet> {
+        self.by_symbol.insert(name, effects)
+    }
+
+    /// Look up a declared effect set. `None` means the user never wrote
+    /// `#:effects` on this binding — its declared bound is implicit
+    /// "anything inference computes."
+    pub fn get(&self, name: cs_core::Symbol) -> Option<EffectSet> {
+        self.by_symbol.get(&name).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_symbol.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_symbol.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (cs_core::Symbol, EffectSet)> + '_ {
+        self.by_symbol.iter().map(|(k, v)| (*k, *v))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
