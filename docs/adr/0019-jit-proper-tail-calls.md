@@ -1,6 +1,6 @@
 # ADR 0019: JIT Proper Tail Calls — Bounce Trampoline
 
-> Status: Accepted (implementation in progress on `perf/jit-sweep`)
+> Status: Accepted (implemented on `perf/jit-sweep`, commit 6d04a98)
 > Date: 2026-05-20
 > Depends on: ADR 0012 (uniform-NB JIT tier, IC dispatch)
 > Closes: the JIT's R6RS proper-tail-call gap (host-stack overflow
