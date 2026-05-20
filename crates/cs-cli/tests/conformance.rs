@@ -919,7 +919,15 @@ fn conformance_macro_hygiene() {
 /// Aggregate count over a small subset to keep the test thread stack happy.
 /// Per-file tests above already exercise everything; this just gates the
 /// total pass count for visibility.
+///
+/// `#[ignore]`d because cargo test runs the 147 per-file tests in parallel
+/// across cores, but this aggregate replays the same content sequentially
+/// in one 16 MB-stack thread — duplicate work that dominated CI runtime
+/// (Run workspace tests was 82–88 min until this was ignored). Run
+/// explicitly with `cargo test -- --ignored` when the rolled-up total is
+/// wanted.
 #[test]
+#[ignore = "runs same content as per-file tests, sequentially; opt-in via --ignored"]
 fn conformance_aggregate_count() {
     // Spawn a thread with a larger stack since the tree-walker recurses on the
     // host stack inside higher-order builtins.
