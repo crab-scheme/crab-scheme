@@ -664,6 +664,66 @@ pub fn jit_peek_deopt() -> u8 {
     JIT_DEOPT_REQUESTED.with(|c| c.get())
 }
 
+// ---- ADR 0019 — JIT proper-tail-call bounce trampoline -------------
+//
+// The Cranelift JIT only converts *self*-recursion in tail position to
+// a constant-stack `return_call`. Every other tail call (cross-function
+// `Call`/`CallGeneral`, or a self-call the translator routed through
+// `CallGeneral`) used to lower to a regular dispatch (`vm_ic_dispatch`
+// / `vm_call_general`) + `return`, leaving the caller's native frame
+// live across the callee. A tail-recursive chain then grew the host
+// stack until it overflowed and aborted the process — violating R6RS
+// proper tail calls (mandelbrot, ping/pong, deep named-let loops).
+//
+// The fix is a bounce trampoline modelled on the deopt sentinel above:
+// a JIT body in tail position calls `vm_jit_set_tailcall(callee, args,
+// n)` (which stashes the call here and returns a placeholder) instead
+// of dispatching, then `return`s. Every site that runs a JIT body
+// (`try_dispatch_jit_nb`, `vm_ic_dispatch`) checks this slot after the
+// body returns and, if a bounce is pending, *loops* — re-dispatching
+// the callee in constant stack rather than recursing.
+//
+// The tuple is `(callee_nb, n_args, [arg_nb; 6])` — all `Copy`, so a
+// `Cell` suffices and a bounce costs no heap allocation (the hot path
+// for tail-recursive loops). `callee_nb` and the first `n_args` arg
+// slots are *owned* NB handles transferred from the emitting body.
+
+thread_local! {
+    static JIT_PENDING_TAILCALL: Cell<Option<(i64, u8, [i64; 6])>> = const { Cell::new(None) };
+}
+
+/// Stash a pending tail call. Called by JIT bodies in tail position via
+/// the `vm_jit_set_tailcall` symbol. `callee` and `args[0..n]` are
+/// owned NB handles whose ownership transfers into the slot; the
+/// trampoline drains it. Returns a placeholder the body discards.
+///
+/// # Safety
+/// `args_ptr` must point to `n` (≤ 6) consecutive live NB i64 slots.
+#[no_mangle]
+pub unsafe extern "C" fn vm_jit_set_tailcall(callee: i64, args_ptr: *const i64, n: i64) -> i64 {
+    let n = n as usize;
+    debug_assert!(n <= 6, "vm_jit_set_tailcall: arity {n} > 6");
+    let mut argv = [0i64; 6];
+    for (i, slot) in argv.iter_mut().enumerate().take(n) {
+        *slot = unsafe { *args_ptr.add(i) };
+    }
+    JIT_PENDING_TAILCALL.with(|c| c.set(Some((callee, n as u8, argv))));
+    0
+}
+
+/// Read and clear the pending tail call (the trampoline's per-iteration
+/// step). Returns `(callee_nb, n_args, args)` or `None`.
+#[inline]
+pub fn jit_take_tailcall() -> Option<(i64, u8, [i64; 6])> {
+    JIT_PENDING_TAILCALL.with(|c| c.replace(None))
+}
+
+/// Whether a tail call is pending without clearing it.
+#[inline]
+pub fn jit_tailcall_pending() -> bool {
+    JIT_PENDING_TAILCALL.with(|c| c.get().is_some())
+}
+
 // ===== Any-lane i64 encoding (Stage 2, inline immediates) =====
 //
 // The JIT's "Any" ABI carries a `Value` as a single i64 word.
@@ -9594,6 +9654,19 @@ pub unsafe extern "C" fn vm_ic_dispatch(
             Err(e) => panic!("vm_ic_dispatch: {}", e.message),
         };
     }
+    // ADR 0019 — if the cached body ended in a proper tail call it left
+    // a bounce in the slot and `raw` is a placeholder. Drive the
+    // trampoline here so the tail chain runs in constant stack rather
+    // than returning the placeholder up to our JIT caller.
+    if jit_tailcall_pending() {
+        let syms_ptr = jit_active_syms();
+        if syms_ptr.is_null() {
+            panic!("vm_ic_dispatch: JIT_ACTIVE_SYMS is null");
+        }
+        let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
+        let nb = drive_jit_tailcalls(syms);
+        return value_to_gc_i64(unsafe { nb.to_value() });
+    }
     value_to_gc_i64(decode_jit_return(closure.jit_return_type(), raw))
 }
 
@@ -9822,19 +9895,25 @@ fn decode_jit_return(rt: u8, r: i64) -> Value {
     unsafe { nb.to_value() }
 }
 
-/// Stage 3 NB-native JIT dispatch entry. Mirrors [`try_dispatch_jit`] but
-/// takes `&[NanboxValue]` and returns `NanboxValue` — no `Value` enum
-/// materialization at the boundary. The JIT body itself still uses the
-/// specialized i64 ABI (per-arg `JIT_RT_*` tags); this function unboxes
-/// directly from NB into those slots.
+/// Run a single JIT body once: validate arity + per-arg type guards,
+/// clone args into the body's owned ABI slots, install the TLS guards,
+/// invoke the native code, and return the *raw* i64 result (the caller
+/// decodes via `closure.jit_return_type()`). Returns `None` when the
+/// body can't be dispatched (arity / type-guard miss) or requested a
+/// deopt.
+///
+/// Does NOT consume `args` (clones internally, as the dispatch ABI
+/// requires) and does NOT drain the tail-call bounce slot — callers
+/// trampoline on it (ADR 0019). Use [`try_dispatch_jit_nb`] for the
+/// trampolined entry that decodes the result.
 ///
 /// Hot path: the main VM `Inst::Call` arm hands a `[NanboxValue; 6]`
 /// stack-local array into this without allocating a `Vec<Value>`.
-fn try_dispatch_jit_nb(
+fn run_jit_body_once(
     closure: &VmClosure,
     args: &[NanboxValue],
     syms: &mut SymbolTable,
-) -> Option<NanboxValue> {
+) -> Option<i64> {
     let ptr = closure.jit_ptr();
     if ptr.is_null() {
         return None;
@@ -9987,7 +10066,141 @@ fn try_dispatch_jit_nb(
         }
         return None;
     }
-    Some(decode_jit_return_nb(closure.jit_return_type(), r))
+    Some(r)
+}
+
+/// Stage 3 NB-native JIT dispatch entry. Mirrors [`try_dispatch_jit`] but
+/// takes `&[NanboxValue]` and returns `NanboxValue` — no `Value` enum
+/// materialization at the boundary.
+///
+/// Runs the body via [`run_jit_body_once`] and then *trampolines* any
+/// proper-tail-call bounce the body left in the slot (ADR 0019), so
+/// tail-recursive JIT chains execute in constant host stack instead of
+/// overflowing. The common (non-tail-bounce) path is one extra
+/// thread-local check, mirroring the deopt check.
+///
+/// Hot path: the main VM `Inst::Call` arm hands a `[NanboxValue; 6]`
+/// stack-local array into this without allocating a `Vec<Value>`.
+fn try_dispatch_jit_nb(
+    closure: &VmClosure,
+    args: &[NanboxValue],
+    syms: &mut SymbolTable,
+) -> Option<NanboxValue> {
+    let r = run_jit_body_once(closure, args, syms)?;
+    if jit_tailcall_pending() {
+        Some(drive_jit_tailcalls(syms))
+    } else {
+        Some(decode_jit_return_nb(closure.jit_return_type(), r))
+    }
+}
+
+/// Proper-tail-call trampoline (ADR 0019). Called when a just-run JIT
+/// body left a bounce in [`jit_take_tailcall`]'s slot. Loops,
+/// re-dispatching each bounced tail call in constant stack until a body
+/// returns normally (no further bounce) or a bounce target isn't
+/// JIT-dispatchable (in which case it's applied once through the VM,
+/// which has its own proper tail calls).
+///
+/// Ownership: each bounce carries owned NB handles (callee + args)
+/// transferred from the emitting body — symmetric with the
+/// `vm_ic_dispatch` / `vm_call_general` arg ABI. On the JIT-success path
+/// the next body clones its own arg copies, so we drop the handles we
+/// carried; on the VM-fallback path `gc_i64_to_value` consumes them.
+fn drive_jit_tailcalls(syms: &mut SymbolTable) -> NanboxValue {
+    loop {
+        let (callee_nb, n, argv) =
+            jit_take_tailcall().expect("drive_jit_tailcalls: no pending bounce");
+        let n = n as usize;
+        // Resolve the callee, consuming its owned handle (matches
+        // `vm_call_general`'s `gc_i64_to_value(callee)`).
+        let callee_v = unsafe { gc_i64_to_value(callee_nb) };
+        // JIT-dispatchable iff a VmClosure with a native body of the
+        // matching arity (and within the 6-arg fast-path window).
+        //
+        // Force a tier-up compile of a not-yet-JIT'd target up front: a
+        // function only ever *reached via bounces* (e.g. the `row` loop
+        // in a nested named-let, called only by the inner `col` loop)
+        // would otherwise never tier up — it'd run on the VM through
+        // `apply_bounce_via_vm` → `vm_call_sync` → `run()`, nesting one
+        // host frame per bounce (O(depth) → overflow). Compiling it here
+        // keeps the whole tail chain on the flat trampoline loop.
+        let cptr: Option<*const VmClosure> = match &callee_v {
+            Value::Procedure(p) => match p.as_any().downcast_ref::<VmClosure>() {
+                Some(c) if n <= 6 => {
+                    if c.jit_ptr().is_null() {
+                        // Build Value hints from the args without
+                        // consuming the owned handles we still carry.
+                        let mut hint_args: Vec<Value> = Vec::with_capacity(n);
+                        for &x in argv.iter().take(n) {
+                            let cloned = unsafe { vm_value_clone_gc(x) };
+                            hint_args.push(unsafe { gc_i64_to_value(cloned) });
+                        }
+                        fire_tier_up_hook(c, &hint_args);
+                    }
+                    if !c.jit_ptr().is_null() && c.jit_arity() as usize == n {
+                        Some(c as *const VmClosure)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(cptr) = cptr {
+            // SAFETY: `callee_v` owns the `Rc<VmClosure>` for the whole
+            // iteration; single-threaded execution means no aliasing
+            // mutation, so the reborrow is valid until `callee_v` drops
+            // at iteration end (the raw ptr just dodges the borrow that
+            // would otherwise conflict with the `continue` drop).
+            let c = unsafe { &*cptr };
+            let mut nb = [NanboxValue(0); 6];
+            for (i, slot) in nb.iter_mut().enumerate().take(n) {
+                *slot = NanboxValue(argv[i]);
+            }
+            match run_jit_body_once(c, &nb[..n], syms) {
+                Some(rr) => {
+                    // The body incref'd its own copies of the args; free
+                    // the owned handles the bounce carried.
+                    for &x in argv.iter().take(n) {
+                        unsafe { vm_value_drop_gc(x) };
+                    }
+                    if jit_tailcall_pending() {
+                        continue;
+                    }
+                    return decode_jit_return_nb(c.jit_return_type(), rr);
+                }
+                None => {
+                    // Arity/type-guard miss (no clone made) or a deopt
+                    // (the body consumed its own clones, not ours). We
+                    // still own `argv`; apply through the VM.
+                    return apply_bounce_via_vm(&callee_v, n, &argv, syms);
+                }
+            }
+        } else {
+            return apply_bounce_via_vm(&callee_v, n, &argv, syms);
+        }
+    }
+}
+
+/// Apply a non-JIT-dispatchable bounce target through the bytecode VM.
+/// Consumes the `n` owned arg handles in `argv`. The VM honours proper
+/// tail calls itself, so this adds at most one frame before the VM
+/// takes over a tail-recursive chain.
+fn apply_bounce_via_vm(
+    callee_v: &Value,
+    n: usize,
+    argv: &[i64; 6],
+    syms: &mut SymbolTable,
+) -> NanboxValue {
+    let mut args: Vec<Value> = Vec::with_capacity(n);
+    for &x in argv.iter().take(n) {
+        args.push(unsafe { gc_i64_to_value(x) });
+    }
+    match vm_call_sync(callee_v, &args, syms) {
+        Ok(v) => NanboxValue::from_value(v),
+        Err(e) => panic!("vm_jit tail-call: {}", e.message),
+    }
 }
 
 /// NB-native counterpart to [`decode_jit_return`]. Wraps the JIT body's

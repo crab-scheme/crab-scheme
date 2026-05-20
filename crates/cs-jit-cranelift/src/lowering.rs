@@ -192,6 +192,12 @@ pub struct Lowerer {
     /// `call_indirect`: it installs the callee's env / bytecode /
     /// stack-map-frame TLS guards first (ADR 0012 D-1, iter JI).
     ic_dispatch_func: cranelift_module::FuncId,
+    /// FuncId of `vm_jit_set_tailcall(callee: i64, args_ptr: *const i64,
+    /// n: i64) -> i64`. A tail-position `Call`/`CallGeneral` lowers to a
+    /// call against this (instead of the IC dispatch) + a `return`, so
+    /// the dispatch trampoline re-runs the callee in constant stack
+    /// (ADR 0019).
+    set_tailcall_func: cranelift_module::FuncId,
     /// FuncId of `vm_closure_id_peek(callee: i64) -> u32`. Used by
     /// the IC hot path (ADR 0012 D-1, iter BY) to read a callee's
     /// closure id without consuming the Gc handle.
@@ -937,6 +943,14 @@ impl Lowerer {
         builder.symbol("vm_call_general", cs_vm::vm::vm_call_general as *const u8);
         // ADR 0012 D-1 (iter JI) — IC hot-path dispatch helper.
         builder.symbol("vm_ic_dispatch", cs_vm::vm::vm_ic_dispatch as *const u8);
+        // ADR 0019 — proper-tail-call bounce. A JIT body in tail
+        // position calls this to stash (callee, args) and returns a
+        // placeholder; the dispatch trampoline re-runs it in constant
+        // stack instead of recursing through the IC.
+        builder.symbol(
+            "vm_jit_set_tailcall",
+            cs_vm::vm::vm_jit_set_tailcall as *const u8,
+        );
         builder.symbol(
             "vm_closure_id_peek",
             cs_vm::vm::vm_closure_id_peek as *const u8,
@@ -2168,6 +2182,22 @@ impl Lowerer {
                 &ic_dispatch_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_ic_dispatch: {e}")))?;
+
+        // ADR 0019 — vm_jit_set_tailcall(callee: i64, args_ptr: i64,
+        // n: i64) -> i64. Stashes a proper tail call for the dispatch
+        // trampoline; returns a placeholder the body discards.
+        let mut set_tailcall_sig = module.make_signature();
+        set_tailcall_sig.params.push(AbiParam::new(I64)); // callee NB handle
+        set_tailcall_sig.params.push(AbiParam::new(I64)); // args buffer pointer
+        set_tailcall_sig.params.push(AbiParam::new(I64)); // n_args
+        set_tailcall_sig.returns.push(AbiParam::new(I64));
+        let set_tailcall_func = module
+            .declare_function(
+                "vm_jit_set_tailcall",
+                cranelift_module::Linkage::Import,
+                &set_tailcall_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_jit_set_tailcall: {e}")))?;
 
         // vm_closure_id_peek(i64) -> i32 (u32 zero-extends).
         let mut closure_id_peek_sig = module.make_signature();
@@ -4546,6 +4576,7 @@ impl Lowerer {
             any_truthy_func,
             call_general_func,
             ic_dispatch_func,
+            set_tailcall_func,
             closure_id_peek_func,
             alloc_vector_func,
             vector_ref_func,
@@ -5208,6 +5239,9 @@ impl Lowerer {
                 call_general: self
                     .module
                     .declare_func_in_func(self.call_general_func, builder.func),
+                set_tailcall: self
+                    .module
+                    .declare_func_in_func(self.set_tailcall_func, builder.func),
                 env_lookup_any: self
                     .module
                     .declare_func_in_func(self.env_lookup_any_func, builder.func),
@@ -5345,6 +5379,46 @@ impl Lowerer {
                         .map(|a| lookup(&value_map, *a))
                         .collect::<Result<_, _>>()?;
                     builder.ins().return_call(nb_helpers.self_fn, &cargs);
+                } else if let Some((callee, gargs)) = detect_tail_call_general(rir, blk) {
+                    // ADR 0019 — tail-position Call / CallGeneral. Lower
+                    // the block's other insts (which produce `callee` and
+                    // `gargs` as owned NB handles), then stash the call
+                    // via `vm_jit_set_tailcall` and `return` a
+                    // placeholder. The dispatch trampoline re-runs the
+                    // callee in constant stack instead of recursing
+                    // through the IC. Ownership of callee + args transfers
+                    // into the slot exactly as it would have transferred
+                    // to vm_ic_dispatch / vm_call_general.
+                    let n = blk.insts.len();
+                    let truncated = cs_rir::Block {
+                        id: blk.id,
+                        params: blk.params.clone(),
+                        insts: blk.insts[..n - 1].to_vec(),
+                        terminator: blk.terminator.clone(),
+                    };
+                    lower_inst_uniform_nb(&mut builder, &mut value_map, &nb_helpers, &truncated)?;
+                    let callee_v = lookup(&value_map, callee)?;
+                    let arg_vs: Vec<cranelift_codegen::ir::Value> = gargs
+                        .iter()
+                        .map(|a| lookup(&value_map, *a))
+                        .collect::<Result<_, _>>()?;
+                    let n_args = gargs.len();
+                    let buf_bytes = std::cmp::max(8u32, (n_args as u32) * 8);
+                    let buf_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        buf_bytes,
+                        3,
+                    ));
+                    for (i, av) in arg_vs.iter().enumerate() {
+                        let _ = builder.ins().stack_store(*av, buf_slot, (i as i32) * 8);
+                    }
+                    let buf_addr = builder.ins().stack_addr(I64, buf_slot, 0);
+                    let n_args_v = builder.ins().iconst(I64, n_args as i64);
+                    let call = builder
+                        .ins()
+                        .call(nb_helpers.set_tailcall, &[callee_v, buf_addr, n_args_v]);
+                    let placeholder = builder.inst_results(call)[0];
+                    builder.ins().return_(&[placeholder]);
                 } else {
                     lower_inst_uniform_nb(&mut builder, &mut value_map, &nb_helpers, blk)?;
                     lower_terminator_uniform_nb(
@@ -6780,6 +6854,48 @@ fn detect_tail_call_self<'a>(
     rir: &'a RirFunction,
     block: &'a cs_rir::Block,
 ) -> Option<&'a [RirValue]> {
+    detect_tail_call_self_inner(rir, block)
+}
+
+/// Tail-position `Call` / `CallGeneral` detection (ADR 0019). Same
+/// structural shape as [`detect_tail_call_self`] — the block's last
+/// inst's `dst` is returned directly (`Term::Return(dst)`) or through a
+/// trivial join (`Term::Jump(t, [dst])` where `t` only returns its
+/// param) — but for a *dynamic* callee. Returns `(callee, args)` so the
+/// caller can emit a `vm_jit_set_tailcall(callee, args, n)` bounce plus
+/// `return`, letting the dispatch trampoline run the callee in constant
+/// stack instead of recursing through the IC.
+fn detect_tail_call_general<'a>(
+    rir: &'a RirFunction,
+    block: &'a cs_rir::Block,
+) -> Option<(RirValue, &'a [RirValue])> {
+    let last = block.insts.last()?;
+    let (dst, callee, args) = match last {
+        Inst::Call(dst, callee, args) | Inst::CallGeneral(dst, callee, args) => {
+            (dst, *callee, args.as_slice())
+        }
+        _ => return None,
+    };
+    match &block.terminator {
+        Term::Return(ret_v) if ret_v == dst => Some((callee, args)),
+        Term::Jump(target, jump_args) if jump_args.len() == 1 && jump_args[0] == *dst => {
+            let target_block = rir.blocks.iter().find(|b| b.id == *target)?;
+            if !target_block.insts.is_empty() {
+                return None;
+            }
+            match (&target_block.terminator, target_block.params.first()) {
+                (Term::Return(rv), Some((p, _))) if rv == p => Some((callee, args)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn detect_tail_call_self_inner<'a>(
+    rir: &'a RirFunction,
+    block: &'a cs_rir::Block,
+) -> Option<&'a [RirValue]> {
     let last = block.insts.last()?;
     let (dst, args) = match last {
         Inst::CallSelf(dst, args) => (dst, args.as_slice()),
@@ -6871,6 +6987,10 @@ struct NbHelpers {
     // path. `vm_call_general(callee, args_ptr, n_args, slot_ptr)`.
     self_fn: cranelift_codegen::ir::FuncRef,
     call_general: cranelift_codegen::ir::FuncRef,
+    // ADR 0019 — proper-tail-call bounce. `vm_jit_set_tailcall(callee,
+    // args_ptr, n_args) -> i64`. Emitted for tail-position Call /
+    // CallGeneral instead of the IC dispatch.
+    set_tailcall: cranelift_codegen::ir::FuncRef,
     // Env access. EnvLookup variants share `vm_env_lookup_any` for
     // uniform-NB (it returns an NB-shaped Gc<Value> wrap); EnvSet
     // uses the new `vm_env_set_nb`. `MakeClosure` invokes
