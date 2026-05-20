@@ -1,0 +1,13 @@
+[package]
+name = "cs-consensus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme consensus engine: Raft-backed replicated actors, leader-elected log replication, joint-consensus membership change, leases with monotonic fencing tokens. v1 wraps openraft. See docs/research/sdk_spec/consistency.md § M06-M07."
+
+[dependencies]
+thiserror = "1"
+# openraft itself comes in M06 iter A. The scaffold doesn't pull it
+# yet to keep the workspace lean during the scaffold-only milestones.

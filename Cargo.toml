@@ -33,6 +33,13 @@ members = [
     "crates/cs-channel",
     "crates/cs-table",
     "crates/cs-hotreload",
+    # Consistency + durable execution — Phase C+D scaffolds.
+    # See docs/research/sdk_spec/consistency.md (M05-M07) and
+    # durable-execution.md (M08). cs-agent + cs-cap remain as
+    # empty directories awaiting Phase D follow-up.
+    "crates/cs-crdt",
+    "crates/cs-consensus",
+    "crates/cs-workflow",
     # Tower-style async web framework. Builds on tokio/hyper, integrates
     # with cs-actor (actor-backed handlers), cs-table (access log +
     # sessions), and cs-runtime (Scheme route registration).

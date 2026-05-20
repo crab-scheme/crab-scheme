@@ -1,0 +1,11 @@
+[package]
+name = "cs-workflow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme durable workflow engine: journal-replay execution, activities + retries + timeouts, sagas with compensation, awakeables for durable promises, continue-as-new for long workflows. Inspired by Temporal/Restate/DBOS, adapted for Scheme. See docs/research/sdk_spec/durable-execution.md § M08."
+
+[dependencies]
+thiserror = "1"

@@ -829,6 +829,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-consensus"
+version = "0.0.1"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "cs-core"
 version = "0.0.1"
 dependencies = [
@@ -837,6 +844,13 @@ dependencies = [
  "num-bigint",
  "num-rational",
  "num-traits",
+]
+
+[[package]]
+name = "cs-crdt"
+version = "0.0.1"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1423,6 +1437,13 @@ name = "cs-web-mod-example"
 version = "0.0.1"
 dependencies = [
  "cs-web",
+]
+
+[[package]]
+name = "cs-workflow"
+version = "0.0.1"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]

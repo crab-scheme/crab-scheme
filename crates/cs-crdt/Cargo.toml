@@ -1,0 +1,13 @@
+[package]
+name = "cs-crdt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme CRDT layer: G-Counter, PN-Counter, OR-Set, OR-Map, LWW-Register, MV-Register, with HLC timestamps + DVV causal context + delta-state sync. See docs/research/sdk_spec/consistency.md § M05."
+
+[dependencies]
+thiserror = "1"
+
+[dev-dependencies]
