@@ -7,15 +7,17 @@ help, formatting, workspace symbols, rename, and semantic highlighting.
 
 ## Prerequisites
 
-The `crabscheme-lsp` binary must be installed and on your `PATH` (or set
-`crabscheme.serverPath`). Get it from a CrabScheme release tarball or
-build it:
+The `crabscheme-lsp` binary must be on your `PATH` (or set
+`crabscheme.serverPath`). Install it from source:
 
 ```sh
-cargo build --release -p cs-lsp   # produces target/release/crabscheme-lsp
+cargo install --path crates/cs-lsp   # → crabscheme-lsp (+ crabscheme-mcp) in ~/.cargo/bin
 ```
 
 ## Build & install the extension
+
+This extension isn't published to the Marketplace — build the `.vsix` and
+install it locally:
 
 ```sh
 cd crabscheme-vscode

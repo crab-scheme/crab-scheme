@@ -74,8 +74,9 @@
 > into the native tarballs; servers are native-only, WASM ships only
 > `crabscheme.wasm`), 6.6 (the user guide above). New cs-lsp modules
 > `harness`, `mcp`; new bin `crabscheme-mcp`; new deps serde/serde_json/
-> clap. **Marketplace/registry publishing remains a manual release step**
-> (needs publisher accounts/tokens). The LSP milestone is complete.
+> clap. **Distribution is install-from-source** (`cargo install --path
+> crates/cs-lsp` → both servers; VS Code via a locally-built `.vsix`) —
+> no package-registry publishing. The LSP milestone is complete.
 >
 > **Target outcome:** ship `crabscheme-lsp`, a Language Server
 > Protocol implementation that gives editors (VS Code, Neovim,

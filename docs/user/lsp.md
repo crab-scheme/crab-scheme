@@ -19,37 +19,43 @@ formatting, workspace symbol search, rename, and semantic tokens.
 > scope/hygiene. Diagnostics cover parse + macro-expansion errors (not yet
 > type/compile errors).
 
-## Install
+## Install from source
 
-The release tarball `crabscheme-<version>-<target>.tar.gz` bundles
-`crabscheme`, `crabscheme-lsp`, and `crabscheme-mcp`. Put them on your
-`PATH`:
-
-```sh
-tar xzf crabscheme-1.0-rc5-darwin-aarch64.tar.gz
-sudo install crabscheme-1.0-rc5-darwin-aarch64/crabscheme-lsp /usr/local/bin/
-sudo install crabscheme-1.0-rc5-darwin-aarch64/crabscheme-mcp /usr/local/bin/
-```
-
-Or build from source (any checkout):
+The servers aren't published to any package registry — build them from a
+checkout. The `cs-lsp` crate produces **both** `crabscheme-lsp` and
+`crabscheme-mcp`, so one `cargo install` puts them on your `PATH`
+(`~/.cargo/bin`):
 
 ```sh
-cargo build --release -p cs-lsp        # builds both crabscheme-lsp and crabscheme-mcp
-# binaries land in target/release/
+cargo install --path crates/cs-lsp     # → crabscheme-lsp + crabscheme-mcp
+cargo install --path crates/cs-cli     # → crabscheme (the interpreter), optional
 ```
 
-> The `wasm32-wasip1` release ships only `crabscheme.wasm`; the LSP/MCP
+Make sure `~/.cargo/bin` is on your `PATH` (`cargo install` prints the
+location). Verify with `crabscheme-lsp --version`; smoke-test
+`crabscheme-mcp` per the Troubleshooting section (it reads JSON-RPC on
+stdin and has no flags).
+
+If you'd rather not install, just build and reference the binaries by path
+(`target/release/crabscheme-lsp`):
+
+```sh
+cargo build --release -p cs-lsp        # binaries land in target/release/
+```
+
+> The `wasm32-wasip1` build ships only `crabscheme.wasm`; the LSP/MCP
 > servers are native-only (they need host stdio).
 
 ## Editors (LSP)
 
 ### VS Code
 
-A ready-to-build extension lives in [`crabscheme-vscode/`](../../crabscheme-vscode/):
+The extension isn't on the Marketplace — build the `.vsix` from
+[`crabscheme-vscode/`](../../crabscheme-vscode/) and install it locally:
 
 ```sh
 cd crabscheme-vscode && npm install && npm run package
-code --install-extension crabscheme-*.vsix
+code --install-extension crabscheme-vscode-*.vsix
 ```
 
 It activates on `.scm` files and spawns `crabscheme-lsp` from your `PATH`
@@ -112,12 +118,15 @@ projects, add to the project's `.mcp.json` or your user config:
 ### MCP server — Claude Desktop
 
 Add to `claude_desktop_config.json` (macOS:
-`~/Library/Application Support/Claude/claude_desktop_config.json`):
+`~/Library/Application Support/Claude/claude_desktop_config.json`). Claude
+Desktop doesn't inherit your shell `PATH` or expand `~`, so use the
+**absolute** path that `cargo install` reported (typically
+`/Users/<you>/.cargo/bin/crabscheme-mcp`):
 
 ```json
 {
   "mcpServers": {
-    "crabscheme": { "command": "/usr/local/bin/crabscheme-mcp" }
+    "crabscheme": { "command": "/Users/you/.cargo/bin/crabscheme-mcp" }
   }
 }
 ```
