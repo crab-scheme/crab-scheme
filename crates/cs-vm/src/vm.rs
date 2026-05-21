@@ -828,6 +828,17 @@ fn value_to_gc_i64(v: Value) -> i64 {
     NanboxValue::from_value(v).into_raw()
 }
 
+/// AOT helper: materialize an inline string literal as an NB-encoded heap
+/// string. The cs-aot backend emits `cs_vm::vm::vm_string_const_nb("…")`
+/// for `Const::String`; the returned i64 is the `NanboxValue` raw carrier
+/// of a fresh `Value::String`, owned by the caller (the same
+/// single-consumer Any-lane contract as the other NB producers). Strings
+/// are the first heap constant the AOT pipeline materializes — see
+/// `cs_aot`'s `Const::String` lowering.
+pub fn vm_string_const_nb(s: &str) -> i64 {
+    NanboxValue::from_value(Value::string(s.to_string())).into_raw()
+}
+
 /// Decode an Any-lane i64. For an inline tagged immediate, returns
 /// the corresponding `Value` directly (no refcount work). For a
 /// `Gc<Value>` raw handle, consumes one strong count (`Rc::from_raw`

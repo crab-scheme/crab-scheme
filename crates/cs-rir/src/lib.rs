@@ -82,6 +82,14 @@ pub enum Const {
     /// Static-string-table index. The JIT loads via a `static`-table
     /// indirection so we don't bake string content into native code.
     StringRef(u32),
+    /// An inline string literal. Used by the **AOT** backend, where
+    /// baking the content into the emitted Rust source (as a `&str`
+    /// literal that materializes a heap string at runtime) is exactly
+    /// what we want — there's no native-code-size concern the way there
+    /// is for the JIT. The cranelift JIT declines functions carrying
+    /// this const (they stay on the VM tier), so it's AOT-only in
+    /// practice.
+    String(String),
 }
 
 /// One RIR instruction. Each variant cites the equivalent `cs-vm`

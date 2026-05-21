@@ -4683,8 +4683,14 @@ impl Lowerer {
                     // (declines → VM).
                     #[cfg(feature = "regions")]
                     Inst::ConsRegion(_, _, _, _, _) => {}
-                    Inst::LoadConst(_, _)
-                    | Inst::Add(_, _, _)
+                    // String constants need heap materialization the JIT
+                    // skeleton doesn't do — let them fall through to the
+                    // decline catch-all below (function stays on the VM
+                    // tier). Every other LoadConst flavor is inline-NB-
+                    // encodable and supported.
+                    Inst::LoadConst(_, c)
+                        if !matches!(c, Const::String(_) | Const::StringRef(_)) => {}
+                    Inst::Add(_, _, _)
                     | Inst::Sub(_, _, _)
                     | Inst::Mul(_, _, _)
                     | Inst::Div(_, _, _)
@@ -9782,14 +9788,12 @@ fn encode_const_as_nb(c: &Const) -> i64 {
         // doesn't support these yet — the translator will route any
         // function containing `Const::StringRef` to the specialized
         // tier (or bytecode).
-        Const::StringRef(_) => {
-            // Sentinel: the caller in `lower_inst_uniform_nb` won't
-            // reach this branch because the Inst::LoadConst arm would
-            // need to fail-out before invoking us. Defensive: return
-            // `Value::Unspecified` NB to keep the lowering honest if
-            // a translator bug routes us here.
-            NanboxValue::UNSPECIFIED.into_raw()
-        }
+        // StringRef (table index) and the AOT-only inline String both
+        // need heap materialization the JIT skeleton doesn't do. The
+        // support gate declines any function carrying them, so this is
+        // unreachable in practice; the sentinel keeps lowering honest if
+        // a translator bug ever routes us here.
+        Const::StringRef(_) | Const::String(_) => NanboxValue::UNSPECIFIED.into_raw(),
     }
 }
 

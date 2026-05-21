@@ -424,7 +424,10 @@ fn infer_value_types(func: &Function) -> std::collections::HashMap<Value, Type> 
                         Const::Character(_) => Type::Character,
                         Const::Null => Type::Null,
                         Const::Symbol(_) => Type::Symbol,
-                        Const::Unspecified | Const::Eof | Const::StringRef(_) => Type::Any,
+                        Const::Unspecified
+                        | Const::Eof
+                        | Const::StringRef(_)
+                        | Const::String(_) => Type::Any,
                     };
                     Some((*dst, t))
                 }
@@ -2652,6 +2655,9 @@ fn const_to_rust_i64(c: &Const) -> Result<String, AotError> {
         Const::Eof => Err(AotError::UnsupportedConst("Eof")),
         Const::Symbol(_) => Err(AotError::UnsupportedConst("Symbol")),
         Const::StringRef(_) => Err(AotError::UnsupportedConst("StringRef")),
+        // Strings are heap values — they need the NB ABI; RawI64 mode
+        // (pure i64, no runtime link) can't represent them.
+        Const::String(_) => Err(AotError::UnsupportedConst("String")),
     }
 }
 
@@ -2697,6 +2703,12 @@ fn const_to_rust_nb(c: &Const) -> Result<String, AotError> {
         // case-marker sentinel) just need the sym id to round-trip.
         Const::Symbol(s) => nb_make(NB_TAG_SYMBOL, *s as u64),
         Const::StringRef(_) => return Err(AotError::UnsupportedConst("StringRef")),
+        // An inline string isn't a compile-time NB bit pattern — it needs
+        // a runtime heap allocation. Emit a call to the cs-vm helper that
+        // materializes a `Value::String` and returns its NB carrier.
+        // `{s:?}` renders a properly escaped Rust `&str` literal, so
+        // embedded quotes/newlines/unicode round-trip safely.
+        Const::String(s) => return Ok(format!("cs_vm::vm::vm_string_const_nb({s:?})")),
     };
     // Render as a hex literal with the i64 suffix. Using hex makes
     // the high bits readable (NB carriers all start with 0xFFF8...).
@@ -3349,5 +3361,37 @@ mod tests {
         assert_eq!(sanitize_ident("string->list"), "string__list");
         assert_eq!(sanitize_ident(""), "proc_anon");
         assert_eq!(sanitize_ident("1plus"), "proc_1plus");
+    }
+
+    #[test]
+    fn nb_string_const_emits_runtime_helper() {
+        // Const::String lowers (Nb mode) to a cs-vm runtime call that
+        // materializes a heap string and returns its NB carrier. The
+        // content round-trips as an escaped Rust `&str` literal, so
+        // embedded quotes survive. RawI64 mode can't represent heap
+        // strings.
+        let mut f = Function::new("p");
+        f.params.push((Value(0), Type::Any));
+        f.return_type = Type::Any;
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::LoadConst(
+                Value(1),
+                Const::String("hi \"x\"".to_string()),
+            )],
+            terminator: Term::Return(Value(1)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(
+            src.contains(r#"cs_vm::vm::vm_string_const_nb("hi \"x\"")"#),
+            "emitted: {src}"
+        );
+        // RawI64 mode (pure i64, no runtime link) can't represent heap
+        // strings — it errors (here on the Any param/return before even
+        // reaching the const, which is fine; the point is it never emits
+        // a string in RawI64).
+        assert!(emit_with(EmitMode::RawI64, &f).is_err());
     }
 }

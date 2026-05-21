@@ -8252,6 +8252,12 @@ fn value_to_const(v: &cs_core::Value) -> Result<Const, TranslateError> {
         Value::Null => Ok(Const::Null),
         Value::Unspecified => Ok(Const::Unspecified),
         Value::Symbol(s) => Ok(Const::Symbol(s.0)),
+        // Inline string literal. Consumed by the AOT backend (which bakes
+        // the content into emitted Rust). The cranelift JIT's support gate
+        // declines any function carrying `Const::String`, so on the JIT
+        // path this just routes the function to the VM tier — the same
+        // outcome as the old "unsupported const" translate failure.
+        Value::String(s) => Ok(Const::String(s.borrow().clone())),
         other => Err(TranslateError::Unsupported(format!(
             "Const value {:?} not in iter-5 scope",
             other
