@@ -5292,7 +5292,15 @@ impl Lowerer {
                     | Inst::FxFirstBitSet(_, _)
                     | Inst::BitwiseBitSetP(_, _, _)
                     | Inst::ExactNonNegIntP(_, _)
-                    | Inst::EqualAny(_, _, _) => {
+                    | Inst::EqualAny(_, _, _)
+                    | Inst::Expt(_, _, _)
+                    | Inst::Gcd(_, _, _)
+                    | Inst::Lcm(_, _, _)
+                    | Inst::ArithShift(_, _, _)
+                    | Inst::BitwiseArithShiftLeft(_, _, _)
+                    | Inst::BitwiseArithShiftRight(_, _, _)
+                    | Inst::DivEuclid(_, _, _)
+                    | Inst::ModEuclid(_, _, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -6053,6 +6061,30 @@ impl Lowerer {
                 equal_any: self
                     .module
                     .declare_func_in_func(self.equal_func, builder.func),
+                expt: self
+                    .module
+                    .declare_func_in_func(self.expt_func, builder.func),
+                gcd: self
+                    .module
+                    .declare_func_in_func(self.gcd_func, builder.func),
+                lcm: self
+                    .module
+                    .declare_func_in_func(self.lcm_func, builder.func),
+                arith_shift: self
+                    .module
+                    .declare_func_in_func(self.arith_shift_func, builder.func),
+                bitwise_arith_shift_left: self
+                    .module
+                    .declare_func_in_func(self.bitwise_arith_shift_left_func, builder.func),
+                bitwise_arith_shift_right: self
+                    .module
+                    .declare_func_in_func(self.bitwise_arith_shift_right_func, builder.func),
+                div_euclid: self
+                    .module
+                    .declare_func_in_func(self.div_euclid_func, builder.func),
+                mod_euclid: self
+                    .module
+                    .declare_func_in_func(self.mod_euclid_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -8217,6 +8249,16 @@ struct NbHelpers {
     bitwise_bit_set_p: cranelift_codegen::ir::FuncRef,
     exact_non_neg_int_p: cranelift_codegen::ir::FuncRef,
     equal_any: cranelift_codegen::ir::FuncRef,
+    // #50 — fixnum `_fx` arithmetic (raw operands + raw result that may
+    // overflow 47 bits → 47-bit check + deopt via nb_fx_call_or_deopt).
+    expt: cranelift_codegen::ir::FuncRef,
+    gcd: cranelift_codegen::ir::FuncRef,
+    lcm: cranelift_codegen::ir::FuncRef,
+    arith_shift: cranelift_codegen::ir::FuncRef,
+    bitwise_arith_shift_left: cranelift_codegen::ir::FuncRef,
+    bitwise_arith_shift_right: cranelift_codegen::ir::FuncRef,
+    div_euclid: cranelift_codegen::ir::FuncRef,
+    mod_euclid: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -9939,6 +9981,71 @@ fn lower_inst_uniform_nb(
                 let r = nb_bool_call(b, helpers.equal_any, &[lookup(map, a)?, lookup(map, c)?]);
                 map.insert(dst, r);
             }
+            // #50 — fixnum `_fx` arithmetic. Operands decode NB→raw; the
+            // raw result is fit-checked to 47 bits (deopt → bytecode
+            // bignum/rational otherwise). DivEuclid/ModEuclid deopt
+            // internally on a zero divisor.
+            &Inst::Expt(dst, a, c) => {
+                let av = unbox_nb_fixnum(b, lookup(map, a)?);
+                let cv = unbox_nb_fixnum(b, lookup(map, c)?);
+                let r = nb_fx_call_or_deopt(b, helpers.request_deopt, helpers.expt, &[av, cv]);
+                map.insert(dst, r);
+            }
+            &Inst::Gcd(dst, a, c) => {
+                let av = unbox_nb_fixnum(b, lookup(map, a)?);
+                let cv = unbox_nb_fixnum(b, lookup(map, c)?);
+                let r = nb_fx_call_or_deopt(b, helpers.request_deopt, helpers.gcd, &[av, cv]);
+                map.insert(dst, r);
+            }
+            &Inst::Lcm(dst, a, c) => {
+                let av = unbox_nb_fixnum(b, lookup(map, a)?);
+                let cv = unbox_nb_fixnum(b, lookup(map, c)?);
+                let r = nb_fx_call_or_deopt(b, helpers.request_deopt, helpers.lcm, &[av, cv]);
+                map.insert(dst, r);
+            }
+            &Inst::ArithShift(dst, a, c) => {
+                let av = unbox_nb_fixnum(b, lookup(map, a)?);
+                let cv = unbox_nb_fixnum(b, lookup(map, c)?);
+                let r =
+                    nb_fx_call_or_deopt(b, helpers.request_deopt, helpers.arith_shift, &[av, cv]);
+                map.insert(dst, r);
+            }
+            &Inst::BitwiseArithShiftLeft(dst, a, c) => {
+                let av = unbox_nb_fixnum(b, lookup(map, a)?);
+                let cv = unbox_nb_fixnum(b, lookup(map, c)?);
+                let r = nb_fx_call_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    helpers.bitwise_arith_shift_left,
+                    &[av, cv],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::BitwiseArithShiftRight(dst, a, c) => {
+                let av = unbox_nb_fixnum(b, lookup(map, a)?);
+                let cv = unbox_nb_fixnum(b, lookup(map, c)?);
+                let r = nb_fx_call_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    helpers.bitwise_arith_shift_right,
+                    &[av, cv],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::DivEuclid(dst, a, c) => {
+                let av = unbox_nb_fixnum(b, lookup(map, a)?);
+                let cv = unbox_nb_fixnum(b, lookup(map, c)?);
+                let r =
+                    nb_fx_call_or_deopt(b, helpers.request_deopt, helpers.div_euclid, &[av, cv]);
+                map.insert(dst, r);
+            }
+            &Inst::ModEuclid(dst, a, c) => {
+                let av = unbox_nb_fixnum(b, lookup(map, a)?);
+                let cv = unbox_nb_fixnum(b, lookup(map, c)?);
+                let r =
+                    nb_fx_call_or_deopt(b, helpers.request_deopt, helpers.mod_euclid, &[av, cv]);
+                map.insert(dst, r);
+            }
             // CharToInt (char->integer): the inverse — keep the codepoint
             // payload, retag as Fixnum (signature bits, tag 0). Without
             // this dedicated direction `char->integer` left the value
@@ -10232,6 +10339,44 @@ fn nb_char_pred(
     let raw = b.inst_results(call)[0];
     b.ins()
         .bor_imm(raw, cs_vm::vm::NanboxValue::FALSE.into_raw())
+}
+
+/// #50 — call an `_fx` helper (gcd/lcm/expt/arith-shift/div-euclid/…)
+/// that takes RAW Fixnum operands and returns a RAW i64 which may exceed
+/// the 47-bit NB Fixnum range. Check the fit and box, else request a
+/// FIXNUM_OVERFLOW deopt → bytecode recomputes (bignum/rational). The
+/// helper also deopts internally on its own overflow / zero-divisor /
+/// non-fixnum cases, returning a benign 0 that the dispatcher discards.
+fn nb_fx_call_or_deopt(
+    b: &mut FunctionBuilder,
+    request_deopt: cranelift_codegen::ir::FuncRef,
+    fnref: cranelift_codegen::ir::FuncRef,
+    args: &[cranelift_codegen::ir::Value],
+) -> cranelift_codegen::ir::Value {
+    let call = b.ins().call(fnref, args);
+    let raw = b.inst_results(call)[0];
+    let shl = b.ins().ishl_imm(raw, 17);
+    let ext = b.ins().sshr_imm(shl, 17);
+    let fits = b.ins().icmp(IntCC::Equal, raw, ext);
+    let ok = b.create_block();
+    let ov = b.create_block();
+    let join = b.create_block();
+    b.append_block_param(join, I64);
+    b.ins().brif(fits, ok, &[], ov, &[]);
+    b.switch_to_block(ov);
+    b.seal_block(ov);
+    emit_request_deopt(b, request_deopt, cs_vm::vm::DEOPT_REASON_FIXNUM_OVERFLOW);
+    let ph = box_raw_fixnum(b, ext);
+    b.ins()
+        .jump(join, &[cranelift_codegen::ir::BlockArg::Value(ph)]);
+    b.switch_to_block(ok);
+    b.seal_block(ok);
+    let nb = box_raw_fixnum(b, raw);
+    b.ins()
+        .jump(join, &[cranelift_codegen::ir::BlockArg::Value(nb)]);
+    b.switch_to_block(join);
+    b.seal_block(join);
+    b.block_params(join)[0]
 }
 
 /// #50 — call a helper that returns a raw fixnum-range i64 (length,
