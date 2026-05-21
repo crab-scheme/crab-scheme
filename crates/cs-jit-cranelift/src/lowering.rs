@@ -5304,7 +5304,15 @@ impl Lowerer {
                     | Inst::NumberToString(_, _)
                     | Inst::StringToNumber(_, _)
                     | Inst::StringContains(_, _, _)
-                    | Inst::StringContainsRight(_, _, _) => {
+                    | Inst::StringContainsRight(_, _, _)
+                    | Inst::NumberToStringRadix(_, _, _)
+                    | Inst::StringToNumberRadix(_, _, _)
+                    | Inst::IotaN(_, _)
+                    | Inst::IotaNs(_, _, _)
+                    | Inst::IotaNss(_, _, _, _)
+                    | Inst::DigitValue(_, _)
+                    | Inst::StringIndex(_, _, _)
+                    | Inst::StringIndexRight(_, _, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -6101,6 +6109,30 @@ impl Lowerer {
                 string_contains_right: self
                     .module
                     .declare_func_in_func(self.string_contains_right_func, builder.func),
+                number_to_string_radix: self
+                    .module
+                    .declare_func_in_func(self.number_to_string_radix_func, builder.func),
+                string_to_number_radix: self
+                    .module
+                    .declare_func_in_func(self.string_to_number_radix_func, builder.func),
+                iota_n: self
+                    .module
+                    .declare_func_in_func(self.iota_n_func, builder.func),
+                iota_ns: self
+                    .module
+                    .declare_func_in_func(self.iota_ns_func, builder.func),
+                iota_nss: self
+                    .module
+                    .declare_func_in_func(self.iota_nss_func, builder.func),
+                digit_value: self
+                    .module
+                    .declare_func_in_func(self.digit_value_func, builder.func),
+                string_index: self
+                    .module
+                    .declare_func_in_func(self.string_index_func, builder.func),
+                string_index_right: self
+                    .module
+                    .declare_func_in_func(self.string_index_right_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -8282,6 +8314,16 @@ struct NbHelpers {
     string_to_number: cranelift_codegen::ir::FuncRef,
     string_contains: cranelift_codegen::ir::FuncRef,
     string_contains_right: cranelift_codegen::ir::FuncRef,
+    // #50 — radix conversions, iota, digit-value, string-index (NB
+    // number/string + raw radix/count/start/step/codepoint args).
+    number_to_string_radix: cranelift_codegen::ir::FuncRef,
+    string_to_number_radix: cranelift_codegen::ir::FuncRef,
+    iota_n: cranelift_codegen::ir::FuncRef,
+    iota_ns: cranelift_codegen::ir::FuncRef,
+    iota_nss: cranelift_codegen::ir::FuncRef,
+    digit_value: cranelift_codegen::ir::FuncRef,
+    string_index: cranelift_codegen::ir::FuncRef,
+    string_index_right: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -10094,6 +10136,64 @@ fn lower_inst_uniform_nb(
                     helpers.string_contains_right,
                     &[lookup(map, h)?, lookup(map, n)?],
                 );
+                map.insert(dst, r);
+            }
+            // #50 — radix conversions: NB number/string operand, raw
+            // radix arg, NB result.
+            &Inst::NumberToStringRadix(dst, n, radix) => {
+                let nv = lookup(map, n)?;
+                let rv = unbox_nb_fixnum(b, lookup(map, radix)?);
+                let r = nb_ptr_call(b, helpers.number_to_string_radix, &[nv, rv]);
+                map.insert(dst, r);
+            }
+            &Inst::StringToNumberRadix(dst, s, radix) => {
+                let sv = lookup(map, s)?;
+                let rv = unbox_nb_fixnum(b, lookup(map, radix)?);
+                let r = nb_ptr_call(b, helpers.string_to_number_radix, &[sv, rv]);
+                map.insert(dst, r);
+            }
+            // #50 — iota: all count/start/step args are raw Fixnums.
+            &Inst::IotaN(dst, n) => {
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.iota_n, &[nv]);
+                map.insert(dst, r);
+            }
+            &Inst::IotaNs(dst, count, start) => {
+                let cv = unbox_nb_fixnum(b, lookup(map, count)?);
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.iota_ns, &[cv, sv]);
+                map.insert(dst, r);
+            }
+            &Inst::IotaNss(dst, count, start, step) => {
+                let cv = unbox_nb_fixnum(b, lookup(map, count)?);
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let stv = unbox_nb_fixnum(b, lookup(map, step)?);
+                let r = nb_ptr_call(b, helpers.iota_nss, &[cv, sv, stv]);
+                map.insert(dst, r);
+            }
+            // #50 — digit-value / string-index: codepoint arg decodes the
+            // NB Character payload; result is an NB Fixnum-or-#f.
+            &Inst::DigitValue(dst, c) => {
+                let cv = b
+                    .ins()
+                    .band_imm(lookup(map, c)?, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let r = nb_ptr_call(b, helpers.digit_value, &[cv]);
+                map.insert(dst, r);
+            }
+            &Inst::StringIndex(dst, s, c) => {
+                let sv = lookup(map, s)?;
+                let cv = b
+                    .ins()
+                    .band_imm(lookup(map, c)?, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let r = nb_ptr_call(b, helpers.string_index, &[sv, cv]);
+                map.insert(dst, r);
+            }
+            &Inst::StringIndexRight(dst, s, c) => {
+                let sv = lookup(map, s)?;
+                let cv = b
+                    .ins()
+                    .band_imm(lookup(map, c)?, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let r = nb_ptr_call(b, helpers.string_index_right, &[sv, cv]);
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
