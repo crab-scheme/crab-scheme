@@ -5123,7 +5123,21 @@ impl Lowerer {
                     | Inst::Modulo(_, _, _)
                     | Inst::FloorQuotient(_, _, _)
                     | Inst::IntCharBitcast(_, _)
-                    | Inst::CharToInt(_, _) => {
+                    | Inst::CharToInt(_, _)
+                    | Inst::Assq(_, _, _)
+                    | Inst::Assv(_, _, _)
+                    | Inst::Assoc(_, _, _)
+                    | Inst::Memq(_, _, _)
+                    | Inst::Memv(_, _, _)
+                    | Inst::Member(_, _, _)
+                    | Inst::Reverse(_, _)
+                    | Inst::ListCopy(_, _)
+                    | Inst::LastPair(_, _)
+                    | Inst::Concatenate(_, _)
+                    | Inst::AppendReverse(_, _, _)
+                    | Inst::NotPairP(_, _)
+                    | Inst::ListP(_, _)
+                    | Inst::ProperListP(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -5382,6 +5396,48 @@ impl Lowerer {
                 ic_dispatch: self
                     .module
                     .declare_func_in_func(self.ic_dispatch_func, builder.func),
+                assq: self
+                    .module
+                    .declare_func_in_func(self.assq_func, builder.func),
+                assv: self
+                    .module
+                    .declare_func_in_func(self.assv_func, builder.func),
+                assoc: self
+                    .module
+                    .declare_func_in_func(self.assoc_func, builder.func),
+                memq: self
+                    .module
+                    .declare_func_in_func(self.memq_func, builder.func),
+                memv: self
+                    .module
+                    .declare_func_in_func(self.memv_func, builder.func),
+                member: self
+                    .module
+                    .declare_func_in_func(self.member_func, builder.func),
+                reverse: self
+                    .module
+                    .declare_func_in_func(self.reverse_func, builder.func),
+                list_copy: self
+                    .module
+                    .declare_func_in_func(self.list_copy_func, builder.func),
+                last_pair: self
+                    .module
+                    .declare_func_in_func(self.last_pair_func, builder.func),
+                concatenate: self
+                    .module
+                    .declare_func_in_func(self.concatenate_func, builder.func),
+                append_reverse: self
+                    .module
+                    .declare_func_in_func(self.append_reverse_func, builder.func),
+                not_pair_p: self
+                    .module
+                    .declare_func_in_func(self.not_pair_p_func, builder.func),
+                list_p: self
+                    .module
+                    .declare_func_in_func(self.list_p_func, builder.func),
+                proper_list_p: self
+                    .module
+                    .declare_func_in_func(self.proper_list_p_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -7359,6 +7415,23 @@ struct NbHelpers {
     // sites also get IC speedups when the callee tiers up.
     closure_id_peek: cranelift_codegen::ir::FuncRef,
     ic_dispatch: cranelift_codegen::ir::FuncRef,
+    // #50 — typed list builtins (pointer-in → pointer/boolean out). All
+    // `vm_*_gc` helpers decode NB carriers natively, so uniform-NB calls
+    // the same ones the specialized tier does.
+    assq: cranelift_codegen::ir::FuncRef,
+    assv: cranelift_codegen::ir::FuncRef,
+    assoc: cranelift_codegen::ir::FuncRef,
+    memq: cranelift_codegen::ir::FuncRef,
+    memv: cranelift_codegen::ir::FuncRef,
+    member: cranelift_codegen::ir::FuncRef,
+    reverse: cranelift_codegen::ir::FuncRef,
+    list_copy: cranelift_codegen::ir::FuncRef,
+    last_pair: cranelift_codegen::ir::FuncRef,
+    concatenate: cranelift_codegen::ir::FuncRef,
+    append_reverse: cranelift_codegen::ir::FuncRef,
+    not_pair_p: cranelift_codegen::ir::FuncRef,
+    list_p: cranelift_codegen::ir::FuncRef,
+    proper_list_p: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -8104,6 +8177,72 @@ fn lower_inst_uniform_nb(
                 );
                 map.insert(dst, r);
             }
+            // #50 — typed list builtins. Pointer-in → Gc-handle out: call
+            // the `vm_*_gc` helper (decodes NB natively), result is an NB
+            // carrier marked for stack-map tracking. The translator's
+            // linearity (AnyClone before consuming uses) makes the
+            // consuming helper calls correct, same as the specialized tier.
+            &Inst::Assq(dst, key, alist) => {
+                let r = nb_ptr_call(b, helpers.assq, &[lookup(map, key)?, lookup(map, alist)?]);
+                map.insert(dst, r);
+            }
+            &Inst::Assv(dst, key, alist) => {
+                let r = nb_ptr_call(b, helpers.assv, &[lookup(map, key)?, lookup(map, alist)?]);
+                map.insert(dst, r);
+            }
+            &Inst::Assoc(dst, key, alist) => {
+                let r = nb_ptr_call(b, helpers.assoc, &[lookup(map, key)?, lookup(map, alist)?]);
+                map.insert(dst, r);
+            }
+            &Inst::Memq(dst, item, lst) => {
+                let r = nb_ptr_call(b, helpers.memq, &[lookup(map, item)?, lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            &Inst::Memv(dst, item, lst) => {
+                let r = nb_ptr_call(b, helpers.memv, &[lookup(map, item)?, lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            &Inst::Member(dst, item, lst) => {
+                let r = nb_ptr_call(b, helpers.member, &[lookup(map, item)?, lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            &Inst::Reverse(dst, lst) => {
+                let r = nb_ptr_call(b, helpers.reverse, &[lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            &Inst::ListCopy(dst, lst) => {
+                let r = nb_ptr_call(b, helpers.list_copy, &[lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            &Inst::LastPair(dst, lst) => {
+                let r = nb_ptr_call(b, helpers.last_pair, &[lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            &Inst::Concatenate(dst, lst) => {
+                let r = nb_ptr_call(b, helpers.concatenate, &[lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            &Inst::AppendReverse(dst, lst, tail) => {
+                let r = nb_ptr_call(
+                    b,
+                    helpers.append_reverse,
+                    &[lookup(map, lst)?, lookup(map, tail)?],
+                );
+                map.insert(dst, r);
+            }
+            // List predicates → NB Boolean.
+            &Inst::NotPairP(dst, src) => {
+                let r = nb_bool_call(b, helpers.not_pair_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::ListP(dst, src) => {
+                let r = nb_bool_call(b, helpers.list_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::ProperListP(dst, src) => {
+                let r = nb_bool_call(b, helpers.proper_list_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
             // CharToInt (char->integer): the inverse — keep the codepoint
             // payload, retag as Fixnum (signature bits, tag 0). Without
             // this dedicated direction `char->integer` left the value
@@ -8338,6 +8477,33 @@ fn emit_request_deopt(
 ) {
     let r = b.ins().iconst(I64, reason as i64);
     b.ins().call(request_deopt, &[r]);
+}
+
+/// #50 — call a `vm_*_gc` helper that returns an NB Gc handle (pair,
+/// list, etc.), declaring the result for GC stack-map tracking. The
+/// shared shape for the typed pointer-builtins ported to uniform-NB.
+fn nb_ptr_call(
+    b: &mut FunctionBuilder,
+    fnref: cranelift_codegen::ir::FuncRef,
+    args: &[cranelift_codegen::ir::Value],
+) -> cranelift_codegen::ir::Value {
+    let call = b.ins().call(fnref, args);
+    let r = b.inst_results(call)[0];
+    b.declare_value_needs_stack_map(r);
+    r
+}
+
+/// #50 — call a `vm_*_gc` predicate helper that returns a raw 0/1 and
+/// re-encode it as an NB Boolean (same pattern as PairP/NullP/VecP).
+fn nb_bool_call(
+    b: &mut FunctionBuilder,
+    fnref: cranelift_codegen::ir::FuncRef,
+    args: &[cranelift_codegen::ir::Value],
+) -> cranelift_codegen::ir::Value {
+    let call = b.ins().call(fnref, args);
+    let raw = b.inst_results(call)[0];
+    b.ins()
+        .bor_imm(raw, cs_vm::vm::NanboxValue::FALSE.into_raw())
 }
 
 /// #50 — trap-free Fixnum binop (bitwise-and/or/xor, min, max) on NB
