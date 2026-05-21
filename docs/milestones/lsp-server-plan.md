@@ -1,10 +1,10 @@
 # LSP Server Plan — Post-1.0-rc3
 
-> Status: **Phases 1–3 COMPLETE (2026-05-21)** — `cs-lsp` crate +
-> `crabscheme-lsp` binary ship live parse+expand diagnostics (P1),
-> document symbols + hover (P2), and go-to-definition + find-references +
-> highlight (P3); exit gates proven end-to-end. Phases 4–6 open.
-> Predecessor: 1.0-rc3
+> Status: **Phases 1–4 COMPLETE (2026-05-21)** — `cs-lsp` crate +
+> `crabscheme-lsp` binary ship diagnostics (P1), document symbols +
+> hover (P2), go-to-definition + references + highlight (P3), and
+> completion + signature help (P4); exit gates proven end-to-end.
+> Phases 5–6 open. Predecessor: 1.0-rc3
 > (`aot-hardening` complete; all 8 microbenches AOT correctly).
 > Estimated duration: 3-5 weeks across six phases.
 > Spec slug: `lsp-server`.
@@ -29,8 +29,18 @@
 > `dc2bf9a` on `feat/lsp-server`. Resolution is by symbol id
 > (name-based): finds all textual uses incl. the definition, but does
 > NOT honor lexical scope/hygiene — **iter 3.1 (expander-scope binding
-> table) DEFERRED**, same scope/import work Phase 5 needs. **Next:
-> Phase 4** (completion + signature help).
+> table) DEFERRED**, same scope/import work Phase 5 needs.
+>
+> **Phase 4 done:** iters 4.1/4.3 (`completion` — builtins + document
+> defines, with detail), 4.4 (special-form snippets), 4.5
+> (`signatureHelp`). Commit `1e37e8c` on `feat/lsp-server`. Both exit
+> criteria pass (unit + e2e): `let` snippet completion + `(cons obj1
+> obj2)` signature help. Signature help finds the call head **textually**
+> so it works mid-type (incomplete call); user-function signatures need a
+> parse. iter 4.2 (scope-aware completion) simplified to all-candidates
+> (client filters) — full scoping is the deferred expander-scope work.
+> **Next: Phase 5** (semantic tokens / formatting / workspace symbol /
+> rename).
 >
 > **Target outcome:** ship `crabscheme-lsp`, a Language Server
 > Protocol implementation that gives editors (VS Code, Neovim,
