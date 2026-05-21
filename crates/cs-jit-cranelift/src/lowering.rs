@@ -5146,7 +5146,24 @@ impl Lowerer {
                     | Inst::CharNumericP(_, _)
                     | Inst::CharWhitespaceP(_, _)
                     | Inst::CharUpperCaseP(_, _)
-                    | Inst::CharLowerCaseP(_, _) => {
+                    | Inst::CharLowerCaseP(_, _)
+                    | Inst::FlonumSin(_, _)
+                    | Inst::FlonumCos(_, _)
+                    | Inst::FlonumTan(_, _)
+                    | Inst::FlonumAsin(_, _)
+                    | Inst::FlonumAcos(_, _)
+                    | Inst::FlonumAtan(_, _)
+                    | Inst::FlonumExp(_, _)
+                    | Inst::FlonumLog(_, _)
+                    | Inst::FlonumExpt(_, _, _)
+                    | Inst::FlonumLog2(_, _, _)
+                    | Inst::FlonumAtan2(_, _, _)
+                    | Inst::FlonumIsInteger(_, _)
+                    | Inst::FlEvenP(_, _)
+                    | Inst::FlOddP(_, _)
+                    | Inst::FlonumIsNan(_, _)
+                    | Inst::FlonumIsInfinite(_, _)
+                    | Inst::FlonumIsFinite(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -5474,6 +5491,48 @@ impl Lowerer {
                 char_lower_case_p: self
                     .module
                     .declare_func_in_func(self.char_lower_case_p_func, builder.func),
+                flonum_sin: self
+                    .module
+                    .declare_func_in_func(self.flonum_sin_func, builder.func),
+                flonum_cos: self
+                    .module
+                    .declare_func_in_func(self.flonum_cos_func, builder.func),
+                flonum_tan: self
+                    .module
+                    .declare_func_in_func(self.flonum_tan_func, builder.func),
+                flonum_asin: self
+                    .module
+                    .declare_func_in_func(self.flonum_asin_func, builder.func),
+                flonum_acos: self
+                    .module
+                    .declare_func_in_func(self.flonum_acos_func, builder.func),
+                flonum_atan: self
+                    .module
+                    .declare_func_in_func(self.flonum_atan_func, builder.func),
+                flonum_exp: self
+                    .module
+                    .declare_func_in_func(self.flonum_exp_func, builder.func),
+                flonum_log: self
+                    .module
+                    .declare_func_in_func(self.flonum_log_func, builder.func),
+                flonum_expt: self
+                    .module
+                    .declare_func_in_func(self.flonum_expt_func, builder.func),
+                flonum_log2: self
+                    .module
+                    .declare_func_in_func(self.flonum_log2_func, builder.func),
+                flonum_atan2: self
+                    .module
+                    .declare_func_in_func(self.flonum_atan2_func, builder.func),
+                flonum_is_integer: self
+                    .module
+                    .declare_func_in_func(self.flonum_is_integer_func, builder.func),
+                fl_even_p: self
+                    .module
+                    .declare_func_in_func(self.fl_even_p_func, builder.func),
+                fl_odd_p: self
+                    .module
+                    .declare_func_in_func(self.fl_odd_p_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -7479,6 +7538,22 @@ struct NbHelpers {
     char_whitespace_p: cranelift_codegen::ir::FuncRef,
     char_upper_case_p: cranelift_codegen::ir::FuncRef,
     char_lower_case_p: cranelift_codegen::ir::FuncRef,
+    // #50 — flonum transcendentals. NB Flonum IS the f64 bit pattern, so
+    // these are pass-through helper calls (no encode/decode).
+    flonum_sin: cranelift_codegen::ir::FuncRef,
+    flonum_cos: cranelift_codegen::ir::FuncRef,
+    flonum_tan: cranelift_codegen::ir::FuncRef,
+    flonum_asin: cranelift_codegen::ir::FuncRef,
+    flonum_acos: cranelift_codegen::ir::FuncRef,
+    flonum_atan: cranelift_codegen::ir::FuncRef,
+    flonum_exp: cranelift_codegen::ir::FuncRef,
+    flonum_log: cranelift_codegen::ir::FuncRef,
+    flonum_expt: cranelift_codegen::ir::FuncRef,
+    flonum_log2: cranelift_codegen::ir::FuncRef,
+    flonum_atan2: cranelift_codegen::ir::FuncRef,
+    flonum_is_integer: cranelift_codegen::ir::FuncRef,
+    fl_even_p: cranelift_codegen::ir::FuncRef,
+    fl_odd_p: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -8326,6 +8401,110 @@ fn lower_inst_uniform_nb(
             }
             &Inst::CharLowerCaseP(dst, src) => {
                 let r = nb_char_pred(b, helpers.char_lower_case_p, lookup(map, src)?);
+                map.insert(dst, r);
+            }
+            // #50 — flonum transcendentals. NB Flonum is the f64 bit
+            // pattern and the helpers take/return i64-encoded f64, so
+            // these are pass-through (no encode/decode, no stack-map).
+            &Inst::FlonumSin(dst, s)
+            | &Inst::FlonumCos(dst, s)
+            | &Inst::FlonumTan(dst, s)
+            | &Inst::FlonumAsin(dst, s)
+            | &Inst::FlonumAcos(dst, s)
+            | &Inst::FlonumAtan(dst, s)
+            | &Inst::FlonumExp(dst, s)
+            | &Inst::FlonumLog(dst, s) => {
+                let fnref = match inst {
+                    Inst::FlonumSin(..) => helpers.flonum_sin,
+                    Inst::FlonumCos(..) => helpers.flonum_cos,
+                    Inst::FlonumTan(..) => helpers.flonum_tan,
+                    Inst::FlonumAsin(..) => helpers.flonum_asin,
+                    Inst::FlonumAcos(..) => helpers.flonum_acos,
+                    Inst::FlonumAtan(..) => helpers.flonum_atan,
+                    Inst::FlonumExp(..) => helpers.flonum_exp,
+                    Inst::FlonumLog(..) => helpers.flonum_log,
+                    _ => unreachable!(),
+                };
+                let sv = lookup(map, s)?;
+                let call = b.ins().call(fnref, &[sv]);
+                let r = b.inst_results(call)[0];
+                map.insert(dst, r);
+            }
+            // 2-arg flonum transcendentals (also pass-through).
+            &Inst::FlonumExpt(dst, a, c)
+            | &Inst::FlonumLog2(dst, a, c)
+            | &Inst::FlonumAtan2(dst, a, c) => {
+                let fnref = match inst {
+                    Inst::FlonumExpt(..) => helpers.flonum_expt,
+                    Inst::FlonumLog2(..) => helpers.flonum_log2,
+                    Inst::FlonumAtan2(..) => helpers.flonum_atan2,
+                    _ => unreachable!(),
+                };
+                let av = lookup(map, a)?;
+                let cv = lookup(map, c)?;
+                let call = b.ins().call(fnref, &[av, cv]);
+                let r = b.inst_results(call)[0];
+                map.insert(dst, r);
+            }
+            // flonum predicates via helper → NB Boolean.
+            &Inst::FlonumIsInteger(dst, s) => {
+                let r = nb_bool_call(b, helpers.flonum_is_integer, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::FlEvenP(dst, s) => {
+                let r = nb_bool_call(b, helpers.fl_even_p, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::FlOddP(dst, s) => {
+                let r = nb_bool_call(b, helpers.fl_odd_p, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            // flonum predicates inline (fcmp) → NB Boolean.
+            &Inst::FlonumIsNan(dst, s) => {
+                let s_i = lookup(map, s)?;
+                let mf = cranelift_codegen::ir::MemFlags::new();
+                let s_f = b.ins().bitcast(F64, mf, s_i);
+                let cmp = b.ins().fcmp(
+                    cranelift_codegen::ir::condcodes::FloatCC::Unordered,
+                    s_f,
+                    s_f,
+                );
+                let widened = b.ins().uextend(I64, cmp);
+                let r = b
+                    .ins()
+                    .bor_imm(widened, cs_vm::vm::NanboxValue::FALSE.into_raw());
+                map.insert(dst, r);
+            }
+            &Inst::FlonumIsInfinite(dst, s) => {
+                let s_i = lookup(map, s)?;
+                let mf = cranelift_codegen::ir::MemFlags::new();
+                let s_f = b.ins().bitcast(F64, mf, s_i);
+                let abs = b.ins().fabs(s_f);
+                let inf = b.ins().f64const(f64::INFINITY);
+                let cmp = b
+                    .ins()
+                    .fcmp(cranelift_codegen::ir::condcodes::FloatCC::Equal, abs, inf);
+                let widened = b.ins().uextend(I64, cmp);
+                let r = b
+                    .ins()
+                    .bor_imm(widened, cs_vm::vm::NanboxValue::FALSE.into_raw());
+                map.insert(dst, r);
+            }
+            &Inst::FlonumIsFinite(dst, s) => {
+                let s_i = lookup(map, s)?;
+                let mf = cranelift_codegen::ir::MemFlags::new();
+                let s_f = b.ins().bitcast(F64, mf, s_i);
+                let abs = b.ins().fabs(s_f);
+                let inf = b.ins().f64const(f64::INFINITY);
+                let cmp = b.ins().fcmp(
+                    cranelift_codegen::ir::condcodes::FloatCC::LessThan,
+                    abs,
+                    inf,
+                );
+                let widened = b.ins().uextend(I64, cmp);
+                let r = b
+                    .ins()
+                    .bor_imm(widened, cs_vm::vm::NanboxValue::FALSE.into_raw());
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
