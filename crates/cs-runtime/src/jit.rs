@@ -277,7 +277,15 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     };
     closure.set_jit_ptr(ptr, lam.params.len() as u32);
     closure.set_jit_param_types(&param_tags);
-    closure.set_jit_needs_frame_env(builds_closures);
+    // #51a — a body that does `EnvDefineLocal` also needs a per-call
+    // frame env. Without one, `EnvDefineLocal` writes into the closure's
+    // definition env (often the global env), leaking the `let`-temp past
+    // the call: harmless for Rc values (overwritten next call) but a
+    // use-after-free for region-allocated temps, which dangle once their
+    // `with-region` arena is freed. A per-call frame env scopes the temp
+    // to the invocation so it's dropped (while the region is still live)
+    // on return.
+    closure.set_jit_needs_frame_env(builds_closures || rir.has_env_define_local());
     // Always compute the semantic return tag from `rir.return_type`
     // (what the body conceptually returns). For uniform-NB the ABI tag
     // is `JIT_RT_NB` (the body emits a uniform NB i64 carrier) while

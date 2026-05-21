@@ -1519,6 +1519,23 @@ impl Function {
             .flat_map(|b| b.insts.iter())
             .any(|i| matches!(i, Inst::MakeClosure(_, _)))
     }
+
+    /// True if the body defines any local binding via `EnvDefineLocal`
+    /// (i.e. it desugars a `let`/internal-define into an env store).
+    ///
+    /// The JIT dispatcher uses this to decide whether a body needs a
+    /// per-invocation frame env: without one, `EnvDefineLocal` writes
+    /// into the closure's *definition* env (often the global env), so
+    /// the binding leaks past the call — harmless for Rc values
+    /// (overwritten next call) but a use-after-free for region-allocated
+    /// values, which dangle once their `with-region` arena is freed
+    /// (#51a). A per-call frame env scopes such temps to the call.
+    pub fn has_env_define_local(&self) -> bool {
+        self.blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, Inst::EnvDefineLocal(_, _)))
+    }
 }
 
 #[cfg(test)]
