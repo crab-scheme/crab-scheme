@@ -290,6 +290,17 @@ pub enum Inst {
     /// today every CallGeneral takes the slow path unconditionally.
     CallGeneral(Value, Value, Vec<Value>),
 
+    /// `dst = call_builtin(name, args…)`. Calls a runtime stdlib builtin
+    /// **by name** that the translator can't open-code to a dedicated inst
+    /// (e.g. `display`, `string-append`, `assoc`). **AOT-only**: cs-aot
+    /// lowers it to `cs_runtime::aot_call_builtin("name", &[args…])`,
+    /// which dispatches through the builtin env embedded in the AOT'd
+    /// binary. The cranelift JIT declines any function carrying it (the
+    /// JIT has no runtime-env dispatch — the function stays on the VM
+    /// tier). Name (not sym id) because the AOT binary's runtime interns
+    /// symbols independently.
+    CallBuiltin(Value, String, Vec<Value>),
+
     /// `dst = env_lookup(sym)`. Look up a free variable by symbol id
     /// in the closure's captured environment. cs-vm: `Inst::LoadVar`
     /// of a non-parameter non-self symbol. The lowerer emits a

@@ -6619,10 +6619,23 @@ pub fn bytecode_to_rir_full(
                                         }
                                     }
                                     _ => {
-                                        return Err(TranslateError::Unsupported(format!(
-                                            "Call to builtin `{name}` (arity {}) not yet lowered",
-                                            args.len()
-                                        )));
+                                        // No dedicated open-coding for this
+                                        // builtin — emit a generic by-name
+                                        // call. The AOT backend lowers it to
+                                        // cs_runtime::aot_call_builtin; the
+                                        // cranelift JIT's support gate
+                                        // declines any function carrying it
+                                        // (it has no runtime-env dispatch),
+                                        // so on the JIT path the function
+                                        // simply stays on the VM tier — the
+                                        // same outcome as the previous
+                                        // "not yet lowered" translate error.
+                                        insts.push(RirInst::CallBuiltin(
+                                            dst,
+                                            name.to_string(),
+                                            args.clone(),
+                                        ));
+                                        value_types.insert(dst, Type::Any);
                                     }
                                 }
                                 sim_stack.push(StackEntry::Value(dst));
