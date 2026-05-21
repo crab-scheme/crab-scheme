@@ -7,7 +7,7 @@
 //! across files in the workspace root. Also covers `rename` (5.6) and
 //! `semanticTokens/full` (5.1).
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;

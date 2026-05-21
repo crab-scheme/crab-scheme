@@ -987,12 +987,14 @@ dependencies = [
 name = "cs-lsp"
 version = "0.0.1"
 dependencies = [
+ "clap",
  "cs-core",
  "cs-diag",
  "cs-expand",
  "cs-lex",
  "cs-parse",
  "dashmap 6.2.1",
+ "serde",
  "serde_json",
  "tokio",
  "tower 0.4.13",

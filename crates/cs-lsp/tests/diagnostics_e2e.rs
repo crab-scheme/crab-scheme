@@ -7,7 +7,7 @@
 //! A reader thread + `recv_timeout` keep the test from hanging if a
 //! regression stops the server from publishing (it fails instead).
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};

@@ -3,7 +3,7 @@
 //! definition, references, completion (a `let` snippet), and signature
 //! help (`(cons obj1 obj2)`). Exercises the full request/response path.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};

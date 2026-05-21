@@ -18,6 +18,7 @@ pub mod builtins;
 pub mod completion;
 pub mod diagnostics;
 pub mod format;
+pub mod harness;
 pub mod hover;
 pub mod references;
 pub mod semantic_tokens;
