@@ -1,9 +1,20 @@
 # LSP Server Plan — Post-1.0-rc3
 
-> Status: **Open** as of 2026-05-17. Predecessor: 1.0-rc3 (`aot-hardening`
-> complete; all 8 microbenches AOT correctly).
+> Status: **Phase 1 COMPLETE (2026-05-21)** — `cs-lsp` crate +
+> `crabscheme-lsp` binary ship live parse+expand diagnostics; exit gate
+> proven end-to-end. Phases 2–6 open. Predecessor: 1.0-rc3
+> (`aot-hardening` complete; all 8 microbenches AOT correctly).
 > Estimated duration: 3-5 weeks across six phases.
 > Spec slug: `lsp-server`.
+>
+> **Phase 1 done:** iters 1.1 (skeleton+initialize), 1.2 (document
+> cache), 1.3/1.4 (parse+expand diagnostics), 1.6 (UTF-16 span→range),
+> 1.7 (stale-change guard). Commits `1711b3e`, `01d455e`, `3f7ad5d` on
+> branch `feat/lsp-server`. **iter 1.5 (compile-stage diagnostics)
+> DEFERRED** — needs a cs-runtime compile-only "check" API for the full
+> globals snapshot, and risks false-positive "unbound variable" on
+> imported/cross-file symbols (the import resolution this plan defers).
+> Do it when Phase 5's workspace/import work lands.
 >
 > **Target outcome:** ship `crabscheme-lsp`, a Language Server
 > Protocol implementation that gives editors (VS Code, Neovim,
