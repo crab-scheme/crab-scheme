@@ -1115,6 +1115,86 @@ pub fn syms_builtins() -> Vec<SymsEntry> {
     v
 }
 
+/// Register the higher-order SRFI-1 / SRFI-13 list, pair, string, and
+/// vector builtins onto the **VM tier** (issue #48).
+///
+/// The walker gets these through `install_into`'s `higher_order_builtins`
+/// loop, but `vm_env` (built in `cs_runtime::Runtime::new`) only receives
+/// `pure_builtins` + `syms_builtins` + a hand-written marker set
+/// (map/filter/fold/for-each/apply). Everything else higher-order fell
+/// through to `undefined variable` under an explicit `--tier vm` /
+/// `--tier vm-jit` — `take-while`, `filter-map`, `pair-fold`, … (default
+/// auto-tier-up mode was unaffected, which is why this hid until the RC
+/// cross-tier sweep).
+///
+/// Each name is bridged to its existing, tested walker `b_*` implementation:
+/// build a throwaway `EvalCtx` and call it. The predicate the `b_*` invokes
+/// via `apply_procedure` is a VM closure, which `apply_procedure` routes to
+/// `cs_vm::vm::vm_call_sync` (see `eval.rs`). The bridge closures capture
+/// nothing, so they coerce to the `fn`-pointer `VmBuiltinSymsFn` that
+/// `make_vm_builtin_syms` takes.
+pub fn install_vm_higher_order(vm_env: &std::rc::Rc<cs_vm::vm::Env>, syms: &mut SymbolTable) {
+    macro_rules! bridge {
+        ($($name:literal => $f:path),+ $(,)?) => {
+            $({
+                let sym = syms.intern($name);
+                vm_env.define(
+                    sym,
+                    cs_vm::vm::make_vm_builtin_syms($name, |args, st| {
+                        let top = crate::env::Frame::root();
+                        let mut macros = std::collections::HashMap::new();
+                        let mut ctx = crate::eval::EvalCtx::new(top, st, &mut macros);
+                        // `b_*` higher-order builtins already return
+                        // `Result<Value, String>` (HoBuiltinFn), the exact
+                        // shape VmBuiltinSymsFn wants.
+                        let r = $f(args, &mut ctx)?;
+                        // Multi-value builtins (span, break, unzip) report
+                        // their extra values through ctx.pending_values;
+                        // forward them to the VM's thread-local multi-value
+                        // channel (the same protocol the VM's `values` uses:
+                        // set pending + return Unspecified).
+                        match ctx.pending_values.take() {
+                            Some(vals) => {
+                                cs_vm::vm::vm_set_pending_values(vals);
+                                Ok(Value::Unspecified)
+                            }
+                            None => Ok(r),
+                        }
+                    }),
+                );
+            })+
+        };
+    }
+    bridge! {
+        "take-while" => b_take_while,
+        "drop-while" => b_drop_while,
+        "span" => b_span,
+        "break" => b_break,
+        "unzip" => b_unzip,
+        "unzip2" => b_unzip,
+        "find-tail" => b_find_tail,
+        "list-index" => b_list_index,
+        "filter-map" => b_filter_map,
+        "append-map" => b_append_map,
+        "list-tabulate" => b_list_tabulate,
+        "reduce-right" => b_reduce_right,
+        "pair-fold" => b_pair_fold,
+        "pair-fold-right" => b_pair_fold_right,
+        "pair-for-each" => b_pair_for_each,
+        "string-fold" => b_string_fold,
+        "string-fold-right" => b_string_fold_right,
+        "string-tabulate" => b_string_tabulate,
+        "unfold-right" => b_unfold_right,
+        "vector-fold-right" => b_vector_fold_right,
+        // File I/O higher-order builtins that open a port and pass it
+        // explicitly to the proc (no current-port dependency, so the
+        // throwaway-ctx bridge is sound). The other call-with-* / with-*
+        // forms are already registered for the VM tier in lib.rs.
+        "call-with-input-file" => b_call_with_input_file,
+        "call-with-output-file" => b_call_with_output_file,
+    }
+}
+
 pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
     // Reset the thread-local condition registry so this Runtime starts from
     // a clean standard hierarchy. User-defined condition types from earlier
