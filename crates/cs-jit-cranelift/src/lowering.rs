@@ -5042,6 +5042,22 @@ impl Lowerer {
         // recursion never boxes args / unboxes results at the call
         // boundary. See `detect_uniform_nb_raw_abi`.
         let raw_abi = detect_uniform_nb_raw_abi(rir);
+        // A non-tail CallSelf is safe on uniform-NB when the inner uses
+        // SystemV conv: small frames, same host-stack ceiling as the
+        // pure-fixnum tier. The inner is Tail conv ONLY when the body has
+        // a tail self-call (return_call). So precompute whether any block
+        // tail-self-recurses: if not, a non-tail CallSelf is admissible
+        // (lowers like pure-fixnum); if so, a non-tail CallSelf in the
+        // same body would burn Tail-conv frames and stays rejected
+        // (unless the #47 cross-call exception or the raw-Fixnum ABI
+        // applies). This is what lets the pointer self-recursive bodies
+        // (binary-trees / alloc-stress helpers) JIT here instead of on
+        // the legacy pure-fixnum tier — the precondition for retiring it
+        // (#50).
+        let has_tail_self = rir
+            .blocks
+            .iter()
+            .any(|b| detect_uniform_nb_tail_self(rir, b).0.is_some());
         for blk in &rir.blocks {
             let last_idx = blk.insts.len().saturating_sub(1);
             for (i, inst) in blk.insts.iter().enumerate() {
@@ -5092,6 +5108,7 @@ impl Lowerer {
                     | Inst::AnyToFlo(_, _)
                     | Inst::AnyTruthy(_, _)
                     | Inst::FixToFlo(_, _)
+                    | Inst::NotBoolean(_, _)
                     | Inst::IntCharBitcast(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
@@ -5129,9 +5146,10 @@ impl Lowerer {
                         let last_check = last_check_ab || pattern_c;
                         let tail_check = detect_tail_call_self(rir, blk).is_some() || pattern_c;
                         let is_tail = last_check && tail_check;
-                        if !is_tail && !has_cross_call && !raw_abi {
+                        if !is_tail && !has_cross_call && !raw_abi && has_tail_self {
                             return Err(JitError::Unsupported(
-                                "uniform-nb: non-tail CallSelf would burn host stack".into(),
+                                "uniform-nb: non-tail CallSelf would burn Tail-conv host stack"
+                                    .into(),
                             ));
                         }
                     }
@@ -5173,11 +5191,11 @@ impl Lowerer {
         // avoids the Tail-conv spill overhead. This is what lets #47's
         // map-style cross-function bodies JIT here (correct IC dispatch)
         // instead of dropping to the VM, with no depth regression.
-        let needs_tail_conv = rir
-            .blocks
-            .iter()
-            .any(|b| detect_uniform_nb_tail_self(rir, b).0.is_some());
-        let inner_conv = if needs_tail_conv {
+        // Reuse `has_tail_self` (computed in the prewalk): the inner needs
+        // the Tail conv exactly when a tail self-call will emit
+        // `return_call`. Everything else takes SystemV (smaller frames,
+        // higher host-stack ceiling).
+        let inner_conv = if has_tail_self {
             CallConv::Tail
         } else {
             CallConv::SystemV
@@ -7868,6 +7886,23 @@ fn lower_inst_uniform_nb(
                 b.switch_to_block(join_block);
                 b.seal_block(join_block);
                 let result = b.block_params(join_block)[0];
+                map.insert(dst, result);
+            }
+            // NotBoolean: Scheme `(not x)` — #t iff x is #f. In NB,
+            // falsy ⟺ the carrier equals NB_FALSE; everything else is
+            // truthy. So `dst = (src == NB_FALSE) ? #t : #f`, encoded as
+            // `(src == NB_FALSE) | NB_FALSE` (1|NB_FALSE = NB_TRUE,
+            // 0|NB_FALSE = NB_FALSE). The translator only emits this for
+            // a Boolean-typed src, but computing the full predicate makes
+            // it correct for any NB value (e.g. an AnyTruthy result that
+            // uniform-NB lowers as an identity passthrough). Result is an
+            // NB Boolean (never raw).
+            &Inst::NotBoolean(dst, src) => {
+                let v = lookup(map, src)?;
+                let nb_false = cs_vm::vm::NanboxValue::FALSE.into_raw();
+                let is_false = b.ins().icmp_imm(IntCC::Equal, v, nb_false);
+                let widened = b.ins().uextend(I64, is_false);
+                let result = b.ins().bor_imm(widened, nb_false);
                 map.insert(dst, result);
             }
             // IntCharBitcast: same bit pattern, just retag the SSA value.

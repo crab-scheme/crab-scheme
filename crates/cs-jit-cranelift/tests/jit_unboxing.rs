@@ -235,3 +235,42 @@ fn unboxed_mul_overflow_requests_deopt() {
         "overflowing unboxed Mul must request a deopt"
     );
 }
+
+#[test]
+fn not_boolean_compiles_and_flips_on_uniform_nb() {
+    // `(define (f n) (if (not (< n 5)) 1 0))` — exercises uniform-NB's
+    // NotBoolean lowering (#50: needed so tak's `(if (not (< y x)) ...)`
+    // leaves the pure-fixnum tier). f(n) = (n >= 5) ? 1 : 0.
+    let mut f = Function::new("not_bool");
+    f.params.push((Value(0), Type::Fixnum)); // n
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            Inst::LoadConst(Value(1), Const::Fixnum(5)),
+            Inst::Lt(Value(2), Value(0), Value(1)), // n < 5
+            Inst::NotBoolean(Value(3), Value(2)),   // not (n < 5)
+        ],
+        terminator: Term::Branch(Value(3), BlockId(1), BlockId(2), Vec::new()),
+    });
+    f.blocks.push(Block {
+        id: BlockId(1),
+        params: vec![],
+        insts: vec![Inst::LoadConst(Value(4), Const::Fixnum(1))],
+        terminator: Term::Return(Value(4)),
+    });
+    f.blocks.push(Block {
+        id: BlockId(2),
+        params: vec![],
+        insts: vec![Inst::LoadConst(Value(5), Const::Fixnum(0))],
+        terminator: Term::Return(Value(5)),
+    });
+    let mut lowerer = Lowerer::new().expect("Lowerer::new");
+    let ptr = lowerer
+        .compile_uniform_nb(&f)
+        .expect("NotBoolean body must compile on uniform-NB");
+    for (n, expected) in [(0, 0), (4, 0), (5, 1), (10, 1)] {
+        assert_eq!(as_fixnum(call1(ptr, n), &format!("f({n})")), expected);
+    }
+}
