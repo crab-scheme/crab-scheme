@@ -16,5 +16,7 @@
 
 pub mod diagnostics;
 pub mod server;
+pub mod symbols;
+pub mod text;
 
 pub use server::Backend;

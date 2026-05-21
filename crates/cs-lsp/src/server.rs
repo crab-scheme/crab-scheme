@@ -9,8 +9,9 @@ use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, ServerCapabilities,
-    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    DocumentSymbolParams, DocumentSymbolResponse, InitializeParams, InitializeResult,
+    InitializedParams, MessageType, OneOf, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -86,6 +87,8 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                // Phase 2: outline view (nested defines).
+                document_symbol_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -99,6 +102,24 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> Result<()> {
         Ok(())
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        // Clone the text out so the DashMap guard is released before the
+        // (potentially slower) parse + walk.
+        let Some(text) = self.documents.get(&uri).map(|d| d.text.clone()) else {
+            return Ok(None);
+        };
+        let name = uri.to_string();
+        let symbols = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::symbols::document_symbols(&name, &text)
+        }))
+        .unwrap_or_default();
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
