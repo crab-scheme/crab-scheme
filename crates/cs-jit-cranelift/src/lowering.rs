@@ -5245,7 +5245,31 @@ impl Lowerer {
                     | Inst::HashtableRef(_, _, _, _)
                     | Inst::MakeHashtableEqual(_)
                     | Inst::MakeHashtableEq(_)
-                    | Inst::MakeHashtableEqv(_) => {
+                    | Inst::MakeHashtableEqv(_)
+                    | Inst::StrCopy(_, _)
+                    | Inst::Substring(_, _, _, _)
+                    | Inst::StrCopyFrom(_, _, _)
+                    | Inst::StringTake(_, _, _)
+                    | Inst::StringTakeRight(_, _, _)
+                    | Inst::StringDrop(_, _, _)
+                    | Inst::StringDropRight(_, _, _)
+                    | Inst::StringPad(_, _, _)
+                    | Inst::StringPadRight(_, _, _)
+                    | Inst::StringSplit(_, _, _)
+                    | Inst::StringJoin(_, _, _)
+                    | Inst::StringReplaceAll(_, _, _, _)
+                    | Inst::StringReplaceFirst(_, _, _, _)
+                    | Inst::StringTrim(_, _)
+                    | Inst::StringTrimLeft(_, _)
+                    | Inst::StringTrimRight(_, _)
+                    | Inst::StringToList(_, _)
+                    | Inst::StringToVector(_, _)
+                    | Inst::StringToListSlice(_, _, _, _)
+                    | Inst::StringToListSliceFrom(_, _, _)
+                    | Inst::StringToVectorSlice(_, _, _, _)
+                    | Inst::StringToVectorSliceFrom(_, _, _)
+                    | Inst::ListToVector(_, _)
+                    | Inst::ListToString(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -5865,6 +5889,78 @@ impl Lowerer {
                 make_hashtable_eqv: self
                     .module
                     .declare_func_in_func(self.make_hashtable_eqv_func, builder.func),
+                str_copy: self
+                    .module
+                    .declare_func_in_func(self.str_copy_func, builder.func),
+                substring: self
+                    .module
+                    .declare_func_in_func(self.substring_func, builder.func),
+                string_copy_from: self
+                    .module
+                    .declare_func_in_func(self.string_copy_from_func, builder.func),
+                string_take: self
+                    .module
+                    .declare_func_in_func(self.string_take_func, builder.func),
+                string_take_right: self
+                    .module
+                    .declare_func_in_func(self.string_take_right_func, builder.func),
+                string_drop: self
+                    .module
+                    .declare_func_in_func(self.string_drop_func, builder.func),
+                string_drop_right: self
+                    .module
+                    .declare_func_in_func(self.string_drop_right_func, builder.func),
+                string_pad: self
+                    .module
+                    .declare_func_in_func(self.string_pad_func, builder.func),
+                string_pad_right: self
+                    .module
+                    .declare_func_in_func(self.string_pad_right_func, builder.func),
+                string_split: self
+                    .module
+                    .declare_func_in_func(self.string_split_func, builder.func),
+                string_join: self
+                    .module
+                    .declare_func_in_func(self.string_join_func, builder.func),
+                string_replace_all: self
+                    .module
+                    .declare_func_in_func(self.string_replace_all_func, builder.func),
+                string_replace_first: self
+                    .module
+                    .declare_func_in_func(self.string_replace_first_func, builder.func),
+                string_trim: self
+                    .module
+                    .declare_func_in_func(self.string_trim_func, builder.func),
+                string_trim_left: self
+                    .module
+                    .declare_func_in_func(self.string_trim_left_func, builder.func),
+                string_trim_right: self
+                    .module
+                    .declare_func_in_func(self.string_trim_right_func, builder.func),
+                string_to_list: self
+                    .module
+                    .declare_func_in_func(self.string_to_list_func, builder.func),
+                string_to_vector: self
+                    .module
+                    .declare_func_in_func(self.string_to_vector_func, builder.func),
+                string_to_list_slice: self
+                    .module
+                    .declare_func_in_func(self.string_to_list_slice_func, builder.func),
+                string_to_list_slice_from: self
+                    .module
+                    .declare_func_in_func(self.string_to_list_slice_from_func, builder.func),
+                string_to_vector_slice: self
+                    .module
+                    .declare_func_in_func(self.string_to_vector_slice_func, builder.func),
+                string_to_vector_slice_from: self
+                    .module
+                    .declare_func_in_func(self.string_to_vector_slice_from_func, builder.func),
+                list_to_vector: self
+                    .module
+                    .declare_func_in_func(self.list_to_vector_func, builder.func),
+                list_to_string: self
+                    .module
+                    .declare_func_in_func(self.list_to_string_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -7977,6 +8073,32 @@ struct NbHelpers {
     make_hashtable_equal: cranelift_codegen::ir::FuncRef,
     make_hashtable_eq: cranelift_codegen::ir::FuncRef,
     make_hashtable_eqv: cranelift_codegen::ir::FuncRef,
+    // #50 — string pointer/index builtins (string pointer + raw
+    // count/index args → string/list/vector pointer).
+    str_copy: cranelift_codegen::ir::FuncRef,
+    substring: cranelift_codegen::ir::FuncRef,
+    string_copy_from: cranelift_codegen::ir::FuncRef,
+    string_take: cranelift_codegen::ir::FuncRef,
+    string_take_right: cranelift_codegen::ir::FuncRef,
+    string_drop: cranelift_codegen::ir::FuncRef,
+    string_drop_right: cranelift_codegen::ir::FuncRef,
+    string_pad: cranelift_codegen::ir::FuncRef,
+    string_pad_right: cranelift_codegen::ir::FuncRef,
+    string_split: cranelift_codegen::ir::FuncRef,
+    string_join: cranelift_codegen::ir::FuncRef,
+    string_replace_all: cranelift_codegen::ir::FuncRef,
+    string_replace_first: cranelift_codegen::ir::FuncRef,
+    string_trim: cranelift_codegen::ir::FuncRef,
+    string_trim_left: cranelift_codegen::ir::FuncRef,
+    string_trim_right: cranelift_codegen::ir::FuncRef,
+    string_to_list: cranelift_codegen::ir::FuncRef,
+    string_to_vector: cranelift_codegen::ir::FuncRef,
+    string_to_list_slice: cranelift_codegen::ir::FuncRef,
+    string_to_list_slice_from: cranelift_codegen::ir::FuncRef,
+    string_to_vector_slice: cranelift_codegen::ir::FuncRef,
+    string_to_vector_slice_from: cranelift_codegen::ir::FuncRef,
+    list_to_vector: cranelift_codegen::ir::FuncRef,
+    list_to_string: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -9390,6 +9512,148 @@ fn lower_inst_uniform_nb(
             }
             &Inst::MakeHashtableEqv(dst) => {
                 let r = nb_ptr_call(b, helpers.make_hashtable_eqv, &[]);
+                map.insert(dst, r);
+            }
+            // #50 — string pointer/index builtins. String/list pointers
+            // pass NB; count/index args decode NB→raw; results are NB
+            // string/list/vector handles.
+            &Inst::StrCopy(dst, s) => {
+                let r = nb_ptr_call(b, helpers.str_copy, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::Substring(dst, s, start, end) => {
+                let sv = lookup(map, s)?;
+                let stv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.substring, &[sv, stv, ev]);
+                map.insert(dst, r);
+            }
+            &Inst::StrCopyFrom(dst, s, start) => {
+                let sv = lookup(map, s)?;
+                let stv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.string_copy_from, &[sv, stv]);
+                map.insert(dst, r);
+            }
+            &Inst::StringTake(dst, s, n) => {
+                let sv = lookup(map, s)?;
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.string_take, &[sv, nv]);
+                map.insert(dst, r);
+            }
+            &Inst::StringTakeRight(dst, s, n) => {
+                let sv = lookup(map, s)?;
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.string_take_right, &[sv, nv]);
+                map.insert(dst, r);
+            }
+            &Inst::StringDrop(dst, s, n) => {
+                let sv = lookup(map, s)?;
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.string_drop, &[sv, nv]);
+                map.insert(dst, r);
+            }
+            &Inst::StringDropRight(dst, s, n) => {
+                let sv = lookup(map, s)?;
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.string_drop_right, &[sv, nv]);
+                map.insert(dst, r);
+            }
+            &Inst::StringPad(dst, s, n) => {
+                let sv = lookup(map, s)?;
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.string_pad, &[sv, nv]);
+                map.insert(dst, r);
+            }
+            &Inst::StringPadRight(dst, s, n) => {
+                let sv = lookup(map, s)?;
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.string_pad_right, &[sv, nv]);
+                map.insert(dst, r);
+            }
+            &Inst::StringSplit(dst, s, sep) => {
+                let r = nb_ptr_call(
+                    b,
+                    helpers.string_split,
+                    &[lookup(map, s)?, lookup(map, sep)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::StringJoin(dst, lst, sep) => {
+                let r = nb_ptr_call(
+                    b,
+                    helpers.string_join,
+                    &[lookup(map, lst)?, lookup(map, sep)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::StringReplaceAll(dst, s, from, to) => {
+                let r = nb_ptr_call(
+                    b,
+                    helpers.string_replace_all,
+                    &[lookup(map, s)?, lookup(map, from)?, lookup(map, to)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::StringReplaceFirst(dst, s, from, to) => {
+                let r = nb_ptr_call(
+                    b,
+                    helpers.string_replace_first,
+                    &[lookup(map, s)?, lookup(map, from)?, lookup(map, to)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::StringTrim(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_trim, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringTrimLeft(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_trim_left, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringTrimRight(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_trim_right, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringToList(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_to_list, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringToVector(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_to_vector, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringToListSlice(dst, s, start, end) => {
+                let sv = lookup(map, s)?;
+                let stv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.string_to_list_slice, &[sv, stv, ev]);
+                map.insert(dst, r);
+            }
+            &Inst::StringToListSliceFrom(dst, s, start) => {
+                let sv = lookup(map, s)?;
+                let stv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.string_to_list_slice_from, &[sv, stv]);
+                map.insert(dst, r);
+            }
+            &Inst::StringToVectorSlice(dst, s, start, end) => {
+                let sv = lookup(map, s)?;
+                let stv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.string_to_vector_slice, &[sv, stv, ev]);
+                map.insert(dst, r);
+            }
+            &Inst::StringToVectorSliceFrom(dst, s, start) => {
+                let sv = lookup(map, s)?;
+                let stv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.string_to_vector_slice_from, &[sv, stv]);
+                map.insert(dst, r);
+            }
+            &Inst::ListToVector(dst, lst) => {
+                let r = nb_ptr_call(b, helpers.list_to_vector, &[lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            &Inst::ListToString(dst, lst) => {
+                let r = nb_ptr_call(b, helpers.list_to_string, &[lookup(map, lst)?]);
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
