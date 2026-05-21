@@ -227,6 +227,78 @@ fn int_char_round_trip_on_uniform_nb() {
 }
 
 #[test]
+fn floor_quotient_on_uniform_nb() {
+    // `(floor-quotient a b)` — floors toward -inf (truncating sdiv would
+    // round toward zero). #50 — ported to uniform-NB. Check the four
+    // sign quadrants against the reference floor division.
+    let mut f = Function::new("fq");
+    f.params.push((Value(0), Type::Fixnum));
+    f.params.push((Value(1), Type::Fixnum));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![Inst::FloorQuotient(Value(2), Value(0), Value(1))],
+        terminator: Term::Return(Value(2)),
+    });
+    let mut lowerer = Lowerer::new().expect("Lowerer::new");
+    let ptr = lowerer
+        .compile_uniform_nb(&f)
+        .expect("FloorQuotient must compile on uniform-NB");
+    for (a, b) in [(13, 4), (-13, 4), (13, -4), (-13, -4), (12, 4)] {
+        let expected = (a as f64 / b as f64).floor() as i64;
+        assert_eq!(
+            as_fixnum(call2(ptr, a, b), &format!("fq({a},{b})")),
+            expected
+        );
+    }
+}
+
+#[test]
+fn quotient_div_by_zero_requests_deopt_no_crash() {
+    // #50 — a zero divisor must NOT execute `sdiv` (which traps/aborts);
+    // the guard requests a deopt instead (dispatcher reruns on bytecode,
+    // which raises the div-by-zero condition). Here we just assert the
+    // sentinel fires and the process doesn't crash.
+    let mut f = Function::new("q");
+    f.params.push((Value(0), Type::Fixnum));
+    f.params.push((Value(1), Type::Fixnum));
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![Inst::Quotient(Value(2), Value(0), Value(1))],
+        terminator: Term::Return(Value(2)),
+    });
+    let mut lowerer = Lowerer::new().expect("Lowerer::new");
+    let ptr = lowerer.compile_uniform_nb(&f).expect("compile");
+    let func: extern "C" fn(i64, i64) -> i64 = unsafe { transmute(ptr) };
+
+    // Normal divide: no deopt, correct quotient.
+    let _ = cs_vm::vm::jit_take_deopt();
+    let ok = func(
+        NanboxValue::fixnum(17).into_raw(),
+        NanboxValue::fixnum(5).into_raw(),
+    );
+    assert_eq!(cs_vm::vm::jit_take_deopt(), 0, "no deopt for 17/5");
+    assert_eq!(
+        as_fixnum(unsafe { NanboxValue(ok).to_value() }, "17 quot 5"),
+        3
+    );
+
+    // Zero divisor: must request a deopt, not trap.
+    let _ = func(
+        NanboxValue::fixnum(17).into_raw(),
+        NanboxValue::fixnum(0).into_raw(),
+    );
+    assert_ne!(
+        cs_vm::vm::jit_take_deopt(),
+        0,
+        "division by zero must request a deopt"
+    );
+}
+
+#[test]
 fn unboxed_mul_overflow_requests_deopt() {
     // (sq x) = x*x. A large x overflows the 47-bit Fixnum range, so the
     // unboxed Mul must set the deopt sentinel (cleared here via

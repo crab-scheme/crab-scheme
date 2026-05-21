@@ -5111,6 +5111,17 @@ impl Lowerer {
                     | Inst::NotBoolean(_, _)
                     | Inst::EqAny(_, _, _)
                     | Inst::Move(_, _)
+                    | Inst::BitAnd(_, _, _)
+                    | Inst::BitOr(_, _, _)
+                    | Inst::BitXor(_, _, _)
+                    | Inst::BitNot(_, _)
+                    | Inst::AbsFixnum(_, _)
+                    | Inst::MaxFixnum(_, _, _)
+                    | Inst::MinFixnum(_, _, _)
+                    | Inst::Quotient(_, _, _)
+                    | Inst::Remainder(_, _, _)
+                    | Inst::Modulo(_, _, _)
+                    | Inst::FloorQuotient(_, _, _)
                     | Inst::IntCharBitcast(_, _)
                     | Inst::CharToInt(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
@@ -7952,6 +7963,147 @@ fn lower_inst_uniform_nb(
                     raw.insert(dst, rv);
                 }
             }
+            // #50 — integer ops formerly only on the pure-fixnum tier.
+            // Each takes a tag-checked Fixnum fast path and deopts (→
+            // bytecode) on a non-Fixnum operand (bignum), a zero divisor,
+            // or a 47-bit overflow. Bitwise/min/max never overflow.
+            &Inst::BitAnd(dst, lhs, rhs) => {
+                let r = emit_nb_fixnum_binop_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    lookup(map, lhs)?,
+                    lookup(map, rhs)?,
+                    |b, l, r| b.ins().band(l, r),
+                );
+                map.insert(dst, r);
+            }
+            &Inst::BitOr(dst, lhs, rhs) => {
+                let r = emit_nb_fixnum_binop_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    lookup(map, lhs)?,
+                    lookup(map, rhs)?,
+                    |b, l, r| b.ins().bor(l, r),
+                );
+                map.insert(dst, r);
+            }
+            &Inst::BitXor(dst, lhs, rhs) => {
+                let r = emit_nb_fixnum_binop_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    lookup(map, lhs)?,
+                    lookup(map, rhs)?,
+                    |b, l, r| b.ins().bxor(l, r),
+                );
+                map.insert(dst, r);
+            }
+            &Inst::MaxFixnum(dst, lhs, rhs) => {
+                let r = emit_nb_fixnum_binop_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    lookup(map, lhs)?,
+                    lookup(map, rhs)?,
+                    |b, l, r| b.ins().smax(l, r),
+                );
+                map.insert(dst, r);
+            }
+            &Inst::MinFixnum(dst, lhs, rhs) => {
+                let r = emit_nb_fixnum_binop_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    lookup(map, lhs)?,
+                    lookup(map, rhs)?,
+                    |b, l, r| b.ins().smin(l, r),
+                );
+                map.insert(dst, r);
+            }
+            &Inst::BitNot(dst, src) => {
+                let r = emit_nb_fixnum_unop_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    lookup(map, src)?,
+                    false, // ~x stays in 47-bit range
+                    |b, x| b.ins().bnot(x),
+                );
+                map.insert(dst, r);
+            }
+            &Inst::AbsFixnum(dst, src) => {
+                let r = emit_nb_fixnum_unop_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    lookup(map, src)?,
+                    true, // abs(-2^46) overflows
+                    |b, x| b.ins().iabs(x),
+                );
+                map.insert(dst, r);
+            }
+            &Inst::Quotient(dst, lhs, rhs) => {
+                let r = emit_nb_fixnum_div_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    lookup(map, lhs)?,
+                    lookup(map, rhs)?,
+                    |b, l, r| b.ins().sdiv(l, r),
+                );
+                map.insert(dst, r);
+            }
+            &Inst::Remainder(dst, lhs, rhs) => {
+                let r = emit_nb_fixnum_div_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    lookup(map, lhs)?,
+                    lookup(map, rhs)?,
+                    |b, l, r| b.ins().srem(l, r),
+                );
+                map.insert(dst, r);
+            }
+            // R6RS modulo: result takes the sign of the divisor. Compute
+            // srem, then add the divisor when the remainder is non-zero
+            // and its sign differs from the divisor's (mirrors the
+            // specialized tier).
+            &Inst::Modulo(dst, lhs, rhs) => {
+                let r = emit_nb_fixnum_div_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    lookup(map, lhs)?,
+                    lookup(map, rhs)?,
+                    |b, l, r| {
+                        let rem = b.ins().srem(l, r);
+                        let zero = b.ins().iconst(I64, 0);
+                        let rem_nz = b.ins().icmp(IntCC::NotEqual, rem, zero);
+                        let rem_neg = b.ins().icmp(IntCC::SignedLessThan, rem, zero);
+                        let div_neg = b.ins().icmp(IntCC::SignedLessThan, r, zero);
+                        let sign_diff = b.ins().bxor(rem_neg, div_neg);
+                        let adjust = b.ins().band(rem_nz, sign_diff);
+                        let adjusted = b.ins().iadd(rem, r);
+                        b.ins().select(adjust, adjusted, rem)
+                    },
+                );
+                map.insert(dst, r);
+            }
+            // R7RS floor-quotient: sdiv truncates toward zero; subtract 1
+            // when the remainder is non-zero and the operand signs differ.
+            &Inst::FloorQuotient(dst, lhs, rhs) => {
+                let r = emit_nb_fixnum_div_or_deopt(
+                    b,
+                    helpers.request_deopt,
+                    lookup(map, lhs)?,
+                    lookup(map, rhs)?,
+                    |b, l, r| {
+                        let q = b.ins().sdiv(l, r);
+                        let rem = b.ins().srem(l, r);
+                        let zero = b.ins().iconst(I64, 0);
+                        let rem_nz = b.ins().icmp(IntCC::NotEqual, rem, zero);
+                        let l_neg = b.ins().icmp(IntCC::SignedLessThan, l, zero);
+                        let r_neg = b.ins().icmp(IntCC::SignedLessThan, r, zero);
+                        let sign_diff = b.ins().bxor(l_neg, r_neg);
+                        let adjust = b.ins().band(rem_nz, sign_diff);
+                        let q_dec = b.ins().iadd_imm(q, -1);
+                        b.ins().select(adjust, q_dec, q)
+                    },
+                );
+                map.insert(dst, r);
+            }
             // CharToInt (char->integer): the inverse — keep the codepoint
             // payload, retag as Fixnum (signature bits, tag 0). Without
             // this dedicated direction `char->integer` left the value
@@ -8161,6 +8313,207 @@ fn emit_raw_cmp_nb_bool(
     let widened = b.ins().uextend(I64, cmp);
     let nb_false = cs_vm::vm::NanboxValue::FALSE.into_raw();
     b.ins().bor_imm(widened, nb_false)
+}
+
+/// #50 — is `v` an NB Fixnum carrier? Returns an i8 bool. Mirrors the
+/// (signature|tag)==Fixnum-pattern check in `emit_nb_arith_fixnum_fast`.
+fn emit_is_fixnum_nb(
+    b: &mut FunctionBuilder,
+    v: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    use cs_vm::vm::{NB_SIGNATURE_BITS, NB_SIGNATURE_MASK, NB_TAG_MASK};
+    let combined_mask = (NB_SIGNATURE_MASK | NB_TAG_MASK) as i64;
+    let masked = b.ins().band_imm(v, combined_mask);
+    b.ins()
+        .icmp_imm(IntCC::Equal, masked, NB_SIGNATURE_BITS as i64)
+}
+
+/// #50 — request a deopt with `reason`. The dispatcher discards the JIT
+/// body's result and reruns on bytecode (which handles bignum operands,
+/// raises div-by-zero, etc.).
+fn emit_request_deopt(
+    b: &mut FunctionBuilder,
+    request_deopt: cranelift_codegen::ir::FuncRef,
+    reason: u8,
+) {
+    let r = b.ins().iconst(I64, reason as i64);
+    b.ins().call(request_deopt, &[r]);
+}
+
+/// #50 — trap-free Fixnum binop (bitwise-and/or/xor, min, max) on NB
+/// operands. Fast path (both Fixnum NB): unbox to sign-extended raw,
+/// apply `raw_op` (whose result is in 47-bit range for these ops), and
+/// re-encode. Slow path (any non-Fixnum operand, e.g. a bignum):
+/// request a `FIXNUM_MISS` deopt and return a benign placeholder
+/// (discarded). Makes uniform-NB cover these without the pure-fixnum
+/// tier, with no new runtime helper.
+fn emit_nb_fixnum_binop_or_deopt(
+    b: &mut FunctionBuilder,
+    request_deopt: cranelift_codegen::ir::FuncRef,
+    a: cranelift_codegen::ir::Value,
+    bv: cranelift_codegen::ir::Value,
+    raw_op: impl FnOnce(
+        &mut FunctionBuilder,
+        cranelift_codegen::ir::Value,
+        cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let a_fix = emit_is_fixnum_nb(b, a);
+    let b_fix = emit_is_fixnum_nb(b, bv);
+    let both = b.ins().band(a_fix, b_fix);
+    let fast = b.create_block();
+    let slow = b.create_block();
+    let join = b.create_block();
+    b.append_block_param(join, I64);
+    b.ins().brif(both, fast, &[], slow, &[]);
+
+    b.switch_to_block(fast);
+    b.seal_block(fast);
+    let ar = unbox_nb_fixnum(b, a);
+    let br = unbox_nb_fixnum(b, bv);
+    let rr = raw_op(b, ar, br);
+    let nb = box_raw_fixnum(b, rr);
+    b.ins()
+        .jump(join, &[cranelift_codegen::ir::BlockArg::Value(nb)]);
+
+    b.switch_to_block(slow);
+    b.seal_block(slow);
+    emit_request_deopt(b, request_deopt, cs_vm::vm::DEOPT_REASON_FIXNUM_MISS);
+    b.ins()
+        .jump(join, &[cranelift_codegen::ir::BlockArg::Value(a)]);
+
+    b.switch_to_block(join);
+    b.seal_block(join);
+    b.block_params(join)[0]
+}
+
+/// #50 — Fixnum unary op (bitwise-not, abs) on an NB operand. Fast path
+/// (Fixnum NB): unbox, apply `raw_op`. When `check_overflow` (abs of
+/// `-2^46` is `2^46`, out of 47-bit range), verify the result fits and
+/// request a `FIXNUM_OVERFLOW` deopt otherwise. Slow path (non-Fixnum):
+/// `FIXNUM_MISS` deopt. Returns the (possibly placeholder) NB result.
+fn emit_nb_fixnum_unop_or_deopt(
+    b: &mut FunctionBuilder,
+    request_deopt: cranelift_codegen::ir::FuncRef,
+    a: cranelift_codegen::ir::Value,
+    check_overflow: bool,
+    raw_op: impl FnOnce(
+        &mut FunctionBuilder,
+        cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let a_fix = emit_is_fixnum_nb(b, a);
+    let fast = b.create_block();
+    let slow = b.create_block();
+    let join = b.create_block();
+    b.append_block_param(join, I64);
+    b.ins().brif(a_fix, fast, &[], slow, &[]);
+
+    b.switch_to_block(fast);
+    b.seal_block(fast);
+    let ar = unbox_nb_fixnum(b, a);
+    let rr = raw_op(b, ar);
+    if check_overflow {
+        let shl = b.ins().ishl_imm(rr, 17);
+        let ext = b.ins().sshr_imm(shl, 17);
+        let fits = b.ins().icmp(IntCC::Equal, rr, ext);
+        let ov = b.create_block();
+        let ok = b.create_block();
+        b.ins().brif(fits, ok, &[], ov, &[]);
+        b.switch_to_block(ov);
+        b.seal_block(ov);
+        emit_request_deopt(b, request_deopt, cs_vm::vm::DEOPT_REASON_FIXNUM_OVERFLOW);
+        let ph = box_raw_fixnum(b, ext);
+        b.ins()
+            .jump(join, &[cranelift_codegen::ir::BlockArg::Value(ph)]);
+        b.switch_to_block(ok);
+        b.seal_block(ok);
+        let nb = box_raw_fixnum(b, rr);
+        b.ins()
+            .jump(join, &[cranelift_codegen::ir::BlockArg::Value(nb)]);
+    } else {
+        let nb = box_raw_fixnum(b, rr);
+        b.ins()
+            .jump(join, &[cranelift_codegen::ir::BlockArg::Value(nb)]);
+    }
+
+    b.switch_to_block(slow);
+    b.seal_block(slow);
+    emit_request_deopt(b, request_deopt, cs_vm::vm::DEOPT_REASON_FIXNUM_MISS);
+    b.ins()
+        .jump(join, &[cranelift_codegen::ir::BlockArg::Value(a)]);
+
+    b.switch_to_block(join);
+    b.seal_block(join);
+    b.block_params(join)[0]
+}
+
+/// #50 — Fixnum integer division family (quotient, remainder, modulo,
+/// floor-quotient) on NB operands. The fast path requires both operands
+/// Fixnum AND the divisor non-zero (`sdiv`/`srem` *trap* on a zero
+/// divisor, so the guard must precede the op) AND the result in 47-bit
+/// range (`(-2^46) quotient -1 == 2^46` overflows). `raw_op` receives
+/// sign-extended raw operands (divisor guaranteed non-zero) and returns
+/// the raw result. Any failed guard requests a deopt → bytecode
+/// computes the bignum / raises the div-by-zero condition.
+fn emit_nb_fixnum_div_or_deopt(
+    b: &mut FunctionBuilder,
+    request_deopt: cranelift_codegen::ir::FuncRef,
+    a: cranelift_codegen::ir::Value,
+    bv: cranelift_codegen::ir::Value,
+    raw_op: impl FnOnce(
+        &mut FunctionBuilder,
+        cranelift_codegen::ir::Value,
+        cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let a_fix = emit_is_fixnum_nb(b, a);
+    let b_fix = emit_is_fixnum_nb(b, bv);
+    let both = b.ins().band(a_fix, b_fix);
+    // NB Fixnum 0 is exactly NB_SIGNATURE_BITS (payload 0, tag 0).
+    let b_nonzero = b
+        .ins()
+        .icmp_imm(IntCC::NotEqual, bv, cs_vm::vm::NB_SIGNATURE_BITS as i64);
+    let cond = b.ins().band(both, b_nonzero);
+    let fast = b.create_block();
+    let slow = b.create_block();
+    let join = b.create_block();
+    b.append_block_param(join, I64);
+    b.ins().brif(cond, fast, &[], slow, &[]);
+
+    b.switch_to_block(fast);
+    b.seal_block(fast);
+    let ar = unbox_nb_fixnum(b, a);
+    let br = unbox_nb_fixnum(b, bv);
+    let rr = raw_op(b, ar, br);
+    // 47-bit fit check (quotient overflow edge).
+    let shl = b.ins().ishl_imm(rr, 17);
+    let ext = b.ins().sshr_imm(shl, 17);
+    let fits = b.ins().icmp(IntCC::Equal, rr, ext);
+    let ov = b.create_block();
+    let ok = b.create_block();
+    b.ins().brif(fits, ok, &[], ov, &[]);
+    b.switch_to_block(ov);
+    b.seal_block(ov);
+    emit_request_deopt(b, request_deopt, cs_vm::vm::DEOPT_REASON_FIXNUM_OVERFLOW);
+    let ph = box_raw_fixnum(b, ext);
+    b.ins()
+        .jump(join, &[cranelift_codegen::ir::BlockArg::Value(ph)]);
+    b.switch_to_block(ok);
+    b.seal_block(ok);
+    let nb = box_raw_fixnum(b, rr);
+    b.ins()
+        .jump(join, &[cranelift_codegen::ir::BlockArg::Value(nb)]);
+
+    b.switch_to_block(slow);
+    b.seal_block(slow);
+    emit_request_deopt(b, request_deopt, cs_vm::vm::DEOPT_REASON_ARITH_MISS);
+    b.ins()
+        .jump(join, &[cranelift_codegen::ir::BlockArg::Value(a)]);
+
+    b.switch_to_block(join);
+    b.seal_block(join);
+    b.block_params(join)[0]
 }
 
 /// Emit the inline Fixnum-Fixnum fast path for an NB-typed binary

@@ -191,6 +191,44 @@ fn diff_loop_sum_1_to_n() {
 }
 
 #[test]
+fn diff_jit_integer_ops_off_pure_fixnum() {
+    // #50 — ops uniform-NB previously rejected (routing them to the
+    // pure-fixnum tier): modulo/remainder (sign-sensitive), bitwise,
+    // abs/min/max, floor-quotient. Each is warmed past the tier
+    // threshold so the body runs on the JIT, then checked against the
+    // walker across negative operands (where R6RS modulo vs remainder
+    // sign rules and floor- vs truncate-quotient diverge).
+    let defines = &[
+        "(define m (lambda (a b) (modulo a b)))",
+        "(define r (lambda (a b) (remainder a b)))",
+        "(define ba (lambda (a b) (bitwise-and a b)))",
+        "(define bo (lambda (a b) (bitwise-or a b)))",
+        "(define bx (lambda (a b) (bitwise-xor a b)))",
+        "(define ab (lambda (a) (abs a)))",
+        "(define mx (lambda (a b) (max a b)))",
+        "(define mn (lambda (a b) (min a b)))",
+        "(define warm (lambda (n) (let loop ((i 0)) (if (> i n) 'done \
+            (begin (m i 3) (r i 3) (ba i 6) (bo i 6) (bx i 6) (ab i) \
+                   (mx i 3) (mn i 3) (loop (+ i 1)))))))",
+    ];
+    for (warm, expr) in [
+        (Some("(warm 2000)"), "(m 13 4)"),
+        (Some("(warm 2000)"), "(m -13 4)"),
+        (Some("(warm 2000)"), "(m 13 -4)"),
+        (Some("(warm 2000)"), "(r -13 4)"),
+        (Some("(warm 2000)"), "(r 13 -4)"),
+        (Some("(warm 2000)"), "(ba 12 10)"),
+        (Some("(warm 2000)"), "(bo 12 10)"),
+        (Some("(warm 2000)"), "(bx 12 10)"),
+        (Some("(warm 2000)"), "(ab -42)"),
+        (Some("(warm 2000)"), "(mx 7 19)"),
+        (Some("(warm 2000)"), "(mn 7 19)"),
+    ] {
+        assert_three_tier_agreement(defines, warm, expr);
+    }
+}
+
+#[test]
 fn diff_gcd() {
     let defines =
         &["(define gcd (lambda (a b) (if (= b 0) a (gcd b (- a (* (quotient a b) b))))))"];
