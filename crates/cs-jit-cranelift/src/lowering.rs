@@ -5317,7 +5317,9 @@ impl Lowerer {
                     | Inst::VecAppend(_, _)
                     | Inst::VecBuild(_, _)
                     | Inst::BvBuild(_, _)
-                    | Inst::BvAppend(_, _) => {
+                    | Inst::BvAppend(_, _)
+                    | Inst::SymbolToString(_, _)
+                    | Inst::StringToSymbol(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -6153,6 +6155,12 @@ impl Lowerer {
                 bytevector_append_buf: self
                     .module
                     .declare_func_in_func(self.bytevector_append_buf_func, builder.func),
+                string_to_symbol: self
+                    .module
+                    .declare_func_in_func(self.string_to_symbol_func, builder.func),
+                symbol_to_string: self
+                    .module
+                    .declare_func_in_func(self.symbol_to_string_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -8350,6 +8358,10 @@ struct NbHelpers {
     make_vector_buf: cranelift_codegen::ir::FuncRef,
     make_bytevector_buf: cranelift_codegen::ir::FuncRef,
     bytevector_append_buf: cranelift_codegen::ir::FuncRef,
+    // #50 — symbol<->string. Helpers use a RAW symbol id (not NB), so
+    // uniform-NB decodes/encodes the NB Symbol's id payload.
+    string_to_symbol: cranelift_codegen::ir::FuncRef,
+    symbol_to_string: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -10263,6 +10275,28 @@ fn lower_inst_uniform_nb(
                     .collect::<Result<_, _>>()?;
                 let r = nb_buf_call(b, helpers.bytevector_append_buf, &arg_vs);
                 map.insert(*dst, r);
+            }
+            // #50 — symbol<->string. The helpers use RAW symbol ids:
+            // symbol->string decodes the NB Symbol's id payload in;
+            // string->symbol returns a raw id that re-tags to an NB
+            // Symbol (without this, string->symbol left the value looking
+            // like a plain number and symbol->string then failed).
+            &Inst::SymbolToString(dst, sym) => {
+                let id = b
+                    .ins()
+                    .band_imm(lookup(map, sym)?, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let r = nb_ptr_call(b, helpers.symbol_to_string, &[id]);
+                map.insert(dst, r);
+            }
+            &Inst::StringToSymbol(dst, s) => {
+                let call = b.ins().call(helpers.string_to_symbol, &[lookup(map, s)?]);
+                let raw_id = b.inst_results(call)[0];
+                let payload = b.ins().band_imm(raw_id, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let sym_tag_bits = (cs_vm::vm::NB_SIGNATURE_BITS
+                    | ((cs_vm::vm::NB_TAG_SYMBOL as u64) << 47))
+                    as i64;
+                let r = b.ins().bor_imm(payload, sym_tag_bits);
+                map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
             // payload, retag as Fixnum (signature bits, tag 0). Without
