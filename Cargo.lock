@@ -990,6 +990,7 @@ dependencies = [
  "cs-core",
  "cs-diag",
  "cs-expand",
+ "cs-lex",
  "cs-parse",
  "dashmap 6.2.1",
  "serde_json",

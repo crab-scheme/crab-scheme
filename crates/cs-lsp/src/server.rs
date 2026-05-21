@@ -13,9 +13,11 @@ use tower_lsp::lsp_types::{
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams, DocumentSymbolParams,
     DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
     HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
-    MessageType, OneOf, Position, Range, ReferenceParams, ServerCapabilities, ServerInfo,
-    SignatureHelp, SignatureHelpOptions, SignatureHelpParams, SymbolInformation,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url, WorkspaceSymbolParams,
+    MessageType, OneOf, Position, Range, ReferenceParams, RenameParams, SemanticTokensFullOptions,
+    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
+    SignatureHelpOptions, SignatureHelpParams, SymbolInformation, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Url, WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -122,9 +124,27 @@ impl LanguageServer for Backend {
                     retrigger_characters: None,
                     work_done_progress_options: Default::default(),
                 }),
-                // Phase 5: whole-document formatting + workspace symbols.
+                // Phase 5: formatting, workspace symbols, rename.
                 document_formatting_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Left(true)),
+                // Phase 5 iter 5.1: semantic highlighting. `full` only —
+                // re-lexing a whole file is cheap, so we skip the `range`
+                // and delta variants. The legend order must match
+                // `semantic_tokens::TOKEN_TYPES`.
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: SemanticTokensLegend {
+                                token_types: crate::semantic_tokens::TOKEN_TYPES.to_vec(),
+                                token_modifiers: vec![],
+                            },
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            range: None,
+                            work_done_progress_options: Default::default(),
+                        },
+                    ),
+                ),
                 ..Default::default()
             },
         })
@@ -305,6 +325,59 @@ impl LanguageServer for Backend {
         }))
         .unwrap_or_default();
         Ok(Some(symbols))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let pos = params.text_document_position;
+        let uri = pos.text_document.uri;
+        let position = pos.position;
+        let new_name = params.new_name;
+        let Some(text) = self.documents.get(&uri).map(|d| d.text.clone()) else {
+            return Ok(None);
+        };
+        let name = uri.to_string();
+        // Rename = replace every occurrence (definition included) with
+        // the new name. Same-file only (cross-file rename is future work).
+        let ranges = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::references::references(&name, &text, position, true)
+        }))
+        .unwrap_or_default();
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        let edits: Vec<TextEdit> = ranges
+            .into_iter()
+            .map(|range| TextEdit {
+                range,
+                new_text: new_name.clone(),
+            })
+            .collect();
+        let mut changes = std::collections::HashMap::new();
+        changes.insert(uri, edits);
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        let Some(text) = self.documents.get(&uri).map(|d| d.text.clone()) else {
+            return Ok(None);
+        };
+        let name = uri.to_string();
+        let tokens = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::semantic_tokens::semantic_tokens(&name, &text)
+        }))
+        .unwrap_or_else(|_| tower_lsp::lsp_types::SemanticTokens {
+            result_id: None,
+            data: Vec::new(),
+        });
+        Ok(Some(SemanticTokensResult::Tokens(tokens)))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {

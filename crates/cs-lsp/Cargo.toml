@@ -17,6 +17,7 @@ dashmap = { workspace = true }
 # span→line/col. No codegen deps — the LSP only inspects source.
 cs-diag = { workspace = true }
 cs-core = { workspace = true }
+cs-lex = { workspace = true }
 cs-parse = { workspace = true }
 cs-expand = { workspace = true }
 

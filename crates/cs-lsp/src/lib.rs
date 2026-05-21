@@ -20,6 +20,7 @@ pub mod diagnostics;
 pub mod format;
 pub mod hover;
 pub mod references;
+pub mod semantic_tokens;
 pub mod server;
 pub mod symbols;
 pub mod text;
