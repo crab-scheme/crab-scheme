@@ -2569,11 +2569,21 @@ thread_local! {
 }
 
 impl Runtime {
-    /// Resolve `name` to a VM-tier builtin, call it with the borrow-decoded
-    /// NB `args`, and re-encode the result as an NB carrier.
+    /// Resolve `name` to a builtin in the walker top-level env, call it with
+    /// the borrow-decoded NB `args`, and re-encode the result as an NB
+    /// carrier.
+    ///
+    /// Dispatch goes through the **walker** `top` env + `apply_procedure`,
+    /// not `vm_env` + `vm_call_sync`: `top` (via `install_into`) holds the
+    /// *complete* builtin set including the higher-order ones (`display`,
+    /// `map`, …) that the VM tier registers as markers `vm_call_sync` can't
+    /// invoke. `apply_procedure` handles every builtin flavor (Pure / Higher
+    /// / Syms). This is the walker tier, so builtin-heavy AOT code pays
+    /// walker speed — fine for breadth/correctness; numeric kernels stay on
+    /// the inline-NB fast paths and never reach here.
     fn aot_dispatch_builtin(&mut self, name: &str, args: &[i64]) -> i64 {
         let sym = self.syms.intern(name);
-        let Some(proc) = self.vm_env.get(sym) else {
+        let Some(proc) = self.top.get(sym) else {
             eprintln!("crabscheme (aot): unbound builtin `{name}`");
             return cs_vm::vm::vm_value_to_nb(Value::Unspecified);
         };
@@ -2582,10 +2592,11 @@ impl Runtime {
             .iter()
             .map(|&a| cs_vm::vm::vm_nb_borrow_to_value(a))
             .collect();
-        match cs_vm::vm::vm_call_sync(&proc, &arg_vals, &mut self.syms) {
+        let mut ctx = EvalCtx::new(self.top.clone(), &mut self.syms, &mut self.macros);
+        match crate::eval::apply_procedure(&proc, &arg_vals, &mut ctx) {
             Ok(v) => cs_vm::vm::vm_value_to_nb(v),
             Err(e) => {
-                eprintln!("crabscheme (aot): builtin `{name}`: {}", e.message);
+                eprintln!("crabscheme (aot): builtin `{name}`: {}", e.message());
                 cs_vm::vm::vm_value_to_nb(Value::Unspecified)
             }
         }
@@ -2606,6 +2617,20 @@ pub fn aot_call_builtin(name: &str, args: &[i64]) -> i64 {
         let mut slot = cell.borrow_mut();
         let rt = slot.get_or_insert_with(Runtime::new);
         rt.aot_dispatch_builtin(name, args)
+    })
+}
+
+/// Format an NB result carrier as its external (Write-mode) Scheme
+/// representation — used by the AOT main shim to print a function's return
+/// value. Handles every value kind (strings show quoted, lists/pairs
+/// nested, symbols by name, …); the numeric shim fast-paths fixnum/flonum
+/// before falling back here. Borrow-decodes (the carrier isn't consumed).
+pub fn aot_format_result(nb: i64) -> String {
+    AOT_RUNTIME.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let rt = slot.get_or_insert_with(Runtime::new);
+        let v = cs_vm::vm::vm_nb_borrow_to_value(nb);
+        v.format_with(&rt.syms, WriteMode::Write)
     })
 }
 

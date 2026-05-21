@@ -3421,4 +3421,31 @@ mod tests {
         // a string in RawI64).
         assert!(emit_with(EmitMode::RawI64, &f).is_err());
     }
+
+    #[test]
+    fn nb_call_builtin_emits_runtime_dispatch() {
+        // Inst::CallBuiltin lowers (Nb) to a cs_runtime::aot_call_builtin
+        // call carrying the builtin name + NB arg list — the generic
+        // stdlib dispatch the AOT translator emits for builtins without a
+        // dedicated open-coding.
+        let mut f = Function::new("p");
+        f.params.push((Value(0), Type::Any));
+        f.return_type = Type::Any;
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::CallBuiltin(
+                Value(1),
+                "string-append".to_string(),
+                vec![Value(0)],
+            )],
+            terminator: Term::Return(Value(1)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(
+            src.contains(r#"cs_runtime::aot_call_builtin("string-append", &[v0])"#),
+            "emitted: {src}"
+        );
+    }
 }
