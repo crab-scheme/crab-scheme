@@ -185,7 +185,10 @@ pub fn analyze_for_inline(func: &Function) -> Result<InlineMetadata, InlineRejec
 
         for inst in &block.insts {
             match inst {
-                Inst::Call(_, _, _) | Inst::CallSelf(_, _) | Inst::CallGeneral(_, _, _) => {
+                Inst::Call(_, _, _)
+                | Inst::CallSelf(_, _)
+                | Inst::CallGeneral(_, _, _)
+                | Inst::CallBuiltin(_, _, _) => {
                     return Err(InlineRejection::HasInternalCall);
                 }
                 Inst::MakeClosure(_, _) => {
@@ -594,6 +597,14 @@ pub fn for_each_value_in_inst<F: FnMut(&mut Value)>(inst: &mut Inst, mut f: F) {
                 f(a);
             }
         }
+        // AOT G3 — generic by-name builtin call. The name is a string, not
+        // a Value; visit dst + args.
+        Inst::CallBuiltin(d, _name, args) => {
+            f(d);
+            for a in args {
+                f(a);
+            }
+        }
         Inst::CallSelf(d, args) => {
             f(d);
             for a in args {
@@ -739,6 +750,7 @@ pub fn value_walker_covers(inst: &Inst) -> bool {
             | Inst::MakeClosure(_, _)
             | Inst::Call(_, _, _)
             | Inst::CallGeneral(_, _, _)
+            | Inst::CallBuiltin(_, _, _)
             | Inst::CallSelf(_, _)
             | Inst::EnvLookup(_, _)
             | Inst::EnvLookupAny(_, _)

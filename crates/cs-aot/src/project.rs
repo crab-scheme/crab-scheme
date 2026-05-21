@@ -227,6 +227,22 @@ fn render_cargo_toml(opts: &ProjectOptions) -> String {
              (caller should resolve cs-vm's location/version before emitting)",
         );
         s.push_str(&format!("cs-vm = {}\n", dep.to_toml()));
+        // AOT G3 — generic builtin dispatch routes unmatched stdlib calls
+        // through `cs_runtime::aot_call_builtin`, so the emitted binary
+        // links cs-runtime too. cs-runtime sits beside cs-vm in the
+        // workspace, so derive its dependency from cs-vm's: a sibling path
+        // for the dev-tree case, the same version for the published case.
+        let rt_dep = match &dep {
+            CsVmDep::Path(p) => {
+                let rt_path = p
+                    .parent()
+                    .map(|parent| parent.join("cs-runtime"))
+                    .unwrap_or_else(|| PathBuf::from("cs-runtime"));
+                format!("{{ path = \"{}\" }}", rt_path.display())
+            }
+            CsVmDep::Version(v) => format!("\"{v}\""),
+        };
+        s.push_str(&format!("cs-runtime = {rt_dep}\n"));
     }
     s.push('\n');
 

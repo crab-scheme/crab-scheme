@@ -478,6 +478,9 @@ fn infer_value_types(func: &Function) -> std::collections::HashMap<Value, Type> 
                         Some((*dst, func.return_type.clone()))
                     }
                 }
+                // Generic builtin dispatch returns an arbitrary Scheme
+                // value — type unknown at compile time.
+                Inst::CallBuiltin(dst, _, _) => Some((*dst, Type::Any)),
                 _ => None,
             };
             if let Some((d, t)) = entry {
@@ -2052,6 +2055,27 @@ fn inst_rhs(
             (*dst, expr)
         }
 
+        // ---- Generic builtin dispatch (AOT G3) ----
+        //
+        // Any stdlib builtin without a dedicated open-coding lowers to a
+        // by-name call into the runtime env embedded in the AOT'd binary.
+        // {name:?} renders an escaped Rust &str literal. RawI64 mode has no
+        // runtime link, so it falls through to the Unsupported catch-all.
+        (Inst::CallBuiltin(dst, name, args), EmitMode::Nb) => {
+            for arg in args {
+                check(*arg)?;
+            }
+            let args_csv = args
+                .iter()
+                .map(|a| format!("v{}", a.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                *dst,
+                format!("cs_runtime::aot_call_builtin({name:?}, &[{args_csv}])"),
+            )
+        }
+
         // ---- Unsupported ----
         (other, _) => return Err(AotError::UnsupportedInst(inst_variant_name(other))),
     })
@@ -2514,6 +2538,8 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         Inst::MakeClosure(v, _) => Some(*v),
         Inst::Call(v, _, _) => Some(*v),
         Inst::CallGeneral(v, _, _) => Some(*v),
+        // AOT G3 — generic by-name builtin call.
+        Inst::CallBuiltin(v, _, _) => Some(*v),
         // RC3 iter 2.4 — EnvLookup post-demote (captures).
         Inst::EnvLookup(v, _) | Inst::EnvLookupAny(v, _) => Some(*v),
         // RC2 iter C — Flonum arith/cmp Insts.
@@ -2743,6 +2769,7 @@ fn inst_variant_name(inst: &Inst) -> &'static str {
         Inst::Call(..) => "Call",
         Inst::CallSelf(..) => "CallSelf",
         Inst::CallGeneral(..) => "CallGeneral",
+        Inst::CallBuiltin(..) => "CallBuiltin",
         Inst::EnvLookup(..) => "EnvLookup",
         Inst::EnvLookupAny(..) => "EnvLookupAny",
         Inst::EnvSet(..) => "EnvSet",

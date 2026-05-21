@@ -28,6 +28,36 @@ use cs_rir::inline::{analyze_for_inline, splice_single_block, SpliceRequest};
 use cs_rir::{Block, BlockId, Const, Function, Inst as RirInst, Term, Type, Value as RirValue};
 
 use crate::opcode::{CompiledLambda, Inst};
+
+thread_local! {
+    /// True while the **AOT** backend is translating (set by a scoped
+    /// guard in `bytecode_to_rir_aot_with_param_types`). When set, builtin
+    /// calls lower to a generic [`RirInst::CallBuiltin`] for *every*
+    /// builtin instead of the JIT-only dedicated insts (StrAppend,
+    /// NumberToString, Reverse, …). Those dedicated insts have no AOT
+    /// lowering — routing all builtins through `cs_runtime::aot_call_builtin`
+    /// covers the whole stdlib uniformly. The JIT path leaves this false
+    /// and keeps its fast dedicated lowerings.
+    static AOT_MODE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard: sets [`AOT_MODE`] for the duration of an AOT translation and
+/// restores the previous value on drop (re-entrant translation and early
+/// returns can't leak the flag).
+struct AotModeGuard(bool);
+impl AotModeGuard {
+    fn enter() -> Self {
+        AotModeGuard(AOT_MODE.with(|c| c.replace(true)))
+    }
+}
+impl Drop for AotModeGuard {
+    fn drop(&mut self) {
+        AOT_MODE.with(|c| c.set(self.0));
+    }
+}
+fn aot_mode() -> bool {
+    AOT_MODE.with(|c| c.get())
+}
 use crate::vm::{Env, VmClosure};
 
 /// Errors the translator can surface. `Unsupported` is the dominant
@@ -128,6 +158,10 @@ pub fn bytecode_to_rir_aot_with_param_types(
     known_globals: Option<&std::collections::HashSet<u32>>,
     param_type_hints: Option<&[Type]>,
 ) -> Result<Function, TranslateError> {
+    // Translate in AOT mode: builtins lower to generic CallBuiltin dispatch
+    // (see AOT_MODE) rather than JIT-only dedicated insts. The guard resets
+    // on drop, so the JIT path (which never enters here) is unaffected.
+    let _aot_guard = AotModeGuard::enter();
     let mut func = bytecode_to_rir_with_hints(lambda, name, self_name, param_type_hints)?;
     // RC3 iter 2.13 — seed self_binding_sym from self_name so
     // record_captures (which runs below) can exclude self-EnvLookups
@@ -1203,4670 +1237,4815 @@ pub fn bytecode_to_rir_full(
                                 }
                             }
                             let dst = alloc();
-                            // Single-Inst lowerings.
-                            let single = match (name, args.len()) {
-                                // ADR 0012 D-2 (iter ED) — R7RS division
-                                // ops: truncate-quotient/remainder are
-                                // aliases for quotient/remainder; floor-
-                                // remainder is an alias for modulo;
-                                // floor-quotient is a new FloorQuotient
-                                // RIR with sdiv+adjust lowering.
-                                // ADR 0012 D-2 (iter EL) — integer-only ops
-                                // gated on !=Flonum to prevent silent
-                                // miscompile when a Flonum operand sneaks
-                                // through (e.g., from a parameter). Flonum
-                                // operands fall through to the multi-Inst
-                                // section (which doesn't handle them either),
-                                // then to the unsupported tail → deopt to VM
-                                // which gives a proper type-error.
-                                ("quotient", 2) | ("truncate-quotient", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Quotient(dst, args[0], args[1]))
-                                }
-                                ("remainder", 2) | ("truncate-remainder", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Remainder(dst, args[0], args[1]))
-                                }
-                                ("modulo", 2) | ("floor-remainder", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Modulo(dst, args[0], args[1]))
-                                }
-                                ("floor-quotient", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::FloorQuotient(dst, args[0], args[1]))
-                                }
-                                ("gcd", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Gcd(dst, args[0], args[1]))
-                                }
-                                ("lcm", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Lcm(dst, args[0], args[1]))
-                                }
-                                ("expt", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Expt(dst, args[0], args[1]))
-                                }
-                                ("arithmetic-shift", 2) | ("bitwise-arithmetic-shift", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::ArithShift(dst, args[0], args[1]))
-                                }
-                                ("bitwise-and", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitAnd(dst, args[0], args[1]))
-                                }
-                                ("bitwise-ior", 2) | ("bitwise-or", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitOr(dst, args[0], args[1]))
-                                }
-                                ("bitwise-xor", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitXor(dst, args[0], args[1]))
-                                }
-                                ("bitwise-not", 1)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitNot(dst, args[0]))
-                                }
-                                // ADR 0012 D-2 (iter FW) — fx bitwise aliases.
-                                // R6RS fixnum-only; refuse Flonum and lower to
-                                // the same primitives as bitwise-{and,or,xor,not}.
-                                ("fxand", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitAnd(dst, args[0], args[1]))
-                                }
-                                ("fxior", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitOr(dst, args[0], args[1]))
-                                }
-                                ("fxxor", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitXor(dst, args[0], args[1]))
-                                }
-                                ("fxnot", 1)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitNot(dst, args[0]))
-                                }
-                                // ADR 0012 D-2 (iter FW) — fx bit-inspection
-                                // aliases (route to vm_bitwise_* helpers).
-                                ("fxbit-count", 1)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitwiseBitCount(dst, args[0]))
-                                }
-                                ("fxlength", 1)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitwiseLength(dst, args[0]))
-                                }
-                                // ADR 0012 D-2 (iter EB) — abs/max/min are
-                                // Fixnum-only on this fast path. If any
-                                // operand is Flonum the multi-Inst section
-                                // picks them up with FlonumAbs/Max/Min.
-                                ("abs", 1)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::AbsFixnum(dst, args[0]))
-                                }
-                                ("max", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::MaxFixnum(dst, args[0], args[1]))
-                                }
-                                ("min", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::MinFixnum(dst, args[0], args[1]))
-                                }
-                                // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
-                                // Both Fixnum -> Fixnum. Gated to non-Flonum.
-                                ("bitwise-bit-count", 1)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitwiseBitCount(dst, args[0]))
-                                }
-                                ("bitwise-length", 1)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitwiseLength(dst, args[0]))
-                                }
-                                // ADR 0012 D-2 (iter FV) — fx arithmetic +
-                                // comparison + max/min (Fixnum-only aliases).
-                                ("fx+", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Add(dst, args[0], args[1]))
-                                }
-                                ("fx-", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Sub(dst, args[0], args[1]))
-                                }
-                                ("fx*", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Mul(dst, args[0], args[1]))
-                                }
-                                ("fxmax", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::MaxFixnum(dst, args[0], args[1]))
-                                }
-                                ("fxmin", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::MinFixnum(dst, args[0], args[1]))
-                                }
-                                ("fx=?", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Eq(dst, args[0], args[1]))
-                                }
-                                ("fx<?", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Lt(dst, args[0], args[1]))
-                                }
-                                ("fx>?", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Lt(dst, args[1], args[0]))
-                                }
-                                // ADR 0012 D-2 (iter FO) — bitwise-arithmetic-shift-{left,right}.
-                                ("bitwise-arithmetic-shift-left", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitwiseArithShiftLeft(dst, args[0], args[1]))
-                                }
-                                ("bitwise-arithmetic-shift-right", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitwiseArithShiftRight(dst, args[0], args[1]))
-                                }
-                                // ADR 0012 D-2 (iter FX) — fx shift aliases.
-                                ("fxarithmetic-shift", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::ArithShift(dst, args[0], args[1]))
-                                }
-                                ("fxarithmetic-shift-left", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitwiseArithShiftLeft(dst, args[0], args[1]))
-                                }
-                                ("fxarithmetic-shift-right", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::BitwiseArithShiftRight(dst, args[0], args[1]))
-                                }
-                                // ADR 0012 D-2 (iter FX) — fxfirst-bit-set.
-                                ("fxfirst-bit-set", 1)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::FxFirstBitSet(dst, args[0]))
-                                }
-                                // ADR 0012 D-2 (iter GE) — R6RS div / mod.
-                                // Both 2-arg Fixnum-only; refuse Flonum.
-                                ("div", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::DivEuclid(dst, args[0], args[1]))
-                                }
-                                ("mod", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::ModEuclid(dst, args[0], args[1]))
-                                }
-                                ("fxdiv", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::DivEuclid(dst, args[0], args[1]))
-                                }
-                                ("fxmod", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::ModEuclid(dst, args[0], args[1]))
-                                }
-                                // ADR 0012 D-2 (iter HO) — R6RS div0 / mod0.
-                                ("div0", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Div0(dst, args[0], args[1]))
-                                }
-                                ("mod0", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Mod0(dst, args[0], args[1]))
-                                }
-                                // ADR 0012 D-2 (iter HP) — R6RS fxdiv0 / fxmod0.
-                                // Same numerics, reuse Div0 / Mod0 lowering.
-                                ("fxdiv0", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Div0(dst, args[0], args[1]))
-                                }
-                                ("fxmod0", 2)
-                                    if value_types.get(&args[0]).copied() != Some(Type::Flonum)
-                                        && value_types.get(&args[1]).copied()
-                                            != Some(Type::Flonum) =>
-                                {
-                                    Some(RirInst::Mod0(dst, args[0], args[1]))
-                                }
-                                _ => None,
-                            };
-                            if let Some(inst) = single {
-                                insts.push(inst);
+                            if aot_mode() {
+                                // AOT: route every builtin through generic
+                                // by-name dispatch. The JIT-only dedicated
+                                // insts below (StrAppend, NumberToString, …)
+                                // have no AOT lowering; cs_runtime::
+                                // aot_call_builtin covers the whole stdlib.
+                                insts.push(RirInst::CallBuiltin(
+                                    dst,
+                                    name.to_string(),
+                                    args.clone(),
+                                ));
+                                value_types.insert(dst, Type::Any);
                                 sim_stack.push(StackEntry::Value(dst));
                             } else {
-                                // Multi-Inst lowerings for 1-arg fixnum
-                                // predicates that the cs-vm compiler
-                                // doesn't have specialized opcodes for.
-                                // All produce Boolean (0 or 1 i64).
-                                match (name, args.len()) {
-                                    // ADR 0012 D-2 (iter EP) — Flonum-typed
-                                    // zero?/positive?/negative? use FlonumEq/
-                                    // FlonumLt against a 0.0 constant.
-                                    ("zero?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
-                                        value_types.insert(zero, Type::Flonum);
-                                        insts.push(RirInst::FlonumEq(dst, args[0], zero));
-                                    }
-                                    ("positive?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
-                                        value_types.insert(zero, Type::Flonum);
-                                        insts.push(RirInst::FlonumLt(dst, zero, args[0]));
-                                    }
-                                    ("negative?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
-                                        value_types.insert(zero, Type::Flonum);
-                                        insts.push(RirInst::FlonumLt(dst, args[0], zero));
-                                    }
-                                    // Fixnum default for zero?/positive?/
-                                    // negative? and odd?/even?. odd?/even?
-                                    // refuse Flonum (no integer parity for
-                                    // f64) → fall through to unsupported.
-                                    ("zero?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Eq(dst, args[0], zero));
-                                    }
-                                    ("positive?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        // x > 0  →  Lt(0, x)
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Lt(dst, zero, args[0]));
-                                    }
-                                    ("negative?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        // x < 0  →  Lt(x, 0)
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Lt(dst, args[0], zero));
-                                    }
-                                    // ADR 0012 D-2 (iter FV) — fx<=? and fx>=?.
-                                    // Multi-Inst because R6RS 2-arg form needs
-                                    // NOT(Lt) — Lt + LoadConst(0) + Eq.
-                                    ("fx<=?", 2)
+                                // Single-Inst lowerings.
+                                let single = match (name, args.len()) {
+                                    // ADR 0012 D-2 (iter ED) — R7RS division
+                                    // ops: truncate-quotient/remainder are
+                                    // aliases for quotient/remainder; floor-
+                                    // remainder is an alias for modulo;
+                                    // floor-quotient is a new FloorQuotient
+                                    // RIR with sdiv+adjust lowering.
+                                    // ADR 0012 D-2 (iter EL) — integer-only ops
+                                    // gated on !=Flonum to prevent silent
+                                    // miscompile when a Flonum operand sneaks
+                                    // through (e.g., from a parameter). Flonum
+                                    // operands fall through to the multi-Inst
+                                    // section (which doesn't handle them either),
+                                    // then to the unsupported tail → deopt to VM
+                                    // which gives a proper type-error.
+                                    ("quotient", 2) | ("truncate-quotient", 2)
                                         if value_types.get(&args[0]).copied()
                                             != Some(Type::Flonum)
                                             && value_types.get(&args[1]).copied()
                                                 != Some(Type::Flonum) =>
                                     {
-                                        // a <= b  ≡  not(b < a)
-                                        let lt = alloc();
-                                        insts.push(RirInst::Lt(lt, args[1], args[0]));
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Eq(dst, lt, zero));
+                                        Some(RirInst::Quotient(dst, args[0], args[1]))
                                     }
-                                    ("fx>=?", 2)
+                                    ("remainder", 2) | ("truncate-remainder", 2)
                                         if value_types.get(&args[0]).copied()
                                             != Some(Type::Flonum)
                                             && value_types.get(&args[1]).copied()
                                                 != Some(Type::Flonum) =>
                                     {
-                                        // a >= b  ≡  not(a < b)
-                                        let lt = alloc();
-                                        insts.push(RirInst::Lt(lt, args[0], args[1]));
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Eq(dst, lt, zero));
+                                        Some(RirInst::Remainder(dst, args[0], args[1]))
                                     }
-                                    // ADR 0012 D-2 (iter FU) — fx predicate aliases.
-                                    // R6RS fixnum-specific; refuse Flonum, lower
-                                    // to the same primitives as Fixnum positive?
-                                    // / negative? / zero? / even? / odd?.
-                                    ("fxzero?", 1)
+                                    ("modulo", 2) | ("floor-remainder", 2)
                                         if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Eq(dst, args[0], zero));
-                                    }
-                                    ("fxpositive?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Lt(dst, zero, args[0]));
-                                    }
-                                    ("fxnegative?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Lt(dst, args[0], zero));
-                                    }
-                                    ("fxeven?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        let one = alloc();
-                                        insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        let bit = alloc();
-                                        insts.push(RirInst::BitAnd(bit, args[0], one));
-                                        insts.push(RirInst::Eq(dst, bit, zero));
-                                    }
-                                    ("fxodd?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        let one = alloc();
-                                        insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
-                                        let bit = alloc();
-                                        insts.push(RirInst::BitAnd(bit, args[0], one));
-                                        insts.push(RirInst::Eq(dst, bit, one));
-                                    }
-                                    ("odd?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        // x & 1 == 1  →  BitAnd then Eq with 1.
-                                        let one = alloc();
-                                        insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
-                                        let bit = alloc();
-                                        insts.push(RirInst::BitAnd(bit, args[0], one));
-                                        insts.push(RirInst::Eq(dst, bit, one));
-                                    }
-                                    ("even?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        // x & 1 == 0
-                                        let one = alloc();
-                                        insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        let bit = alloc();
-                                        insts.push(RirInst::BitAnd(bit, args[0], one));
-                                        insts.push(RirInst::Eq(dst, bit, zero));
-                                    }
-                                    // ADR 0012 D-2 (iter EQ) — type-aware (not x).
-                                    // Boolean operand: lower to the dedicated
-                                    // `Inst::NotBoolean` so AOT and JIT can
-                                    // emit a specialized bit-flip rather
-                                    // than re-using numeric Eq (which calls
-                                    // generic_cmp2 and FAILS on boolean
-                                    // operands, making the previous (not x)
-                                    // path return #f for every boolean — the
-                                    // bug tak hit on `(not (< y x))`).
-                                    ("not", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Boolean) =>
-                                    {
-                                        insts.push(RirInst::NotBoolean(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // Any operand: AnyTruthy returns NB
-                                    // Boolean (true if truthy, false if
-                                    // NB_FALSE). NotBoolean flips. Result
-                                    // is NB Boolean (NB false if input
-                                    // truthy, NB true if input was #f).
-                                    //
-                                    // RC3 iter 2.16 fix — previously this
-                                    // emitted `Eq(truthy, Fixnum(0))`
-                                    // which works in JIT i64-boolean mode
-                                    // but fails in NB-AOT (Eq routes
-                                    // through generic_cmp2 which rejects
-                                    // boolean operands). binary-trees's
-                                    // `(if (not (car t)) ...)` hit this.
-                                    ("not", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let truthy = alloc();
-                                        insts.push(RirInst::AnyTruthy(truthy, args[0]));
-                                        value_types.insert(truthy, Type::Boolean);
-                                        insts.push(RirInst::NotBoolean(dst, truthy));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // Other primitive types (Fixnum,
-                                    // Character, Flonum, Symbol, Null): the
-                                    // value is never #f, so (not x) is
-                                    // always #f. Load preserved for SSA.
-                                    ("not", 1) => {
-                                        let _ = args[0];
-                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
-                                    }
-                                    // Always-true predicates: when the
-                                    // arg is a Fixnum (which it always
-                                    // is in our i64 ABI), every numeric
-                                    // type predicate matches. The JIT
-                                    // emits Const(1) and ignores the
-                                    // arg — the upstream load of `args[0]`
-                                    // is preserved by SSA but unused;
-                                    // Cranelift's DCE removes it.
-                                    // Always-true predicates: number? / real?
-                                    // are correct for both Fixnum and Flonum
-                                    // (Flonum is a number and real). exact-X?
-                                    // is split out below — Flonums are inexact
-                                    // by definition, so all three exact-X?
-                                    // predicates return #f for Flonum operand
-                                    // (ADR 0012 D-2 iter EI). integer? /
-                                    // rational? were split via iter EH.
-                                    // ADR 0012 D-2 (iter GD) — complex? and
-                                    // real-valued? are aliases of number? in the
-                                    // CrabScheme tower (no complex numbers).
-                                    ("number?", 1)
-                                    | ("real?", 1)
-                                    | ("complex?", 1)
-                                    | ("real-valued?", 1) => {
-                                        let _ = args[0]; // load preserved for SSA correctness
-                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
-                                    }
-                                    // ADR 0012 D-2 (iter EI) — exact-integer?
-                                    // and exact-rational? for Fixnum (or
-                                    // default) are #t. For Flonum, both are
-                                    // #f (flonums are inexact).
-                                    // (exact-real? is not a registered
-                                    // runtime builtin.)
-                                    ("exact-integer?", 1) | ("exact-rational?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        let _ = args[0];
-                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
-                                    }
-                                    ("exact-integer?", 1) | ("exact-rational?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        let _ = args[0];
-                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
-                                    }
-                                    // ADR 0012 D-2 (iter HJ) — bytevector=?.
-                                    ("bytevector=?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
+                                            != Some(Type::Flonum)
                                             && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
+                                                != Some(Type::Flonum) =>
                                     {
-                                        insts.push(RirInst::BytevectorEqP(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Boolean);
+                                        Some(RirInst::Modulo(dst, args[0], args[1]))
                                     }
-                                    // ADR 0012 D-2 (iter HK) — vector=?.
-                                    ("vector=?", 2)
+                                    ("floor-quotient", 2)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
+                                            != Some(Type::Flonum)
                                             && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
+                                                != Some(Type::Flonum) =>
                                     {
-                                        insts.push(RirInst::VectorEqP(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Boolean);
+                                        Some(RirInst::FloorQuotient(dst, args[0], args[1]))
                                     }
-                                    // ADR 0012 D-2 (iter HI) — exact-nonnegative-integer?.
-                                    // Flonum is always #f. Otherwise call the
-                                    // helper (operand BoxTyped if not Any).
-                                    ("exact-nonnegative-integer?", 1)
+                                    ("gcd", 2)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
                                     {
-                                        let _ = args[0];
-                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
+                                        Some(RirInst::Gcd(dst, args[0], args[1]))
                                     }
-                                    ("exact-nonnegative-integer?", 1) => {
-                                        let t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let arg = if t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::ExactNonNegIntP(dst, arg));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // integer? / rational? gated on
-                                    // !=Flonum default to const-true (Fixnum
-                                    // is always integer and always rational).
-                                    // ADR 0012 D-2 (iter GF) — integer-valued?
-                                    // and rational-valued? are aliases of
-                                    // integer? and rational? in the CrabScheme
-                                    // tower (no complex numbers; Flonum 5.0
-                                    // already satisfies integer? per iter EH).
-                                    ("integer?", 1)
-                                    | ("rational?", 1)
-                                    | ("integer-valued?", 1)
-                                    | ("rational-valued?", 1)
+                                    ("lcm", 2)
                                         if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
                                     {
-                                        let _ = args[0];
-                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
+                                        Some(RirInst::Lcm(dst, args[0], args[1]))
                                     }
-                                    // ADR 0012 D-2 (iter EH) — Flonum-typed
-                                    // integer? and rational?.
-                                    ("integer?", 1) | ("integer-valued?", 1)
+                                    ("expt", 2)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
                                     {
-                                        insts.push(RirInst::FlonumIsInteger(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
+                                        Some(RirInst::Expt(dst, args[0], args[1]))
                                     }
-                                    ("rational?", 1) | ("rational-valued?", 1)
+                                    ("arithmetic-shift", 2) | ("bitwise-arithmetic-shift", 2)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
                                     {
-                                        insts.push(RirInst::FlonumIsFinite(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
+                                        Some(RirInst::ArithShift(dst, args[0], args[1]))
                                     }
-                                    // ADR 0012 D-2 (iter EE) — exact?/inexact?
-                                    // are Fixnum-vs-Flonum sensitive. Other
-                                    // types (Character, Boolean, etc.) treat
-                                    // exact? as #t (Fixnum default) — non-
-                                    // numeric args are caller errors.
-                                    ("exact?", 1) => {
-                                        let t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let _ = args[0];
-                                        let v = !matches!(t, Type::Flonum);
-                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(v)));
+                                    ("bitwise-and", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::BitAnd(dst, args[0], args[1]))
                                     }
-                                    ("inexact?", 1) => {
-                                        let t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let _ = args[0];
-                                        let v = matches!(t, Type::Flonum);
-                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(v)));
+                                    ("bitwise-ior", 2) | ("bitwise-or", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::BitOr(dst, args[0], args[1]))
                                     }
-                                    ("nan?", 1) | ("infinite?", 1)
+                                    ("bitwise-xor", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::BitXor(dst, args[0], args[1]))
+                                    }
+                                    ("bitwise-not", 1)
                                         if value_types.get(&args[0]).copied()
                                             != Some(Type::Flonum) =>
                                     {
-                                        // Fixnum / non-flonum: not NaN, not
-                                        // infinite.
-                                        let _ = args[0];
-                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
+                                        Some(RirInst::BitNot(dst, args[0]))
                                     }
-                                    // ADR 0012 D-2 (iter EF) — nan?/infinite?/
-                                    // finite? for Flonum via inline fcmp.
-                                    ("nan?", 1)
+                                    // ADR 0012 D-2 (iter FW) — fx bitwise aliases.
+                                    // R6RS fixnum-only; refuse Flonum and lower to
+                                    // the same primitives as bitwise-{and,or,xor,not}.
+                                    ("fxand", 2)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
                                     {
-                                        insts.push(RirInst::FlonumIsNan(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
+                                        Some(RirInst::BitAnd(dst, args[0], args[1]))
                                     }
-                                    ("infinite?", 1)
+                                    ("fxior", 2)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
                                     {
-                                        insts.push(RirInst::FlonumIsInfinite(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
+                                        Some(RirInst::BitOr(dst, args[0], args[1]))
                                     }
-                                    ("finite?", 1)
+                                    ("fxxor", 2)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
                                     {
-                                        insts.push(RirInst::FlonumIsFinite(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
+                                        Some(RirInst::BitXor(dst, args[0], args[1]))
                                     }
-                                    // finite? for Fixnum / non-flonum: always
-                                    // true (per R7RS, exact numbers are
-                                    // finite).
-                                    ("finite?", 1)
+                                    ("fxnot", 1)
                                         if value_types.get(&args[0]).copied()
                                             != Some(Type::Flonum) =>
                                     {
-                                        let _ = args[0];
-                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(true)));
+                                        Some(RirInst::BitNot(dst, args[0]))
                                     }
-                                    // Flonum rounding when the arg is
-                                    // statically Flonum-typed. Cranelift
-                                    // floor/ceil/trunc/nearest do the
-                                    // actual rounding on f64 bits.
-                                    ("floor", 1)
+                                    // ADR 0012 D-2 (iter FW) — fx bit-inspection
+                                    // aliases (route to vm_bitwise_* helpers).
+                                    ("fxbit-count", 1)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
+                                            != Some(Type::Flonum) =>
                                     {
-                                        insts.push(RirInst::FlonumFloor(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
+                                        Some(RirInst::BitwiseBitCount(dst, args[0]))
                                     }
-                                    ("ceiling", 1)
+                                    ("fxlength", 1)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
+                                            != Some(Type::Flonum) =>
                                     {
-                                        insts.push(RirInst::FlonumCeil(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
+                                        Some(RirInst::BitwiseLength(dst, args[0]))
                                     }
-                                    ("truncate", 1)
+                                    // ADR 0012 D-2 (iter EB) — abs/max/min are
+                                    // Fixnum-only on this fast path. If any
+                                    // operand is Flonum the multi-Inst section
+                                    // picks them up with FlonumAbs/Max/Min.
+                                    ("abs", 1)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
+                                            != Some(Type::Flonum) =>
                                     {
-                                        insts.push(RirInst::FlonumTrunc(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
+                                        Some(RirInst::AbsFixnum(dst, args[0]))
                                     }
-                                    ("round", 1)
+                                    ("max", 2)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
                                     {
-                                        insts.push(RirInst::FlonumRound(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
+                                        Some(RirInst::MaxFixnum(dst, args[0], args[1]))
                                     }
-                                    // Identity-on-fixnum rounding ops.
-                                    // (floor n), (ceiling n), etc. all
-                                    // return n unchanged when n is an
-                                    // integer (i.e., a Fixnum here).
-                                    ("floor", 1)
-                                    | ("ceiling", 1)
-                                    | ("truncate", 1)
-                                    | ("round", 1)
-                                    | ("exact", 1)
-                                    | ("inexact->exact", 1) => {
-                                        insts.push(RirInst::Move(dst, args[0]));
-                                    }
-                                    ("square", 1)
+                                    ("min", 2)
                                         if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
                                     {
-                                        // ADR 0012 D-2 (iter EK) — Flonum
-                                        // square via FlonumMul.
-                                        insts.push(RirInst::FlonumMul(dst, args[0], args[0]));
-                                        value_types.insert(dst, Type::Flonum);
+                                        Some(RirInst::MinFixnum(dst, args[0], args[1]))
                                     }
-                                    ("square", 1) => {
-                                        // (square x) → x * x for Fixnum.
-                                        insts.push(RirInst::Mul(dst, args[0], args[0]));
+                                    // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
+                                    // Both Fixnum -> Fixnum. Gated to non-Flonum.
+                                    ("bitwise-bit-count", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::BitwiseBitCount(dst, args[0]))
                                     }
-                                    ("cons", 2) | ("cons-in-region", 2) => {
-                                        // Heap-allocate a Pair via
-                                        // vm_alloc_pair. Tags come from
-                                        // value_types so the helper
-                                        // decodes operands correctly.
-                                        // dst is Type::Any (the i64
-                                        // carries Box::into_raw(Box<Value>)).
+                                    ("bitwise-length", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::BitwiseLength(dst, args[0]))
+                                    }
+                                    // ADR 0012 D-2 (iter FV) — fx arithmetic +
+                                    // comparison + max/min (Fixnum-only aliases).
+                                    ("fx+", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::Add(dst, args[0], args[1]))
+                                    }
+                                    ("fx-", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::Sub(dst, args[0], args[1]))
+                                    }
+                                    ("fx*", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::Mul(dst, args[0], args[1]))
+                                    }
+                                    ("fxmax", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::MaxFixnum(dst, args[0], args[1]))
+                                    }
+                                    ("fxmin", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::MinFixnum(dst, args[0], args[1]))
+                                    }
+                                    ("fx=?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::Eq(dst, args[0], args[1]))
+                                    }
+                                    ("fx<?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::Lt(dst, args[0], args[1]))
+                                    }
+                                    ("fx>?", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::Lt(dst, args[1], args[0]))
+                                    }
+                                    // ADR 0012 D-2 (iter FO) — bitwise-arithmetic-shift-{left,right}.
+                                    ("bitwise-arithmetic-shift-left", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::BitwiseArithShiftLeft(dst, args[0], args[1]))
+                                    }
+                                    ("bitwise-arithmetic-shift-right", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::BitwiseArithShiftRight(dst, args[0], args[1]))
+                                    }
+                                    // ADR 0012 D-2 (iter FX) — fx shift aliases.
+                                    ("fxarithmetic-shift", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::ArithShift(dst, args[0], args[1]))
+                                    }
+                                    ("fxarithmetic-shift-left", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::BitwiseArithShiftLeft(dst, args[0], args[1]))
+                                    }
+                                    ("fxarithmetic-shift-right", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::BitwiseArithShiftRight(dst, args[0], args[1]))
+                                    }
+                                    // ADR 0012 D-2 (iter FX) — fxfirst-bit-set.
+                                    ("fxfirst-bit-set", 1)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::FxFirstBitSet(dst, args[0]))
+                                    }
+                                    // ADR 0012 D-2 (iter GE) — R6RS div / mod.
+                                    // Both 2-arg Fixnum-only; refuse Flonum.
+                                    ("div", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::DivEuclid(dst, args[0], args[1]))
+                                    }
+                                    ("mod", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::ModEuclid(dst, args[0], args[1]))
+                                    }
+                                    ("fxdiv", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::DivEuclid(dst, args[0], args[1]))
+                                    }
+                                    ("fxmod", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::ModEuclid(dst, args[0], args[1]))
+                                    }
+                                    // ADR 0012 D-2 (iter HO) — R6RS div0 / mod0.
+                                    ("div0", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::Div0(dst, args[0], args[1]))
+                                    }
+                                    ("mod0", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::Mod0(dst, args[0], args[1]))
+                                    }
+                                    // ADR 0012 D-2 (iter HP) — R6RS fxdiv0 / fxmod0.
+                                    // Same numerics, reuse Div0 / Mod0 lowering.
+                                    ("fxdiv0", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::Div0(dst, args[0], args[1]))
+                                    }
+                                    ("fxmod0", 2)
+                                        if value_types.get(&args[0]).copied()
+                                            != Some(Type::Flonum)
+                                            && value_types.get(&args[1]).copied()
+                                                != Some(Type::Flonum) =>
+                                    {
+                                        Some(RirInst::Mod0(dst, args[0], args[1]))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(inst) = single {
+                                    insts.push(inst);
+                                    sim_stack.push(StackEntry::Value(dst));
+                                } else {
+                                    // Multi-Inst lowerings for 1-arg fixnum
+                                    // predicates that the cs-vm compiler
+                                    // doesn't have specialized opcodes for.
+                                    // All produce Boolean (0 or 1 i64).
+                                    match (name, args.len()) {
+                                        // ADR 0012 D-2 (iter EP) — Flonum-typed
+                                        // zero?/positive?/negative? use FlonumEq/
+                                        // FlonumLt against a 0.0 constant.
+                                        ("zero?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            let zero = alloc();
+                                            insts
+                                                .push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                            value_types.insert(zero, Type::Flonum);
+                                            insts.push(RirInst::FlonumEq(dst, args[0], zero));
+                                        }
+                                        ("positive?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            let zero = alloc();
+                                            insts
+                                                .push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                            value_types.insert(zero, Type::Flonum);
+                                            insts.push(RirInst::FlonumLt(dst, zero, args[0]));
+                                        }
+                                        ("negative?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            let zero = alloc();
+                                            insts
+                                                .push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                            value_types.insert(zero, Type::Flonum);
+                                            insts.push(RirInst::FlonumLt(dst, args[0], zero));
+                                        }
+                                        // Fixnum default for zero?/positive?/
+                                        // negative? and odd?/even?. odd?/even?
+                                        // refuse Flonum (no integer parity for
+                                        // f64) → fall through to unsupported.
+                                        ("zero?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            insts.push(RirInst::Eq(dst, args[0], zero));
+                                        }
+                                        ("positive?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            // x > 0  →  Lt(0, x)
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            insts.push(RirInst::Lt(dst, zero, args[0]));
+                                        }
+                                        ("negative?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            // x < 0  →  Lt(x, 0)
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            insts.push(RirInst::Lt(dst, args[0], zero));
+                                        }
+                                        // ADR 0012 D-2 (iter FV) — fx<=? and fx>=?.
+                                        // Multi-Inst because R6RS 2-arg form needs
+                                        // NOT(Lt) — Lt + LoadConst(0) + Eq.
+                                        ("fx<=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            // a <= b  ≡  not(b < a)
+                                            let lt = alloc();
+                                            insts.push(RirInst::Lt(lt, args[1], args[0]));
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            insts.push(RirInst::Eq(dst, lt, zero));
+                                        }
+                                        ("fx>=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            // a >= b  ≡  not(a < b)
+                                            let lt = alloc();
+                                            insts.push(RirInst::Lt(lt, args[0], args[1]));
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            insts.push(RirInst::Eq(dst, lt, zero));
+                                        }
+                                        // ADR 0012 D-2 (iter FU) — fx predicate aliases.
+                                        // R6RS fixnum-specific; refuse Flonum, lower
+                                        // to the same primitives as Fixnum positive?
+                                        // / negative? / zero? / even? / odd?.
+                                        ("fxzero?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            insts.push(RirInst::Eq(dst, args[0], zero));
+                                        }
+                                        ("fxpositive?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            insts.push(RirInst::Lt(dst, zero, args[0]));
+                                        }
+                                        ("fxnegative?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            insts.push(RirInst::Lt(dst, args[0], zero));
+                                        }
+                                        ("fxeven?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            let one = alloc();
+                                            insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            let bit = alloc();
+                                            insts.push(RirInst::BitAnd(bit, args[0], one));
+                                            insts.push(RirInst::Eq(dst, bit, zero));
+                                        }
+                                        ("fxodd?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            let one = alloc();
+                                            insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
+                                            let bit = alloc();
+                                            insts.push(RirInst::BitAnd(bit, args[0], one));
+                                            insts.push(RirInst::Eq(dst, bit, one));
+                                        }
+                                        ("odd?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            // x & 1 == 1  →  BitAnd then Eq with 1.
+                                            let one = alloc();
+                                            insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
+                                            let bit = alloc();
+                                            insts.push(RirInst::BitAnd(bit, args[0], one));
+                                            insts.push(RirInst::Eq(dst, bit, one));
+                                        }
+                                        ("even?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            // x & 1 == 0
+                                            let one = alloc();
+                                            insts.push(RirInst::LoadConst(one, Const::Fixnum(1)));
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            let bit = alloc();
+                                            insts.push(RirInst::BitAnd(bit, args[0], one));
+                                            insts.push(RirInst::Eq(dst, bit, zero));
+                                        }
+                                        // ADR 0012 D-2 (iter EQ) — type-aware (not x).
+                                        // Boolean operand: lower to the dedicated
+                                        // `Inst::NotBoolean` so AOT and JIT can
+                                        // emit a specialized bit-flip rather
+                                        // than re-using numeric Eq (which calls
+                                        // generic_cmp2 and FAILS on boolean
+                                        // operands, making the previous (not x)
+                                        // path return #f for every boolean — the
+                                        // bug tak hit on `(not (< y x))`).
+                                        ("not", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Boolean) =>
+                                        {
+                                            insts.push(RirInst::NotBoolean(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // Any operand: AnyTruthy returns NB
+                                        // Boolean (true if truthy, false if
+                                        // NB_FALSE). NotBoolean flips. Result
+                                        // is NB Boolean (NB false if input
+                                        // truthy, NB true if input was #f).
                                         //
-                                        // Free-var args may be
-                                        // Fixnum-defaulted EnvLookups
-                                        // (no `value_types` entry). The
-                                        // free var can hold *any* value
-                                        // — typically a list cdr like
-                                        // n-queens' `placed`. Promote
-                                        // each operand's producing
-                                        // `EnvLookup` to `EnvLookupAny`
-                                        // before tagging, so the cons
-                                        // helper sees a real Gc handle
-                                        // and not a `vm_env_lookup_fixnum`
-                                        // deopt placeholder. Same pattern
-                                        // as the CallGeneral callee/arg
-                                        // promotions. (Post-M8 Stage 0.)
-                                        promote_envlookup_to_any(
-                                            &mut insts,
-                                            &mut value_types,
-                                            args[0],
-                                        );
-                                        promote_envlookup_to_any(
-                                            &mut insts,
-                                            &mut value_types,
-                                            args[1],
-                                        );
-                                        let car_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let cdr_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let car_tag = type_to_jit_rt_tag(car_t);
-                                        let cdr_tag = type_to_jit_rt_tag(cdr_t);
-                                        // Layer 3 — when the typer's
-                                        // lifetime-lowering pass rewrote
-                                        // a (cons …) site to
-                                        // (cons-in-region …), the
-                                        // bytecode encodes a call by
-                                        // that name. Route it to
-                                        // ConsRegion so the JIT/AOT
-                                        // codegen emits vm_alloc_pair_region_gc.
-                                        if name == "cons-in-region" {
-                                            insts.push(RirInst::ConsRegion(
-                                                dst, args[0], car_tag, args[1], cdr_tag,
-                                            ));
-                                        } else {
-                                            insts.push(RirInst::Cons(
-                                                dst, args[0], car_tag, args[1], cdr_tag,
-                                            ));
-                                        }
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DO) — variadic vector.
-                                    // Box each non-Any arg, then emit VecBuild
-                                    // which lowers to a stack-buffer + helper
-                                    // call.
-                                    ("vector", _) => {
-                                        let boxed: Vec<RirValue> = args
-                                            .iter()
-                                            .map(|v| {
-                                                let t = value_types
-                                                    .get(v)
-                                                    .copied()
-                                                    .unwrap_or(Type::Fixnum);
-                                                if t == Type::Any {
-                                                    *v
-                                                } else {
-                                                    let fresh = alloc();
-                                                    insts.push(RirInst::BoxTyped(
-                                                        fresh,
-                                                        *v,
-                                                        type_to_jit_rt_tag(t),
-                                                    ));
-                                                    value_types.insert(fresh, Type::Any);
-                                                    fresh
-                                                }
-                                            })
-                                            .collect();
-                                        insts.push(RirInst::VecBuild(dst, boxed));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DP) — variadic string.
-                                    // Box each non-Any char arg, then emit
-                                    // StrBuild which lowers to a stack-buffer
-                                    // + helper call. The helper deopts if any
-                                    // arg is not a Character.
-                                    ("string", _) => {
-                                        let boxed: Vec<RirValue> = args
-                                            .iter()
-                                            .map(|v| {
-                                                let t = value_types
-                                                    .get(v)
-                                                    .copied()
-                                                    .unwrap_or(Type::Fixnum);
-                                                if t == Type::Any {
-                                                    *v
-                                                } else {
-                                                    let fresh = alloc();
-                                                    insts.push(RirInst::BoxTyped(
-                                                        fresh,
-                                                        *v,
-                                                        type_to_jit_rt_tag(t),
-                                                    ));
-                                                    value_types.insert(fresh, Type::Any);
-                                                    fresh
-                                                }
-                                            })
-                                            .collect();
-                                        insts.push(RirInst::StrBuild(dst, boxed));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DQ) — variadic bytevector.
-                                    // Box each non-Any byte arg, then emit
-                                    // BvBuild. The helper masks each Fixnum
-                                    // to 8 bits and deopts on non-fixnum.
-                                    ("bytevector", _) => {
-                                        let boxed: Vec<RirValue> = args
-                                            .iter()
-                                            .map(|v| {
-                                                let t = value_types
-                                                    .get(v)
-                                                    .copied()
-                                                    .unwrap_or(Type::Fixnum);
-                                                if t == Type::Any {
-                                                    *v
-                                                } else {
-                                                    let fresh = alloc();
-                                                    insts.push(RirInst::BoxTyped(
-                                                        fresh,
-                                                        *v,
-                                                        type_to_jit_rt_tag(t),
-                                                    ));
-                                                    value_types.insert(fresh, Type::Any);
-                                                    fresh
-                                                }
-                                            })
-                                            .collect();
-                                        insts.push(RirInst::BvBuild(dst, boxed));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DR) — variadic
-                                    // string-append. Strings are always
-                                    // Any-shape (Gc<Value::String>), so no
-                                    // BoxTyped pass is needed; non-Any args
-                                    // would be a type error anyway. The
-                                    // helper deopts on non-string.
-                                    ("string-append", _) => {
-                                        let boxed: Vec<RirValue> = args
-                                            .iter()
-                                            .map(|v| {
-                                                let t = value_types
-                                                    .get(v)
-                                                    .copied()
-                                                    .unwrap_or(Type::Fixnum);
-                                                if t == Type::Any {
-                                                    *v
-                                                } else {
-                                                    let fresh = alloc();
-                                                    insts.push(RirInst::BoxTyped(
-                                                        fresh,
-                                                        *v,
-                                                        type_to_jit_rt_tag(t),
-                                                    ));
-                                                    value_types.insert(fresh, Type::Any);
-                                                    fresh
-                                                }
-                                            })
-                                            .collect();
-                                        insts.push(RirInst::StrAppend(dst, boxed));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DS) — variadic
-                                    // append. Lists / Null are Any-shape;
-                                    // last arg can be any value. Box any
-                                    // primitives just in case (typically a
-                                    // no-op here).
-                                    ("append", _) => {
-                                        let boxed: Vec<RirValue> = args
-                                            .iter()
-                                            .map(|v| {
-                                                let t = value_types
-                                                    .get(v)
-                                                    .copied()
-                                                    .unwrap_or(Type::Fixnum);
-                                                if t == Type::Any {
-                                                    *v
-                                                } else {
-                                                    let fresh = alloc();
-                                                    insts.push(RirInst::BoxTyped(
-                                                        fresh,
-                                                        *v,
-                                                        type_to_jit_rt_tag(t),
-                                                    ));
-                                                    value_types.insert(fresh, Type::Any);
-                                                    fresh
-                                                }
-                                            })
-                                            .collect();
-                                        insts.push(RirInst::ListAppend(dst, boxed));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DT) — variadic
-                                    // vector-append. Vectors are always
-                                    // Any-shape; uniform BoxTyped fallback.
-                                    ("vector-append", _) => {
-                                        let boxed: Vec<RirValue> = args
-                                            .iter()
-                                            .map(|v| {
-                                                let t = value_types
-                                                    .get(v)
-                                                    .copied()
-                                                    .unwrap_or(Type::Fixnum);
-                                                if t == Type::Any {
-                                                    *v
-                                                } else {
-                                                    let fresh = alloc();
-                                                    insts.push(RirInst::BoxTyped(
-                                                        fresh,
-                                                        *v,
-                                                        type_to_jit_rt_tag(t),
-                                                    ));
-                                                    value_types.insert(fresh, Type::Any);
-                                                    fresh
-                                                }
-                                            })
-                                            .collect();
-                                        insts.push(RirInst::VecAppend(dst, boxed));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DU) — variadic
-                                    // bytevector-append. Bytevectors are
-                                    // always Any-shape.
-                                    ("bytevector-append", _) => {
-                                        let boxed: Vec<RirValue> = args
-                                            .iter()
-                                            .map(|v| {
-                                                let t = value_types
-                                                    .get(v)
-                                                    .copied()
-                                                    .unwrap_or(Type::Fixnum);
-                                                if t == Type::Any {
-                                                    *v
-                                                } else {
-                                                    let fresh = alloc();
-                                                    insts.push(RirInst::BoxTyped(
-                                                        fresh,
-                                                        *v,
-                                                        type_to_jit_rt_tag(t),
-                                                    ));
-                                                    value_types.insert(fresh, Type::Any);
-                                                    fresh
-                                                }
-                                            })
-                                            .collect();
-                                        insts.push(RirInst::BvAppend(dst, boxed));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DN) — variadic list.
-                                    // `(list a b c)` lowers to a right-to-left
-                                    // chain of cons: cons(a, cons(b, cons(c, '()))).
-                                    // The empty list case yields the Null literal.
-                                    // Emit the final Cons directly into dst so
-                                    // the post-pass's any_values classification
-                                    // covers it (Move doesn't propagate types).
-                                    ("list", _) => {
-                                        if args.is_empty() {
-                                            insts.push(RirInst::LoadConst(dst, Const::Null));
-                                            value_types.insert(dst, Type::Null);
-                                        } else {
-                                            // Build innermost tail: '()
-                                            let mut acc = alloc();
-                                            insts.push(RirInst::LoadConst(acc, Const::Null));
-                                            value_types.insert(acc, Type::Null);
-                                            let mut acc_tag = type_to_jit_rt_tag(Type::Null);
-                                            // Walk args right-to-left, except
-                                            // the last (leftmost) which goes
-                                            // directly into dst.
-                                            for &arg in args[1..].iter().rev() {
-                                                let arg_t = value_types
-                                                    .get(&arg)
-                                                    .copied()
-                                                    .unwrap_or(Type::Fixnum);
-                                                let arg_tag = type_to_jit_rt_tag(arg_t);
-                                                let next = alloc();
-                                                insts.push(RirInst::Cons(
-                                                    next, arg, arg_tag, acc, acc_tag,
-                                                ));
-                                                value_types.insert(next, Type::Any);
-                                                acc = next;
-                                                acc_tag = type_to_jit_rt_tag(Type::Any);
-                                            }
-                                            // First arg goes into dst.
-                                            let first_t = value_types
-                                                .get(&args[0])
-                                                .copied()
-                                                .unwrap_or(Type::Fixnum);
-                                            let first_tag = type_to_jit_rt_tag(first_t);
-                                            insts.push(RirInst::Cons(
-                                                dst, args[0], first_tag, acc, acc_tag,
-                                            ));
-                                            value_types.insert(dst, Type::Any);
-                                        }
-                                    }
-                                    ("car", 1) => {
-                                        // Phase 5 iter4 — promote a free-var
-                                        // EnvLookup arg to Any before
-                                        // requiring it (e.g., `(car p)` where
-                                        // `p` is captured from outer scope).
-                                        let arg0_ty = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        if arg0_ty != Type::Any {
-                                            promote_envlookup_to_any(
-                                                &mut insts,
-                                                &mut value_types,
-                                                args[0],
-                                            );
-                                        }
-                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
-                                            return Err(TranslateError::Unsupported(format!(
-                                                "car on non-Any operand (type={:?})",
-                                                arg0_ty
-                                            )));
-                                        }
-                                        insts.push(RirInst::Car(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("cdr", 1) => {
-                                        let arg0_ty = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        if arg0_ty != Type::Any {
-                                            promote_envlookup_to_any(
-                                                &mut insts,
-                                                &mut value_types,
-                                                args[0],
-                                            );
-                                        }
-                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
-                                            return Err(TranslateError::Unsupported(format!(
-                                                "cdr on non-Any operand (type={:?})",
-                                                arg0_ty
-                                            )));
-                                        }
-                                        insts.push(RirInst::Cdr(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DV) — composed pair
-                                    // accessors (caar/cadr/.../cddddr). Lower
-                                    // to a chain of Car/Cdr RIR insts read
-                                    // right-to-left within the c[ad]+r name.
-                                    // `(caddr x)` ≡ `(car (cdr (cdr x)))`:
-                                    // emit Cdr (rightmost 'd'), then Cdr,
-                                    // then Car (leftmost 'a'). Requires the
-                                    // arg to be Any-typed; intermediate and
-                                    // final values are Any.
-                                    // ADR 0012 D-2 (iter EZ) — also handle
-                                    // SRFI-1 first/second/third/fourth as
-                                    // equivalent cxr names (car, cadr,
-                                    // caddr, cadddr).
-                                    (n, 1)
-                                        if ordinal_to_cxr_dirs(n).is_some()
-                                            && value_types.get(&args[0]).copied()
+                                        // RC3 iter 2.16 fix — previously this
+                                        // emitted `Eq(truthy, Fixnum(0))`
+                                        // which works in JIT i64-boolean mode
+                                        // but fails in NB-AOT (Eq routes
+                                        // through generic_cmp2 which rejects
+                                        // boolean operands). binary-trees's
+                                        // `(if (not (car t)) ...)` hit this.
+                                        ("not", 1)
+                                            if value_types.get(&args[0]).copied()
                                                 == Some(Type::Any) =>
-                                    {
-                                        let dirs = ordinal_to_cxr_dirs(n).unwrap();
-                                        let mut cur = args[0];
-                                        let last_i = dirs.len() - 1;
-                                        for (i, &is_cdr) in dirs.iter().rev().enumerate() {
-                                            let next = if i == last_i { dst } else { alloc() };
-                                            if is_cdr {
-                                                insts.push(RirInst::Cdr(next, cur));
-                                            } else {
-                                                insts.push(RirInst::Car(next, cur));
-                                            }
-                                            value_types.insert(next, Type::Any);
-                                            cur = next;
+                                        {
+                                            let truthy = alloc();
+                                            insts.push(RirInst::AnyTruthy(truthy, args[0]));
+                                            value_types.insert(truthy, Type::Boolean);
+                                            insts.push(RirInst::NotBoolean(dst, truthy));
+                                            value_types.insert(dst, Type::Boolean);
                                         }
-                                    }
-                                    (n, 1)
-                                        if cxr_parse(n).is_some()
-                                            && value_types.get(&args[0]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        let dirs = cxr_parse(n).unwrap();
-                                        let mut cur = args[0];
-                                        let last_i = dirs.len() - 1;
-                                        for (i, &is_cdr) in dirs.iter().rev().enumerate() {
-                                            let next = if i == last_i { dst } else { alloc() };
-                                            if is_cdr {
-                                                insts.push(RirInst::Cdr(next, cur));
-                                            } else {
-                                                insts.push(RirInst::Car(next, cur));
-                                            }
-                                            value_types.insert(next, Type::Any);
-                                            cur = next;
-                                        }
-                                    }
-                                    ("pair?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        // Lower to vm_pair_p. The helper
-                                        // consumes the operand box, so
-                                        // the operand RIR Value must not
-                                        // be reused in this body — a
-                                        // future iter adds AnyClone to
-                                        // support multi-use patterns.
-                                        insts.push(RirInst::PairP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("null?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::NullP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter DD) — type predicates
-                                    // on Any operand. The bottom-of-table
-                                    // "always-false" arms still catch Fixnum-
-                                    // tier operands; these gated arms only
-                                    // fire for Any.
-                                    ("procedure?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::ProcedureP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("port?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::PortP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter GC) — port-subtype predicates.
-                                    // ADR 0012 D-2 (iter GP) — input-port-open? is
-                                    // an alias of input-port? because the runtime
-                                    // never closes input ports (they're alive until
-                                    // GC). R7RS-conformant.
-                                    ("input-port?", 1) | ("input-port-open?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::InputPortP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("output-port?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::OutputPortP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("binary-port?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BinaryPortP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("textual-port?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::TextualPortP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter GP) — output-port-open?.
-                                    ("output-port-open?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::OutputPortOpenP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter GQ) — port-eof? +
-                                    // port-has-set-port-position!?.
-                                    // port-has-port-position? is just port?.
-                                    ("port-has-port-position?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::PortP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("port-eof?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::PortEofP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("port-has-set-port-position!?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::PortHasSetPortPositionP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter GR) — port-position.
-                                    ("port-position", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::PortPosition(dst, args[0]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    // ADR 0012 D-2 (iter GD) — promise?.
-                                    ("promise?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::PromiseP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter GF) — hashtable?.
-                                    ("hashtable?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::HashtableP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter GG) — hashtable-size /
-                                    // hashtable-mutable?.
-                                    ("hashtable-size", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::HashtableSize(dst, args[0]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("hashtable-mutable?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::HashtableMutableP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter HQ) — hashtable-hash-function.
-                                    ("hashtable-hash-function", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::HashtableHashFn(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GH) — hashtable-keys/values.
-                                    ("hashtable-keys", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::HashtableKeys(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("hashtable-values", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::HashtableValues(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GI) — hashtable-clear! (1-arg).
-                                    ("hashtable-clear!", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::HashtableClear(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HW) — hashtable-clear! 2-arg.
-                                    // Second operand is an R6RS capacity hint
-                                    // that CrabScheme's Vec-backed storage
-                                    // ignores. Reuses HashtableClear lowering.
-                                    ("hashtable-clear!", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let _ = args[1];
-                                        insts.push(RirInst::HashtableClear(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GJ) — equal-hash + hashtable->alist.
-                                    ("equal-hash", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::EqualHash(dst, args[0]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("hashtable->alist", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::HashtableToAlist(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GK) — file-exists? + jiffies-per-second.
-                                    ("file-exists?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::FileExistsP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("jiffies-per-second", 0) => {
-                                        insts.push(RirInst::LoadConst(
-                                            dst,
-                                            Const::Fixnum(1_000_000_000),
-                                        ));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    // ADR 0012 D-2 (iter IW) — fixnum constants.
-                                    ("fixnum-width", 0) => {
-                                        insts.push(RirInst::LoadConst(dst, Const::Fixnum(64)));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("least-fixnum", 0) => {
-                                        insts
-                                            .push(RirInst::LoadConst(dst, Const::Fixnum(i64::MIN)));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("greatest-fixnum", 0) => {
-                                        insts
-                                            .push(RirInst::LoadConst(dst, Const::Fixnum(i64::MAX)));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    // ADR 0012 D-2 (iter GL) — current-second / -jiffy.
-                                    ("current-second", 0) => {
-                                        insts.push(RirInst::CurrentSecond(dst));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("current-jiffy", 0) => {
-                                        insts.push(RirInst::CurrentJiffy(dst));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    // ADR 0012 D-2 (iter HD) — eof-object constructor.
-                                    ("eof-object", 0) => {
-                                        insts.push(RirInst::EofObject(dst));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HR) — make-hashtable 0-arg.
-                                    ("make-hashtable", 0) => {
-                                        insts.push(RirInst::MakeHashtableEqual(dst));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HS) — make-eq/eqv-hashtable.
-                                    ("make-eq-hashtable", 0) => {
-                                        insts.push(RirInst::MakeHashtableEq(dst));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("make-eqv-hashtable", 0) => {
-                                        insts.push(RirInst::MakeHashtableEqv(dst));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HY) — make-eq/eqv-hashtable 1-arg.
-                                    // R6RS allows an optional capacity hint
-                                    // (Vec storage ignores it).
-                                    ("make-eq-hashtable", 1) => {
-                                        let _ = args[0];
-                                        insts.push(RirInst::MakeHashtableEq(dst));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("make-eqv-hashtable", 1) => {
-                                        let _ = args[0];
-                                        insts.push(RirInst::MakeHashtableEqv(dst));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GN) — append-reverse.
-                                    ("append-reverse", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::AppendReverse(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GO) — alist-copy.
-                                    ("alist-copy", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::AlistCopy(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GS) — delete + delete-duplicates.
-                                    ("delete", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::Delete(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("delete-duplicates", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::DeleteDuplicates(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GU) — force (fast path).
-                                    // Pending promises deopt to bytecode.
-                                    ("force", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::ForceForced(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GV) — hashtable-contains?.
-                                    // Both operands must be Any; Custom-kind
-                                    // hashtables deopt at runtime.
-                                    ("hashtable-contains?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::HashtableContainsP(
-                                            dst, args[0], args[1],
-                                        ));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter GW) — hashtable-delete!.
-                                    // Mutates table; result is Unspecified.
-                                    ("hashtable-delete!", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::HashtableDelete(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GZ) — hashtable-copy.
-                                    // 1-arg form (mutable copy).
-                                    ("hashtable-copy", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::HashtableCopy(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HX) — hashtable-copy 2-arg.
-                                    // Second operand is an R6RS mutability hint
-                                    // that CrabScheme's mutable-only hashtables
-                                    // ignore. Reuses HashtableCopy lowering.
-                                    ("hashtable-copy", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let _ = args[1];
-                                        insts.push(RirInst::HashtableCopy(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GY) — hashtable-ref.
-                                    // 3-arg; ht and key must be Any; default
-                                    // gets BoxTyped if not Any.
-                                    ("hashtable-ref", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        let dt = value_types
-                                            .get(&args[2])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let default_arg = if dt == Type::Any {
-                                            args[2]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[2],
-                                                type_to_jit_rt_tag(dt),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::HashtableRef(
-                                            dst,
-                                            args[0],
-                                            args[1],
-                                            default_arg,
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GX) — hashtable-set!.
-                                    // 3-arg mutator; ht/key must be Any.
-                                    // Value operand gets BoxTyped if not Any.
-                                    ("hashtable-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        let vt = value_types
-                                            .get(&args[2])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let val_arg = if vt == Type::Any {
-                                            args[2]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[2],
-                                                type_to_jit_rt_tag(vt),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::HashtableSet(
-                                            dst, args[0], args[1], val_arg,
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GT) — make-promise.
-                                    // Accepts any operand; BoxTyped if not Any.
-                                    ("make-promise", 1) => {
-                                        let t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let boxed = if t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::MakePromise(dst, boxed));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter GI) — numerator/denominator
-                                    // for Fixnum: numerator is identity, denominator
-                                    // is 1.
-                                    ("numerator", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        // Identity: copy via Add(0, x)? Simplest: LoadConst+Add.
-                                        // Actually we can just alias by Sub(x, 0).
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Add(dst, args[0], zero));
-                                    }
-                                    ("denominator", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::LoadConst(dst, Const::Fixnum(1)));
-                                    }
-                                    ("eof-object?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::EofP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("symbol?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::SymbolP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter DE) — immediate-shape
-                                    // type predicates. Each does a 3-way
-                                    // dispatch on the operand's static type:
-                                    // matching-type → const true; Any →
-                                    // runtime helper; otherwise → const false.
-                                    // These catch-all arms supersede the
-                                    // always-true (fixnum?) / always-false
-                                    // (char?, boolean?, flonum?) entries in
-                                    // the earlier predicate tables for these
-                                    // four names.
-                                    ("char?", 1) => {
-                                        let t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        match t {
-                                            Type::Any => {
-                                                insts.push(RirInst::CharP(dst, args[0]));
-                                            }
-                                            Type::Character => {
-                                                let _ = args[0];
-                                                insts.push(RirInst::LoadConst(
-                                                    dst,
-                                                    Const::Boolean(true),
-                                                ));
-                                            }
-                                            _ => {
-                                                let _ = args[0];
-                                                insts.push(RirInst::LoadConst(
-                                                    dst,
-                                                    Const::Boolean(false),
-                                                ));
-                                            }
-                                        }
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("boolean?", 1) => {
-                                        let t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        match t {
-                                            Type::Any => {
-                                                insts.push(RirInst::BoolP(dst, args[0]));
-                                            }
-                                            Type::Boolean => {
-                                                let _ = args[0];
-                                                insts.push(RirInst::LoadConst(
-                                                    dst,
-                                                    Const::Boolean(true),
-                                                ));
-                                            }
-                                            _ => {
-                                                let _ = args[0];
-                                                insts.push(RirInst::LoadConst(
-                                                    dst,
-                                                    Const::Boolean(false),
-                                                ));
-                                            }
-                                        }
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("fixnum?", 1) => {
-                                        let t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        match t {
-                                            Type::Any => {
-                                                insts.push(RirInst::FixnumP(dst, args[0]));
-                                            }
-                                            Type::Fixnum => {
-                                                let _ = args[0];
-                                                insts.push(RirInst::LoadConst(
-                                                    dst,
-                                                    Const::Boolean(true),
-                                                ));
-                                            }
-                                            _ => {
-                                                let _ = args[0];
-                                                insts.push(RirInst::LoadConst(
-                                                    dst,
-                                                    Const::Boolean(false),
-                                                ));
-                                            }
-                                        }
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("flonum?", 1) => {
-                                        let t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        match t {
-                                            Type::Any => {
-                                                insts.push(RirInst::FlonumP(dst, args[0]));
-                                            }
-                                            Type::Flonum => {
-                                                let _ = args[0];
-                                                insts.push(RirInst::LoadConst(
-                                                    dst,
-                                                    Const::Boolean(true),
-                                                ));
-                                            }
-                                            _ => {
-                                                let _ = args[0];
-                                                insts.push(RirInst::LoadConst(
-                                                    dst,
-                                                    Const::Boolean(false),
-                                                ));
-                                            }
-                                        }
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter CA) — list ops.
-                                    ("length", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::Length(dst, args[0]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("list?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::ListP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter CB) — reverse.
-                                    // ADR 0012 D-2 (iter EW) — reverse! is
-                                    // an alias for reverse (the cs-runtime
-                                    // builtin doesn't actually mutate; it
-                                    // builds a fresh reversed list, same as
-                                    // R7RS reverse).
-                                    ("reverse", 1) | ("reverse!", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::Reverse(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CC) — memq. Both
-                                    // args must be Any at the helper boundary;
-                                    // typed-immediate items (Symbol literals,
-                                    // Fixnums) are boxed first. The list arg
-                                    // is required to be Any (came from cons /
-                                    // list / env-lookup-any).
-                                    ("memq", 2)
-                                        if value_types.get(&args[1]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let item_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let item = if item_t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(item_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::Memq(dst, item, args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CD) — assq. Mirrors
-                                    // memq's BoxTyped dance on the key arg.
-                                    ("assq", 2)
-                                        if value_types.get(&args[1]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let key_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let key = if key_t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(key_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::Assq(dst, key, args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CG) — memv / assv,
-                                    // the eqv?-flavored variants. Same
-                                    // BoxTyped dance on the search key.
-                                    ("memv", 2)
-                                        if value_types.get(&args[1]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let item_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let item = if item_t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(item_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::Memv(dst, item, args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("assv", 2)
-                                        if value_types.get(&args[1]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let key_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let key = if key_t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(key_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::Assv(dst, key, args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CM) — substring.
-                                    // String arg Any, start/end Fixnum. Result
-                                    // is a fresh Gc<Value::String>.
-                                    ("substring", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::Substring(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HV) — string-copy 2-arg slice-to-end.
-                                    ("string-copy", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::StrCopyFrom(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HB) — string-copy 3-arg
-                                    // is identical to substring in R7RS (char-
-                                    // based slicing, returns fresh string). Reuse
-                                    // the substring lowering.
-                                    ("string-copy", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::Substring(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CK) — list-tail / list-ref.
-                                    // lst Any, index Fixnum. Helpers consume
-                                    // the lst handle; index is a raw i64.
-                                    ("list-tail", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::ListTail(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("list-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::ListRef(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CQ) — bytevector
-                                    // read ops. All gated on Any arg.
-                                    ("bytevector?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("bytevector-length", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvLength(dst, args[0]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("bytevector-u8-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvU8Ref(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    // ADR 0012 D-2 (iter FP) — bytevector-s8-ref.
-                                    ("bytevector-s8-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvS8Ref(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    // ADR 0012 D-2 (iter FQ) — bytevector-u16/s16 native-ref.
-                                    ("bytevector-u16-native-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvU16NativeRef(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("bytevector-s16-native-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvS16NativeRef(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    // ADR 0012 D-2 (iter FR) — bytevector-u32/s32 native-ref.
-                                    ("bytevector-u32-native-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvU32NativeRef(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("bytevector-s32-native-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvS32NativeRef(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    // ADR 0012 D-2 (iter FS) — IEEE float native-ref.
-                                    ("bytevector-ieee-single-native-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvIeeeSingleNativeRef(
-                                            dst, args[0], args[1],
-                                        ));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("bytevector-ieee-double-native-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvIeeeDoubleNativeRef(
-                                            dst, args[0], args[1],
-                                        ));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    // ADR 0012 D-2 (iter FT) — bytevector-u64/s64 native-ref.
-                                    ("bytevector-u64-native-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvU64NativeRef(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("bytevector-s64-native-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvS64NativeRef(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    // ADR 0012 D-2 (iter DB) — string-copy /
-                                    // vector-copy (1-arg full copy).
-                                    ("string-copy", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StrCopy(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("vector-copy", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::VecCopy(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HT) — vector-copy 2-arg slice-to-end.
-                                    ("vector-copy", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::VecCopyFrom(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HA) — vector-copy 3-arg slice.
-                                    // Vector must be Any; start and end must be Fixnum.
-                                    ("vector-copy", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::VecCopySlice(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HU) — bytevector-copy 2-arg slice-to-end.
-                                    ("bytevector-copy", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::BvCopyFrom(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
-                                    ("bytevector-copy", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::BvCopySlice(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DC) — bytevector-copy.
-                                    ("bytevector-copy", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvCopy(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DA) — string-set!.
-                                    // s Any, k Fixnum, ch Character.
-                                    ("string-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::StrSet(dst, args[0], args[1], args[2]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DH) — string-fill!.
-                                    // s Any, ch Character. 2-arg form only.
-                                    ("string-fill!", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::StrFill(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IC) — string-fill! 3-arg fill-from.
-                                    ("string-fill!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Character)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::StrFillFrom(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HH) — string-fill! 4-arg slice.
-                                    ("string-fill!", 4)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Character)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[3]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::StrFillSlice(
-                                            dst, args[0], args[1], args[2], args[3],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CZ) — vector-fill! /
-                                    // bytevector-fill!.
-                                    ("vector-fill!", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        // fill arg: BoxTyped if not Any.
-                                        let f_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let fill = if f_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(f_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::VecFill(dst, args[0], fill));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IB) — vector-fill! 3-arg fill-from.
-                                    ("vector-fill!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        // fill arg: BoxTyped if not Any.
-                                        let f_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let fill = if f_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(f_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::VecFillFrom(
-                                            dst, args[0], fill, args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HG) — vector-fill! 4-arg slice.
-                                    ("vector-fill!", 4)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[3]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        // fill arg: BoxTyped if not Any.
-                                        let f_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let fill = if f_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(f_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::VecFillSlice(
-                                            dst, args[0], fill, args[2], args[3],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("bytevector-fill!", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvFill(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HF) — bytevector-fill! 4-arg slice.
-                                    // ADR 0012 D-2 (iter IA) — bytevector-fill! 3-arg fill-from.
-                                    ("bytevector-fill!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::BvFillFrom(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("bytevector-fill!", 4)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[3]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::BvFillSlice(
-                                            dst, args[0], args[1], args[2], args[3],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CR) — bytevector write ops.
-                                    ("make-bytevector", 2) => {
-                                        insts.push(RirInst::BvAlloc(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HL) — make-bytevector 1-arg.
-                                    // Fill defaults to 0; reuse BvAlloc with a
-                                    // synthesized zero.
-                                    ("make-bytevector", 1) => {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        value_types.insert(zero, Type::Fixnum);
-                                        insts.push(RirInst::BvAlloc(dst, args[0], zero));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("bytevector-u8-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts
-                                            .push(RirInst::BvU8Set(dst, args[0], args[1], args[2]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FP) — bytevector-s8-set!.
-                                    ("bytevector-s8-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts
-                                            .push(RirInst::BvS8Set(dst, args[0], args[1], args[2]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FQ) — bytevector-u16/s16 native-set!.
-                                    ("bytevector-u16-native-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvU16NativeSet(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("bytevector-s16-native-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvS16NativeSet(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FR) — bytevector-u32/s32 native-set!.
-                                    ("bytevector-u32-native-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvU32NativeSet(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("bytevector-s32-native-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvS32NativeSet(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FS) — IEEE float native-set!.
-                                    // Gated on Flonum value so the operand is
-                                    // already an f64 bit pattern at the call site.
-                                    ("bytevector-ieee-single-native-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::BvIeeeSingleNativeSet(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("bytevector-ieee-double-native-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::BvIeeeDoubleNativeSet(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FT) — bytevector-u64/s64 native-set!.
-                                    ("bytevector-u64-native-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvU64NativeSet(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("bytevector-s64-native-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvS64NativeSet(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CN) — list-copy.
-                                    ("list-copy", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::ListCopy(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CO) — list-set!. lst
-                                    // Any, n Fixnum, val gets BoxTyped if it's
-                                    // a typed immediate.
-                                    ("list-set!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let v_t = value_types
-                                            .get(&args[2])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let val = if v_t == Type::Any {
-                                            args[2]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[2],
-                                                type_to_jit_rt_tag(v_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::ListSet(dst, args[0], args[1], val));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CH) — member / assoc,
-                                    // the equal?-flavored variants. Same
-                                    // BoxTyped dance on the search key.
-                                    // Only the 2-arg form; the optional
-                                    // 3-arg (user-supplied equiv proc) is
-                                    // out of scope for this iter.
-                                    ("member", 2)
-                                        if value_types.get(&args[1]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let item_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let item = if item_t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(item_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::Member(dst, item, args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("assoc", 2)
-                                        if value_types.get(&args[1]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let key_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let key = if key_t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(key_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::Assoc(dst, key, args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CE) — pair mutation.
-                                    // Pair arg must be Any; value arg gets
-                                    // BoxTyped if it's a typed immediate.
-                                    ("set-car!", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let v_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let val = if v_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(v_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::SetCar(dst, args[0], val));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("set-cdr!", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let v_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let val = if v_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(v_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::SetCdr(dst, args[0], val));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter BV) — vector ops.
-                                    // make-vector requires the fill to be
-                                    // Any. If the user passed a typed
-                                    // immediate (e.g. Fixnum), box it via
-                                    // BoxTyped first.
-                                    // ADR 0012 D-2 (iter JE) — (make-vector n) 1-arg.
-                                    // RC3 iter 2.18 — accept Any-typed n too.
-                                    ("make-vector", 1)
-                                        if matches!(
-                                            value_types.get(&args[0]).copied(),
-                                            Some(Type::Fixnum) | Some(Type::Any)
-                                        ) =>
-                                    {
-                                        insts.push(RirInst::MakeVectorUnspec(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("make-vector", 2) => {
-                                        let len_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let fill_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        // RC3 iter 2.18 — accept Any-typed
-                                        // length too. The cs-aot VecAlloc
-                                        // lowering decodes NB carriers
-                                        // (Fixnum payload extraction) so
-                                        // raw length works regardless of
-                                        // tracked type. Previously we
-                                        // bailed on non-Fixnum, blocking
-                                        // spectral-norm's
-                                        // (make-vector n 1.0) where n
-                                        // defaults to Any (iter 2.16).
-                                        if len_t != Type::Fixnum && len_t != Type::Any {
-                                            return Err(TranslateError::Unsupported(format!(
-                                                "make-vector: length must be Fixnum or Any (got {len_t:?})"
-                                            )));
-                                        }
-                                        let fill = if fill_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(fill_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::VecAlloc(dst, args[0], fill));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("vector-ref", 2) => {
-                                        // Phase 5 iter3 — try promoting
-                                        // a free-var EnvLookup arg0 to
-                                        // Any before requiring it. This
-                                        // lets `(vector-ref v i)` where
-                                        // `v` is a captured vector work
-                                        // (previously rejected when v
-                                        // defaulted to Fixnum).
-                                        let arg0_ty = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        if arg0_ty != Type::Any {
-                                            promote_envlookup_to_any(
-                                                &mut insts,
-                                                &mut value_types,
-                                                args[0],
-                                            );
-                                        }
-                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
-                                            return Err(TranslateError::Unsupported(format!(
-                                                "vector-ref on non-Any operand (type={:?})",
-                                                arg0_ty
-                                            )));
-                                        }
-                                        insts.push(RirInst::VecRef(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("vector-set!", 3) => {
-                                        // Phase 5 iter3 — promote arg0
-                                        // from EnvLookup Fixnum default
-                                        // to Any if needed.
-                                        let arg0_ty = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        if arg0_ty != Type::Any {
-                                            promote_envlookup_to_any(
-                                                &mut insts,
-                                                &mut value_types,
-                                                args[0],
-                                            );
-                                        }
-                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
-                                            return Err(TranslateError::Unsupported(format!(
-                                                "vector-set! on non-Any operand (type={:?})",
-                                                arg0_ty
-                                            )));
-                                        }
-                                        // Box the value-to-store if it's
-                                        // a typed immediate.
-                                        let v_t = value_types
-                                            .get(&args[2])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let val = if v_t == Type::Any {
-                                            args[2]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[2],
-                                                type_to_jit_rt_tag(v_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::VecSet(dst, args[0], args[1], val));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("vector-length", 1) => {
-                                        let arg0_ty = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        if arg0_ty != Type::Any {
-                                            promote_envlookup_to_any(
-                                                &mut insts,
-                                                &mut value_types,
-                                                args[0],
-                                            );
-                                        }
-                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
-                                            return Err(TranslateError::Unsupported(format!(
-                                                "vector-length on non-Any operand (type={:?})",
-                                                arg0_ty
-                                            )));
-                                        }
-                                        insts.push(RirInst::VecLength(dst, args[0]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("vector?", 1) => {
-                                        let arg0_ty = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        if arg0_ty != Type::Any {
-                                            promote_envlookup_to_any(
-                                                &mut insts,
-                                                &mut value_types,
-                                                args[0],
-                                            );
-                                        }
-                                        if value_types.get(&args[0]).copied() != Some(Type::Any) {
-                                            // For non-Any non-promoted
-                                            // operands the type is statically
-                                            // known and the answer is false
-                                            // (except for Any, handled above).
+                                        // Other primitive types (Fixnum,
+                                        // Character, Flonum, Symbol, Null): the
+                                        // value is never #f, so (not x) is
+                                        // always #f. Load preserved for SSA.
+                                        ("not", 1) => {
+                                            let _ = args[0];
                                             insts.push(RirInst::LoadConst(
                                                 dst,
                                                 Const::Boolean(false),
                                             ));
-                                            value_types.insert(dst, Type::Boolean);
-                                        } else {
-                                            insts.push(RirInst::VecP(dst, args[0]));
+                                        }
+                                        // Always-true predicates: when the
+                                        // arg is a Fixnum (which it always
+                                        // is in our i64 ABI), every numeric
+                                        // type predicate matches. The JIT
+                                        // emits Const(1) and ignores the
+                                        // arg — the upstream load of `args[0]`
+                                        // is preserved by SSA but unused;
+                                        // Cranelift's DCE removes it.
+                                        // Always-true predicates: number? / real?
+                                        // are correct for both Fixnum and Flonum
+                                        // (Flonum is a number and real). exact-X?
+                                        // is split out below — Flonums are inexact
+                                        // by definition, so all three exact-X?
+                                        // predicates return #f for Flonum operand
+                                        // (ADR 0012 D-2 iter EI). integer? /
+                                        // rational? were split via iter EH.
+                                        // ADR 0012 D-2 (iter GD) — complex? and
+                                        // real-valued? are aliases of number? in the
+                                        // CrabScheme tower (no complex numbers).
+                                        ("number?", 1)
+                                        | ("real?", 1)
+                                        | ("complex?", 1)
+                                        | ("real-valued?", 1) => {
+                                            let _ = args[0]; // load preserved for SSA correctness
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Boolean(true),
+                                            ));
+                                        }
+                                        // ADR 0012 D-2 (iter EI) — exact-integer?
+                                        // and exact-rational? for Fixnum (or
+                                        // default) are #t. For Flonum, both are
+                                        // #f (flonums are inexact).
+                                        // (exact-real? is not a registered
+                                        // runtime builtin.)
+                                        ("exact-integer?", 1) | ("exact-rational?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            let _ = args[0];
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Boolean(true),
+                                            ));
+                                        }
+                                        ("exact-integer?", 1) | ("exact-rational?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            let _ = args[0];
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Boolean(false),
+                                            ));
+                                        }
+                                        // ADR 0012 D-2 (iter HJ) — bytevector=?.
+                                        ("bytevector=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BytevectorEqP(
+                                                dst, args[0], args[1],
+                                            ));
                                             value_types.insert(dst, Type::Boolean);
                                         }
-                                    }
-                                    // ADR 0012 D-2 (iter BX) — string ops.
-                                    // make-string requires the fill argument
-                                    // to be Character-typed (the helper
-                                    // expects a codepoint i64 in
-                                    // JIT_RT_CHARACTER carrier shape).
-                                    ("make-string", 2) => {
-                                        let len_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let fill_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        if len_t != Type::Fixnum {
-                                            return Err(TranslateError::Unsupported(
+                                        // ADR 0012 D-2 (iter HK) — vector=?.
+                                        ("vector=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::VectorEqP(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter HI) — exact-nonnegative-integer?.
+                                        // Flonum is always #f. Otherwise call the
+                                        // helper (operand BoxTyped if not Any).
+                                        ("exact-nonnegative-integer?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            let _ = args[0];
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Boolean(false),
+                                            ));
+                                        }
+                                        ("exact-nonnegative-integer?", 1) => {
+                                            let t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let arg = if t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::ExactNonNegIntP(dst, arg));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // integer? / rational? gated on
+                                        // !=Flonum default to const-true (Fixnum
+                                        // is always integer and always rational).
+                                        // ADR 0012 D-2 (iter GF) — integer-valued?
+                                        // and rational-valued? are aliases of
+                                        // integer? and rational? in the CrabScheme
+                                        // tower (no complex numbers; Flonum 5.0
+                                        // already satisfies integer? per iter EH).
+                                        ("integer?", 1)
+                                        | ("rational?", 1)
+                                        | ("integer-valued?", 1)
+                                        | ("rational-valued?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            let _ = args[0];
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Boolean(true),
+                                            ));
+                                        }
+                                        // ADR 0012 D-2 (iter EH) — Flonum-typed
+                                        // integer? and rational?.
+                                        ("integer?", 1) | ("integer-valued?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumIsInteger(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("rational?", 1) | ("rational-valued?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumIsFinite(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter EE) — exact?/inexact?
+                                        // are Fixnum-vs-Flonum sensitive. Other
+                                        // types (Character, Boolean, etc.) treat
+                                        // exact? as #t (Fixnum default) — non-
+                                        // numeric args are caller errors.
+                                        ("exact?", 1) => {
+                                            let t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let _ = args[0];
+                                            let v = !matches!(t, Type::Flonum);
+                                            insts.push(RirInst::LoadConst(dst, Const::Boolean(v)));
+                                        }
+                                        ("inexact?", 1) => {
+                                            let t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let _ = args[0];
+                                            let v = matches!(t, Type::Flonum);
+                                            insts.push(RirInst::LoadConst(dst, Const::Boolean(v)));
+                                        }
+                                        ("nan?", 1) | ("infinite?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            // Fixnum / non-flonum: not NaN, not
+                                            // infinite.
+                                            let _ = args[0];
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Boolean(false),
+                                            ));
+                                        }
+                                        // ADR 0012 D-2 (iter EF) — nan?/infinite?/
+                                        // finite? for Flonum via inline fcmp.
+                                        ("nan?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumIsNan(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("infinite?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumIsInfinite(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("finite?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumIsFinite(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // finite? for Fixnum / non-flonum: always
+                                        // true (per R7RS, exact numbers are
+                                        // finite).
+                                        ("finite?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            let _ = args[0];
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Boolean(true),
+                                            ));
+                                        }
+                                        // Flonum rounding when the arg is
+                                        // statically Flonum-typed. Cranelift
+                                        // floor/ceil/trunc/nearest do the
+                                        // actual rounding on f64 bits.
+                                        ("floor", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumFloor(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("ceiling", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumCeil(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("truncate", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumTrunc(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("round", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumRound(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        // Identity-on-fixnum rounding ops.
+                                        // (floor n), (ceiling n), etc. all
+                                        // return n unchanged when n is an
+                                        // integer (i.e., a Fixnum here).
+                                        ("floor", 1)
+                                        | ("ceiling", 1)
+                                        | ("truncate", 1)
+                                        | ("round", 1)
+                                        | ("exact", 1)
+                                        | ("inexact->exact", 1) => {
+                                            insts.push(RirInst::Move(dst, args[0]));
+                                        }
+                                        ("square", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            // ADR 0012 D-2 (iter EK) — Flonum
+                                            // square via FlonumMul.
+                                            insts.push(RirInst::FlonumMul(dst, args[0], args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("square", 1) => {
+                                            // (square x) → x * x for Fixnum.
+                                            insts.push(RirInst::Mul(dst, args[0], args[0]));
+                                        }
+                                        ("cons", 2) | ("cons-in-region", 2) => {
+                                            // Heap-allocate a Pair via
+                                            // vm_alloc_pair. Tags come from
+                                            // value_types so the helper
+                                            // decodes operands correctly.
+                                            // dst is Type::Any (the i64
+                                            // carries Box::into_raw(Box<Value>)).
+                                            //
+                                            // Free-var args may be
+                                            // Fixnum-defaulted EnvLookups
+                                            // (no `value_types` entry). The
+                                            // free var can hold *any* value
+                                            // — typically a list cdr like
+                                            // n-queens' `placed`. Promote
+                                            // each operand's producing
+                                            // `EnvLookup` to `EnvLookupAny`
+                                            // before tagging, so the cons
+                                            // helper sees a real Gc handle
+                                            // and not a `vm_env_lookup_fixnum`
+                                            // deopt placeholder. Same pattern
+                                            // as the CallGeneral callee/arg
+                                            // promotions. (Post-M8 Stage 0.)
+                                            promote_envlookup_to_any(
+                                                &mut insts,
+                                                &mut value_types,
+                                                args[0],
+                                            );
+                                            promote_envlookup_to_any(
+                                                &mut insts,
+                                                &mut value_types,
+                                                args[1],
+                                            );
+                                            let car_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let cdr_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let car_tag = type_to_jit_rt_tag(car_t);
+                                            let cdr_tag = type_to_jit_rt_tag(cdr_t);
+                                            // Layer 3 — when the typer's
+                                            // lifetime-lowering pass rewrote
+                                            // a (cons …) site to
+                                            // (cons-in-region …), the
+                                            // bytecode encodes a call by
+                                            // that name. Route it to
+                                            // ConsRegion so the JIT/AOT
+                                            // codegen emits vm_alloc_pair_region_gc.
+                                            if name == "cons-in-region" {
+                                                insts.push(RirInst::ConsRegion(
+                                                    dst, args[0], car_tag, args[1], cdr_tag,
+                                                ));
+                                            } else {
+                                                insts.push(RirInst::Cons(
+                                                    dst, args[0], car_tag, args[1], cdr_tag,
+                                                ));
+                                            }
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DO) — variadic vector.
+                                        // Box each non-Any arg, then emit VecBuild
+                                        // which lowers to a stack-buffer + helper
+                                        // call.
+                                        ("vector", _) => {
+                                            let boxed: Vec<RirValue> = args
+                                                .iter()
+                                                .map(|v| {
+                                                    let t = value_types
+                                                        .get(v)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    if t == Type::Any {
+                                                        *v
+                                                    } else {
+                                                        let fresh = alloc();
+                                                        insts.push(RirInst::BoxTyped(
+                                                            fresh,
+                                                            *v,
+                                                            type_to_jit_rt_tag(t),
+                                                        ));
+                                                        value_types.insert(fresh, Type::Any);
+                                                        fresh
+                                                    }
+                                                })
+                                                .collect();
+                                            insts.push(RirInst::VecBuild(dst, boxed));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DP) — variadic string.
+                                        // Box each non-Any char arg, then emit
+                                        // StrBuild which lowers to a stack-buffer
+                                        // + helper call. The helper deopts if any
+                                        // arg is not a Character.
+                                        ("string", _) => {
+                                            let boxed: Vec<RirValue> = args
+                                                .iter()
+                                                .map(|v| {
+                                                    let t = value_types
+                                                        .get(v)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    if t == Type::Any {
+                                                        *v
+                                                    } else {
+                                                        let fresh = alloc();
+                                                        insts.push(RirInst::BoxTyped(
+                                                            fresh,
+                                                            *v,
+                                                            type_to_jit_rt_tag(t),
+                                                        ));
+                                                        value_types.insert(fresh, Type::Any);
+                                                        fresh
+                                                    }
+                                                })
+                                                .collect();
+                                            insts.push(RirInst::StrBuild(dst, boxed));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DQ) — variadic bytevector.
+                                        // Box each non-Any byte arg, then emit
+                                        // BvBuild. The helper masks each Fixnum
+                                        // to 8 bits and deopts on non-fixnum.
+                                        ("bytevector", _) => {
+                                            let boxed: Vec<RirValue> = args
+                                                .iter()
+                                                .map(|v| {
+                                                    let t = value_types
+                                                        .get(v)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    if t == Type::Any {
+                                                        *v
+                                                    } else {
+                                                        let fresh = alloc();
+                                                        insts.push(RirInst::BoxTyped(
+                                                            fresh,
+                                                            *v,
+                                                            type_to_jit_rt_tag(t),
+                                                        ));
+                                                        value_types.insert(fresh, Type::Any);
+                                                        fresh
+                                                    }
+                                                })
+                                                .collect();
+                                            insts.push(RirInst::BvBuild(dst, boxed));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DR) — variadic
+                                        // string-append. Strings are always
+                                        // Any-shape (Gc<Value::String>), so no
+                                        // BoxTyped pass is needed; non-Any args
+                                        // would be a type error anyway. The
+                                        // helper deopts on non-string.
+                                        ("string-append", _) => {
+                                            let boxed: Vec<RirValue> = args
+                                                .iter()
+                                                .map(|v| {
+                                                    let t = value_types
+                                                        .get(v)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    if t == Type::Any {
+                                                        *v
+                                                    } else {
+                                                        let fresh = alloc();
+                                                        insts.push(RirInst::BoxTyped(
+                                                            fresh,
+                                                            *v,
+                                                            type_to_jit_rt_tag(t),
+                                                        ));
+                                                        value_types.insert(fresh, Type::Any);
+                                                        fresh
+                                                    }
+                                                })
+                                                .collect();
+                                            insts.push(RirInst::StrAppend(dst, boxed));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DS) — variadic
+                                        // append. Lists / Null are Any-shape;
+                                        // last arg can be any value. Box any
+                                        // primitives just in case (typically a
+                                        // no-op here).
+                                        ("append", _) => {
+                                            let boxed: Vec<RirValue> = args
+                                                .iter()
+                                                .map(|v| {
+                                                    let t = value_types
+                                                        .get(v)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    if t == Type::Any {
+                                                        *v
+                                                    } else {
+                                                        let fresh = alloc();
+                                                        insts.push(RirInst::BoxTyped(
+                                                            fresh,
+                                                            *v,
+                                                            type_to_jit_rt_tag(t),
+                                                        ));
+                                                        value_types.insert(fresh, Type::Any);
+                                                        fresh
+                                                    }
+                                                })
+                                                .collect();
+                                            insts.push(RirInst::ListAppend(dst, boxed));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DT) — variadic
+                                        // vector-append. Vectors are always
+                                        // Any-shape; uniform BoxTyped fallback.
+                                        ("vector-append", _) => {
+                                            let boxed: Vec<RirValue> = args
+                                                .iter()
+                                                .map(|v| {
+                                                    let t = value_types
+                                                        .get(v)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    if t == Type::Any {
+                                                        *v
+                                                    } else {
+                                                        let fresh = alloc();
+                                                        insts.push(RirInst::BoxTyped(
+                                                            fresh,
+                                                            *v,
+                                                            type_to_jit_rt_tag(t),
+                                                        ));
+                                                        value_types.insert(fresh, Type::Any);
+                                                        fresh
+                                                    }
+                                                })
+                                                .collect();
+                                            insts.push(RirInst::VecAppend(dst, boxed));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DU) — variadic
+                                        // bytevector-append. Bytevectors are
+                                        // always Any-shape.
+                                        ("bytevector-append", _) => {
+                                            let boxed: Vec<RirValue> = args
+                                                .iter()
+                                                .map(|v| {
+                                                    let t = value_types
+                                                        .get(v)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    if t == Type::Any {
+                                                        *v
+                                                    } else {
+                                                        let fresh = alloc();
+                                                        insts.push(RirInst::BoxTyped(
+                                                            fresh,
+                                                            *v,
+                                                            type_to_jit_rt_tag(t),
+                                                        ));
+                                                        value_types.insert(fresh, Type::Any);
+                                                        fresh
+                                                    }
+                                                })
+                                                .collect();
+                                            insts.push(RirInst::BvAppend(dst, boxed));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DN) — variadic list.
+                                        // `(list a b c)` lowers to a right-to-left
+                                        // chain of cons: cons(a, cons(b, cons(c, '()))).
+                                        // The empty list case yields the Null literal.
+                                        // Emit the final Cons directly into dst so
+                                        // the post-pass's any_values classification
+                                        // covers it (Move doesn't propagate types).
+                                        ("list", _) => {
+                                            if args.is_empty() {
+                                                insts.push(RirInst::LoadConst(dst, Const::Null));
+                                                value_types.insert(dst, Type::Null);
+                                            } else {
+                                                // Build innermost tail: '()
+                                                let mut acc = alloc();
+                                                insts.push(RirInst::LoadConst(acc, Const::Null));
+                                                value_types.insert(acc, Type::Null);
+                                                let mut acc_tag = type_to_jit_rt_tag(Type::Null);
+                                                // Walk args right-to-left, except
+                                                // the last (leftmost) which goes
+                                                // directly into dst.
+                                                for &arg in args[1..].iter().rev() {
+                                                    let arg_t = value_types
+                                                        .get(&arg)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    let arg_tag = type_to_jit_rt_tag(arg_t);
+                                                    let next = alloc();
+                                                    insts.push(RirInst::Cons(
+                                                        next, arg, arg_tag, acc, acc_tag,
+                                                    ));
+                                                    value_types.insert(next, Type::Any);
+                                                    acc = next;
+                                                    acc_tag = type_to_jit_rt_tag(Type::Any);
+                                                }
+                                                // First arg goes into dst.
+                                                let first_t = value_types
+                                                    .get(&args[0])
+                                                    .copied()
+                                                    .unwrap_or(Type::Fixnum);
+                                                let first_tag = type_to_jit_rt_tag(first_t);
+                                                insts.push(RirInst::Cons(
+                                                    dst, args[0], first_tag, acc, acc_tag,
+                                                ));
+                                                value_types.insert(dst, Type::Any);
+                                            }
+                                        }
+                                        ("car", 1) => {
+                                            // Phase 5 iter4 — promote a free-var
+                                            // EnvLookup arg to Any before
+                                            // requiring it (e.g., `(car p)` where
+                                            // `p` is captured from outer scope).
+                                            let arg0_ty = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            if arg0_ty != Type::Any {
+                                                promote_envlookup_to_any(
+                                                    &mut insts,
+                                                    &mut value_types,
+                                                    args[0],
+                                                );
+                                            }
+                                            if value_types.get(&args[0]).copied() != Some(Type::Any)
+                                            {
+                                                return Err(TranslateError::Unsupported(format!(
+                                                    "car on non-Any operand (type={:?})",
+                                                    arg0_ty
+                                                )));
+                                            }
+                                            insts.push(RirInst::Car(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("cdr", 1) => {
+                                            let arg0_ty = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            if arg0_ty != Type::Any {
+                                                promote_envlookup_to_any(
+                                                    &mut insts,
+                                                    &mut value_types,
+                                                    args[0],
+                                                );
+                                            }
+                                            if value_types.get(&args[0]).copied() != Some(Type::Any)
+                                            {
+                                                return Err(TranslateError::Unsupported(format!(
+                                                    "cdr on non-Any operand (type={:?})",
+                                                    arg0_ty
+                                                )));
+                                            }
+                                            insts.push(RirInst::Cdr(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DV) — composed pair
+                                        // accessors (caar/cadr/.../cddddr). Lower
+                                        // to a chain of Car/Cdr RIR insts read
+                                        // right-to-left within the c[ad]+r name.
+                                        // `(caddr x)` ≡ `(car (cdr (cdr x)))`:
+                                        // emit Cdr (rightmost 'd'), then Cdr,
+                                        // then Car (leftmost 'a'). Requires the
+                                        // arg to be Any-typed; intermediate and
+                                        // final values are Any.
+                                        // ADR 0012 D-2 (iter EZ) — also handle
+                                        // SRFI-1 first/second/third/fourth as
+                                        // equivalent cxr names (car, cadr,
+                                        // caddr, cadddr).
+                                        (n, 1)
+                                            if ordinal_to_cxr_dirs(n).is_some()
+                                                && value_types.get(&args[0]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            let dirs = ordinal_to_cxr_dirs(n).unwrap();
+                                            let mut cur = args[0];
+                                            let last_i = dirs.len() - 1;
+                                            for (i, &is_cdr) in dirs.iter().rev().enumerate() {
+                                                let next = if i == last_i { dst } else { alloc() };
+                                                if is_cdr {
+                                                    insts.push(RirInst::Cdr(next, cur));
+                                                } else {
+                                                    insts.push(RirInst::Car(next, cur));
+                                                }
+                                                value_types.insert(next, Type::Any);
+                                                cur = next;
+                                            }
+                                        }
+                                        (n, 1)
+                                            if cxr_parse(n).is_some()
+                                                && value_types.get(&args[0]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            let dirs = cxr_parse(n).unwrap();
+                                            let mut cur = args[0];
+                                            let last_i = dirs.len() - 1;
+                                            for (i, &is_cdr) in dirs.iter().rev().enumerate() {
+                                                let next = if i == last_i { dst } else { alloc() };
+                                                if is_cdr {
+                                                    insts.push(RirInst::Cdr(next, cur));
+                                                } else {
+                                                    insts.push(RirInst::Car(next, cur));
+                                                }
+                                                value_types.insert(next, Type::Any);
+                                                cur = next;
+                                            }
+                                        }
+                                        ("pair?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            // Lower to vm_pair_p. The helper
+                                            // consumes the operand box, so
+                                            // the operand RIR Value must not
+                                            // be reused in this body — a
+                                            // future iter adds AnyClone to
+                                            // support multi-use patterns.
+                                            insts.push(RirInst::PairP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("null?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::NullP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter DD) — type predicates
+                                        // on Any operand. The bottom-of-table
+                                        // "always-false" arms still catch Fixnum-
+                                        // tier operands; these gated arms only
+                                        // fire for Any.
+                                        ("procedure?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::ProcedureP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("port?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::PortP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter GC) — port-subtype predicates.
+                                        // ADR 0012 D-2 (iter GP) — input-port-open? is
+                                        // an alias of input-port? because the runtime
+                                        // never closes input ports (they're alive until
+                                        // GC). R7RS-conformant.
+                                        ("input-port?", 1) | ("input-port-open?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::InputPortP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("output-port?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::OutputPortP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("binary-port?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BinaryPortP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("textual-port?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::TextualPortP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter GP) — output-port-open?.
+                                        ("output-port-open?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::OutputPortOpenP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter GQ) — port-eof? +
+                                        // port-has-set-port-position!?.
+                                        // port-has-port-position? is just port?.
+                                        ("port-has-port-position?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::PortP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("port-eof?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::PortEofP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("port-has-set-port-position!?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::PortHasSetPortPositionP(
+                                                dst, args[0],
+                                            ));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter GR) — port-position.
+                                        ("port-position", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::PortPosition(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        // ADR 0012 D-2 (iter GD) — promise?.
+                                        ("promise?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::PromiseP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter GF) — hashtable?.
+                                        ("hashtable?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::HashtableP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter GG) — hashtable-size /
+                                        // hashtable-mutable?.
+                                        ("hashtable-size", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::HashtableSize(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("hashtable-mutable?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::HashtableMutableP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter HQ) — hashtable-hash-function.
+                                        ("hashtable-hash-function", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::HashtableHashFn(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GH) — hashtable-keys/values.
+                                        ("hashtable-keys", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::HashtableKeys(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("hashtable-values", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::HashtableValues(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GI) — hashtable-clear! (1-arg).
+                                        ("hashtable-clear!", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::HashtableClear(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HW) — hashtable-clear! 2-arg.
+                                        // Second operand is an R6RS capacity hint
+                                        // that CrabScheme's Vec-backed storage
+                                        // ignores. Reuses HashtableClear lowering.
+                                        ("hashtable-clear!", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let _ = args[1];
+                                            insts.push(RirInst::HashtableClear(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GJ) — equal-hash + hashtable->alist.
+                                        ("equal-hash", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::EqualHash(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("hashtable->alist", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::HashtableToAlist(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GK) — file-exists? + jiffies-per-second.
+                                        ("file-exists?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::FileExistsP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("jiffies-per-second", 0) => {
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Fixnum(1_000_000_000),
+                                            ));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        // ADR 0012 D-2 (iter IW) — fixnum constants.
+                                        ("fixnum-width", 0) => {
+                                            insts.push(RirInst::LoadConst(dst, Const::Fixnum(64)));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("least-fixnum", 0) => {
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Fixnum(i64::MIN),
+                                            ));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("greatest-fixnum", 0) => {
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Fixnum(i64::MAX),
+                                            ));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        // ADR 0012 D-2 (iter GL) — current-second / -jiffy.
+                                        ("current-second", 0) => {
+                                            insts.push(RirInst::CurrentSecond(dst));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("current-jiffy", 0) => {
+                                            insts.push(RirInst::CurrentJiffy(dst));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        // ADR 0012 D-2 (iter HD) — eof-object constructor.
+                                        ("eof-object", 0) => {
+                                            insts.push(RirInst::EofObject(dst));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HR) — make-hashtable 0-arg.
+                                        ("make-hashtable", 0) => {
+                                            insts.push(RirInst::MakeHashtableEqual(dst));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HS) — make-eq/eqv-hashtable.
+                                        ("make-eq-hashtable", 0) => {
+                                            insts.push(RirInst::MakeHashtableEq(dst));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("make-eqv-hashtable", 0) => {
+                                            insts.push(RirInst::MakeHashtableEqv(dst));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HY) — make-eq/eqv-hashtable 1-arg.
+                                        // R6RS allows an optional capacity hint
+                                        // (Vec storage ignores it).
+                                        ("make-eq-hashtable", 1) => {
+                                            let _ = args[0];
+                                            insts.push(RirInst::MakeHashtableEq(dst));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("make-eqv-hashtable", 1) => {
+                                            let _ = args[0];
+                                            insts.push(RirInst::MakeHashtableEqv(dst));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GN) — append-reverse.
+                                        ("append-reverse", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::AppendReverse(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GO) — alist-copy.
+                                        ("alist-copy", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::AlistCopy(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GS) — delete + delete-duplicates.
+                                        ("delete", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::Delete(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("delete-duplicates", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::DeleteDuplicates(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GU) — force (fast path).
+                                        // Pending promises deopt to bytecode.
+                                        ("force", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::ForceForced(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GV) — hashtable-contains?.
+                                        // Both operands must be Any; Custom-kind
+                                        // hashtables deopt at runtime.
+                                        ("hashtable-contains?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::HashtableContainsP(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter GW) — hashtable-delete!.
+                                        // Mutates table; result is Unspecified.
+                                        ("hashtable-delete!", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::HashtableDelete(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GZ) — hashtable-copy.
+                                        // 1-arg form (mutable copy).
+                                        ("hashtable-copy", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::HashtableCopy(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HX) — hashtable-copy 2-arg.
+                                        // Second operand is an R6RS mutability hint
+                                        // that CrabScheme's mutable-only hashtables
+                                        // ignore. Reuses HashtableCopy lowering.
+                                        ("hashtable-copy", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let _ = args[1];
+                                            insts.push(RirInst::HashtableCopy(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GY) — hashtable-ref.
+                                        // 3-arg; ht and key must be Any; default
+                                        // gets BoxTyped if not Any.
+                                        ("hashtable-ref", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            let dt = value_types
+                                                .get(&args[2])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let default_arg = if dt == Type::Any {
+                                                args[2]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[2],
+                                                    type_to_jit_rt_tag(dt),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::HashtableRef(
+                                                dst,
+                                                args[0],
+                                                args[1],
+                                                default_arg,
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GX) — hashtable-set!.
+                                        // 3-arg mutator; ht/key must be Any.
+                                        // Value operand gets BoxTyped if not Any.
+                                        ("hashtable-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            let vt = value_types
+                                                .get(&args[2])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let val_arg = if vt == Type::Any {
+                                                args[2]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[2],
+                                                    type_to_jit_rt_tag(vt),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::HashtableSet(
+                                                dst, args[0], args[1], val_arg,
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GT) — make-promise.
+                                        // Accepts any operand; BoxTyped if not Any.
+                                        ("make-promise", 1) => {
+                                            let t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let boxed = if t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::MakePromise(dst, boxed));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter GI) — numerator/denominator
+                                        // for Fixnum: numerator is identity, denominator
+                                        // is 1.
+                                        ("numerator", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            // Identity: copy via Add(0, x)? Simplest: LoadConst+Add.
+                                            // Actually we can just alias by Sub(x, 0).
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            insts.push(RirInst::Add(dst, args[0], zero));
+                                        }
+                                        ("denominator", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::LoadConst(dst, Const::Fixnum(1)));
+                                        }
+                                        ("eof-object?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::EofP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("symbol?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::SymbolP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter DE) — immediate-shape
+                                        // type predicates. Each does a 3-way
+                                        // dispatch on the operand's static type:
+                                        // matching-type → const true; Any →
+                                        // runtime helper; otherwise → const false.
+                                        // These catch-all arms supersede the
+                                        // always-true (fixnum?) / always-false
+                                        // (char?, boolean?, flonum?) entries in
+                                        // the earlier predicate tables for these
+                                        // four names.
+                                        ("char?", 1) => {
+                                            let t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            match t {
+                                                Type::Any => {
+                                                    insts.push(RirInst::CharP(dst, args[0]));
+                                                }
+                                                Type::Character => {
+                                                    let _ = args[0];
+                                                    insts.push(RirInst::LoadConst(
+                                                        dst,
+                                                        Const::Boolean(true),
+                                                    ));
+                                                }
+                                                _ => {
+                                                    let _ = args[0];
+                                                    insts.push(RirInst::LoadConst(
+                                                        dst,
+                                                        Const::Boolean(false),
+                                                    ));
+                                                }
+                                            }
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("boolean?", 1) => {
+                                            let t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            match t {
+                                                Type::Any => {
+                                                    insts.push(RirInst::BoolP(dst, args[0]));
+                                                }
+                                                Type::Boolean => {
+                                                    let _ = args[0];
+                                                    insts.push(RirInst::LoadConst(
+                                                        dst,
+                                                        Const::Boolean(true),
+                                                    ));
+                                                }
+                                                _ => {
+                                                    let _ = args[0];
+                                                    insts.push(RirInst::LoadConst(
+                                                        dst,
+                                                        Const::Boolean(false),
+                                                    ));
+                                                }
+                                            }
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("fixnum?", 1) => {
+                                            let t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            match t {
+                                                Type::Any => {
+                                                    insts.push(RirInst::FixnumP(dst, args[0]));
+                                                }
+                                                Type::Fixnum => {
+                                                    let _ = args[0];
+                                                    insts.push(RirInst::LoadConst(
+                                                        dst,
+                                                        Const::Boolean(true),
+                                                    ));
+                                                }
+                                                _ => {
+                                                    let _ = args[0];
+                                                    insts.push(RirInst::LoadConst(
+                                                        dst,
+                                                        Const::Boolean(false),
+                                                    ));
+                                                }
+                                            }
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("flonum?", 1) => {
+                                            let t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            match t {
+                                                Type::Any => {
+                                                    insts.push(RirInst::FlonumP(dst, args[0]));
+                                                }
+                                                Type::Flonum => {
+                                                    let _ = args[0];
+                                                    insts.push(RirInst::LoadConst(
+                                                        dst,
+                                                        Const::Boolean(true),
+                                                    ));
+                                                }
+                                                _ => {
+                                                    let _ = args[0];
+                                                    insts.push(RirInst::LoadConst(
+                                                        dst,
+                                                        Const::Boolean(false),
+                                                    ));
+                                                }
+                                            }
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter CA) — list ops.
+                                        ("length", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::Length(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("list?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::ListP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter CB) — reverse.
+                                        // ADR 0012 D-2 (iter EW) — reverse! is
+                                        // an alias for reverse (the cs-runtime
+                                        // builtin doesn't actually mutate; it
+                                        // builds a fresh reversed list, same as
+                                        // R7RS reverse).
+                                        ("reverse", 1) | ("reverse!", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::Reverse(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CC) — memq. Both
+                                        // args must be Any at the helper boundary;
+                                        // typed-immediate items (Symbol literals,
+                                        // Fixnums) are boxed first. The list arg
+                                        // is required to be Any (came from cons /
+                                        // list / env-lookup-any).
+                                        ("memq", 2)
+                                            if value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let item_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let item = if item_t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(item_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::Memq(dst, item, args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CD) — assq. Mirrors
+                                        // memq's BoxTyped dance on the key arg.
+                                        ("assq", 2)
+                                            if value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let key_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let key = if key_t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(key_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::Assq(dst, key, args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CG) — memv / assv,
+                                        // the eqv?-flavored variants. Same
+                                        // BoxTyped dance on the search key.
+                                        ("memv", 2)
+                                            if value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let item_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let item = if item_t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(item_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::Memv(dst, item, args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("assv", 2)
+                                            if value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let key_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let key = if key_t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(key_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::Assv(dst, key, args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CM) — substring.
+                                        // String arg Any, start/end Fixnum. Result
+                                        // is a fresh Gc<Value::String>.
+                                        ("substring", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::Substring(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HV) — string-copy 2-arg slice-to-end.
+                                        ("string-copy", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::StrCopyFrom(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HB) — string-copy 3-arg
+                                        // is identical to substring in R7RS (char-
+                                        // based slicing, returns fresh string). Reuse
+                                        // the substring lowering.
+                                        ("string-copy", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::Substring(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CK) — list-tail / list-ref.
+                                        // lst Any, index Fixnum. Helpers consume
+                                        // the lst handle; index is a raw i64.
+                                        ("list-tail", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::ListTail(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("list-ref", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::ListRef(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CQ) — bytevector
+                                        // read ops. All gated on Any arg.
+                                        ("bytevector?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("bytevector-length", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvLength(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("bytevector-u8-ref", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvU8Ref(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        // ADR 0012 D-2 (iter FP) — bytevector-s8-ref.
+                                        ("bytevector-s8-ref", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvS8Ref(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        // ADR 0012 D-2 (iter FQ) — bytevector-u16/s16 native-ref.
+                                        ("bytevector-u16-native-ref", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvU16NativeRef(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("bytevector-s16-native-ref", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvS16NativeRef(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        // ADR 0012 D-2 (iter FR) — bytevector-u32/s32 native-ref.
+                                        ("bytevector-u32-native-ref", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvU32NativeRef(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("bytevector-s32-native-ref", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvS32NativeRef(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        // ADR 0012 D-2 (iter FS) — IEEE float native-ref.
+                                        ("bytevector-ieee-single-native-ref", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvIeeeSingleNativeRef(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("bytevector-ieee-double-native-ref", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvIeeeDoubleNativeRef(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        // ADR 0012 D-2 (iter FT) — bytevector-u64/s64 native-ref.
+                                        ("bytevector-u64-native-ref", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvU64NativeRef(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("bytevector-s64-native-ref", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvS64NativeRef(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        // ADR 0012 D-2 (iter DB) — string-copy /
+                                        // vector-copy (1-arg full copy).
+                                        ("string-copy", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StrCopy(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("vector-copy", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::VecCopy(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HT) — vector-copy 2-arg slice-to-end.
+                                        ("vector-copy", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::VecCopyFrom(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HA) — vector-copy 3-arg slice.
+                                        // Vector must be Any; start and end must be Fixnum.
+                                        ("vector-copy", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::VecCopySlice(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HU) — bytevector-copy 2-arg slice-to-end.
+                                        ("bytevector-copy", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::BvCopyFrom(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HC) — bytevector-copy 3-arg slice.
+                                        ("bytevector-copy", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::BvCopySlice(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DC) — bytevector-copy.
+                                        ("bytevector-copy", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvCopy(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DA) — string-set!.
+                                        // s Any, k Fixnum, ch Character.
+                                        ("string-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::StrSet(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DH) — string-fill!.
+                                        // s Any, ch Character. 2-arg form only.
+                                        ("string-fill!", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::StrFill(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IC) — string-fill! 3-arg fill-from.
+                                        ("string-fill!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Character)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::StrFillFrom(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HH) — string-fill! 4-arg slice.
+                                        ("string-fill!", 4)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Character)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[3]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::StrFillSlice(
+                                                dst, args[0], args[1], args[2], args[3],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CZ) — vector-fill! /
+                                        // bytevector-fill!.
+                                        ("vector-fill!", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            // fill arg: BoxTyped if not Any.
+                                            let f_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let fill = if f_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(f_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::VecFill(dst, args[0], fill));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IB) — vector-fill! 3-arg fill-from.
+                                        ("vector-fill!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            // fill arg: BoxTyped if not Any.
+                                            let f_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let fill = if f_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(f_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::VecFillFrom(
+                                                dst, args[0], fill, args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HG) — vector-fill! 4-arg slice.
+                                        ("vector-fill!", 4)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[3]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            // fill arg: BoxTyped if not Any.
+                                            let f_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let fill = if f_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(f_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::VecFillSlice(
+                                                dst, args[0], fill, args[2], args[3],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("bytevector-fill!", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvFill(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HF) — bytevector-fill! 4-arg slice.
+                                        // ADR 0012 D-2 (iter IA) — bytevector-fill! 3-arg fill-from.
+                                        ("bytevector-fill!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::BvFillFrom(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("bytevector-fill!", 4)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[3]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::BvFillSlice(
+                                                dst, args[0], args[1], args[2], args[3],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CR) — bytevector write ops.
+                                        ("make-bytevector", 2) => {
+                                            insts.push(RirInst::BvAlloc(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HL) — make-bytevector 1-arg.
+                                        // Fill defaults to 0; reuse BvAlloc with a
+                                        // synthesized zero.
+                                        ("make-bytevector", 1) => {
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            value_types.insert(zero, Type::Fixnum);
+                                            insts.push(RirInst::BvAlloc(dst, args[0], zero));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("bytevector-u8-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvU8Set(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FP) — bytevector-s8-set!.
+                                        ("bytevector-s8-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvS8Set(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FQ) — bytevector-u16/s16 native-set!.
+                                        ("bytevector-u16-native-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvU16NativeSet(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("bytevector-s16-native-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvS16NativeSet(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FR) — bytevector-u32/s32 native-set!.
+                                        ("bytevector-u32-native-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvU32NativeSet(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("bytevector-s32-native-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvS32NativeSet(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FS) — IEEE float native-set!.
+                                        // Gated on Flonum value so the operand is
+                                        // already an f64 bit pattern at the call site.
+                                        ("bytevector-ieee-single-native-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::BvIeeeSingleNativeSet(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("bytevector-ieee-double-native-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::BvIeeeDoubleNativeSet(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FT) — bytevector-u64/s64 native-set!.
+                                        ("bytevector-u64-native-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvU64NativeSet(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("bytevector-s64-native-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvS64NativeSet(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CN) — list-copy.
+                                        ("list-copy", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::ListCopy(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CO) — list-set!. lst
+                                        // Any, n Fixnum, val gets BoxTyped if it's
+                                        // a typed immediate.
+                                        ("list-set!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let v_t = value_types
+                                                .get(&args[2])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let val = if v_t == Type::Any {
+                                                args[2]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[2],
+                                                    type_to_jit_rt_tag(v_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts
+                                                .push(RirInst::ListSet(dst, args[0], args[1], val));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CH) — member / assoc,
+                                        // the equal?-flavored variants. Same
+                                        // BoxTyped dance on the search key.
+                                        // Only the 2-arg form; the optional
+                                        // 3-arg (user-supplied equiv proc) is
+                                        // out of scope for this iter.
+                                        ("member", 2)
+                                            if value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let item_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let item = if item_t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(item_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::Member(dst, item, args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("assoc", 2)
+                                            if value_types.get(&args[1]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let key_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let key = if key_t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(key_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::Assoc(dst, key, args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CE) — pair mutation.
+                                        // Pair arg must be Any; value arg gets
+                                        // BoxTyped if it's a typed immediate.
+                                        ("set-car!", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let v_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let val = if v_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(v_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::SetCar(dst, args[0], val));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("set-cdr!", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let v_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let val = if v_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(v_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::SetCdr(dst, args[0], val));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter BV) — vector ops.
+                                        // make-vector requires the fill to be
+                                        // Any. If the user passed a typed
+                                        // immediate (e.g. Fixnum), box it via
+                                        // BoxTyped first.
+                                        // ADR 0012 D-2 (iter JE) — (make-vector n) 1-arg.
+                                        // RC3 iter 2.18 — accept Any-typed n too.
+                                        ("make-vector", 1)
+                                            if matches!(
+                                                value_types.get(&args[0]).copied(),
+                                                Some(Type::Fixnum) | Some(Type::Any)
+                                            ) =>
+                                        {
+                                            insts.push(RirInst::MakeVectorUnspec(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("make-vector", 2) => {
+                                            let len_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let fill_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            // RC3 iter 2.18 — accept Any-typed
+                                            // length too. The cs-aot VecAlloc
+                                            // lowering decodes NB carriers
+                                            // (Fixnum payload extraction) so
+                                            // raw length works regardless of
+                                            // tracked type. Previously we
+                                            // bailed on non-Fixnum, blocking
+                                            // spectral-norm's
+                                            // (make-vector n 1.0) where n
+                                            // defaults to Any (iter 2.16).
+                                            if len_t != Type::Fixnum && len_t != Type::Any {
+                                                return Err(TranslateError::Unsupported(format!(
+                                                "make-vector: length must be Fixnum or Any (got {len_t:?})"
+                                            )));
+                                            }
+                                            let fill = if fill_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(fill_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::VecAlloc(dst, args[0], fill));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("vector-ref", 2) => {
+                                            // Phase 5 iter3 — try promoting
+                                            // a free-var EnvLookup arg0 to
+                                            // Any before requiring it. This
+                                            // lets `(vector-ref v i)` where
+                                            // `v` is a captured vector work
+                                            // (previously rejected when v
+                                            // defaulted to Fixnum).
+                                            let arg0_ty = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            if arg0_ty != Type::Any {
+                                                promote_envlookup_to_any(
+                                                    &mut insts,
+                                                    &mut value_types,
+                                                    args[0],
+                                                );
+                                            }
+                                            if value_types.get(&args[0]).copied() != Some(Type::Any)
+                                            {
+                                                return Err(TranslateError::Unsupported(format!(
+                                                    "vector-ref on non-Any operand (type={:?})",
+                                                    arg0_ty
+                                                )));
+                                            }
+                                            insts.push(RirInst::VecRef(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("vector-set!", 3) => {
+                                            // Phase 5 iter3 — promote arg0
+                                            // from EnvLookup Fixnum default
+                                            // to Any if needed.
+                                            let arg0_ty = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            if arg0_ty != Type::Any {
+                                                promote_envlookup_to_any(
+                                                    &mut insts,
+                                                    &mut value_types,
+                                                    args[0],
+                                                );
+                                            }
+                                            if value_types.get(&args[0]).copied() != Some(Type::Any)
+                                            {
+                                                return Err(TranslateError::Unsupported(format!(
+                                                    "vector-set! on non-Any operand (type={:?})",
+                                                    arg0_ty
+                                                )));
+                                            }
+                                            // Box the value-to-store if it's
+                                            // a typed immediate.
+                                            let v_t = value_types
+                                                .get(&args[2])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let val = if v_t == Type::Any {
+                                                args[2]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[2],
+                                                    type_to_jit_rt_tag(v_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::VecSet(dst, args[0], args[1], val));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("vector-length", 1) => {
+                                            let arg0_ty = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            if arg0_ty != Type::Any {
+                                                promote_envlookup_to_any(
+                                                    &mut insts,
+                                                    &mut value_types,
+                                                    args[0],
+                                                );
+                                            }
+                                            if value_types.get(&args[0]).copied() != Some(Type::Any)
+                                            {
+                                                return Err(TranslateError::Unsupported(format!(
+                                                    "vector-length on non-Any operand (type={:?})",
+                                                    arg0_ty
+                                                )));
+                                            }
+                                            insts.push(RirInst::VecLength(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("vector?", 1) => {
+                                            let arg0_ty = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            if arg0_ty != Type::Any {
+                                                promote_envlookup_to_any(
+                                                    &mut insts,
+                                                    &mut value_types,
+                                                    args[0],
+                                                );
+                                            }
+                                            if value_types.get(&args[0]).copied() != Some(Type::Any)
+                                            {
+                                                // For non-Any non-promoted
+                                                // operands the type is statically
+                                                // known and the answer is false
+                                                // (except for Any, handled above).
+                                                insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Boolean(false),
+                                                ));
+                                                value_types.insert(dst, Type::Boolean);
+                                            } else {
+                                                insts.push(RirInst::VecP(dst, args[0]));
+                                                value_types.insert(dst, Type::Boolean);
+                                            }
+                                        }
+                                        // ADR 0012 D-2 (iter BX) — string ops.
+                                        // make-string requires the fill argument
+                                        // to be Character-typed (the helper
+                                        // expects a codepoint i64 in
+                                        // JIT_RT_CHARACTER carrier shape).
+                                        ("make-string", 2) => {
+                                            let len_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let fill_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            if len_t != Type::Fixnum {
+                                                return Err(TranslateError::Unsupported(
                                                 "make-string: length must be Fixnum-typed at JIT translate"
                                                     .into(),
                                             ));
-                                        }
-                                        if fill_t != Type::Character {
-                                            return Err(TranslateError::Unsupported(
+                                            }
+                                            if fill_t != Type::Character {
+                                                return Err(TranslateError::Unsupported(
                                                 "make-string: fill must be Character-typed at JIT translate"
                                                     .into(),
                                             ));
+                                            }
+                                            insts.push(RirInst::StrAlloc(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
                                         }
-                                        insts.push(RirInst::StrAlloc(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HM) — make-string 1-arg.
-                                    // Fill defaults to #\space; reuse StrAlloc
-                                    // with a synthesized space character.
-                                    ("make-string", 1) => {
-                                        let len_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        if len_t != Type::Fixnum {
-                                            return Err(TranslateError::Unsupported(
+                                        // ADR 0012 D-2 (iter HM) — make-string 1-arg.
+                                        // Fill defaults to #\space; reuse StrAlloc
+                                        // with a synthesized space character.
+                                        ("make-string", 1) => {
+                                            let len_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            if len_t != Type::Fixnum {
+                                                return Err(TranslateError::Unsupported(
                                                 "make-string: length must be Fixnum-typed at JIT translate"
                                                     .into(),
                                             ));
+                                            }
+                                            let space = alloc();
+                                            insts.push(RirInst::LoadConst(
+                                                space,
+                                                Const::Character(' '),
+                                            ));
+                                            value_types.insert(space, Type::Character);
+                                            insts.push(RirInst::StrAlloc(dst, args[0], space));
+                                            value_types.insert(dst, Type::Any);
                                         }
-                                        let space = alloc();
-                                        insts
-                                            .push(RirInst::LoadConst(space, Const::Character(' ')));
-                                        value_types.insert(space, Type::Character);
-                                        insts.push(RirInst::StrAlloc(dst, args[0], space));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-ref", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        // s Any (consumed), idx Fixnum.
-                                        // dst is Character — the dispatcher
-                                        // decodes the i64 codepoint via
-                                        // JIT_RT_CHARACTER.
-                                        insts.push(RirInst::StrRef(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Character);
-                                    }
-                                    ("string-length", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StrLength(dst, args[0]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("string?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StrP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // string=? mirrors the eq? Any-arg
-                                    // pattern: if either side is non-Any,
-                                    // box it via BoxTyped first.
-                                    ("string=?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            || value_types.get(&args[1]).copied()
+                                        ("string-ref", 2)
+                                            if value_types.get(&args[0]).copied()
                                                 == Some(Type::Any) =>
-                                    {
-                                        let lhs_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let rhs_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let lhs = if lhs_t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(lhs_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        let rhs = if rhs_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(rhs_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::StrEq(dst, lhs, rhs));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter DW) — ordered string
-                                    // comparisons. Same BoxTyped-fallback
-                                    // pattern as string=?.
-                                    // ADR 0012 D-2 (iter DX) — string-ci
-                                    // family with same dispatch shape.
-                                    // ADR 0012 D-2 (iter JD) — variadic string
-                                    // comparisons. Box each arg if not Any,
-                                    // pairwise compare via Str* RIR + BitAnd
-                                    // chain. Covers string=? plus ordered and
-                                    // string-ci families.
-                                    ("string=?", n)
-                                    | ("string<?", n)
-                                    | ("string>?", n)
-                                    | ("string<=?", n)
-                                    | ("string>=?", n)
-                                    | ("string-ci=?", n)
-                                    | ("string-ci<?", n)
-                                    | ("string-ci>?", n)
-                                    | ("string-ci<=?", n)
-                                    | ("string-ci>=?", n)
-                                        if n >= 3 =>
-                                    {
-                                        let boxed: Vec<RirValue> = args
-                                            .iter()
-                                            .map(|v| {
-                                                let t = value_types
-                                                    .get(v)
-                                                    .copied()
-                                                    .unwrap_or(Type::Fixnum);
-                                                if t == Type::Any {
-                                                    *v
-                                                } else {
-                                                    let fresh = alloc();
-                                                    insts.push(RirInst::BoxTyped(
-                                                        fresh,
-                                                        *v,
-                                                        type_to_jit_rt_tag(t),
-                                                    ));
-                                                    value_types.insert(fresh, Type::Any);
-                                                    fresh
-                                                }
-                                            })
-                                            .collect();
-                                        let make_cmp =
-                                            |d: RirValue, a: RirValue, b: RirValue| match name {
-                                                "string=?" => RirInst::StrEq(d, a, b),
-                                                "string<?" => RirInst::StrLt(d, a, b),
-                                                "string>?" => RirInst::StrGt(d, a, b),
-                                                "string<=?" => RirInst::StrLe(d, a, b),
-                                                "string>=?" => RirInst::StrGe(d, a, b),
-                                                "string-ci=?" => RirInst::StrCiEq(d, a, b),
-                                                "string-ci<?" => RirInst::StrCiLt(d, a, b),
-                                                "string-ci>?" => RirInst::StrCiGt(d, a, b),
-                                                "string-ci<=?" => RirInst::StrCiLe(d, a, b),
-                                                "string-ci>=?" => RirInst::StrCiGe(d, a, b),
+                                        {
+                                            // s Any (consumed), idx Fixnum.
+                                            // dst is Character — the dispatcher
+                                            // decodes the i64 codepoint via
+                                            // JIT_RT_CHARACTER.
+                                            insts.push(RirInst::StrRef(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Character);
+                                        }
+                                        ("string-length", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StrLength(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("string?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StrP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // string=? mirrors the eq? Any-arg
+                                        // pattern: if either side is non-Any,
+                                        // box it via BoxTyped first.
+                                        ("string=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                || value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            let lhs_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let rhs_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let lhs = if lhs_t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(lhs_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            let rhs = if rhs_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(rhs_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::StrEq(dst, lhs, rhs));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter DW) — ordered string
+                                        // comparisons. Same BoxTyped-fallback
+                                        // pattern as string=?.
+                                        // ADR 0012 D-2 (iter DX) — string-ci
+                                        // family with same dispatch shape.
+                                        // ADR 0012 D-2 (iter JD) — variadic string
+                                        // comparisons. Box each arg if not Any,
+                                        // pairwise compare via Str* RIR + BitAnd
+                                        // chain. Covers string=? plus ordered and
+                                        // string-ci families.
+                                        ("string=?", n)
+                                        | ("string<?", n)
+                                        | ("string>?", n)
+                                        | ("string<=?", n)
+                                        | ("string>=?", n)
+                                        | ("string-ci=?", n)
+                                        | ("string-ci<?", n)
+                                        | ("string-ci>?", n)
+                                        | ("string-ci<=?", n)
+                                        | ("string-ci>=?", n)
+                                            if n >= 3 =>
+                                        {
+                                            let boxed: Vec<RirValue> = args
+                                                .iter()
+                                                .map(|v| {
+                                                    let t = value_types
+                                                        .get(v)
+                                                        .copied()
+                                                        .unwrap_or(Type::Fixnum);
+                                                    if t == Type::Any {
+                                                        *v
+                                                    } else {
+                                                        let fresh = alloc();
+                                                        insts.push(RirInst::BoxTyped(
+                                                            fresh,
+                                                            *v,
+                                                            type_to_jit_rt_tag(t),
+                                                        ));
+                                                        value_types.insert(fresh, Type::Any);
+                                                        fresh
+                                                    }
+                                                })
+                                                .collect();
+                                            let make_cmp =
+                                                |d: RirValue, a: RirValue, b: RirValue| match name {
+                                                    "string=?" => RirInst::StrEq(d, a, b),
+                                                    "string<?" => RirInst::StrLt(d, a, b),
+                                                    "string>?" => RirInst::StrGt(d, a, b),
+                                                    "string<=?" => RirInst::StrLe(d, a, b),
+                                                    "string>=?" => RirInst::StrGe(d, a, b),
+                                                    "string-ci=?" => RirInst::StrCiEq(d, a, b),
+                                                    "string-ci<?" => RirInst::StrCiLt(d, a, b),
+                                                    "string-ci>?" => RirInst::StrCiGt(d, a, b),
+                                                    "string-ci<=?" => RirInst::StrCiLe(d, a, b),
+                                                    "string-ci>=?" => RirInst::StrCiGe(d, a, b),
+                                                    _ => unreachable!(),
+                                                };
+                                            let first = alloc();
+                                            insts.push(make_cmp(first, boxed[0], boxed[1]));
+                                            value_types.insert(first, Type::Boolean);
+                                            let mut acc = first;
+                                            for i in 1..boxed.len() - 1 {
+                                                let cmp = alloc();
+                                                insts.push(make_cmp(cmp, boxed[i], boxed[i + 1]));
+                                                value_types.insert(cmp, Type::Boolean);
+                                                let new_acc = alloc();
+                                                insts.push(RirInst::BitAnd(new_acc, acc, cmp));
+                                                value_types.insert(new_acc, Type::Boolean);
+                                                acc = new_acc;
+                                            }
+                                            insts.push(RirInst::Move(dst, acc));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("string<?", 2)
+                                        | ("string>?", 2)
+                                        | ("string<=?", 2)
+                                        | ("string>=?", 2)
+                                        | ("string-ci=?", 2)
+                                        | ("string-ci<?", 2)
+                                        | ("string-ci>?", 2)
+                                        | ("string-ci<=?", 2)
+                                        | ("string-ci>=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                || value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            let lhs_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let rhs_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let lhs = if lhs_t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(lhs_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            let rhs = if rhs_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(rhs_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            let inst = match name {
+                                                "string<?" => RirInst::StrLt(dst, lhs, rhs),
+                                                "string>?" => RirInst::StrGt(dst, lhs, rhs),
+                                                "string<=?" => RirInst::StrLe(dst, lhs, rhs),
+                                                "string>=?" => RirInst::StrGe(dst, lhs, rhs),
+                                                "string-ci=?" => RirInst::StrCiEq(dst, lhs, rhs),
+                                                "string-ci<?" => RirInst::StrCiLt(dst, lhs, rhs),
+                                                "string-ci>?" => RirInst::StrCiGt(dst, lhs, rhs),
+                                                "string-ci<=?" => RirInst::StrCiLe(dst, lhs, rhs),
+                                                "string-ci>=?" => RirInst::StrCiGe(dst, lhs, rhs),
                                                 _ => unreachable!(),
                                             };
-                                        let first = alloc();
-                                        insts.push(make_cmp(first, boxed[0], boxed[1]));
-                                        value_types.insert(first, Type::Boolean);
-                                        let mut acc = first;
-                                        for i in 1..boxed.len() - 1 {
-                                            let cmp = alloc();
-                                            insts.push(make_cmp(cmp, boxed[i], boxed[i + 1]));
-                                            value_types.insert(cmp, Type::Boolean);
-                                            let new_acc = alloc();
-                                            insts.push(RirInst::BitAnd(new_acc, acc, cmp));
-                                            value_types.insert(new_acc, Type::Boolean);
-                                            acc = new_acc;
+                                            insts.push(inst);
+                                            value_types.insert(dst, Type::Boolean);
                                         }
-                                        insts.push(RirInst::Move(dst, acc));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("string<?", 2)
-                                    | ("string>?", 2)
-                                    | ("string<=?", 2)
-                                    | ("string>=?", 2)
-                                    | ("string-ci=?", 2)
-                                    | ("string-ci<?", 2)
-                                    | ("string-ci>?", 2)
-                                    | ("string-ci<=?", 2)
-                                    | ("string-ci>=?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            || value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        let lhs_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let rhs_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let lhs = if lhs_t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(lhs_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        let rhs = if rhs_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(rhs_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        let inst = match name {
-                                            "string<?" => RirInst::StrLt(dst, lhs, rhs),
-                                            "string>?" => RirInst::StrGt(dst, lhs, rhs),
-                                            "string<=?" => RirInst::StrLe(dst, lhs, rhs),
-                                            "string>=?" => RirInst::StrGe(dst, lhs, rhs),
-                                            "string-ci=?" => RirInst::StrCiEq(dst, lhs, rhs),
-                                            "string-ci<?" => RirInst::StrCiLt(dst, lhs, rhs),
-                                            "string-ci>?" => RirInst::StrCiGt(dst, lhs, rhs),
-                                            "string-ci<=?" => RirInst::StrCiLe(dst, lhs, rhs),
-                                            "string-ci>=?" => RirInst::StrCiGe(dst, lhs, rhs),
-                                            _ => unreachable!(),
-                                        };
-                                        insts.push(inst);
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("integer->char", 1) => {
-                                        // Same bit pattern as the Fixnum input;
-                                        // the return-type post-pass will tag
-                                        // dst as Character so the dispatcher
-                                        // decodes the i64 codepoint into a
-                                        // Value::Character on the way out.
-                                        insts.push(RirInst::IntCharBitcast(dst, args[0]));
-                                        // Track Character in the inline
-                                        // value_types map so downstream
-                                        // arms (char-alphabetic? etc.) that
-                                        // gate on Type::Character can fire.
-                                        value_types.insert(dst, Type::Character);
-                                    }
-                                    ("real->flonum", 1)
-                                    | ("exact->inexact", 1)
-                                    | ("inexact", 1)
-                                    | ("fixnum->flonum", 1) => {
-                                        // Convert the i64 Fixnum into f64
-                                        // bits via Cranelift's
-                                        // fcvt_from_sint+bitcast. The
-                                        // return-type post-pass tags dst as
-                                        // Flonum; dispatcher decodes via
-                                        // f64::from_bits.
-                                        insts.push(RirInst::FixToFlo(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    // Flonum unary builtins. Only fire when
-                                    // the operand is statically Flonum-
-                                    // typed, otherwise fall through to the
-                                    // unsupported tail (deopt to bytecode).
-                                    ("flsqrt", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumSqrt(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    // ADR 0012 D-2 (iter EA) — sqrt for typed
-                                    // numeric args. Result is always Flonum
-                                    // (R7RS: unary_flonum semantics — the
-                                    // runtime promotes fixnum to flonum before
-                                    // sqrt).
-                                    ("sqrt", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumSqrt(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("sqrt", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Fixnum) =>
-                                    {
-                                        let promoted = alloc();
-                                        insts.push(RirInst::FixToFlo(promoted, args[0]));
-                                        value_types.insert(promoted, Type::Flonum);
-                                        insts.push(RirInst::FlonumSqrt(dst, promoted));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    // RC3 iter 2.18 — sqrt for Any-typed args.
-                                    // cs-aot's FlonumSqrt lowering is
-                                    // NB-Fixnum-aware (iter 2.17) so we can
-                                    // hand the Any operand directly to
-                                    // FlonumSqrt; the lowering will decode
-                                    // NB Fixnum payload to f64 or use the
-                                    // raw f64 bits for NB Flonum. Spectral-
-                                    // norm's `(sqrt (/ vBv vv))` hits this.
-                                    ("sqrt", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::FlonumSqrt(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("flabs", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumAbs(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    // ADR 0012 D-2 (iter FZ) — fl trig/exp/log/
-                                    // round/predicate aliases (Flonum-only).
-                                    ("flsin", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumSin(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("flcos", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumCos(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("fltan", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumTan(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("flexp", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumExp(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("fllog", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumLog(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("flfloor", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumFloor(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("flceiling", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumCeil(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("fltruncate", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumTrunc(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("flround", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumRound(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("flfinite?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumIsFinite(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("flinfinite?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumIsInfinite(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("flinteger?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumIsInteger(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("flnan?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumIsNan(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter GB) — string-titlecase /
-                                    // string-hash / symbol-hash.
-                                    ("string-titlecase", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringTitlecase(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-hash", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringHash(dst, args[0]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    ("symbol-hash", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::SymbolHash(dst, args[0]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    // ADR 0012 D-2 (iter EB) — abs/max/min for
-                                    // Flonum-typed args. max/min widen any
-                                    // Fixnum operand to Flonum via FixToFlo
-                                    // (numeric-tower contagion).
-                                    ("abs", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumAbs(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("max", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            || value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        let lhs = if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                        {
-                                            args[0]
-                                        } else {
-                                            let p = alloc();
-                                            insts.push(RirInst::FixToFlo(p, args[0]));
-                                            value_types.insert(p, Type::Flonum);
-                                            p
-                                        };
-                                        let rhs = if value_types.get(&args[1]).copied()
-                                            == Some(Type::Flonum)
-                                        {
-                                            args[1]
-                                        } else {
-                                            let p = alloc();
-                                            insts.push(RirInst::FixToFlo(p, args[1]));
-                                            value_types.insert(p, Type::Flonum);
-                                            p
-                                        };
-                                        insts.push(RirInst::FlonumMax(dst, lhs, rhs));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("min", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            || value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        let lhs = if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                        {
-                                            args[0]
-                                        } else {
-                                            let p = alloc();
-                                            insts.push(RirInst::FixToFlo(p, args[0]));
-                                            value_types.insert(p, Type::Flonum);
-                                            p
-                                        };
-                                        let rhs = if value_types.get(&args[1]).copied()
-                                            == Some(Type::Flonum)
-                                        {
-                                            args[1]
-                                        } else {
-                                            let p = alloc();
-                                            insts.push(RirInst::FixToFlo(p, args[1]));
-                                            value_types.insert(p, Type::Flonum);
-                                            p
-                                        };
-                                        insts.push(RirInst::FlonumMin(dst, lhs, rhs));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    // ADR 0012 D-2 (iter DF) — flonum
-                                    // transcendentals. Gated on Flonum operand.
-                                    ("sin", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumSin(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("cos", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumCos(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("tan", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumTan(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("log", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumLog(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("exp", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumExp(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    // ADR 0012 D-2 (iter DG) — inverse trig.
-                                    ("asin", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumAsin(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("acos", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumAcos(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("atan", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumAtan(dst, args[0]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    // ADR 0012 D-2 (iter FM) — log 2-arg, atan 2-arg.
-                                    ("log", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumLog2(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("atan", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumAtan2(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    // ADR 0012 D-2 (iter GA) — flexpt + fleven?/flodd?.
-                                    ("flexpt", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumExpt(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("fleven?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlEvenP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("flodd?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlOddP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("flmax", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumMax(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("flmin", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumMin(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    // ADR 0012 D-2 (iter FY) — fl arithmetic +
-                                    // compare + predicate aliases.
-                                    ("fl+", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumAdd(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("fl-", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumSub(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("fl*", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumMul(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("fl/", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumDiv(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Flonum);
-                                    }
-                                    ("fl=?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumEq(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("fl<?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumLt(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("fl>?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::FlonumLt(dst, args[1], args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("fl<=?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        // a <= b ≡ not(b < a)
-                                        let lt = alloc();
-                                        insts.push(RirInst::FlonumLt(lt, args[1], args[0]));
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Eq(dst, lt, zero));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("fl>=?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Flonum) =>
-                                    {
-                                        let lt = alloc();
-                                        insts.push(RirInst::FlonumLt(lt, args[0], args[1]));
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        insts.push(RirInst::Eq(dst, lt, zero));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("flzero?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
-                                        value_types.insert(zero, Type::Flonum);
-                                        insts.push(RirInst::FlonumEq(dst, args[0], zero));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("flpositive?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
-                                        value_types.insert(zero, Type::Flonum);
-                                        insts.push(RirInst::FlonumLt(dst, zero, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("flnegative?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Flonum) =>
-                                    {
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
-                                        value_types.insert(zero, Type::Flonum);
-                                        insts.push(RirInst::FlonumLt(dst, args[0], zero));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char->integer", 1) => {
-                                        // Inverse of integer->char: same
-                                        // codepoint payload, but the result is
-                                        // a Fixnum. Emit the dedicated
-                                        // `CharToInt` retag (not `Move`) so the
-                                        // tagged uniform-NB tier produces a
-                                        // Fixnum-tagged NB carrier — a `Move`
-                                        // left it Character-tagged and
-                                        // miscompiled `(char->integer
-                                        // (integer->char x))` → Character. The
-                                        // untagged tiers still treat it as a
-                                        // no-op copy. dst stays Fixnum-typed.
-                                        insts.push(RirInst::CharToInt(dst, args[0]));
-                                        value_types.insert(dst, Type::Fixnum);
-                                    }
-                                    // ADR 0012 D-2 (iter CI) — char Unicode
-                                    // predicates. Gated on Character-typed
-                                    // operand. Operand stays in its Fixnum-
-                                    // shape codepoint lane; helper dispatches
-                                    // via `char::from_u32(...).map_or(0, ...)`
-                                    // so invalid codepoints simply return 0
-                                    // (no deopt).
-                                    // ADR 0012 D-2 (iter FO) — bitwise-bit-set?.
-                                    // (Fixnum, Fixnum) -> Boolean.
-                                    ("bitwise-bit-set?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::BitwiseBitSetP(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter FW) — fxbit-set? alias.
-                                    ("fxbit-set?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::BitwiseBitSetP(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char-alphabetic?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::CharAlphabeticP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char-numeric?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::CharNumericP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char-whitespace?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::CharWhitespaceP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter CJ) — char case ops.
-                                    // Same Character-gated dispatch as CI.
-                                    ("char-upcase", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::CharUpcase(dst, args[0]));
-                                        value_types.insert(dst, Type::Character);
-                                    }
-                                    ("char-downcase", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::CharDowncase(dst, args[0]));
-                                        value_types.insert(dst, Type::Character);
-                                    }
-                                    ("char-upper-case?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::CharUpperCaseP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char-lower-case?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::CharLowerCaseP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter CS) — char-foldcase /
-                                    // char-titlecase. Same Character-gated
-                                    // shape as char-upcase / char-downcase.
-                                    ("char-foldcase", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::CharFoldcase(dst, args[0]));
-                                        value_types.insert(dst, Type::Character);
-                                    }
-                                    ("char-titlecase", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::CharTitlecase(dst, args[0]));
-                                        value_types.insert(dst, Type::Character);
-                                    }
-                                    // ADR 0012 D-2 (iter CW) — vector->list /
-                                    // list->vector. 1-arg forms.
-                                    ("vector->list", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::VectorToList(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IL) — vector->list 2-arg slice-from.
-                                    ("vector->list", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::VectorToListSliceFrom(
-                                            dst, args[0], args[1],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IF) — vector->list 3-arg slice.
-                                    ("vector->list", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::VectorToListSlice(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("list->vector", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::ListToVector(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CY) — symbol<->string.
-                                    ("symbol->string", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Symbol) =>
-                                    {
-                                        insts.push(RirInst::SymbolToString(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string->symbol", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringToSymbol(dst, args[0]));
-                                        value_types.insert(dst, Type::Symbol);
-                                    }
-                                    // ADR 0012 D-2 (iter CX) — string<->list.
-                                    ("string->list", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringToList(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IM) — string->list 2-arg slice-from.
-                                    ("string->list", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::StringToListSliceFrom(
-                                            dst, args[0], args[1],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IG) — string->list 3-arg slice.
-                                    ("string->list", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::StringToListSlice(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IN) — bytevector->list 2-arg slice-from.
-                                    ("bytevector->list", 2) | ("bytevector->u8-list", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::BytevectorToListSliceFrom(
-                                            dst, args[0], args[1],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IH) — bytevector->list 3-arg slice.
-                                    ("bytevector->list", 3) | ("bytevector->u8-list", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::BytevectorToListSlice(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("list->string", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::ListToString(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter EJ) — string-reverse.
-                                    ("string-reverse", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringReverse(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter EU) — string-contains.
-                                    ("string-contains", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringContains(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FL) — bytevector/utf8 conversion.
-                                    // ADR 0012 D-2 (iter GM) — bytevector->list /
-                                    // list->bytevector (1-arg) are R7RS aliases of
-                                    // bytevector->u8-list / u8-list->bytevector.
-                                    ("bytevector->u8-list", 1) | ("bytevector->list", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BytevectorToU8List(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("u8-list->bytevector", 1) | ("list->bytevector", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::U8ListToBytevector(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string->utf8", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringToUtf8(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("utf8->string", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::Utf8ToString(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FK) — string-contains-right.
-                                    ("string-contains-right", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringContainsRight(
-                                            dst, args[0], args[1],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FK) — string-index/-right.
-                                    // arg[1] is Character (raw codepoint i64).
-                                    ("string-index", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::StringIndex(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-index-right", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Character) =>
-                                    {
-                                        insts
-                                            .push(RirInst::StringIndexRight(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter EV) — string-prefix?/suffix?.
-                                    ("string-prefix?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringPrefixP(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter FE) — string-join 2-arg.
-                                    ("string-join", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringJoin(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FI) — string-replace-all.
-                                    ("string-replace-all", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringReplaceAll(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter HE) — string-replace
-                                    // (first occurrence only).
-                                    ("string-replace", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringReplaceFirst(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FH) — string trim family.
-                                    ("string-trim", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringTrim(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-trim-left", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringTrimLeft(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-trim-right", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringTrimRight(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FG) — string-pad/string-pad-right 2-arg.
-                                    ("string-pad", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::StringPad(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-pad-right", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::StringPadRight(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FJ) — string-take/-drop/
-                                    // -take-right/-drop-right. All take (String,
-                                    // Fixnum) and return a fresh String.
-                                    ("string-take", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::StringTake(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-drop", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::StringDrop(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-take-right", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::StringTakeRight(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-drop-right", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::StringDropRight(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FF) — string-split 2-arg.
-                                    // sep may be String (Any) or Character;
-                                    // BoxTyped if Character so the helper sees
-                                    // a Gc<Value> uniformly.
-                                    ("string-split", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        let sep_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let sep = if sep_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(sep_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::StringSplit(dst, args[0], sep));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-suffix?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringSuffixP(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter ET) — string case
-                                    // conversions: upcase / downcase / foldcase.
-                                    ("string-upcase", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringUpcase(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-downcase", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringDowncase(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-foldcase", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringFoldcase(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter EN) — (iota n) 1-arg.
-                                    // n must be Fixnum-shape (not Flonum).
-                                    ("iota", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::IotaN(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FC) — (iota count start).
-                                    ("iota", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::IotaNs(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FD) — (iota count start step).
-                                    ("iota", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum)
-                                            && value_types.get(&args[2]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts
-                                            .push(RirInst::IotaNss(dst, args[0], args[1], args[2]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter ER) — vector-copy!
-                                    // 3-arg form. (ES) — same shape for
-                                    // bytevector-copy! and string-copy!.
-                                    ("vector-copy!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::VecCopyBang(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IQ) — vector-copy! 4-arg.
-                                    ("vector-copy!", 4)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Any)
-                                            && value_types.get(&args[3]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::VecCopyBangFrom(
-                                            dst, args[0], args[1], args[2], args[3],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IT) — vector-copy! 5-arg.
-                                    ("vector-copy!", 5)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Any)
-                                            && value_types.get(&args[3]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[4]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::VecCopyBangSlice(
-                                            dst, args[0], args[1], args[2], args[3], args[4],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IR) — bytevector-copy! 4-arg.
-                                    ("bytevector-copy!", 4)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Any)
-                                            && value_types.get(&args[3]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::BvCopyBangFrom(
-                                            dst, args[0], args[1], args[2], args[3],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IU) — bytevector-copy! 5-arg.
-                                    ("bytevector-copy!", 5)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Any)
-                                            && value_types.get(&args[3]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[4]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::BvCopyBangSlice(
-                                            dst, args[0], args[1], args[2], args[3], args[4],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IS) — string-copy! 4-arg.
-                                    ("string-copy!", 4)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Any)
-                                            && value_types.get(&args[3]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::StrCopyBangFrom(
-                                            dst, args[0], args[1], args[2], args[3],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IV) — string-copy! 5-arg.
-                                    ("string-copy!", 5)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Any)
-                                            && value_types.get(&args[3]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[4]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::StrCopyBangSlice(
-                                            dst, args[0], args[1], args[2], args[3], args[4],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("bytevector-copy!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::BvCopyBang(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string-copy!", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StrCopyBang(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter EO) — last-pair / last.
-                                    ("last-pair", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::LastPair(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter FB) — concatenate / not-pair?.
-                                    ("concatenate", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::Concatenate(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("not-pair?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::NotPairP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter EY) — SRFI-1 list classifiers.
-                                    ("null-list?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::NullListP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("proper-list?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::ProperListP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("dotted-list?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::DottedListP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("circular-list?", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::CircularListP(dst, args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter EX) — take / drop.
-                                    // ADR 0012 D-2 (iter GC) — list-head alias.
-                                    // Both R6RS list-head and SRFI-1 take fail
-                                    // when n exceeds list length; we deopt to
-                                    // bytecode in either case.
-                                    ("take", 2) | ("list-head", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::Take(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("drop", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
-                                    {
-                                        insts.push(RirInst::Drop(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("last", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::Last(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IK) — (make-list n) 1-arg.
-                                    ("make-list", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::MakeListUnspec(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter EM) — (make-list n fill).
-                                    // Length must be Fixnum-typed; fill is
-                                    // boxed if a typed primitive.
-                                    ("make-list", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
-                                    {
-                                        let fill_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let fill = if fill_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(fill_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::MakeList(dst, args[0], fill));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter DY) — string<->vector
-                                    // 1-arg forms.
-                                    ("string->vector", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringToVector(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("vector->string", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::VectorToString(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IE) — string->vector 3-arg slice.
-                                    // Strict Fixnum guards on start/end avoid
-                                    // the JIT call-site cache issue that bit
-                                    // iter HN.
-                                    ("string->vector", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::StringToVectorSlice(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IP) — string->vector 2-arg slice-from.
-                                    ("string->vector", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::StringToVectorSliceFrom(
-                                            dst, args[0], args[1],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter ID) — vector->string 3-arg slice.
-                                    ("vector->string", 3)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum)
-                                            && value_types.get(&args[2]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::VectorToStringSlice(
-                                            dst, args[0], args[1], args[2],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IO) — vector->string 2-arg slice-from.
-                                    ("vector->string", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::VectorToStringSliceFrom(
-                                            dst, args[0], args[1],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter EC) — number<->string
-                                    // 1-arg forms. Box typed numeric immediates
-                                    // first; string->number's arg is always Any.
-                                    ("number->string", 1) => {
-                                        let t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let boxed = if t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::NumberToString(dst, boxed));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter II) — number->string 2-arg radix.
-                                    ("number->string", 2)
-                                        if value_types.get(&args[1]).copied()
-                                            == Some(Type::Fixnum) =>
-                                    {
-                                        let t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let boxed = if t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::NumberToStringRadix(
-                                            dst, boxed, args[1],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    ("string->number", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any) =>
-                                    {
-                                        insts.push(RirInst::StringToNumber(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter IJ) — string->number 2-arg radix.
-                                    ("string->number", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Fixnum) =>
-                                    {
-                                        insts.push(RirInst::StringToNumberRadix(
-                                            dst, args[0], args[1],
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // ADR 0012 D-2 (iter CV) — digit-value.
-                                    // Mixed return (Fixnum or #f) so dst is Any.
-                                    ("digit-value", 1)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character) =>
-                                    {
-                                        insts.push(RirInst::DigitValue(dst, args[0]));
-                                        value_types.insert(dst, Type::Any);
-                                    }
-                                    // R6RS tagged-equality on small immediates.
-                                    // For Fixnum/Boolean/Character all three
-                                    // live in the same i64 register, so an
-                                    // `Eq` instruction (which is i64 cmp)
-                                    // matches Scheme semantics. Each name
-                                    // lowers to the same RIR op; the
-                                    // type-guard at dispatch ensures both
-                                    // args are i64-shaped before we enter.
-                                    // `eq?` / `eqv?` on Any operands routes
-                                    // through vm_eq_any (consume-on-use
-                                    // identity check). Both operands must be
-                                    // Box pointers; if one side is a typed
-                                    // immediate (Fixnum / Boolean / Symbol /
-                                    // ...) we wrap it first via BoxTyped.
-                                    // ADR 0012 D-2 (iter EG) — extend the Any-
-                                    // arg eq routing to boolean=?/char=?/
-                                    // symbol=?. Closes a latent gap where
-                                    // integer Eq would compare Gc pointers
-                                    // instead of inner values when either side
-                                    // is Any-shape.
-                                    ("eq?", 2)
-                                    | ("eqv?", 2)
-                                    | ("boolean=?", 2)
-                                    | ("char=?", 2)
-                                    | ("symbol=?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Any)
-                                            || value_types.get(&args[1]).copied()
-                                                == Some(Type::Any) =>
-                                    {
-                                        let lhs_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let rhs_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let lhs = if lhs_t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(lhs_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        let rhs = if rhs_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(rhs_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::EqAny(dst, lhs, rhs));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter DZ) — equal? deep
-                                    // structural equality. Same BoxTyped
-                                    // fallback as eq?/eqv?; helper defers to
-                                    // cs_core::eq::equal.
-                                    ("equal?", 2) => {
-                                        let lhs_t = value_types
-                                            .get(&args[0])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let rhs_t = value_types
-                                            .get(&args[1])
-                                            .copied()
-                                            .unwrap_or(Type::Fixnum);
-                                        let lhs = if lhs_t == Type::Any {
-                                            args[0]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[0],
-                                                type_to_jit_rt_tag(lhs_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        let rhs = if rhs_t == Type::Any {
-                                            args[1]
-                                        } else {
-                                            let fresh = alloc();
-                                            insts.push(RirInst::BoxTyped(
-                                                fresh,
-                                                args[1],
-                                                type_to_jit_rt_tag(rhs_t),
-                                            ));
-                                            value_types.insert(fresh, Type::Any);
-                                            fresh
-                                        };
-                                        insts.push(RirInst::EqualAny(dst, lhs, rhs));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("eq?", 2)
-                                    | ("eqv?", 2)
-                                    | ("boolean=?", 2)
-                                    | ("char=?", 2)
-                                    | ("symbol=?", 2) => {
-                                        insts.push(RirInst::Eq(dst, args[0], args[1]));
-                                    }
-                                    // ADR 0012 D-2 (iter JA) — variadic
-                                    // boolean=? / char=? / symbol=? for 3+ args
-                                    // where all args are the same primitive
-                                    // type. Pairwise Eq + BitAnd chain.
-                                    ("boolean=?", n) | ("char=?", n) | ("symbol=?", n)
-                                        if n >= 3
-                                            && args.iter().all(|v| {
-                                                let t = value_types.get(v).copied();
-                                                t == Some(Type::Boolean)
-                                                    || t == Some(Type::Character)
-                                                    || t == Some(Type::Symbol)
-                                            })
-                                            && {
-                                                let first = value_types.get(&args[0]).copied();
-                                                args.iter()
-                                                    .all(|v| value_types.get(v).copied() == first)
-                                            } =>
-                                    {
-                                        let first = alloc();
-                                        insts.push(RirInst::Eq(first, args[0], args[1]));
-                                        value_types.insert(first, Type::Boolean);
-                                        let mut acc = first;
-                                        for i in 1..args.len() - 1 {
-                                            let cmp = alloc();
-                                            insts.push(RirInst::Eq(cmp, args[i], args[i + 1]));
-                                            value_types.insert(cmp, Type::Boolean);
-                                            let new_acc = alloc();
-                                            insts.push(RirInst::BitAnd(new_acc, acc, cmp));
-                                            value_types.insert(new_acc, Type::Boolean);
-                                            acc = new_acc;
+                                        ("integer->char", 1) => {
+                                            // Same bit pattern as the Fixnum input;
+                                            // the return-type post-pass will tag
+                                            // dst as Character so the dispatcher
+                                            // decodes the i64 codepoint into a
+                                            // Value::Character on the way out.
+                                            insts.push(RirInst::IntCharBitcast(dst, args[0]));
+                                            // Track Character in the inline
+                                            // value_types map so downstream
+                                            // arms (char-alphabetic? etc.) that
+                                            // gate on Type::Character can fire.
+                                            value_types.insert(dst, Type::Character);
                                         }
-                                        insts.push(RirInst::Move(dst, acc));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter CF) — char
-                                    // ordered comparisons. Character carries
-                                    // a codepoint in Fixnum-shape i64 lanes,
-                                    // so RirInst::Lt compares them
-                                    // numerically — matching R6RS char<?
-                                    // (Unicode codepoint order).
-                                    ("char<?", 2) => {
-                                        insts.push(RirInst::Lt(dst, args[0], args[1]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char>?", 2) => {
-                                        // a > b → b < a (swap).
-                                        insts.push(RirInst::Lt(dst, args[1], args[0]));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char<=?", 2) => {
-                                        // a <= b → NOT (b < a). Mirrors
-                                        // LeFx2's pattern: Lt(b, a) then
-                                        // Eq(lt, 0).
-                                        let lt = alloc();
-                                        insts.push(RirInst::Lt(lt, args[1], args[0]));
-                                        value_types.insert(lt, Type::Boolean);
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        value_types.insert(zero, Type::Fixnum);
-                                        insts.push(RirInst::Eq(dst, lt, zero));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char>=?", 2) => {
-                                        // a >= b → NOT (a < b).
-                                        let lt = alloc();
-                                        insts.push(RirInst::Lt(lt, args[0], args[1]));
-                                        value_types.insert(lt, Type::Boolean);
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        value_types.insert(zero, Type::Fixnum);
-                                        insts.push(RirInst::Eq(dst, lt, zero));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter JB) — variadic char
-                                    // ordered comparisons. Pattern mirrors
-                                    // variadic </>/<=/>= at line 5277:
-                                    // pairwise comparison + BitAnd-chain.
-                                    ("char<?", n)
-                                    | ("char>?", n)
-                                    | ("char<=?", n)
-                                    | ("char>=?", n)
-                                        if n >= 3 =>
-                                    {
-                                        let emit_cmp =
+                                        ("real->flonum", 1)
+                                        | ("exact->inexact", 1)
+                                        | ("inexact", 1)
+                                        | ("fixnum->flonum", 1) => {
+                                            // Convert the i64 Fixnum into f64
+                                            // bits via Cranelift's
+                                            // fcvt_from_sint+bitcast. The
+                                            // return-type post-pass tags dst as
+                                            // Flonum; dispatcher decodes via
+                                            // f64::from_bits.
+                                            insts.push(RirInst::FixToFlo(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        // Flonum unary builtins. Only fire when
+                                        // the operand is statically Flonum-
+                                        // typed, otherwise fall through to the
+                                        // unsupported tail (deopt to bytecode).
+                                        ("flsqrt", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumSqrt(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        // ADR 0012 D-2 (iter EA) — sqrt for typed
+                                        // numeric args. Result is always Flonum
+                                        // (R7RS: unary_flonum semantics — the
+                                        // runtime promotes fixnum to flonum before
+                                        // sqrt).
+                                        ("sqrt", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumSqrt(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("sqrt", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Fixnum) =>
+                                        {
+                                            let promoted = alloc();
+                                            insts.push(RirInst::FixToFlo(promoted, args[0]));
+                                            value_types.insert(promoted, Type::Flonum);
+                                            insts.push(RirInst::FlonumSqrt(dst, promoted));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        // RC3 iter 2.18 — sqrt for Any-typed args.
+                                        // cs-aot's FlonumSqrt lowering is
+                                        // NB-Fixnum-aware (iter 2.17) so we can
+                                        // hand the Any operand directly to
+                                        // FlonumSqrt; the lowering will decode
+                                        // NB Fixnum payload to f64 or use the
+                                        // raw f64 bits for NB Flonum. Spectral-
+                                        // norm's `(sqrt (/ vBv vv))` hits this.
+                                        ("sqrt", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::FlonumSqrt(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("flabs", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumAbs(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        // ADR 0012 D-2 (iter FZ) — fl trig/exp/log/
+                                        // round/predicate aliases (Flonum-only).
+                                        ("flsin", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumSin(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("flcos", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumCos(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("fltan", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumTan(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("flexp", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumExp(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("fllog", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumLog(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("flfloor", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumFloor(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("flceiling", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumCeil(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("fltruncate", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumTrunc(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("flround", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumRound(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("flfinite?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumIsFinite(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("flinfinite?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumIsInfinite(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("flinteger?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumIsInteger(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("flnan?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumIsNan(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter GB) — string-titlecase /
+                                        // string-hash / symbol-hash.
+                                        ("string-titlecase", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringTitlecase(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-hash", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringHash(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        ("symbol-hash", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::SymbolHash(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        // ADR 0012 D-2 (iter EB) — abs/max/min for
+                                        // Flonum-typed args. max/min widen any
+                                        // Fixnum operand to Flonum via FixToFlo
+                                        // (numeric-tower contagion).
+                                        ("abs", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumAbs(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("max", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                || value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            let lhs = if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                            {
+                                                args[0]
+                                            } else {
+                                                let p = alloc();
+                                                insts.push(RirInst::FixToFlo(p, args[0]));
+                                                value_types.insert(p, Type::Flonum);
+                                                p
+                                            };
+                                            let rhs = if value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum)
+                                            {
+                                                args[1]
+                                            } else {
+                                                let p = alloc();
+                                                insts.push(RirInst::FixToFlo(p, args[1]));
+                                                value_types.insert(p, Type::Flonum);
+                                                p
+                                            };
+                                            insts.push(RirInst::FlonumMax(dst, lhs, rhs));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("min", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                || value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            let lhs = if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                            {
+                                                args[0]
+                                            } else {
+                                                let p = alloc();
+                                                insts.push(RirInst::FixToFlo(p, args[0]));
+                                                value_types.insert(p, Type::Flonum);
+                                                p
+                                            };
+                                            let rhs = if value_types.get(&args[1]).copied()
+                                                == Some(Type::Flonum)
+                                            {
+                                                args[1]
+                                            } else {
+                                                let p = alloc();
+                                                insts.push(RirInst::FixToFlo(p, args[1]));
+                                                value_types.insert(p, Type::Flonum);
+                                                p
+                                            };
+                                            insts.push(RirInst::FlonumMin(dst, lhs, rhs));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        // ADR 0012 D-2 (iter DF) — flonum
+                                        // transcendentals. Gated on Flonum operand.
+                                        ("sin", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumSin(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("cos", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumCos(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("tan", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumTan(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("log", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumLog(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("exp", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumExp(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        // ADR 0012 D-2 (iter DG) — inverse trig.
+                                        ("asin", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumAsin(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("acos", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumAcos(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("atan", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumAtan(dst, args[0]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        // ADR 0012 D-2 (iter FM) — log 2-arg, atan 2-arg.
+                                        ("log", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumLog2(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("atan", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumAtan2(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        // ADR 0012 D-2 (iter GA) — flexpt + fleven?/flodd?.
+                                        ("flexpt", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumExpt(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("fleven?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlEvenP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("flodd?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlOddP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("flmax", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumMax(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("flmin", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumMin(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        // ADR 0012 D-2 (iter FY) — fl arithmetic +
+                                        // compare + predicate aliases.
+                                        ("fl+", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumAdd(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("fl-", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumSub(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("fl*", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumMul(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("fl/", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumDiv(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Flonum);
+                                        }
+                                        ("fl=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumEq(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("fl<?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumLt(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("fl>?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::FlonumLt(dst, args[1], args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("fl<=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            // a <= b ≡ not(b < a)
+                                            let lt = alloc();
+                                            insts.push(RirInst::FlonumLt(lt, args[1], args[0]));
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            insts.push(RirInst::Eq(dst, lt, zero));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("fl>=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Flonum) =>
+                                        {
+                                            let lt = alloc();
+                                            insts.push(RirInst::FlonumLt(lt, args[0], args[1]));
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            insts.push(RirInst::Eq(dst, lt, zero));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("flzero?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            let zero = alloc();
+                                            insts
+                                                .push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                            value_types.insert(zero, Type::Flonum);
+                                            insts.push(RirInst::FlonumEq(dst, args[0], zero));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("flpositive?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            let zero = alloc();
+                                            insts
+                                                .push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                            value_types.insert(zero, Type::Flonum);
+                                            insts.push(RirInst::FlonumLt(dst, zero, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("flnegative?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Flonum) =>
+                                        {
+                                            let zero = alloc();
+                                            insts
+                                                .push(RirInst::LoadConst(zero, Const::Flonum(0.0)));
+                                            value_types.insert(zero, Type::Flonum);
+                                            insts.push(RirInst::FlonumLt(dst, args[0], zero));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char->integer", 1) => {
+                                            // Inverse of integer->char: same
+                                            // codepoint payload, but the result is
+                                            // a Fixnum. Emit the dedicated
+                                            // `CharToInt` retag (not `Move`) so the
+                                            // tagged uniform-NB tier produces a
+                                            // Fixnum-tagged NB carrier — a `Move`
+                                            // left it Character-tagged and
+                                            // miscompiled `(char->integer
+                                            // (integer->char x))` → Character. The
+                                            // untagged tiers still treat it as a
+                                            // no-op copy. dst stays Fixnum-typed.
+                                            insts.push(RirInst::CharToInt(dst, args[0]));
+                                            value_types.insert(dst, Type::Fixnum);
+                                        }
+                                        // ADR 0012 D-2 (iter CI) — char Unicode
+                                        // predicates. Gated on Character-typed
+                                        // operand. Operand stays in its Fixnum-
+                                        // shape codepoint lane; helper dispatches
+                                        // via `char::from_u32(...).map_or(0, ...)`
+                                        // so invalid codepoints simply return 0
+                                        // (no deopt).
+                                        // ADR 0012 D-2 (iter FO) — bitwise-bit-set?.
+                                        // (Fixnum, Fixnum) -> Boolean.
+                                        ("bitwise-bit-set?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::BitwiseBitSetP(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter FW) — fxbit-set? alias.
+                                        ("fxbit-set?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::BitwiseBitSetP(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char-alphabetic?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::CharAlphabeticP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char-numeric?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::CharNumericP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char-whitespace?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::CharWhitespaceP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter CJ) — char case ops.
+                                        // Same Character-gated dispatch as CI.
+                                        ("char-upcase", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::CharUpcase(dst, args[0]));
+                                            value_types.insert(dst, Type::Character);
+                                        }
+                                        ("char-downcase", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::CharDowncase(dst, args[0]));
+                                            value_types.insert(dst, Type::Character);
+                                        }
+                                        ("char-upper-case?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::CharUpperCaseP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char-lower-case?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::CharLowerCaseP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter CS) — char-foldcase /
+                                        // char-titlecase. Same Character-gated
+                                        // shape as char-upcase / char-downcase.
+                                        ("char-foldcase", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::CharFoldcase(dst, args[0]));
+                                            value_types.insert(dst, Type::Character);
+                                        }
+                                        ("char-titlecase", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::CharTitlecase(dst, args[0]));
+                                            value_types.insert(dst, Type::Character);
+                                        }
+                                        // ADR 0012 D-2 (iter CW) — vector->list /
+                                        // list->vector. 1-arg forms.
+                                        ("vector->list", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::VectorToList(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IL) — vector->list 2-arg slice-from.
+                                        ("vector->list", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::VectorToListSliceFrom(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IF) — vector->list 3-arg slice.
+                                        ("vector->list", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::VectorToListSlice(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("list->vector", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::ListToVector(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CY) — symbol<->string.
+                                        ("symbol->string", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Symbol) =>
+                                        {
+                                            insts.push(RirInst::SymbolToString(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string->symbol", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringToSymbol(dst, args[0]));
+                                            value_types.insert(dst, Type::Symbol);
+                                        }
+                                        // ADR 0012 D-2 (iter CX) — string<->list.
+                                        ("string->list", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringToList(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IM) — string->list 2-arg slice-from.
+                                        ("string->list", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::StringToListSliceFrom(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IG) — string->list 3-arg slice.
+                                        ("string->list", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::StringToListSlice(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IN) — bytevector->list 2-arg slice-from.
+                                        ("bytevector->list", 2) | ("bytevector->u8-list", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::BytevectorToListSliceFrom(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IH) — bytevector->list 3-arg slice.
+                                        ("bytevector->list", 3) | ("bytevector->u8-list", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::BytevectorToListSlice(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("list->string", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::ListToString(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter EJ) — string-reverse.
+                                        ("string-reverse", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringReverse(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter EU) — string-contains.
+                                        ("string-contains", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringContains(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FL) — bytevector/utf8 conversion.
+                                        // ADR 0012 D-2 (iter GM) — bytevector->list /
+                                        // list->bytevector (1-arg) are R7RS aliases of
+                                        // bytevector->u8-list / u8-list->bytevector.
+                                        ("bytevector->u8-list", 1) | ("bytevector->list", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BytevectorToU8List(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("u8-list->bytevector", 1) | ("list->bytevector", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::U8ListToBytevector(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string->utf8", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringToUtf8(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("utf8->string", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::Utf8ToString(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FK) — string-contains-right.
+                                        ("string-contains-right", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringContainsRight(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FK) — string-index/-right.
+                                        // arg[1] is Character (raw codepoint i64).
+                                        ("string-index", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::StringIndex(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-index-right", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::StringIndexRight(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter EV) — string-prefix?/suffix?.
+                                        ("string-prefix?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringPrefixP(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter FE) — string-join 2-arg.
+                                        ("string-join", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringJoin(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FI) — string-replace-all.
+                                        ("string-replace-all", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringReplaceAll(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter HE) — string-replace
+                                        // (first occurrence only).
+                                        ("string-replace", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringReplaceFirst(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FH) — string trim family.
+                                        ("string-trim", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringTrim(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-trim-left", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringTrimLeft(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-trim-right", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringTrimRight(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FG) — string-pad/string-pad-right 2-arg.
+                                        ("string-pad", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::StringPad(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-pad-right", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::StringPadRight(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FJ) — string-take/-drop/
+                                        // -take-right/-drop-right. All take (String,
+                                        // Fixnum) and return a fresh String.
+                                        ("string-take", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::StringTake(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-drop", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::StringDrop(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-take-right", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::StringTakeRight(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-drop-right", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::StringDropRight(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FF) — string-split 2-arg.
+                                        // sep may be String (Any) or Character;
+                                        // BoxTyped if Character so the helper sees
+                                        // a Gc<Value> uniformly.
+                                        ("string-split", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            let sep_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let sep = if sep_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(sep_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::StringSplit(dst, args[0], sep));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-suffix?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringSuffixP(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter ET) — string case
+                                        // conversions: upcase / downcase / foldcase.
+                                        ("string-upcase", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringUpcase(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-downcase", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringDowncase(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-foldcase", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringFoldcase(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter EN) — (iota n) 1-arg.
+                                        // n must be Fixnum-shape (not Flonum).
+                                        ("iota", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::IotaN(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FC) — (iota count start).
+                                        ("iota", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::IotaNs(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FD) — (iota count start step).
+                                        ("iota", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum)
+                                                && value_types.get(&args[2]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::IotaNss(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter ER) — vector-copy!
+                                        // 3-arg form. (ES) — same shape for
+                                        // bytevector-copy! and string-copy!.
+                                        ("vector-copy!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::VecCopyBang(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IQ) — vector-copy! 4-arg.
+                                        ("vector-copy!", 4)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Any)
+                                                && value_types.get(&args[3]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::VecCopyBangFrom(
+                                                dst, args[0], args[1], args[2], args[3],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IT) — vector-copy! 5-arg.
+                                        ("vector-copy!", 5)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Any)
+                                                && value_types.get(&args[3]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[4]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::VecCopyBangSlice(
+                                                dst, args[0], args[1], args[2], args[3], args[4],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IR) — bytevector-copy! 4-arg.
+                                        ("bytevector-copy!", 4)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Any)
+                                                && value_types.get(&args[3]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::BvCopyBangFrom(
+                                                dst, args[0], args[1], args[2], args[3],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IU) — bytevector-copy! 5-arg.
+                                        ("bytevector-copy!", 5)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Any)
+                                                && value_types.get(&args[3]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[4]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::BvCopyBangSlice(
+                                                dst, args[0], args[1], args[2], args[3], args[4],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IS) — string-copy! 4-arg.
+                                        ("string-copy!", 4)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Any)
+                                                && value_types.get(&args[3]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::StrCopyBangFrom(
+                                                dst, args[0], args[1], args[2], args[3],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IV) — string-copy! 5-arg.
+                                        ("string-copy!", 5)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Any)
+                                                && value_types.get(&args[3]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[4]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::StrCopyBangSlice(
+                                                dst, args[0], args[1], args[2], args[3], args[4],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("bytevector-copy!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::BvCopyBang(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string-copy!", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StrCopyBang(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter EO) — last-pair / last.
+                                        ("last-pair", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::LastPair(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter FB) — concatenate / not-pair?.
+                                        ("concatenate", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::Concatenate(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("not-pair?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::NotPairP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter EY) — SRFI-1 list classifiers.
+                                        ("null-list?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::NullListP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("proper-list?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::ProperListP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("dotted-list?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::DottedListP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("circular-list?", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::CircularListP(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter EX) — take / drop.
+                                        // ADR 0012 D-2 (iter GC) — list-head alias.
+                                        // Both R6RS list-head and SRFI-1 take fail
+                                        // when n exceeds list length; we deopt to
+                                        // bytecode in either case.
+                                        ("take", 2) | ("list-head", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::Take(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("drop", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    != Some(Type::Flonum) =>
+                                        {
+                                            insts.push(RirInst::Drop(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("last", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::Last(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IK) — (make-list n) 1-arg.
+                                        ("make-list", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::MakeListUnspec(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter EM) — (make-list n fill).
+                                        // Length must be Fixnum-typed; fill is
+                                        // boxed if a typed primitive.
+                                        ("make-list", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                != Some(Type::Flonum) =>
+                                        {
+                                            let fill_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let fill = if fill_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(fill_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::MakeList(dst, args[0], fill));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter DY) — string<->vector
+                                        // 1-arg forms.
+                                        ("string->vector", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringToVector(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("vector->string", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::VectorToString(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IE) — string->vector 3-arg slice.
+                                        // Strict Fixnum guards on start/end avoid
+                                        // the JIT call-site cache issue that bit
+                                        // iter HN.
+                                        ("string->vector", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::StringToVectorSlice(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IP) — string->vector 2-arg slice-from.
+                                        ("string->vector", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::StringToVectorSliceFrom(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter ID) — vector->string 3-arg slice.
+                                        ("vector->string", 3)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum)
+                                                && value_types.get(&args[2]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::VectorToStringSlice(
+                                                dst, args[0], args[1], args[2],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IO) — vector->string 2-arg slice-from.
+                                        ("vector->string", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::VectorToStringSliceFrom(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter EC) — number<->string
+                                        // 1-arg forms. Box typed numeric immediates
+                                        // first; string->number's arg is always Any.
+                                        ("number->string", 1) => {
+                                            let t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let boxed = if t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::NumberToString(dst, boxed));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter II) — number->string 2-arg radix.
+                                        ("number->string", 2)
+                                            if value_types.get(&args[1]).copied()
+                                                == Some(Type::Fixnum) =>
+                                        {
+                                            let t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let boxed = if t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::NumberToStringRadix(
+                                                dst, boxed, args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        ("string->number", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any) =>
+                                        {
+                                            insts.push(RirInst::StringToNumber(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter IJ) — string->number 2-arg radix.
+                                        ("string->number", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Fixnum) =>
+                                        {
+                                            insts.push(RirInst::StringToNumberRadix(
+                                                dst, args[0], args[1],
+                                            ));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // ADR 0012 D-2 (iter CV) — digit-value.
+                                        // Mixed return (Fixnum or #f) so dst is Any.
+                                        ("digit-value", 1)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character) =>
+                                        {
+                                            insts.push(RirInst::DigitValue(dst, args[0]));
+                                            value_types.insert(dst, Type::Any);
+                                        }
+                                        // R6RS tagged-equality on small immediates.
+                                        // For Fixnum/Boolean/Character all three
+                                        // live in the same i64 register, so an
+                                        // `Eq` instruction (which is i64 cmp)
+                                        // matches Scheme semantics. Each name
+                                        // lowers to the same RIR op; the
+                                        // type-guard at dispatch ensures both
+                                        // args are i64-shaped before we enter.
+                                        // `eq?` / `eqv?` on Any operands routes
+                                        // through vm_eq_any (consume-on-use
+                                        // identity check). Both operands must be
+                                        // Box pointers; if one side is a typed
+                                        // immediate (Fixnum / Boolean / Symbol /
+                                        // ...) we wrap it first via BoxTyped.
+                                        // ADR 0012 D-2 (iter EG) — extend the Any-
+                                        // arg eq routing to boolean=?/char=?/
+                                        // symbol=?. Closes a latent gap where
+                                        // integer Eq would compare Gc pointers
+                                        // instead of inner values when either side
+                                        // is Any-shape.
+                                        ("eq?", 2)
+                                        | ("eqv?", 2)
+                                        | ("boolean=?", 2)
+                                        | ("char=?", 2)
+                                        | ("symbol=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Any)
+                                                || value_types.get(&args[1]).copied()
+                                                    == Some(Type::Any) =>
+                                        {
+                                            let lhs_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let rhs_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let lhs = if lhs_t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(lhs_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            let rhs = if rhs_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(rhs_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::EqAny(dst, lhs, rhs));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter DZ) — equal? deep
+                                        // structural equality. Same BoxTyped
+                                        // fallback as eq?/eqv?; helper defers to
+                                        // cs_core::eq::equal.
+                                        ("equal?", 2) => {
+                                            let lhs_t = value_types
+                                                .get(&args[0])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let rhs_t = value_types
+                                                .get(&args[1])
+                                                .copied()
+                                                .unwrap_or(Type::Fixnum);
+                                            let lhs = if lhs_t == Type::Any {
+                                                args[0]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[0],
+                                                    type_to_jit_rt_tag(lhs_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            let rhs = if rhs_t == Type::Any {
+                                                args[1]
+                                            } else {
+                                                let fresh = alloc();
+                                                insts.push(RirInst::BoxTyped(
+                                                    fresh,
+                                                    args[1],
+                                                    type_to_jit_rt_tag(rhs_t),
+                                                ));
+                                                value_types.insert(fresh, Type::Any);
+                                                fresh
+                                            };
+                                            insts.push(RirInst::EqualAny(dst, lhs, rhs));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("eq?", 2)
+                                        | ("eqv?", 2)
+                                        | ("boolean=?", 2)
+                                        | ("char=?", 2)
+                                        | ("symbol=?", 2) => {
+                                            insts.push(RirInst::Eq(dst, args[0], args[1]));
+                                        }
+                                        // ADR 0012 D-2 (iter JA) — variadic
+                                        // boolean=? / char=? / symbol=? for 3+ args
+                                        // where all args are the same primitive
+                                        // type. Pairwise Eq + BitAnd chain.
+                                        ("boolean=?", n) | ("char=?", n) | ("symbol=?", n)
+                                            if n >= 3
+                                                && args.iter().all(|v| {
+                                                    let t = value_types.get(v).copied();
+                                                    t == Some(Type::Boolean)
+                                                        || t == Some(Type::Character)
+                                                        || t == Some(Type::Symbol)
+                                                })
+                                                && {
+                                                    let first = value_types.get(&args[0]).copied();
+                                                    args.iter().all(|v| {
+                                                        value_types.get(v).copied() == first
+                                                    })
+                                                } =>
+                                        {
+                                            let first = alloc();
+                                            insts.push(RirInst::Eq(first, args[0], args[1]));
+                                            value_types.insert(first, Type::Boolean);
+                                            let mut acc = first;
+                                            for i in 1..args.len() - 1 {
+                                                let cmp = alloc();
+                                                insts.push(RirInst::Eq(cmp, args[i], args[i + 1]));
+                                                value_types.insert(cmp, Type::Boolean);
+                                                let new_acc = alloc();
+                                                insts.push(RirInst::BitAnd(new_acc, acc, cmp));
+                                                value_types.insert(new_acc, Type::Boolean);
+                                                acc = new_acc;
+                                            }
+                                            insts.push(RirInst::Move(dst, acc));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter CF) — char
+                                        // ordered comparisons. Character carries
+                                        // a codepoint in Fixnum-shape i64 lanes,
+                                        // so RirInst::Lt compares them
+                                        // numerically — matching R6RS char<?
+                                        // (Unicode codepoint order).
+                                        ("char<?", 2) => {
+                                            insts.push(RirInst::Lt(dst, args[0], args[1]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char>?", 2) => {
+                                            // a > b → b < a (swap).
+                                            insts.push(RirInst::Lt(dst, args[1], args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char<=?", 2) => {
+                                            // a <= b → NOT (b < a). Mirrors
+                                            // LeFx2's pattern: Lt(b, a) then
+                                            // Eq(lt, 0).
+                                            let lt = alloc();
+                                            insts.push(RirInst::Lt(lt, args[1], args[0]));
+                                            value_types.insert(lt, Type::Boolean);
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            value_types.insert(zero, Type::Fixnum);
+                                            insts.push(RirInst::Eq(dst, lt, zero));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char>=?", 2) => {
+                                            // a >= b → NOT (a < b).
+                                            let lt = alloc();
+                                            insts.push(RirInst::Lt(lt, args[0], args[1]));
+                                            value_types.insert(lt, Type::Boolean);
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            value_types.insert(zero, Type::Fixnum);
+                                            insts.push(RirInst::Eq(dst, lt, zero));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter JB) — variadic char
+                                        // ordered comparisons. Pattern mirrors
+                                        // variadic </>/<=/>= at line 5277:
+                                        // pairwise comparison + BitAnd-chain.
+                                        ("char<?", n)
+                                        | ("char>?", n)
+                                        | ("char<=?", n)
+                                        | ("char>=?", n)
+                                            if n >= 3 =>
+                                        {
+                                            let emit_cmp =
                                             |insts: &mut Vec<RirInst>,
                                              value_types: &mut HashMap<RirValue, Type>,
                                              alloc: &mut dyn FnMut() -> RirValue,
@@ -5906,146 +6085,147 @@ pub fn bytecode_to_rir_full(
                                                 }
                                                 d
                                             };
-                                        let first = emit_cmp(
-                                            &mut insts,
-                                            &mut value_types,
-                                            &mut alloc,
-                                            args[0],
-                                            args[1],
-                                        );
-                                        let mut acc = first;
-                                        for i in 1..args.len() - 1 {
-                                            let cmp = emit_cmp(
+                                            let first = emit_cmp(
                                                 &mut insts,
                                                 &mut value_types,
                                                 &mut alloc,
-                                                args[i],
-                                                args[i + 1],
+                                                args[0],
+                                                args[1],
                                             );
-                                            let new_acc = alloc();
-                                            insts.push(RirInst::BitAnd(new_acc, acc, cmp));
-                                            value_types.insert(new_acc, Type::Boolean);
-                                            acc = new_acc;
+                                            let mut acc = first;
+                                            for i in 1..args.len() - 1 {
+                                                let cmp = emit_cmp(
+                                                    &mut insts,
+                                                    &mut value_types,
+                                                    &mut alloc,
+                                                    args[i],
+                                                    args[i + 1],
+                                                );
+                                                let new_acc = alloc();
+                                                insts.push(RirInst::BitAnd(new_acc, acc, cmp));
+                                                value_types.insert(new_acc, Type::Boolean);
+                                                acc = new_acc;
+                                            }
+                                            insts.push(RirInst::Move(dst, acc));
+                                            value_types.insert(dst, Type::Boolean);
                                         }
-                                        insts.push(RirInst::Move(dst, acc));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter CU) — char-ci
-                                    // comparison family: case-insensitive
-                                    // by foldcasing both operands first,
-                                    // then reusing the base op.
-                                    ("char-ci=?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Character) =>
-                                    {
-                                        let fa = alloc();
-                                        let fb = alloc();
-                                        insts.push(RirInst::CharFoldcase(fa, args[0]));
-                                        value_types.insert(fa, Type::Character);
-                                        insts.push(RirInst::CharFoldcase(fb, args[1]));
-                                        value_types.insert(fb, Type::Character);
-                                        insts.push(RirInst::Eq(dst, fa, fb));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char-ci<?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Character) =>
-                                    {
-                                        let fa = alloc();
-                                        let fb = alloc();
-                                        insts.push(RirInst::CharFoldcase(fa, args[0]));
-                                        value_types.insert(fa, Type::Character);
-                                        insts.push(RirInst::CharFoldcase(fb, args[1]));
-                                        value_types.insert(fb, Type::Character);
-                                        insts.push(RirInst::Lt(dst, fa, fb));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char-ci>?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Character) =>
-                                    {
-                                        let fa = alloc();
-                                        let fb = alloc();
-                                        insts.push(RirInst::CharFoldcase(fa, args[0]));
-                                        value_types.insert(fa, Type::Character);
-                                        insts.push(RirInst::CharFoldcase(fb, args[1]));
-                                        value_types.insert(fb, Type::Character);
-                                        // a > b → b < a.
-                                        insts.push(RirInst::Lt(dst, fb, fa));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char-ci<=?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Character) =>
-                                    {
-                                        let fa = alloc();
-                                        let fb = alloc();
-                                        insts.push(RirInst::CharFoldcase(fa, args[0]));
-                                        value_types.insert(fa, Type::Character);
-                                        insts.push(RirInst::CharFoldcase(fb, args[1]));
-                                        value_types.insert(fb, Type::Character);
-                                        let lt = alloc();
-                                        insts.push(RirInst::Lt(lt, fb, fa));
-                                        value_types.insert(lt, Type::Boolean);
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        value_types.insert(zero, Type::Fixnum);
-                                        insts.push(RirInst::Eq(dst, lt, zero));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    ("char-ci>=?", 2)
-                                        if value_types.get(&args[0]).copied()
-                                            == Some(Type::Character)
-                                            && value_types.get(&args[1]).copied()
-                                                == Some(Type::Character) =>
-                                    {
-                                        let fa = alloc();
-                                        let fb = alloc();
-                                        insts.push(RirInst::CharFoldcase(fa, args[0]));
-                                        value_types.insert(fa, Type::Character);
-                                        insts.push(RirInst::CharFoldcase(fb, args[1]));
-                                        value_types.insert(fb, Type::Character);
-                                        let lt = alloc();
-                                        insts.push(RirInst::Lt(lt, fa, fb));
-                                        value_types.insert(lt, Type::Boolean);
-                                        let zero = alloc();
-                                        insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
-                                        value_types.insert(zero, Type::Fixnum);
-                                        insts.push(RirInst::Eq(dst, lt, zero));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter JC) — variadic char-ci
-                                    // ordered comparisons. Foldcase each arg
-                                    // once, then pairwise compare + BitAnd
-                                    // chain (mirrors JB for plain char</>).
-                                    ("char-ci=?", n)
-                                    | ("char-ci<?", n)
-                                    | ("char-ci>?", n)
-                                    | ("char-ci<=?", n)
-                                    | ("char-ci>=?", n)
-                                        if n >= 3
-                                            && args.iter().all(|v| {
-                                                value_types.get(v).copied() == Some(Type::Character)
-                                            }) =>
-                                    {
-                                        let folded: Vec<RirValue> = args
-                                            .iter()
-                                            .map(|v| {
-                                                let f = alloc();
-                                                insts.push(RirInst::CharFoldcase(f, *v));
-                                                value_types.insert(f, Type::Character);
-                                                f
-                                            })
-                                            .collect();
-                                        let emit_cmp =
+                                        // ADR 0012 D-2 (iter CU) — char-ci
+                                        // comparison family: case-insensitive
+                                        // by foldcasing both operands first,
+                                        // then reusing the base op.
+                                        ("char-ci=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Character) =>
+                                        {
+                                            let fa = alloc();
+                                            let fb = alloc();
+                                            insts.push(RirInst::CharFoldcase(fa, args[0]));
+                                            value_types.insert(fa, Type::Character);
+                                            insts.push(RirInst::CharFoldcase(fb, args[1]));
+                                            value_types.insert(fb, Type::Character);
+                                            insts.push(RirInst::Eq(dst, fa, fb));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char-ci<?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Character) =>
+                                        {
+                                            let fa = alloc();
+                                            let fb = alloc();
+                                            insts.push(RirInst::CharFoldcase(fa, args[0]));
+                                            value_types.insert(fa, Type::Character);
+                                            insts.push(RirInst::CharFoldcase(fb, args[1]));
+                                            value_types.insert(fb, Type::Character);
+                                            insts.push(RirInst::Lt(dst, fa, fb));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char-ci>?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Character) =>
+                                        {
+                                            let fa = alloc();
+                                            let fb = alloc();
+                                            insts.push(RirInst::CharFoldcase(fa, args[0]));
+                                            value_types.insert(fa, Type::Character);
+                                            insts.push(RirInst::CharFoldcase(fb, args[1]));
+                                            value_types.insert(fb, Type::Character);
+                                            // a > b → b < a.
+                                            insts.push(RirInst::Lt(dst, fb, fa));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char-ci<=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Character) =>
+                                        {
+                                            let fa = alloc();
+                                            let fb = alloc();
+                                            insts.push(RirInst::CharFoldcase(fa, args[0]));
+                                            value_types.insert(fa, Type::Character);
+                                            insts.push(RirInst::CharFoldcase(fb, args[1]));
+                                            value_types.insert(fb, Type::Character);
+                                            let lt = alloc();
+                                            insts.push(RirInst::Lt(lt, fb, fa));
+                                            value_types.insert(lt, Type::Boolean);
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            value_types.insert(zero, Type::Fixnum);
+                                            insts.push(RirInst::Eq(dst, lt, zero));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        ("char-ci>=?", 2)
+                                            if value_types.get(&args[0]).copied()
+                                                == Some(Type::Character)
+                                                && value_types.get(&args[1]).copied()
+                                                    == Some(Type::Character) =>
+                                        {
+                                            let fa = alloc();
+                                            let fb = alloc();
+                                            insts.push(RirInst::CharFoldcase(fa, args[0]));
+                                            value_types.insert(fa, Type::Character);
+                                            insts.push(RirInst::CharFoldcase(fb, args[1]));
+                                            value_types.insert(fb, Type::Character);
+                                            let lt = alloc();
+                                            insts.push(RirInst::Lt(lt, fa, fb));
+                                            value_types.insert(lt, Type::Boolean);
+                                            let zero = alloc();
+                                            insts.push(RirInst::LoadConst(zero, Const::Fixnum(0)));
+                                            value_types.insert(zero, Type::Fixnum);
+                                            insts.push(RirInst::Eq(dst, lt, zero));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // ADR 0012 D-2 (iter JC) — variadic char-ci
+                                        // ordered comparisons. Foldcase each arg
+                                        // once, then pairwise compare + BitAnd
+                                        // chain (mirrors JB for plain char</>).
+                                        ("char-ci=?", n)
+                                        | ("char-ci<?", n)
+                                        | ("char-ci>?", n)
+                                        | ("char-ci<=?", n)
+                                        | ("char-ci>=?", n)
+                                            if n >= 3
+                                                && args.iter().all(|v| {
+                                                    value_types.get(v).copied()
+                                                        == Some(Type::Character)
+                                                }) =>
+                                        {
+                                            let folded: Vec<RirValue> = args
+                                                .iter()
+                                                .map(|v| {
+                                                    let f = alloc();
+                                                    insts.push(RirInst::CharFoldcase(f, *v));
+                                                    value_types.insert(f, Type::Character);
+                                                    f
+                                                })
+                                                .collect();
+                                            let emit_cmp =
                                             |insts: &mut Vec<RirInst>,
                                              value_types: &mut HashMap<RirValue, Type>,
                                              alloc: &mut dyn FnMut() -> RirValue,
@@ -6086,297 +6266,311 @@ pub fn bytecode_to_rir_full(
                                                 }
                                                 d
                                             };
-                                        let first = emit_cmp(
-                                            &mut insts,
-                                            &mut value_types,
-                                            &mut alloc,
-                                            folded[0],
-                                            folded[1],
-                                        );
-                                        let mut acc = first;
-                                        for i in 1..folded.len() - 1 {
-                                            let cmp = emit_cmp(
+                                            let first = emit_cmp(
                                                 &mut insts,
                                                 &mut value_types,
                                                 &mut alloc,
-                                                folded[i],
-                                                folded[i + 1],
+                                                folded[0],
+                                                folded[1],
                                             );
-                                            let new_acc = alloc();
-                                            insts.push(RirInst::BitAnd(new_acc, acc, cmp));
-                                            value_types.insert(new_acc, Type::Boolean);
-                                            acc = new_acc;
+                                            let mut acc = first;
+                                            for i in 1..folded.len() - 1 {
+                                                let cmp = emit_cmp(
+                                                    &mut insts,
+                                                    &mut value_types,
+                                                    &mut alloc,
+                                                    folded[i],
+                                                    folded[i + 1],
+                                                );
+                                                let new_acc = alloc();
+                                                insts.push(RirInst::BitAnd(new_acc, acc, cmp));
+                                                value_types.insert(new_acc, Type::Boolean);
+                                                acc = new_acc;
+                                            }
+                                            insts.push(RirInst::Move(dst, acc));
+                                            value_types.insert(dst, Type::Boolean);
                                         }
-                                        insts.push(RirInst::Move(dst, acc));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // Always-false predicates: JIT bodies
-                                    // are only entered when every arg is
-                                    // a Fixnum (the type guard's
-                                    // contract), so any predicate that
-                                    // discriminates "is this a non-numeric
-                                    // type?" reduces to Const(0).
-                                    // `vector?` removed from the alternation:
-                                    // the unconditional `("vector?", 1) => ...`
-                                    // arm above matches first, making the
-                                    // entry here dead (rustc unreachable_
-                                    // patterns lint). Other predicates here
-                                    // are still reachable — their earlier
-                                    // arms have `if arg0 == Type::Any`
-                                    // guards, so non-Any operands fall
-                                    // through to this always-false fallback.
-                                    ("pair?", 1)
-                                    | ("null?", 1)
-                                    | ("symbol?", 1)
-                                    | ("string?", 1)
-                                    | ("bytevector?", 1)
-                                    | ("procedure?", 1)
-                                    | ("port?", 1)
-                                    | ("eof-object?", 1) => {
-                                        let _ = args[0];
-                                        insts.push(RirInst::LoadConst(dst, Const::Boolean(false)));
-                                    }
-                                    // Phase 5b iter7 — variadic / for
-                                    // any operand types. When all
-                                    // operands are statically Flonum,
-                                    // emit FlonumDiv (with FixToFlo
-                                    // promotion for any Fixnum stragglers
-                                    // — Flonum contagion). Otherwise
-                                    // emit Inst::Div, which lowers to a
-                                    // direct call to `vm_value_div_nb`
-                                    // (no inline fast path because
-                                    // Fixnum/Fixnum can return a
-                                    // Rational per R6RS exact division).
-                                    //
-                                    // The iter5 MakeClosure-presence
-                                    // gate no longer applies: with Inst::
-                                    // Div handling the slow case via a
-                                    // helper, col-loop-style bodies don't
-                                    // need to bail out — they get the
-                                    // helper call which is identical to
-                                    // what they'd do through vm_call_general.
-                                    ("/", n) if n >= 2 => {
-                                        let any_flonum = args.iter().any(|v| {
-                                            value_types.get(v).copied() == Some(Type::Flonum)
-                                        });
-                                        // Apply iter5's MakeClosure
-                                        // gate ONLY to the FlonumDiv
-                                        // path — that path would lift
-                                        // bodies that recursively call
-                                        // themselves through let* into
-                                        // uniform-NB and burn host
-                                        // stack (mandelbrot's col-loop).
-                                        // The Inst::Div path (helper
-                                        // call) doesn't have the
-                                        // stack-burn risk.
-                                        if any_flonum && body_has_makeclosure {
-                                            return Err(TranslateError::Unsupported(format!(
+                                        // Always-false predicates: JIT bodies
+                                        // are only entered when every arg is
+                                        // a Fixnum (the type guard's
+                                        // contract), so any predicate that
+                                        // discriminates "is this a non-numeric
+                                        // type?" reduces to Const(0).
+                                        // `vector?` removed from the alternation:
+                                        // the unconditional `("vector?", 1) => ...`
+                                        // arm above matches first, making the
+                                        // entry here dead (rustc unreachable_
+                                        // patterns lint). Other predicates here
+                                        // are still reachable — their earlier
+                                        // arms have `if arg0 == Type::Any`
+                                        // guards, so non-Any operands fall
+                                        // through to this always-false fallback.
+                                        ("pair?", 1)
+                                        | ("null?", 1)
+                                        | ("symbol?", 1)
+                                        | ("string?", 1)
+                                        | ("bytevector?", 1)
+                                        | ("procedure?", 1)
+                                        | ("port?", 1)
+                                        | ("eof-object?", 1) => {
+                                            let _ = args[0];
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Boolean(false),
+                                            ));
+                                        }
+                                        // Phase 5b iter7 — variadic / for
+                                        // any operand types. When all
+                                        // operands are statically Flonum,
+                                        // emit FlonumDiv (with FixToFlo
+                                        // promotion for any Fixnum stragglers
+                                        // — Flonum contagion). Otherwise
+                                        // emit Inst::Div, which lowers to a
+                                        // direct call to `vm_value_div_nb`
+                                        // (no inline fast path because
+                                        // Fixnum/Fixnum can return a
+                                        // Rational per R6RS exact division).
+                                        //
+                                        // The iter5 MakeClosure-presence
+                                        // gate no longer applies: with Inst::
+                                        // Div handling the slow case via a
+                                        // helper, col-loop-style bodies don't
+                                        // need to bail out — they get the
+                                        // helper call which is identical to
+                                        // what they'd do through vm_call_general.
+                                        ("/", n) if n >= 2 => {
+                                            let any_flonum = args.iter().any(|v| {
+                                                value_types.get(v).copied() == Some(Type::Flonum)
+                                            });
+                                            // Apply iter5's MakeClosure
+                                            // gate ONLY to the FlonumDiv
+                                            // path — that path would lift
+                                            // bodies that recursively call
+                                            // themselves through let* into
+                                            // uniform-NB and burn host
+                                            // stack (mandelbrot's col-loop).
+                                            // The Inst::Div path (helper
+                                            // call) doesn't have the
+                                            // stack-burn risk.
+                                            if any_flonum && body_has_makeclosure {
+                                                return Err(TranslateError::Unsupported(format!(
                                                 "Call to builtin `/` (arity {}, Flonum) in body with MakeClosure",
                                                 args.len()
                                             )));
-                                        }
-                                        if any_flonum {
-                                            // Promote Fixnum operands to
-                                            // Flonum, then chain FlonumDiv.
-                                            let promoted: Vec<RirValue> = args
-                                                .iter()
-                                                .map(|v| {
-                                                    let t = value_types
-                                                        .get(v)
-                                                        .copied()
-                                                        .unwrap_or(Type::Fixnum);
-                                                    if t == Type::Flonum {
-                                                        *v
-                                                    } else {
-                                                        let p = alloc();
-                                                        insts.push(RirInst::FixToFlo(p, *v));
-                                                        value_types.insert(p, Type::Flonum);
-                                                        p
-                                                    }
-                                                })
-                                                .collect();
-                                            let mut acc = promoted[0];
-                                            for &x in &promoted[1..promoted.len() - 1] {
-                                                let next = alloc();
-                                                insts.push(RirInst::FlonumDiv(next, acc, x));
-                                                value_types.insert(next, Type::Flonum);
-                                                acc = next;
                                             }
-                                            insts.push(RirInst::FlonumDiv(
-                                                dst,
-                                                acc,
-                                                *promoted.last().unwrap(),
-                                            ));
-                                            value_types.insert(dst, Type::Flonum);
-                                        } else {
-                                            // Fixnum (or Any) operand chain.
-                                            // Use Inst::Div which calls
-                                            // `vm_value_div_nb` — returns
-                                            // Fixnum / Rational / Bigint /
-                                            // Flonum depending on values.
-                                            // Result type is Any since we
-                                            // can't predict.
-                                            let mut acc = args[0];
-                                            for &x in &args[1..args.len() - 1] {
-                                                let next = alloc();
-                                                insts.push(RirInst::Div(next, acc, x));
-                                                value_types.insert(next, Type::Any);
-                                                acc = next;
+                                            if any_flonum {
+                                                // Promote Fixnum operands to
+                                                // Flonum, then chain FlonumDiv.
+                                                let promoted: Vec<RirValue> = args
+                                                    .iter()
+                                                    .map(|v| {
+                                                        let t = value_types
+                                                            .get(v)
+                                                            .copied()
+                                                            .unwrap_or(Type::Fixnum);
+                                                        if t == Type::Flonum {
+                                                            *v
+                                                        } else {
+                                                            let p = alloc();
+                                                            insts.push(RirInst::FixToFlo(p, *v));
+                                                            value_types.insert(p, Type::Flonum);
+                                                            p
+                                                        }
+                                                    })
+                                                    .collect();
+                                                let mut acc = promoted[0];
+                                                for &x in &promoted[1..promoted.len() - 1] {
+                                                    let next = alloc();
+                                                    insts.push(RirInst::FlonumDiv(next, acc, x));
+                                                    value_types.insert(next, Type::Flonum);
+                                                    acc = next;
+                                                }
+                                                insts.push(RirInst::FlonumDiv(
+                                                    dst,
+                                                    acc,
+                                                    *promoted.last().unwrap(),
+                                                ));
+                                                value_types.insert(dst, Type::Flonum);
+                                            } else {
+                                                // Fixnum (or Any) operand chain.
+                                                // Use Inst::Div which calls
+                                                // `vm_value_div_nb` — returns
+                                                // Fixnum / Rational / Bigint /
+                                                // Flonum depending on values.
+                                                // Result type is Any since we
+                                                // can't predict.
+                                                let mut acc = args[0];
+                                                for &x in &args[1..args.len() - 1] {
+                                                    let next = alloc();
+                                                    insts.push(RirInst::Div(next, acc, x));
+                                                    value_types.insert(next, Type::Any);
+                                                    acc = next;
+                                                }
+                                                insts.push(RirInst::Div(
+                                                    dst,
+                                                    acc,
+                                                    *args.last().unwrap(),
+                                                ));
+                                                value_types.insert(dst, Type::Any);
                                             }
-                                            insts.push(RirInst::Div(
-                                                dst,
-                                                acc,
-                                                *args.last().unwrap(),
-                                            ));
-                                            value_types.insert(dst, Type::Any);
                                         }
-                                    }
-                                    // Variadic +/-/*. The bytecode VM
-                                    // compiler only specializes 2-arg
-                                    // forms to *Fx2, so anything else
-                                    // (0, 1, or 3+ args) reaches us as a
-                                    // BuiltinRef + Call N. We chain the
-                                    // matching binary RIR op, dispatching
-                                    // to the Flonum* variants when every
-                                    // operand is statically Flonum-typed.
-                                    ("+", _) | ("-", _) | ("*", _) => {
-                                        // Mixed-tower contagion: any
-                                        // Flonum operand promotes the
-                                        // whole chain to Flonum (R6RS
-                                        // numeric tower). Promote each
-                                        // Fixnum operand via FixToFlo.
-                                        let any_flonum = args.iter().any(|v| {
-                                            value_types.get(v).copied() == Some(Type::Flonum)
-                                        });
-                                        let result_t = if any_flonum {
-                                            Type::Flonum
-                                        } else {
-                                            Type::Fixnum
-                                        };
-                                        let fx_ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
-                                            match name {
+                                        // Variadic +/-/*. The bytecode VM
+                                        // compiler only specializes 2-arg
+                                        // forms to *Fx2, so anything else
+                                        // (0, 1, or 3+ args) reaches us as a
+                                        // BuiltinRef + Call N. We chain the
+                                        // matching binary RIR op, dispatching
+                                        // to the Flonum* variants when every
+                                        // operand is statically Flonum-typed.
+                                        ("+", _) | ("-", _) | ("*", _) => {
+                                            // Mixed-tower contagion: any
+                                            // Flonum operand promotes the
+                                            // whole chain to Flonum (R6RS
+                                            // numeric tower). Promote each
+                                            // Fixnum operand via FixToFlo.
+                                            let any_flonum = args.iter().any(|v| {
+                                                value_types.get(v).copied() == Some(Type::Flonum)
+                                            });
+                                            let result_t = if any_flonum {
+                                                Type::Flonum
+                                            } else {
+                                                Type::Fixnum
+                                            };
+                                            let fx_ctor: fn(
+                                                RirValue,
+                                                RirValue,
+                                                RirValue,
+                                            )
+                                                -> RirInst = match name {
                                                 "+" => RirInst::Add,
                                                 "-" => RirInst::Sub,
                                                 "*" => RirInst::Mul,
                                                 _ => unreachable!(),
                                             };
-                                        let fl_ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
-                                            match name {
+                                            let fl_ctor: fn(
+                                                RirValue,
+                                                RirValue,
+                                                RirValue,
+                                            )
+                                                -> RirInst = match name {
                                                 "+" => RirInst::FlonumAdd,
                                                 "-" => RirInst::FlonumSub,
                                                 "*" => RirInst::FlonumMul,
                                                 _ => unreachable!(),
                                             };
-                                        let ctor = if any_flonum { fl_ctor } else { fx_ctor };
-                                        // Promote any Fixnum operands to
-                                        // Flonum when the chain is
-                                        // any-flonum. Stays Fixnum if all
-                                        // operands are Fixnum.
-                                        let promoted_args: Vec<RirValue> = if any_flonum {
-                                            args.iter()
-                                                .map(|v| {
-                                                    let t = value_types
-                                                        .get(v)
-                                                        .copied()
-                                                        .unwrap_or(Type::Fixnum);
-                                                    if t == Type::Flonum {
-                                                        *v
-                                                    } else {
-                                                        let p = alloc();
-                                                        insts.push(RirInst::FixToFlo(p, *v));
-                                                        value_types.insert(p, Type::Flonum);
-                                                        p
+                                            let ctor = if any_flonum { fl_ctor } else { fx_ctor };
+                                            // Promote any Fixnum operands to
+                                            // Flonum when the chain is
+                                            // any-flonum. Stays Fixnum if all
+                                            // operands are Fixnum.
+                                            let promoted_args: Vec<RirValue> = if any_flonum {
+                                                args.iter()
+                                                    .map(|v| {
+                                                        let t = value_types
+                                                            .get(v)
+                                                            .copied()
+                                                            .unwrap_or(Type::Fixnum);
+                                                        if t == Type::Flonum {
+                                                            *v
+                                                        } else {
+                                                            let p = alloc();
+                                                            insts.push(RirInst::FixToFlo(p, *v));
+                                                            value_types.insert(p, Type::Flonum);
+                                                            p
+                                                        }
+                                                    })
+                                                    .collect()
+                                            } else {
+                                                args.clone()
+                                            };
+                                            if promoted_args.is_empty() {
+                                                // (+) = 0; (*) = 1; (-) is
+                                                // an arity error in walker — bail.
+                                                match name {
+                                                    "+" => insts.push(RirInst::LoadConst(
+                                                        dst,
+                                                        Const::Fixnum(0),
+                                                    )),
+                                                    "*" => insts.push(RirInst::LoadConst(
+                                                        dst,
+                                                        Const::Fixnum(1),
+                                                    )),
+                                                    _ => {
+                                                        return Err(TranslateError::Unsupported(
+                                                            format!("0-arg `{}` is an error", name),
+                                                        ))
                                                     }
-                                                })
-                                                .collect()
-                                        } else {
-                                            args.clone()
-                                        };
-                                        if promoted_args.is_empty() {
-                                            // (+) = 0; (*) = 1; (-) is
-                                            // an arity error in walker — bail.
-                                            match name {
-                                                "+" => insts.push(RirInst::LoadConst(
-                                                    dst,
-                                                    Const::Fixnum(0),
-                                                )),
-                                                "*" => insts.push(RirInst::LoadConst(
-                                                    dst,
-                                                    Const::Fixnum(1),
-                                                )),
-                                                _ => {
-                                                    return Err(TranslateError::Unsupported(
-                                                        format!("0-arg `{}` is an error", name),
-                                                    ))
                                                 }
-                                            }
-                                            value_types.insert(dst, Type::Fixnum);
-                                        } else if promoted_args.len() == 1 {
-                                            match name {
-                                                "+" | "*" => {
-                                                    // Identity.
-                                                    insts
-                                                        .push(RirInst::Move(dst, promoted_args[0]));
-                                                    value_types.insert(dst, result_t);
-                                                }
-                                                "-" => {
-                                                    // (- x) = 0 - x. Same
-                                                    // operand-type rules.
-                                                    let zero = alloc();
-                                                    if any_flonum {
-                                                        insts.push(RirInst::LoadConst(
-                                                            zero,
-                                                            Const::Flonum(0.0),
-                                                        ));
-                                                        value_types.insert(zero, Type::Flonum);
-                                                        insts.push(RirInst::FlonumSub(
+                                                value_types.insert(dst, Type::Fixnum);
+                                            } else if promoted_args.len() == 1 {
+                                                match name {
+                                                    "+" | "*" => {
+                                                        // Identity.
+                                                        insts.push(RirInst::Move(
                                                             dst,
-                                                            zero,
                                                             promoted_args[0],
                                                         ));
-                                                    } else {
-                                                        insts.push(RirInst::LoadConst(
-                                                            zero,
-                                                            Const::Fixnum(0),
-                                                        ));
-                                                        value_types.insert(zero, Type::Fixnum);
-                                                        insts.push(RirInst::Sub(
-                                                            dst,
-                                                            zero,
-                                                            promoted_args[0],
-                                                        ));
+                                                        value_types.insert(dst, result_t);
                                                     }
-                                                    value_types.insert(dst, result_t);
+                                                    "-" => {
+                                                        // (- x) = 0 - x. Same
+                                                        // operand-type rules.
+                                                        let zero = alloc();
+                                                        if any_flonum {
+                                                            insts.push(RirInst::LoadConst(
+                                                                zero,
+                                                                Const::Flonum(0.0),
+                                                            ));
+                                                            value_types.insert(zero, Type::Flonum);
+                                                            insts.push(RirInst::FlonumSub(
+                                                                dst,
+                                                                zero,
+                                                                promoted_args[0],
+                                                            ));
+                                                        } else {
+                                                            insts.push(RirInst::LoadConst(
+                                                                zero,
+                                                                Const::Fixnum(0),
+                                                            ));
+                                                            value_types.insert(zero, Type::Fixnum);
+                                                            insts.push(RirInst::Sub(
+                                                                dst,
+                                                                zero,
+                                                                promoted_args[0],
+                                                            ));
+                                                        }
+                                                        value_types.insert(dst, result_t);
+                                                    }
+                                                    _ => unreachable!(),
                                                 }
-                                                _ => unreachable!(),
+                                            } else {
+                                                // 2+: chain.
+                                                let mut acc = promoted_args[0];
+                                                for &x in &promoted_args[1..promoted_args.len() - 1]
+                                                {
+                                                    let next = alloc();
+                                                    insts.push(ctor(next, acc, x));
+                                                    value_types.insert(next, result_t);
+                                                    acc = next;
+                                                }
+                                                insts.push(ctor(
+                                                    dst,
+                                                    acc,
+                                                    *promoted_args.last().unwrap(),
+                                                ));
+                                                value_types.insert(dst, result_t);
                                             }
-                                        } else {
-                                            // 2+: chain.
-                                            let mut acc = promoted_args[0];
-                                            for &x in &promoted_args[1..promoted_args.len() - 1] {
-                                                let next = alloc();
-                                                insts.push(ctor(next, acc, x));
-                                                value_types.insert(next, result_t);
-                                                acc = next;
-                                            }
-                                            insts.push(ctor(
-                                                dst,
-                                                acc,
-                                                *promoted_args.last().unwrap(),
-                                            ));
-                                            value_types.insert(dst, result_t);
                                         }
-                                    }
-                                    // ADR 0012 D-2 (iter DM) — variadic
-                                    // comparisons (3+ args). R6RS pairwise:
-                                    // (< a b c) means a<b AND b<c. Chains
-                                    // pairwise Lt/Eq with BitAnd on the
-                                    // Boolean (0/1) results. Fixnum-only
-                                    // for now; mixed-tower deferred.
-                                    ("<", n) | (">", n) | ("<=", n) | (">=", n) | ("=", n)
-                                        if n >= 3 =>
-                                    {
-                                        let emit_cmp =
+                                        // ADR 0012 D-2 (iter DM) — variadic
+                                        // comparisons (3+ args). R6RS pairwise:
+                                        // (< a b c) means a<b AND b<c. Chains
+                                        // pairwise Lt/Eq with BitAnd on the
+                                        // Boolean (0/1) results. Fixnum-only
+                                        // for now; mixed-tower deferred.
+                                        ("<", n) | (">", n) | ("<=", n) | (">=", n) | ("=", n)
+                                            if n >= 3 =>
+                                        {
+                                            let emit_cmp =
                                             |insts: &mut Vec<RirInst>,
                                              value_types: &mut HashMap<RirValue, Type>,
                                              alloc: &mut dyn FnMut() -> RirValue,
@@ -6417,229 +6611,241 @@ pub fn bytecode_to_rir_full(
                                                 }
                                                 d
                                             };
-                                        let first = emit_cmp(
-                                            &mut insts,
-                                            &mut value_types,
-                                            &mut alloc,
-                                            args[0],
-                                            args[1],
-                                        );
-                                        let mut acc = first;
-                                        for i in 1..args.len() - 1 {
-                                            let cmp = emit_cmp(
+                                            let first = emit_cmp(
                                                 &mut insts,
                                                 &mut value_types,
                                                 &mut alloc,
-                                                args[i],
-                                                args[i + 1],
+                                                args[0],
+                                                args[1],
                                             );
-                                            let new_acc = alloc();
-                                            insts.push(RirInst::BitAnd(new_acc, acc, cmp));
-                                            value_types.insert(new_acc, Type::Boolean);
-                                            acc = new_acc;
-                                        }
-                                        insts.push(RirInst::Move(dst, acc));
-                                        value_types.insert(dst, Type::Boolean);
-                                    }
-                                    // ADR 0012 D-2 (iter DJ) — variadic
-                                    // bitwise ops. Fixnum-only (no Flonum
-                                    // promotion). Identity element for
-                                    // 0-arg: bitwise-and = -1 (all bits set),
-                                    // bitwise-ior/-or = 0, bitwise-xor = 0.
-                                    ("bitwise-and", _)
-                                    | ("bitwise-ior", _)
-                                    | ("bitwise-or", _)
-                                    | ("bitwise-xor", _) => {
-                                        let ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
-                                            match name {
-                                                "bitwise-and" => RirInst::BitAnd,
-                                                "bitwise-ior" | "bitwise-or" => RirInst::BitOr,
-                                                "bitwise-xor" => RirInst::BitXor,
-                                                _ => unreachable!(),
-                                            };
-                                        if args.is_empty() {
-                                            let ident = match name {
-                                                "bitwise-and" => -1i64,
-                                                _ => 0i64,
-                                            };
-                                            insts.push(RirInst::LoadConst(
-                                                dst,
-                                                Const::Fixnum(ident),
-                                            ));
-                                            value_types.insert(dst, Type::Fixnum);
-                                        } else if args.len() == 1 {
-                                            insts.push(RirInst::Move(dst, args[0]));
-                                            value_types.insert(dst, Type::Fixnum);
-                                        } else {
-                                            let mut acc = args[0];
-                                            for v in &args[1..args.len() - 1] {
-                                                let next = alloc();
-                                                insts.push(ctor(next, acc, *v));
-                                                value_types.insert(next, Type::Fixnum);
-                                                acc = next;
+                                            let mut acc = first;
+                                            for i in 1..args.len() - 1 {
+                                                let cmp = emit_cmp(
+                                                    &mut insts,
+                                                    &mut value_types,
+                                                    &mut alloc,
+                                                    args[i],
+                                                    args[i + 1],
+                                                );
+                                                let new_acc = alloc();
+                                                insts.push(RirInst::BitAnd(new_acc, acc, cmp));
+                                                value_types.insert(new_acc, Type::Boolean);
+                                                acc = new_acc;
                                             }
-                                            insts.push(ctor(dst, acc, *args.last().unwrap()));
-                                            value_types.insert(dst, Type::Fixnum);
+                                            insts.push(RirInst::Move(dst, acc));
+                                            value_types.insert(dst, Type::Boolean);
                                         }
-                                    }
-                                    // ADR 0012 D-2 (iter JF) — variadic flmin/flmax
-                                    // for 1+ args. Strict Flonum-typed args.
-                                    // 1-arg case uses self-application (x.max(x))
-                                    // rather than Move so the post-pass tags dst
-                                    // as Flonum via the FlonumMin/FlonumMax arm —
-                                    // Move is type-neutral and would leave dst
-                                    // decoded as Fixnum.
-                                    ("flmin", _) | ("flmax", _)
-                                        if args.len() >= 1
-                                            && args.iter().all(|v| {
+                                        // ADR 0012 D-2 (iter DJ) — variadic
+                                        // bitwise ops. Fixnum-only (no Flonum
+                                        // promotion). Identity element for
+                                        // 0-arg: bitwise-and = -1 (all bits set),
+                                        // bitwise-ior/-or = 0, bitwise-xor = 0.
+                                        ("bitwise-and", _)
+                                        | ("bitwise-ior", _)
+                                        | ("bitwise-or", _)
+                                        | ("bitwise-xor", _) => {
+                                            let ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
+                                                match name {
+                                                    "bitwise-and" => RirInst::BitAnd,
+                                                    "bitwise-ior" | "bitwise-or" => RirInst::BitOr,
+                                                    "bitwise-xor" => RirInst::BitXor,
+                                                    _ => unreachable!(),
+                                                };
+                                            if args.is_empty() {
+                                                let ident = match name {
+                                                    "bitwise-and" => -1i64,
+                                                    _ => 0i64,
+                                                };
+                                                insts.push(RirInst::LoadConst(
+                                                    dst,
+                                                    Const::Fixnum(ident),
+                                                ));
+                                                value_types.insert(dst, Type::Fixnum);
+                                            } else if args.len() == 1 {
+                                                insts.push(RirInst::Move(dst, args[0]));
+                                                value_types.insert(dst, Type::Fixnum);
+                                            } else {
+                                                let mut acc = args[0];
+                                                for v in &args[1..args.len() - 1] {
+                                                    let next = alloc();
+                                                    insts.push(ctor(next, acc, *v));
+                                                    value_types.insert(next, Type::Fixnum);
+                                                    acc = next;
+                                                }
+                                                insts.push(ctor(dst, acc, *args.last().unwrap()));
+                                                value_types.insert(dst, Type::Fixnum);
+                                            }
+                                        }
+                                        // ADR 0012 D-2 (iter JF) — variadic flmin/flmax
+                                        // for 1+ args. Strict Flonum-typed args.
+                                        // 1-arg case uses self-application (x.max(x))
+                                        // rather than Move so the post-pass tags dst
+                                        // as Flonum via the FlonumMin/FlonumMax arm —
+                                        // Move is type-neutral and would leave dst
+                                        // decoded as Fixnum.
+                                        ("flmin", _) | ("flmax", _)
+                                            if args.len() >= 1
+                                                && args.iter().all(|v| {
+                                                    value_types.get(v).copied()
+                                                        == Some(Type::Flonum)
+                                                }) =>
+                                        {
+                                            let ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
+                                                match name {
+                                                    "flmin" => RirInst::FlonumMin,
+                                                    "flmax" => RirInst::FlonumMax,
+                                                    _ => unreachable!(),
+                                                };
+                                            if args.len() == 1 {
+                                                // Self-application: x.min(x) == x and
+                                                // x.max(x) == x for all finite x; NaN
+                                                // semantics match the underlying op.
+                                                insts.push(ctor(dst, args[0], args[0]));
+                                                value_types.insert(dst, Type::Flonum);
+                                            } else {
+                                                let mut acc = args[0];
+                                                for v in &args[1..args.len() - 1] {
+                                                    let next = alloc();
+                                                    insts.push(ctor(next, acc, *v));
+                                                    value_types.insert(next, Type::Flonum);
+                                                    acc = next;
+                                                }
+                                                insts.push(ctor(dst, acc, *args.last().unwrap()));
+                                                value_types.insert(dst, Type::Flonum);
+                                            }
+                                        }
+                                        // ADR 0012 D-2 (iter IY) — variadic fxmin/fxmax.
+                                        // Fixnum-only (Flonum operands cause deopt
+                                        // via the unsupported tail). 1-arg → Move;
+                                        // 3+ args → left-fold over MinFixnum/MaxFixnum.
+                                        ("fxmin", _) | ("fxmax", _)
+                                            if args.len() >= 1
+                                                && args.iter().all(|v| {
+                                                    value_types.get(v).copied()
+                                                        != Some(Type::Flonum)
+                                                }) =>
+                                        {
+                                            let ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
+                                                match name {
+                                                    "fxmin" => RirInst::MinFixnum,
+                                                    "fxmax" => RirInst::MaxFixnum,
+                                                    _ => unreachable!(),
+                                                };
+                                            if args.len() == 1 {
+                                                insts.push(RirInst::Move(dst, args[0]));
+                                                value_types.insert(dst, Type::Fixnum);
+                                            } else {
+                                                let mut acc = args[0];
+                                                for v in &args[1..args.len() - 1] {
+                                                    let next = alloc();
+                                                    insts.push(ctor(next, acc, *v));
+                                                    value_types.insert(next, Type::Fixnum);
+                                                    acc = next;
+                                                }
+                                                insts.push(ctor(dst, acc, *args.last().unwrap()));
+                                                value_types.insert(dst, Type::Fixnum);
+                                            }
+                                        }
+                                        // ADR 0012 D-2 (iter DI) — variadic
+                                        // min/max chain. Pattern mirrors +/-/*
+                                        // above: Flonum-contagion promotion +
+                                        // left-fold via MinFixnum/MaxFixnum or
+                                        // FlonumMin/FlonumMax.
+                                        ("min", _) | ("max", _) if args.len() >= 1 => {
+                                            let any_flonum = args.iter().any(|v| {
                                                 value_types.get(v).copied() == Some(Type::Flonum)
-                                            }) =>
-                                    {
-                                        let ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
-                                            match name {
-                                                "flmin" => RirInst::FlonumMin,
-                                                "flmax" => RirInst::FlonumMax,
-                                                _ => unreachable!(),
+                                            });
+                                            let result_t = if any_flonum {
+                                                Type::Flonum
+                                            } else {
+                                                Type::Fixnum
                                             };
-                                        if args.len() == 1 {
-                                            // Self-application: x.min(x) == x and
-                                            // x.max(x) == x for all finite x; NaN
-                                            // semantics match the underlying op.
-                                            insts.push(ctor(dst, args[0], args[0]));
-                                            value_types.insert(dst, Type::Flonum);
-                                        } else {
-                                            let mut acc = args[0];
-                                            for v in &args[1..args.len() - 1] {
-                                                let next = alloc();
-                                                insts.push(ctor(next, acc, *v));
-                                                value_types.insert(next, Type::Flonum);
-                                                acc = next;
-                                            }
-                                            insts.push(ctor(dst, acc, *args.last().unwrap()));
-                                            value_types.insert(dst, Type::Flonum);
-                                        }
-                                    }
-                                    // ADR 0012 D-2 (iter IY) — variadic fxmin/fxmax.
-                                    // Fixnum-only (Flonum operands cause deopt
-                                    // via the unsupported tail). 1-arg → Move;
-                                    // 3+ args → left-fold over MinFixnum/MaxFixnum.
-                                    ("fxmin", _) | ("fxmax", _)
-                                        if args.len() >= 1
-                                            && args.iter().all(|v| {
-                                                value_types.get(v).copied() != Some(Type::Flonum)
-                                            }) =>
-                                    {
-                                        let ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
-                                            match name {
-                                                "fxmin" => RirInst::MinFixnum,
-                                                "fxmax" => RirInst::MaxFixnum,
-                                                _ => unreachable!(),
-                                            };
-                                        if args.len() == 1 {
-                                            insts.push(RirInst::Move(dst, args[0]));
-                                            value_types.insert(dst, Type::Fixnum);
-                                        } else {
-                                            let mut acc = args[0];
-                                            for v in &args[1..args.len() - 1] {
-                                                let next = alloc();
-                                                insts.push(ctor(next, acc, *v));
-                                                value_types.insert(next, Type::Fixnum);
-                                                acc = next;
-                                            }
-                                            insts.push(ctor(dst, acc, *args.last().unwrap()));
-                                            value_types.insert(dst, Type::Fixnum);
-                                        }
-                                    }
-                                    // ADR 0012 D-2 (iter DI) — variadic
-                                    // min/max chain. Pattern mirrors +/-/*
-                                    // above: Flonum-contagion promotion +
-                                    // left-fold via MinFixnum/MaxFixnum or
-                                    // FlonumMin/FlonumMax.
-                                    ("min", _) | ("max", _) if args.len() >= 1 => {
-                                        let any_flonum = args.iter().any(|v| {
-                                            value_types.get(v).copied() == Some(Type::Flonum)
-                                        });
-                                        let result_t = if any_flonum {
-                                            Type::Flonum
-                                        } else {
-                                            Type::Fixnum
-                                        };
-                                        let fx_ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
-                                            match name {
+                                            let fx_ctor: fn(
+                                                RirValue,
+                                                RirValue,
+                                                RirValue,
+                                            )
+                                                -> RirInst = match name {
                                                 "min" => RirInst::MinFixnum,
                                                 "max" => RirInst::MaxFixnum,
                                                 _ => unreachable!(),
                                             };
-                                        let fl_ctor: fn(RirValue, RirValue, RirValue) -> RirInst =
-                                            match name {
+                                            let fl_ctor: fn(
+                                                RirValue,
+                                                RirValue,
+                                                RirValue,
+                                            )
+                                                -> RirInst = match name {
                                                 "min" => RirInst::FlonumMin,
                                                 "max" => RirInst::FlonumMax,
                                                 _ => unreachable!(),
                                             };
-                                        let ctor = if any_flonum { fl_ctor } else { fx_ctor };
-                                        let promoted_args: Vec<RirValue> = if any_flonum {
-                                            args.iter()
-                                                .map(|v| {
-                                                    let t = value_types
-                                                        .get(v)
-                                                        .copied()
-                                                        .unwrap_or(Type::Fixnum);
-                                                    if t == Type::Flonum {
-                                                        *v
-                                                    } else {
-                                                        let p = alloc();
-                                                        insts.push(RirInst::FixToFlo(p, *v));
-                                                        value_types.insert(p, Type::Flonum);
-                                                        p
-                                                    }
-                                                })
-                                                .collect()
-                                        } else {
-                                            args.clone()
-                                        };
-                                        if promoted_args.len() == 1 {
-                                            // Single arg → return as-is.
-                                            insts.push(RirInst::Move(dst, promoted_args[0]));
-                                            value_types.insert(dst, result_t);
-                                        } else {
-                                            // Left-fold: acc = ctor(acc, next).
-                                            let mut acc = promoted_args[0];
-                                            for v in &promoted_args[1..promoted_args.len() - 1] {
-                                                let next = alloc();
-                                                insts.push(ctor(next, acc, *v));
-                                                value_types.insert(next, result_t);
-                                                acc = next;
+                                            let ctor = if any_flonum { fl_ctor } else { fx_ctor };
+                                            let promoted_args: Vec<RirValue> = if any_flonum {
+                                                args.iter()
+                                                    .map(|v| {
+                                                        let t = value_types
+                                                            .get(v)
+                                                            .copied()
+                                                            .unwrap_or(Type::Fixnum);
+                                                        if t == Type::Flonum {
+                                                            *v
+                                                        } else {
+                                                            let p = alloc();
+                                                            insts.push(RirInst::FixToFlo(p, *v));
+                                                            value_types.insert(p, Type::Flonum);
+                                                            p
+                                                        }
+                                                    })
+                                                    .collect()
+                                            } else {
+                                                args.clone()
+                                            };
+                                            if promoted_args.len() == 1 {
+                                                // Single arg → return as-is.
+                                                insts.push(RirInst::Move(dst, promoted_args[0]));
+                                                value_types.insert(dst, result_t);
+                                            } else {
+                                                // Left-fold: acc = ctor(acc, next).
+                                                let mut acc = promoted_args[0];
+                                                for v in &promoted_args[1..promoted_args.len() - 1]
+                                                {
+                                                    let next = alloc();
+                                                    insts.push(ctor(next, acc, *v));
+                                                    value_types.insert(next, result_t);
+                                                    acc = next;
+                                                }
+                                                insts.push(ctor(
+                                                    dst,
+                                                    acc,
+                                                    *promoted_args.last().unwrap(),
+                                                ));
+                                                value_types.insert(dst, result_t);
                                             }
-                                            insts.push(ctor(
+                                        }
+                                        _ => {
+                                            // No dedicated open-coding for this
+                                            // builtin — emit a generic by-name
+                                            // call. The AOT backend lowers it to
+                                            // cs_runtime::aot_call_builtin; the
+                                            // cranelift JIT's support gate
+                                            // declines any function carrying it
+                                            // (it has no runtime-env dispatch),
+                                            // so on the JIT path the function
+                                            // simply stays on the VM tier — the
+                                            // same outcome as the previous
+                                            // "not yet lowered" translate error.
+                                            insts.push(RirInst::CallBuiltin(
                                                 dst,
-                                                acc,
-                                                *promoted_args.last().unwrap(),
+                                                name.to_string(),
+                                                args.clone(),
                                             ));
-                                            value_types.insert(dst, result_t);
+                                            value_types.insert(dst, Type::Any);
                                         }
                                     }
-                                    _ => {
-                                        // No dedicated open-coding for this
-                                        // builtin — emit a generic by-name
-                                        // call. The AOT backend lowers it to
-                                        // cs_runtime::aot_call_builtin; the
-                                        // cranelift JIT's support gate
-                                        // declines any function carrying it
-                                        // (it has no runtime-env dispatch),
-                                        // so on the JIT path the function
-                                        // simply stays on the VM tier — the
-                                        // same outcome as the previous
-                                        // "not yet lowered" translate error.
-                                        insts.push(RirInst::CallBuiltin(
-                                            dst,
-                                            name.to_string(),
-                                            args.clone(),
-                                        ));
-                                        value_types.insert(dst, Type::Any);
-                                    }
+                                    sim_stack.push(StackEntry::Value(dst));
                                 }
-                                sim_stack.push(StackEntry::Value(dst));
-                            }
+                            } // end AOT-mode `else` (JIT dedicated lowering)
                         }
                         StackEntry::Value(callee_v) => {
                             // Phase 6 Stage A iter 2 — leaf-callee
