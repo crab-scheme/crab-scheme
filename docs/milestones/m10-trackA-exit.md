@@ -5,6 +5,55 @@
 > Parent: M10 plan (`docs/milestones/m10-plan.md`).
 > Predecessor: Track W (`m10-wasm-complete`).
 
+---
+
+## ⚠️ Status update — 2026-05-21 (AOT-ready assessment)
+
+The "What's deferred to post-1.0" list below is **out of date**. Much of
+it shipped in the RC2/RC3 iterations after this report was written. Verified
+against current code on `feat/aot-ready`:
+
+**Now working end-to-end** (`crabscheme aot <file> --multi --build` →
+native binary that builds and runs):
+
+- **CLI integration** — `crabscheme aot`, with `--multi` (whole-program),
+  `--build`, `--entry`, `--emit-rir`, `--emit-rust-source`, `--explain`,
+  `--verify`, `--target`. (`run_aot` single-define + `run_aot_multi`.)
+- **bytecode → RIR glue** — `cs_vm::jit_translate::bytecode_to_rir_aot*`;
+  the pipeline starts from real Scheme source, not hand-built RIR.
+- **Closures** (`MakeClosure` + capture lowering), **non-self `Call` /
+  `CallGeneral`**, **flonum arith**, **vectors**, **cons/car/cdr/list**,
+  and (this branch) **string constants** (`Const::String`).
+
+**Verified capability:** primop numeric kernels (fib/fact/tak), and via
+`--multi`, programs using cons/list/closures/flonum/vectors compile to
+standalone binaries linking only `cs-vm`.
+
+**The real remaining gap to "compiles arbitrary programs":** general
+stdlib builtins **without a dedicated RIR inst** still error
+`Call to builtin \`<name>\` not yet lowered` (e.g. `string-length`,
+`string-append`, `display`, `newline`, most of the stdlib). Two ways
+forward, a genuine architectural fork:
+
+1. **Per-builtin dedicated insts** (bounded, repetitive) — add a RIR inst
+   + cs-aot lowering + a self-contained `cs-vm` helper per builtin (the
+   pattern `cons`→`vm_alloc_pair_gc`, and now `Const::String`→
+   `vm_string_const_nb` follow). Good for a high-value handful
+   (display/newline/string ops) to unlock hello-world-class I/O programs.
+2. **Generic runtime dispatch** (scalable, larger) — add `cs-runtime` as
+   an emitted-project dependency, initialize the full builtin env once at
+   `main` startup, and lower any unmatched builtin call to a
+   "resolve-by-symbol + apply" runtime helper. Unlocks the *entire*
+   stdlib at once, at the cost of a heavier binary (the numeric-kernel
+   RawI64 mode stays lean).
+
+**Landed on `feat/aot-ready` toward this:** `Const::String` support
+through cs-rir / cs-vm (`vm_string_const_nb`) / cs-aot, with the cranelift
+JIT gated to decline string consts (stays on VM tier; `jit_conformance`
+8/8). Also un-broke `.gitignore` (`*-aot/` was shadowing the `crates/
+cs-aot/` source dir). String *programs* additionally need option (1) or
+(2) for `display`/`string-*`.
+
 ## Decision
 
 **Close Track A complete at a narrower scope than the original plan.**
