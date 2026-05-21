@@ -3317,6 +3317,21 @@ fn fnv1a_hash_jit(bytes: &[u8]) -> i64 {
     (h as i64).wrapping_abs()
 }
 
+/// #50 — encode a raw i64 fixnum value as an NB carrier, promoting to a
+/// bignum `Gc<Value>` when it exceeds the 47-bit NB Fixnum range
+/// (`NanboxValue::fixnum` already does this). The uniform-NB JIT calls
+/// this for builtins (hashes) whose raw i64 result can exceed 47 bits,
+/// where the inline `box_raw_fixnum` (47-bit truncation) would corrupt
+/// the value.
+///
+/// # Safety
+///
+/// Pure value conversion; no pointers involved.
+#[no_mangle]
+pub unsafe extern "C" fn vm_fixnum_to_nb(n: i64) -> i64 {
+    NanboxValue::fixnum(n).into_raw()
+}
+
 /// `(string-hash s)` — FNV-1a of UTF-8 bytes, as Fixnum. ADR 0012
 /// D-2 (iter GB).
 ///

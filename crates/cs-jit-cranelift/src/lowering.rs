@@ -423,6 +423,9 @@ pub struct Lowerer {
     string_titlecase_func: cranelift_module::FuncId,
     /// FuncId of `vm_string_hash_gc(s) -> i64`. ADR 0012 D-2 (iter GB).
     string_hash_func: cranelift_module::FuncId,
+    /// `vm_fixnum_to_nb(n) -> i64` — encode a raw i64 as NB (bignum if
+    /// >47-bit). Used by the uniform-NB hash builtins (#50).
+    fixnum_to_nb_func: cranelift_module::FuncId,
     /// FuncId of `vm_symbol_hash_gc(s) -> i64`. ADR 0012 D-2 (iter GB).
     symbol_hash_func: cranelift_module::FuncId,
     /// FuncId of `vm_input_port_p_gc(v) -> i64` (0/1). ADR 0012 D-2 (iter GC).
@@ -1187,6 +1190,7 @@ impl Lowerer {
             "vm_symbol_hash_gc",
             cs_vm::vm::vm_symbol_hash_gc as *const u8,
         );
+        builder.symbol("vm_fixnum_to_nb", cs_vm::vm::vm_fixnum_to_nb as *const u8);
         // ADR 0012 D-2 (iter GC) — port-subtype predicates.
         builder.symbol(
             "vm_input_port_p_gc",
@@ -2991,6 +2995,13 @@ impl Lowerer {
                 &pair_accessor_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_symbol_hash_gc: {e}")))?;
+        let fixnum_to_nb_func = module
+            .declare_function(
+                "vm_fixnum_to_nb",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_fixnum_to_nb: {e}")))?;
 
         // ADR 0012 D-2 (iter GC) — port-subtype predicates.
         let input_port_p_func = module
@@ -4691,6 +4702,7 @@ impl Lowerer {
             string_titlecase_func,
             string_hash_func,
             symbol_hash_func,
+            fixnum_to_nb_func,
             input_port_p_func,
             output_port_p_func,
             binary_port_p_func,
@@ -5319,7 +5331,10 @@ impl Lowerer {
                     | Inst::BvBuild(_, _)
                     | Inst::BvAppend(_, _)
                     | Inst::SymbolToString(_, _)
-                    | Inst::StringToSymbol(_, _) => {
+                    | Inst::StringToSymbol(_, _)
+                    | Inst::StringHash(_, _)
+                    | Inst::SymbolHash(_, _)
+                    | Inst::EqualHash(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -6161,6 +6176,18 @@ impl Lowerer {
                 symbol_to_string: self
                     .module
                     .declare_func_in_func(self.symbol_to_string_func, builder.func),
+                string_hash: self
+                    .module
+                    .declare_func_in_func(self.string_hash_func, builder.func),
+                symbol_hash: self
+                    .module
+                    .declare_func_in_func(self.symbol_hash_func, builder.func),
+                equal_hash: self
+                    .module
+                    .declare_func_in_func(self.equal_hash_func, builder.func),
+                fixnum_to_nb: self
+                    .module
+                    .declare_func_in_func(self.fixnum_to_nb_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -8362,6 +8389,12 @@ struct NbHelpers {
     // uniform-NB decodes/encodes the NB Symbol's id payload.
     string_to_symbol: cranelift_codegen::ir::FuncRef,
     symbol_to_string: cranelift_codegen::ir::FuncRef,
+    // #50 — hash builtins. Helpers return a full-range i64 hash; encode
+    // via `fixnum_to_nb` (bignum if >47-bit) rather than truncating.
+    string_hash: cranelift_codegen::ir::FuncRef,
+    symbol_hash: cranelift_codegen::ir::FuncRef,
+    equal_hash: cranelift_codegen::ir::FuncRef,
+    fixnum_to_nb: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -10296,6 +10329,30 @@ fn lower_inst_uniform_nb(
                     | ((cs_vm::vm::NB_TAG_SYMBOL as u64) << 47))
                     as i64;
                 let r = b.ins().bor_imm(payload, sym_tag_bits);
+                map.insert(dst, r);
+            }
+            // #50 — hash builtins. The helper returns a full-range i64
+            // hash; encode via vm_fixnum_to_nb (bignum if >47-bit) rather
+            // than the 47-bit-truncating box_raw_fixnum.
+            &Inst::StringHash(dst, s) => {
+                let call = b.ins().call(helpers.string_hash, &[lookup(map, s)?]);
+                let raw = b.inst_results(call)[0];
+                let enc = b.ins().call(helpers.fixnum_to_nb, &[raw]);
+                let r = b.inst_results(enc)[0];
+                map.insert(dst, r);
+            }
+            &Inst::SymbolHash(dst, s) => {
+                let call = b.ins().call(helpers.symbol_hash, &[lookup(map, s)?]);
+                let raw = b.inst_results(call)[0];
+                let enc = b.ins().call(helpers.fixnum_to_nb, &[raw]);
+                let r = b.inst_results(enc)[0];
+                map.insert(dst, r);
+            }
+            &Inst::EqualHash(dst, x) => {
+                let call = b.ins().call(helpers.equal_hash, &[lookup(map, x)?]);
+                let raw = b.inst_results(call)[0];
+                let enc = b.ins().call(helpers.fixnum_to_nb, &[raw]);
+                let r = b.inst_results(enc)[0];
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
