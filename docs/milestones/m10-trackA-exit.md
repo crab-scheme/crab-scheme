@@ -29,30 +29,38 @@ native binary that builds and runs):
 `--multi`, programs using cons/list/closures/flonum/vectors compile to
 standalone binaries linking only `cs-vm`.
 
-**The real remaining gap to "compiles arbitrary programs":** general
-stdlib builtins **without a dedicated RIR inst** still error
-`Call to builtin \`<name>\` not yet lowered` (e.g. `string-length`,
-`string-append`, `display`, `newline`, most of the stdlib). Two ways
-forward, a genuine architectural fork:
+**Generic builtin dispatch — DONE (`feat/aot-ready`, 2026-05-21).** AOT
+now compiles programs that use **arbitrary stdlib builtins** — strings,
+lists, I/O, the lot — to native binaries. Demonstrated via
+`crabscheme aot --multi --build`:
 
-1. **Per-builtin dedicated insts** (bounded, repetitive) — add a RIR inst
-   + cs-aot lowering + a self-contained `cs-vm` helper per builtin (the
-   pattern `cons`→`vm_alloc_pair_gc`, and now `Const::String`→
-   `vm_string_const_nb` follow). Good for a high-value handful
-   (display/newline/string ops) to unlock hello-world-class I/O programs.
-2. **Generic runtime dispatch** (scalable, larger) — add `cs-runtime` as
-   an emitted-project dependency, initialize the full builtin env once at
-   `main` startup, and lower any unmatched builtin call to a
-   "resolve-by-symbol + apply" runtime helper. Unlocks the *entire*
-   stdlib at once, at the cost of a heavier binary (the numeric-kernel
-   RawI64 mode stays lean).
+```
+(string-append "hi " (number->string n))   ->  "hi 7"
+(reverse (list 1 2 n))                      ->  (9 2 1)
+(display "hello world") (newline) n         ->  prints, returns n
+```
 
-**Landed on `feat/aot-ready` toward this:** `Const::String` support
-through cs-rir / cs-vm (`vm_string_const_nb`) / cs-aot, with the cranelift
-JIT gated to decline string consts (stays on VM tier; `jit_conformance`
-8/8). Also un-broke `.gitignore` (`*-aot/` was shadowing the `crates/
-cs-aot/` source dir). String *programs* additionally need option (1) or
-(2) for `display`/`string-*`.
+How it works (the "generic runtime dispatch" path):
+
+- **`Const::String`** — inline string literals through cs-rir / cs-vm
+  (`vm_string_const_nb`) / cs-aot; cranelift JIT gated to decline them
+  (stays on VM tier; `jit_conformance` 8/8).
+- **`Inst::CallBuiltin(name, args)`** — in AOT mode (a scoped `AOT_MODE`
+  thread-local in the translator) **every** builtin lowers to this
+  generic by-name call instead of the JIT-only dedicated insts
+  (StrAppend, NumberToString, … ~200 variants with no AOT lowering). The
+  JIT path is untouched (keeps its fast dedicated lowerings).
+- **`cs_runtime::aot_call_builtin(name, args)`** — the emitted binary now
+  links **cs-runtime** and dispatches builtins by name through a real
+  builtin env (walker `top` + `apply_procedure`) embedded in the binary.
+  `aot_format_result` formats non-numeric return values for the shim.
+
+Cost / caveats: builtin-heavy AOT code runs at *walker* speed (numeric
+kernels stay on the inline-NB fast paths and never dispatch); the binary
+links cs-runtime (heavier than the lean numeric-kernel mode). **Use
+`--multi`** — the single-define default still treats free-var builtins as
+captures (its compile step folds fewer builtins), a follow-up. Also
+un-broke `.gitignore` (`*-aot/` was shadowing `crates/cs-aot/`).
 
 ## Decision
 
