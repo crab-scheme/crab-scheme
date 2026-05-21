@@ -1,8 +1,9 @@
 # LSP Server Plan — Post-1.0-rc3
 
-> Status: **Phase 1 COMPLETE (2026-05-21)** — `cs-lsp` crate +
-> `crabscheme-lsp` binary ship live parse+expand diagnostics; exit gate
-> proven end-to-end. Phases 2–6 open. Predecessor: 1.0-rc3
+> Status: **Phases 1–2 COMPLETE (2026-05-21)** — `cs-lsp` crate +
+> `crabscheme-lsp` binary ship live parse+expand diagnostics (P1) and
+> document symbols + hover (P2); exit gates proven end-to-end. Phases
+> 3–6 open. Predecessor: 1.0-rc3
 > (`aot-hardening` complete; all 8 microbenches AOT correctly).
 > Estimated duration: 3-5 weeks across six phases.
 > Spec slug: `lsp-server`.
@@ -15,6 +16,14 @@
 > globals snapshot, and risks false-positive "unbound variable" on
 > imported/cross-file symbols (the import resolution this plan defers).
 > Do it when Phase 5's workspace/import work lands.
+>
+> **Phase 2 done:** iters 2.1/2.2 (`documentSymbol` — nested defines as
+> Function/Variable), 2.3/2.4 (`hover` — builtin signatures + "defined
+> at line N" for user bindings), 2.5 (~70-entry builtin doc table).
+> Commit `8bc15f0` (symbols) + `c5f3f7a` (hover) on `feat/lsp-server`.
+> Shared `text` module added for span↔position. **Next: Phase 3**
+> (go-to-definition / find-references) — `find_define_span` already
+> resolves a symbol to its definition span.
 >
 > **Target outcome:** ship `crabscheme-lsp`, a Language Server
 > Protocol implementation that gives editors (VS Code, Neovim,
