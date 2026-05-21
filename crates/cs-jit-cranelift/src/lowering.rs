@@ -5163,7 +5163,20 @@ impl Lowerer {
                     | Inst::FlOddP(_, _)
                     | Inst::FlonumIsNan(_, _)
                     | Inst::FlonumIsInfinite(_, _)
-                    | Inst::FlonumIsFinite(_, _) => {
+                    | Inst::FlonumIsFinite(_, _)
+                    | Inst::SymbolP(_, _)
+                    | Inst::ProcedureP(_, _)
+                    | Inst::PortP(_, _)
+                    | Inst::DottedListP(_, _)
+                    | Inst::CircularListP(_, _)
+                    | Inst::NullListP(_, _)
+                    | Inst::FileExistsP(_, _)
+                    | Inst::PortEofP(_, _)
+                    | Inst::EofObject(_)
+                    | Inst::MakePromise(_, _)
+                    | Inst::ForceForced(_, _)
+                    | Inst::AlistCopy(_, _)
+                    | Inst::DeleteDuplicates(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -5533,6 +5546,45 @@ impl Lowerer {
                 fl_odd_p: self
                     .module
                     .declare_func_in_func(self.fl_odd_p_func, builder.func),
+                symbol_p: self
+                    .module
+                    .declare_func_in_func(self.symbol_p_func, builder.func),
+                procedure_p: self
+                    .module
+                    .declare_func_in_func(self.procedure_p_func, builder.func),
+                port_p: self
+                    .module
+                    .declare_func_in_func(self.port_p_func, builder.func),
+                dotted_list_p: self
+                    .module
+                    .declare_func_in_func(self.dotted_list_p_func, builder.func),
+                circular_list_p: self
+                    .module
+                    .declare_func_in_func(self.circular_list_p_func, builder.func),
+                null_list_p: self
+                    .module
+                    .declare_func_in_func(self.null_list_p_func, builder.func),
+                file_exists_p: self
+                    .module
+                    .declare_func_in_func(self.file_exists_p_func, builder.func),
+                port_eof_p: self
+                    .module
+                    .declare_func_in_func(self.port_eof_p_func, builder.func),
+                eof_object: self
+                    .module
+                    .declare_func_in_func(self.eof_object_func, builder.func),
+                make_promise: self
+                    .module
+                    .declare_func_in_func(self.make_promise_func, builder.func),
+                force_forced: self
+                    .module
+                    .declare_func_in_func(self.force_forced_func, builder.func),
+                alist_copy: self
+                    .module
+                    .declare_func_in_func(self.alist_copy_func, builder.func),
+                delete_duplicates: self
+                    .module
+                    .declare_func_in_func(self.delete_duplicates_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -7554,6 +7606,20 @@ struct NbHelpers {
     flonum_is_integer: cranelift_codegen::ir::FuncRef,
     fl_even_p: cranelift_codegen::ir::FuncRef,
     fl_odd_p: cranelift_codegen::ir::FuncRef,
+    // #50 — misc predicate / pointer builtins.
+    symbol_p: cranelift_codegen::ir::FuncRef,
+    procedure_p: cranelift_codegen::ir::FuncRef,
+    port_p: cranelift_codegen::ir::FuncRef,
+    dotted_list_p: cranelift_codegen::ir::FuncRef,
+    circular_list_p: cranelift_codegen::ir::FuncRef,
+    null_list_p: cranelift_codegen::ir::FuncRef,
+    file_exists_p: cranelift_codegen::ir::FuncRef,
+    port_eof_p: cranelift_codegen::ir::FuncRef,
+    eof_object: cranelift_codegen::ir::FuncRef,
+    make_promise: cranelift_codegen::ir::FuncRef,
+    force_forced: cranelift_codegen::ir::FuncRef,
+    alist_copy: cranelift_codegen::ir::FuncRef,
+    delete_duplicates: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -8505,6 +8571,60 @@ fn lower_inst_uniform_nb(
                 let r = b
                     .ins()
                     .bor_imm(widened, cs_vm::vm::NanboxValue::FALSE.into_raw());
+                map.insert(dst, r);
+            }
+            // #50 — misc predicates → NB Boolean.
+            &Inst::SymbolP(dst, src) => {
+                let r = nb_bool_call(b, helpers.symbol_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::ProcedureP(dst, src) => {
+                let r = nb_bool_call(b, helpers.procedure_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::PortP(dst, src) => {
+                let r = nb_bool_call(b, helpers.port_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::DottedListP(dst, src) => {
+                let r = nb_bool_call(b, helpers.dotted_list_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::CircularListP(dst, src) => {
+                let r = nb_bool_call(b, helpers.circular_list_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::NullListP(dst, src) => {
+                let r = nb_bool_call(b, helpers.null_list_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::FileExistsP(dst, src) => {
+                let r = nb_bool_call(b, helpers.file_exists_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::PortEofP(dst, src) => {
+                let r = nb_bool_call(b, helpers.port_eof_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            // #50 — misc pointer/handle builtins → NB Gc handle.
+            &Inst::EofObject(dst) => {
+                let r = nb_ptr_call(b, helpers.eof_object, &[]);
+                map.insert(dst, r);
+            }
+            &Inst::MakePromise(dst, src) => {
+                let r = nb_ptr_call(b, helpers.make_promise, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::ForceForced(dst, src) => {
+                let r = nb_ptr_call(b, helpers.force_forced, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::AlistCopy(dst, src) => {
+                let r = nb_ptr_call(b, helpers.alist_copy, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::DeleteDuplicates(dst, src) => {
+                let r = nb_ptr_call(b, helpers.delete_duplicates, &[lookup(map, src)?]);
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
