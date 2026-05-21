@@ -1,11 +1,13 @@
 # LSP Server Plan — Post-1.0-rc3
 
-> Status: **Phases 1–5 COMPLETE (2026-05-21)** — `cs-lsp` crate +
+> Status: **ALL PHASES (1–6) COMPLETE (2026-05-21)** — `cs-lsp` crate +
 > `crabscheme-lsp` binary ship diagnostics (P1), document symbols +
 > hover (P2), go-to-definition + references + highlight (P3),
 > completion + signature help (P4), and semantic tokens + formatting +
-> workspace symbols + rename (P5); exit gates proven end-to-end.
-> Phase 6 (editor integrations + distribution) open. Predecessor: 1.0-rc3
+> workspace symbols + rename (P5); P6 adds editor integrations + a
+> coding-harness surface (headless JSON CLI + `crabscheme-mcp` MCP
+> server) + release packaging. Exit gates proven end-to-end.
+> Predecessor: 1.0-rc3
 > (`aot-hardening` complete; all 8 microbenches AOT correctly).
 > Estimated duration: 3-5 weeks across six phases.
 > Spec slug: `lsp-server`.
@@ -55,8 +57,25 @@
 > cheap enough that the range/delta optimization is unnecessary at this
 > scale (revisit if large-file latency shows up). Rename + references
 > are name-based (not hygiene-aware), inheriting the deferred iter 3.1
-> expander-scope limitation. **Next: Phase 6** (editor integrations +
-> distribution).
+> expander-scope limitation.
+>
+> **Phase 6 done:** editor integrations + distribution + a coding-harness
+> surface (the latter added at the user's request — "support like
+> Claude"). iter 6.H1 (`harness.rs`: a serde, 1-based-position API
+> wrapping the LSP analysis, shared by CLI + MCP so results never drift;
+> `crabscheme-lsp` gains clap subcommands check/symbols/def/refs/hover/
+> fmt/workspace-symbols emitting JSON, no-subcommand still serves LSP),
+> 6.H2 (`crabscheme-mcp`: an MCP stdio server — `mcp.rs` pure
+> handle()+ thin bin — exposing 7 tools; validated against MCP 2025-06-18
+> by the mcp-validator agent, no MUST violations), 6.H3 (`.mcp.json`
+> dogfood config + `docs/user/lsp.md`), 6.1–6.4 (VS Code extension
+> scaffold in `crabscheme-vscode/`; Neovim/Emacs/Helix one-liners in the
+> guide), 6.5 (`release.yml` bundles `crabscheme-lsp`+`crabscheme-mcp`
+> into the native tarballs; servers are native-only, WASM ships only
+> `crabscheme.wasm`), 6.6 (the user guide above). New cs-lsp modules
+> `harness`, `mcp`; new bin `crabscheme-mcp`; new deps serde/serde_json/
+> clap. **Marketplace/registry publishing remains a manual release step**
+> (needs publisher accounts/tokens). The LSP milestone is complete.
 >
 > **Target outcome:** ship `crabscheme-lsp`, a Language Server
 > Protocol implementation that gives editors (VS Code, Neovim,
