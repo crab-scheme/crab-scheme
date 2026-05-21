@@ -196,6 +196,37 @@ fn unboxed_sum_of_squares_is_correct() {
 }
 
 #[test]
+fn int_char_round_trip_on_uniform_nb() {
+    // `(char->integer (integer->char (+ n 48)))`: IntCharBitcast then
+    // CharToInt. #50 — uniform-NB must retag each direction (Fixnum→Char
+    // then Char→Fixnum), so the round trip returns a Fixnum, not a
+    // Character. (Pre-fix, char->integer lowered to Move and left the
+    // value Character-tagged → wrong type on uniform-NB.)
+    let mut f = Function::new("int_char_rt");
+    f.params.push((Value(0), Type::Fixnum)); // n
+    f.entry = BlockId(0);
+    f.blocks.push(Block {
+        id: BlockId(0),
+        params: vec![],
+        insts: vec![
+            Inst::LoadConst(Value(1), Const::Fixnum(48)),
+            Inst::Add(Value(2), Value(0), Value(1)), // n + 48
+            Inst::IntCharBitcast(Value(3), Value(2)), // integer->char
+            Inst::CharToInt(Value(4), Value(3)),     // char->integer
+        ],
+        terminator: Term::Return(Value(4)),
+    });
+    let mut lowerer = Lowerer::new().expect("Lowerer::new");
+    let ptr = lowerer
+        .compile_uniform_nb(&f)
+        .expect("int<->char round trip must compile on uniform-NB");
+    for n in [0i64, 1, 9, 25] {
+        // Result must be a Fixnum (n+48), NOT a Character.
+        assert_eq!(as_fixnum(call1(ptr, n), &format!("f({n})")), n + 48);
+    }
+}
+
+#[test]
 fn unboxed_mul_overflow_requests_deopt() {
     // (sq x) = x*x. A large x overflows the 47-bit Fixnum range, so the
     // unboxed Mul must set the deopt sentinel (cleared here via

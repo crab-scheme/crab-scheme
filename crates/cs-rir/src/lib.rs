@@ -1235,6 +1235,18 @@ pub enum Inst {
     /// the function's inferred return type. Used for `integer->char`.
     IntCharBitcast(Value, Value),
 
+    /// `dst = src` (same codepoint payload), the inverse of
+    /// [`IntCharBitcast`]: tags `dst` as a Fixnum. Used for
+    /// `char->integer`. The two directions are distinct insts so
+    /// every backend knows which tag to produce: the untagged tiers
+    /// (specialized / AOT) treat both as a no-op copy and rely on
+    /// return-type inference, while the tagged uniform-NB tier emits
+    /// the actual NB retag (Character→Fixnum here, Fixnum→Character
+    /// for `IntCharBitcast`). Previously `char->integer` lowered to
+    /// `Move`, which left the value Character-tagged on uniform-NB and
+    /// miscompiled `(char->integer (integer->char x))` → Character.
+    CharToInt(Value, Value),
+
     /// `dst = bits(f64::from(src))` — convert a Fixnum i64 to a
     /// Flonum f64, then bitcast back to i64 so the value still fits
     /// the i64-only ABI's lane. Tags dst as Flonum for the return-

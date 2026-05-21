@@ -5110,7 +5110,8 @@ impl Lowerer {
                     | Inst::FixToFlo(_, _)
                     | Inst::NotBoolean(_, _)
                     | Inst::EqAny(_, _, _)
-                    | Inst::IntCharBitcast(_, _) => {
+                    | Inst::IntCharBitcast(_, _)
+                    | Inst::CharToInt(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -7926,10 +7927,10 @@ fn lower_inst_uniform_nb(
                 let result = b.ins().bor_imm(widened, nb_false);
                 map.insert(dst, result);
             }
-            // IntCharBitcast: same bit pattern, just retag the SSA value.
+            // IntCharBitcast (integer->char): same codepoint payload,
+            // strip the Fixnum header and OR in the Character header.
             // In NB land both Fixnum and Character carry the codepoint
-            // in low bits — but tag differs. We need to re-tag: strip
-            // the FIXNUM header, OR in the CHARACTER header.
+            // in the low 47 bits — only the tag differs.
             &Inst::IntCharBitcast(dst, src) => {
                 let v = lookup(map, src)?;
                 let payload = b.ins().band_imm(v, cs_vm::vm::NB_PAYLOAD_MASK as i64);
@@ -7938,6 +7939,20 @@ fn lower_inst_uniform_nb(
                     as i64;
                 let retagged = b.ins().bor_imm(payload, char_tag_bits);
                 map.insert(dst, retagged);
+            }
+            // CharToInt (char->integer): the inverse — keep the codepoint
+            // payload, retag as Fixnum (signature bits, tag 0). Without
+            // this dedicated direction `char->integer` left the value
+            // Character-tagged (it used to lower to Move), so
+            // `(char->integer (integer->char x))` returned a Character
+            // instead of a Number on uniform-NB.
+            &Inst::CharToInt(dst, src) => {
+                let v = lookup(map, src)?;
+                let payload = b.ins().band_imm(v, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let fixnum = b
+                    .ins()
+                    .bor_imm(payload, cs_vm::vm::NB_SIGNATURE_BITS as i64);
+                map.insert(dst, fixnum);
             }
             other => {
                 return Err(JitError::Unsupported(format!(
@@ -8885,9 +8900,12 @@ fn lower_inst(
             let v = lookup(map, *src)?;
             map.insert(*dst, v);
         }
-        Inst::IntCharBitcast(dst, src) => {
-            // Same i64 carrying the codepoint; only the dst's
-            // type tag changes for the return-type post-pass.
+        Inst::IntCharBitcast(dst, src) | Inst::CharToInt(dst, src) => {
+            // Same i64 carrying the codepoint; only the dst's type tag
+            // changes for the return-type post-pass. Both directions are
+            // a no-op copy in this untagged tier (the inst distinction
+            // only matters to the tagged uniform-NB tier and to
+            // return-type inference).
             let v = lookup(map, *src)?;
             map.insert(*dst, v);
         }

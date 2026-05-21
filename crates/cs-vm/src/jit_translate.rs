@@ -4726,16 +4726,19 @@ pub fn bytecode_to_rir_full(
                                         value_types.insert(dst, Type::Boolean);
                                     }
                                     ("char->integer", 1) => {
-                                        // Symmetric to integer->char: the i64
-                                        // *already* carries the codepoint, so
-                                        // the unboxed value is simply the
-                                        // Fixnum equivalent. dst stays Fixnum-
-                                        // typed so the default decoding wraps
-                                        // it as Number(Fixnum). This only
-                                        // fires when args[0] flowed from a
-                                        // prior integer->char in the same
-                                        // body (Fixnum→Char→Fixnum chain).
-                                        insts.push(RirInst::Move(dst, args[0]));
+                                        // Inverse of integer->char: same
+                                        // codepoint payload, but the result is
+                                        // a Fixnum. Emit the dedicated
+                                        // `CharToInt` retag (not `Move`) so the
+                                        // tagged uniform-NB tier produces a
+                                        // Fixnum-tagged NB carrier — a `Move`
+                                        // left it Character-tagged and
+                                        // miscompiled `(char->integer
+                                        // (integer->char x))` → Character. The
+                                        // untagged tiers still treat it as a
+                                        // no-op copy. dst stays Fixnum-typed.
+                                        insts.push(RirInst::CharToInt(dst, args[0]));
+                                        value_types.insert(dst, Type::Fixnum);
                                     }
                                     // ADR 0012 D-2 (iter CI) — char Unicode
                                     // predicates. Gated on Character-typed

@@ -1214,7 +1214,8 @@ fn inst_rhs(
         | (Inst::AnyToBool(dst, src), _)
         | (Inst::AnyToFlo(dst, src), _)
         | (Inst::FixToFlo(dst, src), _)
-        | (Inst::IntCharBitcast(dst, src), _) => {
+        | (Inst::IntCharBitcast(dst, src), _)
+        | (Inst::CharToInt(dst, src), _) => {
             check(*src)?;
             (*dst, format!("v{}", src.0))
         }
@@ -2527,7 +2528,8 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         | Inst::AnyToFlo(v, _)
         | Inst::AnyTruthy(v, _)
         | Inst::FixToFlo(v, _)
-        | Inst::IntCharBitcast(v, _) => Some(*v),
+        | Inst::IntCharBitcast(v, _)
+        | Inst::CharToInt(v, _) => Some(*v),
         // RC3 iter 2.14 — boolean negation.
         Inst::NotBoolean(v, _) => Some(*v),
         // RC2 iter L — type predicates.
