@@ -31,6 +31,11 @@ clap = { workspace = true }
 name = "crabscheme-lsp"
 path = "src/bin/crabscheme-lsp.rs"
 
+# Phase 6: MCP server for coding harnesses (Claude Code/Desktop, etc.).
+[[bin]]
+name = "crabscheme-mcp"
+path = "src/bin/crabscheme-mcp.rs"
+
 [dev-dependencies]
 # `ServiceExt::ready` for driving the LspService in-process in tests.
 tower = { version = "0.4", features = ["util"] }

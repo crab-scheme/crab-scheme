@@ -20,6 +20,7 @@ pub mod diagnostics;
 pub mod format;
 pub mod harness;
 pub mod hover;
+pub mod mcp;
 pub mod references;
 pub mod semantic_tokens;
 pub mod server;
