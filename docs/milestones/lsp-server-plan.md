@@ -1,9 +1,82 @@
 # LSP Server Plan — Post-1.0-rc3
 
-> Status: **Open** as of 2026-05-17. Predecessor: 1.0-rc3 (`aot-hardening`
-> complete; all 8 microbenches AOT correctly).
+> Status: **ALL PHASES (1–6) COMPLETE (2026-05-21)** — `cs-lsp` crate +
+> `crabscheme-lsp` binary ship diagnostics (P1), document symbols +
+> hover (P2), go-to-definition + references + highlight (P3),
+> completion + signature help (P4), and semantic tokens + formatting +
+> workspace symbols + rename (P5); P6 adds editor integrations + a
+> coding-harness surface (headless JSON CLI + `crabscheme-mcp` MCP
+> server) + release packaging. Exit gates proven end-to-end.
+> Predecessor: 1.0-rc3
+> (`aot-hardening` complete; all 8 microbenches AOT correctly).
 > Estimated duration: 3-5 weeks across six phases.
 > Spec slug: `lsp-server`.
+>
+> **Phase 1 done:** iters 1.1 (skeleton+initialize), 1.2 (document
+> cache), 1.3/1.4 (parse+expand diagnostics), 1.6 (UTF-16 span→range),
+> 1.7 (stale-change guard). Commits `1711b3e`, `01d455e`, `3f7ad5d` on
+> branch `feat/lsp-server`. **iter 1.5 (compile-stage diagnostics)
+> DEFERRED** — needs a cs-runtime compile-only "check" API for the full
+> globals snapshot, and risks false-positive "unbound variable" on
+> imported/cross-file symbols (the import resolution this plan defers).
+> Do it when Phase 5's workspace/import work lands.
+>
+> **Phase 2 done:** iters 2.1/2.2 (`documentSymbol` — nested defines as
+> Function/Variable), 2.3/2.4 (`hover` — builtin signatures + "defined
+> at line N" for user bindings), 2.5 (~70-entry builtin doc table).
+> Commit `8bc15f0` (symbols) + `c5f3f7a` (hover) on `feat/lsp-server`.
+> Shared `text` module added for span↔position.
+>
+> **Phase 3 done:** iters 3.2 (`definition`), 3.4 (`references`,
+> honoring includeDeclaration), 3.5 (`documentHighlight`). Commit
+> `dc2bf9a` on `feat/lsp-server`. Resolution is by symbol id
+> (name-based): finds all textual uses incl. the definition, but does
+> NOT honor lexical scope/hygiene — **iter 3.1 (expander-scope binding
+> table) DEFERRED**, same scope/import work Phase 5 needs.
+>
+> **Phase 4 done:** iters 4.1/4.3 (`completion` — builtins + document
+> defines, with detail), 4.4 (special-form snippets), 4.5
+> (`signatureHelp`). Commit `1e37e8c` on `feat/lsp-server`. Both exit
+> criteria pass (unit + e2e): `let` snippet completion + `(cons obj1
+> obj2)` signature help. Signature help finds the call head **textually**
+> so it works mid-type (incomplete call); user-function signatures need a
+> parse. iter 4.2 (scope-aware completion) simplified to all-candidates
+> (client filters) — full scoping is the deferred expander-scope work.
+>
+> **Phase 5 done:** iter 5.1 (`semanticTokens/full` — re-lexes with
+> cs-lex, classifies identifiers as keyword/function/variable via the
+> SPECIAL_FORMS set + builtin table, delta-encoded UTF-16 per spec),
+> 5.3/5.4 (`format` depth-based reindenter + `formatting` handler), 5.5
+> (`workspace/symbol` — scans every `.scm` under the captured root,
+> reusing `document_symbols`), 5.6 (`rename` — reuses `references` to
+> rewrite every occurrence, same-file). New modules `format`,
+> `workspace`, `semantic_tokens`; new dep `cs-lex`. Both exit criteria
+> pass (unit + e2e `phase5_e2e.rs`): a messy `.scm` reindents on
+> `textDocument/formatting`; `workspace/symbol` finds cross-file
+> defines. **iter 5.2 (`semanticTokens/range`) SKIPPED** — `full` is
+> cheap enough that the range/delta optimization is unnecessary at this
+> scale (revisit if large-file latency shows up). Rename + references
+> are name-based (not hygiene-aware), inheriting the deferred iter 3.1
+> expander-scope limitation.
+>
+> **Phase 6 done:** editor integrations + distribution + a coding-harness
+> surface (the latter added at the user's request — "support like
+> Claude"). iter 6.H1 (`harness.rs`: a serde, 1-based-position API
+> wrapping the LSP analysis, shared by CLI + MCP so results never drift;
+> `crabscheme-lsp` gains clap subcommands check/symbols/def/refs/hover/
+> fmt/workspace-symbols emitting JSON, no-subcommand still serves LSP),
+> 6.H2 (`crabscheme-mcp`: an MCP stdio server — `mcp.rs` pure
+> handle()+ thin bin — exposing 7 tools; validated against MCP 2025-06-18
+> by the mcp-validator agent, no MUST violations), 6.H3 (`.mcp.json`
+> dogfood config + `docs/user/lsp.md`), 6.1–6.4 (VS Code extension
+> scaffold in `crabscheme-vscode/`; Neovim/Emacs/Helix one-liners in the
+> guide), 6.5 (`release.yml` bundles `crabscheme-lsp`+`crabscheme-mcp`
+> into the native tarballs; servers are native-only, WASM ships only
+> `crabscheme.wasm`), 6.6 (the user guide above). New cs-lsp modules
+> `harness`, `mcp`; new bin `crabscheme-mcp`; new deps serde/serde_json/
+> clap. **Distribution is install-from-source** (`cargo install --path
+> crates/cs-lsp` → both servers; VS Code via a locally-built `.vsix`) —
+> no package-registry publishing. The LSP milestone is complete.
 >
 > **Target outcome:** ship `crabscheme-lsp`, a Language Server
 > Protocol implementation that gives editors (VS Code, Neovim,

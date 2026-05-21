@@ -1,0 +1,42 @@
+[package]
+name = "cs-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Language Server Protocol server for CrabScheme (.scm) source."
+
+[dependencies]
+# LSP framework: JSON-RPC framing, async dispatch, lsp_types re-export.
+tower-lsp = "0.20"
+# `io-std` adds tokio::io::{stdin,stdout} for the stdio transport (the
+# workspace tokio features don't include it).
+tokio = { workspace = true, features = ["io-std"] }
+dashmap = { workspace = true }
+# Front-end reuse: parse + expand for diagnostics, source-map for
+# span→line/col. No codegen deps — the LSP only inspects source.
+cs-diag = { workspace = true }
+cs-core = { workspace = true }
+cs-lex = { workspace = true }
+cs-parse = { workspace = true }
+cs-expand = { workspace = true }
+# Phase 6: the headless CLI + MCP server. `harness` derives Serialize on
+# its result structs; clap drives the `crabscheme-lsp <subcommand>` CLI;
+# serde_json emits the CLI/MCP payloads.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { workspace = true }
+
+[[bin]]
+name = "crabscheme-lsp"
+path = "src/bin/crabscheme-lsp.rs"
+
+# Phase 6: MCP server for coding harnesses (Claude Code/Desktop, etc.).
+[[bin]]
+name = "crabscheme-mcp"
+path = "src/bin/crabscheme-mcp.rs"
+
+[dev-dependencies]
+# `ServiceExt::ready` for driving the LspService in-process in tests.
+tower = { version = "0.4", features = ["util"] }
+

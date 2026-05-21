@@ -6,8 +6,11 @@ name: release
 # accidental pushes of milestone tags like `m10-complete`.
 #
 # Per-target output: a `crabscheme-<version>-<target>.tar.gz`
-# containing the native binary + LICENSE-MIT + LICENSE-APACHE +
-# README.md, with a `.sha256` checksum sidecar.
+# containing the native binaries — `crabscheme`, plus `crabscheme-lsp`
+# and `crabscheme-mcp` (the language server + MCP server for editors and
+# coding agents) — and LICENSE-MIT + LICENSE-APACHE + README.md, with a
+# `.sha256` checksum sidecar. The WASM target ships only
+# `crabscheme.wasm` (the servers are native-only; they need host stdio).
 #
 # Targets (RC1 scope):
 #   - darwin-aarch64   (macOS Apple Silicon)
@@ -51,8 +54,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             asset: darwin-aarch64
-            cargo_args: "--release -p cs-cli"
+            cargo_args: "--release -p cs-cli -p cs-lsp"
             bin_path: "target/release/crabscheme"
+            extra_bins: "target/release/crabscheme-lsp target/release/crabscheme-mcp"
           # x86_64-apple-darwin (Intel Macs) dropped from the
           # release matrix 2026-05-16: Apple is deprecating Intel
           # runners; the GitHub-hosted `macos-13` pool has become
@@ -66,18 +70,21 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
             asset: linux-x86_64
-            cargo_args: "--release -p cs-cli"
+            cargo_args: "--release -p cs-cli -p cs-lsp"
             bin_path: "target/release/crabscheme"
+            extra_bins: "target/release/crabscheme-lsp target/release/crabscheme-mcp"
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             asset: linux-aarch64
-            cargo_args: "--release -p cs-cli"
+            cargo_args: "--release -p cs-cli -p cs-lsp"
             bin_path: "target/release/crabscheme"
+            extra_bins: "target/release/crabscheme-lsp target/release/crabscheme-mcp"
           - target: wasm32-wasip1
             os: ubuntu-24.04
             asset: wasm32-wasip1
             cargo_args: "--release -p cs-cli --no-default-features --target wasm32-wasip1"
             bin_path: "target/wasm32-wasip1/release/crabscheme.wasm"
+            extra_bins: "" # servers are native-only
 
     steps:
       - uses: actions/checkout@v4
@@ -127,6 +134,11 @@ jobs:
           # `crabscheme.wasm` (kept as a .wasm next to the binary
           # name for clarity that this isn't a host binary).
           cp "${{ matrix.bin_path }}" "$stage/"
+          # Native targets also bundle the language + MCP servers
+          # (extra_bins is empty for WASM, so this loop is a no-op there).
+          for b in ${{ matrix.extra_bins }}; do
+            cp "$b" "$stage/"
+          done
           cp README.md "$stage/"
           cp LICENSE-MIT "$stage/"
           cp LICENSE-APACHE "$stage/"

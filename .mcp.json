@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "crabscheme": {
+      "command": "cargo",
+      "args": ["run", "-q", "-p", "cs-lsp", "--bin", "crabscheme-mcp"]
+    }
+  }
+}
