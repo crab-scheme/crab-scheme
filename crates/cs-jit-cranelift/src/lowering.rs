@@ -5210,7 +5210,26 @@ impl Lowerer {
                     | Inst::StringTitlecase(_, _)
                     | Inst::StringReverse(_, _)
                     | Inst::StringPrefixP(_, _, _)
-                    | Inst::StringSuffixP(_, _, _) => {
+                    | Inst::StringSuffixP(_, _, _)
+                    | Inst::BvP(_, _)
+                    | Inst::BvLength(_, _)
+                    | Inst::BvAlloc(_, _, _)
+                    | Inst::BvCopy(_, _)
+                    | Inst::BvFill(_, _, _)
+                    | Inst::BytevectorEqP(_, _, _)
+                    | Inst::BvCopyFrom(_, _, _)
+                    | Inst::BvCopySlice(_, _, _, _)
+                    | Inst::BvFillFrom(_, _, _, _)
+                    | Inst::BvFillSlice(_, _, _, _, _)
+                    | Inst::BytevectorToListSlice(_, _, _, _)
+                    | Inst::BytevectorToListSliceFrom(_, _, _)
+                    | Inst::BvCopyBang(_, _, _, _)
+                    | Inst::BvCopyBangFrom(_, _, _, _, _)
+                    | Inst::BvCopyBangSlice(_, _, _, _, _, _)
+                    | Inst::BvIeeeSingleNativeRef(_, _, _)
+                    | Inst::BvIeeeDoubleNativeRef(_, _, _)
+                    | Inst::BvIeeeSingleNativeSet(_, _, _, _)
+                    | Inst::BvIeeeDoubleNativeSet(_, _, _, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -5721,6 +5740,67 @@ impl Lowerer {
                 string_suffix_p: self
                     .module
                     .declare_func_in_func(self.string_suffix_p_func, builder.func),
+                bv_p: self
+                    .module
+                    .declare_func_in_func(self.bv_p_func, builder.func),
+                bv_length: self
+                    .module
+                    .declare_func_in_func(self.bv_length_func, builder.func),
+                bv_alloc: self
+                    .module
+                    .declare_func_in_func(self.bv_alloc_func, builder.func),
+                bv_copy: self
+                    .module
+                    .declare_func_in_func(self.bv_copy_func, builder.func),
+                bv_fill: self
+                    .module
+                    .declare_func_in_func(self.bv_fill_func, builder.func),
+                bytevector_eq_p: self
+                    .module
+                    .declare_func_in_func(self.bytevector_eq_p_func, builder.func),
+                bytevector_copy_from: self
+                    .module
+                    .declare_func_in_func(self.bytevector_copy_from_func, builder.func),
+                bytevector_copy_slice: self
+                    .module
+                    .declare_func_in_func(self.bytevector_copy_slice_func, builder.func),
+                bytevector_fill_from: self
+                    .module
+                    .declare_func_in_func(self.bytevector_fill_from_func, builder.func),
+                bytevector_fill_slice: self
+                    .module
+                    .declare_func_in_func(self.bytevector_fill_slice_func, builder.func),
+                bytevector_to_list_slice: self
+                    .module
+                    .declare_func_in_func(self.bytevector_to_list_slice_func, builder.func),
+                bytevector_to_list_slice_from: self
+                    .module
+                    .declare_func_in_func(self.bytevector_to_list_slice_from_func, builder.func),
+                bytevector_copy_bang: self
+                    .module
+                    .declare_func_in_func(self.bytevector_copy_bang_func, builder.func),
+                bytevector_copy_bang_from: self
+                    .module
+                    .declare_func_in_func(self.bytevector_copy_bang_from_func, builder.func),
+                bytevector_copy_bang_slice: self
+                    .module
+                    .declare_func_in_func(self.bytevector_copy_bang_slice_func, builder.func),
+                bytevector_ieee_single_native_ref: self.module.declare_func_in_func(
+                    self.bytevector_ieee_single_native_ref_func,
+                    builder.func,
+                ),
+                bytevector_ieee_double_native_ref: self.module.declare_func_in_func(
+                    self.bytevector_ieee_double_native_ref_func,
+                    builder.func,
+                ),
+                bytevector_ieee_single_native_set: self.module.declare_func_in_func(
+                    self.bytevector_ieee_single_native_set_func,
+                    builder.func,
+                ),
+                bytevector_ieee_double_native_set: self.module.declare_func_in_func(
+                    self.bytevector_ieee_double_native_set_func,
+                    builder.func,
+                ),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -7794,6 +7874,27 @@ struct NbHelpers {
     string_reverse: cranelift_codegen::ir::FuncRef,
     string_prefix_p: cranelift_codegen::ir::FuncRef,
     string_suffix_p: cranelift_codegen::ir::FuncRef,
+    // #50 — bytevector builtins (NB bv pointer + raw byte/index/count
+    // args; NB Flonum f64-bit values pass through).
+    bv_p: cranelift_codegen::ir::FuncRef,
+    bv_length: cranelift_codegen::ir::FuncRef,
+    bv_alloc: cranelift_codegen::ir::FuncRef,
+    bv_copy: cranelift_codegen::ir::FuncRef,
+    bv_fill: cranelift_codegen::ir::FuncRef,
+    bytevector_eq_p: cranelift_codegen::ir::FuncRef,
+    bytevector_copy_from: cranelift_codegen::ir::FuncRef,
+    bytevector_copy_slice: cranelift_codegen::ir::FuncRef,
+    bytevector_fill_from: cranelift_codegen::ir::FuncRef,
+    bytevector_fill_slice: cranelift_codegen::ir::FuncRef,
+    bytevector_to_list_slice: cranelift_codegen::ir::FuncRef,
+    bytevector_to_list_slice_from: cranelift_codegen::ir::FuncRef,
+    bytevector_copy_bang: cranelift_codegen::ir::FuncRef,
+    bytevector_copy_bang_from: cranelift_codegen::ir::FuncRef,
+    bytevector_copy_bang_slice: cranelift_codegen::ir::FuncRef,
+    bytevector_ieee_single_native_ref: cranelift_codegen::ir::FuncRef,
+    bytevector_ieee_double_native_ref: cranelift_codegen::ir::FuncRef,
+    bytevector_ieee_single_native_set: cranelift_codegen::ir::FuncRef,
+    bytevector_ieee_double_native_set: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -8989,6 +9090,142 @@ fn lower_inst_uniform_nb(
                     helpers.string_suffix_p,
                     &[lookup(map, a)?, lookup(map, c)?],
                 );
+                map.insert(dst, r);
+            }
+            // #50 — bytevector builtins. bv pointer passes NB; byte/
+            // count/offset/index args decode NB→raw; IEEE f64 values are
+            // NB Flonum (f64 bits) and pass through.
+            &Inst::BvP(dst, src) => {
+                let r = nb_bool_call(b, helpers.bv_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::BvLength(dst, src) => {
+                let r = nb_fixnum_call(b, helpers.bv_length, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::BvAlloc(dst, n, fill) => {
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let fv = unbox_nb_fixnum(b, lookup(map, fill)?);
+                let r = nb_ptr_call(b, helpers.bv_alloc, &[nv, fv]);
+                map.insert(dst, r);
+            }
+            &Inst::BvCopy(dst, src) => {
+                let r = nb_ptr_call(b, helpers.bv_copy, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::BvFill(dst, bv, fill) => {
+                let bvv = lookup(map, bv)?;
+                let fv = unbox_nb_fixnum(b, lookup(map, fill)?);
+                let r = nb_ptr_call(b, helpers.bv_fill, &[bvv, fv]);
+                map.insert(dst, r);
+            }
+            &Inst::BytevectorEqP(dst, a, c) => {
+                let r = nb_bool_call(
+                    b,
+                    helpers.bytevector_eq_p,
+                    &[lookup(map, a)?, lookup(map, c)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::BvCopyFrom(dst, bv, start) => {
+                let bvv = lookup(map, bv)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.bytevector_copy_from, &[bvv, sv]);
+                map.insert(dst, r);
+            }
+            &Inst::BvCopySlice(dst, bv, start, end) => {
+                let bvv = lookup(map, bv)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.bytevector_copy_slice, &[bvv, sv, ev]);
+                map.insert(dst, r);
+            }
+            &Inst::BvFillFrom(dst, bv, fill, start) => {
+                let bvv = lookup(map, bv)?;
+                let fv = unbox_nb_fixnum(b, lookup(map, fill)?);
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.bytevector_fill_from, &[bvv, fv, sv]);
+                map.insert(dst, r);
+            }
+            &Inst::BvFillSlice(dst, bv, fill, start, end) => {
+                let bvv = lookup(map, bv)?;
+                let fv = unbox_nb_fixnum(b, lookup(map, fill)?);
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.bytevector_fill_slice, &[bvv, fv, sv, ev]);
+                map.insert(dst, r);
+            }
+            &Inst::BytevectorToListSlice(dst, bv, start, end) => {
+                let bvv = lookup(map, bv)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.bytevector_to_list_slice, &[bvv, sv, ev]);
+                map.insert(dst, r);
+            }
+            &Inst::BytevectorToListSliceFrom(dst, bv, start) => {
+                let bvv = lookup(map, bv)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.bytevector_to_list_slice_from, &[bvv, sv]);
+                map.insert(dst, r);
+            }
+            &Inst::BvCopyBang(dst, to, at, from) => {
+                let tv = lookup(map, to)?;
+                let av = unbox_nb_fixnum(b, lookup(map, at)?);
+                let fv = lookup(map, from)?;
+                let r = nb_ptr_call(b, helpers.bytevector_copy_bang, &[tv, av, fv]);
+                map.insert(dst, r);
+            }
+            &Inst::BvCopyBangFrom(dst, to, at, from, start) => {
+                let tv = lookup(map, to)?;
+                let av = unbox_nb_fixnum(b, lookup(map, at)?);
+                let fv = lookup(map, from)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.bytevector_copy_bang_from, &[tv, av, fv, sv]);
+                map.insert(dst, r);
+            }
+            &Inst::BvCopyBangSlice(dst, to, at, from, start, end) => {
+                let tv = lookup(map, to)?;
+                let av = unbox_nb_fixnum(b, lookup(map, at)?);
+                let fv = lookup(map, from)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.bytevector_copy_bang_slice, &[tv, av, fv, sv, ev]);
+                map.insert(dst, r);
+            }
+            // IEEE native ref → NB Flonum (f64 bits, pass through); the
+            // offset arg decodes NB→raw.
+            &Inst::BvIeeeSingleNativeRef(dst, bv, k) => {
+                let bvv = lookup(map, bv)?;
+                let kv = unbox_nb_fixnum(b, lookup(map, k)?);
+                let call = b
+                    .ins()
+                    .call(helpers.bytevector_ieee_single_native_ref, &[bvv, kv]);
+                let r = b.inst_results(call)[0];
+                map.insert(dst, r);
+            }
+            &Inst::BvIeeeDoubleNativeRef(dst, bv, k) => {
+                let bvv = lookup(map, bv)?;
+                let kv = unbox_nb_fixnum(b, lookup(map, k)?);
+                let call = b
+                    .ins()
+                    .call(helpers.bytevector_ieee_double_native_ref, &[bvv, kv]);
+                let r = b.inst_results(call)[0];
+                map.insert(dst, r);
+            }
+            // IEEE native set: offset decodes; value is NB Flonum (f64
+            // bits) passed through.
+            &Inst::BvIeeeSingleNativeSet(dst, bv, k, val) => {
+                let bvv = lookup(map, bv)?;
+                let kv = unbox_nb_fixnum(b, lookup(map, k)?);
+                let vv = lookup(map, val)?;
+                let r = nb_ptr_call(b, helpers.bytevector_ieee_single_native_set, &[bvv, kv, vv]);
+                map.insert(dst, r);
+            }
+            &Inst::BvIeeeDoubleNativeSet(dst, bv, k, val) => {
+                let bvv = lookup(map, bv)?;
+                let kv = unbox_nb_fixnum(b, lookup(map, k)?);
+                let vv = lookup(map, val)?;
+                let r = nb_ptr_call(b, helpers.bytevector_ieee_double_native_set, &[bvv, kv, vv]);
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
