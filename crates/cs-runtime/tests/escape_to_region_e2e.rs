@@ -128,27 +128,21 @@ fn cons_in_region_correct_on_walker_and_vm() {
     assert_eq!(disp(&rt2, &vm), "57", "vm");
 }
 
-/// KNOWN PRE-EXISTING BUG (discovered while building #51, not caused by
-/// the escape-to-region pass — the pass conservatively avoids it).
+/// Regression test for the region/env-lifetime UAF fixed in #51a.
 ///
-/// A `cons-in-region` pair *bound by `let`* is materialized into a JIT
-/// frame env via `EnvDefineLocal`. That env frame can be retained past
-/// the `with-region` scope (JIT frame-env caching), so the
-/// region-allocated pair handle outlives the region. When the region's
-/// bump arena is bulk-freed at `with-region` exit, the dangling handle
-/// in the env dangles; at runtime teardown `Bindings::drop` →
-/// `decode_gc_handle` → `Gc::from_raw_jit_region` reads the freed slot
-/// and panics `slot region_id was 0`.
+/// Before the fix: a `cons-in-region` pair *bound by `let`* is lowered
+/// to `EnvDefineLocal`. For a JIT body without a frame env (no nested
+/// closure), `EnvDefineLocal` wrote into the closure's *definition*
+/// (global) env, so the region-allocated pair outlived its
+/// `with-region` arena; once the arena was bulk-freed, the dangling
+/// handle panicked `slot region_id was 0` at teardown
+/// (`Bindings::drop` → `Gc::from_raw_jit_region`).
 ///
-/// This is the region/env-lifetime gap (a layer-3/JIT interaction);
-/// the escape-to-region pass sidesteps it by treating `EnvDefineLocal`
-/// stores as escapes, so it never region-allocates a pair that lands in
-/// an env frame. Fixing the builtin path (promote region values out of
-/// retained env frames on region drop, or keep non-captured let temps
-/// in SSA) is a separate follow-up. Re-enable this test once fixed.
+/// The fix (`Function::has_env_define_local` → `set_jit_needs_frame_env`)
+/// gives any `EnvDefineLocal` body a per-call frame env, so the temp is
+/// scoped to the invocation and dropped (region still live) on return.
 #[test]
-#[ignore = "pre-existing region/env-lifetime bug in cons-in-region under JIT tier-up; tracked as a #51 follow-up"]
-fn cons_in_region_jit_with_region_env_leak_known_bug() {
+fn cons_in_region_jit_with_region_no_env_leak() {
     cs_opt::clear_active_passes();
     let mut rt = Runtime::new();
     rt.install_jit().unwrap();
