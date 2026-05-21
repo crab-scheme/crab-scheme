@@ -15,88 +15,6 @@ use cs_jit_cranelift::Lowerer;
 use cs_vm::jit_translate::bytecode_to_rir;
 use cs_vm::opcode::{CompiledLambda, Inst};
 
-fn fib_lambda(syms: &mut SymbolTable) -> (CompiledLambda, cs_core::Symbol) {
-    let n = syms.intern("n");
-    let fib = syms.intern("fib");
-    let body = vec![
-        Inst::LoadVar(n),
-        Inst::Const(Value::Number(Number::Fixnum(2))),
-        Inst::LtFx2,
-        Inst::JumpIfFalse(6),
-        Inst::LoadVar(n),
-        Inst::Return,
-        Inst::LoadVar(fib),
-        Inst::LoadVar(n),
-        Inst::Const(Value::Number(Number::Fixnum(1))),
-        Inst::SubFx2,
-        Inst::Call(1),
-        Inst::LoadVar(fib),
-        Inst::LoadVar(n),
-        Inst::Const(Value::Number(Number::Fixnum(2))),
-        Inst::SubFx2,
-        Inst::Call(1),
-        Inst::AddFx2,
-        Inst::Return,
-    ];
-    let len = body.len();
-    let l = CompiledLambda {
-        params: vec![n],
-        rest: None,
-        body: Rc::new(body),
-        spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
-        fast: None,
-        profile: Default::default(),
-    };
-    (l, fib)
-}
-
-#[test]
-fn fib_bytecode_translates_and_jits_natively() {
-    let mut syms = SymbolTable::new();
-    let (lam, fib_sym) = fib_lambda(&mut syms);
-    let rir = bytecode_to_rir(&lam, "fib_jit", Some(fib_sym)).expect("translate");
-
-    let mut lowerer = Lowerer::new().expect("Lowerer::new");
-    let ptr = lowerer.compile_pure_fixnum(&rir).expect("compile");
-    let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
-
-    assert_eq!(func(0), 0);
-    assert_eq!(func(1), 1);
-    assert_eq!(func(2), 1);
-    assert_eq!(func(3), 2);
-    assert_eq!(func(5), 5);
-    assert_eq!(func(10), 55);
-    assert_eq!(func(20), 6765);
-}
-
-#[test]
-fn add_one_bytecode_translates_and_jits() {
-    let mut syms = SymbolTable::new();
-    let x = syms.intern("x");
-    let body = vec![
-        Inst::LoadVar(x),
-        Inst::Const(Value::Number(Number::Fixnum(1))),
-        Inst::AddFx2,
-        Inst::Return,
-    ];
-    let len = body.len();
-    let lam = CompiledLambda {
-        params: vec![x],
-        rest: None,
-        body: Rc::new(body),
-        spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
-        fast: None,
-        profile: Default::default(),
-    };
-    let rir = bytecode_to_rir(&lam, "addone", None).unwrap();
-    let mut lowerer = Lowerer::new().unwrap();
-    let ptr = lowerer.compile_pure_fixnum(&rir).unwrap();
-    let func: extern "C" fn(i64) -> i64 = unsafe { transmute(ptr) };
-    assert_eq!(func(0), 1);
-    assert_eq!(func(41), 42);
-    assert_eq!(func(-1), 0);
-}
-
 // ====================================================================
 // Stage 3 iter 3.1 — uniform-NB skeleton tests.
 //
@@ -693,16 +611,18 @@ fn uniform_nb_call_self_countdown() {
 }
 
 #[test]
-fn uniform_nb_rejects_non_tail_callself() {
+fn uniform_nb_admits_nontail_callself_via_systemv() {
     // (define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
-    // — has two non-tail CallSelfs in the same block. The uniform-NB
-    // inner uses CallConv::Tail which costs more host stack per non-
-    // tail frame than SystemV; deeper nestings like tak's triple
-    // CallSelf overflow at benchmark sizes. Rejecting forces the
-    // closure to the specialized tier (SystemV) where these compile
-    // safely.
-    use cs_jit::JitError;
+    // — two non-tail CallSelfs, here with an *Any* param (so the raw-
+    // Fixnum ABI does not apply). #50: because the body has no *tail*
+    // self-call, the inner uses CallConv::SystemV (small frames, the
+    // same host-stack ceiling as the legacy pure-fixnum tier), so it is
+    // admitted on uniform-NB instead of routing to that tier. (Earlier
+    // this asserted rejection; the SystemV-conv selection removed the
+    // host-stack hazard for non-tail-only bodies.) Recursion goes
+    // through the NB lane (Any param), so verify correctness too.
     use cs_rir::{Block, BlockId, Const as RirConst, Function, Inst as RirInst, Term, Type};
+    use cs_vm::vm::NanboxValue;
 
     let mut f = Function::new("fib_nb");
     f.params.push((cs_rir::Value(0), Type::Any));
@@ -738,12 +658,19 @@ fn uniform_nb_rejects_non_tail_callself() {
     });
 
     let mut lowerer = Lowerer::new().unwrap();
-    let result = lowerer.compile_uniform_nb(&f);
-    assert!(
-        matches!(result, Err(JitError::Unsupported(_))),
-        "expected Unsupported (non-tail CallSelf), got {:?}",
-        result
-    );
+    let ptr = lowerer
+        .compile_uniform_nb(&f)
+        .expect("non-tail CallSelf (no tail-self) must compile on uniform-NB via SystemV (#50)");
+    let func: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+    for (n, expected) in [(0i64, 0i64), (1, 1), (2, 1), (7, 13), (10, 55)] {
+        let r = func(NanboxValue::fixnum(n).into_raw());
+        match unsafe { NanboxValue(r).to_value() } {
+            cs_core::Value::Number(cs_core::Number::Fixnum(v)) => {
+                assert_eq!(v, expected, "fib({n})")
+            }
+            other => panic!("fib({n}): expected Fixnum({expected}), got {other:?}"),
+        }
+    }
 }
 
 #[test]

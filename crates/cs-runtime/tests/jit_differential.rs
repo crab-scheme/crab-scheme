@@ -116,6 +116,59 @@ fn diff_ack_3_5() {
 }
 
 #[test]
+fn diff_unboxed_sum_of_squares() {
+    // ADR 0020 Strategy C — arith-heavy body that exercises the
+    // speculative Fixnum unboxing path: `a`/`b` are Fixnum params,
+    // `(* a a)`/`(* b b)` lower to unboxed Mul, and the `(+ ...)` of two
+    // unboxed results stays unboxed. Differential agreement confirms the
+    // unboxed lowering computes the same value as the VM/walker.
+    let defines = &[
+        "(define ss (lambda (a b) (+ (* a a) (* b b))))",
+        "(define warm (lambda (n) \
+            (let loop ((i 0) (acc 0)) (if (> i n) acc (loop (+ i 1) (ss i i))))))",
+    ];
+    assert_three_tier_agreement(defines, Some("(warm 3000)"), "(ss 123 456)");
+}
+
+#[test]
+fn diff_unboxed_fixnum_overflow_deopts_to_bignum() {
+    // ADR 0020 Strategy C — the unboxed Mul must request a deopt when
+    // its result overflows the 47-bit Fixnum range, so the VM promotes
+    // to a bignum. `sq` is warmed with small (Fixnum) inputs to tier it
+    // up, then called with an input whose square overflows: 47-bit max
+    // is ~7.04e13, and (sq 10000000) = 1e14 > that. Pre-deopt this would
+    // silently return a wrapped/garbage Fixnum; correct behavior agrees
+    // with the walker's bignum (1e14 is exact in f64).
+    let defines = &[
+        "(define sq (lambda (x) (* x x)))",
+        "(define warm (lambda (n) \
+            (let loop ((i 0)) (if (> i n) 'done (begin (sq i) (loop (+ i 1)))))))",
+    ];
+    assert_three_tier_agreement(defines, Some("(warm 3000)"), "(sq 10000000)");
+}
+
+#[test]
+fn diff_raw_abi_recursive_overflow_deopts_to_bignum() {
+    // ADR 0020 Strategy C iter-3 — the raw-Fixnum self-call ABI passes
+    // raw i64 through the whole recursion. When an intermediate product
+    // overflows the 47-bit Fixnum range the unboxed Mul requests a deopt;
+    // the dispatcher discards the JIT body's result (raw garbage) and
+    // reruns on bytecode, which promotes to a bignum. This is the SAME
+    // discard-and-retry path the pure-fixnum tier relies on, but here it
+    // fires inside a body whose self-calls also speak the raw ABI — the
+    // regression guard for "garbage propagating through raw self-calls is
+    // never observed". `fact` is self-recursive and all-Fixnum-param, so
+    // it tiers up onto the raw ABI; (fact 17) = 355687428096000 ≈ 3.56e14
+    // overflows 47 bits (max ~7.04e13) yet is exact in f64.
+    let defines = &[
+        "(define fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))",
+        "(define warm (lambda (n) \
+            (let loop ((i 0)) (if (> i n) 'done (begin (fact 8) (loop (+ i 1)))))))",
+    ];
+    assert_three_tier_agreement(defines, Some("(warm 2000)"), "(fact 17)");
+}
+
+#[test]
 fn diff_loop_sum_1_to_n() {
     // Iterative-style sum via tail recursion.
     let defines = &["(define loop-sum (lambda (n) \
@@ -134,6 +187,44 @@ fn diff_loop_sum_1_to_n() {
             assert_eq!(a.to_f64(), 5050.0);
         }
         other => panic!("expected numbers, got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_jit_integer_ops_off_pure_fixnum() {
+    // #50 — ops uniform-NB previously rejected (routing them to the
+    // pure-fixnum tier): modulo/remainder (sign-sensitive), bitwise,
+    // abs/min/max, floor-quotient. Each is warmed past the tier
+    // threshold so the body runs on the JIT, then checked against the
+    // walker across negative operands (where R6RS modulo vs remainder
+    // sign rules and floor- vs truncate-quotient diverge).
+    let defines = &[
+        "(define m (lambda (a b) (modulo a b)))",
+        "(define r (lambda (a b) (remainder a b)))",
+        "(define ba (lambda (a b) (bitwise-and a b)))",
+        "(define bo (lambda (a b) (bitwise-or a b)))",
+        "(define bx (lambda (a b) (bitwise-xor a b)))",
+        "(define ab (lambda (a) (abs a)))",
+        "(define mx (lambda (a b) (max a b)))",
+        "(define mn (lambda (a b) (min a b)))",
+        "(define warm (lambda (n) (let loop ((i 0)) (if (> i n) 'done \
+            (begin (m i 3) (r i 3) (ba i 6) (bo i 6) (bx i 6) (ab i) \
+                   (mx i 3) (mn i 3) (loop (+ i 1)))))))",
+    ];
+    for (warm, expr) in [
+        (Some("(warm 2000)"), "(m 13 4)"),
+        (Some("(warm 2000)"), "(m -13 4)"),
+        (Some("(warm 2000)"), "(m 13 -4)"),
+        (Some("(warm 2000)"), "(r -13 4)"),
+        (Some("(warm 2000)"), "(r 13 -4)"),
+        (Some("(warm 2000)"), "(ba 12 10)"),
+        (Some("(warm 2000)"), "(bo 12 10)"),
+        (Some("(warm 2000)"), "(bx 12 10)"),
+        (Some("(warm 2000)"), "(ab -42)"),
+        (Some("(warm 2000)"), "(mx 7 19)"),
+        (Some("(warm 2000)"), "(mn 7 19)"),
+    ] {
+        assert_three_tier_agreement(defines, warm, expr);
     }
 }
 
@@ -838,7 +929,7 @@ fn diff_jit_introspection_and_distinct_compiles() {
     // (jit-status proc) Scheme-visible accessors.
     //
     // Also pins down a regression caught while writing this test:
-    // every call to compile_pure_fixnum used `declare_function` with
+    // every JIT compile used `declare_function` with
     // the same module-level name "anon-jit", colliding on the
     // second compile and silently leaving subsequent closures on
     // bytecode. The fix appends the lowerer's fresh_id to the

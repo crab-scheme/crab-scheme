@@ -35,23 +35,6 @@ use cs_core::{Number, Value};
 
 use crate::Runtime;
 
-/// Whether a RIR body makes a cross-function call (`Inst::Call` or
-/// `Inst::CallGeneral`) — i.e. calls a procedure other than itself.
-///
-/// Used to keep such bodies off the legacy pure-fixnum tier, which
-/// miscompiles them (issue #19). `Inst::CallSelf` (self-recursion) is
-/// fine and intentionally not matched.
-fn rir_has_cross_function_call(rir: &cs_rir::Function) -> bool {
-    rir.blocks.iter().any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(
-                i,
-                cs_rir::Inst::Call(_, _, _) | cs_rir::Inst::CallGeneral(_, _, _)
-            )
-        })
-    })
-}
-
 impl Runtime {
     /// Install the JIT for this runtime: build a [`Lowerer`] and
     /// register the tier-up hook on the calling thread.
@@ -284,59 +267,24 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
                 return;
             }
             // Ordinary `Unsupported` / `Codegen` rejection — by-design
-            // tier routing. Try the specialized tier. pure_fixnum can
-            // also panic (its codegen path overlaps cranelift's), so
-            // wrap it the same way and poison on panic.
-            //
-            // Issue #19 — the legacy pure-fixnum tier silently
-            // MISCOMPILES bodies containing a cross-function call
-            // (`Inst::Call` / `Inst::CallGeneral`): the call clobbers
-            // state so a following `Car`/`Cdr`/`Cons`/`CallSelf` reads
-            // garbage and returns `Null` where the caller expects a
-            // pair (nboyer/sboyer's `(caddr (car lst))`). Self-recursive
-            // pointer bodies (binary-trees, alloc-stress) use only
-            // `CallSelf` and compile correctly, so the precise, no-
-            // measured-regression fix is: when uniform-NB declined a
-            // body that makes a cross-function call, route it to the VM
-            // rather than miscompile it on the legacy tier. Cross-
-            // function calls belong on the uniform-NB tier (which has
-            // proper IC dispatch); the VM is always a correct fallback.
-            if rir_has_cross_function_call(&rir) {
-                return;
-            }
-            let pure_result = catch_unwind(AssertUnwindSafe(|| lowerer.compile_pure_fixnum(&rir)));
-            match pure_result {
-                Ok(Ok(p)) => (p, None),
-                Err(_) => {
-                    poison.set(true);
-                    return;
-                }
-                Ok(Err(_)) => return,
-            }
+            // tier routing. uniform-NB is now the single Cranelift
+            // backend (the legacy pure-fixnum tier was retired in #50
+            // once uniform-NB covered its full inst surface), so a body
+            // uniform-NB declines stays on the bytecode VM, always a
+            // correct fallback.
+            return;
         }
     };
     closure.set_jit_ptr(ptr, lam.params.len() as u32);
     closure.set_jit_param_types(&param_tags);
     closure.set_jit_needs_frame_env(builds_closures);
-    // ADR 0012 D-2 (iter BM) — install the harvested stack-map
-    // registry on the closure. Empty record-set is fine (means no
-    // call inside the body kept a Gc handle live across it). The
-    // GC scanner (iter BN) will use these maps to walk JIT frames.
-    if !lowerer.last_inner_stack_maps.is_empty() {
-        let mut maps = cs_vm::jit_stackmap::JitStackMaps::new(lowerer.last_inner_base);
-        for (pc, offsets) in lowerer.last_inner_stack_maps.drain() {
-            maps.insert(pc, offsets);
-        }
-        closure.set_jit_stack_maps(std::rc::Rc::new(maps));
-    }
     // Always compute the semantic return tag from `rir.return_type`
-    // (what the body conceptually returns). For the specialized tier
-    // this is also the ABI tag — the body emits raw i64 of that
-    // shape. For uniform-NB the ABI tag is `JIT_RT_NB` (the body
-    // emits a uniform NB i64 carrier) while the semantic tag still
-    // describes what the body conceptually returns, so observability
-    // surfaces like `jit-status` and `jit-introspection` can report
-    // the user-visible type rather than the ABI carrier.
+    // (what the body conceptually returns). For uniform-NB the ABI tag
+    // is `JIT_RT_NB` (the body emits a uniform NB i64 carrier) while
+    // the semantic tag still describes what the body conceptually
+    // returns, so observability surfaces like `jit-status` and
+    // `jit-introspection` can report the user-visible type rather than
+    // the ABI carrier.
     let semantic_tag = match rir.return_type {
         RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
         RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,

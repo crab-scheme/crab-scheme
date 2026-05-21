@@ -16,12 +16,12 @@
 //! self-call will emit `return_call`, else `CallConv::SystemV` (smaller
 //! frames → higher host-stack ceiling, matching the legacy tier).
 //!
-//! These tests assert at the tier boundary: a map-style RIR body now
-//! *compiles* on uniform-NB (`Ok`), while a pure non-tail self-recursive
-//! body with no cross-call is still rejected (`Err`) so `tak`-style
-//! arithmetic keeps routing to the specialized tier with no regression.
+//! These tests assert at the tier boundary: a map-style RIR body
+//! *compiles* on uniform-NB (`Ok`). A pure non-tail self-recursive body
+//! with no cross-call also compiles now (#50) — it has no tail self-call,
+//! so the inner uses CallConv::SystemV and incurs no host-stack hazard,
+//! letting it leave the legacy pure-fixnum tier.
 
-use cs_jit::JitError;
 use cs_jit_cranelift::Lowerer;
 use cs_rir::{Block, BlockId, Const, Function, Inst, Term, Type, Value};
 
@@ -174,13 +174,17 @@ fn tail_self_with_cross_call_compiles_on_uniform_nb() {
 }
 
 #[test]
-fn pure_nontail_self_still_rejected() {
+fn pure_nontail_self_now_compiles_on_uniform_nb() {
     let f = nontail_self_no_crosscall();
     let mut lowerer = Lowerer::new().expect("Lowerer::new");
-    // No cross-call ⇒ the host-stack guard still rejects, keeping
-    // tak-style recursion on the specialized tier (no perf regression).
-    match lowerer.compile_uniform_nb(&f) {
-        Err(JitError::Unsupported(_)) => {}
-        other => panic!("expected Unsupported rejection, got {:?}", other),
-    }
+    // #50 — a pure non-tail self-recursive body with no cross-call has no
+    // *tail* self-call, so the inner uses CallConv::SystemV (small frames,
+    // the same host-stack ceiling as the legacy pure-fixnum tier). It is
+    // therefore admitted on uniform-NB now instead of routing to the
+    // pure-fixnum tier — the precondition for retiring that tier. (Earlier
+    // this asserted rejection; the SystemV-conv selection from #47 made
+    // the host-stack hazard a non-issue for non-tail-only bodies.)
+    lowerer
+        .compile_uniform_nb(&f)
+        .expect("pure non-tail self-recursion must compile on uniform-NB (#50)");
 }
