@@ -17,10 +17,12 @@
 pub mod builtins;
 pub mod completion;
 pub mod diagnostics;
+pub mod format;
 pub mod hover;
 pub mod references;
 pub mod server;
 pub mod symbols;
 pub mod text;
+pub mod workspace;
 
 pub use server::Backend;

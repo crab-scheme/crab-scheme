@@ -9,12 +9,13 @@ use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentHighlight,
-    DocumentHighlightKind, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, Location, MessageType, OneOf,
-    ReferenceParams, ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions,
-    SignatureHelpParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
+    DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
+    MessageType, OneOf, Position, Range, ReferenceParams, ServerCapabilities, ServerInfo,
+    SignatureHelp, SignatureHelpOptions, SignatureHelpParams, SymbolInformation,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -31,6 +32,9 @@ struct Document {
 pub struct Backend {
     client: Client,
     documents: DashMap<Url, Document>,
+    /// Workspace root, captured at `initialize`. Used by
+    /// `workspace/symbol` to scan the project's `.scm` files.
+    root: std::sync::Mutex<Option<Url>>,
 }
 
 impl Backend {
@@ -40,6 +44,7 @@ impl Backend {
         Self {
             client,
             documents: DashMap::new(),
+            root: std::sync::Mutex::new(None),
         }
     }
 
@@ -77,7 +82,17 @@ impl Backend {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _params: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Capture the workspace root for workspace/symbol scanning.
+        #[allow(deprecated)] // root_uri is deprecated but still widely sent
+        let root = params
+            .workspace_folders
+            .and_then(|fs| fs.into_iter().next())
+            .map(|f| f.uri)
+            .or(params.root_uri);
+        if let Some(r) = root {
+            *self.root.lock().unwrap() = Some(r);
+        }
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "crabscheme-lsp".to_string(),
@@ -107,6 +122,9 @@ impl LanguageServer for Backend {
                     retrigger_characters: None,
                     work_done_progress_options: Default::default(),
                 }),
+                // Phase 5: whole-document formatting + workspace symbols.
+                document_formatting_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -249,6 +267,44 @@ impl LanguageServer for Backend {
         }))
         .unwrap_or(None);
         Ok(help)
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let Some(text) = self.documents.get(&uri).map(|d| d.text.clone()) else {
+            return Ok(None);
+        };
+        let formatted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::format::format(&text)
+        }))
+        .unwrap_or_else(|_| text.clone());
+        if formatted == text {
+            return Ok(Some(Vec::new()));
+        }
+        // Replace the whole document with the formatted text.
+        let end = crate::text::offset_to_position(&text, text.len());
+        Ok(Some(vec![TextEdit {
+            range: Range::new(Position::new(0, 0), end),
+            new_text: formatted,
+        }]))
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let Some(root) = self.root.lock().unwrap().clone() else {
+            return Ok(None);
+        };
+        let Ok(root_path) = root.to_file_path() else {
+            return Ok(None);
+        };
+        let query = params.query;
+        let symbols = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::workspace::workspace_symbols(&root_path, &query)
+        }))
+        .unwrap_or_default();
+        Ok(Some(symbols))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
