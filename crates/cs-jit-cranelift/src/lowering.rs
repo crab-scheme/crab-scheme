@@ -5176,7 +5176,23 @@ impl Lowerer {
                     | Inst::MakePromise(_, _)
                     | Inst::ForceForced(_, _)
                     | Inst::AlistCopy(_, _)
-                    | Inst::DeleteDuplicates(_, _) => {
+                    | Inst::DeleteDuplicates(_, _)
+                    | Inst::VecCopy(_, _)
+                    | Inst::VecFill(_, _, _)
+                    | Inst::VectorToList(_, _)
+                    | Inst::VectorToString(_, _)
+                    | Inst::VectorEqP(_, _, _)
+                    | Inst::VecCopyFrom(_, _, _)
+                    | Inst::VecCopySlice(_, _, _, _)
+                    | Inst::VectorToListSlice(_, _, _, _)
+                    | Inst::VectorToListSliceFrom(_, _, _)
+                    | Inst::VectorToStringSlice(_, _, _, _)
+                    | Inst::VectorToStringSliceFrom(_, _, _)
+                    | Inst::VecFillFrom(_, _, _, _)
+                    | Inst::VecFillSlice(_, _, _, _, _)
+                    | Inst::VecCopyBang(_, _, _, _)
+                    | Inst::VecCopyBangFrom(_, _, _, _, _)
+                    | Inst::VecCopyBangSlice(_, _, _, _, _, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -5585,6 +5601,54 @@ impl Lowerer {
                 delete_duplicates: self
                     .module
                     .declare_func_in_func(self.delete_duplicates_func, builder.func),
+                vec_copy: self
+                    .module
+                    .declare_func_in_func(self.vec_copy_func, builder.func),
+                vec_fill: self
+                    .module
+                    .declare_func_in_func(self.vec_fill_func, builder.func),
+                vector_to_list: self
+                    .module
+                    .declare_func_in_func(self.vector_to_list_func, builder.func),
+                vector_to_string: self
+                    .module
+                    .declare_func_in_func(self.vector_to_string_func, builder.func),
+                vector_eq_p: self
+                    .module
+                    .declare_func_in_func(self.vector_eq_p_func, builder.func),
+                vector_copy_from: self
+                    .module
+                    .declare_func_in_func(self.vector_copy_from_func, builder.func),
+                vector_copy_slice: self
+                    .module
+                    .declare_func_in_func(self.vector_copy_slice_func, builder.func),
+                vector_to_list_slice: self
+                    .module
+                    .declare_func_in_func(self.vector_to_list_slice_func, builder.func),
+                vector_to_list_slice_from: self
+                    .module
+                    .declare_func_in_func(self.vector_to_list_slice_from_func, builder.func),
+                vector_to_string_slice: self
+                    .module
+                    .declare_func_in_func(self.vector_to_string_slice_func, builder.func),
+                vector_to_string_slice_from: self
+                    .module
+                    .declare_func_in_func(self.vector_to_string_slice_from_func, builder.func),
+                vector_fill_from: self
+                    .module
+                    .declare_func_in_func(self.vector_fill_from_func, builder.func),
+                vector_fill_slice: self
+                    .module
+                    .declare_func_in_func(self.vector_fill_slice_func, builder.func),
+                vector_copy_bang: self
+                    .module
+                    .declare_func_in_func(self.vector_copy_bang_func, builder.func),
+                vector_copy_bang_from: self
+                    .module
+                    .declare_func_in_func(self.vector_copy_bang_from_func, builder.func),
+                vector_copy_bang_slice: self
+                    .module
+                    .declare_func_in_func(self.vector_copy_bang_slice_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -7620,6 +7684,24 @@ struct NbHelpers {
     force_forced: cranelift_codegen::ir::FuncRef,
     alist_copy: cranelift_codegen::ir::FuncRef,
     delete_duplicates: cranelift_codegen::ir::FuncRef,
+    // #50 — vector builtins (NB vector pointer + raw index args; the
+    // gc-helpers deopt internally on out-of-range).
+    vec_copy: cranelift_codegen::ir::FuncRef,
+    vec_fill: cranelift_codegen::ir::FuncRef,
+    vector_to_list: cranelift_codegen::ir::FuncRef,
+    vector_to_string: cranelift_codegen::ir::FuncRef,
+    vector_eq_p: cranelift_codegen::ir::FuncRef,
+    vector_copy_from: cranelift_codegen::ir::FuncRef,
+    vector_copy_slice: cranelift_codegen::ir::FuncRef,
+    vector_to_list_slice: cranelift_codegen::ir::FuncRef,
+    vector_to_list_slice_from: cranelift_codegen::ir::FuncRef,
+    vector_to_string_slice: cranelift_codegen::ir::FuncRef,
+    vector_to_string_slice_from: cranelift_codegen::ir::FuncRef,
+    vector_fill_from: cranelift_codegen::ir::FuncRef,
+    vector_fill_slice: cranelift_codegen::ir::FuncRef,
+    vector_copy_bang: cranelift_codegen::ir::FuncRef,
+    vector_copy_bang_from: cranelift_codegen::ir::FuncRef,
+    vector_copy_bang_slice: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -8625,6 +8707,112 @@ fn lower_inst_uniform_nb(
             }
             &Inst::DeleteDuplicates(dst, src) => {
                 let r = nb_ptr_call(b, helpers.delete_duplicates, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            // #50 — vector builtins. NB vector pointer passed through;
+            // index/count args decoded NB→raw (the gc-helpers take raw
+            // indices and deopt internally on out-of-range). Fill args
+            // are values, passed NB.
+            &Inst::VecCopy(dst, src) => {
+                let r = nb_ptr_call(b, helpers.vec_copy, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::VecFill(dst, vec, fill) => {
+                let r = nb_ptr_call(
+                    b,
+                    helpers.vec_fill,
+                    &[lookup(map, vec)?, lookup(map, fill)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::VectorToList(dst, src) => {
+                let r = nb_ptr_call(b, helpers.vector_to_list, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::VectorToString(dst, src) => {
+                let r = nb_ptr_call(b, helpers.vector_to_string, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::VectorEqP(dst, a, c) => {
+                let r = nb_bool_call(b, helpers.vector_eq_p, &[lookup(map, a)?, lookup(map, c)?]);
+                map.insert(dst, r);
+            }
+            &Inst::VecCopyFrom(dst, vec, start) => {
+                let vv = lookup(map, vec)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.vector_copy_from, &[vv, sv]);
+                map.insert(dst, r);
+            }
+            &Inst::VecCopySlice(dst, vec, start, end) => {
+                let vv = lookup(map, vec)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.vector_copy_slice, &[vv, sv, ev]);
+                map.insert(dst, r);
+            }
+            &Inst::VectorToListSlice(dst, vec, start, end) => {
+                let vv = lookup(map, vec)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.vector_to_list_slice, &[vv, sv, ev]);
+                map.insert(dst, r);
+            }
+            &Inst::VectorToListSliceFrom(dst, vec, start) => {
+                let vv = lookup(map, vec)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.vector_to_list_slice_from, &[vv, sv]);
+                map.insert(dst, r);
+            }
+            &Inst::VectorToStringSlice(dst, vec, start, end) => {
+                let vv = lookup(map, vec)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.vector_to_string_slice, &[vv, sv, ev]);
+                map.insert(dst, r);
+            }
+            &Inst::VectorToStringSliceFrom(dst, vec, start) => {
+                let vv = lookup(map, vec)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.vector_to_string_slice_from, &[vv, sv]);
+                map.insert(dst, r);
+            }
+            &Inst::VecFillFrom(dst, vec, fill, start) => {
+                let vv = lookup(map, vec)?;
+                let fv = lookup(map, fill)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.vector_fill_from, &[vv, fv, sv]);
+                map.insert(dst, r);
+            }
+            &Inst::VecFillSlice(dst, vec, fill, start, end) => {
+                let vv = lookup(map, vec)?;
+                let fv = lookup(map, fill)?;
+                let sv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.vector_fill_slice, &[vv, fv, sv, ev]);
+                map.insert(dst, r);
+            }
+            &Inst::VecCopyBang(dst, dest, at, src) => {
+                let d = lookup(map, dest)?;
+                let a = unbox_nb_fixnum(b, lookup(map, at)?);
+                let s = lookup(map, src)?;
+                let r = nb_ptr_call(b, helpers.vector_copy_bang, &[d, a, s]);
+                map.insert(dst, r);
+            }
+            &Inst::VecCopyBangFrom(dst, dest, at, src, start) => {
+                let d = lookup(map, dest)?;
+                let a = unbox_nb_fixnum(b, lookup(map, at)?);
+                let s = lookup(map, src)?;
+                let st = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.vector_copy_bang_from, &[d, a, s, st]);
+                map.insert(dst, r);
+            }
+            &Inst::VecCopyBangSlice(dst, dest, at, src, start, end) => {
+                let d = lookup(map, dest)?;
+                let a = unbox_nb_fixnum(b, lookup(map, at)?);
+                let s = lookup(map, src)?;
+                let st = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.vector_copy_bang_slice, &[d, a, s, st, ev]);
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
