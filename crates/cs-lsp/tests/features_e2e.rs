@@ -93,7 +93,25 @@ fn document_symbol_and_hover_over_stdio() {
     let hov = recv_id(&rx, 3);
     assert!(hov.contains("defined at line 1"), "hover wrong: {hov}");
 
-    send(r#"{"jsonrpc":"2.0","id":4,"method":"shutdown","params":null}"#);
+    // goto-definition on the use of f (line 1) → its define on line 0.
+    send(
+        r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///t.scm"},"position":{"line":1,"character":1}}}"#,
+    );
+    let def = recv_id(&rx, 4);
+    assert!(def.contains("\"line\":0"), "definition wrong: {def}");
+
+    // references of f (with declaration) → 2 Locations (define + use).
+    send(
+        r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/references","params":{"textDocument":{"uri":"file:///t.scm"},"position":{"line":1,"character":1},"context":{"includeDeclaration":true}}}"#,
+    );
+    let refs = recv_id(&rx, 5);
+    assert_eq!(
+        refs.matches("\"range\"").count(),
+        2,
+        "references wrong: {refs}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":6,"method":"shutdown","params":null}"#);
     send(r#"{"jsonrpc":"2.0","method":"exit","params":null}"#);
     drop(stdin);
     let _ = child.wait();

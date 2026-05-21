@@ -133,6 +133,58 @@ pub(crate) fn is_symbol(d: &Datum, sym: Symbol) -> bool {
     matches!(d, Datum::Symbol(s, _) if *s == sym)
 }
 
+/// The innermost identifier whose span contains byte `offset`, across
+/// all `forms`. Used by hover, definition, references, highlight.
+pub(crate) fn symbol_at(forms: &[&Datum], offset: usize) -> Option<(Symbol, Span)> {
+    forms.iter().find_map(|f| symbol_at_datum(f, offset))
+}
+
+fn symbol_at_datum(d: &Datum, offset: usize) -> Option<(Symbol, Span)> {
+    if !span_contains(d.span(), offset) {
+        return None;
+    }
+    match d {
+        Datum::Symbol(s, sp) => Some((*s, *sp)),
+        Datum::Pair(car, cdr, _) => {
+            symbol_at_datum(car, offset).or_else(|| symbol_at_datum(cdr, offset))
+        }
+        Datum::Vector(elems, _) => elems.iter().find_map(|e| symbol_at_datum(e, offset)),
+        _ => None,
+    }
+}
+
+fn span_contains(span: Span, offset: usize) -> bool {
+    !span.is_dummy() && (span.start as usize) <= offset && offset < (span.end as usize)
+}
+
+/// Spans of every occurrence of `target` (by symbol id) across `forms`.
+/// Symbol ids are name-based (the reader interns each name once), so
+/// this finds all textual uses of the identifier, definition included.
+/// Lexical scope / hygiene is not honored — that's the Phase 3.1
+/// expander-scope refinement.
+pub(crate) fn collect_symbol_spans(forms: &[&Datum], target: Symbol) -> Vec<Span> {
+    fn walk(d: &Datum, target: Symbol, out: &mut Vec<Span>) {
+        match d {
+            Datum::Symbol(s, sp) if *s == target => out.push(*sp),
+            Datum::Pair(car, cdr, _) => {
+                walk(car, target, out);
+                walk(cdr, target, out);
+            }
+            Datum::Vector(elems, _) => {
+                for e in elems {
+                    walk(e, target, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for &f in forms {
+        walk(f, target, &mut out);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

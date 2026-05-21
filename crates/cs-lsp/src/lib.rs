@@ -17,6 +17,7 @@
 pub mod builtins;
 pub mod diagnostics;
 pub mod hover;
+pub mod references;
 pub mod server;
 pub mod symbols;
 pub mod text;

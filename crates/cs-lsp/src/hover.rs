@@ -4,13 +4,13 @@
 //! special-form signature (from [`crate::builtins`]), or "defined at
 //! line N" for a user binding, or "unbound" otherwise.
 
-use cs_core::{Symbol, SymbolTable};
-use cs_diag::{SourceMap, Span};
+use cs_core::SymbolTable;
+use cs_diag::SourceMap;
 use cs_parse::{read_all, Datum};
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::builtins::builtin_doc;
-use crate::symbols::find_define_span;
+use crate::symbols::{find_define_span, symbol_at};
 use crate::text::{offset_to_position, position_to_offset, span_to_range};
 
 /// Hover info for `position` in `text`, or `None` if the cursor isn't on
@@ -43,29 +43,6 @@ pub fn hover(name: &str, text: &str, position: Position) -> Option<Hover> {
         }),
         range: Some(span_to_range(text, span)),
     })
-}
-
-/// Innermost identifier whose span contains `offset`, across all forms.
-fn symbol_at(forms: &[&Datum], offset: usize) -> Option<(Symbol, Span)> {
-    forms.iter().find_map(|f| symbol_at_datum(f, offset))
-}
-
-fn symbol_at_datum(d: &Datum, offset: usize) -> Option<(Symbol, Span)> {
-    if !span_contains(d.span(), offset) {
-        return None;
-    }
-    match d {
-        Datum::Symbol(s, sp) => Some((*s, *sp)),
-        Datum::Pair(car, cdr, _) => {
-            symbol_at_datum(car, offset).or_else(|| symbol_at_datum(cdr, offset))
-        }
-        Datum::Vector(elems, _) => elems.iter().find_map(|e| symbol_at_datum(e, offset)),
-        _ => None,
-    }
-}
-
-fn span_contains(span: Span, offset: usize) -> bool {
-    !span.is_dummy() && (span.start as usize) <= offset && offset < (span.end as usize)
 }
 
 #[cfg(test)]

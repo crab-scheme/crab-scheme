@@ -9,9 +9,11 @@ use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentSymbolParams, DocumentSymbolResponse, Hover, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf, ServerCapabilities,
-    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
+    MessageType, OneOf, ReferenceParams, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -90,6 +92,10 @@ impl LanguageServer for Backend {
                 // Phase 2: outline view (nested defines) + hover.
                 document_symbol_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // Phase 3: go-to-definition, references, highlight.
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -136,6 +142,74 @@ impl LanguageServer for Backend {
         }))
         .unwrap_or(None);
         Ok(result)
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let pos = params.text_document_position_params;
+        let uri = pos.text_document.uri;
+        let position = pos.position;
+        let Some(text) = self.documents.get(&uri).map(|d| d.text.clone()) else {
+            return Ok(None);
+        };
+        let name = uri.to_string();
+        let range = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::references::definition(&name, &text, position)
+        }))
+        .unwrap_or(None);
+        Ok(range.map(|range| GotoDefinitionResponse::Scalar(Location { uri, range })))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let pos = params.text_document_position;
+        let uri = pos.text_document.uri;
+        let position = pos.position;
+        let include = params.context.include_declaration;
+        let Some(text) = self.documents.get(&uri).map(|d| d.text.clone()) else {
+            return Ok(None);
+        };
+        let name = uri.to_string();
+        let ranges = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::references::references(&name, &text, position, include)
+        }))
+        .unwrap_or_default();
+        Ok(Some(
+            ranges
+                .into_iter()
+                .map(|range| Location {
+                    uri: uri.clone(),
+                    range,
+                })
+                .collect(),
+        ))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let pos = params.text_document_position_params;
+        let uri = pos.text_document.uri;
+        let position = pos.position;
+        let Some(text) = self.documents.get(&uri).map(|d| d.text.clone()) else {
+            return Ok(None);
+        };
+        let name = uri.to_string();
+        let ranges = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::references::document_highlights(&name, &text, position)
+        }))
+        .unwrap_or_default();
+        Ok(Some(
+            ranges
+                .into_iter()
+                .map(|range| DocumentHighlight {
+                    range,
+                    kind: Some(DocumentHighlightKind::TEXT),
+                })
+                .collect(),
+        ))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
