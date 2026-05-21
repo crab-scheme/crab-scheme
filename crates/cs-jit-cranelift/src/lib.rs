@@ -61,7 +61,10 @@ impl JitBackend for CraneliftBackend {
             self.lowerer = Some(Lowerer::new()?);
         }
         let lowerer = self.lowerer.as_mut().unwrap();
-        let ptr = lowerer.compile_pure_fixnum(rir)?;
+        // #50 — uniform-NB is the sole Cranelift backend. The returned
+        // pointer is the NB-ABI outer trampoline (NanboxValue i64 args
+        // and result).
+        let ptr = lowerer.compile_uniform_nb(rir)?;
         let cookie = self.next_cookie;
         self.next_cookie += 1;
         self.finalized.insert(cookie, ptr);
@@ -119,16 +122,23 @@ mod tests {
     }
 
     #[test]
-    fn compile_pure_fixnum_via_jit_backend_trait() {
+    fn compile_via_jit_backend_trait() {
         let mut b = CraneliftBackend::default();
         let f = lowering::testing::add_two_fixnums();
         let jf = b.compile(&f).expect("compile via JitBackend");
         assert_eq!(jf.backend, "cranelift");
         let ptr = b.native_ptr(&jf).expect("native_ptr present");
-        // SAFETY: ptr is the address of a finalized native function
-        // with the (i64, i64) -> i64 signature we declared.
+        // #50 — the backend now lowers via uniform-NB, whose outer
+        // trampoline speaks the NanboxValue i64 ABI. Encode the args and
+        // decode the result accordingly.
         let func: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
-        assert_eq!(func(40, 2), 42);
+        let a = cs_vm::vm::NanboxValue::fixnum(40).into_raw();
+        let c = cs_vm::vm::NanboxValue::fixnum(2).into_raw();
+        let r = func(a, c);
+        match unsafe { cs_vm::vm::NanboxValue(r).to_value() } {
+            cs_core::Value::Number(cs_core::Number::Fixnum(v)) => assert_eq!(v, 42),
+            other => panic!("expected Fixnum(42), got {other:?}"),
+        }
     }
 
     #[test]
@@ -171,9 +181,17 @@ mod tests {
         });
         let jf = b.compile(&f).expect("compile multi-block");
         let ptr = b.native_ptr(&jf).expect("native_ptr present");
+        // #50 — uniform-NB outer trampoline: NanboxValue i64 ABI.
         let func: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };
-        assert_eq!(func(5), 5);
-        assert_eq!(func(15), 30);
+        let call = |n: i64| -> i64 {
+            let r = func(cs_vm::vm::NanboxValue::fixnum(n).into_raw());
+            match unsafe { cs_vm::vm::NanboxValue(r).to_value() } {
+                cs_core::Value::Number(cs_core::Number::Fixnum(v)) => v,
+                other => panic!("expected Fixnum, got {other:?}"),
+            }
+        };
+        assert_eq!(call(5), 5);
+        assert_eq!(call(15), 30);
     }
 
     #[test]

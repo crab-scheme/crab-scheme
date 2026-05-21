@@ -278,25 +278,13 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     closure.set_jit_ptr(ptr, lam.params.len() as u32);
     closure.set_jit_param_types(&param_tags);
     closure.set_jit_needs_frame_env(builds_closures);
-    // ADR 0012 D-2 (iter BM) — install the harvested stack-map
-    // registry on the closure. Empty record-set is fine (means no
-    // call inside the body kept a Gc handle live across it). The
-    // GC scanner (iter BN) will use these maps to walk JIT frames.
-    if !lowerer.last_inner_stack_maps.is_empty() {
-        let mut maps = cs_vm::jit_stackmap::JitStackMaps::new(lowerer.last_inner_base);
-        for (pc, offsets) in lowerer.last_inner_stack_maps.drain() {
-            maps.insert(pc, offsets);
-        }
-        closure.set_jit_stack_maps(std::rc::Rc::new(maps));
-    }
     // Always compute the semantic return tag from `rir.return_type`
-    // (what the body conceptually returns). For the specialized tier
-    // this is also the ABI tag — the body emits raw i64 of that
-    // shape. For uniform-NB the ABI tag is `JIT_RT_NB` (the body
-    // emits a uniform NB i64 carrier) while the semantic tag still
-    // describes what the body conceptually returns, so observability
-    // surfaces like `jit-status` and `jit-introspection` can report
-    // the user-visible type rather than the ABI carrier.
+    // (what the body conceptually returns). For uniform-NB the ABI tag
+    // is `JIT_RT_NB` (the body emits a uniform NB i64 carrier) while
+    // the semantic tag still describes what the body conceptually
+    // returns, so observability surfaces like `jit-status` and
+    // `jit-introspection` can report the user-visible type rather than
+    // the ABI carrier.
     let semantic_tag = match rir.return_type {
         RirType::Boolean => cs_vm::vm::JIT_RT_BOOLEAN,
         RirType::Character => cs_vm::vm::JIT_RT_CHARACTER,

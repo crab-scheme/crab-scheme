@@ -929,7 +929,7 @@ fn diff_jit_introspection_and_distinct_compiles() {
     // (jit-status proc) Scheme-visible accessors.
     //
     // Also pins down a regression caught while writing this test:
-    // every call to compile_pure_fixnum used `declare_function` with
+    // every JIT compile used `declare_function` with
     // the same module-level name "anon-jit", colliding on the
     // second compile and silently leaving subsequent closures on
     // bytecode. The fix appends the lowerer's fresh_id to the
