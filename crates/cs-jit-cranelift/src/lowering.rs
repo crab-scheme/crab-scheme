@@ -5347,7 +5347,26 @@ impl Lowerer {
                     | Inst::PortPosition(_, _)
                     | Inst::PortHasSetPortPositionP(_, _)
                     | Inst::CurrentJiffy(_)
-                    | Inst::CurrentSecond(_) => {
+                    | Inst::CurrentSecond(_)
+                    | Inst::BvU8Ref(_, _, _)
+                    | Inst::BvS8Ref(_, _, _)
+                    | Inst::BvU16NativeRef(_, _, _)
+                    | Inst::BvS16NativeRef(_, _, _)
+                    | Inst::BvU32NativeRef(_, _, _)
+                    | Inst::BvS32NativeRef(_, _, _)
+                    | Inst::BvU64NativeRef(_, _, _)
+                    | Inst::BvS64NativeRef(_, _, _)
+                    | Inst::BvU8Set(_, _, _, _)
+                    | Inst::BvS8Set(_, _, _, _)
+                    | Inst::BvU16NativeSet(_, _, _, _)
+                    | Inst::BvS16NativeSet(_, _, _, _)
+                    | Inst::BvU32NativeSet(_, _, _, _)
+                    | Inst::BvS32NativeSet(_, _, _, _)
+                    | Inst::BvU64NativeSet(_, _, _, _)
+                    | Inst::BvS64NativeSet(_, _, _, _)
+                    | Inst::Div0(_, _, _)
+                    | Inst::Mod0(_, _, _)
+                    | Inst::StrBuild(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -6240,6 +6259,63 @@ impl Lowerer {
                 current_second: self
                     .module
                     .declare_func_in_func(self.current_second_func, builder.func),
+                bv_u8_ref: self
+                    .module
+                    .declare_func_in_func(self.bv_u8_ref_func, builder.func),
+                bv_u8_set: self
+                    .module
+                    .declare_func_in_func(self.bv_u8_set_func, builder.func),
+                bv_s8_ref: self
+                    .module
+                    .declare_func_in_func(self.bytevector_s8_ref_func, builder.func),
+                bv_s8_set: self
+                    .module
+                    .declare_func_in_func(self.bytevector_s8_set_func, builder.func),
+                bv_u16_ref: self
+                    .module
+                    .declare_func_in_func(self.bytevector_u16_native_ref_func, builder.func),
+                bv_u16_set: self
+                    .module
+                    .declare_func_in_func(self.bytevector_u16_native_set_func, builder.func),
+                bv_s16_ref: self
+                    .module
+                    .declare_func_in_func(self.bytevector_s16_native_ref_func, builder.func),
+                bv_s16_set: self
+                    .module
+                    .declare_func_in_func(self.bytevector_s16_native_set_func, builder.func),
+                bv_u32_ref: self
+                    .module
+                    .declare_func_in_func(self.bytevector_u32_native_ref_func, builder.func),
+                bv_u32_set: self
+                    .module
+                    .declare_func_in_func(self.bytevector_u32_native_set_func, builder.func),
+                bv_s32_ref: self
+                    .module
+                    .declare_func_in_func(self.bytevector_s32_native_ref_func, builder.func),
+                bv_s32_set: self
+                    .module
+                    .declare_func_in_func(self.bytevector_s32_native_set_func, builder.func),
+                bv_u64_ref: self
+                    .module
+                    .declare_func_in_func(self.bytevector_u64_native_ref_func, builder.func),
+                bv_u64_set: self
+                    .module
+                    .declare_func_in_func(self.bytevector_u64_native_set_func, builder.func),
+                bv_s64_ref: self
+                    .module
+                    .declare_func_in_func(self.bytevector_s64_native_ref_func, builder.func),
+                bv_s64_set: self
+                    .module
+                    .declare_func_in_func(self.bytevector_s64_native_set_func, builder.func),
+                div0: self
+                    .module
+                    .declare_func_in_func(self.div0_func, builder.func),
+                mod0: self
+                    .module
+                    .declare_func_in_func(self.mod0_func, builder.func),
+                make_string_buf: self
+                    .module
+                    .declare_func_in_func(self.make_string_buf_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -8461,6 +8537,28 @@ struct NbHelpers {
     port_has_set_port_position_p: cranelift_codegen::ir::FuncRef,
     current_jiffy: cranelift_codegen::ir::FuncRef,
     current_second: cranelift_codegen::ir::FuncRef,
+    // #50 — bytevector typed accessors (bv pointer + raw offset; ref →
+    // fixnum-or-bignum via fixnum_to_nb, set takes a raw int value),
+    // Div0/Mod0 (fx arith), and string (build).
+    bv_u8_ref: cranelift_codegen::ir::FuncRef,
+    bv_u8_set: cranelift_codegen::ir::FuncRef,
+    bv_s8_ref: cranelift_codegen::ir::FuncRef,
+    bv_s8_set: cranelift_codegen::ir::FuncRef,
+    bv_u16_ref: cranelift_codegen::ir::FuncRef,
+    bv_u16_set: cranelift_codegen::ir::FuncRef,
+    bv_s16_ref: cranelift_codegen::ir::FuncRef,
+    bv_s16_set: cranelift_codegen::ir::FuncRef,
+    bv_u32_ref: cranelift_codegen::ir::FuncRef,
+    bv_u32_set: cranelift_codegen::ir::FuncRef,
+    bv_s32_ref: cranelift_codegen::ir::FuncRef,
+    bv_s32_set: cranelift_codegen::ir::FuncRef,
+    bv_u64_ref: cranelift_codegen::ir::FuncRef,
+    bv_u64_set: cranelift_codegen::ir::FuncRef,
+    bv_s64_ref: cranelift_codegen::ir::FuncRef,
+    bv_s64_set: cranelift_codegen::ir::FuncRef,
+    div0: cranelift_codegen::ir::FuncRef,
+    mod0: cranelift_codegen::ir::FuncRef,
+    make_string_buf: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -10489,6 +10587,80 @@ fn lower_inst_uniform_nb(
                 let r = b.inst_results(call)[0];
                 map.insert(dst, r);
             }
+            // #50 — bytevector typed reads. bv pointer NB, offset decodes
+            // NB→raw; the raw int result is encoded fixnum-or-bignum.
+            &Inst::BvU8Ref(dst, bv, k)
+            | &Inst::BvS8Ref(dst, bv, k)
+            | &Inst::BvU16NativeRef(dst, bv, k)
+            | &Inst::BvS16NativeRef(dst, bv, k)
+            | &Inst::BvU32NativeRef(dst, bv, k)
+            | &Inst::BvS32NativeRef(dst, bv, k)
+            | &Inst::BvU64NativeRef(dst, bv, k)
+            | &Inst::BvS64NativeRef(dst, bv, k) => {
+                let fnref = match inst {
+                    Inst::BvU8Ref(..) => helpers.bv_u8_ref,
+                    Inst::BvS8Ref(..) => helpers.bv_s8_ref,
+                    Inst::BvU16NativeRef(..) => helpers.bv_u16_ref,
+                    Inst::BvS16NativeRef(..) => helpers.bv_s16_ref,
+                    Inst::BvU32NativeRef(..) => helpers.bv_u32_ref,
+                    Inst::BvS32NativeRef(..) => helpers.bv_s32_ref,
+                    Inst::BvU64NativeRef(..) => helpers.bv_u64_ref,
+                    Inst::BvS64NativeRef(..) => helpers.bv_s64_ref,
+                    _ => unreachable!(),
+                };
+                let bvv = lookup(map, bv)?;
+                let kv = unbox_nb_fixnum(b, lookup(map, k)?);
+                let r = nb_call_fx_nb(b, fnref, helpers.fixnum_to_nb, &[bvv, kv]);
+                map.insert(dst, r);
+            }
+            // #50 — bytevector typed writes. offset + int value decode.
+            &Inst::BvU8Set(dst, bv, k, v)
+            | &Inst::BvS8Set(dst, bv, k, v)
+            | &Inst::BvU16NativeSet(dst, bv, k, v)
+            | &Inst::BvS16NativeSet(dst, bv, k, v)
+            | &Inst::BvU32NativeSet(dst, bv, k, v)
+            | &Inst::BvS32NativeSet(dst, bv, k, v)
+            | &Inst::BvU64NativeSet(dst, bv, k, v)
+            | &Inst::BvS64NativeSet(dst, bv, k, v) => {
+                let fnref = match inst {
+                    Inst::BvU8Set(..) => helpers.bv_u8_set,
+                    Inst::BvS8Set(..) => helpers.bv_s8_set,
+                    Inst::BvU16NativeSet(..) => helpers.bv_u16_set,
+                    Inst::BvS16NativeSet(..) => helpers.bv_s16_set,
+                    Inst::BvU32NativeSet(..) => helpers.bv_u32_set,
+                    Inst::BvS32NativeSet(..) => helpers.bv_s32_set,
+                    Inst::BvU64NativeSet(..) => helpers.bv_u64_set,
+                    Inst::BvS64NativeSet(..) => helpers.bv_s64_set,
+                    _ => unreachable!(),
+                };
+                let bvv = lookup(map, bv)?;
+                let kv = unbox_nb_fixnum(b, lookup(map, k)?);
+                let vv = unbox_nb_fixnum(b, lookup(map, v)?);
+                let r = nb_ptr_call(b, fnref, &[bvv, kv, vv]);
+                map.insert(dst, r);
+            }
+            // #50 — div0/mod0 (R6RS rounding division), fx arith.
+            &Inst::Div0(dst, a, c) => {
+                let av = unbox_nb_fixnum(b, lookup(map, a)?);
+                let cv = unbox_nb_fixnum(b, lookup(map, c)?);
+                let r = nb_fx_call_or_deopt(b, helpers.request_deopt, helpers.div0, &[av, cv]);
+                map.insert(dst, r);
+            }
+            &Inst::Mod0(dst, a, c) => {
+                let av = unbox_nb_fixnum(b, lookup(map, a)?);
+                let cv = unbox_nb_fixnum(b, lookup(map, c)?);
+                let r = nb_fx_call_or_deopt(b, helpers.request_deopt, helpers.mod0, &[av, cv]);
+                map.insert(dst, r);
+            }
+            // #50 — string (build) from chars: variadic buffer.
+            Inst::StrBuild(dst, args) => {
+                let arg_vs: Vec<cranelift_codegen::ir::Value> = args
+                    .iter()
+                    .map(|a| lookup(map, *a))
+                    .collect::<Result<_, _>>()?;
+                let r = nb_buf_call(b, helpers.make_string_buf, &arg_vs);
+                map.insert(*dst, r);
+            }
             // CharToInt (char->integer): the inverse — keep the codepoint
             // payload, retag as Fixnum (signature bits, tag 0). Without
             // this dedicated direction `char->integer` left the value
@@ -10859,6 +11031,21 @@ fn nb_fixnum_call(
     let call = b.ins().call(fnref, args);
     let raw = b.inst_results(call)[0];
     box_raw_fixnum(b, raw)
+}
+
+/// #50 — call a helper returning a raw i64 that may exceed 47 bits
+/// (bytevector u64/s64 native ref, …) and encode it via `fixnum_to_nb`
+/// (bignum if needed). Safe for the smaller-width reads too.
+fn nb_call_fx_nb(
+    b: &mut FunctionBuilder,
+    fnref: cranelift_codegen::ir::FuncRef,
+    fixnum_to_nb: cranelift_codegen::ir::FuncRef,
+    args: &[cranelift_codegen::ir::Value],
+) -> cranelift_codegen::ir::Value {
+    let call = b.ins().call(fnref, args);
+    let raw = b.inst_results(call)[0];
+    let enc = b.ins().call(fixnum_to_nb, &[raw]);
+    b.inst_results(enc)[0]
 }
 
 /// #50 — trap-free Fixnum binop (bitwise-and/or/xor, min, max) on NB
