@@ -79,6 +79,17 @@ pub struct Lowerer {
     /// FuncId of `vm_alloc_pair(car, car_tag, cdr, cdr_tag) -> i64`.
     /// `Inst::Cons` lowers to a Cranelift call against this.
     alloc_pair_func: cranelift_module::FuncId,
+    /// FuncId of `vm_alloc_pair_region(car, car_tag, cdr, cdr_tag)
+    /// -> i64` (layer-3 region allocator). `Inst::ConsRegion` lowers
+    /// to a call against this; the runtime helper allocates into the
+    /// innermost in-scope `cs_gc::Region` (resolved via the
+    /// cs-runtime region resolver) and falls back to Rc allocation if
+    /// no region is in scope. Only declared with the `regions`
+    /// feature — cs-vm's `vm_alloc_pair_region_gc` is `regions`-gated.
+    /// Produced by the cs-opt `escape-to-region` pass (#51) and by the
+    /// explicit `cons-in-region` builtin.
+    #[cfg(feature = "regions")]
+    alloc_pair_region_func: cranelift_module::FuncId,
     /// FuncId of `vm_pair_car(pair) -> i64`. Reserved for `car`
     /// lowering.
     #[allow(dead_code)]
@@ -820,6 +831,15 @@ impl Lowerer {
         // (vm_alloc_pair etc.) remain defined in cs-vm but become
         // unreachable from JIT'd code after this commit.
         builder.symbol("vm_alloc_pair", cs_vm::vm::vm_alloc_pair_gc as *const u8);
+        // Layer 3 — Inst::ConsRegion calls this region-allocating
+        // counterpart. The runtime helper resolves the current region
+        // via the cs-runtime resolver hook; falls back to Rc
+        // allocation if no region is in scope.
+        #[cfg(feature = "regions")]
+        builder.symbol(
+            "vm_alloc_pair_region",
+            cs_vm::vm::vm_alloc_pair_region_gc as *const u8,
+        );
         builder.symbol("vm_pair_car", cs_vm::vm::vm_pair_car_gc as *const u8);
         builder.symbol("vm_pair_cdr", cs_vm::vm::vm_pair_cdr_gc as *const u8);
         builder.symbol("vm_pair_p", cs_vm::vm::vm_pair_p_gc as *const u8);
@@ -1793,6 +1813,18 @@ impl Lowerer {
                 &alloc_pair_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_alloc_pair: {e}")))?;
+        // Layer-3 region allocator, same (i64,i64,i64,i64)->i64 shape
+        // as vm_alloc_pair. Only when `regions` is on.
+        #[cfg(feature = "regions")]
+        let alloc_pair_region_func = module
+            .declare_function(
+                "vm_alloc_pair_region",
+                cranelift_module::Linkage::Import,
+                &alloc_pair_sig,
+            )
+            .map_err(|e| {
+                JitError::Codegen(format!("declare_function vm_alloc_pair_region: {e}"))
+            })?;
 
         // vm_pair_car(pair: i64) -> i64 and vm_pair_cdr same shape.
         let mut pair_accessor_sig = module.make_signature();
@@ -4275,6 +4307,8 @@ impl Lowerer {
             env_set_nb_func,
             env_define_local_nb_func,
             alloc_pair_func,
+            #[cfg(feature = "regions")]
+            alloc_pair_region_func,
             pair_car_func,
             pair_cdr_func,
             pair_p_func,
@@ -4642,6 +4676,13 @@ impl Lowerer {
             let last_idx = blk.insts.len().saturating_sub(1);
             for (i, inst) in blk.insts.iter().enumerate() {
                 match inst {
+                    // Layer-3 region cons (#51). Supported only with the
+                    // `regions` feature — its lowering arm and the
+                    // `vm_alloc_pair_region` helper are `regions`-gated.
+                    // Without `regions` it falls to the catch-all below
+                    // (declines → VM).
+                    #[cfg(feature = "regions")]
+                    Inst::ConsRegion(_, _, _, _, _) => {}
                     Inst::LoadConst(_, _)
                     | Inst::Add(_, _, _)
                     | Inst::Sub(_, _, _)
@@ -5131,6 +5172,10 @@ impl Lowerer {
                 alloc_pair: self
                     .module
                     .declare_func_in_func(self.alloc_pair_func, builder.func),
+                #[cfg(feature = "regions")]
+                alloc_pair_region: self
+                    .module
+                    .declare_func_in_func(self.alloc_pair_region_func, builder.func),
                 pair_car: self
                     .module
                     .declare_func_in_func(self.pair_car_func, builder.func),
@@ -6482,6 +6527,8 @@ struct NbHelpers {
     ge: cranelift_codegen::ir::FuncRef,
     // Pair primitives.
     alloc_pair: cranelift_codegen::ir::FuncRef,
+    #[cfg(feature = "regions")]
+    alloc_pair_region: cranelift_codegen::ir::FuncRef,
     pair_car: cranelift_codegen::ir::FuncRef,
     pair_cdr: cranelift_codegen::ir::FuncRef,
     pair_p: cranelift_codegen::ir::FuncRef,
@@ -6969,6 +7016,25 @@ fn lower_inst_uniform_nb(
                 let call = b
                     .ins()
                     .call(helpers.alloc_pair, &[car_v, any_tag, cdr_v, any_tag]);
+                let result = b.inst_results(call)[0];
+                b.declare_value_needs_stack_map(result);
+                map.insert(dst, result);
+            }
+            // Layer-3 region-allocating cons (#51 escape analysis). Same
+            // NB-operand shape as `Inst::Cons` but routes to
+            // `vm_alloc_pair_region`, which allocates the pair in the
+            // innermost in-scope region (or falls back to Rc if none).
+            // Only reachable when `regions` is on; the prewalk gates
+            // ConsRegion behind the same feature, so without `regions`
+            // it never reaches lowering (declines → VM).
+            #[cfg(feature = "regions")]
+            &Inst::ConsRegion(dst, car, _car_tag, cdr, _cdr_tag) => {
+                let car_v = lookup(map, car)?;
+                let cdr_v = lookup(map, cdr)?;
+                let any_tag = b.ins().iconst(I64, cs_vm::vm::JIT_RT_ANY as i64);
+                let call = b
+                    .ins()
+                    .call(helpers.alloc_pair_region, &[car_v, any_tag, cdr_v, any_tag]);
                 let result = b.inst_results(call)[0];
                 b.declare_value_needs_stack_map(result);
                 map.insert(dst, result);
