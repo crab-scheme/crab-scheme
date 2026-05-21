@@ -25,6 +25,10 @@ members = [
     "crates/cs-aot",
     "crates/cs-cli",
     "crates/cs-cli-sha2",
+    # Language Server Protocol server (docs/milestones/lsp-server-plan.md).
+    # Reuses the front-end (cs-parse/cs-expand/cs-diag) for diagnostics,
+    # hover, go-to-def, completion — no codegen deps.
+    "crates/cs-lsp",
     # BEAM-style runtime (see docs/research/beam_runtime_spec.md).
     # cs-supervisor was removed: per the Rust/Scheme split, supervision
     # trees live in lib/beam/prelude.scm on top of the four cs-actor
