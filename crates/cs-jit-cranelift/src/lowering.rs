@@ -5192,7 +5192,25 @@ impl Lowerer {
                     | Inst::VecFillSlice(_, _, _, _, _)
                     | Inst::VecCopyBang(_, _, _, _)
                     | Inst::VecCopyBangFrom(_, _, _, _, _)
-                    | Inst::VecCopyBangSlice(_, _, _, _, _, _) => {
+                    | Inst::VecCopyBangSlice(_, _, _, _, _, _)
+                    | Inst::StrP(_, _)
+                    | Inst::StrLength(_, _)
+                    | Inst::StrLt(_, _, _)
+                    | Inst::StrGt(_, _, _)
+                    | Inst::StrLe(_, _, _)
+                    | Inst::StrGe(_, _, _)
+                    | Inst::StrCiEq(_, _, _)
+                    | Inst::StrCiLt(_, _, _)
+                    | Inst::StrCiGt(_, _, _)
+                    | Inst::StrCiLe(_, _, _)
+                    | Inst::StrCiGe(_, _, _)
+                    | Inst::StringDowncase(_, _)
+                    | Inst::StringUpcase(_, _)
+                    | Inst::StringFoldcase(_, _)
+                    | Inst::StringTitlecase(_, _)
+                    | Inst::StringReverse(_, _)
+                    | Inst::StringPrefixP(_, _, _)
+                    | Inst::StringSuffixP(_, _, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -5649,6 +5667,60 @@ impl Lowerer {
                 vector_copy_bang_slice: self
                     .module
                     .declare_func_in_func(self.vector_copy_bang_slice_func, builder.func),
+                string_p: self
+                    .module
+                    .declare_func_in_func(self.string_p_func, builder.func),
+                string_length: self
+                    .module
+                    .declare_func_in_func(self.string_length_func, builder.func),
+                string_lt: self
+                    .module
+                    .declare_func_in_func(self.string_lt_func, builder.func),
+                string_gt: self
+                    .module
+                    .declare_func_in_func(self.string_gt_func, builder.func),
+                string_le: self
+                    .module
+                    .declare_func_in_func(self.string_le_func, builder.func),
+                string_ge: self
+                    .module
+                    .declare_func_in_func(self.string_ge_func, builder.func),
+                string_ci_eq: self
+                    .module
+                    .declare_func_in_func(self.string_ci_eq_func, builder.func),
+                string_ci_lt: self
+                    .module
+                    .declare_func_in_func(self.string_ci_lt_func, builder.func),
+                string_ci_gt: self
+                    .module
+                    .declare_func_in_func(self.string_ci_gt_func, builder.func),
+                string_ci_le: self
+                    .module
+                    .declare_func_in_func(self.string_ci_le_func, builder.func),
+                string_ci_ge: self
+                    .module
+                    .declare_func_in_func(self.string_ci_ge_func, builder.func),
+                string_downcase: self
+                    .module
+                    .declare_func_in_func(self.string_downcase_func, builder.func),
+                string_upcase: self
+                    .module
+                    .declare_func_in_func(self.string_upcase_func, builder.func),
+                string_foldcase: self
+                    .module
+                    .declare_func_in_func(self.string_foldcase_func, builder.func),
+                string_titlecase: self
+                    .module
+                    .declare_func_in_func(self.string_titlecase_func, builder.func),
+                string_reverse: self
+                    .module
+                    .declare_func_in_func(self.string_reverse_func, builder.func),
+                string_prefix_p: self
+                    .module
+                    .declare_func_in_func(self.string_prefix_p_func, builder.func),
+                string_suffix_p: self
+                    .module
+                    .declare_func_in_func(self.string_suffix_p_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -7702,6 +7774,26 @@ struct NbHelpers {
     vector_copy_bang: cranelift_codegen::ir::FuncRef,
     vector_copy_bang_from: cranelift_codegen::ir::FuncRef,
     vector_copy_bang_slice: cranelift_codegen::ir::FuncRef,
+    // #50 — string predicate/comparison/transform/hash builtins
+    // (pointer-in → pointer / boolean / Fixnum out).
+    string_p: cranelift_codegen::ir::FuncRef,
+    string_length: cranelift_codegen::ir::FuncRef,
+    string_lt: cranelift_codegen::ir::FuncRef,
+    string_gt: cranelift_codegen::ir::FuncRef,
+    string_le: cranelift_codegen::ir::FuncRef,
+    string_ge: cranelift_codegen::ir::FuncRef,
+    string_ci_eq: cranelift_codegen::ir::FuncRef,
+    string_ci_lt: cranelift_codegen::ir::FuncRef,
+    string_ci_gt: cranelift_codegen::ir::FuncRef,
+    string_ci_le: cranelift_codegen::ir::FuncRef,
+    string_ci_ge: cranelift_codegen::ir::FuncRef,
+    string_downcase: cranelift_codegen::ir::FuncRef,
+    string_upcase: cranelift_codegen::ir::FuncRef,
+    string_foldcase: cranelift_codegen::ir::FuncRef,
+    string_titlecase: cranelift_codegen::ir::FuncRef,
+    string_reverse: cranelift_codegen::ir::FuncRef,
+    string_prefix_p: cranelift_codegen::ir::FuncRef,
+    string_suffix_p: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -8815,6 +8907,90 @@ fn lower_inst_uniform_nb(
                 let r = nb_ptr_call(b, helpers.vector_copy_bang_slice, &[d, a, s, st, ev]);
                 map.insert(dst, r);
             }
+            // #50 — string predicate/comparison/transform/hash builtins.
+            // Pointer operands pass through NB; results are NB pointer
+            // (transforms), NB Boolean (predicates/compares), or NB
+            // Fixnum (length/hash).
+            &Inst::StrP(dst, s) => {
+                let r = nb_bool_call(b, helpers.string_p, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StrLength(dst, s) => {
+                let r = nb_fixnum_call(b, helpers.string_length, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StrLt(dst, a, c) => {
+                let r = nb_bool_call(b, helpers.string_lt, &[lookup(map, a)?, lookup(map, c)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StrGt(dst, a, c) => {
+                let r = nb_bool_call(b, helpers.string_gt, &[lookup(map, a)?, lookup(map, c)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StrLe(dst, a, c) => {
+                let r = nb_bool_call(b, helpers.string_le, &[lookup(map, a)?, lookup(map, c)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StrGe(dst, a, c) => {
+                let r = nb_bool_call(b, helpers.string_ge, &[lookup(map, a)?, lookup(map, c)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StrCiEq(dst, a, c) => {
+                let r = nb_bool_call(b, helpers.string_ci_eq, &[lookup(map, a)?, lookup(map, c)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StrCiLt(dst, a, c) => {
+                let r = nb_bool_call(b, helpers.string_ci_lt, &[lookup(map, a)?, lookup(map, c)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StrCiGt(dst, a, c) => {
+                let r = nb_bool_call(b, helpers.string_ci_gt, &[lookup(map, a)?, lookup(map, c)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StrCiLe(dst, a, c) => {
+                let r = nb_bool_call(b, helpers.string_ci_le, &[lookup(map, a)?, lookup(map, c)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StrCiGe(dst, a, c) => {
+                let r = nb_bool_call(b, helpers.string_ci_ge, &[lookup(map, a)?, lookup(map, c)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringDowncase(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_downcase, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringUpcase(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_upcase, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringFoldcase(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_foldcase, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringTitlecase(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_titlecase, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringReverse(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_reverse, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringPrefixP(dst, a, c) => {
+                let r = nb_bool_call(
+                    b,
+                    helpers.string_prefix_p,
+                    &[lookup(map, a)?, lookup(map, c)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::StringSuffixP(dst, a, c) => {
+                let r = nb_bool_call(
+                    b,
+                    helpers.string_suffix_p,
+                    &[lookup(map, a)?, lookup(map, c)?],
+                );
+                map.insert(dst, r);
+            }
             // CharToInt (char->integer): the inverse — keep the codepoint
             // payload, retag as Fixnum (signature bits, tag 0). Without
             // this dedicated direction `char->integer` left the value
@@ -9108,6 +9284,18 @@ fn nb_char_pred(
     let raw = b.inst_results(call)[0];
     b.ins()
         .bor_imm(raw, cs_vm::vm::NanboxValue::FALSE.into_raw())
+}
+
+/// #50 — call a helper that returns a raw fixnum-range i64 (length,
+/// hash, …) and re-encode it as an NB Fixnum (same as VecLength).
+fn nb_fixnum_call(
+    b: &mut FunctionBuilder,
+    fnref: cranelift_codegen::ir::FuncRef,
+    args: &[cranelift_codegen::ir::Value],
+) -> cranelift_codegen::ir::Value {
+    let call = b.ins().call(fnref, args);
+    let raw = b.inst_results(call)[0];
+    box_raw_fixnum(b, raw)
 }
 
 /// #50 — trap-free Fixnum binop (bitwise-and/or/xor, min, max) on NB
