@@ -5300,7 +5300,11 @@ impl Lowerer {
                     | Inst::BitwiseArithShiftLeft(_, _, _)
                     | Inst::BitwiseArithShiftRight(_, _, _)
                     | Inst::DivEuclid(_, _, _)
-                    | Inst::ModEuclid(_, _, _) => {
+                    | Inst::ModEuclid(_, _, _)
+                    | Inst::NumberToString(_, _)
+                    | Inst::StringToNumber(_, _)
+                    | Inst::StringContains(_, _, _)
+                    | Inst::StringContainsRight(_, _, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -6085,6 +6089,18 @@ impl Lowerer {
                 mod_euclid: self
                     .module
                     .declare_func_in_func(self.mod_euclid_func, builder.func),
+                number_to_string: self
+                    .module
+                    .declare_func_in_func(self.number_to_string_func, builder.func),
+                string_to_number: self
+                    .module
+                    .declare_func_in_func(self.string_to_number_func, builder.func),
+                string_contains: self
+                    .module
+                    .declare_func_in_func(self.string_contains_func, builder.func),
+                string_contains_right: self
+                    .module
+                    .declare_func_in_func(self.string_contains_right_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -8259,6 +8275,13 @@ struct NbHelpers {
     bitwise_arith_shift_right: cranelift_codegen::ir::FuncRef,
     div_euclid: cranelift_codegen::ir::FuncRef,
     mod_euclid: cranelift_codegen::ir::FuncRef,
+    // #50 — number/string conversions + substring search (NB pass-through:
+    // number/string operands and number-or-#f / index-or-#f results all
+    // ride the NB lane unchanged).
+    number_to_string: cranelift_codegen::ir::FuncRef,
+    string_to_number: cranelift_codegen::ir::FuncRef,
+    string_contains: cranelift_codegen::ir::FuncRef,
+    string_contains_right: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -10044,6 +10067,33 @@ fn lower_inst_uniform_nb(
                 let cv = unbox_nb_fixnum(b, lookup(map, c)?);
                 let r =
                     nb_fx_call_or_deopt(b, helpers.request_deopt, helpers.mod_euclid, &[av, cv]);
+                map.insert(dst, r);
+            }
+            // #50 — number/string conversions + substring search. All
+            // operands and results ride the NB lane (number, string, and
+            // number-or-#f / index-or-#f results need no encode/decode).
+            &Inst::NumberToString(dst, x) => {
+                let r = nb_ptr_call(b, helpers.number_to_string, &[lookup(map, x)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringToNumber(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_to_number, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringContains(dst, h, n) => {
+                let r = nb_ptr_call(
+                    b,
+                    helpers.string_contains,
+                    &[lookup(map, h)?, lookup(map, n)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::StringContainsRight(dst, h, n) => {
+                let r = nb_ptr_call(
+                    b,
+                    helpers.string_contains_right,
+                    &[lookup(map, h)?, lookup(map, n)?],
+                );
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
