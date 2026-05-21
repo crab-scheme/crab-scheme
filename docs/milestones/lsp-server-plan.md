@@ -1,10 +1,11 @@
 # LSP Server Plan — Post-1.0-rc3
 
-> Status: **Phases 1–4 COMPLETE (2026-05-21)** — `cs-lsp` crate +
+> Status: **Phases 1–5 COMPLETE (2026-05-21)** — `cs-lsp` crate +
 > `crabscheme-lsp` binary ship diagnostics (P1), document symbols +
-> hover (P2), go-to-definition + references + highlight (P3), and
-> completion + signature help (P4); exit gates proven end-to-end.
-> Phases 5–6 open. Predecessor: 1.0-rc3
+> hover (P2), go-to-definition + references + highlight (P3),
+> completion + signature help (P4), and semantic tokens + formatting +
+> workspace symbols + rename (P5); exit gates proven end-to-end.
+> Phase 6 (editor integrations + distribution) open. Predecessor: 1.0-rc3
 > (`aot-hardening` complete; all 8 microbenches AOT correctly).
 > Estimated duration: 3-5 weeks across six phases.
 > Spec slug: `lsp-server`.
@@ -39,8 +40,23 @@
 > so it works mid-type (incomplete call); user-function signatures need a
 > parse. iter 4.2 (scope-aware completion) simplified to all-candidates
 > (client filters) — full scoping is the deferred expander-scope work.
-> **Next: Phase 5** (semantic tokens / formatting / workspace symbol /
-> rename).
+>
+> **Phase 5 done:** iter 5.1 (`semanticTokens/full` — re-lexes with
+> cs-lex, classifies identifiers as keyword/function/variable via the
+> SPECIAL_FORMS set + builtin table, delta-encoded UTF-16 per spec),
+> 5.3/5.4 (`format` depth-based reindenter + `formatting` handler), 5.5
+> (`workspace/symbol` — scans every `.scm` under the captured root,
+> reusing `document_symbols`), 5.6 (`rename` — reuses `references` to
+> rewrite every occurrence, same-file). New modules `format`,
+> `workspace`, `semantic_tokens`; new dep `cs-lex`. Both exit criteria
+> pass (unit + e2e `phase5_e2e.rs`): a messy `.scm` reindents on
+> `textDocument/formatting`; `workspace/symbol` finds cross-file
+> defines. **iter 5.2 (`semanticTokens/range`) SKIPPED** — `full` is
+> cheap enough that the range/delta optimization is unnecessary at this
+> scale (revisit if large-file latency shows up). Rename + references
+> are name-based (not hygiene-aware), inheriting the deferred iter 3.1
+> expander-scope limitation. **Next: Phase 6** (editor integrations +
+> distribution).
 >
 > **Target outcome:** ship `crabscheme-lsp`, a Language Server
 > Protocol implementation that gives editors (VS Code, Neovim,
