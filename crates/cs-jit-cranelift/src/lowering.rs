@@ -5334,7 +5334,20 @@ impl Lowerer {
                     | Inst::StringToSymbol(_, _)
                     | Inst::StringHash(_, _)
                     | Inst::SymbolHash(_, _)
-                    | Inst::EqualHash(_, _) => {
+                    | Inst::EqualHash(_, _)
+                    | Inst::SetCar(_, _, _)
+                    | Inst::SetCdr(_, _, _)
+                    | Inst::Length(_, _)
+                    | Inst::Last(_, _)
+                    | Inst::ListAppend(_, _)
+                    | Inst::BytevectorToU8List(_, _)
+                    | Inst::U8ListToBytevector(_, _)
+                    | Inst::StringToUtf8(_, _)
+                    | Inst::Utf8ToString(_, _)
+                    | Inst::PortPosition(_, _)
+                    | Inst::PortHasSetPortPositionP(_, _)
+                    | Inst::CurrentJiffy(_)
+                    | Inst::CurrentSecond(_) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -6188,6 +6201,45 @@ impl Lowerer {
                 fixnum_to_nb: self
                     .module
                     .declare_func_in_func(self.fixnum_to_nb_func, builder.func),
+                set_car: self
+                    .module
+                    .declare_func_in_func(self.set_car_func, builder.func),
+                set_cdr: self
+                    .module
+                    .declare_func_in_func(self.set_cdr_func, builder.func),
+                length: self
+                    .module
+                    .declare_func_in_func(self.length_func, builder.func),
+                last: self
+                    .module
+                    .declare_func_in_func(self.last_func, builder.func),
+                append_buf: self
+                    .module
+                    .declare_func_in_func(self.append_buf_func, builder.func),
+                bytevector_to_u8_list: self
+                    .module
+                    .declare_func_in_func(self.bytevector_to_u8_list_func, builder.func),
+                u8_list_to_bytevector: self
+                    .module
+                    .declare_func_in_func(self.u8_list_to_bytevector_func, builder.func),
+                string_to_utf8: self
+                    .module
+                    .declare_func_in_func(self.string_to_utf8_func, builder.func),
+                utf8_to_string: self
+                    .module
+                    .declare_func_in_func(self.utf8_to_string_func, builder.func),
+                port_position: self
+                    .module
+                    .declare_func_in_func(self.port_position_func, builder.func),
+                port_has_set_port_position_p: self
+                    .module
+                    .declare_func_in_func(self.port_has_set_port_position_p_func, builder.func),
+                current_jiffy: self
+                    .module
+                    .declare_func_in_func(self.current_jiffy_func, builder.func),
+                current_second: self
+                    .module
+                    .declare_func_in_func(self.current_second_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -8395,6 +8447,20 @@ struct NbHelpers {
     symbol_hash: cranelift_codegen::ir::FuncRef,
     equal_hash: cranelift_codegen::ir::FuncRef,
     fixnum_to_nb: cranelift_codegen::ir::FuncRef,
+    // #50 — pair mutate / list / conversions / port / time builtins.
+    set_car: cranelift_codegen::ir::FuncRef,
+    set_cdr: cranelift_codegen::ir::FuncRef,
+    length: cranelift_codegen::ir::FuncRef,
+    last: cranelift_codegen::ir::FuncRef,
+    append_buf: cranelift_codegen::ir::FuncRef,
+    bytevector_to_u8_list: cranelift_codegen::ir::FuncRef,
+    u8_list_to_bytevector: cranelift_codegen::ir::FuncRef,
+    string_to_utf8: cranelift_codegen::ir::FuncRef,
+    utf8_to_string: cranelift_codegen::ir::FuncRef,
+    port_position: cranelift_codegen::ir::FuncRef,
+    port_has_set_port_position_p: cranelift_codegen::ir::FuncRef,
+    current_jiffy: cranelift_codegen::ir::FuncRef,
+    current_second: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -10353,6 +10419,74 @@ fn lower_inst_uniform_nb(
                 let raw = b.inst_results(call)[0];
                 let enc = b.ins().call(helpers.fixnum_to_nb, &[raw]);
                 let r = b.inst_results(enc)[0];
+                map.insert(dst, r);
+            }
+            // #50 — pair mutate / list / conversion / port / time.
+            &Inst::SetCar(dst, p, v) => {
+                let r = nb_ptr_call(b, helpers.set_car, &[lookup(map, p)?, lookup(map, v)?]);
+                map.insert(dst, r);
+            }
+            &Inst::SetCdr(dst, p, v) => {
+                let r = nb_ptr_call(b, helpers.set_cdr, &[lookup(map, p)?, lookup(map, v)?]);
+                map.insert(dst, r);
+            }
+            &Inst::Length(dst, lst) => {
+                let r = nb_fixnum_call(b, helpers.length, &[lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            &Inst::Last(dst, lst) => {
+                let r = nb_ptr_call(b, helpers.last, &[lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            Inst::ListAppend(dst, args) => {
+                let arg_vs: Vec<cranelift_codegen::ir::Value> = args
+                    .iter()
+                    .map(|a| lookup(map, *a))
+                    .collect::<Result<_, _>>()?;
+                let r = nb_buf_call(b, helpers.append_buf, &arg_vs);
+                map.insert(*dst, r);
+            }
+            &Inst::BytevectorToU8List(dst, bv) => {
+                let r = nb_ptr_call(b, helpers.bytevector_to_u8_list, &[lookup(map, bv)?]);
+                map.insert(dst, r);
+            }
+            &Inst::U8ListToBytevector(dst, lst) => {
+                let r = nb_ptr_call(b, helpers.u8_list_to_bytevector, &[lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            &Inst::StringToUtf8(dst, s) => {
+                let r = nb_ptr_call(b, helpers.string_to_utf8, &[lookup(map, s)?]);
+                map.insert(dst, r);
+            }
+            &Inst::Utf8ToString(dst, bv) => {
+                let r = nb_ptr_call(b, helpers.utf8_to_string, &[lookup(map, bv)?]);
+                map.insert(dst, r);
+            }
+            &Inst::PortPosition(dst, port) => {
+                let r = nb_fixnum_call(b, helpers.port_position, &[lookup(map, port)?]);
+                map.insert(dst, r);
+            }
+            &Inst::PortHasSetPortPositionP(dst, port) => {
+                let r = nb_bool_call(
+                    b,
+                    helpers.port_has_set_port_position_p,
+                    &[lookup(map, port)?],
+                );
+                map.insert(dst, r);
+            }
+            // current-jiffy returns a raw nanosecond count (>47-bit) →
+            // encode via fixnum_to_nb; current-second returns f64 bits
+            // (NB Flonum) → pass through.
+            &Inst::CurrentJiffy(dst) => {
+                let call = b.ins().call(helpers.current_jiffy, &[]);
+                let raw = b.inst_results(call)[0];
+                let enc = b.ins().call(helpers.fixnum_to_nb, &[raw]);
+                let r = b.inst_results(enc)[0];
+                map.insert(dst, r);
+            }
+            &Inst::CurrentSecond(dst) => {
+                let call = b.ins().call(helpers.current_second, &[]);
+                let r = b.inst_results(call)[0];
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint

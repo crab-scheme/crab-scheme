@@ -306,7 +306,27 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
             }
             let pure_result = catch_unwind(AssertUnwindSafe(|| lowerer.compile_pure_fixnum(&rir)));
             match pure_result {
-                Ok(Ok(p)) => (p, None),
+                Ok(Ok(p)) => {
+                    if std::env::var("CS_TIER_TRACE").is_ok() {
+                        let kinds: std::collections::BTreeSet<String> = rir
+                            .blocks
+                            .iter()
+                            .flat_map(|b| b.insts.iter())
+                            .map(|i| {
+                                format!("{i:?}")
+                                    .split(['(', ' '])
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_string()
+                            })
+                            .collect();
+                        eprintln!(
+                            "[tier] PURE-FIXNUM HIT params={:?} insts={kinds:?}",
+                            rir.params
+                        );
+                    }
+                    (p, None)
+                }
                 Err(_) => {
                     poison.set(true);
                     return;
