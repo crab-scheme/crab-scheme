@@ -5137,7 +5137,16 @@ impl Lowerer {
                     | Inst::AppendReverse(_, _, _)
                     | Inst::NotPairP(_, _)
                     | Inst::ListP(_, _)
-                    | Inst::ProperListP(_, _) => {
+                    | Inst::ProperListP(_, _)
+                    | Inst::CharUpcase(_, _)
+                    | Inst::CharDowncase(_, _)
+                    | Inst::CharFoldcase(_, _)
+                    | Inst::CharTitlecase(_, _)
+                    | Inst::CharAlphabeticP(_, _)
+                    | Inst::CharNumericP(_, _)
+                    | Inst::CharWhitespaceP(_, _)
+                    | Inst::CharUpperCaseP(_, _)
+                    | Inst::CharLowerCaseP(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -5438,6 +5447,33 @@ impl Lowerer {
                 proper_list_p: self
                     .module
                     .declare_func_in_func(self.proper_list_p_func, builder.func),
+                char_upcase: self
+                    .module
+                    .declare_func_in_func(self.char_upcase_func, builder.func),
+                char_downcase: self
+                    .module
+                    .declare_func_in_func(self.char_downcase_func, builder.func),
+                char_foldcase: self
+                    .module
+                    .declare_func_in_func(self.char_foldcase_func, builder.func),
+                char_titlecase: self
+                    .module
+                    .declare_func_in_func(self.char_titlecase_func, builder.func),
+                char_alphabetic_p: self
+                    .module
+                    .declare_func_in_func(self.char_alphabetic_p_func, builder.func),
+                char_numeric_p: self
+                    .module
+                    .declare_func_in_func(self.char_numeric_p_func, builder.func),
+                char_whitespace_p: self
+                    .module
+                    .declare_func_in_func(self.char_whitespace_p_func, builder.func),
+                char_upper_case_p: self
+                    .module
+                    .declare_func_in_func(self.char_upper_case_p_func, builder.func),
+                char_lower_case_p: self
+                    .module
+                    .declare_func_in_func(self.char_lower_case_p_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -7432,6 +7468,17 @@ struct NbHelpers {
     not_pair_p: cranelift_codegen::ir::FuncRef,
     list_p: cranelift_codegen::ir::FuncRef,
     proper_list_p: cranelift_codegen::ir::FuncRef,
+    // #50 — char builtins. Helpers take/return a RAW codepoint i64, so
+    // uniform-NB decodes the NB Character payload in and re-tags out.
+    char_upcase: cranelift_codegen::ir::FuncRef,
+    char_downcase: cranelift_codegen::ir::FuncRef,
+    char_foldcase: cranelift_codegen::ir::FuncRef,
+    char_titlecase: cranelift_codegen::ir::FuncRef,
+    char_alphabetic_p: cranelift_codegen::ir::FuncRef,
+    char_numeric_p: cranelift_codegen::ir::FuncRef,
+    char_whitespace_p: cranelift_codegen::ir::FuncRef,
+    char_upper_case_p: cranelift_codegen::ir::FuncRef,
+    char_lower_case_p: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -8243,6 +8290,44 @@ fn lower_inst_uniform_nb(
                 let r = nb_bool_call(b, helpers.proper_list_p, &[lookup(map, src)?]);
                 map.insert(dst, r);
             }
+            // #50 — char transforms: NB Character → NB Character.
+            &Inst::CharUpcase(dst, src) => {
+                let r = nb_char_op(b, helpers.char_upcase, lookup(map, src)?);
+                map.insert(dst, r);
+            }
+            &Inst::CharDowncase(dst, src) => {
+                let r = nb_char_op(b, helpers.char_downcase, lookup(map, src)?);
+                map.insert(dst, r);
+            }
+            &Inst::CharFoldcase(dst, src) => {
+                let r = nb_char_op(b, helpers.char_foldcase, lookup(map, src)?);
+                map.insert(dst, r);
+            }
+            &Inst::CharTitlecase(dst, src) => {
+                let r = nb_char_op(b, helpers.char_titlecase, lookup(map, src)?);
+                map.insert(dst, r);
+            }
+            // #50 — char predicates: NB Character → NB Boolean.
+            &Inst::CharAlphabeticP(dst, src) => {
+                let r = nb_char_pred(b, helpers.char_alphabetic_p, lookup(map, src)?);
+                map.insert(dst, r);
+            }
+            &Inst::CharNumericP(dst, src) => {
+                let r = nb_char_pred(b, helpers.char_numeric_p, lookup(map, src)?);
+                map.insert(dst, r);
+            }
+            &Inst::CharWhitespaceP(dst, src) => {
+                let r = nb_char_pred(b, helpers.char_whitespace_p, lookup(map, src)?);
+                map.insert(dst, r);
+            }
+            &Inst::CharUpperCaseP(dst, src) => {
+                let r = nb_char_pred(b, helpers.char_upper_case_p, lookup(map, src)?);
+                map.insert(dst, r);
+            }
+            &Inst::CharLowerCaseP(dst, src) => {
+                let r = nb_char_pred(b, helpers.char_lower_case_p, lookup(map, src)?);
+                map.insert(dst, r);
+            }
             // CharToInt (char->integer): the inverse — keep the codepoint
             // payload, retag as Fixnum (signature bits, tag 0). Without
             // this dedicated direction `char->integer` left the value
@@ -8501,6 +8586,38 @@ fn nb_bool_call(
     args: &[cranelift_codegen::ir::Value],
 ) -> cranelift_codegen::ir::Value {
     let call = b.ins().call(fnref, args);
+    let raw = b.inst_results(call)[0];
+    b.ins()
+        .bor_imm(raw, cs_vm::vm::NanboxValue::FALSE.into_raw())
+}
+
+/// #50 — char transform (upcase/downcase/…): decode the NB Character's
+/// codepoint payload, call the raw-codepoint helper, re-tag the result
+/// as an NB Character.
+fn nb_char_op(
+    b: &mut FunctionBuilder,
+    fnref: cranelift_codegen::ir::FuncRef,
+    nb_char: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let cp = b.ins().band_imm(nb_char, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+    let call = b.ins().call(fnref, &[cp]);
+    let raw = b.inst_results(call)[0];
+    let payload = b.ins().band_imm(raw, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+    let char_tag_bits =
+        (cs_vm::vm::NB_SIGNATURE_BITS | ((cs_vm::vm::NB_TAG_CHARACTER as u64) << 47)) as i64;
+    b.ins().bor_imm(payload, char_tag_bits)
+}
+
+/// #50 — char predicate (alphabetic?/numeric?/…): decode the NB
+/// Character's codepoint, call the raw-codepoint helper (returns 0/1),
+/// re-encode as an NB Boolean.
+fn nb_char_pred(
+    b: &mut FunctionBuilder,
+    fnref: cranelift_codegen::ir::FuncRef,
+    nb_char: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let cp = b.ins().band_imm(nb_char, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+    let call = b.ins().call(fnref, &[cp]);
     let raw = b.inst_results(call)[0];
     b.ins()
         .bor_imm(raw, cs_vm::vm::NanboxValue::FALSE.into_raw())
