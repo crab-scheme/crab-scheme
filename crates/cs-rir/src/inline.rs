@@ -616,7 +616,8 @@ pub fn for_each_value_in_inst<F: FnMut(&mut Value)>(inst: &mut Inst, mut f: F) {
             f(idx);
             f(val);
         }
-        Inst::Cons(d, car_v, _car_tag, cdr_v, _cdr_tag) => {
+        Inst::Cons(d, car_v, _car_tag, cdr_v, _cdr_tag)
+        | Inst::ConsRegion(d, car_v, _car_tag, cdr_v, _cdr_tag) => {
             f(d);
             f(car_v);
             f(cdr_v);
@@ -648,6 +649,115 @@ pub fn for_each_value_in_inst<F: FnMut(&mut Value)>(inst: &mut Inst, mut f: F) {
             inst
         ),
     }
+}
+
+/// True iff [`for_each_value_in_inst`] handles `inst` (i.e. calling it
+/// won't hit the `unreachable!` arm). Lets a caller that walks an
+/// arbitrary function decide up-front whether the walker is total over
+/// it — e.g. cs-opt's `escape-to-region` pass bails on a function
+/// containing any uncovered variant rather than risk a panic.
+///
+/// **Lockstep invariant:** every variant matched by
+/// [`for_each_value_in_inst`] MUST be listed here, and vice versa. If
+/// they drift, the failure is non-silent: a `true` here for a variant
+/// the walker lacks panics loudly (caught by tests); a `false` here for
+/// a variant the walker handles only makes callers over-conservative
+/// (they bail). Keep the two arm-sets identical.
+pub fn value_walker_covers(inst: &Inst) -> bool {
+    matches!(
+        inst,
+        Inst::LoadConst(_, _)
+            | Inst::Add(_, _, _)
+            | Inst::Sub(_, _, _)
+            | Inst::Mul(_, _, _)
+            | Inst::Div(_, _, _)
+            | Inst::FlonumAdd(_, _, _)
+            | Inst::FlonumSub(_, _, _)
+            | Inst::FlonumMul(_, _, _)
+            | Inst::FlonumDiv(_, _, _)
+            | Inst::FlonumLt(_, _, _)
+            | Inst::FlonumEq(_, _, _)
+            | Inst::FlonumMax(_, _, _)
+            | Inst::FlonumMin(_, _, _)
+            | Inst::FlonumExpt(_, _, _)
+            | Inst::Lt(_, _, _)
+            | Inst::Eq(_, _, _)
+            | Inst::Quotient(_, _, _)
+            | Inst::Remainder(_, _, _)
+            | Inst::Modulo(_, _, _)
+            | Inst::FloorQuotient(_, _, _)
+            | Inst::Gcd(_, _, _)
+            | Inst::Lcm(_, _, _)
+            | Inst::BitAnd(_, _, _)
+            | Inst::BitOr(_, _, _)
+            | Inst::BitXor(_, _, _)
+            | Inst::BitwiseArithShiftLeft(_, _, _)
+            | Inst::BitwiseArithShiftRight(_, _, _)
+            | Inst::BitwiseBitSetP(_, _, _)
+            | Inst::EqAny(_, _, _)
+            | Inst::EqualAny(_, _, _)
+            | Inst::VecRef(_, _, _)
+            | Inst::StrRef(_, _, _)
+            | Inst::FlonumSqrt(_, _)
+            | Inst::FlonumAbs(_, _)
+            | Inst::FlonumFloor(_, _)
+            | Inst::FlonumCeil(_, _)
+            | Inst::FlonumTrunc(_, _)
+            | Inst::FlonumRound(_, _)
+            | Inst::FlonumSin(_, _)
+            | Inst::FlonumCos(_, _)
+            | Inst::FlonumTan(_, _)
+            | Inst::FlonumLog(_, _)
+            | Inst::FlonumExp(_, _)
+            | Inst::FlonumAsin(_, _)
+            | Inst::FlonumAcos(_, _)
+            | Inst::FlonumAtan(_, _)
+            | Inst::FlEvenP(_, _)
+            | Inst::FlOddP(_, _)
+            | Inst::BitwiseBitCount(_, _)
+            | Inst::BitwiseLength(_, _)
+            | Inst::FxFirstBitSet(_, _)
+            | Inst::FixToFlo(_, _)
+            | Inst::IntCharBitcast(_, _)
+            | Inst::CharToInt(_, _)
+            | Inst::VecLength(_, _)
+            | Inst::VecP(_, _)
+            | Inst::StrLength(_, _)
+            | Inst::StrP(_, _)
+            | Inst::AnyToFix(_, _)
+            | Inst::AnyToBool(_, _)
+            | Inst::AnyToFlo(_, _)
+            | Inst::AnyTruthy(_, _)
+            | Inst::Move(_, _)
+            | Inst::BoxTyped(_, _, _)
+            | Inst::DeoptCheck(_, _)
+            | Inst::NotBoolean(_, _)
+            | Inst::ArithShift(_, _, _)
+            | Inst::Expt(_, _, _)
+            | Inst::Length(_, _)
+            | Inst::AnyDrop(_)
+            | Inst::MakeClosure(_, _)
+            | Inst::Call(_, _, _)
+            | Inst::CallGeneral(_, _, _)
+            | Inst::CallSelf(_, _)
+            | Inst::EnvLookup(_, _)
+            | Inst::EnvLookupAny(_, _)
+            | Inst::EnvSet(_, _)
+            | Inst::EnvDefineLocal(_, _)
+            | Inst::VecAlloc(_, _, _)
+            | Inst::VecSet(_, _, _, _)
+            | Inst::Cons(_, _, _, _, _)
+            | Inst::ConsRegion(_, _, _, _, _)
+            | Inst::Car(_, _)
+            | Inst::Cdr(_, _)
+            | Inst::AnyClone(_, _)
+            | Inst::PairP(_, _)
+            | Inst::NullP(_, _)
+            | Inst::ProcedureP(_, _)
+            | Inst::SymbolP(_, _)
+            | Inst::FixnumP(_, _)
+            | Inst::FlonumP(_, _)
+    )
 }
 
 /// Walker over a `Term`'s `Value` operands. Same lockstep discipline
@@ -1164,6 +1274,55 @@ mod tests {
         let mut seen: Vec<u32> = Vec::new();
         for_each_value_in_inst(&mut bt, |v| seen.push(v.0));
         assert_eq!(seen, vec![11, 22]); // tag (u8) is NOT a Value
+    }
+
+    #[test]
+    fn walker_handles_cons_region_like_cons() {
+        // #51 — ConsRegion shares Cons's (dst, car, _tag, cdr, _tag)
+        // shape; the walker must visit dst/car/cdr (tags are u8, not
+        // Values).
+        let mut cr = Inst::ConsRegion(Value(2), Value(0), 0, Value(1), 0);
+        let mut seen: Vec<u32> = Vec::new();
+        for_each_value_in_inst(&mut cr, |v| seen.push(v.0));
+        assert_eq!(seen, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn value_walker_covers_lockstep_with_walker() {
+        // Lockstep guard: every variant `value_walker_covers` returns
+        // true for MUST be handled by `for_each_value_in_inst` (no
+        // `unreachable!`). Sample across the arm groups, incl. the #51
+        // ConsRegion addition. Covered ⇒ walker runs without panic.
+        let covered = [
+            Inst::LoadConst(Value(0), Const::Fixnum(1)),
+            Inst::Add(Value(0), Value(1), Value(2)),
+            Inst::Move(Value(0), Value(1)),
+            Inst::Cons(Value(0), Value(1), 0, Value(2), 0),
+            Inst::ConsRegion(Value(0), Value(1), 0, Value(2), 0),
+            Inst::Car(Value(0), Value(1)),
+            Inst::Cdr(Value(0), Value(1)),
+            Inst::PairP(Value(0), Value(1)),
+            Inst::NullP(Value(0), Value(1)),
+            Inst::Call(Value(0), Value(1), vec![Value(2)]),
+            Inst::CallSelf(Value(0), vec![Value(1)]),
+            Inst::MakeClosure(Value(0), 0),
+            Inst::VecSet(Value(0), Value(1), Value(2), Value(3)),
+            Inst::EnvSet(0, Value(1)),
+        ];
+        for mut inst in covered {
+            assert!(value_walker_covers(&inst), "expected covered: {inst:?}");
+            // Must not hit the `unreachable!` arm.
+            for_each_value_in_inst(&mut inst, |_| {});
+        }
+
+        // A few variants outside the walker's set: covers ⇒ false (so
+        // callers bail rather than risk the panic).
+        assert!(!value_walker_covers(&Inst::StrAlloc(
+            Value(0),
+            Value(1),
+            Value(2)
+        )));
+        assert!(!value_walker_covers(&Inst::MakeHashtableEq(Value(0))));
     }
 
     #[test]

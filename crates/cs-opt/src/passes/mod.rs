@@ -8,6 +8,7 @@
 
 pub mod constant_fold;
 pub mod dead_block_elim;
+pub mod escape_to_region;
 pub mod inst_stats;
 
 use std::sync::Arc;
@@ -26,10 +27,16 @@ use crate::{PassRegistry, RegisterError};
 pub fn register_builtins(registry: &mut PassRegistry) -> Result<(), RegisterError> {
     registry.register(Arc::new(constant_fold::ConstantFold))?;
     registry.register(Arc::new(dead_block_elim::DeadBlockElim))?;
+    registry.register(Arc::new(escape_to_region::EscapeToRegion))?;
     registry.register(Arc::new(inst_stats::InstStats))?;
     Ok(())
 }
 
 /// Names of every builtin, in registration order. Used by tests +
 /// diagnostics that want to know what shipped.
-pub const BUILTIN_NAMES: &[&str] = &["constant-fold", "dead-block-elim", "inst-stats"];
+pub const BUILTIN_NAMES: &[&str] = &[
+    "constant-fold",
+    "dead-block-elim",
+    "escape-to-region",
+    "inst-stats",
+];
