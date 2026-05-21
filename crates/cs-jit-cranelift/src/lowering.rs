@@ -5269,7 +5269,16 @@ impl Lowerer {
                     | Inst::StringToVectorSlice(_, _, _, _)
                     | Inst::StringToVectorSliceFrom(_, _, _)
                     | Inst::ListToVector(_, _)
-                    | Inst::ListToString(_, _) => {
+                    | Inst::ListToString(_, _)
+                    | Inst::StrRef(_, _, _)
+                    | Inst::StrSet(_, _, _, _)
+                    | Inst::StrAlloc(_, _, _)
+                    | Inst::StrFill(_, _, _)
+                    | Inst::StrFillFrom(_, _, _, _)
+                    | Inst::StrFillSlice(_, _, _, _, _)
+                    | Inst::StrCopyBang(_, _, _, _)
+                    | Inst::StrCopyBangFrom(_, _, _, _, _)
+                    | Inst::StrCopyBangSlice(_, _, _, _, _, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -5961,6 +5970,33 @@ impl Lowerer {
                 list_to_string: self
                     .module
                     .declare_func_in_func(self.list_to_string_func, builder.func),
+                string_ref: self
+                    .module
+                    .declare_func_in_func(self.string_ref_func, builder.func),
+                str_set: self
+                    .module
+                    .declare_func_in_func(self.str_set_func, builder.func),
+                alloc_string: self
+                    .module
+                    .declare_func_in_func(self.alloc_string_func, builder.func),
+                str_fill: self
+                    .module
+                    .declare_func_in_func(self.str_fill_func, builder.func),
+                string_fill_from: self
+                    .module
+                    .declare_func_in_func(self.string_fill_from_func, builder.func),
+                string_fill_slice: self
+                    .module
+                    .declare_func_in_func(self.string_fill_slice_func, builder.func),
+                string_copy_bang: self
+                    .module
+                    .declare_func_in_func(self.string_copy_bang_func, builder.func),
+                string_copy_bang_from: self
+                    .module
+                    .declare_func_in_func(self.string_copy_bang_from_func, builder.func),
+                string_copy_bang_slice: self
+                    .module
+                    .declare_func_in_func(self.string_copy_bang_slice_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -8099,6 +8135,17 @@ struct NbHelpers {
     string_to_vector_slice_from: cranelift_codegen::ir::FuncRef,
     list_to_vector: cranelift_codegen::ir::FuncRef,
     list_to_string: cranelift_codegen::ir::FuncRef,
+    // #50 — string codepoint builtins (char args/results decode/encode
+    // the NB Character codepoint payload; indices decode NB→raw).
+    string_ref: cranelift_codegen::ir::FuncRef,
+    str_set: cranelift_codegen::ir::FuncRef,
+    alloc_string: cranelift_codegen::ir::FuncRef,
+    str_fill: cranelift_codegen::ir::FuncRef,
+    string_fill_from: cranelift_codegen::ir::FuncRef,
+    string_fill_slice: cranelift_codegen::ir::FuncRef,
+    string_copy_bang: cranelift_codegen::ir::FuncRef,
+    string_copy_bang_from: cranelift_codegen::ir::FuncRef,
+    string_copy_bang_slice: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -9654,6 +9701,90 @@ fn lower_inst_uniform_nb(
             }
             &Inst::ListToString(dst, lst) => {
                 let r = nb_ptr_call(b, helpers.list_to_string, &[lookup(map, lst)?]);
+                map.insert(dst, r);
+            }
+            // #50 — string codepoint builtins. Char operands decode their
+            // NB Character codepoint payload (band PAYLOAD_MASK); indices
+            // decode NB→raw; StrRef's codepoint result re-tags to an NB
+            // Character.
+            &Inst::StrRef(dst, s, idx) => {
+                let sv = lookup(map, s)?;
+                let iv = unbox_nb_fixnum(b, lookup(map, idx)?);
+                let call = b.ins().call(helpers.string_ref, &[sv, iv]);
+                let raw = b.inst_results(call)[0];
+                let payload = b.ins().band_imm(raw, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let char_tag_bits = (cs_vm::vm::NB_SIGNATURE_BITS
+                    | ((cs_vm::vm::NB_TAG_CHARACTER as u64) << 47))
+                    as i64;
+                let r = b.ins().bor_imm(payload, char_tag_bits);
+                map.insert(dst, r);
+            }
+            &Inst::StrSet(dst, s, k, ch) => {
+                let sv = lookup(map, s)?;
+                let kv = unbox_nb_fixnum(b, lookup(map, k)?);
+                let chv = b
+                    .ins()
+                    .band_imm(lookup(map, ch)?, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let r = nb_ptr_call(b, helpers.str_set, &[sv, kv, chv]);
+                map.insert(dst, r);
+            }
+            &Inst::StrAlloc(dst, n, fill) => {
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let fv = b
+                    .ins()
+                    .band_imm(lookup(map, fill)?, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let r = nb_ptr_call(b, helpers.alloc_string, &[nv, fv]);
+                map.insert(dst, r);
+            }
+            &Inst::StrFill(dst, s, ch) => {
+                let sv = lookup(map, s)?;
+                let chv = b
+                    .ins()
+                    .band_imm(lookup(map, ch)?, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let r = nb_ptr_call(b, helpers.str_fill, &[sv, chv]);
+                map.insert(dst, r);
+            }
+            &Inst::StrFillFrom(dst, s, ch, start) => {
+                let sv = lookup(map, s)?;
+                let chv = b
+                    .ins()
+                    .band_imm(lookup(map, ch)?, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let stv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.string_fill_from, &[sv, chv, stv]);
+                map.insert(dst, r);
+            }
+            &Inst::StrFillSlice(dst, s, ch, start, end) => {
+                let sv = lookup(map, s)?;
+                let chv = b
+                    .ins()
+                    .band_imm(lookup(map, ch)?, cs_vm::vm::NB_PAYLOAD_MASK as i64);
+                let stv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.string_fill_slice, &[sv, chv, stv, ev]);
+                map.insert(dst, r);
+            }
+            &Inst::StrCopyBang(dst, to, at, from) => {
+                let tv = lookup(map, to)?;
+                let av = unbox_nb_fixnum(b, lookup(map, at)?);
+                let fv = lookup(map, from)?;
+                let r = nb_ptr_call(b, helpers.string_copy_bang, &[tv, av, fv]);
+                map.insert(dst, r);
+            }
+            &Inst::StrCopyBangFrom(dst, to, at, from, start) => {
+                let tv = lookup(map, to)?;
+                let av = unbox_nb_fixnum(b, lookup(map, at)?);
+                let fv = lookup(map, from)?;
+                let stv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let r = nb_ptr_call(b, helpers.string_copy_bang_from, &[tv, av, fv, stv]);
+                map.insert(dst, r);
+            }
+            &Inst::StrCopyBangSlice(dst, to, at, from, start, end) => {
+                let tv = lookup(map, to)?;
+                let av = unbox_nb_fixnum(b, lookup(map, at)?);
+                let fv = lookup(map, from)?;
+                let stv = unbox_nb_fixnum(b, lookup(map, start)?);
+                let ev = unbox_nb_fixnum(b, lookup(map, end)?);
+                let r = nb_ptr_call(b, helpers.string_copy_bang_slice, &[tv, av, fv, stv, ev]);
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
