@@ -13,6 +13,12 @@ tower-lsp = "0.20"
 # workspace tokio features don't include it).
 tokio = { workspace = true, features = ["io-std"] }
 dashmap = { workspace = true }
+# Front-end reuse: parse + expand for diagnostics, source-map for
+# span→line/col. No codegen deps — the LSP only inspects source.
+cs-diag = { workspace = true }
+cs-core = { workspace = true }
+cs-parse = { workspace = true }
+cs-expand = { workspace = true }
 
 [[bin]]
 name = "crabscheme-lsp"

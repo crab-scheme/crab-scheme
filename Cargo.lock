@@ -987,6 +987,10 @@ dependencies = [
 name = "cs-lsp"
 version = "0.0.1"
 dependencies = [
+ "cs-core",
+ "cs-diag",
+ "cs-expand",
+ "cs-parse",
  "dashmap 6.2.1",
  "serde_json",
  "tokio",

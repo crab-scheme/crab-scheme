@@ -14,6 +14,7 @@
 //! The server binary is `crabscheme-lsp` (`src/bin/crabscheme-lsp.rs`),
 //! a stdio JSON-RPC loop built on `tower-lsp`.
 
+pub mod diagnostics;
 pub mod server;
 
 pub use server::Backend;
