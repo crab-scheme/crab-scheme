@@ -5109,6 +5109,7 @@ impl Lowerer {
                     | Inst::AnyTruthy(_, _)
                     | Inst::FixToFlo(_, _)
                     | Inst::NotBoolean(_, _)
+                    | Inst::EqAny(_, _, _)
                     | Inst::IntCharBitcast(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
@@ -5292,6 +5293,9 @@ impl Lowerer {
                 eq: self
                     .module
                     .declare_func_in_func(self.value_eq_nb_func, builder.func),
+                eq_any: self
+                    .module
+                    .declare_func_in_func(self.eq_any_func, builder.func),
                 le: self
                     .module
                     .declare_func_in_func(self.value_le_nb_func, builder.func),
@@ -7285,6 +7289,9 @@ struct NbHelpers {
     div: cranelift_codegen::ir::FuncRef,
     lt: cranelift_codegen::ir::FuncRef,
     eq: cranelift_codegen::ir::FuncRef,
+    /// `vm_eq_any(a, b) -> i64` (0/1). `Inst::EqAny` — pointer/`eq?`
+    /// identity over Any operands. Consumes both NB carriers.
+    eq_any: cranelift_codegen::ir::FuncRef,
     // `le`, `gt`, `ge` are wired through but not currently emitted —
     // the translator lowers `(> a b)` and `(>= a b)` by swapping
     // operands and calling `lt`/`le`. Keeping the FuncRefs declared
@@ -7886,6 +7893,20 @@ fn lower_inst_uniform_nb(
                 b.switch_to_block(join_block);
                 b.seal_block(join_block);
                 let result = b.block_params(join_block)[0];
+                map.insert(dst, result);
+            }
+            // EqAny: `eq?`-style identity over Any operands. The helper
+            // `vm_eq_any` decodes both NB carriers (consuming them) and
+            // returns a raw 0/1; re-encode that as an NB Boolean. Same
+            // 0/1→NB pattern as PairP/NullP/VecP. (#50 — the last inst a
+            // real benchmark, contract-overhead, needed off pure-fixnum.)
+            &Inst::EqAny(dst, lhs, rhs) => {
+                let l = lookup(map, lhs)?;
+                let r = lookup(map, rhs)?;
+                let call = b.ins().call(helpers.eq_any, &[l, r]);
+                let raw_bit = b.inst_results(call)[0];
+                let nb_false = cs_vm::vm::NanboxValue::FALSE.into_raw();
+                let result = b.ins().bor_imm(raw_bit, nb_false);
                 map.insert(dst, result);
             }
             // NotBoolean: Scheme `(not x)` — #t iff x is #f. In NB,
