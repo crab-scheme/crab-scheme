@@ -241,6 +241,24 @@ mod tests {
     }
 
     #[test]
+    fn cons_stored_via_env_define_local_stays_heap() {
+        // The translator materializes `(let ((p (cons a b))) …)` as an
+        // `EnvDefineLocal` of the pair. Storing into a (potentially
+        // retained) env frame is an escape — this is the exact safety
+        // property that stops the pass from region-allocating a pair
+        // that could outlive its region. Must stay a heap `Cons`.
+        let mut f = cons_fn(
+            vec![
+                Inst::EnvDefineLocal(7, Value(2)),
+                Inst::Car(Value(3), Value(2)),
+            ],
+            Term::Return(Value(3)),
+        );
+        assert_eq!(promote_non_escaping_cons(&mut f), 0);
+        assert!(matches!(nth_inst(&f, 0), Inst::Cons(..)));
+    }
+
+    #[test]
     fn cons_passed_to_call_stays_heap() {
         // (f (cons a b)) — escapes into the callee.
         let mut f = cons_fn(
