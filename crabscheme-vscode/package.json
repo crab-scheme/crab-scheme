@@ -1,0 +1,73 @@
+{
+  "name": "crabscheme-vscode",
+  "displayName": "CrabScheme",
+  "description": "Language support for CrabScheme (.scm) via the crabscheme-lsp language server.",
+  "version": "0.0.1",
+  "publisher": "crabscheme",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/crab-scheme/crabscheme"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:scheme"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "scheme",
+        "aliases": [
+          "Scheme",
+          "CrabScheme"
+        ],
+        "extensions": [
+          ".scm",
+          ".ss"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "CrabScheme",
+      "properties": {
+        "crabscheme.serverPath": {
+          "type": "string",
+          "default": "crabscheme-lsp",
+          "description": "Path to the crabscheme-lsp executable. Defaults to looking it up on PATH."
+        },
+        "crabscheme.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace the JSON-RPC traffic between VS Code and crabscheme-lsp."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/vscode": "^1.75.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.4"
+  }
+}
