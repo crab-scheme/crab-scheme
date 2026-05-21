@@ -5229,7 +5229,23 @@ impl Lowerer {
                     | Inst::BvIeeeSingleNativeRef(_, _, _)
                     | Inst::BvIeeeDoubleNativeRef(_, _, _)
                     | Inst::BvIeeeSingleNativeSet(_, _, _, _)
-                    | Inst::BvIeeeDoubleNativeSet(_, _, _, _) => {
+                    | Inst::BvIeeeDoubleNativeSet(_, _, _, _)
+                    | Inst::HashtableP(_, _)
+                    | Inst::HashtableMutableP(_, _)
+                    | Inst::HashtableContainsP(_, _, _)
+                    | Inst::HashtableSize(_, _)
+                    | Inst::HashtableKeys(_, _)
+                    | Inst::HashtableValues(_, _)
+                    | Inst::HashtableClear(_, _)
+                    | Inst::HashtableToAlist(_, _)
+                    | Inst::HashtableCopy(_, _)
+                    | Inst::HashtableHashFn(_, _)
+                    | Inst::HashtableDelete(_, _, _)
+                    | Inst::HashtableSet(_, _, _, _)
+                    | Inst::HashtableRef(_, _, _, _)
+                    | Inst::MakeHashtableEqual(_)
+                    | Inst::MakeHashtableEq(_)
+                    | Inst::MakeHashtableEqv(_) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -5801,6 +5817,54 @@ impl Lowerer {
                     self.bytevector_ieee_double_native_set_func,
                     builder.func,
                 ),
+                hashtable_p: self
+                    .module
+                    .declare_func_in_func(self.hashtable_p_func, builder.func),
+                hashtable_size: self
+                    .module
+                    .declare_func_in_func(self.hashtable_size_func, builder.func),
+                hashtable_mutable_p: self
+                    .module
+                    .declare_func_in_func(self.hashtable_mutable_p_func, builder.func),
+                hashtable_keys: self
+                    .module
+                    .declare_func_in_func(self.hashtable_keys_func, builder.func),
+                hashtable_values: self
+                    .module
+                    .declare_func_in_func(self.hashtable_values_func, builder.func),
+                hashtable_clear: self
+                    .module
+                    .declare_func_in_func(self.hashtable_clear_func, builder.func),
+                hashtable_to_alist: self
+                    .module
+                    .declare_func_in_func(self.hashtable_to_alist_func, builder.func),
+                hashtable_contains_p: self
+                    .module
+                    .declare_func_in_func(self.hashtable_contains_p_func, builder.func),
+                hashtable_delete: self
+                    .module
+                    .declare_func_in_func(self.hashtable_delete_func, builder.func),
+                hashtable_set: self
+                    .module
+                    .declare_func_in_func(self.hashtable_set_func, builder.func),
+                hashtable_ref: self
+                    .module
+                    .declare_func_in_func(self.hashtable_ref_func, builder.func),
+                hashtable_copy: self
+                    .module
+                    .declare_func_in_func(self.hashtable_copy_func, builder.func),
+                hashtable_hash_function: self
+                    .module
+                    .declare_func_in_func(self.hashtable_hash_function_func, builder.func),
+                make_hashtable_equal: self
+                    .module
+                    .declare_func_in_func(self.make_hashtable_equal_func, builder.func),
+                make_hashtable_eq: self
+                    .module
+                    .declare_func_in_func(self.make_hashtable_eq_func, builder.func),
+                make_hashtable_eqv: self
+                    .module
+                    .declare_func_in_func(self.make_hashtable_eqv_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -7895,6 +7959,24 @@ struct NbHelpers {
     bytevector_ieee_double_native_ref: cranelift_codegen::ir::FuncRef,
     bytevector_ieee_single_native_set: cranelift_codegen::ir::FuncRef,
     bytevector_ieee_double_native_set: cranelift_codegen::ir::FuncRef,
+    // #50 — hashtable builtins (HT pointer + NB keys/values; no index
+    // decoding).
+    hashtable_p: cranelift_codegen::ir::FuncRef,
+    hashtable_size: cranelift_codegen::ir::FuncRef,
+    hashtable_mutable_p: cranelift_codegen::ir::FuncRef,
+    hashtable_keys: cranelift_codegen::ir::FuncRef,
+    hashtable_values: cranelift_codegen::ir::FuncRef,
+    hashtable_clear: cranelift_codegen::ir::FuncRef,
+    hashtable_to_alist: cranelift_codegen::ir::FuncRef,
+    hashtable_contains_p: cranelift_codegen::ir::FuncRef,
+    hashtable_delete: cranelift_codegen::ir::FuncRef,
+    hashtable_set: cranelift_codegen::ir::FuncRef,
+    hashtable_ref: cranelift_codegen::ir::FuncRef,
+    hashtable_copy: cranelift_codegen::ir::FuncRef,
+    hashtable_hash_function: cranelift_codegen::ir::FuncRef,
+    make_hashtable_equal: cranelift_codegen::ir::FuncRef,
+    make_hashtable_eq: cranelift_codegen::ir::FuncRef,
+    make_hashtable_eqv: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -9226,6 +9308,88 @@ fn lower_inst_uniform_nb(
                 let kv = unbox_nb_fixnum(b, lookup(map, k)?);
                 let vv = lookup(map, val)?;
                 let r = nb_ptr_call(b, helpers.bytevector_ieee_double_native_set, &[bvv, kv, vv]);
+                map.insert(dst, r);
+            }
+            // #50 — hashtable builtins. HT pointer + keys/values pass NB
+            // (no index decoding); results are NB handle / Boolean / Fixnum.
+            &Inst::HashtableP(dst, src) => {
+                let r = nb_bool_call(b, helpers.hashtable_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::HashtableMutableP(dst, src) => {
+                let r = nb_bool_call(b, helpers.hashtable_mutable_p, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::HashtableContainsP(dst, ht, key) => {
+                let r = nb_bool_call(
+                    b,
+                    helpers.hashtable_contains_p,
+                    &[lookup(map, ht)?, lookup(map, key)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::HashtableSize(dst, src) => {
+                let r = nb_fixnum_call(b, helpers.hashtable_size, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::HashtableKeys(dst, src) => {
+                let r = nb_ptr_call(b, helpers.hashtable_keys, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::HashtableValues(dst, src) => {
+                let r = nb_ptr_call(b, helpers.hashtable_values, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::HashtableClear(dst, src) => {
+                let r = nb_ptr_call(b, helpers.hashtable_clear, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::HashtableToAlist(dst, src) => {
+                let r = nb_ptr_call(b, helpers.hashtable_to_alist, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::HashtableCopy(dst, src) => {
+                let r = nb_ptr_call(b, helpers.hashtable_copy, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::HashtableHashFn(dst, src) => {
+                let r = nb_ptr_call(b, helpers.hashtable_hash_function, &[lookup(map, src)?]);
+                map.insert(dst, r);
+            }
+            &Inst::HashtableDelete(dst, ht, key) => {
+                let r = nb_ptr_call(
+                    b,
+                    helpers.hashtable_delete,
+                    &[lookup(map, ht)?, lookup(map, key)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::HashtableSet(dst, ht, key, val) => {
+                let r = nb_ptr_call(
+                    b,
+                    helpers.hashtable_set,
+                    &[lookup(map, ht)?, lookup(map, key)?, lookup(map, val)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::HashtableRef(dst, ht, key, default) => {
+                let r = nb_ptr_call(
+                    b,
+                    helpers.hashtable_ref,
+                    &[lookup(map, ht)?, lookup(map, key)?, lookup(map, default)?],
+                );
+                map.insert(dst, r);
+            }
+            &Inst::MakeHashtableEqual(dst) => {
+                let r = nb_ptr_call(b, helpers.make_hashtable_equal, &[]);
+                map.insert(dst, r);
+            }
+            &Inst::MakeHashtableEq(dst) => {
+                let r = nb_ptr_call(b, helpers.make_hashtable_eq, &[]);
+                map.insert(dst, r);
+            }
+            &Inst::MakeHashtableEqv(dst) => {
+                let r = nb_ptr_call(b, helpers.make_hashtable_eqv, &[]);
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
