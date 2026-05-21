@@ -112,6 +112,43 @@ pub(crate) fn find_define_span(forms: &[&Datum], define: Symbol, target: Symbol)
     None
 }
 
+/// If `target` is defined as a function — `(define (target p…) …)` —
+/// return its signature string `"(target p…)"`. Variable defines and
+/// missing/non-function defines return `None`. Used by signature help.
+pub(crate) fn find_define_signature(
+    forms: &[&Datum],
+    define: Symbol,
+    target: Symbol,
+    syms: &SymbolTable,
+) -> Option<String> {
+    for &form in forms {
+        let Some(elems) = list_elements(form) else {
+            continue;
+        };
+        if elems.len() >= 2 && is_symbol(elems[0], define) {
+            // Function form: elems[1] is the (name param…) list.
+            if let Some(head) = list_elements(elems[1]) {
+                if !head.is_empty() && is_symbol(head[0], target) {
+                    let parts: Vec<&str> = head
+                        .iter()
+                        .filter_map(|&d| match d {
+                            Datum::Symbol(s, _) => Some(syms.name(*s)),
+                            _ => None,
+                        })
+                        .collect();
+                    return Some(format!("({})", parts.join(" ")));
+                }
+            }
+            if let Some(s) = find_define_signature(&elems[2..], define, target, syms) {
+                return Some(s);
+            }
+        } else if let Some(s) = find_define_signature(&elems, define, target, syms) {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// If `d` is a (possibly improper) list, return its car data in order;
 /// atoms return `None`.
 pub(crate) fn list_elements(d: &Datum) -> Option<Vec<&Datum>> {

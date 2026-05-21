@@ -15,6 +15,7 @@
 //! a stdio JSON-RPC loop built on `tower-lsp`.
 
 pub mod builtins;
+pub mod completion;
 pub mod diagnostics;
 pub mod hover;
 pub mod references;

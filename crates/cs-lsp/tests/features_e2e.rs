@@ -1,7 +1,7 @@
-//! Phase 2 exit-gate test: drive the real `crabscheme-lsp` binary,
-//! open a file, then issue `documentSymbol` and `hover` requests and
-//! assert the responses (outline lists the define; hover on a use shows
-//! where it's defined). Exercises the request/response path over stdio.
+//! Feature exit-gate test (Phases 2–4): drive the real `crabscheme-lsp`
+//! binary over stdio and assert the responses for documentSymbol, hover,
+//! definition, references, completion (a `let` snippet), and signature
+//! help (`(cons obj1 obj2)`). Exercises the full request/response path.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
@@ -76,7 +76,7 @@ fn document_symbol_and_hover_over_stdio() {
     recv_id(&rx, 1);
     send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
     send(
-        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///t.scm","languageId":"scheme","version":1,"text":"(define (f x) x)\n(f 1)"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///t.scm","languageId":"scheme","version":1,"text":"(define (f x) x)\n(f 1)\n(cons 1 2)"}}}"#,
     );
 
     // documentSymbol → outline contains f, kind Function (12).
@@ -111,7 +111,31 @@ fn document_symbol_and_hover_over_stdio() {
         "references wrong: {refs}"
     );
 
-    send(r#"{"jsonrpc":"2.0","id":6,"method":"shutdown","params":null}"#);
+    // Phase 4 exit criterion 1: completion offers a `let` snippet.
+    send(
+        r#"{"jsonrpc":"2.0","id":6,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///t.scm"},"position":{"line":2,"character":0}}}"#,
+    );
+    let comp = recv_id(&rx, 6);
+    assert!(
+        comp.contains("\"label\":\"let\""),
+        "no let completion: {comp}"
+    );
+    assert!(
+        comp.contains("\"insertTextFormat\":2"),
+        "let completion not a snippet: {comp}"
+    );
+
+    // Phase 4 exit criterion 2: signature help for cons (line 2).
+    send(
+        r#"{"jsonrpc":"2.0","id":7,"method":"textDocument/signatureHelp","params":{"textDocument":{"uri":"file:///t.scm"},"position":{"line":2,"character":6}}}"#,
+    );
+    let sig = recv_id(&rx, 7);
+    assert!(
+        sig.contains("(cons obj1 obj2)"),
+        "signature help wrong: {sig}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":8,"method":"shutdown","params":null}"#);
     send(r#"{"jsonrpc":"2.0","method":"exit","params":null}"#);
     drop(stdin);
     let _ = child.wait();
