@@ -2552,6 +2552,63 @@ impl SymTableExt for SymbolTable {
     }
 }
 
+// ---------------------------------------------------------------------
+// AOT generic-builtin dispatch (feat/aot-ready).
+//
+// The cs-aot backend open-codes a handful of builtins (arithmetic via
+// primops; cons/car/list/vector/string-const via direct cs-vm helpers).
+// Everything else in the stdlib — `display`, `string-append`, `assoc`,
+// `for-each`, … — is lowered to a call to `aot_call_builtin`, which
+// dispatches through a real VM-tier builtin environment embedded in the
+// AOT'd binary (the binary links cs-runtime for exactly this).
+// ---------------------------------------------------------------------
+
+thread_local! {
+    /// Per-thread runtime backing `aot_call_builtin`, built on first use.
+    static AOT_RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
+}
+
+impl Runtime {
+    /// Resolve `name` to a VM-tier builtin, call it with the borrow-decoded
+    /// NB `args`, and re-encode the result as an NB carrier.
+    fn aot_dispatch_builtin(&mut self, name: &str, args: &[i64]) -> i64 {
+        let sym = self.syms.intern(name);
+        let Some(proc) = self.vm_env.get(sym) else {
+            eprintln!("crabscheme (aot): unbound builtin `{name}`");
+            return cs_vm::vm::vm_value_to_nb(Value::Unspecified);
+        };
+        // Borrow-decode: the AOT'd caller keeps owning its arg carriers.
+        let arg_vals: Vec<Value> = args
+            .iter()
+            .map(|&a| cs_vm::vm::vm_nb_borrow_to_value(a))
+            .collect();
+        match cs_vm::vm::vm_call_sync(&proc, &arg_vals, &mut self.syms) {
+            Ok(v) => cs_vm::vm::vm_value_to_nb(v),
+            Err(e) => {
+                eprintln!("crabscheme (aot): builtin `{name}`: {}", e.message);
+                cs_vm::vm::vm_value_to_nb(Value::Unspecified)
+            }
+        }
+    }
+}
+
+/// Generic-builtin dispatch entry point for AOT'd binaries.
+///
+/// cs-aot lowers any builtin it can't open-code to
+/// `cs_runtime::aot_call_builtin("<name>", &[nb_args…])`. Resolution is by
+/// **name** — sym ids differ between AOT-compile time and the AOT binary's
+/// fresh runtime, so the id can't be baked in. `args` are NB carriers
+/// (borrow-decoded; the caller retains ownership); the return is an NB
+/// carrier the caller owns. On an unbound name / runtime error this prints
+/// to stderr and returns NB `Unspecified` rather than aborting.
+pub fn aot_call_builtin(name: &str, args: &[i64]) -> i64 {
+    AOT_RUNTIME.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let rt = slot.get_or_insert_with(Runtime::new);
+        rt.aot_dispatch_builtin(name, args)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2879,5 +2936,35 @@ mod tests {
             "error must name rejected library; got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn aot_call_builtin_dispatches_stdlib() {
+        // The AOT generic-dispatch path resolves a builtin by name,
+        // borrow-decodes NB args, calls it, and re-encodes the result.
+        // string-length of an NB string literal → fixnum 5.
+        let s = cs_vm::vm::vm_string_const_nb("hello");
+        match cs_vm::vm::vm_nb_borrow_to_value(aot_call_builtin("string-length", &[s])) {
+            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 5),
+            other => panic!("string-length: {other:?}"),
+        }
+        // string-append "ab" "cd" → "abcd" (multi-arg).
+        let a = cs_vm::vm::vm_string_const_nb("ab");
+        let b = cs_vm::vm::vm_string_const_nb("cd");
+        match cs_vm::vm::vm_nb_borrow_to_value(aot_call_builtin("string-append", &[a, b])) {
+            Value::String(st) => assert_eq!(st.borrow().as_str(), "abcd"),
+            other => panic!("string-append: {other:?}"),
+        }
+        // The original arg carriers are still valid (borrow-decode, not
+        // consume): re-use `a` in another call.
+        match cs_vm::vm::vm_nb_borrow_to_value(aot_call_builtin("string-length", &[a])) {
+            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 2),
+            other => panic!("string-length reuse: {other:?}"),
+        }
+        // Unbound name → no panic, returns Unspecified.
+        assert!(matches!(
+            cs_vm::vm::vm_nb_borrow_to_value(aot_call_builtin("nope-not-a-builtin", &[])),
+            Value::Unspecified
+        ));
     }
 }
