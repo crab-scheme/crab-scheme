@@ -9,9 +9,9 @@ use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentSymbolParams, DocumentSymbolResponse, InitializeParams, InitializeResult,
-    InitializedParams, MessageType, OneOf, ServerCapabilities, ServerInfo,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    DocumentSymbolParams, DocumentSymbolResponse, Hover, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf, ServerCapabilities,
+    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -87,8 +87,9 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
-                // Phase 2: outline view (nested defines).
+                // Phase 2: outline view (nested defines) + hover.
                 document_symbol_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
         })
@@ -120,6 +121,21 @@ impl LanguageServer for Backend {
         }))
         .unwrap_or_default();
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let pos = params.text_document_position_params;
+        let uri = pos.text_document.uri;
+        let position = pos.position;
+        let Some(text) = self.documents.get(&uri).map(|d| d.text.clone()) else {
+            return Ok(None);
+        };
+        let name = uri.to_string();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::hover::hover(&name, &text, position)
+        }))
+        .unwrap_or(None);
+        Ok(result)
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {

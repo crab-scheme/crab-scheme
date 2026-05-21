@@ -6,7 +6,7 @@
 //! as children of their enclosing define.
 
 use cs_core::{Symbol, SymbolTable};
-use cs_diag::SourceMap;
+use cs_diag::{SourceMap, Span};
 use cs_parse::{read_all, Datum};
 use tower_lsp::lsp_types::{DocumentSymbol, SymbolKind};
 
@@ -46,6 +46,26 @@ fn defines_in_forms(
     out
 }
 
+/// If `form` is a `define`, return its (name symbol, name span, kind).
+/// Handles both `(define x …)` (Variable) and `(define (f …) …)`
+/// (Function). `None` if `form` isn't a define.
+pub(crate) fn define_head(form: &Datum, define: Symbol) -> Option<(Symbol, Span, SymbolKind)> {
+    let elems = list_elements(form)?;
+    if elems.len() < 2 || !is_symbol(elems[0], define) {
+        return None;
+    }
+    match elems[1] {
+        Datum::Symbol(s, sp) => Some((*s, *sp, SymbolKind::VARIABLE)),
+        head_list => {
+            let inner = list_elements(head_list)?;
+            match inner.first()? {
+                Datum::Symbol(s, sp) => Some((*s, *sp, SymbolKind::FUNCTION)),
+                _ => None,
+            }
+        }
+    }
+}
+
 #[allow(deprecated)] // DocumentSymbol::deprecated is a deprecated LSP field
 fn define_symbol(
     text: &str,
@@ -53,22 +73,9 @@ fn define_symbol(
     define: Symbol,
     form: &Datum,
 ) -> Option<DocumentSymbol> {
+    let (name_sym, name_span, kind) = define_head(form, define)?;
+    // Body forms are everything after the name (elems[2..]).
     let elems = list_elements(form)?;
-    if elems.len() < 2 || !is_symbol(elems[0], define) {
-        return None;
-    }
-    let (name_sym, name_span, kind) = match elems[1] {
-        // (define x …) — variable.
-        Datum::Symbol(s, sp) => (*s, *sp, SymbolKind::VARIABLE),
-        // (define (name . args) …) — function; name is the list head.
-        head_list => {
-            let inner = list_elements(head_list)?;
-            match inner.first()? {
-                Datum::Symbol(s, sp) => (*s, *sp, SymbolKind::FUNCTION),
-                _ => return None,
-            }
-        }
-    };
     let children = defines_in_forms(text, syms, define, &elems[2..]);
     Some(DocumentSymbol {
         name: syms.name(name_sym).to_string(),
@@ -82,9 +89,32 @@ fn define_symbol(
     })
 }
 
+/// Find where `target` is `define`d in `forms` (searching nested
+/// bodies), returning the span of its name. Used by hover's
+/// "defined at line N".
+pub(crate) fn find_define_span(forms: &[&Datum], define: Symbol, target: Symbol) -> Option<Span> {
+    for &form in forms {
+        if let Some((sym, span, _)) = define_head(form, define) {
+            if sym == target {
+                return Some(span);
+            }
+            if let Some(elems) = list_elements(form) {
+                if let Some(s) = find_define_span(&elems[2..], define, target) {
+                    return Some(s);
+                }
+            }
+        } else if let Some(sub) = list_elements(form) {
+            if let Some(s) = find_define_span(&sub, define, target) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
 /// If `d` is a (possibly improper) list, return its car data in order;
 /// atoms return `None`.
-fn list_elements(d: &Datum) -> Option<Vec<&Datum>> {
+pub(crate) fn list_elements(d: &Datum) -> Option<Vec<&Datum>> {
     match d {
         Datum::Pair(..) => {
             let mut out = Vec::new();
@@ -99,7 +129,7 @@ fn list_elements(d: &Datum) -> Option<Vec<&Datum>> {
     }
 }
 
-fn is_symbol(d: &Datum, sym: Symbol) -> bool {
+pub(crate) fn is_symbol(d: &Datum, sym: Symbol) -> bool {
     matches!(d, Datum::Symbol(s, _) if *s == sym)
 }
 
