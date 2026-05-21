@@ -5312,7 +5312,12 @@ impl Lowerer {
                     | Inst::IotaNss(_, _, _, _)
                     | Inst::DigitValue(_, _)
                     | Inst::StringIndex(_, _, _)
-                    | Inst::StringIndexRight(_, _, _) => {
+                    | Inst::StringIndexRight(_, _, _)
+                    | Inst::StrAppend(_, _)
+                    | Inst::VecAppend(_, _)
+                    | Inst::VecBuild(_, _)
+                    | Inst::BvBuild(_, _)
+                    | Inst::BvAppend(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -6133,6 +6138,21 @@ impl Lowerer {
                 string_index_right: self
                     .module
                     .declare_func_in_func(self.string_index_right_func, builder.func),
+                string_append_buf: self
+                    .module
+                    .declare_func_in_func(self.string_append_buf_func, builder.func),
+                vector_append_buf: self
+                    .module
+                    .declare_func_in_func(self.vector_append_buf_func, builder.func),
+                make_vector_buf: self
+                    .module
+                    .declare_func_in_func(self.make_vector_buf_func, builder.func),
+                make_bytevector_buf: self
+                    .module
+                    .declare_func_in_func(self.make_bytevector_buf_func, builder.func),
+                bytevector_append_buf: self
+                    .module
+                    .declare_func_in_func(self.bytevector_append_buf_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -8324,6 +8344,12 @@ struct NbHelpers {
     digit_value: cranelift_codegen::ir::FuncRef,
     string_index: cranelift_codegen::ir::FuncRef,
     string_index_right: cranelift_codegen::ir::FuncRef,
+    // #50 — variadic buffer builders (NB args via a stack buffer).
+    string_append_buf: cranelift_codegen::ir::FuncRef,
+    vector_append_buf: cranelift_codegen::ir::FuncRef,
+    make_vector_buf: cranelift_codegen::ir::FuncRef,
+    make_bytevector_buf: cranelift_codegen::ir::FuncRef,
+    bytevector_append_buf: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -10196,6 +10222,48 @@ fn lower_inst_uniform_nb(
                 let r = nb_ptr_call(b, helpers.string_index_right, &[sv, cv]);
                 map.insert(dst, r);
             }
+            // #50 — variadic buffer builders. NB args go through a stack
+            // buffer; result is an NB string/vector/bytevector handle.
+            Inst::StrAppend(dst, args) => {
+                let arg_vs: Vec<cranelift_codegen::ir::Value> = args
+                    .iter()
+                    .map(|a| lookup(map, *a))
+                    .collect::<Result<_, _>>()?;
+                let r = nb_buf_call(b, helpers.string_append_buf, &arg_vs);
+                map.insert(*dst, r);
+            }
+            Inst::VecAppend(dst, args) => {
+                let arg_vs: Vec<cranelift_codegen::ir::Value> = args
+                    .iter()
+                    .map(|a| lookup(map, *a))
+                    .collect::<Result<_, _>>()?;
+                let r = nb_buf_call(b, helpers.vector_append_buf, &arg_vs);
+                map.insert(*dst, r);
+            }
+            Inst::VecBuild(dst, args) => {
+                let arg_vs: Vec<cranelift_codegen::ir::Value> = args
+                    .iter()
+                    .map(|a| lookup(map, *a))
+                    .collect::<Result<_, _>>()?;
+                let r = nb_buf_call(b, helpers.make_vector_buf, &arg_vs);
+                map.insert(*dst, r);
+            }
+            Inst::BvBuild(dst, args) => {
+                let arg_vs: Vec<cranelift_codegen::ir::Value> = args
+                    .iter()
+                    .map(|a| lookup(map, *a))
+                    .collect::<Result<_, _>>()?;
+                let r = nb_buf_call(b, helpers.make_bytevector_buf, &arg_vs);
+                map.insert(*dst, r);
+            }
+            Inst::BvAppend(dst, args) => {
+                let arg_vs: Vec<cranelift_codegen::ir::Value> = args
+                    .iter()
+                    .map(|a| lookup(map, *a))
+                    .collect::<Result<_, _>>()?;
+                let r = nb_buf_call(b, helpers.bytevector_append_buf, &arg_vs);
+                map.insert(*dst, r);
+            }
             // CharToInt (char->integer): the inverse — keep the codepoint
             // payload, retag as Fixnum (signature bits, tag 0). Without
             // this dedicated direction `char->integer` left the value
@@ -10441,6 +10509,33 @@ fn nb_ptr_call(
     args: &[cranelift_codegen::ir::Value],
 ) -> cranelift_codegen::ir::Value {
     let call = b.ins().call(fnref, args);
+    let r = b.inst_results(call)[0];
+    b.declare_value_needs_stack_map(r);
+    r
+}
+
+/// #50 — call a variadic `*_buf` builtin (string/vector/bytevector
+/// append/build). Stack-allocates an i64 buffer, stores the NB args,
+/// and calls `fnref(buf_ptr, n_args)`; the result is an NB handle marked
+/// for stack-map tracking. Mirrors the specialized tier's buffer shape.
+fn nb_buf_call(
+    b: &mut FunctionBuilder,
+    fnref: cranelift_codegen::ir::FuncRef,
+    arg_vs: &[cranelift_codegen::ir::Value],
+) -> cranelift_codegen::ir::Value {
+    let n = arg_vs.len();
+    let buf_bytes = std::cmp::max(8u32, (n as u32) * 8);
+    let buf_slot = b.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        buf_bytes,
+        3,
+    ));
+    for (i, av) in arg_vs.iter().enumerate() {
+        let _ = b.ins().stack_store(*av, buf_slot, (i as i32) * 8);
+    }
+    let buf_addr = b.ins().stack_addr(I64, buf_slot, 0);
+    let n_v = b.ins().iconst(I64, n as i64);
+    let call = b.ins().call(fnref, &[buf_addr, n_v]);
     let r = b.inst_results(call)[0];
     b.declare_value_needs_stack_map(r);
     r
