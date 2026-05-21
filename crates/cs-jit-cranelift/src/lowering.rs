@@ -31,6 +31,7 @@
 //! self-reference, non-fixnum args) come once `Call` lands.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -4968,8 +4969,11 @@ impl Lowerer {
             return Err(e);
         }
         // Compile outer — a plain SystemV trampoline that calls inner.
+        // The specialized (pure-fixnum) tier has its own raw ABI handled
+        // entirely within `compile_inner_body`; the trampoline here is a
+        // pure passthrough (`raw_abi = false`).
         if let Err(e) =
-            self.compile_outer_trampoline(rir, outer_id, outer_seq, &outer_sig, inner_id)
+            self.compile_outer_trampoline(rir, outer_id, outer_seq, &outer_sig, inner_id, false)
         {
             self.reset_func_ctx();
             return Err(e);
@@ -5030,6 +5034,14 @@ impl Lowerer {
                 .iter()
                 .any(|i| matches!(i, Inst::Call(_, _, _) | Inst::CallGeneral(_, _, _)))
         });
+        // ADR 0020 Strategy C iter-3 — does this body qualify for the
+        // raw-Fixnum self-call ABI (#50)? When true the prewalk admits
+        // its non-tail self-calls: they pass raw i64 and burn the same
+        // host stack as the pure-fixnum tier (no Tail-conv frame blowup),
+        // and the body + trampoline lower in the raw representation so
+        // recursion never boxes args / unboxes results at the call
+        // boundary. See `detect_uniform_nb_raw_abi`.
+        let raw_abi = detect_uniform_nb_raw_abi(rir);
         for blk in &rir.blocks {
             let last_idx = blk.insts.len().saturating_sub(1);
             for (i, inst) in blk.insts.iter().enumerate() {
@@ -5117,7 +5129,7 @@ impl Lowerer {
                         let last_check = last_check_ab || pattern_c;
                         let tail_check = detect_tail_call_self(rir, blk).is_some() || pattern_c;
                         let is_tail = last_check && tail_check;
-                        if !is_tail && !has_cross_call {
+                        if !is_tail && !has_cross_call && !raw_abi {
                             return Err(JitError::Unsupported(
                                 "uniform-nb: non-tail CallSelf would burn host stack".into(),
                             ));
@@ -5196,15 +5208,18 @@ impl Lowerer {
                 JitError::Codegen(format!("declare_function {}: {e}", inner_module_name))
             })?;
 
-        if let Err(e) = self.compile_inner_body_uniform_nb(rir, inner_id, inner_seq, &inner_sig) {
+        if let Err(e) =
+            self.compile_inner_body_uniform_nb(rir, inner_id, inner_seq, &inner_sig, raw_abi)
+        {
             self.reset_func_ctx();
             return Err(e);
         }
-        // Re-use the existing trampoline: it's tier-agnostic — just
-        // forwards i64 args to inner. Same shape works for NB-typed
-        // bodies.
+        // Re-use the existing trampoline: it forwards i64 args to inner.
+        // Under the raw-Fixnum self-call ABI it also unboxes each NB arg
+        // on the way in and boxes the raw result on the way out — the
+        // NB↔raw perimeter.
         if let Err(e) =
-            self.compile_outer_trampoline(rir, outer_id, outer_seq, &outer_sig, inner_id)
+            self.compile_outer_trampoline(rir, outer_id, outer_seq, &outer_sig, inner_id, raw_abi)
         {
             self.reset_func_ctx();
             return Err(e);
@@ -5228,6 +5243,7 @@ impl Lowerer {
         inner_id: cranelift_module::FuncId,
         inner_seq: u64,
         inner_sig: &Signature,
+        raw_abi: bool,
     ) -> Result<(), JitError> {
         let func_name = UserFuncName::user(0, inner_seq as u32);
         let mut clif = ClifFunction::with_name_signature(func_name, inner_sig.clone());
@@ -5350,14 +5366,26 @@ impl Lowerer {
             builder.seal_block(entry_block);
             for (i, (rv, ty)) in rir.params.iter().enumerate() {
                 let p = builder.block_params(entry_block)[i];
-                value_map.insert(*rv, p);
-                // ADR 0020 Strategy C — unbox Fixnum params into the raw
-                // lane once at entry. run_jit_body_once has already
-                // validated the Fixnum tag (deopting on a miss), so the
-                // raw payload is trustworthy without a per-op check.
-                if matches!(ty, cs_rir::Type::Fixnum) {
-                    let r = unbox_nb_fixnum(&mut builder, p);
-                    raw_map.insert(*rv, r);
+                if raw_abi {
+                    // iter-3 raw ABI: the trampoline already unboxed each
+                    // Fixnum arg, so `p` IS the raw sign-extended payload.
+                    // Seed the raw lane directly; materialize an NB carrier
+                    // lazily for any NB consumer (DCE'd if only unboxed
+                    // arith / self-calls read it). All params are Fixnum
+                    // (the raw-ABI gate guarantees it).
+                    raw_map.insert(*rv, p);
+                    let nb = box_raw_fixnum(&mut builder, p);
+                    value_map.insert(*rv, nb);
+                } else {
+                    value_map.insert(*rv, p);
+                    // ADR 0020 Strategy C — unbox Fixnum params into the
+                    // raw lane once at entry. run_jit_body_once has already
+                    // validated the Fixnum tag (deopting on a miss), so the
+                    // raw payload is trustworthy without a per-op check.
+                    if matches!(ty, cs_rir::Type::Fixnum) {
+                        let r = unbox_nb_fixnum(&mut builder, p);
+                        raw_map.insert(*rv, r);
+                    }
                 }
             }
 
@@ -5377,7 +5405,18 @@ impl Lowerer {
                     builder.switch_to_block(cb);
                     for (i, (rv, _ty)) in blk.params.iter().enumerate() {
                         let p = builder.block_params(cb)[i];
-                        value_map.insert(*rv, p);
+                        if raw_abi {
+                            // iter-3 raw ABI: every block param is a raw
+                            // Fixnum (the gate verified all incoming args
+                            // are raw, so predecessors pass raw block-args
+                            // — see `lower_terminator_uniform_nb`). Seed
+                            // the raw lane; box lazily for NB consumers.
+                            raw_map.insert(*rv, p);
+                            let nb = box_raw_fixnum(&mut builder, p);
+                            value_map.insert(*rv, nb);
+                        } else {
+                            value_map.insert(*rv, p);
+                        }
                     }
                     builder.seal_block(cb);
                 }
@@ -5414,11 +5453,15 @@ impl Lowerer {
                         &mut raw_map,
                         &nb_helpers,
                         &truncated,
+                        raw_abi,
                     )?;
                     let args = tail_args.unwrap();
+                    // iter-3 raw ABI: a tail self-call passes raw Fixnum
+                    // args (the gate verified each is raw), matching the
+                    // inner's raw signature. Otherwise pass NB carriers.
                     let cargs: Vec<cranelift_codegen::ir::Value> = args
                         .iter()
-                        .map(|a| lookup(&value_map, *a))
+                        .map(|a| lookup(if raw_abi { &raw_map } else { &value_map }, *a))
                         .collect::<Result<_, _>>()?;
                     builder.ins().return_call(nb_helpers.self_fn, &cargs);
                 } else if let Some((callee, gargs)) = detect_tail_call_general(rir, blk) {
@@ -5444,6 +5487,7 @@ impl Lowerer {
                         &mut raw_map,
                         &nb_helpers,
                         &truncated,
+                        raw_abi,
                     )?;
                     let callee_v = lookup(&value_map, callee)?;
                     let arg_vs: Vec<cranelift_codegen::ir::Value> = gargs
@@ -5474,12 +5518,15 @@ impl Lowerer {
                         &mut raw_map,
                         &nb_helpers,
                         blk,
+                        raw_abi,
                     )?;
                     lower_terminator_uniform_nb(
                         &mut builder,
                         &value_map,
+                        &raw_map,
                         &block_map,
                         &blk.terminator,
+                        raw_abi,
                     )?;
                 }
             }
@@ -6852,6 +6899,7 @@ impl Lowerer {
         outer_seq: u64,
         outer_sig: &Signature,
         inner_id: cranelift_module::FuncId,
+        raw_abi: bool,
     ) -> Result<(), JitError> {
         let func_name = UserFuncName::user(0, outer_seq as u32);
         let mut clif = ClifFunction::with_name_signature(func_name, outer_sig.clone());
@@ -6864,7 +6912,21 @@ impl Lowerer {
             builder.seal_block(entry);
             let args_v: Vec<cranelift_codegen::ir::Value> = builder.block_params(entry).to_vec();
             let _ = rir;
-            let inst = builder.ins().call(inner_fnref, &args_v);
+            // ADR 0020 Strategy C iter-3 — raw-Fixnum self-call ABI
+            // perimeter. The trampoline speaks the NB ABI to its callers
+            // (the dispatcher / IC), but `inner` consumes/produces raw
+            // sign-extended Fixnums. The dispatcher (`run_jit_body_once`)
+            // already validated each arg's Fixnum tag before this call,
+            // so the unbox is safe; the raw result is re-boxed to NB.
+            let call_args: Vec<cranelift_codegen::ir::Value> = if raw_abi {
+                args_v
+                    .iter()
+                    .map(|&a| unbox_nb_fixnum(&mut builder, a))
+                    .collect()
+            } else {
+                args_v
+            };
+            let inst = builder.ins().call(inner_fnref, &call_args);
             let results = builder.inst_results(inst).to_vec();
             if results.len() != 1 {
                 return Err(JitError::Codegen(format!(
@@ -6872,7 +6934,12 @@ impl Lowerer {
                     results.len()
                 )));
             }
-            builder.ins().return_(&[results[0]]);
+            let ret = if raw_abi {
+                box_raw_fixnum(&mut builder, results[0])
+            } else {
+                results[0]
+            };
+            builder.ins().return_(&[ret]);
             builder.finalize();
         }
         self.ctx.func = clif;
@@ -6998,6 +7065,142 @@ fn detect_uniform_nb_tail_self<'a>(
         }
     }
     (detect_tail_call_self(rir, block), 0)
+}
+
+/// ADR 0020 Strategy C iter-3 — raw-Fixnum self-call ABI gate.
+///
+/// Decides whether a uniform-NB body can pass raw (unboxed, sign-
+/// extended i64) Fixnum args and return raw to its own recursive
+/// calls, boxing only at the NB perimeter (the outer trampoline).
+/// This closes the fib/tak parity gap with the legacy pure-fixnum
+/// tier (#50): a call-dominated body no longer boxes args / unboxes
+/// the result at every self-call.
+///
+/// Returns `true` only for bodies where the raw representation
+/// provably "closes":
+///  1. all params Fixnum (at least one),
+///  2. at least one `CallSelf` (it is self-recursive),
+///  3. no cross-function `Call`/`CallGeneral` — those are the #47 NB
+///     path and interact with the tail-call bounce; kept separate,
+///  4. a forward-only (topologically ordered) CFG — excludes loops,
+///     whose loop-carried block params are a later iter,
+///  5. every block param is Fixnum and all its incoming jump-args are
+///     produced raw,
+///  6. every `Term::Return` value is produced raw,
+///  7. every `CallSelf` arg is produced raw.
+///
+/// "Produced raw" = a Fixnum param/const, an `Add`/`Sub`/`Mul` whose
+/// operands are both raw (the unboxed-arith lane), a `CallSelf` result
+/// (raw under this ABI), or a raw block param. When any condition
+/// fails the body keeps the iter-1 NB self-call behavior (correct,
+/// just boxes at the call boundary).
+fn detect_uniform_nb_raw_abi(rir: &RirFunction) -> bool {
+    use cs_rir::Type;
+    // 1. Non-empty, all-Fixnum params.
+    if rir.params.is_empty() || !rir.params.iter().all(|(_, t)| matches!(t, Type::Fixnum)) {
+        return false;
+    }
+    // 2/3. Pure self-recursion: ≥1 CallSelf, no cross-function call.
+    let mut has_self_call = false;
+    for blk in &rir.blocks {
+        for inst in &blk.insts {
+            match inst {
+                Inst::CallSelf(_, _) => has_self_call = true,
+                Inst::Call(_, _, _) | Inst::CallGeneral(_, _, _) => return false,
+                _ => {}
+            }
+        }
+    }
+    if !has_self_call {
+        return false;
+    }
+    // 4. Forward-only CFG: every edge targets a later block in
+    // `rir.blocks` order (a topologically ordered DAG).
+    let pos: HashMap<cs_rir::BlockId, usize> = rir
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+    for blk in &rir.blocks {
+        let src = pos[&blk.id];
+        let fwd = |t: &cs_rir::BlockId| pos.get(t).map_or(false, |&p| p > src);
+        let ok = match &blk.terminator {
+            Term::Return(_) => true,
+            Term::Jump(t, _) => fwd(t),
+            Term::Branch(_, t, e, _) => fwd(t) && fwd(e),
+        };
+        if !ok {
+            return false;
+        }
+    }
+    // Predecessor arg vectors per block (positional to block params).
+    let mut incoming: HashMap<cs_rir::BlockId, Vec<&Vec<RirValue>>> = HashMap::new();
+    for blk in &rir.blocks {
+        match &blk.terminator {
+            Term::Jump(t, args) => incoming.entry(*t).or_default().push(args),
+            Term::Branch(_, t, e, args) => {
+                incoming.entry(*t).or_default().push(args);
+                incoming.entry(*e).or_default().push(args);
+            }
+            Term::Return(_) => {}
+        }
+    }
+    // Forward raw-set pass — blocks already proven topologically
+    // ordered, so a value is defined (and its raw-ness known) before
+    // any use.
+    let mut raw: HashSet<RirValue> = HashSet::new();
+    for (v, _) in &rir.params {
+        raw.insert(*v);
+    }
+    for blk in &rir.blocks {
+        // 5. Block params (non-entry) must be Fixnum + all-incoming-raw.
+        if blk.id != rir.entry {
+            let preds = incoming.get(&blk.id);
+            for (i, (pv, pty)) in blk.params.iter().enumerate() {
+                if !matches!(pty, Type::Fixnum) {
+                    return false;
+                }
+                let all_raw = preds.map_or(false, |ps| {
+                    !ps.is_empty()
+                        && ps
+                            .iter()
+                            .all(|args| args.get(i).map_or(false, |a| raw.contains(a)))
+                });
+                if !all_raw {
+                    return false;
+                }
+                raw.insert(*pv);
+            }
+        }
+        for inst in &blk.insts {
+            match inst {
+                Inst::LoadConst(dst, Const::Fixnum(_)) => {
+                    raw.insert(*dst);
+                }
+                Inst::Add(dst, l, r) | Inst::Sub(dst, l, r) | Inst::Mul(dst, l, r) => {
+                    if raw.contains(l) && raw.contains(r) {
+                        raw.insert(*dst);
+                    }
+                }
+                Inst::CallSelf(dst, args) => {
+                    // 7. Self-call args must be raw.
+                    if !args.iter().all(|a| raw.contains(a)) {
+                        return false;
+                    }
+                    raw.insert(*dst);
+                }
+                _ => {}
+            }
+        }
+        // 6. Return value must be raw.
+        if let Term::Return(v) = &blk.terminator {
+            if !raw.contains(v) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn detect_tail_call_self_inner<'a>(
@@ -7131,6 +7334,7 @@ fn lower_inst_uniform_nb(
     raw: &mut HashMap<RirValue, cranelift_codegen::ir::Value>,
     helpers: &NbHelpers,
     blk: &cs_rir::Block,
+    raw_abi: bool,
 ) -> Result<(), JitError> {
     for inst in &blk.insts {
         match inst {
@@ -7199,20 +7403,30 @@ fn lower_inst_uniform_nb(
                 map.insert(dst, r);
             }
             &Inst::Lt(dst, lhs, rhs) => {
-                let a = lookup(map, lhs)?;
-                let bv = lookup(map, rhs)?;
-                let r = emit_nb_cmp_fixnum_fast(b, helpers.lt, a, bv, |b, l, r| {
-                    b.ins().icmp(IntCC::SignedLessThan, l, r)
-                });
-                map.insert(dst, r);
+                if let (Some(&ra), Some(&rb)) = (raw.get(&lhs), raw.get(&rhs)) {
+                    let r = emit_raw_cmp_nb_bool(b, ra, rb, IntCC::SignedLessThan);
+                    map.insert(dst, r);
+                } else {
+                    let a = lookup(map, lhs)?;
+                    let bv = lookup(map, rhs)?;
+                    let r = emit_nb_cmp_fixnum_fast(b, helpers.lt, a, bv, |b, l, r| {
+                        b.ins().icmp(IntCC::SignedLessThan, l, r)
+                    });
+                    map.insert(dst, r);
+                }
             }
             &Inst::Eq(dst, lhs, rhs) => {
-                let a = lookup(map, lhs)?;
-                let bv = lookup(map, rhs)?;
-                let r = emit_nb_cmp_fixnum_fast(b, helpers.eq, a, bv, |b, l, r| {
-                    b.ins().icmp(IntCC::Equal, l, r)
-                });
-                map.insert(dst, r);
+                if let (Some(&ra), Some(&rb)) = (raw.get(&lhs), raw.get(&rhs)) {
+                    let r = emit_raw_cmp_nb_bool(b, ra, rb, IntCC::Equal);
+                    map.insert(dst, r);
+                } else {
+                    let a = lookup(map, lhs)?;
+                    let bv = lookup(map, rhs)?;
+                    let r = emit_nb_cmp_fixnum_fast(b, helpers.eq, a, bv, |b, l, r| {
+                        b.ins().icmp(IntCC::Equal, l, r)
+                    });
+                    map.insert(dst, r);
+                }
             }
             // (RIR has no Le/Gt/Ge variants — the translator rewrites
             // those to `Lt` with swapped args plus `not`. Helpers
@@ -7406,18 +7620,30 @@ fn lower_inst_uniform_nb(
                 b.ins().call(helpers.value_drop, &[v]);
             }
             Inst::CallSelf(dst, args) => {
-                // Recursive self-call. The inner Cranelift func uses
-                // `CallConv::Tail`; future iters can promote this to
-                // `return_call` for tail-recursion ergonomics. For now
-                // a plain call is correct (just consumes host stack
-                // per level — same as the bytecode VM's frames).
+                // Recursive (non-tail) self-call.
+                //
+                // iter-3 raw-Fixnum ABI: when `raw_abi`, `inner` consumes
+                // and produces raw sign-extended Fixnums, so pass raw args
+                // (the gate verified each is raw) and treat the result as
+                // raw — `dst` joins the raw lane, with its NB carrier
+                // materialized lazily (DCE'd if only unboxed arith /
+                // further self-calls consume it). This is what keeps a
+                // call-dominated body (fib/tak) from boxing args /
+                // unboxing the result at every recursion, matching the
+                // pure-fixnum tier (#50). Otherwise pass/return NB.
                 let cargs: Vec<cranelift_codegen::ir::Value> = args
                     .iter()
-                    .map(|a| lookup(map, *a))
+                    .map(|a| lookup(if raw_abi { raw } else { map }, *a))
                     .collect::<Result<_, _>>()?;
                 let call = b.ins().call(helpers.self_fn, &cargs);
                 let result = b.inst_results(call)[0];
-                map.insert(*dst, result);
+                if raw_abi {
+                    raw.insert(*dst, result);
+                    let nb = box_raw_fixnum(b, result);
+                    map.insert(*dst, nb);
+                } else {
+                    map.insert(*dst, result);
+                }
             }
             &Inst::MakeClosure(dst, lambda_idx) => {
                 // Builds a fresh `VmClosure` capturing the enclosing
@@ -7674,12 +7900,19 @@ fn lower_inst_uniform_nb(
 fn lower_terminator_uniform_nb(
     b: &mut FunctionBuilder,
     map: &HashMap<RirValue, cranelift_codegen::ir::Value>,
+    raw: &HashMap<RirValue, cranelift_codegen::ir::Value>,
     block_map: &HashMap<cs_rir::BlockId, cranelift_codegen::ir::Block>,
     term: &Term,
+    raw_abi: bool,
 ) -> Result<(), JitError> {
+    // iter-3 raw ABI: the function returns raw, and every block param is
+    // a raw Fixnum, so `Return` values and `Jump`/`Branch` block-args are
+    // read from the raw lane. (A `Branch` condition is a Boolean, never a
+    // Fixnum, so it always reads the NB lane.)
+    let arg_map = if raw_abi { raw } else { map };
     match term {
         Term::Return(v) => {
-            let val = lookup(map, *v)?;
+            let val = lookup(arg_map, *v)?;
             b.ins().return_(&[val]);
             Ok(())
         }
@@ -7689,7 +7922,7 @@ fn lower_terminator_uniform_nb(
                 .ok_or_else(|| JitError::Codegen(format!("unknown jump target {:?}", target)))?;
             let cargs: Vec<cranelift_codegen::ir::BlockArg> = args
                 .iter()
-                .map(|a| lookup(map, *a).map(cranelift_codegen::ir::BlockArg::Value))
+                .map(|a| lookup(arg_map, *a).map(cranelift_codegen::ir::BlockArg::Value))
                 .collect::<Result<_, _>>()?;
             b.ins().jump(tb, &cargs);
             Ok(())
@@ -7710,7 +7943,7 @@ fn lower_terminator_uniform_nb(
             // their params get their incoming values.
             let cargs: Vec<cranelift_codegen::ir::BlockArg> = args
                 .iter()
-                .map(|a| lookup(map, *a).map(cranelift_codegen::ir::BlockArg::Value))
+                .map(|a| lookup(arg_map, *a).map(cranelift_codegen::ir::BlockArg::Value))
                 .collect::<Result<_, _>>()?;
             b.ins().brif(truthy, tb, &cargs, eb, &cargs);
             Ok(())
@@ -7827,6 +8060,24 @@ fn lower_nb_arith(
         map.insert(dst, r);
     }
     Ok(())
+}
+
+/// ADR 0020 Strategy C iter-3 — compare two raw (proven-Fixnum) i64
+/// operands directly and encode the result as an NB Boolean, skipping
+/// the per-operand tag check `emit_nb_cmp_fixnum_fast` would emit.
+/// Same encoding as the Flonum compares: `(cmp as i64) | NB_FALSE`
+/// yields `NB_FALSE` when false and the NB `#t` carrier when true, so
+/// the NB-truthiness `Branch` lowering consumes it unchanged.
+fn emit_raw_cmp_nb_bool(
+    b: &mut FunctionBuilder,
+    ra: cranelift_codegen::ir::Value,
+    rb: cranelift_codegen::ir::Value,
+    cc: IntCC,
+) -> cranelift_codegen::ir::Value {
+    let cmp = b.ins().icmp(cc, ra, rb);
+    let widened = b.ins().uextend(I64, cmp);
+    let nb_false = cs_vm::vm::NanboxValue::FALSE.into_raw();
+    b.ins().bor_imm(widened, nb_false)
 }
 
 /// Emit the inline Fixnum-Fixnum fast path for an NB-typed binary
@@ -12911,6 +13162,160 @@ mod tests {
         assert_eq!(func(5), 5);
         assert_eq!(func(10), 55);
         assert_eq!(func(20), 6765);
+    }
+
+    /// Build fib in the exact shape the bytecode→RIR translator emits
+    /// for the JIT: an `if` whose two arms `Jump` to a join block with
+    /// a Fixnum param, then `Return(param)`. The two `CallSelf`s are
+    /// non-tail (their results feed `Add`). This is the canonical
+    /// raw-ABI target (#50).
+    fn fib_join_rir() -> RirFunction {
+        let mut f = RirFunction::new("fib");
+        f.params.push((cs_rir::Value(0), cs_rir::Type::Fixnum)); // n
+        f.entry = cs_rir::BlockId(0);
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(0),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(cs_rir::Value(1), Const::Fixnum(2)),
+                Inst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
+            ],
+            terminator: Term::Branch(
+                cs_rir::Value(2),
+                cs_rir::BlockId(1),
+                cs_rir::BlockId(2),
+                Vec::new(),
+            ),
+        });
+        // then arm: jump join with n.
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(1),
+            params: vec![],
+            insts: vec![],
+            terminator: Term::Jump(cs_rir::BlockId(3), vec![cs_rir::Value(0)]),
+        });
+        // else arm: s = fib(n-1) + fib(n-2); jump join with s.
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(2),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(cs_rir::Value(4), Const::Fixnum(1)),
+                Inst::Sub(cs_rir::Value(5), cs_rir::Value(0), cs_rir::Value(4)),
+                Inst::CallSelf(cs_rir::Value(6), vec![cs_rir::Value(5)]),
+                Inst::LoadConst(cs_rir::Value(7), Const::Fixnum(2)),
+                Inst::Sub(cs_rir::Value(8), cs_rir::Value(0), cs_rir::Value(7)),
+                Inst::CallSelf(cs_rir::Value(9), vec![cs_rir::Value(8)]),
+                Inst::Add(cs_rir::Value(10), cs_rir::Value(6), cs_rir::Value(9)),
+            ],
+            terminator: Term::Jump(cs_rir::BlockId(3), vec![cs_rir::Value(10)]),
+        });
+        // join: return the merged Fixnum.
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(3),
+            params: vec![(cs_rir::Value(3), cs_rir::Type::Fixnum)],
+            insts: vec![],
+            terminator: Term::Return(cs_rir::Value(3)),
+        });
+        f
+    }
+
+    #[test]
+    fn raw_abi_accepts_join_block_fib() {
+        // The join-block param (Value(3)) merges a Fixnum param and an
+        // Add result — both raw — so the body closes under the raw ABI.
+        assert!(detect_uniform_nb_raw_abi(&fib_join_rir()));
+    }
+
+    #[test]
+    fn raw_abi_accepts_direct_return_fib() {
+        // The simpler arm-returns-directly shape (no join block) also
+        // qualifies: every Return is a raw value (param / Add result).
+        let mut f = RirFunction::new("fib_direct");
+        f.params.push((cs_rir::Value(0), cs_rir::Type::Fixnum));
+        f.entry = cs_rir::BlockId(0);
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(0),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(cs_rir::Value(1), Const::Fixnum(2)),
+                Inst::Lt(cs_rir::Value(2), cs_rir::Value(0), cs_rir::Value(1)),
+            ],
+            terminator: Term::Branch(
+                cs_rir::Value(2),
+                cs_rir::BlockId(1),
+                cs_rir::BlockId(2),
+                Vec::new(),
+            ),
+        });
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(1),
+            params: vec![],
+            insts: vec![],
+            terminator: Term::Return(cs_rir::Value(0)),
+        });
+        f.blocks.push(Block {
+            id: cs_rir::BlockId(2),
+            params: vec![],
+            insts: vec![
+                Inst::LoadConst(cs_rir::Value(3), Const::Fixnum(1)),
+                Inst::Sub(cs_rir::Value(4), cs_rir::Value(0), cs_rir::Value(3)),
+                Inst::CallSelf(cs_rir::Value(5), vec![cs_rir::Value(4)]),
+                Inst::LoadConst(cs_rir::Value(6), Const::Fixnum(2)),
+                Inst::Sub(cs_rir::Value(7), cs_rir::Value(0), cs_rir::Value(6)),
+                Inst::CallSelf(cs_rir::Value(8), vec![cs_rir::Value(7)]),
+                Inst::Add(cs_rir::Value(9), cs_rir::Value(5), cs_rir::Value(8)),
+            ],
+            terminator: Term::Return(cs_rir::Value(9)),
+        });
+        assert!(detect_uniform_nb_raw_abi(&f));
+    }
+
+    #[test]
+    fn raw_abi_rejects_any_param() {
+        // Same shape as fib but the param is Any → not all-Fixnum, so
+        // the raw ABI does not apply (stays the iter-1 NB path).
+        let mut f = fib_join_rir();
+        f.params[0].1 = cs_rir::Type::Any;
+        assert!(!detect_uniform_nb_raw_abi(&f));
+    }
+
+    #[test]
+    fn raw_abi_rejects_no_self_call() {
+        // A straight-line Fixnum body with no CallSelf gains nothing
+        // from the raw self-call ABI.
+        let f = super::testing::add_two_fixnums();
+        assert!(!detect_uniform_nb_raw_abi(&f));
+    }
+
+    #[test]
+    fn raw_abi_rejects_cross_call() {
+        // A self-recursive Fixnum body that also makes a cross-function
+        // call is the #47 NB path, not the raw ABI.
+        let mut f = fib_join_rir();
+        // Splice a cross-call into the else arm (block index 2).
+        f.blocks[2].insts.push(Inst::Call(
+            cs_rir::Value(11),
+            cs_rir::Value(0),
+            vec![cs_rir::Value(0)],
+        ));
+        assert!(!detect_uniform_nb_raw_abi(&f));
+    }
+
+    #[test]
+    fn raw_abi_rejects_non_raw_return() {
+        // If the join param's incoming includes a non-raw value (here a
+        // Cons result), the param can't be raw and the gate rejects.
+        let mut f = fib_join_rir();
+        // Replace the then-arm's jump arg with a freshly Cons'd pair.
+        f.blocks[1].insts.push(Inst::Cons(
+            cs_rir::Value(20),
+            cs_rir::Value(0),
+            0,
+            cs_rir::Value(0),
+            0,
+        ));
+        f.blocks[1].terminator = Term::Jump(cs_rir::BlockId(3), vec![cs_rir::Value(20)]);
+        assert!(!detect_uniform_nb_raw_abi(&f));
     }
 
     #[test]

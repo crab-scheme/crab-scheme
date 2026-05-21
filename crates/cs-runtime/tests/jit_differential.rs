@@ -148,6 +148,27 @@ fn diff_unboxed_fixnum_overflow_deopts_to_bignum() {
 }
 
 #[test]
+fn diff_raw_abi_recursive_overflow_deopts_to_bignum() {
+    // ADR 0020 Strategy C iter-3 — the raw-Fixnum self-call ABI passes
+    // raw i64 through the whole recursion. When an intermediate product
+    // overflows the 47-bit Fixnum range the unboxed Mul requests a deopt;
+    // the dispatcher discards the JIT body's result (raw garbage) and
+    // reruns on bytecode, which promotes to a bignum. This is the SAME
+    // discard-and-retry path the pure-fixnum tier relies on, but here it
+    // fires inside a body whose self-calls also speak the raw ABI — the
+    // regression guard for "garbage propagating through raw self-calls is
+    // never observed". `fact` is self-recursive and all-Fixnum-param, so
+    // it tiers up onto the raw ABI; (fact 17) = 355687428096000 ≈ 3.56e14
+    // overflows 47 bits (max ~7.04e13) yet is exact in f64.
+    let defines = &[
+        "(define fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))",
+        "(define warm (lambda (n) \
+            (let loop ((i 0)) (if (> i n) 'done (begin (fact 8) (loop (+ i 1)))))))",
+    ];
+    assert_three_tier_agreement(defines, Some("(warm 2000)"), "(fact 17)");
+}
+
+#[test]
 fn diff_loop_sum_1_to_n() {
     // Iterative-style sum via tail recursion.
     let defines = &["(define loop-sum (lambda (n) \
