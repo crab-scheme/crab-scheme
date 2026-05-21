@@ -5110,6 +5110,7 @@ impl Lowerer {
                     | Inst::FixToFlo(_, _)
                     | Inst::NotBoolean(_, _)
                     | Inst::EqAny(_, _, _)
+                    | Inst::Move(_, _)
                     | Inst::IntCharBitcast(_, _)
                     | Inst::CharToInt(_, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
@@ -7939,6 +7940,17 @@ fn lower_inst_uniform_nb(
                     as i64;
                 let retagged = b.ins().bor_imm(payload, char_tag_bits);
                 map.insert(dst, retagged);
+            }
+            // Move: SSA copy. Carry both the NB carrier and (if present)
+            // the raw lane so a moved Fixnum stays unboxed under the raw
+            // ABI. (char->integer no longer lowers to Move — it uses
+            // CharToInt — so a Move never carries a tag/type mismatch.)
+            &Inst::Move(dst, src) => {
+                let v = lookup(map, src)?;
+                map.insert(dst, v);
+                if let Some(&rv) = raw.get(&src) {
+                    raw.insert(dst, rv);
+                }
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
             // payload, retag as Fixnum (signature bits, tag 0). Without
