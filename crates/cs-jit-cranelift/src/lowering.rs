@@ -5278,7 +5278,21 @@ impl Lowerer {
                     | Inst::StrFillSlice(_, _, _, _, _)
                     | Inst::StrCopyBang(_, _, _, _)
                     | Inst::StrCopyBangFrom(_, _, _, _, _)
-                    | Inst::StrCopyBangSlice(_, _, _, _, _, _) => {
+                    | Inst::StrCopyBangSlice(_, _, _, _, _, _)
+                    | Inst::ListTail(_, _, _)
+                    | Inst::ListRef(_, _, _)
+                    | Inst::ListSet(_, _, _, _)
+                    | Inst::Take(_, _, _)
+                    | Inst::Drop(_, _, _)
+                    | Inst::MakeList(_, _, _)
+                    | Inst::MakeListUnspec(_, _)
+                    | Inst::MakeVectorUnspec(_, _)
+                    | Inst::BitwiseBitCount(_, _)
+                    | Inst::BitwiseLength(_, _)
+                    | Inst::FxFirstBitSet(_, _)
+                    | Inst::BitwiseBitSetP(_, _, _)
+                    | Inst::ExactNonNegIntP(_, _)
+                    | Inst::EqualAny(_, _, _) => {
                         // Phase 5 iter3 — BoxTyped is an identity in
                         // uniform-NB: the typed-lane src is already an
                         // NB carrier with its proper tag, and any
@@ -5997,6 +6011,48 @@ impl Lowerer {
                 string_copy_bang_slice: self
                     .module
                     .declare_func_in_func(self.string_copy_bang_slice_func, builder.func),
+                list_tail: self
+                    .module
+                    .declare_func_in_func(self.list_tail_func, builder.func),
+                list_ref: self
+                    .module
+                    .declare_func_in_func(self.list_ref_func, builder.func),
+                list_set: self
+                    .module
+                    .declare_func_in_func(self.list_set_func, builder.func),
+                take: self
+                    .module
+                    .declare_func_in_func(self.take_func, builder.func),
+                drop: self
+                    .module
+                    .declare_func_in_func(self.drop_func, builder.func),
+                make_list: self
+                    .module
+                    .declare_func_in_func(self.make_list_fill_func, builder.func),
+                make_list_unspec: self
+                    .module
+                    .declare_func_in_func(self.make_list_unspec_func, builder.func),
+                make_vector_unspec: self
+                    .module
+                    .declare_func_in_func(self.make_vector_unspec_func, builder.func),
+                bitwise_bit_count: self
+                    .module
+                    .declare_func_in_func(self.bitwise_bit_count_func, builder.func),
+                bitwise_length: self
+                    .module
+                    .declare_func_in_func(self.bitwise_length_func, builder.func),
+                fx_first_bit_set: self
+                    .module
+                    .declare_func_in_func(self.fx_first_bit_set_func, builder.func),
+                bitwise_bit_set_p: self
+                    .module
+                    .declare_func_in_func(self.bitwise_bit_set_p_func, builder.func),
+                exact_non_neg_int_p: self
+                    .module
+                    .declare_func_in_func(self.exact_nonneg_int_p_func, builder.func),
+                equal_any: self
+                    .module
+                    .declare_func_in_func(self.equal_func, builder.func),
             };
 
             // Block-id map: RIR BlockId -> Cranelift Block.
@@ -8146,6 +8202,21 @@ struct NbHelpers {
     string_copy_bang: cranelift_codegen::ir::FuncRef,
     string_copy_bang_from: cranelift_codegen::ir::FuncRef,
     string_copy_bang_slice: cranelift_codegen::ir::FuncRef,
+    // #50 — list-index, fixnum-bit, and predicate builtins.
+    list_tail: cranelift_codegen::ir::FuncRef,
+    list_ref: cranelift_codegen::ir::FuncRef,
+    list_set: cranelift_codegen::ir::FuncRef,
+    take: cranelift_codegen::ir::FuncRef,
+    drop: cranelift_codegen::ir::FuncRef,
+    make_list: cranelift_codegen::ir::FuncRef,
+    make_list_unspec: cranelift_codegen::ir::FuncRef,
+    make_vector_unspec: cranelift_codegen::ir::FuncRef,
+    bitwise_bit_count: cranelift_codegen::ir::FuncRef,
+    bitwise_length: cranelift_codegen::ir::FuncRef,
+    fx_first_bit_set: cranelift_codegen::ir::FuncRef,
+    bitwise_bit_set_p: cranelift_codegen::ir::FuncRef,
+    exact_non_neg_int_p: cranelift_codegen::ir::FuncRef,
+    equal_any: cranelift_codegen::ir::FuncRef,
 }
 
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
@@ -9785,6 +9856,87 @@ fn lower_inst_uniform_nb(
                 let stv = unbox_nb_fixnum(b, lookup(map, start)?);
                 let ev = unbox_nb_fixnum(b, lookup(map, end)?);
                 let r = nb_ptr_call(b, helpers.string_copy_bang_slice, &[tv, av, fv, stv, ev]);
+                map.insert(dst, r);
+            }
+            // #50 — list-index builtins. List pointer passes NB; index/
+            // count args decode NB→raw; element/result are NB.
+            &Inst::ListTail(dst, lst, n) => {
+                let lv = lookup(map, lst)?;
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.list_tail, &[lv, nv]);
+                map.insert(dst, r);
+            }
+            &Inst::ListRef(dst, lst, n) => {
+                let lv = lookup(map, lst)?;
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.list_ref, &[lv, nv]);
+                map.insert(dst, r);
+            }
+            &Inst::ListSet(dst, lst, n, v) => {
+                let lv = lookup(map, lst)?;
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let vv = lookup(map, v)?;
+                let r = nb_ptr_call(b, helpers.list_set, &[lv, nv, vv]);
+                map.insert(dst, r);
+            }
+            &Inst::Take(dst, lst, n) => {
+                let lv = lookup(map, lst)?;
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.take, &[lv, nv]);
+                map.insert(dst, r);
+            }
+            &Inst::Drop(dst, lst, n) => {
+                let lv = lookup(map, lst)?;
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.drop, &[lv, nv]);
+                map.insert(dst, r);
+            }
+            &Inst::MakeList(dst, n, fill) => {
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let fv = lookup(map, fill)?;
+                let r = nb_ptr_call(b, helpers.make_list, &[nv, fv]);
+                map.insert(dst, r);
+            }
+            &Inst::MakeListUnspec(dst, n) => {
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.make_list_unspec, &[nv]);
+                map.insert(dst, r);
+            }
+            &Inst::MakeVectorUnspec(dst, n) => {
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let r = nb_ptr_call(b, helpers.make_vector_unspec, &[nv]);
+                map.insert(dst, r);
+            }
+            // #50 — fixnum bit ops. Operand decodes NB→raw; result is a
+            // small Fixnum (count/length/position).
+            &Inst::BitwiseBitCount(dst, x) => {
+                let xv = unbox_nb_fixnum(b, lookup(map, x)?);
+                let r = nb_fixnum_call(b, helpers.bitwise_bit_count, &[xv]);
+                map.insert(dst, r);
+            }
+            &Inst::BitwiseLength(dst, x) => {
+                let xv = unbox_nb_fixnum(b, lookup(map, x)?);
+                let r = nb_fixnum_call(b, helpers.bitwise_length, &[xv]);
+                map.insert(dst, r);
+            }
+            &Inst::FxFirstBitSet(dst, x) => {
+                let xv = unbox_nb_fixnum(b, lookup(map, x)?);
+                let r = nb_fixnum_call(b, helpers.fx_first_bit_set, &[xv]);
+                map.insert(dst, r);
+            }
+            &Inst::BitwiseBitSetP(dst, n, i) => {
+                let nv = unbox_nb_fixnum(b, lookup(map, n)?);
+                let iv = unbox_nb_fixnum(b, lookup(map, i)?);
+                let r = nb_bool_call(b, helpers.bitwise_bit_set_p, &[nv, iv]);
+                map.insert(dst, r);
+            }
+            // #50 — predicates over Any operands (passed NB).
+            &Inst::ExactNonNegIntP(dst, x) => {
+                let r = nb_bool_call(b, helpers.exact_non_neg_int_p, &[lookup(map, x)?]);
+                map.insert(dst, r);
+            }
+            &Inst::EqualAny(dst, a, c) => {
+                let r = nb_bool_call(b, helpers.equal_any, &[lookup(map, a)?, lookup(map, c)?]);
                 map.insert(dst, r);
             }
             // CharToInt (char->integer): the inverse — keep the codepoint
