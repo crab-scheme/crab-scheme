@@ -29,26 +29,35 @@ sockets/certs or a cross-milestone dependency) is done and covered;
 - ◑ **`spawn-remote` returns a usable RemoteRef** — `RemoteRef` is done;
   shipping the *closure* to the remote node needs M12 (content-addressed
   codebase), so `spawn-remote` proper is deferred to that milestone.
-- ◑ **mTLS required on production transports** — the handshake protocol +
-  epoch quarantine are done and tested; rustls wraps the cs-net `TcpStream`
-  before `from_stream` (framing + handshake then run unchanged over it). The
-  cert-provisioning socket task is the remaining iter-D wiring.
+- ✅ **mTLS required on production transports** — `TcpTransport::connect_tls`
+  / `accept_tls` (rustls configs in `cs-net::tls`) encrypt + mutually
+  authenticate; tested (encrypted round-trip + certless-client rejection).
+  A **QUIC** transport (`cs-net::quic`, quinn) is also implemented: TLS 1.3
+  is mandatory there, and each channel rides its own QUIC stream (no
+  head-of-line blocking) — tested under the `quic` feature.
 - ◑ **Per-peer pooling; channels never starve** — per-channel isolation +
   watermark backpressure are implemented and tested (Sim); a connection
   *pool* manager (multiple conns per peer) is a follow-up.
 
+### Encrypted transports — DONE
+
+Both production transports are encrypted + mutually authenticated:
+- **mTLS over TCP** — `cs-net::tls` config builders + `TcpTransport::{connect_tls, accept_tls}`.
+- **QUIC** — `cs-net::quic` (quinn, `quic` feature): TLS 1.3 mandatory, one stream per channel (no HoL).
+
+Cert *provisioning from files* (`--tls-cert` PEM loading) is the only TLS
+piece left — the configs take parsed DER today; tests use rcgen.
+
 ## Remaining tail (follow-ups)
 
-1. **mTLS cert provisioning** — load certs (`--tls-cert`), wrap TCP with
-   tokio-rustls, run the (already-implemented) `Hello` exchange over it.
-2. **`(spawn-remote …)`** — blocked on **M12** for closure transfer.
-3. **cs-actor / Scheme binding** — map `RemoteRef` onto cs-actor `ActorRef`,
+1. **`(spawn-remote …)`** — blocked on **M12** for closure transfer.
+2. **cs-actor / Scheme binding** — map `RemoteRef` onto cs-actor `ActorRef`,
    serialize messages via cs-runtime's `SendableValue`, so `(send pid msg)`
    is unchanged in source. (The substrate carries opaque bytes today, which
    is what kept it deterministically testable in isolation.)
-4. **Connection pooling** — multiple connections per peer for the
-   `bulk`/`messages` split.
+3. **Connection pooling** — multiple connections per peer.
+4. **PEM cert loading** — `--tls-cert` file provisioning for the configs.
 
-These are I/O glue (1, 4), a cross-milestone dependency (2), or runtime
-integration (3) — none change the substrate's design, which is locked in
-and tested here.
+These are a cross-milestone dependency (1), runtime integration (2), or I/O
+glue (3, 4) — none change the substrate's design, which is locked in + tested
+(cs-net 22 default / 24 with `quic`, cs-distrib 33).
