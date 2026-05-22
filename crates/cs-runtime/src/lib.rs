@@ -244,6 +244,11 @@ impl Runtime {
             let sym = syms.intern(name);
             vm_env.define(sym, cs_vm::vm::make_vm_builtin_syms(name, f));
         }
+        // Issue #48: bridge the higher-order SRFI-1/13 list/pair/string/
+        // vector builtins onto the VM tier (take-while, filter-map,
+        // pair-fold, …). The walker gets these via install_into; without
+        // this the explicit --tier vm / --tier vm-jit env was missing them.
+        builtins::install_vm_higher_order(&vm_env, &mut syms);
         // BEAM-style actor / table primops — same Syms shape, gated
         // on the `actor` feature. See crates/cs-runtime/src/builtins/
         // beam.rs and ADR 0013-equivalent (beam_runtime_spec.md).
@@ -1343,6 +1348,17 @@ impl Runtime {
                             buf.borrow_mut().push(c);
                             Ok(Value::Unspecified)
                         }
+                        // #48: accept file output ports too (the VM tier's
+                        // display/write already do via write_to_current_output).
+                        cs_core::Port::FileOutput(state) => {
+                            let mut st = state.borrow_mut();
+                            if st.closed {
+                                return Err("write-char: port is closed".into());
+                            }
+                            let mut b = [0u8; 4];
+                            st.buf.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+                            Ok(Value::Unspecified)
+                        }
                         _ => Err("write-char: not an output port".into()),
                     },
                     other => Err(format!(
@@ -1405,6 +1421,16 @@ impl Runtime {
                     Value::Port(p) => match &**p {
                         cs_core::Port::StringOutput(buf) => {
                             buf.borrow_mut().push_str(&slice);
+                            Ok(Value::Unspecified)
+                        }
+                        // #48: accept file output ports too (the VM tier's
+                        // display/write already do via write_to_current_output).
+                        cs_core::Port::FileOutput(state) => {
+                            let mut st = state.borrow_mut();
+                            if st.closed {
+                                return Err("write-string: port is closed".into());
+                            }
+                            st.buf.extend_from_slice(slice.as_bytes());
                             Ok(Value::Unspecified)
                         }
                         _ => Err("write-string: not an output port".into()),

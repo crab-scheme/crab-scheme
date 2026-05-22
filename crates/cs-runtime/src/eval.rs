@@ -249,7 +249,14 @@ pub fn apply_procedure(
                 ctx.pending_escape = Some((k.id, v));
                 return Err(EvalError::new("__escape__", Span::DUMMY));
             }
-            Err(EvalError::new("unknown procedure type", Span::DUMMY))
+            // A `Value::Procedure` the walker doesn't recognize is a
+            // VM/JIT-tier procedure (VmClosure / VmBuiltin / …). Delegate
+            // to the VM's universal caller so higher-order *walker*
+            // builtins (take-while, …) bridged onto the VM tier can invoke
+            // a VM-closure predicate. On a pure walker run this arm is
+            // unreachable (every proc is a walker type handled above).
+            cs_vm::vm::vm_call_sync(proc_val, args, ctx.syms)
+                .map_err(|e| EvalError::new(e.message, Span::DUMMY))
         }
         v => Err(EvalError::new(
             format!("not a procedure: {}", v.type_name()),
