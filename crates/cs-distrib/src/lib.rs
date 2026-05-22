@@ -28,11 +28,13 @@
 use thiserror::Error;
 
 pub mod gossip;
+pub mod handshake;
 pub mod membership;
 pub mod phi;
 pub mod pid;
 pub mod router;
 
+pub use handshake::{evaluate_hello, HandshakeOutcome, Hello};
 pub use membership::{MemberState, PartitionPolicy};
 pub use phi::PhiAccrualFailureDetector;
 pub use pid::DistPid;
