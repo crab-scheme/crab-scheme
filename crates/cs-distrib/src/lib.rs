@@ -31,10 +31,12 @@ pub mod gossip;
 pub mod membership;
 pub mod phi;
 pub mod pid;
+pub mod router;
 
 pub use membership::{MemberState, PartitionPolicy};
 pub use phi::PhiAccrualFailureDetector;
 pub use pid::DistPid;
+pub use router::{RemoteRef, Router};
 
 /// Cluster-wide identity for a CrabScheme node.
 ///
