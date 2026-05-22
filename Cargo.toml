@@ -23,6 +23,7 @@ members = [
     "crates/cs-ffi-sha2",
     "crates/cs-ffi-http",
     "crates/cs-aot",
+    "crates/cs-aot-rt",
     "crates/cs-cli",
     "crates/cs-cli-sha2",
     # Language Server Protocol server (docs/milestones/lsp-server-plan.md).
