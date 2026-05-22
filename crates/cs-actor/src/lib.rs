@@ -271,35 +271,44 @@ impl ActorMailbox {
     /// `spawn_sync_body_on_task_with_kind` for
     /// `block_in_place` semantics).
     ///
-    /// **Caveat:** Fast take-and-replace the receiver around
-    /// the await. If the await is cancelled or the task is
-    /// dropped between the take and the put-back, the
-    /// receiver is leaked — subsequent recv attempts hit
-    /// `None`. Real fix is moving the receiver out of the
-    /// `Mutex` (e.g., to a `tokio::sync::Mutex`) but that's
-    /// a deeper restructure.
+    /// **Cancel-safe.** The Fast backing moves the receiver out of the std
+    /// `Mutex` to await on it (a std guard can't be held across `.await`), but
+    /// a `Drop` guard returns it to the slot — on normal completion *and* on
+    /// cancellation (the future being dropped mid-await, e.g. as the losing
+    /// branch of `tokio::select!`). Without the guard a cancelled await leaked
+    /// the receiver and wedged the mailbox shut (issue #60).
     pub async fn pop_or_wait_async(&self) -> Option<Message> {
         match &*self.inner {
             MailboxBacking::Fast {
                 receiver, pending, ..
             } => {
-                // Take the receiver out of the std Mutex so
-                // we can hold it across await (guard is
-                // !Send). Mem-replace with a fresh throwaway
-                // channel keeps the slot populated for any
-                // concurrent try_recv probe. Scope blocks
-                // guarantee no guard outlives its critical
-                // section.
-                let mut taken = {
+                // The real receiver is parked in this guard while we await on
+                // it; the guard's `Drop` restores it into the slot whether we
+                // complete or are cancelled — that's what makes this
+                // cancel-safe. A throwaway channel keeps the slot populated for
+                // any concurrent `try_recv` probe in the meantime.
+                struct Restore<'a> {
+                    slot: &'a Mutex<mpsc::UnboundedReceiver<Message>>,
+                    rx: Option<mpsc::UnboundedReceiver<Message>>,
+                }
+                impl Drop for Restore<'_> {
+                    fn drop(&mut self) {
+                        if let Some(rx) = self.rx.take() {
+                            *self.slot.lock().expect("receiver lock poisoned") = rx;
+                        }
+                    }
+                }
+
+                let mut parked = {
                     let mut guard = receiver.lock().expect("receiver lock poisoned");
                     let (_dummy_tx, dummy_rx) = mpsc::unbounded_channel();
-                    std::mem::replace(&mut *guard, dummy_rx)
+                    Restore {
+                        slot: receiver,
+                        rx: Some(std::mem::replace(&mut *guard, dummy_rx)),
+                    }
                 };
-                let msg = taken.recv().await;
-                {
-                    let mut guard = receiver.lock().expect("receiver lock poisoned");
-                    *guard = taken;
-                }
+                let msg = parked.rx.as_mut().expect("receiver parked").recv().await;
+                drop(parked); // restore now (the same Drop runs on cancellation)
                 if msg.is_some() {
                     pending.fetch_sub(1, Ordering::Relaxed);
                 }
@@ -1360,6 +1369,34 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex; // tests use Mutex for their own shared state
+
+    #[tokio::test]
+    async fn fast_mailbox_recv_async_is_cancel_safe() {
+        // Regression for issue #60: cancelling a pending async receive — e.g.
+        // as the losing branch of `select!` — must not wedge the mailbox shut.
+        let mb = ActorMailbox::new_fast();
+
+        // Poll a receive once (parks the receiver), then cancel it by letting a
+        // ready branch win the race.
+        tokio::select! {
+            biased;
+            _ = mb.pop_or_wait_async() => unreachable!("nothing was sent"),
+            _ = std::future::ready(()) => {} // wins immediately → cancels the recv
+        }
+
+        // The mailbox must still accept + deliver: the cancelled receive must
+        // have restored the receiver rather than leaking it.
+        let p: Payload = Arc::new(7u8);
+        mb.push(Message::User(p))
+            .expect("mailbox must still accept after a cancelled receive");
+        let got = tokio::time::timeout(Duration::from_secs(1), mb.pop_or_wait_async())
+            .await
+            .expect("receive must not hang after a cancelled receive");
+        assert!(
+            matches!(got, Some(Message::User(_))),
+            "message must be delivered after a cancelled receive"
+        );
+    }
 
     #[test]
     fn pid_displays() {
