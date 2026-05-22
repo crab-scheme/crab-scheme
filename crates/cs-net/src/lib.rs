@@ -29,6 +29,8 @@
 use std::fmt;
 use thiserror::Error;
 
+pub mod framing;
+
 /// A logical traffic class multiplexed over one transport connection.
 ///
 /// Per-channel backpressure means a stalled `bulk` transfer cannot
@@ -89,6 +91,8 @@ pub enum TransportError {
     Backpressure { channel: Channel, depth: usize },
     #[error("handshake failed: {0}")]
     Handshake(String),
+    #[error("framing: {0}")]
+    Framing(String),
     #[error("TLS error: {0}")]
     Tls(String),
     #[error("I/O: {0}")]
