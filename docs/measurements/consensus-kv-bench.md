@@ -152,6 +152,30 @@ Also fixed here: node state and the cluster map used a **shadow-cons** alist tha
 replica); both now do a proper non-growing replace (`aset`/`cluster-set`), a
 small constant cost at low N for bounded memory at scale.
 
+## Actor-driven cluster (real concurrency) — `spawn-source`
+
+The benchmarks above run the engines through the deterministic in-memory
+*simulator* (one thread, explicit `settle`). The same pure engine now also runs
+as **real parallel actors**, each replica on its own OS thread, coordinating
+over live mailboxes — no sim:
+
+- `lib/consensus/raft-actor-body.scm` — the replica actor body: it `(raw-receive)`s
+  messages and `(send)`s the engine's outputs to peer actors, pumping the exact
+  pure transitions from `raft.scm`.
+- `lib/consensus/raft-cluster.scm` — `crabscheme run lib/consensus/raft-cluster.scm`
+  spawns 3 replicas, elects a leader, replicates 3 writes, and asserts every
+  replica's state machine converged (commit index `(3 3 3)`, `user:1 = alice`
+  on a/b/c). Verified stable across repeated runs.
+
+This is unblocked by **`spawn-source`** (cs-runtime), the bridge that lets a
+Scheme procedure *be* an actor body. A Scheme `Value` is `Rc`-based and so
+`!Send`, but an actor body must be `Send` (it runs on a worker of the
+multi-thread runtime), so `(spawn (lambda …))` is impossible; `spawn-source`
+instead ships the body as source + an entry name and rebuilds it on the actor's
+own thread. Consensus *logic stays Scheme* (Constitution Article I) while
+honoring the runtime's thread model. PIDs round-trip through messages as
+printable symbols, so replicas address each other directly.
+
 ## Remaining for a production benchmark
 
 1. ~~Model network latency~~ — done (`latency-sim.scm`).
@@ -159,6 +183,7 @@ small constant cost at low N for bounded memory at scale.
    (`pmap.scm`, Article II intact).
 3. **EPaxos dependency index** — key-bucket `cmds` to flatten the
    non-conflicting `deps-and-seq` scan (couples to key-based interference).
-4. **Run over real transport** — actor-driven in-process works via the wired
-   cs-actor primops; cross-node over cs-net needs new transport builtins (Rust).
+4. **Run over real transport** — ~~actor-driven in-process~~ done via
+   `spawn-source` (`raft-cluster.scm`, real threads + mailboxes); cross-*node*
+   over cs-net still needs new transport builtins (Rust).
 5. **JIT tier** instead of the tree-walker for the protocol compute.
