@@ -8,7 +8,9 @@ name: release
 # Per-target output: a `crabscheme-<version>-<target>.tar.gz`
 # containing the native binaries — `crabscheme`, plus `crabscheme-lsp`
 # and `crabscheme-mcp` (the language server + MCP server for editors and
-# coding agents) — and LICENSE-MIT + LICENSE-APACHE + README.md, with a
+# coding agents) — the AOT level-3 runtime archive `libcs_aot_rt.a` (so
+# `crabscheme aot --build` produces native binaries with no Rust
+# toolchain), and LICENSE-MIT + LICENSE-APACHE + README.md, with a
 # `.sha256` checksum sidecar. The WASM target ships only
 # `crabscheme.wasm` (the servers are native-only; they need host stdio).
 #
@@ -120,6 +122,16 @@ jobs:
       - name: cargo build
         run: cargo build ${{ matrix.cargo_args }}
 
+      # AOT level-3 runtime archive (libcs_aot_rt.a). MUST be built in its
+      # own cargo invocation: feature unification with cs-cli's stdlib
+      # otherwise pulls framework-only deps (security-framework, rustls, …)
+      # into the archive that the user's `cc` link can't auto-resolve.
+      # Native targets only — WASM has no `cc` link step. Bundled beside the
+      # binary so `crabscheme aot --build` works toolchain-free.
+      - name: Build AOT level-3 runtime archive
+        if: matrix.target != 'wasm32-wasip1'
+        run: cargo build --release -p cs-aot-rt
+
       - name: Package artifact
         id: package
         shell: bash
@@ -139,6 +151,12 @@ jobs:
           for b in ${{ matrix.extra_bins }}; do
             cp "$b" "$stage/"
           done
+          # AOT level-3 runtime archive (native only). Sits beside the
+          # binary so `crabscheme aot --build` finds it without a Rust
+          # toolchain (resolve_aot_archive checks the exe's directory).
+          if [ "${{ matrix.target }}" != "wasm32-wasip1" ]; then
+            cp "target/release/libcs_aot_rt.a" "$stage/"
+          fi
           cp README.md "$stage/"
           cp LICENSE-MIT "$stage/"
           cp LICENSE-APACHE "$stage/"

@@ -163,12 +163,14 @@ enum Cmd {
     },
     /// RC3 Phase 4 iter 4.5: self-test the AOT installation. Runs
     /// a baked-in `(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))`
-    /// through the full pipeline (parse → expand → compile → RIR →
-    /// emit project → cargo build → run) and asserts the resulting
-    /// binary returns `120` for `fact(5)`. Exit code 0 on success;
-    /// non-zero (with diagnostic) on any pipeline stage failure.
-    /// Useful for verifying a release-installed binary works on
-    /// the user's platform before pointing it at real source files.
+    /// through the front-end (parse → expand → compile → RIR → emit) then
+    /// exercises both back-ends: level 1 (cargo project → `cargo build` →
+    /// run, when a Rust toolchain is present) and level 3 (cranelift-object
+    /// → system `cc` link against libcs_aot_rt.a → run, no toolchain). Each
+    /// asserts the binary returns `120` for `fact(5)`. Exit 0 if at least
+    /// one back-end is usable; non-zero (with per-step diagnostics) if the
+    /// front-end fails or neither back-end works. Useful for verifying a
+    /// release-installed binary works on the user's platform.
     #[cfg(feature = "aot")]
     AotDoctor,
     /// Typer Phase 6.1: typecheck a Scheme source file.
@@ -511,50 +513,149 @@ fn run_aot_doctor() -> ExitCode {
         }
     };
 
-    // ---- Step 7: cargo build ------
-    println!("  ...running cargo build --release (may take ~10s on a cold cache)...");
-    let build_status = Command::new("cargo")
-        .current_dir(&emitted.project_dir)
-        .arg("build")
-        .arg("--release")
-        .status();
-    match build_status {
-        Ok(s) if s.success() => report("cargo build --release", true, ""),
-        Ok(s) => {
-            report("cargo build --release", false, &format!("exit {s}"));
-            return bail("cargo build failed — is the rust toolchain installed?");
+    // ---- Step 7: level-1 build (cargo). Non-fatal: on a toolchain-free
+    //      host, level 3 (below) may be the only available backend.
+    let mut l1_ok = false;
+    if rust_toolchain_present() {
+        println!("  ...running cargo build --release (may take ~10s on a cold cache)...");
+        match Command::new("cargo")
+            .current_dir(&emitted.project_dir)
+            .arg("build")
+            .arg("--release")
+            .status()
+        {
+            Ok(s) if s.success() => {
+                report("level 1: cargo build --release", true, "");
+                let bin = &emitted.built_binary_path;
+                match Command::new(bin).arg("5").output() {
+                    Ok(o)
+                        if o.status.success()
+                            && String::from_utf8_lossy(&o.stdout).trim() == "120" =>
+                    {
+                        report("level 1: fact(5) = 120", true, &bin.display().to_string());
+                        l1_ok = true;
+                    }
+                    Ok(o) => report(
+                        "level 1: fact(5) = 120",
+                        false,
+                        &format!("got {:?}", String::from_utf8_lossy(&o.stdout).trim()),
+                    ),
+                    Err(e) => report("level 1: run binary", false, &format!("spawn: {e}")),
+                }
+            }
+            Ok(s) => report(
+                "level 1: cargo build --release",
+                false,
+                &format!("exit {s}"),
+            ),
+            Err(e) => report(
+                "level 1: cargo build --release",
+                false,
+                &format!("spawn: {e}"),
+            ),
         }
-        Err(e) => {
-            report("cargo build --release", false, &format!("spawn: {e}"));
-            return bail("cargo not on PATH");
-        }
+    } else {
+        report(
+            "level 1: cargo + rustc",
+            false,
+            "not on PATH — skipping (level 3 below is the toolchain-free path)",
+        );
     }
 
-    // ---- Step 8: run + verify ------
-    let bin = &emitted.built_binary_path;
-    let out = match Command::new(bin).arg("5").output() {
-        Ok(o) => o,
-        Err(e) => {
-            report("run AOT binary", false, &format!("spawn: {e}"));
-            return bail("binary couldn't be spawned");
+    // ---- Step 8: level-3 self-test (cranelift-object + system cc, no
+    //      rustc). Lowers the same `fact` to a relocatable object, links it
+    //      against libcs_aot_rt.a, and verifies fact(5) = 120.
+    let mut l3_ok = false;
+    {
+        use cs_jit_cranelift::ObjectLowerer;
+        use cs_vm::jit_translate::bytecode_to_rir;
+
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let cc_ok = Command::new(&cc)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        report("level 3: system cc", cc_ok, &cc);
+        let archive = resolve_aot_archive();
+        report(
+            "level 3: runtime archive",
+            archive.is_some(),
+            &archive
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "libcs_aot_rt.a not found".to_string()),
+        );
+        if let (true, Some(archive)) = (cc_ok, archive) {
+            let lowered = bytecode_to_rir(lam, "fact", Some(fact_sym))
+                .map_err(|e| format!("{e:?}"))
+                .and_then(|rir| {
+                    let mut lo =
+                        ObjectLowerer::new_object("doctor").map_err(|e| format!("{e:?}"))?;
+                    lo.set_entry_export("crabscheme_aot_entry");
+                    lo.define_uniform_nb(&rir).map_err(|e| format!("{e:?}"))?;
+                    lo.finish_object().map_err(|e| format!("{e:?}"))
+                });
+            match lowered {
+                Ok(obj) => {
+                    report(
+                        "level 3: emit object",
+                        true,
+                        &format!("{} bytes", obj.len()),
+                    );
+                    let l3dir = tmpdir.join("l3");
+                    let _ = std::fs::create_dir_all(&l3dir);
+                    let (op, mp, bp) = (
+                        l3dir.join("prog.o"),
+                        l3dir.join("main.c"),
+                        l3dir.join("fact"),
+                    );
+                    let _ = std::fs::write(&op, &obj);
+                    let _ = std::fs::write(&mp, generate_c_main("crabscheme_aot_entry", 1));
+                    let mut cmd = Command::new(&cc);
+                    cmd.arg(&mp).arg(&op).arg(&archive).arg("-o").arg(&bp);
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        cmd.arg("-lpthread").arg("-ldl").arg("-lm");
+                    }
+                    match cmd.status() {
+                        Ok(s) if s.success() => match Command::new(&bp).arg("5").output() {
+                            Ok(o)
+                                if o.status.success()
+                                    && String::from_utf8_lossy(&o.stdout).trim() == "120" =>
+                            {
+                                report("level 3: fact(5) = 120", true, &bp.display().to_string());
+                                l3_ok = true;
+                            }
+                            Ok(o) => report(
+                                "level 3: fact(5) = 120",
+                                false,
+                                &format!("got {:?}", String::from_utf8_lossy(&o.stdout).trim()),
+                            ),
+                            Err(e) => report("level 3: run binary", false, &format!("spawn: {e}")),
+                        },
+                        Ok(s) => report("level 3: cc link", false, &format!("exit {s}")),
+                        Err(e) => report("level 3: cc link", false, &format!("spawn: {e}")),
+                    }
+                }
+                Err(e) => report("level 3: emit object", false, &e),
+            }
         }
-    };
-    if !out.status.success() {
-        report("run AOT binary", false, &format!("exit {}", out.status));
-        return bail("binary exited non-zero");
-    }
-    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let want = "120";
-    if got == want {
-        report("verify fact(5) = 120", true, "");
-    } else {
-        report("verify fact(5) = 120", false, &format!("got {got:?}"));
-        return bail("AOT binary returned wrong result — silent codegen bug");
     }
 
     println!();
-    println!("crabscheme aot-doctor: all checks passed.");
-    println!("  AOT-compiled binary at: {}", bin.display());
+    match (l1_ok, l3_ok) {
+        (true, true) => println!("crabscheme aot-doctor: ready — level 1 + level 3."),
+        (true, false) => println!("crabscheme aot-doctor: ready — level 1 (cargo+rustc) only."),
+        (false, true) => {
+            println!("crabscheme aot-doctor: ready — level 3 only (toolchain-free: cc + archive).")
+        }
+        (false, false) => {
+            return bail(
+                "neither level 1 (cargo+rustc) nor level 3 (cc + libcs_aot_rt.a) is usable",
+            )
+        }
+    }
     ExitCode::SUCCESS
 }
 
@@ -1823,12 +1924,19 @@ fn run_aot_multi(
     let out_dir = output
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{basename}-aot")));
-    // Level-1 toolchain gate (see run_aot).
+    // Toolchain gate. --multi is the multi-procedure path: the AOT'd
+    // functions call each other through the runtime, which only the
+    // level-1 (cargo+rustc) build registers. The toolchain-free level-3
+    // backend handles single self-contained functions only, so there's no
+    // L3 fallback here — install a toolchain, or AOT one self-recursive
+    // entry at a time (plain `aot <file> --build`, which falls back to L3).
     if build && !rust_toolchain_present() {
         eprintln!(
             "crabscheme aot --multi --build: no Rust toolchain (cargo + rustc) on PATH. \
-             Install rustup, or drop --build to emit the project for building elsewhere. \
-             (Toolchain-free native codegen is a planned follow-up.)"
+             --multi needs level 1 (cross-procedure calls go through the runtime). \
+             Install rustup, drop --build to emit the project for building elsewhere, \
+             or compile a single self-recursive entry with `aot <file> --build` \
+             (which uses the toolchain-free level-3 backend)."
         );
         return ExitCode::from(4);
     }

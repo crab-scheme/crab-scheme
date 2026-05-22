@@ -27,6 +27,41 @@ prog.scm
 The resulting binary runs without any Scheme runtime install —
 it's a single self-contained ELF / Mach-O.
 
+## AOT levels (toolchain-free builds)
+
+`crabscheme aot --build` has two back-ends and picks one automatically:
+
+| Level | When | How | Scope |
+|-------|------|-----|-------|
+| **1** | `cargo` + `rustc` on `PATH` | emit a Cargo project → `cargo build --release` (rustc codegen, full optimization) | everything in *What works* below, incl. multi-procedure (`--multi`) |
+| **3** | no Rust toolchain (or `CRABSCHEME_AOT_FORCE_OBJECT=1`) | reuse the JIT's Cranelift lowering to emit a relocatable `.o`, then link with the system **`cc`** against the prebuilt `libcs_aot_rt.a` archive | **a single self-contained function** (self-recursion only) |
+
+Level 3 needs only a C linker (`cc`/`clang`/`gcc`) — **no Rust toolchain**.
+The pieces ship in the release tarball: the `crabscheme` binary plus
+`libcs_aot_rt.a` beside it (the runtime archive of the `vm_*` helpers the
+emitted object calls). `crabscheme aot-doctor` self-tests both back-ends and
+reports which are usable on your machine.
+
+```bash
+# On a box with cc but no rustc/cargo, this still works:
+$ crabscheme aot fib.scm --build -o fib
+crabscheme aot (level 3): linking fib with cc...
+crabscheme aot: built fib (level 3 — no Rust toolchain)
+$ ./fib 25            # → 75025
+```
+
+**Level-3 limits (today):** one self-recursive entry. A program whose entry
+calls *other* functions (`Inst::Call`) needs the runtime procedure
+registration only level 1 sets up, so it declines with a pointer to install
+a toolchain. `--multi` and `--target` (cross-compile) are level-1 only.
+Override the archive location with `CRABSCHEME_AOT_ARCHIVE=/path/libcs_aot_rt.a`.
+
+> The archive **must be built in its own `cargo` invocation**
+> (`cargo build --release -p cs-aot-rt`): building it alongside `cs-cli`
+> lets Cargo feature-unification pull stdlib-only deps (TLS/HTTP →
+> `security-framework` etc.) into the archive that `cc` can't auto-link.
+> The release workflow already does this in a separate step.
+
 ## Quickstart
 
 ```bash

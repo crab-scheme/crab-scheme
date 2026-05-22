@@ -62,6 +62,37 @@ links cs-runtime (heavier than the lean numeric-kernel mode). **Use
 captures (its compile step folds fewer builtins), a follow-up. Also
 un-broke `.gitignore` (`*-aot/` was shadowing `crates/cs-aot/`).
 
+**AOT level 3 (toolchain-free) — DONE (`feat/aot-ready`, 2026-05-21).**
+Everything above is *level 1*: emit a Cargo project and shell out to
+`cargo build` (needs cargo+rustc). Level 3 removes that dependency —
+`crabscheme aot <file> --build` now produces a native binary on a host with
+**only a C linker** (`cc`), no Rust toolchain:
+
+- **`Lowerer<M: Module>`** — cs-jit-cranelift's JIT lowerer is now generic
+  over the cranelift `Module`. `Lowerer<JITModule>` is the in-process JIT
+  (unchanged); `Lowerer<ObjectModule>` (`new_object` / `define_uniform_nb` /
+  `finish_object`) emits a relocatable `.o` from the *same* per-Inst
+  lowering. Behavior-preserving: `jit_conformance` 8/8, `jit_differential`
+  244, all cs-jit-cranelift tests green.
+- **`cs-aot-rt`** — a new `staticlib` crate (`libcs_aot_rt.a`) bundling the
+  `vm_*` runtime symbols the object references + three C-ABI shims
+  (`cs_aot_nb_fixnum` / `cs_aot_print_result` / `cs_aot_call_builtin`).
+  Thin-LTO retains all 260 declared JIT import symbols with no `#[used]`
+  table. Built in its **own** cargo invocation so feature-unification with
+  cs-cli's stdlib doesn't pull `cc`-unlinkable framework deps.
+- **CLI fork** — `run_aot` auto-selects: cargo+rustc present → L1; absent
+  (or `CRABSCHEME_AOT_FORCE_OBJECT=1`) → L3. The object `.o` + a generated C
+  `main` + `libcs_aot_rt.a` are linked by the system `cc`.
+  `aot-doctor` self-tests both back-ends. Release tarballs ship
+  `libcs_aot_rt.a` beside the binary.
+
+Proven on darwin-aarch64 with cargo+rustc stripped from `PATH`:
+`crabscheme aot fib.scm --build` → `fib 25` = `75025`. Also tak, ack,
+non-recursive `sq`. **Scope:** a single self-contained function
+(self-recursion). Cross-function programs (`Inst::Call`) decline to L1 —
+they need runtime procedure registration the standalone binary lacks;
+multi-procedure L3 is the post-1.0 follow-up.
+
 ## Decision
 
 **Close Track A complete at a narrower scope than the original plan.**

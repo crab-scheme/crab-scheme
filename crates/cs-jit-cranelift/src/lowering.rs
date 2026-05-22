@@ -1781,7 +1781,9 @@ impl Lowerer<JITModule> {
             "vm_string_to_symbol_gc",
             cs_vm::vm::vm_string_to_symbol_gc as *const u8,
         );
-        let mut module = JITModule::new(builder);
+        // `finish_construction` takes ownership and does the mutation
+        // (declare_function); nothing here mutates `module`.
+        let module = JITModule::new(builder);
         Self::finish_construction(module)
     }
 
