@@ -54,7 +54,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             asset: darwin-aarch64
-            cargo_args: "--release -p cs-cli -p cs-lsp"
+            cargo_args: "--release -p cs-cli -p cs-lsp --features bundled-aot-sources"
             bin_path: "target/release/crabscheme"
             extra_bins: "target/release/crabscheme-lsp target/release/crabscheme-mcp"
           # x86_64-apple-darwin (Intel Macs) dropped from the
@@ -70,13 +70,13 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
             asset: linux-x86_64
-            cargo_args: "--release -p cs-cli -p cs-lsp"
+            cargo_args: "--release -p cs-cli -p cs-lsp --features bundled-aot-sources"
             bin_path: "target/release/crabscheme"
             extra_bins: "target/release/crabscheme-lsp target/release/crabscheme-mcp"
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             asset: linux-aarch64
-            cargo_args: "--release -p cs-cli -p cs-lsp"
+            cargo_args: "--release -p cs-cli -p cs-lsp --features bundled-aot-sources"
             bin_path: "target/release/crabscheme"
             extra_bins: "target/release/crabscheme-lsp target/release/crabscheme-mcp"
           - target: wasm32-wasip1
