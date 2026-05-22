@@ -119,6 +119,11 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
     /// for the membership-layer mapping from NodeId to transport.
     fn peer_label(&self) -> &str;
 
+    /// Whether the connection has been closed (locally or by the peer).
+    /// The router uses this to fire DOWN for monitored remote Pids on a
+    /// dropped connection without consuming inbound frames.
+    fn is_closed(&self) -> bool;
+
     /// Initiate a graceful close. Subsequent `send`s fail with
     /// `PeerClosed`.
     fn close(&self) -> Result<(), TransportError>;
@@ -209,12 +214,6 @@ pub mod sim {
         closed: Arc<AtomicBool>,
     }
 
-    impl SimEndpoint {
-        fn is_closed(&self) -> bool {
-            self.closed.load(Ordering::Acquire)
-        }
-    }
-
     impl Transport for SimEndpoint {
         fn send(&self, channel: Channel, payload: &[u8]) -> Result<(), TransportError> {
             if self.is_closed() {
@@ -245,6 +244,10 @@ pub mod sim {
 
         fn peer_label(&self) -> &str {
             &self.peer_label
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Acquire)
         }
 
         fn close(&self) -> Result<(), TransportError> {

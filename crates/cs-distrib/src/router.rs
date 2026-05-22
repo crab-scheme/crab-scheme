@@ -39,6 +39,44 @@ impl std::fmt::Debug for Peer {
     }
 }
 
+/// Why a monitored remote Pid went DOWN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownReason {
+    /// The transport to the Pid's node dropped (Erlang's `noconnection`).
+    NoConnection,
+}
+
+impl DownReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DownReason::NoConnection => "noconnection",
+        }
+    }
+}
+
+impl std::fmt::Display for DownReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A DOWN notification: `watcher` was monitoring `monitored`, which is now
+/// unreachable. Delivered to the watcher's local actor as the equivalent of
+/// `('down ref pid reason)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownNotice {
+    pub watcher: DistPid,
+    pub monitored: DistPid,
+    pub reason: DownReason,
+}
+
+/// A registered monitor: `watcher` (local) watches `target` (remote).
+#[derive(Debug, Clone)]
+struct Monitor {
+    watcher: DistPid,
+    target: DistPid,
+}
+
 /// One node's message router.
 #[derive(Debug)]
 pub struct Router {
@@ -48,6 +86,10 @@ pub struct Router {
     peers: Mutex<HashMap<String, Peer>>,
     /// Inbound messages destined for local actors on this node.
     inbox: Mutex<VecDeque<(DistPid, Vec<u8>)>>,
+    /// Active monitors of remote Pids (fire DOWN on disconnect).
+    monitors: Mutex<Vec<Monitor>>,
+    /// DOWN notices ready for local delivery.
+    down_inbox: Mutex<VecDeque<DownNotice>>,
 }
 
 impl Router {
@@ -56,6 +98,8 @@ impl Router {
             node,
             peers: Mutex::new(HashMap::new()),
             inbox: Mutex::new(VecDeque::new()),
+            monitors: Mutex::new(Vec::new()),
+            down_inbox: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -137,6 +181,75 @@ impl Router {
     /// for cs-actor mailbox delivery until that integration lands.)
     pub fn recv_local(&self) -> Option<(DistPid, Vec<u8>)> {
         self.inbox.lock().expect("inbox poisoned").pop_front()
+    }
+
+    /// Register that local `watcher` monitors remote `target`. If the
+    /// transport to `target`'s node later drops, a [`DownNotice`] with
+    /// reason [`DownReason::NoConnection`] is queued for `watcher`.
+    pub fn monitor(&self, watcher: DistPid, target: DistPid) {
+        self.monitors
+            .lock()
+            .expect("monitors poisoned")
+            .push(Monitor { watcher, target });
+    }
+
+    /// Scan peers for dropped connections and fire DOWN for every monitor
+    /// of a Pid on a now-closed node. Returns the number of DOWN notices
+    /// fired. Closed peers + their monitors are removed (DOWN fires once).
+    pub fn detect_disconnects(&self) -> usize {
+        let mut peers = self.peers.lock().expect("peers poisoned");
+        let down_nodes: Vec<String> = peers
+            .iter()
+            .filter(|(_, p)| p.transport.is_closed())
+            .map(|(label, _)| label.clone())
+            .collect();
+        if down_nodes.is_empty() {
+            return 0;
+        }
+        for label in &down_nodes {
+            peers.remove(label);
+        }
+        drop(peers);
+
+        let mut monitors = self.monitors.lock().expect("monitors poisoned");
+        let mut down = self.down_inbox.lock().expect("down_inbox poisoned");
+        let mut fired = 0;
+        monitors.retain(|m| {
+            if down_nodes.contains(&m.target.node.label()) {
+                down.push_back(DownNotice {
+                    watcher: m.watcher.clone(),
+                    monitored: m.target.clone(),
+                    reason: DownReason::NoConnection,
+                });
+                fired += 1;
+                false // monitor consumed
+            } else {
+                true
+            }
+        });
+        fired
+    }
+
+    /// Pop the next DOWN notice ready for local delivery, if any.
+    pub fn recv_down(&self) -> Option<DownNotice> {
+        self.down_inbox
+            .lock()
+            .expect("down_inbox poisoned")
+            .pop_front()
+    }
+
+    /// Close the transport to `peer_label` (`name@host`), as on a graceful
+    /// leave or a detected link failure. The drop is observed by the next
+    /// [`Self::detect_disconnects`]. Returns whether a peer matched.
+    pub fn disconnect_peer(&self, peer_label: &str) -> bool {
+        let peers = self.peers.lock().expect("peers poisoned");
+        match peers.get(peer_label) {
+            Some(p) => {
+                let _ = p.transport.close();
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -272,5 +385,64 @@ mod tests {
         r.send(b"via-ref").unwrap();
         b.poll().unwrap();
         assert_eq!(b.recv_local(), Some((r.pid().clone(), b"via-ref".to_vec())));
+    }
+
+    #[test]
+    fn disconnect_fires_down_for_monitored_remote_pid() {
+        let a = Router::new(node("a"));
+        let b = Router::new(node("b"));
+        connect(&a, &b);
+        let remote = DistPid::new(node("b"), 77);
+        let watcher = DistPid::new(node("a"), 1);
+        a.monitor(watcher.clone(), remote.clone());
+        // No disconnect yet → nothing fires.
+        assert_eq!(a.detect_disconnects(), 0);
+        assert_eq!(a.recv_down(), None);
+        // Link drops.
+        assert!(a.disconnect_peer(&node("b").label()));
+        assert_eq!(a.detect_disconnects(), 1);
+        assert_eq!(
+            a.recv_down(),
+            Some(DownNotice {
+                watcher,
+                monitored: remote,
+                reason: DownReason::NoConnection,
+            })
+        );
+        // Fires once: the monitor + peer are consumed.
+        assert_eq!(a.detect_disconnects(), 0);
+        assert_eq!(a.recv_down(), None);
+    }
+
+    #[test]
+    fn disconnect_without_monitor_fires_nothing() {
+        let a = Router::new(node("a"));
+        let b = Router::new(node("b"));
+        connect(&a, &b);
+        a.disconnect_peer(&node("b").label());
+        assert_eq!(a.detect_disconnects(), 0);
+        assert_eq!(a.recv_down(), None);
+    }
+
+    #[test]
+    fn down_only_for_the_disconnected_node() {
+        let a = Router::new(node("a"));
+        let b = Router::new(node("b"));
+        let c = Router::new(node("c"));
+        connect(&a, &b);
+        connect(&a, &c);
+        let on_b = DistPid::new(node("b"), 1);
+        let on_c = DistPid::new(node("c"), 1);
+        let w = DistPid::new(node("a"), 9);
+        a.monitor(w.clone(), on_b.clone());
+        a.monitor(w.clone(), on_c.clone());
+        // Only B drops.
+        a.disconnect_peer(&node("b").label());
+        assert_eq!(a.detect_disconnects(), 1);
+        let notice = a.recv_down().expect("one DOWN");
+        assert_eq!(notice.monitored, on_b);
+        assert_eq!(a.recv_down(), None);
+        // C's monitor is untouched — still reachable.
+        assert_eq!(a.send(&on_c, b"still-ok").is_ok(), true);
     }
 }

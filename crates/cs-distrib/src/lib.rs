@@ -36,7 +36,7 @@ pub mod router;
 pub use membership::{MemberState, PartitionPolicy};
 pub use phi::PhiAccrualFailureDetector;
 pub use pid::DistPid;
-pub use router::{RemoteRef, Router};
+pub use router::{DownNotice, DownReason, RemoteRef, Router};
 
 /// Cluster-wide identity for a CrabScheme node.
 ///
