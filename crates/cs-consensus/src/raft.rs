@@ -59,7 +59,7 @@ impl ConfState {
     fn is_quorum(&self, acked: &BTreeSet<ReplicaId>) -> bool {
         let maj = |set: &[ReplicaId]| {
             let n = set.iter().filter(|v| acked.contains(v)).count();
-            n >= set.len() / 2 + 1
+            n > set.len() / 2
         };
         match self {
             ConfState::Simple(v) => maj(v),
