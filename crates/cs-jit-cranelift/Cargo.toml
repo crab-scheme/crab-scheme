@@ -20,6 +20,8 @@ cranelift-frontend = { workspace = true }
 cranelift-jit = { workspace = true }
 cranelift-module = { workspace = true }
 cranelift-native = { workspace = true }
+# AOT L3 — emit relocatable objects the system `cc` links without rustc.
+cranelift-object = { workspace = true }
 
 [dev-dependencies]
 cs-diag = { workspace = true }

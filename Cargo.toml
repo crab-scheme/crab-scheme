@@ -179,6 +179,8 @@ cranelift-frontend = "0.131"
 cranelift-jit = "0.131"
 cranelift-module = "0.131"
 cranelift-native = "0.131"
+# AOT L3 — object backend (sibling of cranelift-jit; same Module trait).
+cranelift-object = "0.131"
 libloading = "0.8"
 proptest = "1"
 # Fast non-cryptographic hasher for Symbol(u32)-keyed maps (the

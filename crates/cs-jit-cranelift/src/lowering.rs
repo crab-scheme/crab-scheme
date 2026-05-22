@@ -45,6 +45,7 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
+use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use cs_jit::JitError;
 #[cfg(test)]
@@ -72,6 +73,12 @@ pub struct Lowerer<M: Module = JITModule> {
     ctx: Context,
     func_ctx: FunctionBuilderContext,
     next_id: u64,
+    /// AOT L3 — when `Some(name)`, the next `define_uniform_nb` declares its
+    /// outer NB trampoline with `Linkage::Export` under `name` (a clean,
+    /// C-callable symbol) so the system linker + generated `main` can reach
+    /// it. `None` (JIT default) keeps the legacy `Linkage::Local`
+    /// auto-generated name. Set via [`Lowerer::set_entry_export`].
+    export_outer_as: Option<String>,
     /// FuncId of the imported `vm_env_lookup_any` helper.
     /// `Inst::EnvLookupAny` lowers to a Cranelift call against
     /// this. Used by iter BU's translator when a free-var load
@@ -852,7 +859,10 @@ impl Lowerer<JITModule> {
         builder.symbol("vm_pair_cdr_gc", cs_vm::vm::vm_pair_cdr_gc as *const u8);
         builder.symbol("vm_pair_p_gc", cs_vm::vm::vm_pair_p_gc as *const u8);
         builder.symbol("vm_null_p_gc", cs_vm::vm::vm_null_p_gc as *const u8);
-        builder.symbol("vm_value_clone_gc", cs_vm::vm::vm_value_clone_gc as *const u8);
+        builder.symbol(
+            "vm_value_clone_gc",
+            cs_vm::vm::vm_value_clone_gc as *const u8,
+        );
         builder.symbol("vm_value_drop_gc", cs_vm::vm::vm_value_drop_gc as *const u8);
         // Stage 3 baseline-JIT NB-typed arithmetic helpers (iter 3.0).
         builder.symbol("vm_value_add_nb", cs_vm::vm::vm_value_add_nb as *const u8);
@@ -1788,6 +1798,58 @@ impl Lowerer<JITModule> {
     #[doc(hidden)]
     pub fn module(&self) -> &JITModule {
         &self.module
+    }
+}
+
+impl Lowerer<ObjectModule> {
+    /// Build an object-emitting lowerer for AOT **level 3**. Same host ISA
+    /// and per-Inst lowering as the JIT, but the runtime helpers stay
+    /// undefined imports (the system `cc` resolves them against the prebuilt
+    /// `libcs_aot_rt.a`) and the emitted functions land in a relocatable
+    /// object via [`Self::finish_object`] — no Rust toolchain at AOT time.
+    ///
+    /// `name` is the object's module identifier (cosmetic; used in
+    /// diagnostics). PIC is on so the `.o` links cleanly into a PIE.
+    pub fn new_object(name: &str) -> Result<Self, JitError> {
+        let mut flag_builder = settings::builder();
+        flag_builder
+            .set("use_colocated_libcalls", "false")
+            .map_err(|e| JitError::Codegen(format!("flag use_colocated_libcalls: {e}")))?;
+        // Object output is linked into an executable (a PIE on modern
+        // macOS / Linux), so position-independent code is required —
+        // unlike the in-process JIT, which maps at a fixed address.
+        flag_builder
+            .set("is_pic", "true")
+            .map_err(|e| JitError::Codegen(format!("flag is_pic: {e}")))?;
+        // Same x64 tail-call frame-pointer requirement as the JIT path.
+        flag_builder
+            .set("preserve_frame_pointers", "true")
+            .map_err(|e| JitError::Codegen(format!("flag preserve_frame_pointers: {e}")))?;
+        let isa_builder = cranelift_native::builder()
+            .map_err(|e| JitError::Codegen(format!("native isa: {e}")))?;
+        let isa = isa_builder
+            .finish(settings::Flags::new(flag_builder))
+            .map_err(|e| JitError::Codegen(format!("isa finish: {e}")))?;
+        let builder = ObjectBuilder::new(isa, name, cranelift_module::default_libcall_names())
+            .map_err(|e| JitError::Codegen(format!("object builder: {e}")))?;
+        let module = ObjectModule::new(builder);
+        Self::finish_construction(module)
+    }
+
+    /// Set the symbol name the *next* [`Self::define_uniform_nb`] exports its
+    /// outer trampoline under (the program's externally-callable entry).
+    pub fn set_entry_export(&mut self, name: impl Into<String>) {
+        self.export_outer_as = Some(name.into());
+    }
+
+    /// Finish the object module and return the relocatable object bytes
+    /// (Mach-O / ELF / COFF for the host target). The caller writes these to
+    /// `prog.o` and links with the system `cc` + `libcs_aot_rt.a`.
+    pub fn finish_object(self) -> Result<Vec<u8>, JitError> {
+        let product = self.module.finish();
+        product
+            .emit()
+            .map_err(|e| JitError::Codegen(format!("object emit: {e}")))
     }
 }
 
@@ -4609,6 +4671,8 @@ impl<M: Module> Lowerer<M> {
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
+            // AOT L3: JIT default keeps the outer trampoline Local.
+            export_outer_as: None,
         })
     }
 
@@ -5133,11 +5197,22 @@ impl<M: Module> Lowerer<M> {
 
         let outer_seq = self.fresh_id();
         let inner_seq = self.fresh_id();
-        let outer_module_name = format!("{}#{}.nb_outer", rir.name, outer_seq);
+        // AOT L3: when an export name is set, the outer trampoline is the
+        // program's externally-callable entry — Export it under that clean
+        // symbol so the generated C `main` + system linker can reach it.
+        // JIT keeps the legacy Local auto-name (the runtime invokes it via
+        // the returned native pointer, not by symbol).
+        let (outer_linkage, outer_module_name) = match self.export_outer_as.take() {
+            Some(name) => (Linkage::Export, name),
+            None => (
+                Linkage::Local,
+                format!("{}#{}.nb_outer", rir.name, outer_seq),
+            ),
+        };
         let inner_module_name = format!("{}#{}.nb_inner", rir.name, inner_seq);
         let outer_id = self
             .module
-            .declare_function(&outer_module_name, Linkage::Local, &outer_sig)
+            .declare_function(&outer_module_name, outer_linkage, &outer_sig)
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function {}: {e}", outer_module_name))
             })?;
@@ -9922,6 +9997,29 @@ pub mod testing {
 mod tests {
     use super::*;
     use std::mem::transmute;
+
+    /// AOT L3 — the object backend lowers a function and emits a
+    /// relocatable object that exports the entry under the requested
+    /// symbol name. Smoke test: non-trivial bytes + the export name
+    /// present in the object's string table.
+    #[test]
+    fn object_backend_emits_exported_entry() {
+        let mut lo = Lowerer::<ObjectModule>::new_object("cs_aot_test").expect("new_object");
+        lo.set_entry_export("cs_test_entry");
+        let f = testing::add_two_fixnums();
+        lo.define_uniform_nb(&f).expect("define_uniform_nb");
+        let obj = lo.finish_object().expect("finish_object");
+        assert!(
+            obj.len() > 64,
+            "object suspiciously small: {} bytes",
+            obj.len()
+        );
+        let needle = b"cs_test_entry";
+        assert!(
+            obj.windows(needle.len()).any(|w| w == needle),
+            "exported entry symbol `cs_test_entry` not found in emitted object"
+        );
+    }
 
     /// Issue #16 — the pre-codegen verifier rejects a function
     /// with an empty block layout (the issue-#4 malformed shape)
