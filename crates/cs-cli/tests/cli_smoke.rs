@@ -408,8 +408,19 @@ fn features_builtin_returns_advertised_symbols() {
 fn version_builtin_returns_string() {
     let (out, _, code) = run_eval("(crabscheme-version)");
     assert_eq!(code, 0);
-    // Should be a quoted string (write mode).
-    assert!(out.contains("\"0.0"), "stdout: {:?}", out);
+    // Should be a quoted, version-like string in write mode (e.g. "1.0.0-rc6"
+    // or "0.0.1") — assert the shape, not a specific version, so RC bumps
+    // don't break this.
+    let s = out.trim();
+    assert!(
+        s.starts_with('"') && s.ends_with('"') && s.len() >= 3,
+        "not a quoted string: {out:?}"
+    );
+    let inner = &s[1..s.len() - 1];
+    assert!(
+        inner.starts_with(|c: char| c.is_ascii_digit()) && inner.contains('.'),
+        "not a version-like string: {out:?}"
+    );
 }
 
 #[test]
