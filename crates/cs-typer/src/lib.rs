@@ -39,6 +39,7 @@ pub mod lifetime_lower;
 pub mod parse_ann;
 pub mod poly;
 pub mod rir_bridge;
+pub mod side_effect;
 pub mod types;
 
 pub use annotate::{
@@ -57,4 +58,5 @@ pub use poly::{instantiate, subst, unify};
 pub use rir_bridge::{
     hints_by_name, lifetime_from_effect, lower as lower_to_rir, param_hints_from_table,
 };
+pub use side_effect::{Effect, EffectSet};
 pub use types::{ProcType, Type};
