@@ -27,6 +27,7 @@
 
 pub mod codec;
 pub mod driver;
+pub mod epaxos;
 pub mod raft;
 pub mod sim;
 
