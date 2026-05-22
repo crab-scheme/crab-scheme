@@ -119,21 +119,46 @@ engine cost. Release numbers:
 | 80 | 2716 → 3576 w/s (+32%) | 629 → 708 (+13%) |
 
 The hash-table SM helps Raft's distinct-key path most; EPaxos benefits least
-because its cost is the **dependency machinery**, not the SM. Crucially, scaling
-is **still O(N²)** — the dominant cost is the *engine's own* association lists
-(`cmds`, shadow-grown node state) and list-`append` log. A truly flat benchmark
-needs those ported to hashtables/vectors too. (Note: CrabScheme has only
-*mutable* R6RS hashtables, no persistent/immutable map, so an O(1) **pure** state
-machine isn't expressible today — a persistent-map library is the real fix and
-keeps Article II intact.)
+because its cost is the **dependency machinery**, not the SM.
+
+## Pure persistent-map state machine (#1 — `lib/consensus/pmap.scm`)
+
+CrabScheme ships only *mutable* R6RS hashtables, so the hash-table SM above
+violates Article II (a pure value). `pmap.scm` adds a **persistent (immutable)
+ordered map** — a treap balanced by `equal-hash` priorities — giving an
+**O(log n) PURE** state machine: each replica keeps its own immutable snapshot,
+no mutation. The library KV (`kv-cache.scm`, `epaxos-kv.scm`) now uses it.
+
+Release numbers (pure pmap SM), with the engine's unbounded-`aset` leak fixed:
+
+| N | Raft (distinct, pmap) | EPaxos (distinct, pmap) |
+|--:|--:|--:|
+| 20 | 2894 w/s | 1984 w/s |
+| 40 | 2549 w/s | 1450 w/s |
+| 80 | 2256 w/s | 969 w/s |
+| 160 | 1884 w/s | 590 w/s |
+
+Reading the scaling: **Raft is nearly flat** (2894→1884 over an 8× N increase —
+the per-write cost barely grows), so its remaining list-`append` log is not the
+bottleneck in range. **EPaxos still falls ~O(N²)** (1984→590) because
+`deps-and-seq` must compare each new command against every prior one — that scan
+is **inherent** to EPaxos's general interference model (a key-indexed variant
+would flatten the *non-conflicting* case, at the cost of the generic
+`interferes?` predicate). pmap ≈ alist at these N (treap overhead vs alist's
+O(n)); pmap pulls ahead as N grows, and stays pure — the point.
+
+Also fixed here: node state and the cluster map used a **shadow-cons** alist that
+**grew unbounded over a node's lifetime** (a real leak for a long-running
+replica); both now do a proper non-growing replace (`aset`/`cluster-set`), a
+small constant cost at low N for bounded memory at scale.
 
 ## Remaining for a production benchmark
 
 1. ~~Model network latency~~ — done (`latency-sim.scm`).
-2. ~~Hash-table state machine~~ — done (bench-only; pure version needs a
-   persistent map).
-3. **Port the engine internals** (`cmds`/log/node-state) off association lists to
-   flatten the O(N²) compute scaling.
-4. **Run over the real cs-net transport** (Sim/TCP/QUIC) once the cluster
-   send/recv primops are wired — measures the actual networked path.
+2. ~~Hash-table state machine~~ / ~~pure O(log n) state machine~~ — done
+   (`pmap.scm`, Article II intact).
+3. **EPaxos dependency index** — key-bucket `cmds` to flatten the
+   non-conflicting `deps-and-seq` scan (couples to key-based interference).
+4. **Run over real transport** — actor-driven in-process works via the wired
+   cs-actor primops; cross-node over cs-net needs new transport builtins (Rust).
 5. **JIT tier** instead of the tree-walker for the protocol compute.

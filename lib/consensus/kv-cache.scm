@@ -10,25 +10,20 @@
 ; of writes, and every replica converges to the same store.
 
 (include "lib/consensus/raft.scm")   ; path is relative to the working directory
+(include "lib/consensus/pmap.scm")   ; pure persistent map for the state machine
 
 ; ============================================================
-; KV state machine (pure)  —  op is (set k v) | (del k)
+; KV state machine (pure, O(log n))  —  op is (set k v) | (del k)
 ; ============================================================
+; State is a pmap (a pure persistent map), so each replica keeps its own
+; immutable snapshot — no mutable hashtable, Article II preserved.
 
-(define (kv-del al k)
-  (cond ((null? al) '())
-        ((equal? (caar al) k) (kv-del (cdr al) k))
-        (else (cons (car al) (kv-del (cdr al) k)))))
-
-(define (kv-set al k v) (cons (cons k v) (kv-del al k)))   ; upsert
-
-(define (kv-ref al k)
-  (let ((p (assoc k al))) (if p (cdr p) #f)))
-
+(define (kv-empty) (pmap string<?))
+(define (kv-ref m k) (pmap-ref m k #f))
 (define (kv-apply state op)
   (case (car op)
-    ((set) (kv-set state (cadr op) (caddr op)))
-    ((del) (kv-del state (cadr op)))
+    ((set) (pmap-set state (cadr op) (caddr op)))
+    ((del) (pmap-del state (cadr op)))
     (else  state)))
 
 ; ============================================================
@@ -63,7 +58,7 @@
         (display " got=") (write actual) (newline))))
 
 ; A 3-node cluster (tolerates 1 failure).
-(define c0 (cluster-make '(a b c) kv-apply '()))
+(define c0 (cluster-make '(a b c) kv-apply (kv-empty)))
 
 ; node a runs for office; b and c grant their votes -> a is leader.
 (define c1 (cluster-campaign c0 'a))

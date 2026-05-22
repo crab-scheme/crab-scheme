@@ -28,7 +28,12 @@
 ; ============================================================
 
 (define (aget al k) (cdr (assq k al)))
-(define (aset al k v) (cons (cons k v) al))      ; shadows; assq finds newest
+; Proper (non-growing) replace — bounds node state to O(fields) instead of
+; letting a shadow-cons alist grow O(transitions) and turn lookups quadratic.
+(define (aset al k v)
+  (cond ((null? al) (list (cons k v)))
+        ((eq? (caar al) k) (cons (cons k v) (cdr al)))
+        (else (cons (car al) (aset (cdr al) k v)))))
 ; aset* takes a flat list (k v k v ...) — this dialect has no rest-args.
 (define (aset* al kvs)
   (if (null? kvs) al (aset* (aset al (car kvs) (cadr kvs)) (cddr kvs))))
@@ -217,7 +222,7 @@
   (map (lambda (id) (cons id (make-raft id ids apply-fn sm0))) ids))
 
 (define (cluster-get c id) (cdr (assq id c)))
-(define (cluster-set c id st) (cons (cons id st) c))    ; shadow; assq newest
+(define (cluster-set c id st) (aset c id st))           ; proper replace (no growth)
 
 ; Deliver every queued (from to msg) — and the replies they beget — until none
 ; remain. Returns the settled cluster.

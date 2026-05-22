@@ -8,21 +8,18 @@
 ;   crabscheme run lib/consensus/epaxos-kv.scm
 
 (include "lib/consensus/epaxos.scm")   ; path is relative to the working directory
+(include "lib/consensus/pmap.scm")     ; pure persistent map for the state machine
 
 ; ============================================================
-; KV state machine + interference (pure)
+; KV state machine + interference (pure, O(log n))
 ; ============================================================
 
-(define (kv-del al k)
-  (cond ((null? al) '())
-        ((equal? (caar al) k) (kv-del (cdr al) k))
-        (else (cons (car al) (kv-del (cdr al) k)))))
-(define (kv-set al k v) (cons (cons k v) (kv-del al k)))
-(define (kv-ref al k) (let ((p (assoc k al))) (if p (cdr p) #f)))
+(define (kv-empty) (pmap string<?))
+(define (kv-ref m k) (pmap-ref m k #f))
 (define (kv-apply state op)
   (case (car op)
-    ((set) (kv-set state (cadr op) (caddr op)))
-    ((del) (kv-del state (cadr op)))
+    ((set) (pmap-set state (cadr op) (caddr op)))
+    ((del) (pmap-del state (cadr op)))
     (else  state)))
 
 ; Two ops interfere iff they touch the same key (cadr is the key for set/del).
@@ -60,7 +57,7 @@
         (display " got=") (write actual) (newline))))
 
 ; ---- 1. Non-interfering commands commute: committed + executed everywhere ----
-(define n0 (epx-make '(a b c) kv-interferes? kv-apply '()))
+(define n0 (epx-make '(a b c) kv-interferes? kv-apply (kv-empty)))
 (define ni1 (epx-inject n0 'a (lambda (st) (epaxos-propose st (list 'set "x" 1)))))
 (define ni2 (epx-inject (car ni1) 'b (lambda (st) (epaxos-propose st (list 'set "y" 2)))))
 (define nf  (epx-settle (car ni2) (append (cdr ni1) (cdr ni2))))
@@ -74,7 +71,7 @@
 
 ; ---- 2. Concurrent interfering writes (same key) at two different leaders:
 ;         every replica executes them in the SAME order, no leader. ----
-(define m0 (epx-make '(a b c) kv-interferes? kv-apply '()))
+(define m0 (epx-make '(a b c) kv-interferes? kv-apply (kv-empty)))
 (define mi1 (epx-inject m0 'a (lambda (st) (epaxos-propose st (list 'set "k" 1)))))
 (define mi2 (epx-inject (car mi1) 'c (lambda (st) (epaxos-propose st (list 'set "k" 2)))))
 (define mf  (epx-settle (car mi2) (append (cdr mi1) (cdr mi2))))

@@ -13,6 +13,7 @@
 
 (include "lib/consensus/raft.scm")
 (include "lib/consensus/epaxos.scm")
+(include "lib/consensus/pmap.scm")
 
 ; ---- KV state machine + interference ----
 (define (kv-del al k)
@@ -115,3 +116,36 @@
    (report "epaxos (distinct, fast-path,ht)" n (bench-epaxos-distinct-ht n))
    (newline))
  '(20 40 80))
+
+; ---- pure persistent-map state machine (Article II intact, O(log n)) ----
+(define (kv-apply-pm m op)
+  (case (car op)
+    ((set) (pmap-set m (cadr op) (caddr op)))
+    ((del) (pmap-del m (cadr op)))
+    (else  m)))
+(define (kv0) (pmap string<?))
+
+(define (bench-raft-pm n)
+  (let* ((c1 (cluster-campaign (cluster-make '(a b c) kv-apply-pm (kv0)) 'a))
+         (t0 (now)))
+    (let loop ((i 0) (c c1))
+      (if (>= i n) (secs t0 (now))
+          (loop (+ i 1) (cluster-propose c 'a (list 'set (key i) i)))))))
+
+(define (bench-epaxos-distinct-pm n)
+  (let* ((c0 (epx-make '(a b c) kv-interferes? kv-apply-pm (kv0)))
+         (t0 (now)))
+    (let loop ((i 0) (c c0))
+      (if (>= i n) (secs t0 (now))
+          (let* ((leader (list-ref '(a b c) (modulo i 3)))
+                 (inj (epx-inject c leader (lambda (st) (epaxos-propose st (list 'set (key i) i))))))
+            (loop (+ i 1) (epx-settle (car inj) (cdr inj))))))))
+
+(display "=== pure persistent-map state machine (Article II intact) ===") (newline)
+(for-each
+ (lambda (n)
+   (display "N = ") (display n) (newline)
+   (report "raft   (distinct keys, pmap)  " n (bench-raft-pm n))
+   (report "epaxos (distinct, fast-path,pm)" n (bench-epaxos-distinct-pm n))
+   (newline))
+ '(20 40 80 160))

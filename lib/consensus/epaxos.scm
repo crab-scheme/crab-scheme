@@ -27,7 +27,12 @@
 ; ============================================================
 
 (define (aget al k) (cdr (assq k al)))           ; symbol-keyed (eq?)
-(define (aset al k v) (cons (cons k v) al))      ; shadow; not iterated
+; Proper (non-growing) replace — bounds node state / collect records to
+; O(fields) instead of growing the alist O(transitions).
+(define (aset al k v)
+  (cond ((null? al) (list (cons k v)))
+        ((eq? (caar al) k) (cons (cons k v) (cdr al)))
+        (else (cons (car al) (aset (cdr al) k v)))))
 (define (aset* al kvs)
   (if (null? kvs) al (aset* (aset al (car kvs) (cadr kvs)) (cddr kvs))))
 
