@@ -13,12 +13,16 @@
 //! - gate privileged effects (net / agent / audit) behind capabilities
 //!   (M10).
 //!
-//! # Iter A (this commit)
+//! # Contents
 //!
-//! Ships the [`Effect`] enum + the [`EffectSet`] bitset and its lattice
-//! algebra (union / subset / difference). The bottom-up inferencer over
-//! `cs_ir::CoreExpr` and the builtin effect table land in iter B; the
-//! `#:effects` surface syntax in iter C; the check pass in iter D.
+//! - The [`Effect`] enum + [`EffectSet`] bitset and its lattice algebra
+//!   (union / subset / difference) — M01 iter A.
+//! - [`primitive_side_effects`] (the builtin effect table) and
+//!   [`infer_side_effects`] (the bottom-up inferencer over `cs_ir::CoreExpr`)
+//!   — iter B.
+//!
+//! The `#:effects` surface syntax, the check pass, and the state-migration
+//! constraint live in [`crate::effect_decl`] (iters C / D / E).
 //!
 //! # Lattice
 //!
@@ -130,6 +134,13 @@ impl EffectSet {
     /// Every effect set — top of the lattice. Mostly useful as the
     /// conservative effect of an unanalyzable callee.
     pub const ALL: EffectSet = EffectSet((1u16 << Effect::ALL.len()) - 1);
+
+    /// The effects a state-migration thunk (M01 iter E) is permitted to
+    /// perform: it may allocate the new state and mutate locals, but must
+    /// be otherwise deterministic — no I/O, network, wall-clock, or
+    /// randomness — so hot-upgrade replays are reproducible.
+    pub const MIGRATION_ALLOWED: EffectSet =
+        EffectSet::PURE.with(Effect::Alloc).with(Effect::Mutation);
 
     /// A set containing exactly `e`.
     pub const fn single(e: Effect) -> EffectSet {

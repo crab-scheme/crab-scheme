@@ -117,6 +117,38 @@ fn check_form(
     }
 }
 
+/// Effect constraint for a state-migration thunk (M01 iter E).
+///
+/// `(define-state-migration …)` registers a thunk that hot-upgrade runs on
+/// each actor's saved state. Replays must be reproducible, so the thunk may
+/// only allocate the new state and mutate locals
+/// ([`EffectSet::MIGRATION_ALLOWED`]) — never I/O, network, wall-clock, or
+/// randomness. Returns a diagnostic naming any disallowed effect.
+///
+/// `value` is the migration thunk (a lambda); `declared` is the program's
+/// effect environment for resolving any calls it makes.
+pub fn check_migration_body(
+    name: &str,
+    value: &CoreExpr,
+    syms: &SymbolTable,
+    declared: &EffectDecls,
+) -> Option<Diagnostic> {
+    let inferred = definition_body_effects(value, syms, declared);
+    let disallowed = inferred.difference(EffectSet::MIGRATION_ALLOWED);
+    if disallowed.is_empty() {
+        None
+    } else {
+        Some(Diagnostic::error(
+            format!(
+                "state migration `{name}` performs disallowed effect(s) {disallowed}; \
+                 migrations must be deterministic (allowed: {})",
+                EffectSet::MIGRATION_ALLOWED
+            ),
+            value.span(),
+        ))
+    }
+}
+
 /// If `d` is `(define HEAD #:effects QUOTED REST…)`, record the declaration
 /// and return the form with the `#:effects QUOTED` pair removed. Returns
 /// `None` (caller keeps the original) when `d` isn't an effect-annotated
@@ -400,5 +432,57 @@ mod tests {
         );
         assert_eq!(bad.len(), 1, "{bad:?}");
         assert!(bad[0].contains("net"), "{}", bad[0]);
+    }
+
+    // === iter E: state-migration effect constraint ===
+
+    /// Expand `(define m <thunk>)` and run the migration-effect check on the
+    /// thunk; return the diagnostic message, if any.
+    fn migration_diag(thunk_src: &str) -> Option<String> {
+        let src = format!("(define m {thunk_src})");
+        let mut syms = SymbolTable::new();
+        let mut sources = cs_diag::SourceMap::new();
+        let fid = sources.add("<test>", &src);
+        let data = cs_parse::read_all(fid, &src, &mut syms).expect("parse");
+        let (stripped, declared, _) = extract_effect_decls(&data, &mut syms);
+        let mut macros = std::collections::HashMap::new();
+        let mut expander = cs_expand::Expander::new(&mut syms, &mut macros);
+        let program = expander.expand_program(&stripped).expect("expand");
+        drop(expander);
+        let value = first_set_value(&program).expect("a top-level define");
+        check_migration_body("m", value, &syms, &declared).map(|d| d.message)
+    }
+
+    fn first_set_value(program: &CoreExpr) -> Option<&CoreExpr> {
+        match program {
+            CoreExpr::Begin { exprs, .. } => exprs.iter().find_map(first_set_value),
+            CoreExpr::Set { value, .. } => Some(&**value),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn pure_migration_is_allowed() {
+        assert_eq!(migration_diag("(lambda (s) (cons s 0))"), None);
+    }
+
+    #[test]
+    fn mutation_migration_is_allowed() {
+        assert_eq!(
+            migration_diag("(lambda (s) (begin (vector-set! s 0 1) s))"),
+            None
+        );
+    }
+
+    #[test]
+    fn wall_clock_migration_is_rejected() {
+        let d = migration_diag("(lambda (s) (cons s (current-time)))").expect("must reject");
+        assert!(d.contains("wall-clock"), "{d}");
+    }
+
+    #[test]
+    fn io_migration_is_rejected() {
+        let d = migration_diag("(lambda (s) (begin (display s) s))").expect("must reject");
+        assert!(d.contains("io"), "{d}");
     }
 }
