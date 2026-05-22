@@ -60,16 +60,58 @@
                  (inj (epx-inject c leader (lambda (st) (epaxos-propose st (list 'set "hot" i))))))
             (loop (+ i 1) (epx-settle (car inj) (cdr inj))))))))
 
+; ---- #2: O(1) hash-table state machine (R6RS mutable hashtable) ----
+; Removes the KV state machine's O(n) cost. A mutable hashtable is NOT a pure
+; value (Article II), so it's used here in the benchmark only — with a FRESH
+; table per replica — while the library KV (kv-cache.scm) stays pure (alist).
+; This isolates how much of the falloff is the state machine vs the engine's own
+; alist/list internals.
+(define (kv-apply-ht ht op)
+  (case (car op)
+    ((set) (hashtable-set! ht (cadr op) (caddr op)) ht)
+    ((del) (hashtable-delete! ht (cadr op)) ht)
+    (else ht)))
+(define (fresh-ht) (make-hashtable equal-hash equal?))
+
+(define (bench-raft-ht n)
+  (let* ((ids '(a b c))
+         (c0 (map (lambda (id) (cons id (make-raft id ids kv-apply-ht (fresh-ht)))) ids))
+         (c1 (cluster-campaign c0 'a))
+         (t0 (now)))
+    (let loop ((i 0) (c c1))
+      (if (>= i n) (secs t0 (now))
+          (loop (+ i 1) (cluster-propose c 'a (list 'set (key i) i)))))))
+
+(define (bench-epaxos-distinct-ht n)
+  (let* ((ids '(a b c))
+         (c0 (map (lambda (id) (cons id (make-epaxos id ids kv-interferes? kv-apply-ht (fresh-ht)))) ids))
+         (t0 (now)))
+    (let loop ((i 0) (c c0))
+      (if (>= i n) (secs t0 (now))
+          (let* ((leader (list-ref '(a b c) (modulo i 3)))
+                 (inj (epx-inject c leader (lambda (st) (epaxos-propose st (list 'set (key i) i))))))
+            (loop (+ i 1) (epx-settle (car inj) (cdr inj))))))))
+
 (define (report label n s)
   (display "  ") (display label) (display ": ") (display n)
   (display " writes in ") (display s) (display "s  =>  ")
   (display (round (/ n s))) (display " writes/sec") (newline))
 
+(display "=== pure alist state machine ===") (newline)
 (for-each
  (lambda (n)
    (display "N = ") (display n) (newline)
    (report "raft   (distinct keys)        " n (bench-raft n))
    (report "epaxos (distinct, fast-path)  " n (bench-epaxos-distinct n))
    (report "epaxos (same key, conflicting)" n (bench-epaxos-conflict n))
+   (newline))
+ '(20 40 80))
+
+(display "=== O(1) hash-table state machine (bench-only; engine internals unchanged) ===") (newline)
+(for-each
+ (lambda (n)
+   (display "N = ") (display n) (newline)
+   (report "raft   (distinct keys, ht)    " n (bench-raft-ht n))
+   (report "epaxos (distinct, fast-path,ht)" n (bench-epaxos-distinct-ht n))
    (newline))
  '(20 40 80))

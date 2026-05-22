@@ -75,12 +75,65 @@ conflict, loses the edge under high conflict* — is a **network/round-trip**
 result. Our compute sim can't reproduce the win (no latency) but does reproduce
 the conflict-sensitivity.
 
-## To make this a fair throughput benchmark
+## Latency model — where EPaxos's advantage actually shows
 
-1. **Model network latency** in the sim (per-message delay) — then EPaxos's
-   fewer round trips / leaderless parallelism become visible.
-2. **Hash-table state machine** (remove the O(n) alist) for honest absolute
-   numbers.
-3. **Run over the real cs-net transport** (Sim/TCP/QUIC) once the cluster
+`lib/consensus/latency-sim.scm` — `crabscheme run lib/consensus/latency-sim.scm`.
+
+EPaxos's win is a **round-trip** effect, invisible in the zero-latency compute
+bench. This sim **measures** the number of sequential message rounds to commit a
+write (BFS over the real engines' message-causality graph), then expresses
+commit latency as `rounds × L` (one-way network delay). Raft has no
+forward/notify messages in our engine, so for a non-leader origin we measure the
+leader's round-trip commit (2 rounds) and *add* the two hops Raft genuinely
+needs — forward (origin→leader) and notify (leader→origin).
+
+Measured: **both** engines commit in **2 message rounds** (one round trip) — but
+Raft only when the write originates at the leader; **EPaxos achieves it from any
+origin** (any replica leads its own command).
+
+| write origin (3-node) | Raft | EPaxos |
+|---|---|---|
+| leader | 2L | 2L |
+| follower-1 | 4L | 2L |
+| follower-2 | 4L | 2L |
+| **mean (uniform origins)** | **3.33L** | **2L** |
+
+At a WAN `L = 50 ms`: **mean commit latency Raft ≈ 167 ms vs EPaxos 100 ms** (~40%
+lower). Throughput axis: Raft's single leader coordinates *all* M writes (a
+bottleneck); EPaxos spreads coordination ~M/3 across replicas (≈3× headroom at
+low conflict) — matching the literature's "no leader bottleneck" / 2.7×-at-2%-
+conflict result. Under conflict EPaxos falls to 2 round trips and loses the edge.
+
+## Hash-table state machine (#2)
+
+`bench.scm` also runs an O(1) **hash-table** state machine (R6RS mutable
+`make-hashtable`, a fresh table per replica) beside the pure alist. A mutable
+hashtable isn't a pure value (Article II), so it's **benchmark-only** — the
+library KV (`kv-cache.scm`) stays pure-alist; this just isolates SM cost from
+engine cost. Release numbers:
+
+| N | Raft alist → ht | EPaxos alist → ht |
+|--:|--|--|
+| 20 | 5141 → 6321 w/s (+23%) | 2470 → 2693 (+9%) |
+| 40 | 4119 → 5027 w/s (+22%) | 1274 → 1586 (+24%) |
+| 80 | 2716 → 3576 w/s (+32%) | 629 → 708 (+13%) |
+
+The hash-table SM helps Raft's distinct-key path most; EPaxos benefits least
+because its cost is the **dependency machinery**, not the SM. Crucially, scaling
+is **still O(N²)** — the dominant cost is the *engine's own* association lists
+(`cmds`, shadow-grown node state) and list-`append` log. A truly flat benchmark
+needs those ported to hashtables/vectors too. (Note: CrabScheme has only
+*mutable* R6RS hashtables, no persistent/immutable map, so an O(1) **pure** state
+machine isn't expressible today — a persistent-map library is the real fix and
+keeps Article II intact.)
+
+## Remaining for a production benchmark
+
+1. ~~Model network latency~~ — done (`latency-sim.scm`).
+2. ~~Hash-table state machine~~ — done (bench-only; pure version needs a
+   persistent map).
+3. **Port the engine internals** (`cmds`/log/node-state) off association lists to
+   flatten the O(N²) compute scaling.
+4. **Run over the real cs-net transport** (Sim/TCP/QUIC) once the cluster
    send/recv primops are wired — measures the actual networked path.
-4. **JIT tier** instead of the tree-walker for the protocol compute.
+5. **JIT tier** instead of the tree-walker for the protocol compute.
