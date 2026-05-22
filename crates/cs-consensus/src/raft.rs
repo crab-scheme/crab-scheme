@@ -73,6 +73,17 @@ pub enum Message {
         conflict_index: Index,
         read_seq: u64,
     },
+    /// Leader → follower that has fallen behind the leader's compacted log:
+    /// ship the snapshot so it can catch up. The follower replies with an
+    /// `AppendEntriesResp` (`match_index = last_included_index`).
+    InstallSnapshot {
+        term: Term,
+        leader: ReplicaId,
+        last_included_index: Index,
+        last_included_term: Term,
+        data: Vec<u8>,
+        read_seq: u64,
+    },
 }
 
 /// A node's current role in its term.
@@ -117,6 +128,9 @@ pub struct Config {
     /// Leader heartbeat period; must be `< election_timeout_min` so a healthy
     /// leader keeps followers from timing out.
     pub heartbeat_interval: u32,
+    /// Compact the log into a snapshot once this many *applied* entries have
+    /// accumulated past the current snapshot base. `0` disables compaction.
+    pub snapshot_threshold: u64,
 }
 
 impl Default for Config {
@@ -125,6 +139,7 @@ impl Default for Config {
             election_timeout_min: 5,
             election_timeout_max: 10,
             heartbeat_interval: 1,
+            snapshot_threshold: 0,
         }
     }
 }
@@ -143,6 +158,13 @@ pub struct RaftNode<SM: StateMachine> {
     current_term: Term,
     voted_for: Option<ReplicaId>,
     log: Vec<Entry>,
+    /// Index/term of the last entry folded into the latest snapshot; the live
+    /// `log` holds only entries after `base_index`.
+    base_index: Index,
+    base_term: Term,
+    /// Serialized state machine as of `base_index` — shipped verbatim in
+    /// `InstallSnapshot` (it must reflect `base_index`, not the latest apply).
+    snapshot_data: Vec<u8>,
 
     // ---- volatile state ----
     role: Role,
@@ -188,6 +210,9 @@ impl<SM: StateMachine> RaftNode<SM> {
             current_term: 0,
             voted_for: None,
             log: Vec::new(),
+            base_index: 0,
+            base_term: 0,
+            snapshot_data: Vec::new(),
             role: Role::Follower,
             leader_id: None,
             commit_index: 0,
@@ -236,25 +261,36 @@ impl<SM: StateMachine> RaftNode<SM> {
         &self.sm
     }
 
-    // ---- log helpers (1-based) ----
+    // ---- log helpers (1-based; `base_index` entries are compacted away into
+    // the latest snapshot, so live entries are `base_index+1 ..= last`) ----
     pub fn last_log_index(&self) -> Index {
-        self.log.last().map(|e| e.index).unwrap_or(0)
+        self.log.last().map(|e| e.index).unwrap_or(self.base_index)
     }
     fn last_log_term(&self) -> Term {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+        self.log.last().map(|e| e.term).unwrap_or(self.base_term)
     }
-    /// Term of the entry at `index` (0 for index 0 / empty).
+    /// Term of the entry at `index`, or `None` if it's unknown (beyond the log)
+    /// or already compacted (`index < base_index`). `base_index` itself is the
+    /// snapshot's last-included term.
     fn term_at(&self, index: Index) -> Option<Term> {
         if index == 0 {
             return Some(0);
         }
-        self.log.get((index - 1) as usize).map(|e| e.term)
+        if index == self.base_index {
+            return Some(self.base_term);
+        }
+        if index < self.base_index {
+            return None; // compacted
+        }
+        self.log
+            .get((index - self.base_index - 1) as usize)
+            .map(|e| e.term)
     }
     fn entry_at(&self, index: Index) -> Option<&Entry> {
-        if index == 0 {
-            return None;
+        if index <= self.base_index {
+            return None; // zero or compacted
         }
-        self.log.get((index - 1) as usize)
+        self.log.get((index - self.base_index - 1) as usize)
     }
 
     fn peers(&self) -> impl Iterator<Item = ReplicaId> + '_ {
@@ -394,6 +430,21 @@ impl<SM: StateMachine> RaftNode<SM> {
                 success,
                 match_index,
                 conflict_index,
+                read_seq,
+            ),
+            Message::InstallSnapshot {
+                term,
+                leader,
+                last_included_index,
+                last_included_term,
+                data,
+                read_seq,
+            } => self.handle_install_snapshot(
+                term,
+                leader,
+                last_included_index,
+                last_included_term,
+                data,
                 read_seq,
             ),
         }
@@ -579,11 +630,14 @@ impl<SM: StateMachine> RaftNode<SM> {
         let match_index = prev_log_index + entries.len() as Index;
         // Splice in entries, truncating on the first conflict.
         for e in entries {
+            if e.index <= self.base_index {
+                continue; // already folded into our snapshot
+            }
             match self.term_at(e.index) {
                 Some(t) if t == e.term => {} // already have it; skip
                 Some(_) => {
                     // Conflict: drop this entry and everything after it.
-                    self.log.truncate((e.index - 1) as usize);
+                    self.log.truncate((e.index - self.base_index - 1) as usize);
                     self.log.push(e);
                 }
                 None => self.log.push(e),
@@ -605,6 +659,54 @@ impl<SM: StateMachine> RaftNode<SM> {
                 read_seq,
             },
         )]
+    }
+
+    // ---- InstallSnapshot (follower side) ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_install_snapshot(
+        &mut self,
+        term: Term,
+        leader: ReplicaId,
+        last_included_index: Index,
+        last_included_term: Term,
+        data: Vec<u8>,
+        read_seq: u64,
+    ) -> Vec<Out> {
+        let ack = |this: &Self, success, match_index| {
+            vec![(
+                leader,
+                Message::AppendEntriesResp {
+                    term: this.current_term,
+                    success,
+                    match_index,
+                    conflict_index: 0,
+                    read_seq,
+                },
+            )]
+        };
+        if term < self.current_term {
+            return ack(self, false, 0);
+        }
+        self.become_follower(term, Some(leader));
+        // Stale / already-covered snapshot: ack our current position.
+        if last_included_index <= self.base_index {
+            return ack(self, true, self.last_log_index());
+        }
+        // Keep a consistent suffix if we have a matching entry at the snapshot
+        // boundary; otherwise the whole log is superseded.
+        if self.term_at(last_included_index) == Some(last_included_term) {
+            self.log.retain(|e| e.index > last_included_index);
+        } else {
+            self.log.clear();
+        }
+        self.sm.restore(&data);
+        self.snapshot_data = data;
+        self.base_index = last_included_index;
+        self.base_term = last_included_term;
+        self.commit_index = self.commit_index.max(last_included_index);
+        self.last_applied = self.last_applied.max(last_included_index);
+        ack(self, true, last_included_index)
     }
 
     // ---- AppendEntries (leader side) ----
@@ -650,9 +752,22 @@ impl<SM: StateMachine> RaftNode<SM> {
         }
     }
 
-    /// Build the `AppendEntries` to send to `peer` from its `next_index`.
+    /// Build the message to send to `peer` from its `next_index`: an
+    /// `InstallSnapshot` if it has fallen behind the compacted log, else an
+    /// `AppendEntries` carrying the missing suffix.
     fn append_for(&self, peer: ReplicaId) -> Message {
         let next = self.next_index.get(&peer).copied().unwrap_or(1);
+        // The entry just before `next` is gone (compacted) → ship the snapshot.
+        if next <= self.base_index {
+            return Message::InstallSnapshot {
+                term: self.current_term,
+                leader: self.id,
+                last_included_index: self.base_index,
+                last_included_term: self.base_term,
+                data: self.snapshot_data.clone(),
+                read_seq: self.read_seq,
+            };
+        }
         let prev_log_index = next - 1;
         let prev_log_term = self.term_at(prev_log_index).unwrap_or(0);
         let entries: Vec<Entry> = self
@@ -724,6 +839,37 @@ impl<SM: StateMachine> RaftNode<SM> {
         }
         // Newly-applied state may satisfy a pending read's read_index.
         self.serve_reads();
+        self.maybe_compact();
+    }
+
+    /// Fold every applied entry into a snapshot and drop it from the live log.
+    /// The snapshot blob is captured from the state machine *now*, while it
+    /// reflects exactly `last_applied`. No-op if nothing new was applied.
+    pub fn compact(&mut self) {
+        if self.last_applied <= self.base_index {
+            return;
+        }
+        let new_base = self.last_applied;
+        let new_base_term = self.term_at(new_base).expect("applied entry is present");
+        self.snapshot_data = self.sm.snapshot();
+        self.log.retain(|e| e.index > new_base);
+        self.base_index = new_base;
+        self.base_term = new_base_term;
+    }
+
+    /// Compact once the configured number of applied entries has accumulated
+    /// past the snapshot base.
+    fn maybe_compact(&mut self) {
+        let thr = self.cfg.snapshot_threshold;
+        if thr > 0 && self.last_applied.saturating_sub(self.base_index) >= thr {
+            self.compact();
+        }
+    }
+
+    /// Snapshot bookkeeping accessor (for tests/metrics): the highest index
+    /// folded into a snapshot.
+    pub fn snapshot_index(&self) -> Index {
+        self.base_index
     }
 
     /// Highest `read_seq` a quorum of voters has confirmed (the leader counts
@@ -814,10 +960,14 @@ mod tests {
     }
 
     fn cluster(n: u64) -> Cluster<RaftNode<SumSm>> {
+        cluster_with(n, Config::default())
+    }
+
+    fn cluster_with(n: u64, cfg: Config) -> Cluster<RaftNode<SumSm>> {
         let ids: Vec<ReplicaId> = (0..n).map(ReplicaId).collect();
         let nodes = ids
             .iter()
-            .map(|id| RaftNode::new(*id, ids.clone(), Config::default(), SumSm::default()));
+            .map(|id| RaftNode::new(*id, ids.clone(), cfg.clone(), SumSm::default()));
         Cluster::new(nodes)
     }
 
@@ -1028,6 +1178,48 @@ mod tests {
         assert_eq!(
             c.node_mut(follower).take_ready_reads(),
             vec![(7, ReadResult::NotLeader)]
+        );
+    }
+
+    #[test]
+    fn lagging_follower_recovers_via_snapshot() {
+        // Threshold 3: the leader compacts aggressively. A follower isolated
+        // from the start falls behind the compacted prefix and must be caught
+        // up with an InstallSnapshot, not an AppendEntries.
+        let cfg = Config {
+            snapshot_threshold: 3,
+            ..Config::default()
+        };
+        let mut c = cluster_with(3, cfg);
+        let leader = elect(&mut c, 50);
+        let follower = c.ids().into_iter().find(|id| *id != leader).unwrap();
+
+        c.isolate(follower);
+        for v in [1, 2, 3, 4, 5] {
+            propose(&mut c, leader, v);
+        }
+        c.run(3);
+        assert!(
+            c.node(leader).snapshot_index() > 0,
+            "leader should have compacted its log"
+        );
+        assert_eq!(
+            c.node(follower).sm().total,
+            0,
+            "isolated follower missed all"
+        );
+
+        // Heal: the only way to catch up is via the snapshot.
+        c.heal(follower);
+        c.run(10);
+        assert_eq!(
+            c.node(follower).sm().total,
+            15,
+            "follower restored from snapshot + tail"
+        );
+        assert!(
+            c.node(follower).snapshot_index() > 0,
+            "follower installed the snapshot"
         );
     }
 }
