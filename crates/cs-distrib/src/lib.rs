@@ -30,9 +30,11 @@ use thiserror::Error;
 pub mod gossip;
 pub mod membership;
 pub mod phi;
+pub mod pid;
 
 pub use membership::{MemberState, PartitionPolicy};
 pub use phi::PhiAccrualFailureDetector;
+pub use pid::DistPid;
 
 /// Cluster-wide identity for a CrabScheme node.
 ///
@@ -77,6 +79,8 @@ pub enum DistribError {
     EpochMismatch { expected: u64, got: u64 },
     #[error("peer unreachable: {0}")]
     Unreachable(String),
+    #[error("wire decode: {0}")]
+    Decode(String),
     #[error("transport: {0}")]
     Transport(#[from] cs_net::TransportError),
     #[error("not implemented (cs-distrib scaffold; see docs/research/sdk_spec/tasks/M02-cluster-substrate.md)")]
