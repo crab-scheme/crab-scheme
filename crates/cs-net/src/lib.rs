@@ -105,6 +105,12 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
     /// watermark.
     fn send(&self, channel: Channel, payload: &[u8]) -> Result<(), TransportError>;
 
+    /// Non-blocking inbound poll: return the next frame received on
+    /// `channel`, `Ok(None)` if none is queued, or `Err(PeerClosed)`
+    /// once the connection is closed and the channel is drained. Lets a
+    /// router poll any transport uniformly without an async runtime.
+    fn try_recv(&self, channel: Channel) -> Result<Option<Vec<u8>>, TransportError>;
+
     /// Peer-side identity hint (`name@host`). Used for logging and
     /// for the membership-layer mapping from NodeId to transport.
     fn peer_label(&self) -> &str;
@@ -137,34 +143,166 @@ impl Default for TransportConfig {
 
 #[cfg(feature = "sim")]
 pub mod sim {
-    //! In-memory simulation transport. Deterministic, no syscalls.
+    //! In-memory simulation transport. Deterministic, no syscalls, no
+    //! async runtime.
     //!
-    //! Two peers share an `mpsc` pair per channel; sends are queued
-    //! and delivered in order within a channel. Used by every cs-net
-    //! consumer's unit-test suite and by the future cs-sim
-    //! deterministic simulator.
+    //! A [`SimPair`] connects two [`SimEndpoint`]s. Each endpoint owns one
+    //! inbound queue per [`Channel`] and writes into the *peer's* inbound
+    //! queues; delivery is in-order within a channel (FIFO) and isolated
+    //! across channels (a stalled `Bulk` transfer can't block `Control`).
+    //! A shared closed-flag models a connection drop in both directions.
     //!
-    //! Not yet implemented — placeholder so the feature compiles.
+    //! Used by every cs-net / cs-distrib consumer's unit-test suite (and
+    //! the future cs-sim deterministic simulator): construct a pair, drive
+    //! `send` / `try_recv` synchronously, assert on what arrives.
 
-    // M02 iter B will pull `Channel`, `Transport`, `TransportError`
-    // from `super`. Scaffold needs none of them yet.
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    /// A pair of sim-transport endpoints connected to each other.
-    /// Implementation deferred to M02 iter B.
+    use super::{Channel, Transport, TransportConfig, TransportError};
+
+    /// One channel's FIFO queue plus its high-watermark for backpressure.
+    #[derive(Debug)]
+    struct SimChannelQueue {
+        deque: Mutex<VecDeque<Vec<u8>>>,
+        high_watermark: usize,
+    }
+
+    /// The six per-channel inbound queues for one direction.
+    #[derive(Debug)]
+    struct SimQueues {
+        channels: [SimChannelQueue; Channel::ALL.len()],
+    }
+
+    impl SimQueues {
+        fn new(cfg: &TransportConfig) -> Arc<Self> {
+            let hwm = |c: Channel| match c {
+                Channel::Control | Channel::Consensus => cfg.control_high_watermark,
+                Channel::Messages | Channel::Workflow => cfg.messages_high_watermark,
+                Channel::Bulk | Channel::Observability => cfg.bulk_high_watermark,
+            };
+            Arc::new(SimQueues {
+                channels: Channel::ALL.map(|c| SimChannelQueue {
+                    deque: Mutex::new(VecDeque::new()),
+                    high_watermark: hwm(c),
+                }),
+            })
+        }
+    }
+
+    /// One end of a connected [`SimPair`]. Implements [`Transport`]: `send`
+    /// enqueues into the peer's inbound queue; `try_recv` drains its own.
+    #[derive(Debug)]
+    pub struct SimEndpoint {
+        label: String,
+        peer_label: String,
+        /// Peer's inbound queues — where this endpoint's `send` writes.
+        outbound: Arc<SimQueues>,
+        /// This endpoint's inbound queues — where `try_recv` reads.
+        inbound: Arc<SimQueues>,
+        /// Shared connection-closed flag (drops both directions at once).
+        closed: Arc<AtomicBool>,
+    }
+
+    impl SimEndpoint {
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Acquire)
+        }
+    }
+
+    impl Transport for SimEndpoint {
+        fn send(&self, channel: Channel, payload: &[u8]) -> Result<(), TransportError> {
+            if self.is_closed() {
+                return Err(TransportError::PeerClosed);
+            }
+            let q = &self.outbound.channels[channel as usize];
+            let mut deque = q.deque.lock().expect("sim queue poisoned");
+            if deque.len() >= q.high_watermark {
+                return Err(TransportError::Backpressure {
+                    channel,
+                    depth: deque.len(),
+                });
+            }
+            deque.push_back(payload.to_vec());
+            Ok(())
+        }
+
+        fn try_recv(&self, channel: Channel) -> Result<Option<Vec<u8>>, TransportError> {
+            let q = &self.inbound.channels[channel as usize];
+            let mut deque = q.deque.lock().expect("sim queue poisoned");
+            match deque.pop_front() {
+                Some(frame) => Ok(Some(frame)),
+                // Closed *and* drained → signal end-of-stream.
+                None if self.is_closed() => Err(TransportError::PeerClosed),
+                None => Ok(None),
+            }
+        }
+
+        fn peer_label(&self) -> &str {
+            &self.peer_label
+        }
+
+        fn close(&self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    /// A connected pair of in-memory endpoints. `into_endpoints` yields the
+    /// two [`SimEndpoint`]s; whatever `a` sends, `b` receives, and vice
+    /// versa.
     #[derive(Debug)]
     pub struct SimPair {
-        pub a_label: String,
-        pub b_label: String,
+        a: SimEndpoint,
+        b: SimEndpoint,
     }
 
     impl SimPair {
-        /// Construct a connected pair. The two endpoints implement
-        /// `Transport` and route to each other.
+        /// Construct a connected pair with the default [`TransportConfig`].
         pub fn new(a_label: impl Into<String>, b_label: impl Into<String>) -> Self {
-            SimPair {
-                a_label: a_label.into(),
-                b_label: b_label.into(),
-            }
+            Self::with_config(a_label, b_label, &TransportConfig::default())
+        }
+
+        /// Construct a connected pair with explicit watermarks.
+        pub fn with_config(
+            a_label: impl Into<String>,
+            b_label: impl Into<String>,
+            cfg: &TransportConfig,
+        ) -> Self {
+            let a_label = a_label.into();
+            let b_label = b_label.into();
+            let qa = SimQueues::new(cfg); // a's inbound
+            let qb = SimQueues::new(cfg); // b's inbound
+            let closed = Arc::new(AtomicBool::new(false));
+            let a = SimEndpoint {
+                label: a_label.clone(),
+                peer_label: b_label.clone(),
+                outbound: qb.clone(),
+                inbound: qa.clone(),
+                closed: closed.clone(),
+            };
+            let b = SimEndpoint {
+                label: b_label,
+                peer_label: a_label,
+                outbound: qa,
+                inbound: qb,
+                closed,
+            };
+            SimPair { a, b }
+        }
+
+        /// This endpoint's own label.
+        pub fn a_label(&self) -> &str {
+            &self.a.label
+        }
+        pub fn b_label(&self) -> &str {
+            &self.b.label
+        }
+
+        /// Consume the pair into its two endpoints `(a, b)`.
+        pub fn into_endpoints(self) -> (SimEndpoint, SimEndpoint) {
+            (self.a, self.b)
         }
     }
 }
@@ -240,10 +378,115 @@ mod tests {
     }
 
     #[cfg(feature = "sim")]
-    #[test]
-    fn sim_pair_labels_round_trip() {
-        let pair = sim::SimPair::new("node-a", "node-b");
-        assert_eq!(pair.a_label, "node-a");
-        assert_eq!(pair.b_label, "node-b");
+    mod sim_transport {
+        use super::super::sim::SimPair;
+        use super::super::{Channel, Transport, TransportConfig, TransportError};
+
+        #[test]
+        fn labels_round_trip() {
+            let pair = SimPair::new("node-a", "node-b");
+            assert_eq!(pair.a_label(), "node-a");
+            assert_eq!(pair.b_label(), "node-b");
+            let (a, b) = pair.into_endpoints();
+            assert_eq!(a.peer_label(), "node-b");
+            assert_eq!(b.peer_label(), "node-a");
+        }
+
+        #[test]
+        fn send_is_received_by_peer() {
+            let (a, b) = SimPair::new("a", "b").into_endpoints();
+            a.send(Channel::Messages, b"hello").unwrap();
+            assert_eq!(
+                b.try_recv(Channel::Messages).unwrap(),
+                Some(b"hello".to_vec())
+            );
+            // Drained.
+            assert_eq!(b.try_recv(Channel::Messages).unwrap(), None);
+        }
+
+        #[test]
+        fn delivery_is_bidirectional() {
+            let (a, b) = SimPair::new("a", "b").into_endpoints();
+            a.send(Channel::Messages, b"a->b").unwrap();
+            b.send(Channel::Messages, b"b->a").unwrap();
+            assert_eq!(
+                b.try_recv(Channel::Messages).unwrap(),
+                Some(b"a->b".to_vec())
+            );
+            assert_eq!(
+                a.try_recv(Channel::Messages).unwrap(),
+                Some(b"b->a".to_vec())
+            );
+        }
+
+        #[test]
+        fn order_is_fifo_within_a_channel() {
+            let (a, b) = SimPair::new("a", "b").into_endpoints();
+            for i in 0u8..5 {
+                a.send(Channel::Messages, &[i]).unwrap();
+            }
+            for i in 0u8..5 {
+                assert_eq!(b.try_recv(Channel::Messages).unwrap(), Some(vec![i]));
+            }
+        }
+
+        #[test]
+        fn channels_are_isolated() {
+            let (a, b) = SimPair::new("a", "b").into_endpoints();
+            a.send(Channel::Messages, b"msg").unwrap();
+            // Nothing on Control — a stalled/empty channel doesn't leak.
+            assert_eq!(b.try_recv(Channel::Control).unwrap(), None);
+            assert_eq!(
+                b.try_recv(Channel::Messages).unwrap(),
+                Some(b"msg".to_vec())
+            );
+        }
+
+        #[test]
+        fn backpressure_at_high_watermark() {
+            let cfg = TransportConfig {
+                control_high_watermark: 2,
+                ..TransportConfig::default()
+            };
+            let (a, _b) = SimPair::with_config("a", "b", &cfg).into_endpoints();
+            a.send(Channel::Control, b"1").unwrap();
+            a.send(Channel::Control, b"2").unwrap();
+            // Third send hits the watermark.
+            match a.send(Channel::Control, b"3") {
+                Err(TransportError::Backpressure { channel, depth }) => {
+                    assert_eq!(channel, Channel::Control);
+                    assert_eq!(depth, 2);
+                }
+                other => panic!("expected Backpressure, got {other:?}"),
+            }
+            // A higher-watermark channel still accepts traffic — no
+            // cross-channel starvation.
+            a.send(Channel::Messages, b"ok").unwrap();
+        }
+
+        #[test]
+        fn close_fails_sends_and_drains_then_ends() {
+            let (a, b) = SimPair::new("a", "b").into_endpoints();
+            a.send(Channel::Messages, b"queued").unwrap();
+            a.close().unwrap();
+            // Subsequent sends fail (both directions — shared flag).
+            assert!(matches!(
+                a.send(Channel::Messages, b"x"),
+                Err(TransportError::PeerClosed)
+            ));
+            assert!(matches!(
+                b.send(Channel::Messages, b"y"),
+                Err(TransportError::PeerClosed)
+            ));
+            // Already-queued frames still drain, then end-of-stream.
+            assert_eq!(
+                b.try_recv(Channel::Messages).unwrap(),
+                Some(b"queued".to_vec())
+            );
+            assert!(matches!(
+                b.try_recv(Channel::Messages),
+                Err(TransportError::PeerClosed)
+            ));
+        }
     }
 }
