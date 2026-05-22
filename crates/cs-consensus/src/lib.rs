@@ -59,6 +59,10 @@ pub trait StateMachine {
     /// Apply one committed command, returning an opaque result for the caller.
     fn apply(&mut self, command: &[u8]) -> Vec<u8>;
 
+    /// Answer a read-only query against the current applied state, without
+    /// mutating it. Backs linearizable ReadIndex reads.
+    fn query(&self, query: &[u8]) -> Vec<u8>;
+
     /// Serialize the full applied state (for a log-compaction snapshot).
     fn snapshot(&self) -> Vec<u8>;
 

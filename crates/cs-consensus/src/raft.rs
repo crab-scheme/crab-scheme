@@ -51,7 +51,9 @@ pub enum Message {
     },
     /// Voter → candidate.
     RequestVoteResp { term: Term, granted: bool },
-    /// Leader → follower: heartbeat / replicate entries.
+    /// Leader → follower: heartbeat / replicate entries. `read_seq` is the
+    /// leader's monotonic heartbeat counter, echoed back to confirm leadership
+    /// for ReadIndex reads (Raft §6.4) without appending to the log.
     AppendEntries {
         term: Term,
         leader: ReplicaId,
@@ -59,14 +61,17 @@ pub enum Message {
         prev_log_term: Term,
         entries: Vec<Entry>,
         leader_commit: Index,
+        read_seq: u64,
     },
     /// Follower → leader. `match_index` is the highest index now known to
-    /// match the leader; `conflict_index` hints where to back up on failure.
+    /// match the leader; `conflict_index` hints where to back up on failure;
+    /// `read_seq` echoes the heartbeat's counter for ReadIndex confirmation.
     AppendEntriesResp {
         term: Term,
         success: bool,
         match_index: Index,
         conflict_index: Index,
+        read_seq: u64,
     },
 }
 
@@ -76,6 +81,29 @@ pub enum Role {
     Follower,
     Candidate,
     Leader,
+}
+
+/// Outcome of a linearizable [`read`](RaftNode::read), delivered via
+/// [`take_ready_reads`](RaftNode::take_ready_reads).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadResult {
+    /// The query result from the leader's committed state.
+    Value(Vec<u8>),
+    /// This node was not (or stopped being) the leader; retry elsewhere.
+    NotLeader,
+}
+
+/// A linearizable read awaiting leadership confirmation (ReadIndex).
+#[derive(Clone, Debug)]
+struct PendingRead {
+    req_id: u64,
+    query: Vec<u8>,
+    /// Commit index captured when the read was issued; the read must observe
+    /// at least this much applied state.
+    read_index: Index,
+    /// The read can be served once a quorum has confirmed a heartbeat with at
+    /// least this `read_seq`.
+    min_seq: u64,
 }
 
 /// Timer/tuning knobs, in logical ticks.
@@ -129,6 +157,14 @@ pub struct RaftNode<SM: StateMachine> {
     next_index: BTreeMap<ReplicaId, Index>,
     match_index: BTreeMap<ReplicaId, Index>,
 
+    // ---- ReadIndex (linearizable reads) ----
+    /// Monotonic heartbeat counter; bumped on each broadcast.
+    read_seq: u64,
+    /// Highest `read_seq` each follower has echoed (leadership confirmation).
+    acked_seq: BTreeMap<ReplicaId, u64>,
+    pending_reads: Vec<PendingRead>,
+    ready_reads: Vec<(u64, ReadResult)>,
+
     // ---- timers (logical ticks) ----
     election_elapsed: u32,
     heartbeat_elapsed: u32,
@@ -159,6 +195,10 @@ impl<SM: StateMachine> RaftNode<SM> {
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            read_seq: 0,
+            acked_seq: BTreeMap::new(),
+            pending_reads: Vec::new(),
+            ready_reads: Vec::new(),
             election_elapsed: 0,
             heartbeat_elapsed: 0,
             election_timeout: 0,
@@ -283,6 +323,36 @@ impl<SM: StateMachine> RaftNode<SM> {
         (Some(index), outs)
     }
 
+    /// Issue a linearizable read (ReadIndex, Raft §6.4). The leader captures
+    /// its current commit index and confirms — via a quorum-acked heartbeat —
+    /// that it is still the leader before answering, so the read reflects
+    /// every previously-committed write and never a stale value.
+    ///
+    /// The result arrives via [`take_ready_reads`](Self::take_ready_reads):
+    /// immediately as [`ReadResult::NotLeader`] if this node isn't the leader
+    /// (or single-node), otherwise once leadership is confirmed. The returned
+    /// messages are the confirming heartbeats to send.
+    pub fn read(&mut self, req_id: u64, query: Vec<u8>) -> Vec<Out> {
+        if self.role != Role::Leader {
+            self.ready_reads.push((req_id, ReadResult::NotLeader));
+            return Vec::new();
+        }
+        let outs = self.broadcast_append(); // bumps read_seq
+        self.pending_reads.push(PendingRead {
+            req_id,
+            query,
+            read_index: self.commit_index,
+            min_seq: self.read_seq,
+        });
+        self.serve_reads(); // single-node leader can answer right away
+        outs
+    }
+
+    /// Drain reads that have completed since the last call.
+    pub fn take_ready_reads(&mut self) -> Vec<(u64, ReadResult)> {
+        std::mem::take(&mut self.ready_reads)
+    }
+
     /// Handle one inbound message.
     pub fn on_message(&mut self, from: ReplicaId, msg: Message) -> Vec<Out> {
         match msg {
@@ -302,6 +372,7 @@ impl<SM: StateMachine> RaftNode<SM> {
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_seq,
             } => self.handle_append_entries(
                 term,
                 leader,
@@ -309,13 +380,22 @@ impl<SM: StateMachine> RaftNode<SM> {
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_seq,
             ),
             Message::AppendEntriesResp {
                 term,
                 success,
                 match_index,
                 conflict_index,
-            } => self.handle_append_entries_resp(from, term, success, match_index, conflict_index),
+                read_seq,
+            } => self.handle_append_entries_resp(
+                from,
+                term,
+                success,
+                match_index,
+                conflict_index,
+                read_seq,
+            ),
         }
     }
 
@@ -326,6 +406,12 @@ impl<SM: StateMachine> RaftNode<SM> {
         self.current_term = term;
         self.leader_id = leader;
         self.votes.clear();
+        // Reads can only be served by a leader; fail any in flight so the
+        // caller retries on the new one.
+        for pr in std::mem::take(&mut self.pending_reads) {
+            self.ready_reads.push((pr.req_id, ReadResult::NotLeader));
+        }
+        self.acked_seq.clear();
         self.reset_election_timer();
     }
 
@@ -438,6 +524,7 @@ impl<SM: StateMachine> RaftNode<SM> {
 
     // ---- AppendEntries (follower side) ----
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_append_entries(
         &mut self,
         term: Term,
@@ -446,6 +533,7 @@ impl<SM: StateMachine> RaftNode<SM> {
         prev_log_term: Term,
         entries: Vec<Entry>,
         leader_commit: Index,
+        read_seq: u64,
     ) -> Vec<Out> {
         if term < self.current_term {
             return vec![(
@@ -455,6 +543,7 @@ impl<SM: StateMachine> RaftNode<SM> {
                     success: false,
                     match_index: 0,
                     conflict_index: 0,
+                    read_seq,
                 },
             )];
         }
@@ -481,6 +570,7 @@ impl<SM: StateMachine> RaftNode<SM> {
                     success: false,
                     match_index: 0,
                     conflict_index,
+                    read_seq,
                 },
             )];
         }
@@ -512,6 +602,7 @@ impl<SM: StateMachine> RaftNode<SM> {
                 success: true,
                 match_index,
                 conflict_index: 0,
+                read_seq,
             },
         )]
     }
@@ -525,6 +616,7 @@ impl<SM: StateMachine> RaftNode<SM> {
         success: bool,
         match_index: Index,
         conflict_index: Index,
+        read_seq: u64,
     ) -> Vec<Out> {
         if term > self.current_term {
             self.become_follower(term, None);
@@ -534,10 +626,15 @@ impl<SM: StateMachine> RaftNode<SM> {
         if self.role != Role::Leader || term != self.current_term {
             return Vec::new();
         }
+        // Any in-term response (success or not) confirms this follower still
+        // sees us as leader as of `read_seq` — that's the ReadIndex barrier.
+        let prev = self.acked_seq.get(&from).copied().unwrap_or(0);
+        self.acked_seq.insert(from, read_seq.max(prev));
         if success {
             self.match_index.insert(from, match_index);
             self.next_index.insert(from, match_index + 1);
             self.maybe_advance_commit();
+            self.serve_reads();
             Vec::new()
         } else {
             // Back up next_index toward the follower's hint and retry.
@@ -548,6 +645,7 @@ impl<SM: StateMachine> RaftNode<SM> {
                 ni.saturating_sub(1).max(1)
             };
             self.next_index.insert(from, backed);
+            self.serve_reads();
             vec![(from, self.append_for(from))]
         }
     }
@@ -570,10 +668,14 @@ impl<SM: StateMachine> RaftNode<SM> {
             prev_log_term,
             entries,
             leader_commit: self.commit_index,
+            read_seq: self.read_seq,
         }
     }
 
     fn broadcast_append(&mut self) -> Vec<Out> {
+        // Each broadcast carries a higher read_seq; quorum echoes confirm
+        // leadership and let pending ReadIndex reads be served.
+        self.read_seq += 1;
         self.peers()
             .collect::<Vec<_>>()
             .into_iter()
@@ -620,6 +722,47 @@ impl<SM: StateMachine> RaftNode<SM> {
                 }
             }
         }
+        // Newly-applied state may satisfy a pending read's read_index.
+        self.serve_reads();
+    }
+
+    /// Highest `read_seq` a quorum of voters has confirmed (the leader counts
+    /// itself at its current `read_seq`). Mirrors commit-index advancement but
+    /// over heartbeat acknowledgements instead of match indices.
+    fn confirmed_read_seq(&self) -> u64 {
+        let mut seqs: Vec<u64> = self
+            .voters
+            .iter()
+            .map(|v| {
+                if *v == self.id {
+                    self.read_seq
+                } else {
+                    self.acked_seq.get(v).copied().unwrap_or(0)
+                }
+            })
+            .collect();
+        seqs.sort_unstable_by(|a, b| b.cmp(a)); // descending
+        seqs[self.majority() - 1]
+    }
+
+    /// Serve every pending read whose leadership barrier is confirmed and
+    /// whose `read_index` has been applied.
+    fn serve_reads(&mut self) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let confirmed = self.confirmed_read_seq();
+        let applied = self.last_applied;
+        let mut still_pending = Vec::new();
+        for pr in std::mem::take(&mut self.pending_reads) {
+            if pr.min_seq <= confirmed && pr.read_index <= applied {
+                let val = self.sm.query(&pr.query);
+                self.ready_reads.push((pr.req_id, ReadResult::Value(val)));
+            } else {
+                still_pending.push(pr);
+            }
+        }
+        self.pending_reads = still_pending;
     }
 }
 
@@ -652,6 +795,9 @@ mod tests {
             let v = i64::from_le_bytes(command.try_into().expect("i64"));
             self.total += v;
             self.applied.push(v);
+            self.total.to_le_bytes().to_vec()
+        }
+        fn query(&self, _query: &[u8]) -> Vec<u8> {
             self.total.to_le_bytes().to_vec()
         }
         fn snapshot(&self) -> Vec<u8> {
@@ -843,5 +989,45 @@ mod tests {
         for id in &majority {
             assert_eq!(c.node(*id).sm().total, 41, "majority replica {id}");
         }
+    }
+
+    /// Issue a ReadIndex read on `leader`, settle the confirming heartbeats,
+    /// and return its result.
+    fn read(c: &mut Cluster<RaftNode<SumSm>>, leader: ReplicaId, req: u64) -> ReadResult {
+        c.act(leader, |n| ((), n.read(req, Vec::new())));
+        c.deliver_all();
+        c.node_mut(leader)
+            .take_ready_reads()
+            .into_iter()
+            .find(|(id, _)| *id == req)
+            .map(|(_, r)| r)
+            .expect("read completed")
+    }
+
+    #[test]
+    fn linearizable_read_reflects_committed_writes() {
+        let mut c = cluster(3);
+        let leader = elect(&mut c, 50);
+        propose(&mut c, leader, 100);
+        propose(&mut c, leader, 30);
+        c.run(2);
+        // ReadIndex returns the leader's committed value after quorum confirms
+        // leadership — never a stale read.
+        assert_eq!(
+            read(&mut c, leader, 1),
+            ReadResult::Value(130i64.to_le_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn read_on_follower_reports_not_leader() {
+        let mut c = cluster(3);
+        let leader = elect(&mut c, 50);
+        let follower = c.ids().into_iter().find(|id| *id != leader).unwrap();
+        c.act(follower, |n| ((), n.read(7, Vec::new())));
+        assert_eq!(
+            c.node_mut(follower).take_ready_reads(),
+            vec![(7, ReadResult::NotLeader)]
+        );
     }
 }
