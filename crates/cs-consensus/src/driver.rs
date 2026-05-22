@@ -14,7 +14,8 @@ use std::collections::BTreeMap;
 
 use cs_net::{Channel, Transport};
 
-use crate::codec::{decode, encode};
+use crate::codec::{decode, decode_epaxos, encode, encode_epaxos};
+use crate::epaxos::{EpaxosReplica, EpaxosStateMachine, Message as EpaxosMessage};
 use crate::raft::{Index, Message, RaftNode};
 use crate::{ReplicaId, StateMachine};
 
@@ -147,6 +148,73 @@ where
             driver.poll();
         }
     })
+}
+
+/// An EPaxos replica wired to its peers over cs-net (the EPaxos analogue of
+/// [`RaftDriver`]). Same thin sync shim: encode/route over `Channel::Consensus`,
+/// drain inbound, drive `propose`/`poll`.
+pub struct EpaxosDriver<SM: EpaxosStateMachine> {
+    node: EpaxosReplica<SM>,
+    peers: BTreeMap<ReplicaId, Box<dyn Transport>>,
+}
+
+impl<SM: EpaxosStateMachine> std::fmt::Debug for EpaxosDriver<SM> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpaxosDriver")
+            .field("id", &self.node.id())
+            .field("peers", &self.peers.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl<SM: EpaxosStateMachine> EpaxosDriver<SM> {
+    pub fn new(node: EpaxosReplica<SM>) -> Self {
+        EpaxosDriver {
+            node,
+            peers: BTreeMap::new(),
+        }
+    }
+
+    pub fn add_peer(&mut self, id: ReplicaId, transport: Box<dyn Transport>) {
+        self.peers.insert(id, transport);
+    }
+
+    pub fn node(&self) -> &EpaxosReplica<SM> {
+        &self.node
+    }
+
+    fn dispatch(&self, outs: Vec<(ReplicaId, EpaxosMessage)>) {
+        for (to, msg) in outs {
+            if let Some(t) = self.peers.get(&to) {
+                let _ = t.send(Channel::Consensus, &encode_epaxos(&msg));
+            }
+        }
+    }
+
+    /// Lead a new command; routes the PreAccept round.
+    pub fn propose(&mut self, command: Vec<u8>) {
+        let outs = self.node.propose(command);
+        self.dispatch(outs);
+    }
+
+    /// Drain inbound consensus frames, feed them to the replica, route replies.
+    pub fn poll(&mut self) -> usize {
+        let mut inbound: Vec<(ReplicaId, Vec<u8>)> = Vec::new();
+        for (id, t) in &self.peers {
+            while let Ok(Some(frame)) = t.try_recv(Channel::Consensus) {
+                inbound.push((*id, frame));
+            }
+        }
+        let mut processed = 0;
+        for (from, frame) in inbound {
+            if let Ok(msg) = decode_epaxos(&frame) {
+                let outs = self.node.on_message(from, msg);
+                self.dispatch(outs);
+                processed += 1;
+            }
+        }
+        processed
+    }
 }
 
 #[cfg(test)]
@@ -359,5 +427,70 @@ mod tests {
         }
         assert!(ok, "actor-driven Raft group did not converge to 42");
         system.shutdown();
+    }
+
+    // ---- EPaxos over cs-net ----
+
+    use crate::epaxos::{EpaxosReplica, EpaxosStateMachine};
+
+    /// Commands `[key, val]`; interfere iff same key. Records execution order.
+    #[derive(Default, Debug)]
+    struct KvSm {
+        executed: Vec<Vec<u8>>,
+    }
+    impl EpaxosStateMachine for KvSm {
+        fn interferes(&self, a: &[u8], b: &[u8]) -> bool {
+            !a.is_empty() && !b.is_empty() && a[0] == b[0]
+        }
+        fn execute(&mut self, command: &[u8]) -> Vec<u8> {
+            self.executed.push(command.to_vec());
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn epaxos_consistent_order_over_cs_net_sim_transport() {
+        let ids = [ReplicaId(0), ReplicaId(1), ReplicaId(2)];
+        let replicas = ids.to_vec();
+        let mut drivers: BTreeMap<ReplicaId, EpaxosDriver<KvSm>> = ids
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    EpaxosDriver::new(EpaxosReplica::new(*id, replicas.clone(), KvSm::default())),
+                )
+            })
+            .collect();
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                let (ea, eb) = SimPair::new("a", "b").into_endpoints();
+                drivers
+                    .get_mut(&ids[i])
+                    .unwrap()
+                    .add_peer(ids[j], Box::new(ea));
+                drivers
+                    .get_mut(&ids[j])
+                    .unwrap()
+                    .add_peer(ids[i], Box::new(eb));
+            }
+        }
+        // Two concurrent interfering commands (same key) via different leaders,
+        // committed + executed over the real cs-net framed path.
+        drivers.get_mut(&ids[0]).unwrap().propose(vec![9, 1]);
+        drivers.get_mut(&ids[1]).unwrap().propose(vec![9, 2]);
+        for _ in 0..20 {
+            for id in &ids {
+                drivers.get_mut(id).unwrap().poll();
+            }
+        }
+        let order0 = drivers[&ids[0]].node().sm().executed.clone();
+        assert_eq!(order0.len(), 2, "both interfering commands executed");
+        for id in &ids {
+            assert_eq!(
+                drivers[id].node().sm().executed,
+                order0,
+                "replica {id} agrees on order over cs-net"
+            );
+        }
     }
 }

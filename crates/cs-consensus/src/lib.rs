@@ -31,7 +31,7 @@ pub mod epaxos;
 pub mod raft;
 pub mod sim;
 
-pub use driver::{spawn_raft_actor, RaftCommand, RaftDriver};
+pub use driver::{spawn_raft_actor, EpaxosDriver, RaftCommand, RaftDriver};
 
 /// Stable identity of one replica within a consensus group.
 ///

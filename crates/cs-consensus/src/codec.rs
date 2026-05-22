@@ -6,6 +6,9 @@
 //! encoded: the driver knows which peer a frame arrived from (it polls each
 //! peer's transport), so `from` is supplied out-of-band.
 
+use std::collections::BTreeSet;
+
+use crate::epaxos;
 use crate::raft::{ConfState, Entry, EntryPayload, Message};
 use crate::ReplicaId;
 
@@ -258,6 +261,142 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
             read_seq: c.u64()?,
         },
         _ => return Err(DecodeError("bad message tag")),
+    };
+    Ok(msg)
+}
+
+// ---- EPaxos wire codec ----
+
+fn put_instance(out: &mut Vec<u8>, i: &epaxos::Instance) {
+    put_u64(out, i.replica.0);
+    put_u64(out, i.slot);
+}
+fn put_inst_set(out: &mut Vec<u8>, deps: &BTreeSet<epaxos::Instance>) {
+    put_u64(out, deps.len() as u64);
+    for i in deps {
+        put_instance(out, i);
+    }
+}
+
+impl Cursor<'_> {
+    fn instance(&mut self) -> Result<epaxos::Instance, DecodeError> {
+        Ok(epaxos::Instance {
+            replica: ReplicaId(self.u64()?),
+            slot: self.u64()?,
+        })
+    }
+    fn inst_set(&mut self) -> Result<BTreeSet<epaxos::Instance>, DecodeError> {
+        let n = self.u64()? as usize;
+        let mut s = BTreeSet::new();
+        for _ in 0..n {
+            s.insert(self.instance()?);
+        }
+        Ok(s)
+    }
+}
+
+/// Encode an EPaxos message to bytes.
+pub fn encode_epaxos(msg: &epaxos::Message) -> Vec<u8> {
+    use epaxos::Message as M;
+    let mut out = Vec::with_capacity(32);
+    match msg {
+        M::PreAccept {
+            instance,
+            ballot,
+            command,
+            seq,
+            deps,
+        } => {
+            put_u8(&mut out, 0);
+            put_instance(&mut out, instance);
+            put_u64(&mut out, *ballot);
+            put_bytes(&mut out, command);
+            put_u64(&mut out, *seq);
+            put_inst_set(&mut out, deps);
+        }
+        M::PreAcceptReply {
+            instance,
+            ballot,
+            seq,
+            deps,
+        } => {
+            put_u8(&mut out, 1);
+            put_instance(&mut out, instance);
+            put_u64(&mut out, *ballot);
+            put_u64(&mut out, *seq);
+            put_inst_set(&mut out, deps);
+        }
+        M::Accept {
+            instance,
+            ballot,
+            command,
+            seq,
+            deps,
+        } => {
+            put_u8(&mut out, 2);
+            put_instance(&mut out, instance);
+            put_u64(&mut out, *ballot);
+            put_bytes(&mut out, command);
+            put_u64(&mut out, *seq);
+            put_inst_set(&mut out, deps);
+        }
+        M::AcceptReply { instance, ballot } => {
+            put_u8(&mut out, 3);
+            put_instance(&mut out, instance);
+            put_u64(&mut out, *ballot);
+        }
+        M::Commit {
+            instance,
+            command,
+            seq,
+            deps,
+        } => {
+            put_u8(&mut out, 4);
+            put_instance(&mut out, instance);
+            put_bytes(&mut out, command);
+            put_u64(&mut out, *seq);
+            put_inst_set(&mut out, deps);
+        }
+    }
+    out
+}
+
+/// Decode an EPaxos message produced by [`encode_epaxos`].
+pub fn decode_epaxos(buf: &[u8]) -> Result<epaxos::Message, DecodeError> {
+    use epaxos::Message as M;
+    let mut c = Cursor::new(buf);
+    let msg = match c.u8()? {
+        0 => M::PreAccept {
+            instance: c.instance()?,
+            ballot: c.u64()?,
+            command: c.bytes()?,
+            seq: c.u64()?,
+            deps: c.inst_set()?,
+        },
+        1 => M::PreAcceptReply {
+            instance: c.instance()?,
+            ballot: c.u64()?,
+            seq: c.u64()?,
+            deps: c.inst_set()?,
+        },
+        2 => M::Accept {
+            instance: c.instance()?,
+            ballot: c.u64()?,
+            command: c.bytes()?,
+            seq: c.u64()?,
+            deps: c.inst_set()?,
+        },
+        3 => M::AcceptReply {
+            instance: c.instance()?,
+            ballot: c.u64()?,
+        },
+        4 => M::Commit {
+            instance: c.instance()?,
+            command: c.bytes()?,
+            seq: c.u64()?,
+            deps: c.inst_set()?,
+        },
+        _ => return Err(DecodeError("bad epaxos message tag")),
     };
     Ok(msg)
 }
