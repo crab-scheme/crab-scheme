@@ -21,6 +21,53 @@ pub type Term = u64;
 /// A 1-based log index (`0` means "before the first entry").
 pub type Index = u64;
 
+/// A cluster membership configuration.
+///
+/// During a change the cluster passes through a **joint** config: commits and
+/// elections require a majority in *both* the old and new voter sets, which
+/// rules out the two-disjoint-majorities split brain (Raft §6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfState {
+    /// A settled membership.
+    Simple(Vec<ReplicaId>),
+    /// Transitional `C_old,new` — quorum requires both halves.
+    Joint {
+        old: Vec<ReplicaId>,
+        new: Vec<ReplicaId>,
+    },
+}
+
+impl ConfState {
+    fn sorted(mut v: Vec<ReplicaId>) -> Vec<ReplicaId> {
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+    /// All voters that participate (the union under a joint config).
+    fn voters(&self) -> Vec<ReplicaId> {
+        match self {
+            ConfState::Simple(v) => v.clone(),
+            ConfState::Joint { old, new } => {
+                let mut u = old.clone();
+                u.extend_from_slice(new);
+                Self::sorted(u)
+            }
+        }
+    }
+    /// Whether `acked` is a quorum: a majority of the voters (of *both* halves
+    /// when joint).
+    fn is_quorum(&self, acked: &BTreeSet<ReplicaId>) -> bool {
+        let maj = |set: &[ReplicaId]| {
+            let n = set.iter().filter(|v| acked.contains(v)).count();
+            n >= set.len() / 2 + 1
+        };
+        match self {
+            ConfState::Simple(v) => maj(v),
+            ConfState::Joint { old, new } => maj(old) && maj(new),
+        }
+    }
+}
+
 /// What a log entry carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntryPayload {
@@ -29,6 +76,9 @@ pub enum EntryPayload {
     /// A leader's no-op, appended on election so the leader can commit
     /// entries from prior terms via one of its own (Raft §5.4.2).
     Noop,
+    /// A membership configuration; takes effect as soon as it's appended
+    /// (Raft §6), committed or not.
+    Config(ConfState),
 }
 
 /// One replicated log entry.
@@ -81,6 +131,7 @@ pub enum Message {
         leader: ReplicaId,
         last_included_index: Index,
         last_included_term: Term,
+        last_included_config: ConfState,
         data: Vec<u8>,
         read_seq: u64,
     },
@@ -150,8 +201,11 @@ type Out = (ReplicaId, Message);
 #[derive(Debug)]
 pub struct RaftNode<SM: StateMachine> {
     id: ReplicaId,
-    /// Full voter set (including self), ascending. Single-config for now.
-    voters: Vec<ReplicaId>,
+    /// Effective membership: the config of the last `Config` entry in the log
+    /// (committed or not), else `base_config`. Recomputed on every log change.
+    config: ConfState,
+    /// Membership as of the snapshot base (`base_index`).
+    base_config: ConfState,
     cfg: Config,
 
     // ---- persistent state (would be fsync'd in production) ----
@@ -197,15 +251,17 @@ pub struct RaftNode<SM: StateMachine> {
 }
 
 impl<SM: StateMachine> RaftNode<SM> {
-    /// Create a follower in `voters` (which must contain `id`).
+    /// Create a follower whose initial membership is `voters`.
+    ///
+    /// Usually `voters` contains `id`. If it doesn't, this node starts as a
+    /// non-voting **learner**: it won't campaign and isn't counted in quorums
+    /// until a `Config` entry adds it (the join-via-membership-change path).
     pub fn new(id: ReplicaId, voters: Vec<ReplicaId>, cfg: Config, sm: SM) -> Self {
-        assert!(voters.contains(&id), "voter set must include self");
-        let mut voters = voters;
-        voters.sort_unstable();
-        voters.dedup();
+        let initial = ConfState::Simple(ConfState::sorted(voters));
         let mut node = RaftNode {
             id,
-            voters,
+            config: initial.clone(),
+            base_config: initial,
             cfg,
             current_term: 0,
             voted_for: None,
@@ -293,17 +349,53 @@ impl<SM: StateMachine> RaftNode<SM> {
         self.log.get((index - self.base_index - 1) as usize)
     }
 
+    /// Peers to replicate to: every voter in the effective config (the union
+    /// under a joint config, so new members are caught up) except self.
     fn peers(&self) -> impl Iterator<Item = ReplicaId> + '_ {
         let me = self.id;
-        self.voters.iter().copied().filter(move |v| *v != me)
+        self.config.voters().into_iter().filter(move |v| *v != me)
     }
-    fn majority(&self) -> usize {
-        self.voters.len() / 2 + 1
-    }
-    /// Does `acked` (a set of replica ids) constitute a quorum of voters?
+    /// Does `acked` constitute a quorum under the current (possibly joint)
+    /// config?
     fn is_quorum(&self, acked: &BTreeSet<ReplicaId>) -> bool {
-        let n = self.voters.iter().filter(|v| acked.contains(v)).count();
-        n >= self.majority()
+        self.config.is_quorum(acked)
+    }
+
+    // ---- membership / config tracking ----
+
+    /// Index of the last `Config` entry in the live log, if any.
+    fn last_config_index(&self) -> Option<Index> {
+        self.log
+            .iter()
+            .rev()
+            .find(|e| matches!(e.payload, EntryPayload::Config(_)))
+            .map(|e| e.index)
+    }
+    /// The config in effect at `index`: the last `Config` entry at or before
+    /// `index`, else the snapshot's `base_config`.
+    fn config_at(&self, index: Index) -> ConfState {
+        self.log
+            .iter()
+            .rev()
+            .find(|e| e.index <= index && matches!(e.payload, EntryPayload::Config(_)))
+            .map(|e| match &e.payload {
+                EntryPayload::Config(c) => c.clone(),
+                _ => unreachable!(),
+            })
+            .unwrap_or_else(|| self.base_config.clone())
+    }
+    /// Recompute `config` from the log after any mutation (Raft: the latest
+    /// `Config` entry wins, even uncommitted).
+    fn recompute_config(&mut self) {
+        self.config = self
+            .log
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EntryPayload::Config(c) => Some(c.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.base_config.clone());
     }
 
     // ---- PRNG (xorshift64) ----
@@ -337,6 +429,10 @@ impl<SM: StateMachine> RaftNode<SM> {
                 Vec::new()
             }
             Role::Follower | Role::Candidate => {
+                // Learners (not in the current config) never campaign.
+                if !self.config.voters().contains(&self.id) {
+                    return Vec::new();
+                }
                 self.election_elapsed += 1;
                 if self.election_elapsed >= self.election_timeout {
                     self.start_election()
@@ -357,6 +453,38 @@ impl<SM: StateMachine> RaftNode<SM> {
         let index = self.append_local(EntryPayload::Command(command));
         let outs = self.broadcast_append();
         (Some(index), outs)
+    }
+
+    /// Begin a membership change to `new_voters` via joint consensus (Raft §6).
+    /// The leader appends `C_old,new`; once that commits it auto-appends the
+    /// final `C_new`. Returns `(true, msgs)` if started, `(false, [])` if this
+    /// node isn't the leader or a change is already in progress.
+    pub fn propose_conf(&mut self, new_voters: Vec<ReplicaId>) -> (bool, Vec<Out>) {
+        if self.role != Role::Leader {
+            return (false, Vec::new());
+        }
+        let old = match &self.config {
+            ConfState::Simple(v) => v.clone(),
+            // One change at a time: refuse while a joint config is pending.
+            ConfState::Joint { .. } => return (false, Vec::new()),
+        };
+        let joint = ConfState::Joint {
+            old,
+            new: ConfState::sorted(new_voters),
+        };
+        self.append_local(EntryPayload::Config(joint));
+        let outs = self.broadcast_append();
+        (true, outs)
+    }
+
+    /// The effective membership (voters) right now.
+    pub fn voters(&self) -> Vec<ReplicaId> {
+        self.config.voters()
+    }
+
+    /// Whether a membership change is mid-flight (joint config in effect).
+    pub fn in_joint_config(&self) -> bool {
+        matches!(self.config, ConfState::Joint { .. })
     }
 
     /// Issue a linearizable read (ReadIndex, Raft §6.4). The leader captures
@@ -437,6 +565,7 @@ impl<SM: StateMachine> RaftNode<SM> {
                 leader,
                 last_included_index,
                 last_included_term,
+                last_included_config,
                 data,
                 read_seq,
             } => self.handle_install_snapshot(
@@ -444,6 +573,7 @@ impl<SM: StateMachine> RaftNode<SM> {
                 leader,
                 last_included_index,
                 last_included_term,
+                last_included_config,
                 data,
                 read_seq,
             ),
@@ -511,6 +641,7 @@ impl<SM: StateMachine> RaftNode<SM> {
 
     fn append_local(&mut self, payload: EntryPayload) -> Index {
         let index = self.last_log_index() + 1;
+        let is_config = matches!(payload, EntryPayload::Config(_));
         self.log.push(Entry {
             term: self.current_term,
             index,
@@ -518,6 +649,9 @@ impl<SM: StateMachine> RaftNode<SM> {
         });
         if let Some(m) = self.match_index.get_mut(&self.id) {
             *m = index;
+        }
+        if is_config {
+            self.recompute_config();
         }
         index
     }
@@ -643,6 +777,8 @@ impl<SM: StateMachine> RaftNode<SM> {
                 None => self.log.push(e),
             }
         }
+        // Entries may have added or truncated a Config entry.
+        self.recompute_config();
 
         // Advance commit to the leader's, bounded by what we now hold.
         if leader_commit > self.commit_index {
@@ -670,6 +806,7 @@ impl<SM: StateMachine> RaftNode<SM> {
         leader: ReplicaId,
         last_included_index: Index,
         last_included_term: Term,
+        last_included_config: ConfState,
         data: Vec<u8>,
         read_seq: u64,
     ) -> Vec<Out> {
@@ -704,8 +841,10 @@ impl<SM: StateMachine> RaftNode<SM> {
         self.snapshot_data = data;
         self.base_index = last_included_index;
         self.base_term = last_included_term;
+        self.base_config = last_included_config;
         self.commit_index = self.commit_index.max(last_included_index);
         self.last_applied = self.last_applied.max(last_included_index);
+        self.recompute_config();
         ack(self, true, last_included_index)
     }
 
@@ -764,6 +903,7 @@ impl<SM: StateMachine> RaftNode<SM> {
                 leader: self.id,
                 last_included_index: self.base_index,
                 last_included_term: self.base_term,
+                last_included_config: self.base_config.clone(),
                 data: self.snapshot_data.clone(),
                 read_seq: self.read_seq,
             };
@@ -823,6 +963,27 @@ impl<SM: StateMachine> RaftNode<SM> {
         }
         if advanced {
             self.apply_committed();
+            self.finalize_joint_if_committed();
+        }
+    }
+
+    /// Once a joint `C_old,new` is committed, append the final `C_new`
+    /// (Raft §6). It replicates on the next heartbeat; when *it* commits the
+    /// change is complete. A no-op if there's no committed joint config.
+    fn finalize_joint_if_committed(&mut self) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let new = match &self.config {
+            ConfState::Joint { new, .. } => new.clone(),
+            ConfState::Simple(_) => return,
+        };
+        // The joint entry is the last config entry; only finalize once committed.
+        match self.last_config_index() {
+            Some(joint_idx) if self.commit_index >= joint_idx => {
+                self.append_local(EntryPayload::Config(ConfState::Simple(new)));
+            }
+            _ => {}
         }
     }
 
@@ -851,10 +1012,14 @@ impl<SM: StateMachine> RaftNode<SM> {
         }
         let new_base = self.last_applied;
         let new_base_term = self.term_at(new_base).expect("applied entry is present");
+        let new_base_config = self.config_at(new_base);
         self.snapshot_data = self.sm.snapshot();
         self.log.retain(|e| e.index > new_base);
         self.base_index = new_base;
         self.base_term = new_base_term;
+        self.base_config = new_base_config;
+        // A dropped Config entry is now captured in base_config.
+        self.recompute_config();
     }
 
     /// Compact once the configured number of applied entries has accumulated
@@ -872,23 +1037,29 @@ impl<SM: StateMachine> RaftNode<SM> {
         self.base_index
     }
 
-    /// Highest `read_seq` a quorum of voters has confirmed (the leader counts
-    /// itself at its current `read_seq`). Mirrors commit-index advancement but
-    /// over heartbeat acknowledgements instead of match indices.
+    /// Highest `read_seq` a quorum has confirmed (the leader counts itself at
+    /// its current `read_seq`). Joint-config-aware: returns the largest seq for
+    /// which the set of voters that reached it is a quorum.
     fn confirmed_read_seq(&self) -> u64 {
-        let mut seqs: Vec<u64> = self
-            .voters
-            .iter()
-            .map(|v| {
-                if *v == self.id {
-                    self.read_seq
-                } else {
-                    self.acked_seq.get(v).copied().unwrap_or(0)
-                }
-            })
-            .collect();
-        seqs.sort_unstable_by(|a, b| b.cmp(a)); // descending
-        seqs[self.majority() - 1]
+        let voters = self.config.voters();
+        let eff = |v: ReplicaId| {
+            if v == self.id {
+                self.read_seq
+            } else {
+                self.acked_seq.get(&v).copied().unwrap_or(0)
+            }
+        };
+        let mut cands: Vec<u64> = voters.iter().map(|v| eff(*v)).collect();
+        cands.sort_unstable_by(|a, b| b.cmp(a)); // descending
+        cands.dedup();
+        for s in cands {
+            let acked: BTreeSet<ReplicaId> =
+                voters.iter().copied().filter(|v| eff(*v) >= s).collect();
+            if self.config.is_quorum(&acked) {
+                return s;
+            }
+        }
+        0
     }
 
     /// Serve every pending read whose leadership barrier is confirmed and
@@ -1221,5 +1392,57 @@ mod tests {
             c.node(follower).snapshot_index() > 0,
             "follower installed the snapshot"
         );
+    }
+
+    #[test]
+    fn add_node_via_joint_consensus() {
+        // Three voters {0,1,2} plus node 3 as a learner (its initial config is
+        // {0,1,2}, so it neither campaigns nor counts until added).
+        let v3 = vec![ReplicaId(0), ReplicaId(1), ReplicaId(2)];
+        let mut nodes: Vec<RaftNode<SumSm>> = v3
+            .iter()
+            .map(|id| RaftNode::new(*id, v3.clone(), Config::default(), SumSm::default()))
+            .collect();
+        nodes.push(RaftNode::new(
+            ReplicaId(3),
+            v3.clone(),
+            Config::default(),
+            SumSm::default(),
+        ));
+        let mut c = Cluster::new(nodes);
+
+        let leader = elect(&mut c, 50);
+        propose(&mut c, leader, 10);
+        c.run(3);
+        // Node 3 is still a learner: not a voter, no committed state yet.
+        assert_eq!(c.node(ReplicaId(3)).voters(), v3);
+
+        // Add node 3 via joint consensus.
+        let v4 = vec![ReplicaId(0), ReplicaId(1), ReplicaId(2), ReplicaId(3)];
+        let started = c.act(leader, |n| n.propose_conf(v4.clone()));
+        assert!(started, "leader started the config change");
+        c.deliver_all();
+        c.run(10); // joint commits → C_new appended → commits → 3 catches up
+
+        // Everyone (incl. the new node) converges on the 4-node config + state.
+        assert!(
+            !c.node(leader).in_joint_config(),
+            "joint transition finalized"
+        );
+        for id in c.ids() {
+            assert_eq!(c.node(id).voters(), v4, "node {id} sees the new config");
+        }
+        assert_eq!(
+            c.node(ReplicaId(3)).sm().total,
+            10,
+            "new node caught up to committed state"
+        );
+
+        // The new 4-node cluster commits (node 3 now participates in quorum).
+        propose(&mut c, leader, 5);
+        c.run(3);
+        for id in c.ids() {
+            assert_eq!(c.node(id).sm().total, 15, "4-node commit on {id}");
+        }
     }
 }
