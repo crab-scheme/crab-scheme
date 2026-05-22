@@ -19,9 +19,11 @@ default = ["tcp", "sim"]
 # for M02. mTLS is wired in alongside the handshake in cs-distrib.
 tcp = ["dep:rustls", "dep:tokio-rustls"]
 # QUIC transport via quinn. Cheaper stream creation than TCP, true
-# multiplexing without head-of-line blocking. Default-off until the
-# transport selection plumbing is wired into the cluster bootstrap.
-quic = ["dep:quinn"]
+# multiplexing without head-of-line blocking (one QUIC stream per logical
+# channel), mTLS via TLS 1.3 baked in. Default-off until the transport
+# selection plumbing is wired into the cluster bootstrap. Pulls rustls too
+# (the `tls` config builders are shared with the TCP transport).
+quic = ["dep:quinn", "dep:rustls"]
 # WebSocket transport for browser-edge clusters.
 ws = ["dep:tokio-tungstenite"]
 # In-memory simulation transport: deterministic, no syscalls. Used by
@@ -52,3 +54,5 @@ optional = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "test-util", "time"] }
+# Self-signed certs for the mTLS loopback tests (M02.D).
+rcgen = "0.13"

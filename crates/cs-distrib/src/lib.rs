@@ -10,17 +10,23 @@
 //!
 //! ## Status
 //!
-//! **Scaffold only.** Public types + module shapes exist so future
-//! milestone PRs can land focused implementation work without
-//! re-litigating crate boundaries.
+//! **M02 substrate implemented + tested** (deterministic via the cs-net Sim
+//! transport):
 //!
-//! - M02 iter A: `NodeId` + extended `Pid` encoding (here).
-//! - M02 iter B-D: transport + handshake + multiplexing (cs-net + this).
-//! - M02 iter E-F: `RemoteActorRef` impl + `(spawn-remote …)`.
-//! - M04 iter A: `MemberState` machine (`membership` module here).
-//! - M04 iter B: phi-accrual failure detector (`phi` module here).
-//! - M04 iter C: SWIM-style gossip (`gossip` module here).
-//! - M04 iter D: SBR strategies + `cluster-events` channel.
+//! - A — [`NodeId`] + [`DistPid`] cluster identity + wire codec ([`pid`]).
+//! - C/E — [`Router`] (local vs remote dispatch) + [`RemoteRef`]; the
+//!   3-node ping/pong acceptance is a [`router`] test.
+//! - D — [`Hello`] / [`evaluate_hello`] handshake protocol ([`handshake`]):
+//!   accept / quarantine on version, self-identity, or stale epoch.
+//! - F — DOWN-on-disconnect for monitored remote Pids ([`DownNotice`]).
+//!
+//! Remaining M02 tail: mTLS cert provisioning (the protocol is done; rustls
+//! wraps the cs-net TCP stream); `(spawn-remote …)` closure transfer (needs
+//! M12's content-addressed codebase); and the cs-actor mailbox / Scheme
+//! `(send pid msg)` binding (cs-runtime integration).
+//!
+//! M04 modules ([`membership`] / [`phi`] / [`gossip`]) remain scaffolds for
+//! that milestone.
 
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -28,11 +34,17 @@
 use thiserror::Error;
 
 pub mod gossip;
+pub mod handshake;
 pub mod membership;
 pub mod phi;
+pub mod pid;
+pub mod router;
 
+pub use handshake::{evaluate_hello, HandshakeOutcome, Hello};
 pub use membership::{MemberState, PartitionPolicy};
 pub use phi::PhiAccrualFailureDetector;
+pub use pid::DistPid;
+pub use router::{DownNotice, DownReason, RemoteRef, Router};
 
 /// Cluster-wide identity for a CrabScheme node.
 ///
@@ -77,6 +89,8 @@ pub enum DistribError {
     EpochMismatch { expected: u64, got: u64 },
     #[error("peer unreachable: {0}")]
     Unreachable(String),
+    #[error("wire decode: {0}")]
+    Decode(String),
     #[error("transport: {0}")]
     Transport(#[from] cs_net::TransportError),
     #[error("not implemented (cs-distrib scaffold; see docs/research/sdk_spec/tasks/M02-cluster-substrate.md)")]
