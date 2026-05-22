@@ -32,40 +32,47 @@ fn cc_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Build `pkg` (release) if `artifact` is missing. Returns false on build
-/// failure so the caller can skip rather than hard-fail.
-fn ensure_built(root: &Path, artifact: &Path, pkg: &str) -> bool {
-    if artifact.exists() {
-        return true;
-    }
-    let ok = Command::new("cargo")
+fn build_pkg(root: &Path, pkg: &str) -> bool {
+    Command::new("cargo")
         .current_dir(root)
         .args(["build", "--release", "-p", pkg])
         .status()
         .map(|s| s.success())
-        .unwrap_or(false);
-    ok && artifact.exists()
+        .unwrap_or(false)
 }
 
 /// Resolve (crabscheme binary, archive) for the release profile, building
-/// either if needed. `None` means the test should skip (cc/build absent).
+/// both **once** (cached: `cargo test` runs these tests in parallel, so they
+/// must not race on the shared target/release artifacts). `None` ⇒ the test
+/// should skip (no `cc`, or a build failed).
 fn setup() -> Option<(PathBuf, PathBuf)> {
-    if !cc_available() {
-        eprintln!("aot_object_l3: skipping — no `cc` on PATH");
-        return None;
-    }
-    let root = workspace_root();
-    let bin = root.join("target/release/crabscheme");
-    let archive = root.join("target/release/libcs_aot_rt.a");
-    if !ensure_built(&root, &bin, "cs-cli") {
-        eprintln!("aot_object_l3: skipping — could not build cs-cli");
-        return None;
-    }
-    if !ensure_built(&root, &archive, "cs-aot-rt") {
-        eprintln!("aot_object_l3: skipping — could not build cs-aot-rt archive");
-        return None;
-    }
-    Some((bin, archive))
+    static SETUP: std::sync::OnceLock<Option<(PathBuf, PathBuf)>> = std::sync::OnceLock::new();
+    SETUP
+        .get_or_init(|| {
+            if !cc_available() {
+                eprintln!("aot_object_l3: skipping — no `cc` on PATH");
+                return None;
+            }
+            let root = workspace_root();
+            let bin = root.join("target/release/crabscheme");
+            let archive = root.join("target/release/libcs_aot_rt.a");
+            if !bin.exists() && !build_pkg(&root, "cs-cli") {
+                eprintln!("aot_object_l3: skipping — could not build cs-cli");
+                return None;
+            }
+            // The archive MUST be (re)built in its OWN cargo invocation: a
+            // prior `cargo build --workspace` (CI) leaves a feature-unified
+            // archive that pulls cc-unlinkable framework deps (TLS/HTTP →
+            // security-framework on macOS). Remove it first so this isolated
+            // build always produces the minimal, linkable archive.
+            let _ = std::fs::remove_file(&archive);
+            if !build_pkg(&root, "cs-aot-rt") || !archive.exists() {
+                eprintln!("aot_object_l3: skipping — could not build cs-aot-rt archive");
+                return None;
+            }
+            Some((bin, archive))
+        })
+        .clone()
 }
 
 /// Compile `src`'s `entry` to a native binary via the L3 object path, run it
