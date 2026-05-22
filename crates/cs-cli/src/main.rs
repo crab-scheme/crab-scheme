@@ -1542,11 +1542,14 @@ fn run_check(file: &str, color: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // M01: strip `#:effects` declarations + record the declared effect set
+    // per definition before the annotation pre-pass / expander see the forms.
+    let (data, effect_decls, effect_decl_diags) = cs_typer::extract_effect_decls(&data, &mut syms);
     // Typer pre-pass: strip annotations + diagnostics for
     // malformed ones (typer-bad-annotation).
     let (data, table, ann_diags) = cs_typer::extract_annotations(&data, &mut syms);
     let mut any_error = false;
-    for d in &ann_diags {
+    for d in effect_decl_diags.iter().chain(ann_diags.iter()) {
         if matches!(d.severity, cs_diag::Severity::Error) {
             any_error = true;
         }
@@ -1572,14 +1575,25 @@ fn run_check(file: &str, color: bool) -> ExitCode {
         let diag = err.to_diagnostic();
         eprintln!("{}", render_diag(&diag, &sources, color));
     }
+    // M01: effect-check pass — reject any body that performs an effect not
+    // listed in its `#:effects` declaration.
+    let effect_diags = cs_typer::check_effects(&core, &effect_decls, &syms);
+    for d in &effect_diags {
+        any_error = true;
+        eprintln!("{}", render_diag(d, &sources, color));
+    }
     if any_error {
-        let count = type_errors.len()
-            + ann_diags
-                .iter()
+        let err_count = |ds: &[cs_diag::Diagnostic]| {
+            ds.iter()
                 .filter(|d| matches!(d.severity, cs_diag::Severity::Error))
-                .count();
+                .count()
+        };
+        let count = type_errors.len()
+            + effect_diags.len()
+            + err_count(&effect_decl_diags)
+            + err_count(&ann_diags);
         eprintln!(
-            "crabscheme check: {} type error{} in {file}",
+            "crabscheme check: {} error{} in {file}",
             count,
             if count == 1 { "" } else { "s" }
         );

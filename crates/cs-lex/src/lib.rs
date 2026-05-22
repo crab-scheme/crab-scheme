@@ -518,7 +518,7 @@ impl<'src> Lexer<'src> {
     fn read_hash(
         &mut self,
         start: usize,
-        _syms: &mut SymbolTable,
+        syms: &mut SymbolTable,
     ) -> Result<(Token, Span), LexError> {
         self.bump(); // consume #
         match self.peek() {
@@ -558,6 +558,23 @@ impl<'src> Lexer<'src> {
                 self.bump(); // 8
                 self.bump(); // (
                 Ok((Token::HashU8LParen, self.span(start, self.pos)))
+            }
+            // Racket-style keyword `#:foo` — lexes as an identifier whose
+            // interned name keeps the `#:` prefix, so it flows downstream as
+            // an ordinary `Symbol` datum. Consumed by SDK M01's `#:effects`
+            // annotation and by `syntax-rules` keyword literals
+            // (e.g. lib/beam/web-contracts.scm's `#:param`/`#:header`).
+            Some(b':') => {
+                self.bump(); // consume ':'
+                while let Some(b) = self.peek() {
+                    if is_delimiter(b) {
+                        break;
+                    }
+                    self.bump();
+                }
+                let text = &self.src[start..self.pos];
+                let sym = syms.intern(text);
+                Ok((Token::Identifier(sym), self.span(start, self.pos)))
             }
             _ => Err(LexError::UnexpectedChar {
                 c: '#',
@@ -945,6 +962,28 @@ mod tests {
     fn binary_radix() {
         let toks = lex("#b1010");
         assert!(matches!(toks[0], Token::Number(Number::Fixnum(10))));
+    }
+
+    #[test]
+    fn keyword_hash_colon_lexes_as_identifier() {
+        // `#:foo` reads as an identifier whose interned name keeps the
+        // `#:` prefix (SDK M01 `#:effects`; syntax-rules keyword literals).
+        let mut syms = SymbolTable::new();
+        let toks = lex_all(FileId(0), "#:effects", &mut syms).unwrap();
+        match toks[0].0 {
+            Token::Identifier(s) => assert_eq!(syms.name(s), "#:effects"),
+            _ => panic!("expected Identifier for #:effects"),
+        }
+        // Delimited correctly inside a list.
+        let toks2 = lex_all(FileId(0), "(a #:foo b)", &mut syms).unwrap();
+        let ids: Vec<&str> = toks2
+            .iter()
+            .filter_map(|(t, _)| match t {
+                Token::Identifier(s) => Some(syms.name(*s)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["a", "#:foo", "b"]);
     }
 
     #[test]
