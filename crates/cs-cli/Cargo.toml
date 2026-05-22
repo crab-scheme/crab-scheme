@@ -144,7 +144,17 @@ wasm-stdlib = [
 ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the
 # WASM build drops it (can't spawn cargo at WASI runtime).
-aot = ["dep:cs-aot", "dep:cs-vm", "dep:cs-rir", "dep:cs-parse", "dep:cs-expand", "dep:cs-typer"]
+aot = [
+    "dep:cs-aot",
+    "dep:cs-vm",
+    "dep:cs-rir",
+    "dep:cs-parse",
+    "dep:cs-expand",
+    "dep:cs-typer",
+    # AOT level 3 — cranelift-object backend the CLI drives when no Rust
+    # toolchain is present (or CRABSCHEME_AOT_FORCE_OBJECT=1).
+    "dep:cs-jit-cranelift",
+]
 # AOT level 1: embed the workspace crate sources into the binary (via
 # build.rs) so `crabscheme aot --build` works from a release-installed
 # binary with no dev source tree. OFF by default to avoid include_bytes!
@@ -189,4 +199,6 @@ cs-parse = { workspace = true, optional = true }
 cs-expand = { workspace = true, optional = true }
 # Phase 5 — typer feeds param_type_hints into AOT.
 cs-typer = { workspace = true, optional = true }
+# AOT level 3 — object backend (cranelift-object) for toolchain-free builds.
+cs-jit-cranelift = { workspace = true, optional = true }
 clap = { workspace = true }

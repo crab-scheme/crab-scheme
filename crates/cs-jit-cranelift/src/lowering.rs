@@ -792,6 +792,11 @@ pub struct Lowerer<M: Module = JITModule> {
     ic_table: IcTable,
 }
 
+/// AOT **level 3** lowerer: `Lowerer` specialized to emit a relocatable
+/// object instead of in-process JIT code. Lets downstream crates name the
+/// object backend without depending on `cranelift-object` directly.
+pub type ObjectLowerer = Lowerer<ObjectModule>;
+
 impl Lowerer<JITModule> {
     /// Build a fresh lowerer, using the host ISA.
     pub fn new() -> Result<Self, JitError> {

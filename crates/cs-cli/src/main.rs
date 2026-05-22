@@ -756,16 +756,14 @@ fn run_aot(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{}-aot", basename_no_ext(file))));
 
-    // AOT level-1 toolchain gate: `--build` emits a cargo project and runs
-    // `cargo build`, so it needs cargo + rustc. (Self-contained AOT without
-    // a toolchain — level 3 — is not implemented yet.)
-    if build && !rust_toolchain_present() {
-        eprintln!(
-            "crabscheme aot --build: no Rust toolchain (cargo + rustc) on PATH. \
-             Install rustup, or drop --build to emit the project for building \
-             elsewhere. (Toolchain-free native codegen is a planned follow-up.)"
-        );
-        return ExitCode::from(4);
+    // AOT level gate (#249). `--build` with a Rust toolchain present uses
+    // level 1 (emit a cargo project + `cargo build`). Without cargo+rustc
+    // on PATH — or with CRABSCHEME_AOT_FORCE_OBJECT=1 — fall back to level 3:
+    // a self-contained cranelift-object `.o` linked by the system `cc`
+    // against the prebuilt cs-aot-rt archive, no Rust toolchain required.
+    let force_object = std::env::var_os("CRABSCHEME_AOT_FORCE_OBJECT").is_some();
+    if build && (force_object || !rust_toolchain_present()) {
+        return run_aot_object(file, &lam, &entry_name, entry_sym, output, target);
     }
     // Resolve cs-vm: the dev-tree path for a from-source build, else the
     // workspace sources embedded in this binary (release tarball).
@@ -885,6 +883,244 @@ fn run_aot(
             ExitCode::from(5)
         }
     }
+}
+
+/// AOT **level 3** driver — compile the entry lambda to a self-contained
+/// native binary with no Rust toolchain. Reuses the JIT's Cranelift
+/// lowering (`cs_jit_cranelift::ObjectLowerer`) to emit a relocatable `.o`,
+/// generates a tiny C `main`, and links both against the prebuilt
+/// `libcs_aot_rt.a` archive with the system `cc`. See `docs/user/aot.md`.
+///
+/// Scope: a single self-contained function (only self-recursion). Cross-
+/// function programs lower `Inst::Call`/`CallGeneral`, which need runtime
+/// procedure registration the standalone binary lacks — those decline here
+/// with a pointer to the L1 (cargo+rustc) multi-procedure path.
+#[cfg(feature = "aot")]
+fn run_aot_object(
+    file: &str,
+    lam: &cs_vm::opcode::CompiledLambda,
+    entry_name: &str,
+    entry_sym: cs_core::Symbol,
+    output: Option<&str>,
+    target: Option<&str>,
+) -> ExitCode {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use cs_jit_cranelift::ObjectLowerer;
+    use cs_rir::Inst;
+    use cs_vm::jit_translate::bytecode_to_rir;
+
+    // The symbol the emitted object exports + the generated C main calls.
+    const ENTRY_SYM: &str = "crabscheme_aot_entry";
+
+    // L3 emits host-native objects only; cross-compilation needs L1.
+    if let Some(t) = target {
+        eprintln!(
+            "crabscheme aot --build --target={t}: the toolchain-free (level 3) \
+             backend emits host-native objects only. Install cargo+rustc for \
+             cross-compilation (level 1)."
+        );
+        return ExitCode::from(4);
+    }
+
+    // JIT-dialect RIR: builtins lower to dedicated Insts the object backend
+    // handles (not the AOT `CallBuiltin` dialect, which the standalone
+    // binary can't dispatch).
+    let rir = match bytecode_to_rir(lam, entry_name, Some(entry_sym)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("crabscheme aot (level 3): bytecode→RIR error: {e:?}");
+            return ExitCode::from(3);
+        }
+    };
+
+    // Self-contained check: a cross-function call needs runtime dispatch the
+    // standalone binary can't satisfy (self-recursion lowers to a direct
+    // call and is fine).
+    let has_cross_call = rir.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|i| matches!(i, Inst::Call(..) | Inst::CallGeneral(..)))
+    });
+    if has_cross_call {
+        eprintln!(
+            "crabscheme aot (level 3): `{entry_name}` calls other functions, which \
+             the toolchain-free backend can't link yet (only self-recursion is \
+             supported). Install cargo+rustc to use level 1 (multi-procedure AOT)."
+        );
+        return ExitCode::from(4);
+    }
+
+    // Lower to a relocatable object exporting ENTRY_SYM.
+    let mut lo = match ObjectLowerer::new_object(entry_name) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("crabscheme aot (level 3): object backend init failed: {e:?}");
+            return ExitCode::from(4);
+        }
+    };
+    lo.set_entry_export(ENTRY_SYM);
+    if let Err(e) = lo.define_uniform_nb(&rir) {
+        eprintln!(
+            "crabscheme aot (level 3): cannot compile `{entry_name}`: {e:?}\n  \
+             (the level-3 backend lowers the same Inst set as the JIT; an \
+             unsupported op means this function needs level 1 — cargo+rustc.)"
+        );
+        return ExitCode::from(3);
+    }
+    let obj_bytes = match lo.finish_object() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("crabscheme aot (level 3): object emit failed: {e:?}");
+            return ExitCode::from(4);
+        }
+    };
+
+    // Locate the prebuilt runtime archive.
+    let archive = match resolve_aot_archive() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "crabscheme aot (level 3): cannot find the runtime archive \
+                 libcs_aot_rt.a. It ships beside the binary in release tarballs; \
+                 set CRABSCHEME_AOT_ARCHIVE=/path/to/libcs_aot_rt.a to override."
+            );
+            return ExitCode::from(4);
+        }
+    };
+
+    // Output binary path (compiler `-o` semantics: the binary, not a dir).
+    let bin_path = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(basename_no_ext(file)));
+
+    // Intermediates in a per-process temp dir.
+    let tmp = std::env::temp_dir().join(format!("crabscheme-aot-{}", std::process::id()));
+    if let Err(e) = fs::create_dir_all(&tmp) {
+        eprintln!(
+            "crabscheme aot (level 3): cannot create temp dir {}: {e}",
+            tmp.display()
+        );
+        return ExitCode::from(4);
+    }
+    let obj_path = tmp.join("prog.o");
+    let main_c_path = tmp.join("main.c");
+    if let Err(e) = fs::write(&obj_path, &obj_bytes) {
+        eprintln!(
+            "crabscheme aot (level 3): cannot write {}: {e}",
+            obj_path.display()
+        );
+        return ExitCode::from(4);
+    }
+    if let Err(e) = fs::write(&main_c_path, generate_c_main(ENTRY_SYM, rir.params.len())) {
+        eprintln!(
+            "crabscheme aot (level 3): cannot write {}: {e}",
+            main_c_path.display()
+        );
+        return ExitCode::from(4);
+    }
+
+    // Link: cc main.c prog.o libcs_aot_rt.a -o bin
+    println!(
+        "crabscheme aot (level 3): linking {} with cc...",
+        bin_path.display()
+    );
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let mut cmd = Command::new(&cc);
+    cmd.arg(&main_c_path)
+        .arg(&obj_path)
+        .arg(&archive)
+        .arg("-o")
+        .arg(&bin_path);
+    // Rust std needs the platform thread/dl/math libs on Linux; macOS folds
+    // them into libSystem (and rejects -ldl), so only add them elsewhere.
+    #[cfg(not(target_os = "macos"))]
+    {
+        cmd.arg("-lpthread").arg("-ldl").arg("-lm");
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => {
+            println!(
+                "crabscheme aot: built {} (level 3 — no Rust toolchain)",
+                bin_path.display()
+            );
+            println!("  entry: {entry_name}");
+            println!("  archive: {}", archive.display());
+            ExitCode::SUCCESS
+        }
+        Ok(s) => {
+            eprintln!("crabscheme aot (level 3): cc failed with status {s}");
+            ExitCode::from(5)
+        }
+        Err(e) => {
+            eprintln!("crabscheme aot (level 3): cannot spawn `{cc}`: {e}");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// Locate the prebuilt `libcs_aot_rt.a` runtime archive the level-3 link
+/// step needs. Checks, in order: `CRABSCHEME_AOT_ARCHIVE`, beside the
+/// running binary (release-tarball layout `crabscheme` + `libcs_aot_rt.a`,
+/// which also matches the dev `target/<profile>/` directory), and a `lib/`
+/// subdir of either.
+#[cfg(feature = "aot")]
+fn resolve_aot_archive() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    const NAME: &str = "libcs_aot_rt.a";
+
+    if let Some(p) = std::env::var_os("CRABSCHEME_AOT_ARCHIVE") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for cand in [dir.join(NAME), dir.join("lib").join(NAME)] {
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Generate the C `main` for a level-3 AOT binary. The emitted object
+/// exports `entry_sym` as `int64_t entry(int64_t…)` taking `arity`
+/// nan-boxed args and returning a nan-boxed result; the C glue parses argv
+/// integers, encodes them via `cs_aot_nb_fixnum`, calls the entry, and
+/// prints through `cs_aot_print_result` (both from `libcs_aot_rt.a`), so
+/// the glue never hard-codes the nan-box ABI.
+#[cfg(feature = "aot")]
+fn generate_c_main(entry_sym: &str, arity: usize) -> String {
+    let mut s = String::new();
+    s.push_str("#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n\n");
+    s.push_str("extern int64_t cs_aot_nb_fixnum(int64_t);\n");
+    s.push_str("extern void cs_aot_print_result(int64_t);\n");
+    let params = if arity == 0 {
+        "void".to_string()
+    } else {
+        vec!["int64_t"; arity].join(", ")
+    };
+    s.push_str(&format!("extern int64_t {entry_sym}({params});\n\n"));
+    s.push_str("int main(int argc, char **argv) {\n");
+    s.push_str(&format!("    if (argc < {}) {{\n", arity + 1));
+    let usage: String = (0..arity).map(|i| format!(" <arg{i}>")).collect();
+    s.push_str(&format!(
+        "        fprintf(stderr, \"usage: %s{usage}\\n\", argv[0]);\n"
+    ));
+    s.push_str("        return 2;\n    }\n");
+    let call_args: String = (0..arity)
+        .map(|i| format!("cs_aot_nb_fixnum(atoll(argv[{}]))", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    s.push_str(&format!("    int64_t r = {entry_sym}({call_args});\n"));
+    s.push_str("    cs_aot_print_result(r);\n");
+    s.push_str("    return 0;\n}\n");
+    s
 }
 
 #[cfg(feature = "aot")]
