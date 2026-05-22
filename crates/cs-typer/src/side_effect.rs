@@ -27,7 +27,11 @@
 //! top [`EffectSet::ALL`]. "Body conforms to declaration" is the subset
 //! test `inferred ⊆ declared` ([`EffectSet::is_subset`]).
 
+use std::collections::HashMap;
 use std::fmt;
+
+use cs_core::{Symbol, SymbolTable};
+use cs_ir::CoreExpr;
 
 /// A single observable side effect a computation may perform.
 ///
@@ -224,6 +228,194 @@ impl fmt::Display for EffectSet {
     }
 }
 
+/// The observable side effects of a primitive procedure, by its R6RS /
+/// stdlib name. Unknown names are [`EffectSet::PURE`] — the inferencer
+/// can't reason about an unclassified callee and stays permissive (matching
+/// [`crate::effect::primitive_effect`]); the check pass relies on declared
+/// effects for user functions, not on this table being exhaustive.
+///
+/// Allocation is intentionally *not* reported here — it's a benign effect
+/// tracked by the separate [`crate::effect::AllocEffect`] analysis, not an
+/// observable side effect relevant to effect declarations, determinism, or
+/// capabilities. [`Effect::Agent`] / [`Effect::Audit`] have no primitives
+/// yet (they arrive with M09 / M10).
+pub fn primitive_side_effects(name: &str) -> EffectSet {
+    let one = EffectSet::single;
+    match name {
+        // Network.
+        "http-get" | "http-post" | "http-put" | "http-delete" | "http-head" | "http-patch"
+        | "http-request" | "tcp-connect" | "tcp-listen" | "tcp-accept" | "tcp-send"
+        | "tcp-recv" | "udp-open" | "udp-send" | "udp-recv" | "dns-resolve" | "dns-lookup"
+        | "websocket-connect" | "websocket-send" | "websocket-recv" | "socket-send"
+        | "socket-recv" => one(Effect::Net),
+
+        // Filesystem / port I/O.
+        "read-file"
+        | "write-file"
+        | "append-file"
+        | "delete-file"
+        | "file-exists?"
+        | "rename-file"
+        | "open-input-file"
+        | "open-output-file"
+        | "call-with-input-file"
+        | "call-with-output-file"
+        | "with-input-from-file"
+        | "with-output-to-file"
+        | "read"
+        | "read-line"
+        | "read-char"
+        | "peek-char"
+        | "read-string"
+        | "read-u8"
+        | "write"
+        | "write-char"
+        | "write-string"
+        | "write-u8"
+        | "display"
+        | "newline"
+        | "flush-output-port"
+        | "close-port"
+        | "close-input-port"
+        | "close-output-port"
+        | "directory-list"
+        | "make-directory"
+        | "current-directory" => one(Effect::Io),
+
+        // Wall clock — non-deterministic.
+        "current-time" | "current-jiffy" | "current-second" | "current-date" | "system-time"
+        | "time-monotonic" | "time-utc" => one(Effect::WallClock),
+
+        // Randomness — non-deterministic.
+        "random"
+        | "random-real"
+        | "random-integer"
+        | "random-fixnum"
+        | "make-random-state"
+        | "random-source-randomize!" => one(Effect::Random),
+
+        // Mutation of existing state.
+        "set-car!" | "set-cdr!" | "vector-set!" | "vector-fill!" | "vector-copy!"
+        | "string-set!" | "string-fill!" | "bytevector-u8-set!" | "bytevector-set!"
+        | "bytevector-copy!" | "hashtable-set!" | "hashtable-delete!" | "hashtable-update!"
+        | "hashtable-clear!" | "set!" => one(Effect::Mutation),
+
+        // Non-local control transfer.
+        "raise"
+        | "raise-continuable"
+        | "error"
+        | "assert"
+        | "assertion-violation"
+        | "error-with-irritants" => one(Effect::Panic),
+
+        _ => EffectSet::PURE,
+    }
+}
+
+/// Infer the observable [`EffectSet`] of `expr`, bottom-up over the
+/// `cs_ir::CoreExpr`. Mirrors the allocation inferencer in
+/// [`crate::effect::infer_effect`] but for the side-effect axis.
+///
+/// `syms` resolves a [`Symbol`] callee to its name so it can be looked up
+/// in `declared` (user functions with `#:effects`) or
+/// [`primitive_side_effects`]. `declared` is the effect environment the
+/// check pass (iter D) builds from all top-level `#:effects` annotations;
+/// pass an empty map for standalone inference.
+///
+/// # Scope (iter B)
+///
+/// - **A `Lambda` expression is pure**: constructing a closure performs no
+///   observable effect. Its *latent* effect (what running the body does)
+///   surfaces when the closure is applied — either directly
+///   (`App` of a `Lambda`) or via a `declared` lookup when it's bound to a
+///   name and called by name.
+/// - **Unknown callees are permissive** (`PURE`): a computed callee
+///   (`((car fns) …)`) or an unclassified primitive contributes no effect.
+///   Full soundness needs an inter-procedural fixpoint, deferred per the
+///   M01 brief; the check pass leans on `declared` for user code.
+pub fn infer_side_effects(
+    expr: &CoreExpr,
+    syms: &SymbolTable,
+    declared: &HashMap<Symbol, EffectSet>,
+) -> EffectSet {
+    match expr {
+        CoreExpr::Const { .. } | CoreExpr::Ref { .. } => EffectSet::PURE,
+
+        // `set!` mutates; plus whatever the RHS does.
+        CoreExpr::Set { value, .. } => {
+            EffectSet::single(Effect::Mutation).union(infer_side_effects(value, syms, declared))
+        }
+
+        // Constructing a closure is pure; its latent effect surfaces at the
+        // call site (see App / the check pass's lambda-body handling).
+        CoreExpr::Lambda { .. } => EffectSet::PURE,
+
+        CoreExpr::If {
+            cond, then, alt, ..
+        } => infer_side_effects(cond, syms, declared)
+            .union(infer_side_effects(then, syms, declared))
+            .union(infer_side_effects(alt, syms, declared)),
+
+        CoreExpr::Begin { exprs, .. } => exprs.iter().fold(EffectSet::PURE, |acc, e| {
+            acc.union(infer_side_effects(e, syms, declared))
+        }),
+
+        CoreExpr::Letrec { bindings, body, .. } => {
+            let mut acc = infer_side_effects(body, syms, declared);
+            for (_, rhs) in bindings {
+                acc = acc.union(infer_side_effects(rhs, syms, declared));
+            }
+            acc
+        }
+
+        CoreExpr::App { func, args, .. } => {
+            // Evaluating the callee + args.
+            let mut acc = infer_side_effects(func, syms, declared);
+            for arg in args {
+                acc = acc.union(infer_side_effects(arg, syms, declared));
+            }
+            // Plus the callee's latent effect (what calling it does).
+            acc = acc.union(callee_latent_effect(func, syms, declared));
+            acc
+        }
+    }
+}
+
+/// The latent effect of applying `func`: a named callee resolves through
+/// `declared` (user `#:effects`) then [`primitive_side_effects`]; an
+/// immediately-invoked lambda contributes its body's effect; any other
+/// (computed) callee is permissive `PURE`.
+fn callee_latent_effect(
+    func: &CoreExpr,
+    syms: &SymbolTable,
+    declared: &HashMap<Symbol, EffectSet>,
+) -> EffectSet {
+    match func {
+        CoreExpr::Ref { name, .. } => declared
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| primitive_side_effects(syms.name(*name))),
+        CoreExpr::Lambda { body, .. } => infer_side_effects(body, syms, declared),
+        _ => EffectSet::PURE,
+    }
+}
+
+/// The latent effect of a definition's value — the effects performed when
+/// the binding is *used*. For a `(lambda …)` value that's the body's
+/// effect (the function runs when called); for any other value it's the
+/// effect of evaluating it. This is what the check pass compares against a
+/// `#:effects` declaration.
+pub fn definition_body_effects(
+    value: &CoreExpr,
+    syms: &SymbolTable,
+    declared: &HashMap<Symbol, EffectSet>,
+) -> EffectSet {
+    match value {
+        CoreExpr::Lambda { body, .. } => infer_side_effects(body, syms, declared),
+        other => infer_side_effects(other, syms, declared),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +537,185 @@ mod tests {
         assert!(EffectSet::single(Effect::Mutation).is_subset(migration_allowed));
         // wall-clock in a migration is rejected.
         assert!(!EffectSet::single(Effect::WallClock).is_subset(migration_allowed));
+    }
+
+    // === iter B: inferencer + builtin table ===
+
+    use cs_core::Value;
+    use cs_diag::Span;
+    use cs_ir::Params;
+    use std::rc::Rc;
+
+    fn cnst(v: i64) -> CoreExpr {
+        CoreExpr::Const {
+            value: Value::fixnum(v),
+            span: Span::DUMMY,
+        }
+    }
+    fn rf(sym: Symbol) -> CoreExpr {
+        CoreExpr::Ref {
+            name: sym,
+            span: Span::DUMMY,
+        }
+    }
+    fn app(func: CoreExpr, args: Vec<CoreExpr>) -> CoreExpr {
+        CoreExpr::App {
+            func: Rc::new(func),
+            args,
+            span: Span::DUMMY,
+        }
+    }
+    fn lam(params: Vec<Symbol>, body: CoreExpr) -> CoreExpr {
+        CoreExpr::Lambda {
+            params: Params::fixed(params),
+            body: Rc::new(body),
+            span: Span::DUMMY,
+        }
+    }
+    fn set(name: Symbol, value: CoreExpr) -> CoreExpr {
+        CoreExpr::Set {
+            name,
+            value: Rc::new(value),
+            span: Span::DUMMY,
+        }
+    }
+    fn no_decls() -> HashMap<Symbol, EffectSet> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn primitive_table_classifies_each_axis() {
+        assert_eq!(
+            primitive_side_effects("http-get"),
+            EffectSet::single(Effect::Net)
+        );
+        assert_eq!(
+            primitive_side_effects("read-file"),
+            EffectSet::single(Effect::Io)
+        );
+        assert_eq!(
+            primitive_side_effects("current-time"),
+            EffectSet::single(Effect::WallClock)
+        );
+        assert_eq!(
+            primitive_side_effects("random"),
+            EffectSet::single(Effect::Random)
+        );
+        assert_eq!(
+            primitive_side_effects("vector-set!"),
+            EffectSet::single(Effect::Mutation)
+        );
+        assert_eq!(
+            primitive_side_effects("raise"),
+            EffectSet::single(Effect::Panic)
+        );
+        // Pure ops and benign allocation are not observable side effects.
+        assert!(primitive_side_effects("+").is_pure());
+        assert!(primitive_side_effects("cons").is_pure());
+        assert!(primitive_side_effects("car").is_pure());
+        assert!(primitive_side_effects("totally-unknown").is_pure());
+    }
+
+    #[test]
+    fn pure_expression_has_empty_effect_set() {
+        let mut syms = SymbolTable::new();
+        let plus = syms.intern("+");
+        let e = app(rf(plus), vec![cnst(1), cnst(2)]);
+        assert!(infer_side_effects(&e, &syms, &no_decls()).is_pure());
+    }
+
+    #[test]
+    fn read_file_call_has_io() {
+        let mut syms = SymbolTable::new();
+        let rdf = syms.intern("read-file");
+        let p = syms.intern("p");
+        let e = app(rf(rdf), vec![rf(p)]);
+        assert_eq!(
+            infer_side_effects(&e, &syms, &no_decls()),
+            EffectSet::single(Effect::Io)
+        );
+    }
+
+    #[test]
+    fn call_to_declared_binding_uses_its_effects() {
+        let mut syms = SymbolTable::new();
+        let g = syms.intern("g");
+        let mut decls = no_decls();
+        decls.insert(g, EffectSet::from_effects([Effect::Net, Effect::Audit]));
+        let e = app(rf(g), vec![]);
+        assert_eq!(
+            infer_side_effects(&e, &syms, &decls),
+            EffectSet::from_effects([Effect::Net, Effect::Audit])
+        );
+    }
+
+    #[test]
+    fn set_node_is_mutation() {
+        let mut syms = SymbolTable::new();
+        let x = syms.intern("x");
+        let e = set(x, cnst(1));
+        assert_eq!(
+            infer_side_effects(&e, &syms, &no_decls()),
+            EffectSet::single(Effect::Mutation)
+        );
+    }
+
+    #[test]
+    fn if_unions_branch_effects() {
+        let mut syms = SymbolTable::new();
+        let hget = syms.intern("http-get");
+        let rdf = syms.intern("read-file");
+        let (c, u, p) = (syms.intern("c"), syms.intern("u"), syms.intern("p"));
+        let e = CoreExpr::If {
+            cond: Rc::new(rf(c)),
+            then: Rc::new(app(rf(hget), vec![rf(u)])),
+            alt: Rc::new(app(rf(rdf), vec![rf(p)])),
+            span: Span::DUMMY,
+        };
+        assert_eq!(
+            infer_side_effects(&e, &syms, &no_decls()),
+            EffectSet::from_effects([Effect::Net, Effect::Io])
+        );
+    }
+
+    #[test]
+    fn lambda_is_pure_latent_effect_surfaces_at_call() {
+        let mut syms = SymbolTable::new();
+        let hget = syms.intern("http-get");
+        let u = syms.intern("u");
+        // Defining the closure is pure.
+        let l = lam(vec![u], app(rf(hget), vec![rf(u)]));
+        assert!(
+            infer_side_effects(&l, &syms, &no_decls()).is_pure(),
+            "constructing a closure performs no observable effect"
+        );
+        // Immediately invoking it surfaces the body's {net}.
+        let called = app(lam(vec![u], app(rf(hget), vec![rf(u)])), vec![cnst(0)]);
+        assert_eq!(
+            infer_side_effects(&called, &syms, &no_decls()),
+            EffectSet::single(Effect::Net)
+        );
+        // definition_body_effects gives the latent {net} the #:effects
+        // check (iter D) compares against the declaration.
+        let l2 = lam(vec![u], app(rf(hget), vec![rf(u)]));
+        assert_eq!(
+            definition_body_effects(&l2, &syms, &no_decls()),
+            EffectSet::single(Effect::Net)
+        );
+    }
+
+    #[test]
+    fn begin_unions_subexpr_effects() {
+        let mut syms = SymbolTable::new();
+        let rnd = syms.intern("random");
+        let disp = syms.intern("display");
+        let e = CoreExpr::Begin {
+            exprs: vec![app(rf(rnd), vec![]), app(rf(disp), vec![cnst(1)])],
+            span: Span::DUMMY,
+        };
+        assert_eq!(
+            infer_side_effects(&e, &syms, &no_decls()),
+            EffectSet::from_effects([Effect::Random, Effect::Io])
+        );
     }
 }
