@@ -279,6 +279,61 @@ async fn quic_pair() -> (Tx, Tx, quinn::Endpoint, quinn::Endpoint) {
     (Arc::new(client), Arc::new(server), client_ep, server_ep)
 }
 
+/// A QUIC pair whose datagrams traverse a loss-injecting relay
+/// ([`cs_net::quic::lossy_relay`]). `single_stream` picks the no-isolation
+/// baseline (all channels share one ordered stream) vs the per-channel
+/// design. Loss at the datagram level is what makes QUIC's per-stream
+/// recovery matter — the head-of-line case a single stream can't avoid.
+#[cfg(feature = "quic")]
+async fn quic_pair_lossy(
+    drop_prob: f64,
+    single_stream: bool,
+) -> (Tx, Tx, quinn::Endpoint, quinn::Endpoint) {
+    use cs_net::quic::QuicTransport;
+
+    cs_net::tls::install_crypto_provider();
+    let (cert, key) = identity();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.clone()).unwrap();
+    let scfg = cs_net::tls::quic_server_config(roots.clone(), vec![cert.clone()], key.clone_key())
+        .unwrap();
+    let ccfg = cs_net::tls::quic_client_config(roots, vec![cert.clone()], key).unwrap();
+
+    let server_ep = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let server_addr = server_ep.local_addr().unwrap();
+    // Client connects to the relay; the relay forwards to the server, dropping
+    // `drop_prob` of datagrams each way. TLS stays end-to-end.
+    let relay_addr = cs_net::quic::lossy_relay(server_addr, drop_prob, 0xC0FFEE)
+        .await
+        .unwrap();
+
+    let accept_ep = server_ep.clone();
+    let accept = tokio::spawn(async move {
+        let conn = accept_ep.accept().await.unwrap().await.unwrap();
+        let cfg = TransportConfig::default();
+        if single_stream {
+            QuicTransport::from_connection_single_stream(conn, "a@local", &cfg)
+        } else {
+            QuicTransport::from_connection(conn, "a@local", &cfg)
+        }
+    });
+
+    let client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let conn = client_ep
+        .connect_with(ccfg, relay_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let cfg = TransportConfig::default();
+    let client = if single_stream {
+        QuicTransport::from_connection_single_stream(conn, "b@local", &cfg)
+    } else {
+        QuicTransport::from_connection(conn, "b@local", &cfg)
+    };
+    let server = accept.await.unwrap();
+    (Arc::new(client), Arc::new(server), client_ep, server_ep)
+}
+
 // ---------------------------------------------------------------------------
 // Suite runner + reporting
 // ---------------------------------------------------------------------------
@@ -321,6 +376,20 @@ async fn run_suite(label: &str, a: &Tx, b: &Tx) {
     );
 }
 
+/// Focused head-of-line probe (for the lossy comparison): control ping-pong
+/// RTT idle vs under a bulk flood, and the HoL factor, over `n` round trips.
+#[cfg(feature = "quic")]
+async fn run_hol(label: &str, a: &Tx, b: &Tx, n: usize) {
+    let p64 = vec![0u8; 64];
+    let idle = ping_pong(a, b, Channel::Control, &p64, n).await;
+    let idle_us = idle.as_secs_f64() * 1e6 / n as f64;
+    let bulk = vec![0u8; HOL_BULK_BYTES];
+    let under = ctrl_rtt_under_bulk(a, b, &bulk, &p64, n).await;
+    let under_us = under.as_secs_f64() * 1e6 / n as f64;
+    let hol = under_us / idle_us.max(f64::MIN_POSITIVE);
+    println!("  {label:<34}: ctrl idle {idle_us:>8.1} µs, under-bulk {under_us:>9.1} µs  (HoL {hol:.2}x)");
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     println!("cs-net distributed-transport benchmark (loopback; Savina-style kernels)");
@@ -351,6 +420,26 @@ async fn main() {
     {
         let (a, b, _client_ep, _server_ep) = quic_pair().await;
         run_suite("QUIC (quinn, mTLS, per-channel streams)", &a, &b).await;
+    }
+
+    // The point of per-channel streams is loss isolation: a dropped Bulk
+    // packet must not stall Control. That only shows on a LOSSY link (clean
+    // loopback is CPU-bound, not loss-bound), so inject 5% datagram loss and
+    // compare the per-channel design against a single shared stream.
+    #[cfg(feature = "quic")]
+    {
+        println!(
+            "\n== QUIC over a LOSSY link (5% datagram drop): per-stream isolation vs baseline =="
+        );
+        let n = 80;
+        {
+            let (a, b, _c, _s) = quic_pair_lossy(0.05, false).await;
+            run_hol("per-channel streams (the fix)", &a, &b, n).await;
+        }
+        {
+            let (a, b, _c, _s) = quic_pair_lossy(0.05, true).await;
+            run_hol("single shared stream (baseline)", &a, &b, n).await;
+        }
     }
 
     #[cfg(not(feature = "quic"))]

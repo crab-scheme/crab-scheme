@@ -33,8 +33,11 @@ sockets/certs or a cross-milestone dependency) is done and covered;
   / `accept_tls` (rustls configs in `cs-net::tls`) encrypt + mutually
   authenticate; tested (encrypted round-trip + certless-client rejection).
   A **QUIC** transport (`cs-net::quic`, quinn) is also implemented: TLS 1.3
-  is mandatory there, and each channel rides its own QUIC stream (no
-  head-of-line blocking) — tested under the `quic` feature.
+  is mandatory there, and each channel rides its own QUIC stream. The
+  head-of-line-blocking isolation that buys is **measured and proven under
+  packet loss** (≈110× lower control latency vs a single shared stream at 5%
+  loss) — see `docs/milestones/m02-transport-benchmark.md` and the test
+  `quic_per_stream_isolates_control_from_bulk_under_loss`.
 - ◑ **Per-peer pooling; channels never starve** — per-channel isolation +
   watermark backpressure are implemented and tested (Sim); a connection
   *pool* manager (multiple conns per peer) is a follow-up.

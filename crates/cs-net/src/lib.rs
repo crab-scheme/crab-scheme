@@ -78,6 +78,20 @@ impl Channel {
             Channel::Observability => "observability",
         }
     }
+
+    /// Wire-scheduler priority; higher is flushed first. Maps the channel's
+    /// traffic class onto a QUIC stream priority (`quinn::SendStream::set_priority`)
+    /// and the TCP transport's drain order, so latency-sensitive control
+    /// traffic is sent ahead of background bulk transfers. The ordering
+    /// matches the `Channel::ALL` / enum order (Control highest).
+    pub const fn priority(self) -> i32 {
+        match self {
+            Channel::Control => 10,
+            Channel::Consensus => 8,
+            Channel::Messages | Channel::Workflow => 0,
+            Channel::Bulk | Channel::Observability => -10,
+        }
+    }
 }
 
 impl fmt::Display for Channel {
@@ -342,19 +356,24 @@ pub mod tcp {
 
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpStream;
-    use tokio::sync::mpsc;
+    use tokio::sync::Notify;
 
     use super::framing::{encode_frame, FrameDecoder};
     use super::{Channel, Transport, TransportConfig, TransportError};
 
     type Inbound = Arc<[Mutex<VecDeque<Vec<u8>>>; Channel::ALL.len()]>;
+    /// Per-channel outbound queues, drained by the writer in channel-priority
+    /// order so a flood of `Bulk` frames cannot delay a `Control` frame.
+    type Outbound = Arc<[Mutex<VecDeque<Vec<u8>>>; Channel::ALL.len()]>;
 
     /// A per-peer TCP transport. Construct with [`Self::connect`] (client)
     /// or [`Self::from_stream`] (an accepted stream); both spawn the I/O
     /// pump on the current tokio runtime.
     pub struct TcpTransport {
         peer_label: String,
-        outbound: mpsc::UnboundedSender<(Channel, Vec<u8>)>,
+        outbound: Outbound,
+        /// Wakes the writer task when a frame is enqueued (or on close).
+        outbound_wake: Arc<Notify>,
         inbound: Inbound,
         closed: Arc<AtomicBool>,
         /// Abort handles for the reader + writer tasks, fired on `Drop` so
@@ -398,22 +417,66 @@ pub mod tcp {
             S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
         {
             let peer_label = peer_label.into();
-            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(Channel, Vec<u8>)>();
+            let outbound: Outbound = Arc::new(std::array::from_fn(|_| Mutex::new(VecDeque::new())));
+            let outbound_wake = Arc::new(Notify::new());
             let inbound: Inbound = Arc::new(std::array::from_fn(|_| Mutex::new(VecDeque::new())));
             let closed = Arc::new(AtomicBool::new(false));
             let (mut rd, mut wr) = tokio::io::split(stream);
 
-            // Writer: drain outbound, frame, write.
+            // Writer: when woken, drain every queued frame in channel-priority
+            // order (`Channel::ALL` is ordered Control..Observability), framing
+            // and writing one at a time. Picking the highest-priority non-empty
+            // channel each step lets a Control frame jump ahead of frames
+            // already queued on Bulk instead of waiting behind them in a FIFO.
+            // (One in-flight `write_all` is the irreducible single-stream HoL.)
+            let out_w = outbound.clone();
+            let wake_w = outbound_wake.clone();
             let closed_w = closed.clone();
             let writer = tokio::spawn(async move {
-                while let Some((ch, payload)) = out_rx.recv().await {
-                    let mut frame = Vec::with_capacity(payload.len() + 8);
-                    encode_frame(ch, &payload, &mut frame);
-                    if wr.write_all(&frame).await.is_err() {
-                        break;
+                let mut frame = Vec::new();
+                loop {
+                    loop {
+                        let next = {
+                            let mut picked = None;
+                            for ch in Channel::ALL {
+                                if let Some(f) = out_w[ch as usize]
+                                    .lock()
+                                    .expect("tcp outbound poisoned")
+                                    .pop_front()
+                                {
+                                    picked = Some((ch, f));
+                                    break;
+                                }
+                            }
+                            picked
+                        };
+                        match next {
+                            Some((ch, payload)) => {
+                                frame.clear();
+                                encode_frame(ch, &payload, &mut frame);
+                                if wr.write_all(&frame).await.is_err() {
+                                    closed_w.store(true, Ordering::Release);
+                                    return;
+                                }
+                            }
+                            None => break,
+                        }
                     }
+                    // Queue drained — flush so buffered bytes reach the peer.
+                    // A plain TcpStream is unbuffered, but a tokio_rustls
+                    // TlsStream buffers records; without a flush a small write
+                    // (e.g. a ping-pong reply) can sit unsent until the next
+                    // one, stalling request/reply traffic. Flushing only when
+                    // the queue empties keeps batched throughput intact.
+                    if wr.flush().await.is_err() {
+                        closed_w.store(true, Ordering::Release);
+                        return;
+                    }
+                    if closed_w.load(Ordering::Acquire) {
+                        return;
+                    }
+                    wake_w.notified().await;
                 }
-                closed_w.store(true, Ordering::Release);
             });
 
             // Reader: read, reassemble frames, fan out per channel.
@@ -446,7 +509,8 @@ pub mod tcp {
 
             TcpTransport {
                 peer_label,
-                outbound: out_tx,
+                outbound,
+                outbound_wake,
                 inbound,
                 closed,
                 tasks: [writer.abort_handle(), reader.abort_handle()],
@@ -513,9 +577,12 @@ pub mod tcp {
             if self.is_closed() {
                 return Err(TransportError::PeerClosed);
             }
-            self.outbound
-                .send((channel, payload.to_vec()))
-                .map_err(|_| TransportError::PeerClosed)
+            self.outbound[channel as usize]
+                .lock()
+                .expect("tcp outbound poisoned")
+                .push_back(payload.to_vec());
+            self.outbound_wake.notify_one();
+            Ok(())
         }
 
         fn try_recv(&self, channel: Channel) -> Result<Option<Vec<u8>>, TransportError> {
@@ -543,6 +610,8 @@ pub mod tcp {
 
         fn close(&self) -> Result<(), TransportError> {
             self.closed.store(true, Ordering::Release);
+            // Wake the writer so it flushes any queued frames, then exits.
+            self.outbound_wake.notify_one();
             Ok(())
         }
     }
@@ -559,10 +628,16 @@ pub mod quic {
     //! single-stream TCP transport's framing can't provide.
     //!
     //! Like the TCP transport it bridges the sync [`Transport`] trait over
-    //! async: `send` queues to a writer task that owns one `SendStream` per
-    //! channel (each prefixed with its channel tag, then length-delimited
-    //! messages); an acceptor task takes incoming uni streams and fans their
-    //! messages onto per-channel inbound queues that `try_recv` drains.
+    //! async: `send` queues to a per-channel writer task; in the default
+    //! per-channel mode each task owns its own `SendStream` (prioritized),
+    //! while [`QuicTransport::from_connection_single_stream`] shares one
+    //! stream across all channels (the no-isolation baseline). Frames are
+    //! self-describing — `[channel][len][payload]` — so an acceptor task can
+    //! demux any stream onto the per-channel inbound queues `try_recv` drains.
+    //!
+    //! [`lossy_relay`] injects datagram loss for tests/benchmarks, so the
+    //! per-stream design's head-of-line-blocking advantage under loss can be
+    //! measured (see `examples/actor_bench.rs`).
 
     use std::collections::VecDeque;
     use std::net::SocketAddr;
@@ -571,6 +646,7 @@ pub mod quic {
 
     use quinn::{Connection, Endpoint};
     use tokio::sync::mpsc;
+    use tokio::sync::Mutex as AsyncMutex;
 
     use super::{Channel, Transport, TransportConfig, TransportError};
 
@@ -579,7 +655,10 @@ pub mod quic {
     /// A per-peer QUIC transport.
     pub struct QuicTransport {
         peer_label: String,
-        outbound: mpsc::UnboundedSender<(Channel, Vec<u8>)>,
+        /// One writer mpsc per channel; each feeds a dedicated writer task that
+        /// owns that channel's QUIC stream, so a `Bulk` write blocked on flow
+        /// control can't stall `Control` behind it in a shared queue.
+        outbound: [mpsc::UnboundedSender<Vec<u8>>; Channel::ALL.len()],
         inbound: Inbound,
         closed: Arc<AtomicBool>,
         conn: Connection,
@@ -615,101 +694,173 @@ pub mod quic {
             Ok(Self::from_connection(conn, peer_label, cfg))
         }
 
-        /// Wrap an established QUIC connection (client or server side),
-        /// spawning the per-channel writer + the uni-stream acceptor.
+        /// Wrap an established QUIC connection (client or server side) with
+        /// **per-channel** stream multiplexing: one QUIC stream per
+        /// [`Channel`], independent writer tasks, per-stream priority. A
+        /// `Bulk` transfer — including its packet-loss retransmissions —
+        /// therefore can't head-of-line-block `Control`.
         pub fn from_connection(
             conn: Connection,
             peer_label: impl Into<String>,
             cfg: &TransportConfig,
         ) -> Self {
-            let peer_label = peer_label.into();
-            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(Channel, Vec<u8>)>();
+            Self::new_io(conn, peer_label.into(), cfg, false)
+        }
+
+        /// Like [`from_connection`](Self::from_connection) but multiplexes
+        /// **all** channels onto a single shared QUIC stream — the
+        /// no-isolation baseline (equivalent to the single-ordered-stream TCP
+        /// transport): one lost packet stalls every channel queued behind it.
+        /// Used to demonstrate the per-stream design's advantage under loss;
+        /// not the production path.
+        pub fn from_connection_single_stream(
+            conn: Connection,
+            peer_label: impl Into<String>,
+            cfg: &TransportConfig,
+        ) -> Self {
+            Self::new_io(conn, peer_label.into(), cfg, true)
+        }
+
+        fn new_io(
+            conn: Connection,
+            peer_label: String,
+            cfg: &TransportConfig,
+            single_stream: bool,
+        ) -> Self {
             let inbound: Inbound = Arc::new(std::array::from_fn(|_| Mutex::new(VecDeque::new())));
             let closed = Arc::new(AtomicBool::new(false));
             let max_frame = cfg.max_frame_bytes;
+            let mut tasks: Vec<tokio::task::AbortHandle> =
+                Vec::with_capacity(Channel::ALL.len() + 1);
 
-            // Writer: one SendStream per channel, opened lazily.
-            let conn_w = conn.clone();
-            let closed_w = closed.clone();
-            let writer = tokio::spawn(async move {
-                let mut streams: [Option<quinn::SendStream>; Channel::ALL.len()] =
-                    std::array::from_fn(|_| None);
-                while let Some((ch, payload)) = out_rx.recv().await {
-                    let idx = ch as usize;
-                    if streams[idx].is_none() {
-                        match conn_w.open_uni().await {
-                            Ok(mut s) => {
-                                if s.write_all(&[ch as u8]).await.is_err() {
-                                    break;
+            // In single-stream mode every channel task shares one lazily-opened
+            // stream behind an async mutex, so writes serialize onto it (the
+            // HoL-prone baseline). In per-channel mode each task owns its own
+            // prioritized stream. Either way frames are self-describing —
+            // `[channel][len][payload]` — so the reader below handles both.
+            let shared: Option<Arc<AsyncMutex<Option<quinn::SendStream>>>> =
+                single_stream.then(|| Arc::new(AsyncMutex::new(None)));
+
+            let mut senders: Vec<mpsc::UnboundedSender<Vec<u8>>> =
+                Vec::with_capacity(Channel::ALL.len());
+            for ch in Channel::ALL {
+                let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                senders.push(tx);
+                let conn_w = conn.clone();
+                let closed_w = closed.clone();
+                let shared_w = shared.clone();
+                let w = tokio::spawn(async move {
+                    match shared_w {
+                        // Single shared stream: lock, lazily open, write frame.
+                        Some(shared) => {
+                            while let Some(payload) = rx.recv().await {
+                                let mut guard = shared.lock().await;
+                                if guard.is_none() {
+                                    match conn_w.open_uni().await {
+                                        Ok(s) => *guard = Some(s),
+                                        Err(_) => {
+                                            closed_w.store(true, Ordering::Release);
+                                            return;
+                                        }
+                                    }
                                 }
-                                streams[idx] = Some(s);
+                                let s = guard.as_mut().expect("shared stream open");
+                                if write_frame(s, ch, &payload).await.is_err() {
+                                    closed_w.store(true, Ordering::Release);
+                                    return;
+                                }
                             }
-                            Err(_) => break,
+                        }
+                        // Dedicated per-channel stream (lazily opened, prioritized).
+                        None => {
+                            let mut stream: Option<quinn::SendStream> = None;
+                            while let Some(payload) = rx.recv().await {
+                                if stream.is_none() {
+                                    match conn_w.open_uni().await {
+                                        Ok(s) => {
+                                            let _ = s.set_priority(ch.priority());
+                                            stream = Some(s);
+                                        }
+                                        Err(_) => {
+                                            closed_w.store(true, Ordering::Release);
+                                            return;
+                                        }
+                                    }
+                                }
+                                let s = stream.as_mut().expect("stream open");
+                                if write_frame(s, ch, &payload).await.is_err() {
+                                    closed_w.store(true, Ordering::Release);
+                                    return;
+                                }
+                            }
                         }
                     }
-                    let s = streams[idx].as_mut().expect("stream open");
-                    let len = (payload.len() as u32).to_be_bytes();
-                    if s.write_all(&len).await.is_err() || s.write_all(&payload).await.is_err() {
-                        break;
-                    }
-                }
-                closed_w.store(true, Ordering::Release);
-            });
+                });
+                tasks.push(w.abort_handle());
+            }
+            let outbound: [mpsc::UnboundedSender<Vec<u8>>; Channel::ALL.len()] =
+                senders.try_into().expect("one sender per channel");
 
-            // Acceptor: take incoming uni streams; one reader per stream.
+            // Acceptor: each incoming uni stream gets a reader pulling
+            // self-describing `[channel][len][payload]` frames and demuxing
+            // them (one stream may carry several channels in single-stream mode).
             let conn_r = conn.clone();
             let inbound_r = inbound.clone();
             let closed_r = closed.clone();
             let acceptor = tokio::spawn(async move {
-                loop {
-                    match conn_r.accept_uni().await {
-                        Ok(mut recv) => {
-                            let inb = inbound_r.clone();
-                            tokio::spawn(async move {
-                                let mut tag = [0u8; 1];
-                                if recv.read_exact(&mut tag).await.is_err() {
-                                    return;
-                                }
-                                let Some(ch) =
-                                    Channel::ALL.into_iter().find(|c| *c as u8 == tag[0])
-                                else {
-                                    return;
-                                };
-                                loop {
-                                    let mut lenb = [0u8; 4];
-                                    if recv.read_exact(&mut lenb).await.is_err() {
-                                        return; // stream finished / reset
-                                    }
-                                    let len = u32::from_be_bytes(lenb) as usize;
-                                    if len > max_frame {
-                                        return;
-                                    }
-                                    let mut payload = vec![0u8; len];
-                                    if recv.read_exact(&mut payload).await.is_err() {
-                                        return;
-                                    }
-                                    inb[ch as usize]
-                                        .lock()
-                                        .expect("quic inbound poisoned")
-                                        .push_back(payload);
-                                }
-                            });
+                // One reader task per incoming uni stream; loop ends when the
+                // connection closes (`accept_uni` errors).
+                while let Ok(mut recv) = conn_r.accept_uni().await {
+                    let inb = inbound_r.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let mut hdr = [0u8; 5];
+                            if recv.read_exact(&mut hdr).await.is_err() {
+                                return; // stream finished / reset
+                            }
+                            let Some(ch) = Channel::ALL.into_iter().find(|c| *c as u8 == hdr[0])
+                            else {
+                                return; // unknown channel tag
+                            };
+                            let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+                            if len > max_frame {
+                                return;
+                            }
+                            let mut payload = vec![0u8; len];
+                            if recv.read_exact(&mut payload).await.is_err() {
+                                return;
+                            }
+                            inb[ch as usize]
+                                .lock()
+                                .expect("quic inbound poisoned")
+                                .push_back(payload);
                         }
-                        Err(_) => break, // connection closed
-                    }
+                    });
                 }
                 closed_r.store(true, Ordering::Release);
             });
 
+            tasks.push(acceptor.abort_handle());
             QuicTransport {
                 peer_label,
-                outbound: out_tx,
+                outbound,
                 inbound,
                 closed,
                 conn,
-                tasks: vec![writer.abort_handle(), acceptor.abort_handle()],
+                tasks,
             }
         }
+    }
+
+    /// Write one self-describing frame `[channel:u8][len:u32 BE][payload]`.
+    async fn write_frame(s: &mut quinn::SendStream, ch: Channel, payload: &[u8]) -> Result<(), ()> {
+        let mut hdr = [0u8; 5];
+        hdr[0] = ch as u8;
+        hdr[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        if s.write_all(&hdr).await.is_err() || s.write_all(payload).await.is_err() {
+            return Err(());
+        }
+        Ok(())
     }
 
     impl Drop for QuicTransport {
@@ -727,8 +878,8 @@ pub mod quic {
             if self.is_closed() {
                 return Err(TransportError::PeerClosed);
             }
-            self.outbound
-                .send((channel, payload.to_vec()))
+            self.outbound[channel as usize]
+                .send(payload.to_vec())
                 .map_err(|_| TransportError::PeerClosed)
         }
 
@@ -760,6 +911,54 @@ pub mod quic {
             self.conn.close(0u32.into(), b"closed");
             Ok(())
         }
+    }
+
+    /// Loss-injecting UDP relay for tests/benchmarks (not a production path).
+    ///
+    /// Forwards QUIC datagrams between a client and `server_addr`, dropping
+    /// each datagram with probability `drop_prob` (deterministic per `seed`).
+    /// Point the QUIC client at the returned relay address; TLS stays
+    /// end-to-end (the relay only drops, never inspects). Dropping at the
+    /// *datagram* level is what exercises QUIC's per-stream loss recovery —
+    /// the regime where one stream per [`Channel`] avoids the head-of-line
+    /// blocking a single ordered stream cannot.
+    pub async fn lossy_relay(
+        server_addr: SocketAddr,
+        drop_prob: f64,
+        seed: u64,
+    ) -> std::io::Result<SocketAddr> {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+        let relay_addr = sock.local_addr()?;
+        tokio::spawn(async move {
+            let mut state = seed | 1; // LCG state (nonzero)
+            let mut client: Option<SocketAddr> = None;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let (n, from) = match sock.recv_from(&mut buf).await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                let dst = if from == server_addr {
+                    match client {
+                        Some(c) => c,
+                        None => continue, // no client seen yet
+                    }
+                } else {
+                    client = Some(from);
+                    server_addr
+                };
+                // PCG-style LCG → pseudo-random in [0, 1); deterministic per seed.
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let r = (state >> 33) as f64 / (1u64 << 31) as f64;
+                if r < drop_prob {
+                    continue; // drop this datagram
+                }
+                let _ = sock.send_to(&buf[..n], dst).await;
+            }
+        });
+        Ok(relay_addr)
     }
 }
 
@@ -1112,7 +1311,9 @@ mod quic_tests {
     use quinn::Endpoint;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::RootCertStore;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     fn identity() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -1193,5 +1394,145 @@ mod quic_tests {
         for i in 0u8..4 {
             assert_eq!(recv(&server, Channel::Bulk).await, vec![i]);
         }
+    }
+
+    /// Connected pair whose datagrams cross a loss-injecting relay
+    /// ([`super::quic::lossy_relay`]). `single_stream` selects the
+    /// no-isolation baseline. Both ends use the same mode (and the same drop
+    /// seed, so the comparison is fair).
+    async fn connected_lossy(
+        single_stream: bool,
+        drop_prob: f64,
+    ) -> (QuicTransport, QuicTransport, Endpoint, Endpoint) {
+        tls::install_crypto_provider();
+        let (cert, key) = identity();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let scfg =
+            tls::quic_server_config(roots.clone(), vec![cert.clone()], key.clone_key()).unwrap();
+        let ccfg = tls::quic_client_config(roots, vec![cert.clone()], key).unwrap();
+        let cfg = TransportConfig::default();
+
+        let server_ep = Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+        let relay = super::quic::lossy_relay(server_addr, drop_prob, 0x1234)
+            .await
+            .unwrap();
+
+        let accept_ep = server_ep.clone();
+        let accept = tokio::spawn(async move {
+            let conn = accept_ep.accept().await.unwrap().await.unwrap();
+            let cfg = TransportConfig::default();
+            if single_stream {
+                QuicTransport::from_connection_single_stream(conn, "client@host", &cfg)
+            } else {
+                QuicTransport::from_connection(conn, "client@host", &cfg)
+            }
+        });
+        let client_ep = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let conn = client_ep
+            .connect_with(ccfg, relay, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let client = if single_stream {
+            QuicTransport::from_connection_single_stream(conn, "server@host", &cfg)
+        } else {
+            QuicTransport::from_connection(conn, "server@host", &cfg)
+        };
+        let server = accept.await.unwrap();
+        (client, server, client_ep, server_ep)
+    }
+
+    /// Time `n` `Control` round trips while a bounded `Bulk` flood runs a→b.
+    async fn control_under_bulk(
+        a: Arc<QuicTransport>,
+        b: Arc<QuicTransport>,
+        n: usize,
+    ) -> Duration {
+        let stop = Arc::new(AtomicBool::new(false));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let bulk = vec![0u8; 256 * 1024];
+
+        let a_b = a.clone();
+        let stop1 = stop.clone();
+        let inf1 = inflight.clone();
+        let blaster = tokio::spawn(async move {
+            while !stop1.load(Ordering::Relaxed) {
+                if inf1.load(Ordering::Relaxed) < 8 && a_b.send(Channel::Bulk, &bulk).is_ok() {
+                    inf1.fetch_add(1, Ordering::Relaxed);
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        let b_b = b.clone();
+        let stop2 = stop.clone();
+        let inf2 = inflight.clone();
+        let drainer = tokio::spawn(async move {
+            while !stop2.load(Ordering::Relaxed) {
+                match b_b.try_recv(Channel::Bulk) {
+                    Ok(Some(_)) => {
+                        inf2.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    _ => tokio::task::yield_now().await,
+                }
+            }
+        });
+
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        let start = Instant::now();
+        for _ in 0..n {
+            a.send(Channel::Control, b"ping").unwrap();
+            loop {
+                match b.try_recv(Channel::Control) {
+                    Ok(Some(m)) => {
+                        b.send(Channel::Control, &m).unwrap();
+                        break;
+                    }
+                    Ok(None) => tokio::task::yield_now().await,
+                    Err(_) => panic!("peer closed"),
+                }
+            }
+            loop {
+                match a.try_recv(Channel::Control) {
+                    Ok(Some(_)) => break,
+                    Ok(None) => tokio::task::yield_now().await,
+                    Err(_) => panic!("peer closed"),
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        let _ = blaster.await;
+        let _ = drainer.await;
+        elapsed
+    }
+
+    #[tokio::test]
+    async fn quic_per_stream_isolates_control_from_bulk_under_loss() {
+        // The payoff of one stream per channel: under datagram loss, a `Bulk`
+        // flood's retransmissions must not stall `Control`. With per-channel
+        // streams Control rides its own stream (isolated); with a single shared
+        // stream one lost Bulk packet head-of-line-blocks Control behind it.
+        // On a clean link this difference is invisible — loss is what reveals
+        // it — so cross a 5%-loss relay and compare the two modes.
+        let n = 12;
+        let drop = 0.05;
+
+        let (ca, cb, _c1, _s1) = connected_lossy(false, drop).await; // per-channel
+        let multi = control_under_bulk(Arc::new(ca), Arc::new(cb), n).await;
+
+        let (sa, sb, _c2, _s2) = connected_lossy(true, drop).await; // single stream
+        let single = control_under_bulk(Arc::new(sa), Arc::new(sb), n).await;
+
+        // The measured gap is ~100x; assert a conservative 4x so the test is
+        // robust to scheduling/loss variance while still proving the isolation.
+        assert!(
+            single > multi * 4,
+            "per-channel streams should keep Control far more responsive than a \
+             single shared stream under loss; got multi={multi:?}, single={single:?}"
+        );
     }
 }

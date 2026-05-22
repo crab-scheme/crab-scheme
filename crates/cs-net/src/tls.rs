@@ -62,6 +62,26 @@ pub fn client_config(
 #[cfg(feature = "quic")]
 pub const QUIC_ALPN: &[u8] = b"crabscheme-cluster";
 
+/// Shared QUIC transport tuning for the cluster. Sizes flow-control windows so
+/// one channel's stream can't monopolize the connection-wide receive budget
+/// and starve another: quinn's `receive_window` caps bytes *across all streams*
+/// of a connection, and the docs note that keeping `stream_receive_window`
+/// smaller than it stops a single stream from monopolizing receive buffers
+/// "while still requiring data on other streams" — exactly the head-of-line
+/// case where a `Bulk` flood must not delay `Control`. `send_fairness`
+/// round-robins equal-priority streams (channel priority is set per-stream in
+/// [`crate::quic`]).
+#[cfg(feature = "quic")]
+fn quic_transport_config() -> Arc<quinn::TransportConfig> {
+    use quinn::VarInt;
+    let mut tc = quinn::TransportConfig::default();
+    tc.receive_window(VarInt::from_u32(16 * 1024 * 1024)); // 16 MiB, connection-wide
+    tc.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024)); // 2 MiB per stream
+    tc.send_window(16 * 1024 * 1024); // match the peer's receive window
+    tc.send_fairness(true);
+    Arc::new(tc)
+}
+
 /// quinn server config for the QUIC transport: the same mTLS as
 /// [`server_config`] (require + verify a client cert), wrapped for QUIC
 /// (TLS 1.3, cluster ALPN).
@@ -75,7 +95,9 @@ pub fn quic_server_config(
     rc.alpn_protocols = vec![QUIC_ALPN.to_vec()];
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(rc)
         .map_err(|e| TransportError::Tls(format!("quic server config: {e}")))?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(qsc)))
+    let mut sc = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+    sc.transport_config(quic_transport_config());
+    Ok(sc)
 }
 
 /// quinn client config for the QUIC transport (mTLS + cluster ALPN).
@@ -89,5 +111,7 @@ pub fn quic_client_config(
     cc.alpn_protocols = vec![QUIC_ALPN.to_vec()];
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(cc)
         .map_err(|e| TransportError::Tls(format!("quic client config: {e}")))?;
-    Ok(quinn::ClientConfig::new(Arc::new(qcc)))
+    let mut client = quinn::ClientConfig::new(Arc::new(qcc));
+    client.transport_config(quic_transport_config());
+    Ok(client)
 }

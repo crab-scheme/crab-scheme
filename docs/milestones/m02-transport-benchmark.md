@@ -70,24 +70,64 @@ per-channel streams are being defeated by two things:
    written. So channel "priorities" are advisory only — the same is true of
    the TCP transport (its 6–16× HoL factor has the same single-mpsc cause).
 
-## Recommended follow-ups (turn the design into the benefit)
+## The fix (implemented)
 
-All addressable with APIs already in our quinn version:
+Four changes in `crates/cs-net/src/{lib.rs,tls.rs}`:
 
-- **Size the windows** on `quinn::TransportConfig`: raise `receive_window`
-  (connection-wide) well above the bulk in-flight bytes, and keep
-  `stream_receive_window` per-stream smaller, so `Bulk` cannot monopolise the
-  connection budget and starve `Control`. This is the documented fix for #1
-  and almost certainly also recovers the 64 KiB throughput.
-- **Per-channel writer tasks** (or write straight from `send()` into a
-  per-stream buffer) so a blocked `Bulk` `write_all` cannot stall `Control`.
-  Fixes #2 for QUIC.
-- **Map our `Channel` priority onto QUIC** via `SendStream::set_priority`
-  (Control/Consensus high) and `TransportConfig::send_fairness`, so the wire
-  scheduler honours the priority the `Channel` enum already declares.
-- **TCP**: replace the single FIFO mpsc with per-channel queues drained in
-  priority order, so the TCP transport's advisory priorities become real.
+1. **Per-channel writer tasks (QUIC)** — each `Channel` gets its own task +
+   mpsc + `SendStream`, so a `Bulk` write blocked on flow control can't stall
+   `Control` (replaces the single-writer / single-mpsc serializer). Frames are
+   now self-describing (`[channel][len][payload]`), so one constructor knob
+   selects per-channel vs single-stream multiplexing.
+2. **Per-stream priority** — `SendStream::set_priority(Channel::priority())`
+   (Control=10 … Bulk=−10) + `TransportConfig::send_fairness`.
+3. **Flow-control windows** — `receive_window`=16 MiB (connection-wide),
+   `stream_receive_window`=2 MiB (per-stream), `send_window`=16 MiB, so one
+   channel can't monopolise the connection's receive budget.
+4. **TCP per-channel priority queues** — the writer drains the highest-priority
+   non-empty channel first instead of one FIFO mpsc. (Plus a real bug fix: the
+   batched TCP writer needs an explicit `flush()` for buffered `tokio_rustls`
+   records, else small request/reply frames can sit unsent.)
 
-These are perf/robustness refinements on top of the M02 substrate — the
-transport's behaviour is now *measured*, and the gap between "per-channel
-streams exist" and "per-channel isolation is delivered" is quantified.
+## On clean loopback the fix barely moves the number — and that's expected
+
+After the fix the table above is ~unchanged: QUIC HoL 49→~25–33×, TCP 6→~5×,
+and **throughput is unaffected by the 4× larger windows**. That last fact is
+the tell: **loopback is lossless**, and QUIC's per-stream design eliminates
+head-of-line blocking *for packet-loss recovery* — a dropped `Bulk` packet not
+stalling `Control`. With zero loss there is nothing to isolate; `Control` and
+`Bulk` simply contend for one connection's CPU/driver. (Sim stays at ~1.0× —
+its per-channel in-memory queues share no link at all.) This is precisely the
+KTH result: QUIC ≤ TCP in actor benchmarks *absent loss*.
+
+## Proof: under loss, per-stream isolation works
+
+Inject 5% datagram loss with `cs_net::quic::lossy_relay` (a tiny UDP relay
+that drops datagrams — the layer QUIC's loss recovery operates on) and compare
+the per-channel design against a single shared stream
+(`QuicTransport::from_connection_single_stream`, the TCP-like baseline) over
+the *same* lossy link:
+
+| QUIC over a 5%-loss link | ctrl RTT idle | ctrl RTT under bulk | **HoL factor** |
+|---|--:|--:|--:|
+| **per-channel streams (the fix)** | 1756 µs | 1888 µs | **1.08×** |
+| single shared stream (baseline) | 1120 µs | **215 179 µs** | **192×** |
+
+Under loss, per-channel streams hold `Control` at ~1.9 ms under a `Bulk` flood
+(**HoL 1.08×** — bulk's retransmissions don't touch control), while a single
+shared stream balloons to **215 ms** (HoL 192×): one lost bulk packet
+head-of-line-blocks the ordered stream control rides. That is **~110× lower
+control latency under loss** — exactly the isolation the per-stream design
+promises, invisible on clean loopback but decisive once packets drop.
+
+Locked in by the test `quic_per_stream_isolates_control_from_bulk_under_loss`
+(asserts the single-stream baseline is ≥4× slower under loss; the real gap is
+~100×), and reproduced by the example's "QUIC over a LOSSY link" section:
+
+```sh
+cargo run --release -p cs-net --example actor_bench --features quic
+```
+
+These changes sit on top of the M02 substrate — its design is unchanged; the
+gap between "per-channel streams exist" and "per-channel isolation is
+delivered" is now both closed and proven.
