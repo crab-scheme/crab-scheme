@@ -57,3 +57,37 @@ pub fn client_config(
         .with_client_auth_cert(cert_chain, key)
         .map_err(|e| TransportError::Tls(format!("client identity: {e}")))
 }
+
+/// The cluster's QUIC ALPN protocol id (QUIC mandates ALPN).
+#[cfg(feature = "quic")]
+pub const QUIC_ALPN: &[u8] = b"crabscheme-cluster";
+
+/// quinn server config for the QUIC transport: the same mTLS as
+/// [`server_config`] (require + verify a client cert), wrapped for QUIC
+/// (TLS 1.3, cluster ALPN).
+#[cfg(feature = "quic")]
+pub fn quic_server_config(
+    roots: RootCertStore,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<quinn::ServerConfig, TransportError> {
+    let mut rc = server_config(roots, cert_chain, key)?;
+    rc.alpn_protocols = vec![QUIC_ALPN.to_vec()];
+    let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(rc)
+        .map_err(|e| TransportError::Tls(format!("quic server config: {e}")))?;
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(qsc)))
+}
+
+/// quinn client config for the QUIC transport (mTLS + cluster ALPN).
+#[cfg(feature = "quic")]
+pub fn quic_client_config(
+    roots: RootCertStore,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<quinn::ClientConfig, TransportError> {
+    let mut cc = client_config(roots, cert_chain, key)?;
+    cc.alpn_protocols = vec![QUIC_ALPN.to_vec()];
+    let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(cc)
+        .map_err(|e| TransportError::Tls(format!("quic client config: {e}")))?;
+    Ok(quinn::ClientConfig::new(Arc::new(qcc)))
+}

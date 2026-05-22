@@ -20,8 +20,10 @@
 //!   I/O (M02.B), with **mTLS** via `connect_tls` / `accept_tls` ([`tls`],
 //!   M02.D): all `Channel` traffic is encrypted + both peers mutually
 //!   authenticated. The cs-distrib handshake protocol runs over it.
-//! - [`tls`] — rustls mTLS config builders (M02.D).
-//! - [`quic`] — placeholder (default-off; future).
+//! - [`tls`] — rustls mTLS config builders (M02.D), shared by TCP + QUIC.
+//! - [`quic`] — quinn QUIC transport (default-off feature): TLS 1.3 mandatory
+//!   (always encrypted + mutually authenticated) and **one QUIC stream per
+//!   channel**, so channels never head-of-line-block each other.
 
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -30,7 +32,7 @@ use std::fmt;
 use thiserror::Error;
 
 pub mod framing;
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub mod tls;
 
 /// A logical traffic class multiplexed over one transport connection.
@@ -548,15 +550,216 @@ pub mod tcp {
 
 #[cfg(feature = "quic")]
 pub mod quic {
-    //! QUIC transport via `quinn`. Multi-stream, no head-of-line
-    //! blocking, mTLS via TLS 1.3 baked in. Default-off until the
-    //! transport-selection plumbing is wired into cluster bootstrap.
+    //! QUIC transport via `quinn` (SDK M02, QUIC variant).
     //!
-    //! Not yet implemented — placeholder so the feature compiles.
+    //! mTLS (TLS 1.3) is mandatory in QUIC, so this transport is always
+    //! encrypted + mutually authenticated. Crucially, each logical
+    //! [`Channel`] gets its **own QUIC stream**, so a stalled `Bulk`
+    //! transfer can't head-of-line-block `Control` — the multiplexing the
+    //! single-stream TCP transport's framing can't provide.
+    //!
+    //! Like the TCP transport it bridges the sync [`Transport`] trait over
+    //! async: `send` queues to a writer task that owns one `SendStream` per
+    //! channel (each prefixed with its channel tag, then length-delimited
+    //! messages); an acceptor task takes incoming uni streams and fans their
+    //! messages onto per-channel inbound queues that `try_recv` drains.
 
-    #[derive(Debug)]
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use quinn::{Connection, Endpoint};
+    use tokio::sync::mpsc;
+
+    use super::{Channel, Transport, TransportConfig, TransportError};
+
+    type Inbound = Arc<[Mutex<VecDeque<Vec<u8>>>; Channel::ALL.len()]>;
+
+    /// A per-peer QUIC transport.
     pub struct QuicTransport {
-        pub peer: String,
+        peer_label: String,
+        outbound: mpsc::UnboundedSender<(Channel, Vec<u8>)>,
+        inbound: Inbound,
+        closed: Arc<AtomicBool>,
+        conn: Connection,
+        tasks: Vec<tokio::task::AbortHandle>,
+    }
+
+    impl std::fmt::Debug for QuicTransport {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("QuicTransport")
+                .field("peer", &self.peer_label)
+                .field("closed", &self.is_closed())
+                .finish()
+        }
+    }
+
+    impl QuicTransport {
+        /// Open a client QUIC connection to `addr` (verifying the server +
+        /// presenting our identity per the endpoint's client config), then
+        /// wrap it. `server_name` must match the server cert SAN.
+        pub async fn connect(
+            endpoint: &Endpoint,
+            client_config: quinn::ClientConfig,
+            addr: SocketAddr,
+            server_name: &str,
+            peer_label: impl Into<String>,
+            cfg: &TransportConfig,
+        ) -> Result<Self, TransportError> {
+            let conn = endpoint
+                .connect_with(client_config, addr, server_name)
+                .map_err(|e| TransportError::Tls(format!("quic connect: {e}")))?
+                .await
+                .map_err(|e| TransportError::Tls(format!("quic handshake: {e}")))?;
+            Ok(Self::from_connection(conn, peer_label, cfg))
+        }
+
+        /// Wrap an established QUIC connection (client or server side),
+        /// spawning the per-channel writer + the uni-stream acceptor.
+        pub fn from_connection(
+            conn: Connection,
+            peer_label: impl Into<String>,
+            cfg: &TransportConfig,
+        ) -> Self {
+            let peer_label = peer_label.into();
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(Channel, Vec<u8>)>();
+            let inbound: Inbound = Arc::new(std::array::from_fn(|_| Mutex::new(VecDeque::new())));
+            let closed = Arc::new(AtomicBool::new(false));
+            let max_frame = cfg.max_frame_bytes;
+
+            // Writer: one SendStream per channel, opened lazily.
+            let conn_w = conn.clone();
+            let closed_w = closed.clone();
+            let writer = tokio::spawn(async move {
+                let mut streams: [Option<quinn::SendStream>; Channel::ALL.len()] =
+                    std::array::from_fn(|_| None);
+                while let Some((ch, payload)) = out_rx.recv().await {
+                    let idx = ch as usize;
+                    if streams[idx].is_none() {
+                        match conn_w.open_uni().await {
+                            Ok(mut s) => {
+                                if s.write_all(&[ch as u8]).await.is_err() {
+                                    break;
+                                }
+                                streams[idx] = Some(s);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let s = streams[idx].as_mut().expect("stream open");
+                    let len = (payload.len() as u32).to_be_bytes();
+                    if s.write_all(&len).await.is_err() || s.write_all(&payload).await.is_err() {
+                        break;
+                    }
+                }
+                closed_w.store(true, Ordering::Release);
+            });
+
+            // Acceptor: take incoming uni streams; one reader per stream.
+            let conn_r = conn.clone();
+            let inbound_r = inbound.clone();
+            let closed_r = closed.clone();
+            let acceptor = tokio::spawn(async move {
+                loop {
+                    match conn_r.accept_uni().await {
+                        Ok(mut recv) => {
+                            let inb = inbound_r.clone();
+                            tokio::spawn(async move {
+                                let mut tag = [0u8; 1];
+                                if recv.read_exact(&mut tag).await.is_err() {
+                                    return;
+                                }
+                                let Some(ch) =
+                                    Channel::ALL.into_iter().find(|c| *c as u8 == tag[0])
+                                else {
+                                    return;
+                                };
+                                loop {
+                                    let mut lenb = [0u8; 4];
+                                    if recv.read_exact(&mut lenb).await.is_err() {
+                                        return; // stream finished / reset
+                                    }
+                                    let len = u32::from_be_bytes(lenb) as usize;
+                                    if len > max_frame {
+                                        return;
+                                    }
+                                    let mut payload = vec![0u8; len];
+                                    if recv.read_exact(&mut payload).await.is_err() {
+                                        return;
+                                    }
+                                    inb[ch as usize]
+                                        .lock()
+                                        .expect("quic inbound poisoned")
+                                        .push_back(payload);
+                                }
+                            });
+                        }
+                        Err(_) => break, // connection closed
+                    }
+                }
+                closed_r.store(true, Ordering::Release);
+            });
+
+            QuicTransport {
+                peer_label,
+                outbound: out_tx,
+                inbound,
+                closed,
+                conn,
+                tasks: vec![writer.abort_handle(), acceptor.abort_handle()],
+            }
+        }
+    }
+
+    impl Drop for QuicTransport {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::Release);
+            self.conn.close(0u32.into(), b"transport dropped");
+            for t in &self.tasks {
+                t.abort();
+            }
+        }
+    }
+
+    impl Transport for QuicTransport {
+        fn send(&self, channel: Channel, payload: &[u8]) -> Result<(), TransportError> {
+            if self.is_closed() {
+                return Err(TransportError::PeerClosed);
+            }
+            self.outbound
+                .send((channel, payload.to_vec()))
+                .map_err(|_| TransportError::PeerClosed)
+        }
+
+        fn try_recv(&self, channel: Channel) -> Result<Option<Vec<u8>>, TransportError> {
+            if let Some(frame) = self.inbound[channel as usize]
+                .lock()
+                .expect("quic inbound poisoned")
+                .pop_front()
+            {
+                return Ok(Some(frame));
+            }
+            if self.is_closed() {
+                Err(TransportError::PeerClosed)
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn peer_label(&self) -> &str {
+            &self.peer_label
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Acquire)
+        }
+
+        fn close(&self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::Release);
+            self.conn.close(0u32.into(), b"closed");
+            Ok(())
+        }
     }
 }
 
@@ -899,5 +1102,96 @@ mod mtls_tests {
             accept.await.unwrap().is_err(),
             "server must reject the certless client"
         );
+    }
+}
+
+#[cfg(all(test, feature = "quic"))]
+mod quic_tests {
+    use super::quic::QuicTransport;
+    use super::{tls, Channel, Transport, TransportConfig};
+    use quinn::Endpoint;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::RootCertStore;
+    use std::time::Duration;
+
+    fn identity() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        (
+            CertificateDer::from(ck.cert.der().to_vec()),
+            PrivateKeyDer::try_from(ck.key_pair.serialize_der()).unwrap(),
+        )
+    }
+
+    async fn recv(t: &QuicTransport, ch: Channel) -> Vec<u8> {
+        for _ in 0..400 {
+            if let Some(f) = t.try_recv(ch).unwrap() {
+                return f;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("frame not received");
+    }
+
+    /// Connected client+server transports. Returns the endpoints too — they
+    /// must outlive the connections (dropping a quinn Endpoint stops its
+    /// driver and closes its connections).
+    async fn connected() -> (QuicTransport, QuicTransport, Endpoint, Endpoint) {
+        tls::install_crypto_provider();
+        let (cert, key) = identity();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let scfg =
+            tls::quic_server_config(roots.clone(), vec![cert.clone()], key.clone_key()).unwrap();
+        let ccfg = tls::quic_client_config(roots, vec![cert.clone()], key).unwrap();
+
+        let server_ep = Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server_ep.local_addr().unwrap();
+        let accept_ep = server_ep.clone();
+        let accept = tokio::spawn(async move {
+            let conn = accept_ep.accept().await.unwrap().await.unwrap();
+            QuicTransport::from_connection(conn, "client@host", &TransportConfig::default())
+        });
+        let client_ep = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = QuicTransport::connect(
+            &client_ep,
+            ccfg,
+            addr,
+            "localhost",
+            "server@host",
+            &TransportConfig::default(),
+        )
+        .await
+        .unwrap();
+        let server = accept.await.unwrap();
+        (client, server, client_ep, server_ep)
+    }
+
+    #[tokio::test]
+    async fn quic_loopback_round_trip_encrypted() {
+        let (client, server, _cep, _sep) = connected().await;
+        // QUIC is always TLS 1.3 → this traffic is encrypted + mutually authd.
+        client.send(Channel::Messages, b"q-ping").unwrap();
+        assert_eq!(recv(&server, Channel::Messages).await, b"q-ping");
+        server.send(Channel::Control, b"q-pong").unwrap();
+        assert_eq!(recv(&client, Channel::Control).await, b"q-pong");
+        assert_eq!(server.peer_label(), "client@host");
+    }
+
+    #[tokio::test]
+    async fn quic_channels_use_independent_streams() {
+        // Each channel rides its own QUIC stream → no head-of-line blocking
+        // across channels. Send on Bulk + Control + Messages; all arrive on
+        // their own channel, FIFO within each.
+        let (client, server, _cep, _sep) = connected().await;
+        for i in 0u8..4 {
+            client.send(Channel::Bulk, &[i]).unwrap();
+        }
+        client.send(Channel::Control, b"ctl").unwrap();
+        client.send(Channel::Messages, b"msg").unwrap();
+        assert_eq!(recv(&server, Channel::Control).await, b"ctl");
+        assert_eq!(recv(&server, Channel::Messages).await, b"msg");
+        for i in 0u8..4 {
+            assert_eq!(recv(&server, Channel::Bulk).await, vec![i]);
+        }
     }
 }
