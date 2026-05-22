@@ -1032,6 +1032,7 @@ version = "1.0.0-rc6"
 dependencies = [
  "bytes",
  "quinn",
+ "rcgen",
  "rustls",
  "thiserror 1.0.69",
  "tokio",

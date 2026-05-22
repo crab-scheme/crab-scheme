@@ -52,3 +52,5 @@ optional = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "test-util", "time"] }
+# Self-signed certs for the mTLS loopback tests (M02.D).
+rcgen = "0.13"

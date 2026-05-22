@@ -17,9 +17,10 @@
 //! - [`framing`] — length-prefixed channel framing so a byte stream carries
 //!   all six channels (M02.C).
 //! - [`tcp`] — real tokio TCP transport bridging the sync trait over async
-//!   I/O (M02.B). mTLS wraps the stream before `TcpTransport::from_stream`;
-//!   that rustls cert wiring is the remaining iter-D socket task (the
-//!   handshake *protocol* it carries is in cs-distrib::handshake).
+//!   I/O (M02.B), with **mTLS** via `connect_tls` / `accept_tls` ([`tls`],
+//!   M02.D): all `Channel` traffic is encrypted + both peers mutually
+//!   authenticated. The cs-distrib handshake protocol runs over it.
+//! - [`tls`] — rustls mTLS config builders (M02.D).
 //! - [`quic`] — placeholder (default-off; future).
 
 #![deny(unsafe_code)]
@@ -29,6 +30,8 @@ use std::fmt;
 use thiserror::Error;
 
 pub mod framing;
+#[cfg(feature = "tcp")]
+pub mod tls;
 
 /// A logical traffic class multiplexed over one transport connection.
 ///
@@ -335,7 +338,7 @@ pub mod tcp {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
 
@@ -352,6 +355,9 @@ pub mod tcp {
         outbound: mpsc::UnboundedSender<(Channel, Vec<u8>)>,
         inbound: Inbound,
         closed: Arc<AtomicBool>,
+        /// Abort handles for the reader + writer tasks, fired on `Drop` so
+        /// the socket closes deterministically.
+        tasks: [tokio::task::AbortHandle; 2],
     }
 
     impl std::fmt::Debug for TcpTransport {
@@ -372,26 +378,32 @@ pub mod tcp {
             cfg: &TransportConfig,
         ) -> std::io::Result<Self> {
             let stream = TcpStream::connect(addr).await?;
+            let _ = stream.set_nodelay(true);
             Ok(Self::from_stream(stream, peer_label, cfg))
         }
 
-        /// Wrap an already-connected stream (e.g. from `TcpListener::accept`,
-        /// or a rustls-wrapped stream). Spawns reader + writer tasks.
-        pub fn from_stream(
-            stream: TcpStream,
+        /// Wrap an already-connected stream and spawn the reader + writer
+        /// tasks. Generic over the stream type so a plain `TcpStream` (from
+        /// `TcpListener::accept`) or a `tokio_rustls::TlsStream` (mTLS — see
+        /// [`super::tls`]) both work; the framing + handshake run unchanged
+        /// over either.
+        pub fn from_stream<S>(
+            stream: S,
             peer_label: impl Into<String>,
             cfg: &TransportConfig,
-        ) -> Self {
+        ) -> Self
+        where
+            S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        {
             let peer_label = peer_label.into();
-            let _ = stream.set_nodelay(true);
             let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(Channel, Vec<u8>)>();
             let inbound: Inbound = Arc::new(std::array::from_fn(|_| Mutex::new(VecDeque::new())));
             let closed = Arc::new(AtomicBool::new(false));
-            let (mut rd, mut wr) = stream.into_split();
+            let (mut rd, mut wr) = tokio::io::split(stream);
 
             // Writer: drain outbound, frame, write.
             let closed_w = closed.clone();
-            tokio::spawn(async move {
+            let writer = tokio::spawn(async move {
                 while let Some((ch, payload)) = out_rx.recv().await {
                     let mut frame = Vec::with_capacity(payload.len() + 8);
                     encode_frame(ch, &payload, &mut frame);
@@ -406,7 +418,7 @@ pub mod tcp {
             let inbound_r = inbound.clone();
             let closed_r = closed.clone();
             let max_frame = cfg.max_frame_bytes;
-            tokio::spawn(async move {
+            let reader = tokio::spawn(async move {
                 let mut decoder = FrameDecoder::new(max_frame);
                 let mut buf = vec![0u8; 64 * 1024];
                 'read: loop {
@@ -435,6 +447,61 @@ pub mod tcp {
                 outbound: out_tx,
                 inbound,
                 closed,
+                tasks: [writer.abort_handle(), reader.abort_handle()],
+            }
+        }
+
+        /// Connect to `addr` and perform a client-side **mTLS** handshake
+        /// (presenting our identity, verifying the server against
+        /// `client_config`'s roots), then wrap the encrypted stream.
+        /// `server_name` must match the server certificate's SAN.
+        /// Build `client_config` with [`crate::tls::client_config`].
+        pub async fn connect_tls(
+            addr: &str,
+            server_name: &str,
+            peer_label: impl Into<String>,
+            cfg: &TransportConfig,
+            client_config: std::sync::Arc<rustls::ClientConfig>,
+        ) -> Result<Self, TransportError> {
+            let tcp = TcpStream::connect(addr).await?;
+            let _ = tcp.set_nodelay(true);
+            let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())
+                .map_err(|e| TransportError::Tls(format!("invalid server name: {e}")))?;
+            let tls = tokio_rustls::TlsConnector::from(client_config)
+                .connect(domain, tcp)
+                .await
+                .map_err(|e| TransportError::Tls(format!("client handshake: {e}")))?;
+            Ok(Self::from_stream(tls, peer_label, cfg))
+        }
+
+        /// Accept an mTLS handshake on an already-accepted `tcp` stream
+        /// (server side — requires + verifies the client certificate per
+        /// `server_config`), then wrap the encrypted stream. Build
+        /// `server_config` with [`crate::tls::server_config`].
+        pub async fn accept_tls(
+            tcp: TcpStream,
+            peer_label: impl Into<String>,
+            cfg: &TransportConfig,
+            server_config: std::sync::Arc<rustls::ServerConfig>,
+        ) -> Result<Self, TransportError> {
+            let _ = tcp.set_nodelay(true);
+            let tls = tokio_rustls::TlsAcceptor::from(server_config)
+                .accept(tcp)
+                .await
+                .map_err(|e| TransportError::Tls(format!("server handshake: {e}")))?;
+            Ok(Self::from_stream(tls, peer_label, cfg))
+        }
+    }
+
+    impl Drop for TcpTransport {
+        fn drop(&mut self) {
+            // Mark closed + abort the I/O tasks so both stream halves drop
+            // and the socket actually closes (tokio::io::split keeps the
+            // stream alive until both halves are gone — the peer must see
+            // EOF when this transport is dropped).
+            self.closed.store(true, Ordering::Release);
+            for t in &self.tasks {
+                t.abort();
             }
         }
     }
@@ -718,5 +785,119 @@ mod tcp_transport_tests {
             server.send(Channel::Messages, b"x"),
             Err(super::TransportError::PeerClosed)
         ));
+    }
+}
+
+#[cfg(all(test, feature = "tcp"))]
+mod mtls_tests {
+    use super::tcp::TcpTransport;
+    use super::{tls, Channel, Transport, TransportConfig};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::RootCertStore;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    /// One self-signed identity for `localhost`, used (in the tests) as both
+    /// the node identity *and* the trusted root on both ends.
+    fn identity() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = CertificateDer::from(ck.cert.der().to_vec());
+        let key = PrivateKeyDer::try_from(ck.key_pair.serialize_der()).unwrap();
+        (cert, key)
+    }
+
+    fn roots_with(cert: &CertificateDer<'static>) -> RootCertStore {
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        roots
+    }
+
+    async fn recv(t: &TcpTransport, ch: Channel) -> Vec<u8> {
+        for _ in 0..200 {
+            if let Some(f) = t.try_recv(ch).unwrap() {
+                return f;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("frame not received");
+    }
+
+    #[tokio::test]
+    async fn mtls_loopback_round_trip_encrypted() {
+        tls::install_crypto_provider();
+        let (cert, key) = identity();
+        let roots = roots_with(&cert);
+        let server_cfg = Arc::new(
+            tls::server_config(roots.clone(), vec![cert.clone()], key.clone_key()).unwrap(),
+        );
+        let client_cfg = Arc::new(tls::client_config(roots, vec![cert.clone()], key).unwrap());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            TcpTransport::accept_tls(tcp, "client@host", &TransportConfig::default(), server_cfg)
+                .await
+                .unwrap()
+        });
+        let client = TcpTransport::connect_tls(
+            &addr.to_string(),
+            "localhost",
+            "server@host",
+            &TransportConfig::default(),
+            client_cfg,
+        )
+        .await
+        .unwrap();
+        let server = accept.await.unwrap();
+
+        // Encrypted application traffic round-trips both ways.
+        client.send(Channel::Messages, b"secret-ping").unwrap();
+        assert_eq!(recv(&server, Channel::Messages).await, b"secret-ping");
+        server.send(Channel::Control, b"secret-pong").unwrap();
+        assert_eq!(recv(&client, Channel::Control).await, b"secret-pong");
+    }
+
+    #[tokio::test]
+    async fn mtls_rejects_client_without_certificate() {
+        tls::install_crypto_provider();
+        let (cert, key) = identity();
+        let roots = roots_with(&cert);
+        let server_cfg =
+            Arc::new(tls::server_config(roots.clone(), vec![cert.clone()], key).unwrap());
+        // Client that presents NO certificate — mutual auth must reject it.
+        let client_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            TcpTransport::accept_tls(tcp, "client@host", &TransportConfig::default(), server_cfg)
+                .await
+        });
+        let client_res = TcpTransport::connect_tls(
+            &addr.to_string(),
+            "localhost",
+            "server@host",
+            &TransportConfig::default(),
+            client_cfg,
+        )
+        .await;
+
+        // The server is the authoritative side: mutual auth must reject the
+        // certless client. In TLS 1.3 the client may consider its own
+        // handshake done before the server validates the client cert, so
+        // `client_res` can be Ok — but the session is refused server-side
+        // and is unusable.
+        let _ = client_res;
+        assert!(
+            accept.await.unwrap().is_err(),
+            "server must reject the certless client"
+        );
     }
 }
