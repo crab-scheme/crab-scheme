@@ -8,20 +8,19 @@
 //! Spec: `docs/research/sdk_spec/distributed.md` § M02; task list at
 //! `docs/research/sdk_spec/tasks/M02-cluster-substrate.md`.
 //!
-//! ## Status
+//! ## Status (M02)
 //!
-//! **Scaffold only.** Public types + trait shapes exist; concrete
-//! implementations are deferred to follow-up iters as part of M02:
-//!
-//! - iter B: `Transport::Sim` (deterministic, no syscalls — for tests).
-//! - iter B: `Transport::Tcp` (no TLS yet — bootstrap path).
-//! - iter C: logical-channel framing + per-channel watermarks.
-//! - iter D: rustls mTLS handshake.
-//! - iter E: `RemoteActorRef` integration with cs-distrib.
-//!
-//! This scaffold exists so the workspace builds with the new crate
-//! boundary locked in, mirroring the cs-actor / cs-table /
-//! cs-supervisor scaffolds that preceded the BEAM v1 milestones.
+//! - [`Channel`] + [`Transport`] trait + [`TransportConfig`] — the layer's
+//!   shape.
+//! - [`sim`] — deterministic in-memory transport (no syscalls / runtime),
+//!   the test substrate (M02.B).
+//! - [`framing`] — length-prefixed channel framing so a byte stream carries
+//!   all six channels (M02.C).
+//! - [`tcp`] — real tokio TCP transport bridging the sync trait over async
+//!   I/O (M02.B). mTLS wraps the stream before `TcpTransport::from_stream`;
+//!   that rustls cert wiring is the remaining iter-D socket task (the
+//!   handshake *protocol* it carries is in cs-distrib::handshake).
+//! - [`quic`] — placeholder (default-off; future).
 
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -316,21 +315,166 @@ pub mod sim {
 
 #[cfg(feature = "tcp")]
 pub mod tcp {
-    //! TCP + (optional) rustls TLS transport. Production default.
+    //! TCP transport. Production cross-process default.
     //!
-    //! mTLS is added in M02 iter D via the cs-distrib handshake.
+    //! Bridges the synchronous [`Transport`] trait over an async tokio
+    //! `TcpStream`: a writer task drains an outbound queue, frames each
+    //! message ([`crate::framing`]) and writes it; a reader task reassembles
+    //! frames and pushes them onto per-channel inbound queues that
+    //! `try_recv` drains. So `send` / `try_recv` stay non-blocking and
+    //! runtime-agnostic for callers (the router), while the socket I/O runs
+    //! on the tokio runtime the cluster already uses.
     //!
-    //! Not yet implemented — placeholder so the feature compiles.
+    //! mTLS (rustls) wraps the `TcpStream` before [`TcpTransport::from_stream`]
+    //! — the [`crate::framing`] + cs-distrib handshake then run unchanged
+    //! over the encrypted stream. That cert wiring is the remaining iter-D
+    //! socket task; the protocol it carries is implemented + tested in
+    //! cs-distrib::handshake.
 
-    /// A stub TCP transport handle. Implementation deferred to M02 iter B.
-    #[derive(Debug)]
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::sync::mpsc;
+
+    use super::framing::{encode_frame, FrameDecoder};
+    use super::{Channel, Transport, TransportConfig, TransportError};
+
+    type Inbound = Arc<[Mutex<VecDeque<Vec<u8>>>; Channel::ALL.len()]>;
+
+    /// A per-peer TCP transport. Construct with [`Self::connect`] (client)
+    /// or [`Self::from_stream`] (an accepted stream); both spawn the I/O
+    /// pump on the current tokio runtime.
     pub struct TcpTransport {
-        pub peer: String,
+        peer_label: String,
+        outbound: mpsc::UnboundedSender<(Channel, Vec<u8>)>,
+        inbound: Inbound,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl std::fmt::Debug for TcpTransport {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TcpTransport")
+                .field("peer", &self.peer_label)
+                .field("closed", &self.is_closed())
+                .finish()
+        }
     }
 
     impl TcpTransport {
-        pub fn new(peer: impl Into<String>) -> Self {
-            TcpTransport { peer: peer.into() }
+        /// Open a client connection to `addr` (a `host:port`), labelling the
+        /// peer `peer_label` (`name@host`).
+        pub async fn connect(
+            addr: &str,
+            peer_label: impl Into<String>,
+            cfg: &TransportConfig,
+        ) -> std::io::Result<Self> {
+            let stream = TcpStream::connect(addr).await?;
+            Ok(Self::from_stream(stream, peer_label, cfg))
+        }
+
+        /// Wrap an already-connected stream (e.g. from `TcpListener::accept`,
+        /// or a rustls-wrapped stream). Spawns reader + writer tasks.
+        pub fn from_stream(
+            stream: TcpStream,
+            peer_label: impl Into<String>,
+            cfg: &TransportConfig,
+        ) -> Self {
+            let peer_label = peer_label.into();
+            let _ = stream.set_nodelay(true);
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(Channel, Vec<u8>)>();
+            let inbound: Inbound = Arc::new(std::array::from_fn(|_| Mutex::new(VecDeque::new())));
+            let closed = Arc::new(AtomicBool::new(false));
+            let (mut rd, mut wr) = stream.into_split();
+
+            // Writer: drain outbound, frame, write.
+            let closed_w = closed.clone();
+            tokio::spawn(async move {
+                while let Some((ch, payload)) = out_rx.recv().await {
+                    let mut frame = Vec::with_capacity(payload.len() + 8);
+                    encode_frame(ch, &payload, &mut frame);
+                    if wr.write_all(&frame).await.is_err() {
+                        break;
+                    }
+                }
+                closed_w.store(true, Ordering::Release);
+            });
+
+            // Reader: read, reassemble frames, fan out per channel.
+            let inbound_r = inbound.clone();
+            let closed_r = closed.clone();
+            let max_frame = cfg.max_frame_bytes;
+            tokio::spawn(async move {
+                let mut decoder = FrameDecoder::new(max_frame);
+                let mut buf = vec![0u8; 64 * 1024];
+                'read: loop {
+                    match rd.read(&mut buf).await {
+                        Ok(0) | Err(_) => break, // EOF or socket error
+                        Ok(n) => {
+                            decoder.push(&buf[..n]);
+                            loop {
+                                match decoder.next_frame() {
+                                    Ok(Some((ch, payload))) => inbound_r[ch as usize]
+                                        .lock()
+                                        .expect("tcp inbound poisoned")
+                                        .push_back(payload),
+                                    Ok(None) => break,
+                                    Err(_) => break 'read, // malformed framing → drop
+                                }
+                            }
+                        }
+                    }
+                }
+                closed_r.store(true, Ordering::Release);
+            });
+
+            TcpTransport {
+                peer_label,
+                outbound: out_tx,
+                inbound,
+                closed,
+            }
+        }
+    }
+
+    impl Transport for TcpTransport {
+        fn send(&self, channel: Channel, payload: &[u8]) -> Result<(), TransportError> {
+            if self.is_closed() {
+                return Err(TransportError::PeerClosed);
+            }
+            self.outbound
+                .send((channel, payload.to_vec()))
+                .map_err(|_| TransportError::PeerClosed)
+        }
+
+        fn try_recv(&self, channel: Channel) -> Result<Option<Vec<u8>>, TransportError> {
+            if let Some(frame) = self.inbound[channel as usize]
+                .lock()
+                .expect("tcp inbound poisoned")
+                .pop_front()
+            {
+                return Ok(Some(frame));
+            }
+            if self.is_closed() {
+                Err(TransportError::PeerClosed)
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn peer_label(&self) -> &str {
+            &self.peer_label
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Acquire)
+        }
+
+        fn close(&self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::Release);
+            Ok(())
         }
     }
 }
@@ -495,5 +639,84 @@ mod tests {
                 Err(TransportError::PeerClosed)
             ));
         }
+    }
+}
+
+#[cfg(all(test, feature = "tcp"))]
+mod tcp_transport_tests {
+    use super::tcp::TcpTransport;
+    use super::{Channel, Transport, TransportConfig};
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    /// `try_recv` is non-blocking but TCP delivery is driven by the reader
+    /// task — poll with a short backoff until the frame arrives.
+    async fn recv(t: &TcpTransport, ch: Channel) -> Vec<u8> {
+        for _ in 0..200 {
+            if let Some(f) = t.try_recv(ch).unwrap() {
+                return f;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("frame not received within timeout");
+    }
+
+    async fn connected_pair() -> (TcpTransport, TcpTransport) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            TcpTransport::from_stream(stream, "client@host", &TransportConfig::default())
+        });
+        let client = TcpTransport::connect(
+            &addr.to_string(),
+            "server@host",
+            &TransportConfig::default(),
+        )
+        .await
+        .unwrap();
+        let server = accept.await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn loopback_round_trip_bidirectional_and_ordered() {
+        let (client, server) = connected_pair().await;
+        // client → server.
+        client.send(Channel::Messages, b"ping").unwrap();
+        assert_eq!(recv(&server, Channel::Messages).await, b"ping");
+        // server → client.
+        server.send(Channel::Control, b"pong").unwrap();
+        assert_eq!(recv(&client, Channel::Control).await, b"pong");
+        // FIFO within a channel, and channel isolation (Bulk vs Messages).
+        for i in 0u8..8 {
+            client.send(Channel::Bulk, &[i]).unwrap();
+        }
+        client.send(Channel::Messages, b"after-bulk").unwrap();
+        for i in 0u8..8 {
+            assert_eq!(recv(&server, Channel::Bulk).await, vec![i]);
+        }
+        assert_eq!(recv(&server, Channel::Messages).await, b"after-bulk");
+        assert_eq!(server.peer_label(), "client@host");
+        assert_eq!(client.peer_label(), "server@host");
+    }
+
+    #[tokio::test]
+    async fn dropping_peer_is_observed_as_closed() {
+        let (client, server) = connected_pair().await;
+        // Drop the client → its writer task ends, write half closes, the
+        // server's reader hits EOF and marks the connection closed.
+        drop(client);
+        for _ in 0..200 {
+            if server.is_closed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(server.is_closed(), "server must observe the client drop");
+        assert!(matches!(
+            server.send(Channel::Messages, b"x"),
+            Err(super::TransportError::PeerClosed)
+        ));
     }
 }
