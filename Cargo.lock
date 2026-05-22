@@ -740,6 +740,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cranelift-object"
+version = "0.131.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f6cfa3a6ed5cc9a616cd5ef5dd4d26f683175737b1541679214da7ca12c2b43"
+dependencies = [
+ "anyhow",
+ "cranelift-codegen 0.131.1",
+ "cranelift-control 0.131.1",
+ "cranelift-module",
+ "log",
+ "object 0.39.1",
+ "target-lexicon",
+]
+
+[[package]]
 name = "cranelift-srcgen"
 version = "0.123.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -778,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "cs-actor"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-table",
  "cs-vm",
@@ -803,8 +818,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "cs-channel"
+name = "cs-aot-rt"
 version = "0.0.1"
+dependencies = [
+ "cs-runtime",
+ "cs-vm",
+]
+
+[[package]]
+name = "cs-channel"
+version = "1.0.0-rc6"
 dependencies = [
  "dashmap 6.2.1",
  "futures-util",
@@ -814,13 +837,14 @@ dependencies = [
 
 [[package]]
 name = "cs-cli"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "clap",
  "cs-aot",
  "cs-core",
  "cs-diag",
  "cs-expand",
+ "cs-jit-cranelift",
  "cs-parse",
  "cs-rir",
  "cs-runtime",
@@ -841,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "cs-core"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-diag",
  "cs-gc",
@@ -852,11 +876,11 @@ dependencies = [
 
 [[package]]
 name = "cs-diag"
-version = "0.0.1"
+version = "1.0.0-rc6"
 
 [[package]]
 name = "cs-discovery"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "async-trait",
  "thiserror 1.0.69",
@@ -865,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "cs-distrib"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-net",
  "thiserror 1.0.69",
@@ -875,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "cs-expand"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -927,14 +951,14 @@ dependencies = [
 
 [[package]]
 name = "cs-gc"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "bumpalo",
 ]
 
 [[package]]
 name = "cs-hotreload"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "dashmap 6.2.1",
  "rustc-hash",
@@ -943,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "cs-ir"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -966,6 +990,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native 0.131.1",
+ "cranelift-object",
  "cs-core",
  "cs-diag",
  "cs-jit",
@@ -975,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "cs-lex"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -985,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "cs-lsp"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "clap",
  "cs-core",
@@ -1003,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "cs-net"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "bytes",
  "quinn",
@@ -1017,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "cs-opt"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-rir",
@@ -1025,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "cs-opt-example"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-opt",
@@ -1034,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "cs-parse"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -1043,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "cs-pkg"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -1060,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "cs-runtime"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-actor",
  "cs-channel",
@@ -1120,7 +1145,7 @@ dependencies = [
 
 [[package]]
 name = "cs-sandbox-wasm"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "wasmtime",
  "wasmtime-wasi",
@@ -1128,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-archive"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1139,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-base"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "base64",
  "cs-core",
@@ -1149,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-collection"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1157,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-compress"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1167,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-csv"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1176,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-deflate"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1185,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-format"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1193,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-fs"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1201,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-hash"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "blake3",
  "cs-core",
@@ -1214,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-http"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1224,7 +1249,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-json"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1233,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-log"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1241,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-math"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1250,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-meta"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1286,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-metrics"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1294,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-net"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1302,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-os"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1311,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-path"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1319,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-process"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1328,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-random"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1337,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-regex"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1346,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-signal"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1355,7 +1380,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-string"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1363,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-time"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "chrono",
  "cs-core",
@@ -1372,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-toml"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1381,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-tty"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1390,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-url"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1400,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-uuid"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1409,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-websocket"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1418,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "cs-table"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "dashmap 6.2.1",
  "thiserror 1.0.69",
@@ -1426,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "cs-typer"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -1440,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "cs-vm"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -1456,7 +1481,7 @@ dependencies = [
 
 [[package]]
 name = "cs-web"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1482,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "cs-web-mod-example"
-version = "0.0.1"
+version = "1.0.0-rc6"
 dependencies = [
  "cs-web",
 ]
@@ -1961,6 +1986,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -2547,6 +2575,18 @@ checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
  "crc32fast",
  "hashbrown 0.15.5",
+ "indexmap",
+ "memchr",
+]
+
+[[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "crc32fast",
+ "hashbrown 0.17.1",
  "indexmap",
  "memchr",
 ]
@@ -4069,7 +4109,7 @@ dependencies = [
  "log",
  "mach2",
  "memfd",
- "object",
+ "object 0.37.3",
  "once_cell",
  "postcard",
  "pulley-interpreter",
@@ -4109,7 +4149,7 @@ dependencies = [
  "gimli 0.32.3",
  "indexmap",
  "log",
- "object",
+ "object 0.37.3",
  "postcard",
  "semver",
  "serde",
@@ -4178,7 +4218,7 @@ dependencies = [
  "gimli 0.32.3",
  "itertools",
  "log",
- "object",
+ "object 0.37.3",
  "pulley-interpreter",
  "smallvec",
  "target-lexicon",
@@ -4264,7 +4304,7 @@ dependencies = [
  "cfg-if",
  "cranelift-codegen 0.123.9",
  "log",
- "object",
+ "object 0.37.3",
 ]
 
 [[package]]
@@ -4287,7 +4327,7 @@ dependencies = [
  "anyhow",
  "cranelift-codegen 0.123.9",
  "gimli 0.32.3",
- "object",
+ "object 0.37.3",
  "target-lexicon",
  "wasmparser 0.236.1",
  "wasmtime-environ",

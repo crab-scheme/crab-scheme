@@ -1,0 +1,21 @@
+[package]
+name = "cs-aot-rt"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+description = "AOT level-3 runtime archive. Built as a `staticlib` (libcs_aot_rt.a) and bundled per-target in the release tarball: it contains cs-vm's `vm_*_nb` helper symbols + cs-runtime's generic-dispatch entry points + a few C-ABI boundary shims. The cranelift-object backend (AOT L3) emits a `.o` that references these symbols; the system `cc` links the `.o` + a generated C `main` against this archive to produce a native binary with NO Rust toolchain at AOT time (the L1 cargo+rustc path is used when a toolchain IS present)."
+
+[lib]
+# `staticlib` produces the linkable `libcs_aot_rt.a`; `rlib` keeps the
+# crate testable with `cargo test -p cs-aot-rt`.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# The object backend's `.o` references cs-vm's `vm_*_nb` helpers and
+# cs-runtime's `aot_call_builtin` / `aot_format_result`; both are linked
+# (transitively) into the archive. Workspace deps inherit the same feature
+# set the rest of the build uses (regions on, stdlib via cs-runtime default
+# features being off — see workspace Cargo.toml).
+cs-vm = { workspace = true }
+cs-runtime = { workspace = true }

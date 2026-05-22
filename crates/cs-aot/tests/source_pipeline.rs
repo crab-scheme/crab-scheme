@@ -32,9 +32,7 @@ use cs_expand::Expander;
 use cs_parse::read_all;
 use cs_vm::compile_with_globals_and_primops;
 use cs_vm::compiler::PrimOp;
-use cs_vm::jit_translate::{
-    bytecode_to_rir_aot, bytecode_to_rir_aot_with_globals, bytecode_to_rir_aot_with_param_types,
-};
+use cs_vm::jit_translate::{bytecode_to_rir_aot, bytecode_to_rir_aot_with_param_types};
 
 /// Mirrors cs_runtime's private primop_table. The compiler uses
 /// this to emit AddFx2/SubFx2/etc. specialized opcodes instead of

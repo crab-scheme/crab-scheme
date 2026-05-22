@@ -82,6 +82,14 @@ pub enum Const {
     /// Static-string-table index. The JIT loads via a `static`-table
     /// indirection so we don't bake string content into native code.
     StringRef(u32),
+    /// An inline string literal. Used by the **AOT** backend, where
+    /// baking the content into the emitted Rust source (as a `&str`
+    /// literal that materializes a heap string at runtime) is exactly
+    /// what we want — there's no native-code-size concern the way there
+    /// is for the JIT. The cranelift JIT declines functions carrying
+    /// this const (they stay on the VM tier), so it's AOT-only in
+    /// practice.
+    String(String),
 }
 
 /// One RIR instruction. Each variant cites the equivalent `cs-vm`
@@ -281,6 +289,17 @@ pub enum Inst {
     /// (load-compare-call into a per-call-site cache) lands later;
     /// today every CallGeneral takes the slow path unconditionally.
     CallGeneral(Value, Value, Vec<Value>),
+
+    /// `dst = call_builtin(name, args…)`. Calls a runtime stdlib builtin
+    /// **by name** that the translator can't open-code to a dedicated inst
+    /// (e.g. `display`, `string-append`, `assoc`). **AOT-only**: cs-aot
+    /// lowers it to `cs_runtime::aot_call_builtin("name", &[args…])`,
+    /// which dispatches through the builtin env embedded in the AOT'd
+    /// binary. The cranelift JIT declines any function carrying it (the
+    /// JIT has no runtime-env dispatch — the function stays on the VM
+    /// tier). Name (not sym id) because the AOT binary's runtime interns
+    /// symbols independently.
+    CallBuiltin(Value, String, Vec<Value>),
 
     /// `dst = env_lookup(sym)`. Look up a free variable by symbol id
     /// in the closure's captured environment. cs-vm: `Inst::LoadVar`

@@ -828,6 +828,34 @@ fn value_to_gc_i64(v: Value) -> i64 {
     NanboxValue::from_value(v).into_raw()
 }
 
+/// AOT helper: materialize an inline string literal as an NB-encoded heap
+/// string. The cs-aot backend emits `cs_vm::vm::vm_string_const_nb("…")`
+/// for `Const::String`; the returned i64 is the `NanboxValue` raw carrier
+/// of a fresh `Value::String`, owned by the caller (the same
+/// single-consumer Any-lane contract as the other NB producers). Strings
+/// are the first heap constant the AOT pipeline materializes — see
+/// `cs_aot`'s `Const::String` lowering.
+pub fn vm_string_const_nb(s: &str) -> i64 {
+    NanboxValue::from_value(Value::string(s.to_string())).into_raw()
+}
+
+/// AOT helper: borrow-decode an NB carrier `raw` into an owned `Value`
+/// WITHOUT consuming the caller's reference (increfs heap payloads first,
+/// then decodes the +1). Used by `cs_runtime::aot_call_builtin` to turn NB
+/// call args into the `Value`s the runtime dispatch expects — the AOT'd
+/// caller keeps owning its carriers, so this is safe to call on a value
+/// the caller still uses afterward. Mirrors `VmStack::at_as_value`.
+pub fn vm_nb_borrow_to_value(raw: i64) -> Value {
+    unsafe { NanboxValue(vm_value_clone_gc(raw)).to_value() }
+}
+
+/// AOT helper: encode an owned `Value` into its NB carrier i64 (the
+/// inverse of [`vm_nb_borrow_to_value`]). Ownership of any heap payload
+/// transfers into the returned carrier.
+pub fn vm_value_to_nb(v: Value) -> i64 {
+    NanboxValue::from_value(v).into_raw()
+}
+
 /// Decode an Any-lane i64. For an inline tagged immediate, returns
 /// the corresponding `Value` directly (no refcount work). For a
 /// `Gc<Value>` raw handle, consumes one strong count (`Rc::from_raw`

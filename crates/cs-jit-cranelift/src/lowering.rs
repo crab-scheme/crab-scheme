@@ -45,6 +45,7 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
+use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use cs_jit::JitError;
 #[cfg(test)]
@@ -53,17 +54,31 @@ use cs_rir::{Const, Function as RirFunction, Inst, Term, Value as RirValue};
 
 use crate::ic::IcTable;
 
-/// Owns a Cranelift `JITModule` and emits one native function per
-/// `compile_uniform_nb` call.
+/// Owns a Cranelift [`Module`] and emits one native function per
+/// `compile_uniform_nb` / `define_uniform_nb` call.
 ///
-/// One module per backend instance is fine for iter 2 (we never
-/// re-define the same function); iter 3 may want a per-module
-/// finalize pattern for tier-up.
-pub struct Lowerer {
-    module: JITModule,
+/// Generic over the module backend (AOT L3): `Lowerer<JITModule>` (the
+/// default) finalizes in-process and hands back a native pointer for
+/// tier-up; `Lowerer<ObjectModule>` defines the same functions into a
+/// relocatable object the system `cc` links ahead-of-time. The per-Inst
+/// lowering is identical — it only uses `Module`-trait methods — so both
+/// share `finish_construction` / `define_uniform_nb` and every helper
+/// below; the JIT- and object-specific bits live in the two narrow
+/// `impl Lowerer<JITModule>` / `impl Lowerer<ObjectModule>` blocks.
+///
+/// One module per backend instance is fine (we never re-define the same
+/// function).
+pub struct Lowerer<M: Module = JITModule> {
+    module: M,
     ctx: Context,
     func_ctx: FunctionBuilderContext,
     next_id: u64,
+    /// AOT L3 — when `Some(name)`, the next `define_uniform_nb` declares its
+    /// outer NB trampoline with `Linkage::Export` under `name` (a clean,
+    /// C-callable symbol) so the system linker + generated `main` can reach
+    /// it. `None` (JIT default) keeps the legacy `Linkage::Local`
+    /// auto-generated name. Set via [`Lowerer::set_entry_export`].
+    export_outer_as: Option<String>,
     /// FuncId of the imported `vm_env_lookup_any` helper.
     /// `Inst::EnvLookupAny` lowers to a Cranelift call against
     /// this. Used by iter BU's translator when a free-var load
@@ -777,7 +792,12 @@ pub struct Lowerer {
     ic_table: IcTable,
 }
 
-impl Lowerer {
+/// AOT **level 3** lowerer: `Lowerer` specialized to emit a relocatable
+/// object instead of in-process JIT code. Lets downstream crates name the
+/// object backend without depending on `cranelift-object` directly.
+pub type ObjectLowerer = Lowerer<ObjectModule>;
+
+impl Lowerer<JITModule> {
     /// Build a fresh lowerer, using the host ISA.
     pub fn new() -> Result<Self, JitError> {
         let mut flag_builder = settings::builder();
@@ -830,22 +850,25 @@ impl Lowerer {
         // resolved function address changes. The Box-flavored helpers
         // (vm_alloc_pair etc.) remain defined in cs-vm but become
         // unreachable from JIT'd code after this commit.
-        builder.symbol("vm_alloc_pair", cs_vm::vm::vm_alloc_pair_gc as *const u8);
+        builder.symbol("vm_alloc_pair_gc", cs_vm::vm::vm_alloc_pair_gc as *const u8);
         // Layer 3 — Inst::ConsRegion calls this region-allocating
         // counterpart. The runtime helper resolves the current region
         // via the cs-runtime resolver hook; falls back to Rc
         // allocation if no region is in scope.
         #[cfg(feature = "regions")]
         builder.symbol(
-            "vm_alloc_pair_region",
+            "vm_alloc_pair_region_gc",
             cs_vm::vm::vm_alloc_pair_region_gc as *const u8,
         );
-        builder.symbol("vm_pair_car", cs_vm::vm::vm_pair_car_gc as *const u8);
-        builder.symbol("vm_pair_cdr", cs_vm::vm::vm_pair_cdr_gc as *const u8);
-        builder.symbol("vm_pair_p", cs_vm::vm::vm_pair_p_gc as *const u8);
-        builder.symbol("vm_null_p", cs_vm::vm::vm_null_p_gc as *const u8);
-        builder.symbol("vm_value_clone", cs_vm::vm::vm_value_clone_gc as *const u8);
-        builder.symbol("vm_value_drop", cs_vm::vm::vm_value_drop_gc as *const u8);
+        builder.symbol("vm_pair_car_gc", cs_vm::vm::vm_pair_car_gc as *const u8);
+        builder.symbol("vm_pair_cdr_gc", cs_vm::vm::vm_pair_cdr_gc as *const u8);
+        builder.symbol("vm_pair_p_gc", cs_vm::vm::vm_pair_p_gc as *const u8);
+        builder.symbol("vm_null_p_gc", cs_vm::vm::vm_null_p_gc as *const u8);
+        builder.symbol(
+            "vm_value_clone_gc",
+            cs_vm::vm::vm_value_clone_gc as *const u8,
+        );
+        builder.symbol("vm_value_drop_gc", cs_vm::vm::vm_value_drop_gc as *const u8);
         // Stage 3 baseline-JIT NB-typed arithmetic helpers (iter 3.0).
         builder.symbol("vm_value_add_nb", cs_vm::vm::vm_value_add_nb as *const u8);
         builder.symbol("vm_value_sub_nb", cs_vm::vm::vm_value_sub_nb as *const u8);
@@ -859,7 +882,7 @@ impl Lowerer {
         builder.symbol("vm_value_le_nb", cs_vm::vm::vm_value_le_nb as *const u8);
         builder.symbol("vm_value_gt_nb", cs_vm::vm::vm_value_gt_nb as *const u8);
         builder.symbol("vm_value_ge_nb", cs_vm::vm::vm_value_ge_nb as *const u8);
-        builder.symbol("vm_eq_any", cs_vm::vm::vm_eq_any_gc as *const u8);
+        builder.symbol("vm_eq_any_gc", cs_vm::vm::vm_eq_any_gc as *const u8);
         // ADR 0012 D-2 (iter DZ) — equal? deep structural equality.
         builder.symbol("vm_equal_gc", cs_vm::vm::vm_equal_gc as *const u8);
         // ADR 0012 D-1 (iter BU) — slow-path general Call. Lowered
@@ -1758,8 +1781,95 @@ impl Lowerer {
             "vm_string_to_symbol_gc",
             cs_vm::vm::vm_string_to_symbol_gc as *const u8,
         );
-        let mut module = JITModule::new(builder);
+        // `finish_construction` takes ownership and does the mutation
+        // (declare_function); nothing here mutates `module`.
+        let module = JITModule::new(builder);
+        Self::finish_construction(module)
+    }
 
+    /// JIT entry point (#50 — uniform-NB is the sole backend): lower `rir`,
+    /// finalize the in-process module, and return the NB-ABI native pointer
+    /// the runtime invokes for tier-up. The object backend instead pairs
+    /// the shared [`Self::define_uniform_nb`] with `finish_object` (it has
+    /// no in-process finalize step — the system linker resolves everything).
+    pub fn compile_uniform_nb(&mut self, rir: &RirFunction) -> Result<*const u8, JitError> {
+        let outer_id = self.define_uniform_nb(rir)?;
+        self.module
+            .finalize_definitions()
+            .map_err(|e| JitError::Codegen(format!("finalize_definitions: {e}")))?;
+        Ok(self.module.get_finalized_function(outer_id))
+    }
+
+    /// Borrow the underlying JIT module. Test-only (module-isolation
+    /// checks); no production caller.
+    #[doc(hidden)]
+    pub fn module(&self) -> &JITModule {
+        &self.module
+    }
+}
+
+impl Lowerer<ObjectModule> {
+    /// Build an object-emitting lowerer for AOT **level 3**. Same host ISA
+    /// and per-Inst lowering as the JIT, but the runtime helpers stay
+    /// undefined imports (the system `cc` resolves them against the prebuilt
+    /// `libcs_aot_rt.a`) and the emitted functions land in a relocatable
+    /// object via [`Self::finish_object`] — no Rust toolchain at AOT time.
+    ///
+    /// `name` is the object's module identifier (cosmetic; used in
+    /// diagnostics). PIC is on so the `.o` links cleanly into a PIE.
+    pub fn new_object(name: &str) -> Result<Self, JitError> {
+        let mut flag_builder = settings::builder();
+        flag_builder
+            .set("use_colocated_libcalls", "false")
+            .map_err(|e| JitError::Codegen(format!("flag use_colocated_libcalls: {e}")))?;
+        // Object output is linked into an executable (a PIE on modern
+        // macOS / Linux), so position-independent code is required —
+        // unlike the in-process JIT, which maps at a fixed address.
+        flag_builder
+            .set("is_pic", "true")
+            .map_err(|e| JitError::Codegen(format!("flag is_pic: {e}")))?;
+        // Same x64 tail-call frame-pointer requirement as the JIT path.
+        flag_builder
+            .set("preserve_frame_pointers", "true")
+            .map_err(|e| JitError::Codegen(format!("flag preserve_frame_pointers: {e}")))?;
+        let isa_builder = cranelift_native::builder()
+            .map_err(|e| JitError::Codegen(format!("native isa: {e}")))?;
+        let isa = isa_builder
+            .finish(settings::Flags::new(flag_builder))
+            .map_err(|e| JitError::Codegen(format!("isa finish: {e}")))?;
+        let builder = ObjectBuilder::new(isa, name, cranelift_module::default_libcall_names())
+            .map_err(|e| JitError::Codegen(format!("object builder: {e}")))?;
+        let module = ObjectModule::new(builder);
+        Self::finish_construction(module)
+    }
+
+    /// Set the symbol name the *next* [`Self::define_uniform_nb`] exports its
+    /// outer trampoline under (the program's externally-callable entry).
+    pub fn set_entry_export(&mut self, name: impl Into<String>) {
+        self.export_outer_as = Some(name.into());
+    }
+
+    /// Finish the object module and return the relocatable object bytes
+    /// (Mach-O / ELF / COFF for the host target). The caller writes these to
+    /// `prog.o` and links with the system `cc` + `libcs_aot_rt.a`.
+    pub fn finish_object(self) -> Result<Vec<u8>, JitError> {
+        let product = self.module.finish();
+        product
+            .emit()
+            .map_err(|e| JitError::Codegen(format!("object emit: {e}")))
+    }
+}
+
+impl<M: Module> Lowerer<M> {
+    /// Declare every runtime helper as a [`Linkage::Import`] against
+    /// `module` and assemble the `Lowerer`. Shared by the JIT (`new`) and
+    /// object (`new_object`) constructors — the per-helper signatures and
+    /// `FuncId`s are backend-independent (only `Module` methods are used).
+    /// The JIT registers each symbol's in-process address via
+    /// `JITBuilder::symbol` *before* this runs; the object backend leaves
+    /// them as undefined imports the system `cc` resolves against the
+    /// prebuilt `libcs_aot_rt.a` archive (AOT L3).
+    fn finish_construction(mut module: M) -> Result<Self, JitError> {
         // Import env-lookup helpers: extern "C" fn(i64) -> i64.
         let mut env_lookup_sig = module.make_signature();
         env_lookup_sig.params.push(AbiParam::new(I64));
@@ -1808,7 +1918,7 @@ impl Lowerer {
         alloc_pair_sig.returns.push(AbiParam::new(I64));
         let alloc_pair_func = module
             .declare_function(
-                "vm_alloc_pair",
+                "vm_alloc_pair_gc",
                 cranelift_module::Linkage::Import,
                 &alloc_pair_sig,
             )
@@ -1818,7 +1928,7 @@ impl Lowerer {
         #[cfg(feature = "regions")]
         let alloc_pair_region_func = module
             .declare_function(
-                "vm_alloc_pair_region",
+                "vm_alloc_pair_region_gc",
                 cranelift_module::Linkage::Import,
                 &alloc_pair_sig,
             )
@@ -1835,14 +1945,14 @@ impl Lowerer {
         zero_arg_sig.returns.push(AbiParam::new(I64));
         let pair_car_func = module
             .declare_function(
-                "vm_pair_car",
+                "vm_pair_car_gc",
                 cranelift_module::Linkage::Import,
                 &pair_accessor_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_pair_car: {e}")))?;
         let pair_cdr_func = module
             .declare_function(
-                "vm_pair_cdr",
+                "vm_pair_cdr_gc",
                 cranelift_module::Linkage::Import,
                 &pair_accessor_sig,
             )
@@ -1853,14 +1963,14 @@ impl Lowerer {
         // the input box.
         let pair_p_func = module
             .declare_function(
-                "vm_pair_p",
+                "vm_pair_p_gc",
                 cranelift_module::Linkage::Import,
                 &pair_accessor_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_pair_p: {e}")))?;
         let null_p_func = module
             .declare_function(
-                "vm_null_p",
+                "vm_null_p_gc",
                 cranelift_module::Linkage::Import,
                 &pair_accessor_sig,
             )
@@ -1869,7 +1979,7 @@ impl Lowerer {
         // vm_value_clone — same shape as the accessors (i64 → i64).
         let value_clone_func = module
             .declare_function(
-                "vm_value_clone",
+                "vm_value_clone_gc",
                 cranelift_module::Linkage::Import,
                 &pair_accessor_sig,
             )
@@ -1880,7 +1990,7 @@ impl Lowerer {
         value_drop_sig.params.push(AbiParam::new(I64));
         let value_drop_func = module
             .declare_function(
-                "vm_value_drop",
+                "vm_value_drop_gc",
                 cranelift_module::Linkage::Import,
                 &value_drop_sig,
             )
@@ -1969,7 +2079,7 @@ impl Lowerer {
         // `box_typed_sig` (i64, i64) -> i64.
         let eq_any_func = module
             .declare_function(
-                "vm_eq_any",
+                "vm_eq_any_gc",
                 cranelift_module::Linkage::Import,
                 &box_typed_sig,
             )
@@ -4568,6 +4678,8 @@ impl Lowerer {
             // iter BR: empty IC table. Iter BS+ will reserve a
             // slot per Inst::Call as lowering walks the RIR.
             ic_table: IcTable::new(0),
+            // AOT L3: JIT default keeps the outer trampoline Local.
+            export_outer_as: None,
         })
     }
 
@@ -4616,7 +4728,16 @@ impl Lowerer {
     /// time. Other RIR variants return `JitError::Unsupported` so the
     /// translator's coverage analysis can mark functions as
     /// baseline-eligible vs not.
-    pub fn compile_uniform_nb(&mut self, rir: &RirFunction) -> Result<*const u8, JitError> {
+    ///
+    /// Backend-independent: lowers `rir` (inner body + NB outer trampoline)
+    /// and *defines* both into the module, returning the outer trampoline's
+    /// [`FuncId`]. The JIT wrapper [`Lowerer::<JITModule>::compile_uniform_nb`]
+    /// finalizes and resolves it to a native pointer; the object backend
+    /// declares it `Export` and emits it into the `.o` (AOT L3).
+    pub fn define_uniform_nb(
+        &mut self,
+        rir: &RirFunction,
+    ) -> Result<cranelift_module::FuncId, JitError> {
         if rir.blocks.is_empty() {
             return Err(JitError::Codegen("function has no blocks".into()));
         }
@@ -4683,8 +4804,14 @@ impl Lowerer {
                     // (declines → VM).
                     #[cfg(feature = "regions")]
                     Inst::ConsRegion(_, _, _, _, _) => {}
-                    Inst::LoadConst(_, _)
-                    | Inst::Add(_, _, _)
+                    // String constants need heap materialization the JIT
+                    // skeleton doesn't do — let them fall through to the
+                    // decline catch-all below (function stays on the VM
+                    // tier). Every other LoadConst flavor is inline-NB-
+                    // encodable and supported.
+                    Inst::LoadConst(_, c)
+                        if !matches!(c, Const::String(_) | Const::StringRef(_)) => {}
+                    Inst::Add(_, _, _)
                     | Inst::Sub(_, _, _)
                     | Inst::Mul(_, _, _)
                     | Inst::Div(_, _, _)
@@ -5077,11 +5204,22 @@ impl Lowerer {
 
         let outer_seq = self.fresh_id();
         let inner_seq = self.fresh_id();
-        let outer_module_name = format!("{}#{}.nb_outer", rir.name, outer_seq);
+        // AOT L3: when an export name is set, the outer trampoline is the
+        // program's externally-callable entry — Export it under that clean
+        // symbol so the generated C `main` + system linker can reach it.
+        // JIT keeps the legacy Local auto-name (the runtime invokes it via
+        // the returned native pointer, not by symbol).
+        let (outer_linkage, outer_module_name) = match self.export_outer_as.take() {
+            Some(name) => (Linkage::Export, name),
+            None => (
+                Linkage::Local,
+                format!("{}#{}.nb_outer", rir.name, outer_seq),
+            ),
+        };
         let inner_module_name = format!("{}#{}.nb_inner", rir.name, inner_seq);
         let outer_id = self
             .module
-            .declare_function(&outer_module_name, Linkage::Local, &outer_sig)
+            .declare_function(&outer_module_name, outer_linkage, &outer_sig)
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function {}: {e}", outer_module_name))
             })?;
@@ -5108,10 +5246,10 @@ impl Lowerer {
             self.reset_func_ctx();
             return Err(e);
         }
-        self.module
-            .finalize_definitions()
-            .map_err(|e| JitError::Codegen(format!("finalize_definitions: {e}")))?;
-        Ok(self.module.get_finalized_function(outer_id))
+        // Both functions are now defined in the module. Finalization
+        // (JIT) / object emission (L3) happens in the backend-specific
+        // wrappers; here we just hand back the entry FuncId.
+        Ok(outer_id)
     }
 
     /// Body lowering for the uniform-NB tier. Iter 3.1 supported only
@@ -6191,13 +6329,6 @@ impl Lowerer {
             .map_err(|e| JitError::Codegen(format!("define_function outer: {e}")))?;
         self.module.clear_context(&mut self.ctx);
         Ok(())
-    }
-
-    /// Drain references to internal state. Used by tests that want
-    /// to ensure module isolation between calls.
-    #[doc(hidden)]
-    pub fn module(&self) -> &JITModule {
-        &self.module
     }
 }
 
@@ -9782,14 +9913,12 @@ fn encode_const_as_nb(c: &Const) -> i64 {
         // doesn't support these yet — the translator will route any
         // function containing `Const::StringRef` to the specialized
         // tier (or bytecode).
-        Const::StringRef(_) => {
-            // Sentinel: the caller in `lower_inst_uniform_nb` won't
-            // reach this branch because the Inst::LoadConst arm would
-            // need to fail-out before invoking us. Defensive: return
-            // `Value::Unspecified` NB to keep the lowering honest if
-            // a translator bug routes us here.
-            NanboxValue::UNSPECIFIED.into_raw()
-        }
+        // StringRef (table index) and the AOT-only inline String both
+        // need heap materialization the JIT skeleton doesn't do. The
+        // support gate declines any function carrying them, so this is
+        // unreachable in practice; the sentinel keeps lowering honest if
+        // a translator bug ever routes us here.
+        Const::StringRef(_) | Const::String(_) => NanboxValue::UNSPECIFIED.into_raw(),
     }
 }
 
@@ -9875,6 +10004,29 @@ pub mod testing {
 mod tests {
     use super::*;
     use std::mem::transmute;
+
+    /// AOT L3 — the object backend lowers a function and emits a
+    /// relocatable object that exports the entry under the requested
+    /// symbol name. Smoke test: non-trivial bytes + the export name
+    /// present in the object's string table.
+    #[test]
+    fn object_backend_emits_exported_entry() {
+        let mut lo = Lowerer::<ObjectModule>::new_object("cs_aot_test").expect("new_object");
+        lo.set_entry_export("cs_test_entry");
+        let f = testing::add_two_fixnums();
+        lo.define_uniform_nb(&f).expect("define_uniform_nb");
+        let obj = lo.finish_object().expect("finish_object");
+        assert!(
+            obj.len() > 64,
+            "object suspiciously small: {} bytes",
+            obj.len()
+        );
+        let needle = b"cs_test_entry";
+        assert!(
+            obj.windows(needle.len()).any(|w| w == needle),
+            "exported entry symbol `cs_test_entry` not found in emitted object"
+        );
+    }
 
     /// Issue #16 — the pre-codegen verifier rejects a function
     /// with an empty block layout (the issue-#4 malformed shape)

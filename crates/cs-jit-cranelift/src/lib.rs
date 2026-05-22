@@ -14,7 +14,7 @@ pub mod ic;
 pub mod lowering;
 
 pub use ic::{IcSlot, IcTable};
-pub use lowering::Lowerer;
+pub use lowering::{Lowerer, ObjectLowerer};
 
 use std::collections::HashMap;
 

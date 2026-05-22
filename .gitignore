@@ -33,6 +33,11 @@ Thumbs.db
 # by default. Ignore these tmp project directories so dev-loop
 # usage doesn't pollute the workspace.
 *-aot/
+# ...but NOT the cs-aot crate itself (the `*-aot/` glob matches its
+# `cs-aot/` directory name). Without this, new untracked files under
+# the crate (e.g. a new test) would be silently un-added.
+!crates/cs-aot/
+!crates/cs-aot/**
 
 # Real-world bench harness JSONL outputs.
 bench/realworld/results/

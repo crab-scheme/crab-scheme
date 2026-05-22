@@ -424,7 +424,10 @@ fn infer_value_types(func: &Function) -> std::collections::HashMap<Value, Type> 
                         Const::Character(_) => Type::Character,
                         Const::Null => Type::Null,
                         Const::Symbol(_) => Type::Symbol,
-                        Const::Unspecified | Const::Eof | Const::StringRef(_) => Type::Any,
+                        Const::Unspecified
+                        | Const::Eof
+                        | Const::StringRef(_)
+                        | Const::String(_) => Type::Any,
                     };
                     Some((*dst, t))
                 }
@@ -475,6 +478,9 @@ fn infer_value_types(func: &Function) -> std::collections::HashMap<Value, Type> 
                         Some((*dst, func.return_type.clone()))
                     }
                 }
+                // Generic builtin dispatch returns an arbitrary Scheme
+                // value — type unknown at compile time.
+                Inst::CallBuiltin(dst, _, _) => Some((*dst, Type::Any)),
                 _ => None,
             };
             if let Some((d, t)) = entry {
@@ -2049,6 +2055,27 @@ fn inst_rhs(
             (*dst, expr)
         }
 
+        // ---- Generic builtin dispatch (AOT G3) ----
+        //
+        // Any stdlib builtin without a dedicated open-coding lowers to a
+        // by-name call into the runtime env embedded in the AOT'd binary.
+        // {name:?} renders an escaped Rust &str literal. RawI64 mode has no
+        // runtime link, so it falls through to the Unsupported catch-all.
+        (Inst::CallBuiltin(dst, name, args), EmitMode::Nb) => {
+            for arg in args {
+                check(*arg)?;
+            }
+            let args_csv = args
+                .iter()
+                .map(|a| format!("v{}", a.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                *dst,
+                format!("cs_runtime::aot_call_builtin({name:?}, &[{args_csv}])"),
+            )
+        }
+
         // ---- Unsupported ----
         (other, _) => return Err(AotError::UnsupportedInst(inst_variant_name(other))),
     })
@@ -2511,6 +2538,8 @@ fn inst_dst(inst: &Inst) -> Option<Value> {
         Inst::MakeClosure(v, _) => Some(*v),
         Inst::Call(v, _, _) => Some(*v),
         Inst::CallGeneral(v, _, _) => Some(*v),
+        // AOT G3 — generic by-name builtin call.
+        Inst::CallBuiltin(v, _, _) => Some(*v),
         // RC3 iter 2.4 — EnvLookup post-demote (captures).
         Inst::EnvLookup(v, _) | Inst::EnvLookupAny(v, _) => Some(*v),
         // RC2 iter C — Flonum arith/cmp Insts.
@@ -2652,6 +2681,9 @@ fn const_to_rust_i64(c: &Const) -> Result<String, AotError> {
         Const::Eof => Err(AotError::UnsupportedConst("Eof")),
         Const::Symbol(_) => Err(AotError::UnsupportedConst("Symbol")),
         Const::StringRef(_) => Err(AotError::UnsupportedConst("StringRef")),
+        // Strings are heap values — they need the NB ABI; RawI64 mode
+        // (pure i64, no runtime link) can't represent them.
+        Const::String(_) => Err(AotError::UnsupportedConst("String")),
     }
 }
 
@@ -2697,6 +2729,12 @@ fn const_to_rust_nb(c: &Const) -> Result<String, AotError> {
         // case-marker sentinel) just need the sym id to round-trip.
         Const::Symbol(s) => nb_make(NB_TAG_SYMBOL, *s as u64),
         Const::StringRef(_) => return Err(AotError::UnsupportedConst("StringRef")),
+        // An inline string isn't a compile-time NB bit pattern — it needs
+        // a runtime heap allocation. Emit a call to the cs-vm helper that
+        // materializes a `Value::String` and returns its NB carrier.
+        // `{s:?}` renders a properly escaped Rust `&str` literal, so
+        // embedded quotes/newlines/unicode round-trip safely.
+        Const::String(s) => return Ok(format!("cs_vm::vm::vm_string_const_nb({s:?})")),
     };
     // Render as a hex literal with the i64 suffix. Using hex makes
     // the high bits readable (NB carriers all start with 0xFFF8...).
@@ -2731,6 +2769,7 @@ fn inst_variant_name(inst: &Inst) -> &'static str {
         Inst::Call(..) => "Call",
         Inst::CallSelf(..) => "CallSelf",
         Inst::CallGeneral(..) => "CallGeneral",
+        Inst::CallBuiltin(..) => "CallBuiltin",
         Inst::EnvLookup(..) => "EnvLookup",
         Inst::EnvLookupAny(..) => "EnvLookupAny",
         Inst::EnvSet(..) => "EnvSet",
@@ -3349,5 +3388,64 @@ mod tests {
         assert_eq!(sanitize_ident("string->list"), "string__list");
         assert_eq!(sanitize_ident(""), "proc_anon");
         assert_eq!(sanitize_ident("1plus"), "proc_1plus");
+    }
+
+    #[test]
+    fn nb_string_const_emits_runtime_helper() {
+        // Const::String lowers (Nb mode) to a cs-vm runtime call that
+        // materializes a heap string and returns its NB carrier. The
+        // content round-trips as an escaped Rust `&str` literal, so
+        // embedded quotes survive. RawI64 mode can't represent heap
+        // strings.
+        let mut f = Function::new("p");
+        f.params.push((Value(0), Type::Any));
+        f.return_type = Type::Any;
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::LoadConst(
+                Value(1),
+                Const::String("hi \"x\"".to_string()),
+            )],
+            terminator: Term::Return(Value(1)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(
+            src.contains(r#"cs_vm::vm::vm_string_const_nb("hi \"x\"")"#),
+            "emitted: {src}"
+        );
+        // RawI64 mode (pure i64, no runtime link) can't represent heap
+        // strings — it errors (here on the Any param/return before even
+        // reaching the const, which is fine; the point is it never emits
+        // a string in RawI64).
+        assert!(emit_with(EmitMode::RawI64, &f).is_err());
+    }
+
+    #[test]
+    fn nb_call_builtin_emits_runtime_dispatch() {
+        // Inst::CallBuiltin lowers (Nb) to a cs_runtime::aot_call_builtin
+        // call carrying the builtin name + NB arg list — the generic
+        // stdlib dispatch the AOT translator emits for builtins without a
+        // dedicated open-coding.
+        let mut f = Function::new("p");
+        f.params.push((Value(0), Type::Any));
+        f.return_type = Type::Any;
+        f.entry = BlockId(0);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            params: vec![],
+            insts: vec![Inst::CallBuiltin(
+                Value(1),
+                "string-append".to_string(),
+                vec![Value(0)],
+            )],
+            terminator: Term::Return(Value(1)),
+        });
+        let src = emit_with(EmitMode::Nb, &f).unwrap();
+        assert!(
+            src.contains(r#"cs_runtime::aot_call_builtin("string-append", &[v0])"#),
+            "emitted: {src}"
+        );
     }
 }

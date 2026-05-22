@@ -5,6 +5,94 @@
 > Parent: M10 plan (`docs/milestones/m10-plan.md`).
 > Predecessor: Track W (`m10-wasm-complete`).
 
+---
+
+## ⚠️ Status update — 2026-05-21 (AOT-ready assessment)
+
+The "What's deferred to post-1.0" list below is **out of date**. Much of
+it shipped in the RC2/RC3 iterations after this report was written. Verified
+against current code on `feat/aot-ready`:
+
+**Now working end-to-end** (`crabscheme aot <file> --multi --build` →
+native binary that builds and runs):
+
+- **CLI integration** — `crabscheme aot`, with `--multi` (whole-program),
+  `--build`, `--entry`, `--emit-rir`, `--emit-rust-source`, `--explain`,
+  `--verify`, `--target`. (`run_aot` single-define + `run_aot_multi`.)
+- **bytecode → RIR glue** — `cs_vm::jit_translate::bytecode_to_rir_aot*`;
+  the pipeline starts from real Scheme source, not hand-built RIR.
+- **Closures** (`MakeClosure` + capture lowering), **non-self `Call` /
+  `CallGeneral`**, **flonum arith**, **vectors**, **cons/car/cdr/list**,
+  and (this branch) **string constants** (`Const::String`).
+
+**Verified capability:** primop numeric kernels (fib/fact/tak), and via
+`--multi`, programs using cons/list/closures/flonum/vectors compile to
+standalone binaries linking only `cs-vm`.
+
+**Generic builtin dispatch — DONE (`feat/aot-ready`, 2026-05-21).** AOT
+now compiles programs that use **arbitrary stdlib builtins** — strings,
+lists, I/O, the lot — to native binaries. Demonstrated via
+`crabscheme aot --multi --build`:
+
+```
+(string-append "hi " (number->string n))   ->  "hi 7"
+(reverse (list 1 2 n))                      ->  (9 2 1)
+(display "hello world") (newline) n         ->  prints, returns n
+```
+
+How it works (the "generic runtime dispatch" path):
+
+- **`Const::String`** — inline string literals through cs-rir / cs-vm
+  (`vm_string_const_nb`) / cs-aot; cranelift JIT gated to decline them
+  (stays on VM tier; `jit_conformance` 8/8).
+- **`Inst::CallBuiltin(name, args)`** — in AOT mode (a scoped `AOT_MODE`
+  thread-local in the translator) **every** builtin lowers to this
+  generic by-name call instead of the JIT-only dedicated insts
+  (StrAppend, NumberToString, … ~200 variants with no AOT lowering). The
+  JIT path is untouched (keeps its fast dedicated lowerings).
+- **`cs_runtime::aot_call_builtin(name, args)`** — the emitted binary now
+  links **cs-runtime** and dispatches builtins by name through a real
+  builtin env (walker `top` + `apply_procedure`) embedded in the binary.
+  `aot_format_result` formats non-numeric return values for the shim.
+
+Cost / caveats: builtin-heavy AOT code runs at *walker* speed (numeric
+kernels stay on the inline-NB fast paths and never dispatch); the binary
+links cs-runtime (heavier than the lean numeric-kernel mode). **Use
+`--multi`** — the single-define default still treats free-var builtins as
+captures (its compile step folds fewer builtins), a follow-up. Also
+un-broke `.gitignore` (`*-aot/` was shadowing `crates/cs-aot/`).
+
+**AOT level 3 (toolchain-free) — DONE (`feat/aot-ready`, 2026-05-21).**
+Everything above is *level 1*: emit a Cargo project and shell out to
+`cargo build` (needs cargo+rustc). Level 3 removes that dependency —
+`crabscheme aot <file> --build` now produces a native binary on a host with
+**only a C linker** (`cc`), no Rust toolchain:
+
+- **`Lowerer<M: Module>`** — cs-jit-cranelift's JIT lowerer is now generic
+  over the cranelift `Module`. `Lowerer<JITModule>` is the in-process JIT
+  (unchanged); `Lowerer<ObjectModule>` (`new_object` / `define_uniform_nb` /
+  `finish_object`) emits a relocatable `.o` from the *same* per-Inst
+  lowering. Behavior-preserving: `jit_conformance` 8/8, `jit_differential`
+  244, all cs-jit-cranelift tests green.
+- **`cs-aot-rt`** — a new `staticlib` crate (`libcs_aot_rt.a`) bundling the
+  `vm_*` runtime symbols the object references + three C-ABI shims
+  (`cs_aot_nb_fixnum` / `cs_aot_print_result` / `cs_aot_call_builtin`).
+  Thin-LTO retains all 260 declared JIT import symbols with no `#[used]`
+  table. Built in its **own** cargo invocation so feature-unification with
+  cs-cli's stdlib doesn't pull `cc`-unlinkable framework deps.
+- **CLI fork** — `run_aot` auto-selects: cargo+rustc present → L1; absent
+  (or `CRABSCHEME_AOT_FORCE_OBJECT=1`) → L3. The object `.o` + a generated C
+  `main` + `libcs_aot_rt.a` are linked by the system `cc`.
+  `aot-doctor` self-tests both back-ends. Release tarballs ship
+  `libcs_aot_rt.a` beside the binary.
+
+Proven on darwin-aarch64 with cargo+rustc stripped from `PATH`:
+`crabscheme aot fib.scm --build` → `fib 25` = `75025`. Also tak, ack,
+non-recursive `sq`. **Scope:** a single self-contained function
+(self-recursion). Cross-function programs (`Inst::Call`) decline to L1 —
+they need runtime procedure registration the standalone binary lacks;
+multi-procedure L3 is the post-1.0 follow-up.
+
 ## Decision
 
 **Close Track A complete at a narrower scope than the original plan.**
