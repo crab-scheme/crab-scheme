@@ -25,8 +25,12 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod codec;
+pub mod driver;
 pub mod raft;
 pub mod sim;
+
+pub use driver::{spawn_raft_actor, RaftCommand, RaftDriver};
 
 /// Stable identity of one replica within a consensus group.
 ///
