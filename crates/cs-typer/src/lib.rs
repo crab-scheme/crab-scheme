@@ -50,7 +50,7 @@ pub use builtins::{install_primops, primop_pairs, primop_table};
 pub use check::{check, render_type, subtype, TypeError};
 pub use checker::Checker;
 pub use effect::{infer_effect, primitive_effect, AllocEffect, EscapeKind};
-pub use effect_decl::{extract_effect_decls, EffectDecls};
+pub use effect_decl::{check_effects, extract_effect_decls, EffectDecls};
 pub use env::{Frame, TypeEnv};
 pub use extract::extract_annotations;
 pub use infer::infer;

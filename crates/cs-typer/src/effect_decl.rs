@@ -25,9 +25,10 @@ use std::collections::HashMap;
 
 use cs_core::{Symbol, SymbolTable};
 use cs_diag::{Diagnostic, Span};
+use cs_ir::CoreExpr;
 use cs_parse::Datum;
 
-use crate::side_effect::{Effect, EffectSet};
+use crate::side_effect::{definition_body_effects, Effect, EffectSet};
 
 /// Declared effect sets keyed by top-level definition name.
 pub type EffectDecls = HashMap<Symbol, EffectSet>;
@@ -61,6 +62,59 @@ pub fn extract_effect_decls(
         out.push(stripped.unwrap_or_else(|| d.clone()));
     }
     (out, declared, diags)
+}
+
+/// The effect-check pass (M01.D).
+///
+/// Runs on the **expanded** program (`cs_expand::Expander::expand_program`,
+/// a top-level `Begin` of `Set` forms — top-level `define` lowers to `Set`).
+/// For every top-level definition whose name carries a `#:effects`
+/// declaration in `declared`, infer the body's effects and emit a
+/// diagnostic if any inferred effect wasn't declared.
+///
+/// `declared` doubles as the effect environment: a checked body that calls
+/// another declared function uses that function's declared set (so effects
+/// compose across the program without an inter-procedural fixpoint).
+pub fn check_effects(
+    program: &CoreExpr,
+    declared: &EffectDecls,
+    syms: &SymbolTable,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    check_form(program, declared, syms, &mut diags);
+    diags
+}
+
+fn check_form(
+    form: &CoreExpr,
+    declared: &EffectDecls,
+    syms: &SymbolTable,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match form {
+        CoreExpr::Begin { exprs, .. } => {
+            for e in exprs {
+                check_form(e, declared, syms, diags);
+            }
+        }
+        CoreExpr::Set { name, value, span } => {
+            if let Some(&declared_set) = declared.get(name) {
+                let inferred = definition_body_effects(value, syms, declared);
+                let undeclared = inferred.difference(declared_set);
+                if !undeclared.is_empty() {
+                    diags.push(Diagnostic::error(
+                        format!(
+                            "function `{}` performs effect(s) {undeclared} not in its \
+                             #:effects declaration {declared_set}",
+                            syms.name(*name)
+                        ),
+                        *span,
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// If `d` is `(define HEAD #:effects QUOTED REST…)`, record the declaration
@@ -282,5 +336,69 @@ mod tests {
         let (_out, _decls, diags) = extract_effect_decls(&data, &mut syms);
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("quoted list"), "{:?}", diags[0]);
+    }
+
+    // === iter D: effect-check pass (extract → expand → check) ===
+
+    /// Full pipeline: parse, extract `#:effects`, expand, then run the
+    /// effect check. Returns the diagnostic messages.
+    fn check_src(src: &str) -> Vec<String> {
+        let mut syms = SymbolTable::new();
+        let mut sources = cs_diag::SourceMap::new();
+        let fid = sources.add("<test>", src);
+        let data = cs_parse::read_all(fid, src, &mut syms).expect("parse");
+        let (stripped, declared, ediags) = extract_effect_decls(&data, &mut syms);
+        assert!(ediags.is_empty(), "extract diags: {ediags:?}");
+        let mut macros = std::collections::HashMap::new();
+        let mut expander = cs_expand::Expander::new(&mut syms, &mut macros);
+        let program = expander.expand_program(&stripped).expect("expand");
+        drop(expander);
+        check_effects(&program, &declared, &syms)
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn undeclared_effect_is_rejected() {
+        let diags = check_src("(define f #:effects '(io) (lambda (p) (http-get p)))");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].contains("net"), "{}", diags[0]);
+    }
+
+    #[test]
+    fn declared_effect_conforms() {
+        let diags = check_src("(define f #:effects '(io net) (lambda (p) (http-get p)))");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn pure_body_with_pure_declaration_is_ok() {
+        let diags = check_src("(define f #:effects '() (lambda (x) (+ x 1)))");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn undeclared_mutation_is_rejected() {
+        let diags = check_src("(define f #:effects '() (lambda (x) (vector-set! x 0 1)))");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].contains("mutation"), "{}", diags[0]);
+    }
+
+    #[test]
+    fn effects_compose_across_declared_functions() {
+        // f calls g (declared net); f declaring net conforms.
+        let ok = check_src(
+            "(define g #:effects '(net) (lambda (x) (http-get x)))\
+             (define f #:effects '(net) (lambda (x) (g x)))",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        // f declaring only io must be rejected — calling g performs net.
+        let bad = check_src(
+            "(define g #:effects '(net) (lambda (x) (http-get x)))\
+             (define f #:effects '(io) (lambda (x) (g x)))",
+        );
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert!(bad[0].contains("net"), "{}", bad[0]);
     }
 }
