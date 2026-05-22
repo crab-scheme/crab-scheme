@@ -32,6 +32,7 @@ pub mod check;
 pub mod checker;
 pub mod contract_lowering;
 pub mod effect;
+pub mod effect_decl;
 pub mod env;
 pub mod extract;
 pub mod infer;
@@ -39,6 +40,7 @@ pub mod lifetime_lower;
 pub mod parse_ann;
 pub mod poly;
 pub mod rir_bridge;
+pub mod side_effect;
 pub mod types;
 
 pub use annotate::{
@@ -48,6 +50,7 @@ pub use builtins::{install_primops, primop_pairs, primop_table};
 pub use check::{check, render_type, subtype, TypeError};
 pub use checker::Checker;
 pub use effect::{infer_effect, primitive_effect, AllocEffect, EscapeKind};
+pub use effect_decl::{check_effects, check_migration_body, extract_effect_decls, EffectDecls};
 pub use env::{Frame, TypeEnv};
 pub use extract::extract_annotations;
 pub use infer::infer;
@@ -57,4 +60,5 @@ pub use poly::{instantiate, subst, unify};
 pub use rir_bridge::{
     hints_by_name, lifetime_from_effect, lower as lower_to_rir, param_hints_from_table,
 };
+pub use side_effect::{Effect, EffectSet};
 pub use types::{ProcType, Type};
