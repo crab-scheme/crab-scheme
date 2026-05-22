@@ -88,7 +88,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+# Release-candidate version. Bumped per RC (see docs/RELEASING.md); the git
+# tag `1.0-rcN` maps to Cargo version `1.0.0-rcN`. Crates that opt in via
+# `version.workspace = true` (the CLI + servers) report this as their
+# `--version`; internal `publish = false` crates keep their own `0.0.1`.
+version = "1.0.0-rc6"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
