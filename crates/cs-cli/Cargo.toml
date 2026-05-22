@@ -145,6 +145,13 @@ ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the
 # WASM build drops it (can't spawn cargo at WASI runtime).
 aot = ["dep:cs-aot", "dep:cs-vm", "dep:cs-rir", "dep:cs-parse", "dep:cs-expand", "dep:cs-typer"]
+# AOT level 1: embed the workspace crate sources into the binary (via
+# build.rs) so `crabscheme aot --build` works from a release-installed
+# binary with no dev source tree. OFF by default to avoid include_bytes!
+# rebuild churn on the dev loop (a from-source build resolves cs-vm via
+# its on-disk path); the release workflow turns it on so the shipped
+# tarball is self-contained. Only meaningful together with `aot`.
+bundled-aot-sources = []
 # Layer-4 tracing cycle collector (tracing-revival spec).
 # Off by default; embedders and benchmarks that want to
 # exercise the layer-4 path enable it explicitly.

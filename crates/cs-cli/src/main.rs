@@ -276,11 +276,88 @@ fn main() -> ExitCode {
 /// | 7. cargo build          | rust toolchain / cargo install      |
 /// | 8. run + verify         | NB ABI / runtime helper mismatch    |
 ///
+/// AOT level 1: locate the cs-vm crate the emitted project depends on.
+/// Prefers the on-disk dev-tree path (a from-source build); falls back to
+/// the workspace sources embedded in this binary (release tarball built
+/// with `--features bundled-aot-sources`), extracted once to a cache dir.
+/// `cs-runtime` is derived as cs-vm's sibling by `cs_aot::project`.
+#[cfg(feature = "aot")]
+fn resolve_cs_vm_path() -> std::io::Result<std::path::PathBuf> {
+    let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .join("cs-vm");
+    // `CRABSCHEME_AOT_FORCE_BUNDLED=1` forces the embedded path even when
+    // the dev tree exists — used to exercise the release path in tests.
+    let force = std::env::var_os("CRABSCHEME_AOT_FORCE_BUNDLED").is_some();
+    if dev.exists() && !force {
+        return Ok(dev);
+    }
+    Ok(bundled_sources::ensure()?.join("crates/cs-vm"))
+}
+
+/// Whether a Rust toolchain (cargo + rustc) is on PATH. Gates AOT level 1
+/// (emit a cargo project + `cargo build`) vs. the self-contained level-3
+/// path (direct native codegen — not yet implemented).
+#[cfg(feature = "aot")]
+fn rust_toolchain_present() -> bool {
+    let ok = |tool: &str| {
+        std::process::Command::new(tool)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    ok("cargo") && ok("rustc")
+}
+
+/// The workspace crate sources embedded into this binary (AOT level 1).
+#[cfg(feature = "aot")]
+mod bundled_sources {
+    include!(concat!(env!("OUT_DIR"), "/bundled_sources.rs"));
+
+    /// Extract the embedded sources to a per-version cache dir (once) and
+    /// return its path. Errors if this binary was built without
+    /// `--features bundled-aot-sources` (the table is empty).
+    pub fn ensure() -> std::io::Result<std::path::PathBuf> {
+        use std::io::{Error, ErrorKind};
+        if BUNDLED_SOURCES.is_empty() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "no workspace sources embedded (built without \
+                 --features bundled-aot-sources) and cs-vm not on disk",
+            ));
+        }
+        let base = cache_dir().join(concat!("crabscheme-aot-src-", env!("CARGO_PKG_VERSION")));
+        let ready = base.join(".ready");
+        if ready.exists() {
+            return Ok(base);
+        }
+        for (rel, bytes) in BUNDLED_SOURCES {
+            let p = base.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&p, bytes)?;
+        }
+        std::fs::write(&ready, env!("CARGO_PKG_VERSION"))?;
+        Ok(base)
+    }
+
+    fn cache_dir() -> std::path::PathBuf {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
+            })
+            .unwrap_or_else(std::env::temp_dir)
+    }
+}
+
 /// Prints each step's result; exits 0 if all pass.
 #[cfg(feature = "aot")]
 fn run_aot_doctor() -> ExitCode {
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use std::process::Command;
 
     use cs_aot::project::{emit_project, ProjectOptions};
@@ -401,21 +478,17 @@ fn run_aot_doctor() -> ExitCode {
     };
 
     // ---- Step 5: emit_project -----
-    let cs_vm_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/")
-        .join("cs-vm");
-    let cs_vm_present = cs_vm_path.exists();
+    // Dev-tree path if present, else the workspace sources embedded in this
+    // binary (release tarball built with --features bundled-aot-sources).
+    let cs_vm_path = match resolve_cs_vm_path() {
+        Ok(p) => p,
+        Err(e) => return bail(&format!("cannot locate cs-vm sources: {e}")),
+    };
     report(
         "resolve cs-vm dep",
-        cs_vm_present,
+        cs_vm_path.exists(),
         &cs_vm_path.display().to_string(),
     );
-    if !cs_vm_present {
-        return bail(
-            "cs-vm not at the expected dev-tree path — release-installed binaries can't AOT yet (Phase 1.3 crates.io publish addresses this)",
-        );
-    }
 
     let tmpdir = std::env::temp_dir().join(format!("crabscheme-aot-doctor-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmpdir);
@@ -683,27 +756,26 @@ fn run_aot(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{}-aot", basename_no_ext(file))));
 
-    // Resolve cs-vm path relative to this binary's manifest — at
-    // CARGO_MANIFEST_DIR build time, cs-vm sits at ../cs-vm in the
-    // workspace. For end-user binaries shipped via the release
-    // workflow, this path won't resolve at runtime; the emitted
-    // Cargo.toml then needs cs-vm published to crates.io, which is
-    // post-RC2 packaging work. For dev-loop usage from a built-from-
-    // source binary the path is correct.
-    let cs_vm_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/")
-        .join("cs-vm");
-    if !cs_vm_path.exists() {
+    // AOT level-1 toolchain gate: `--build` emits a cargo project and runs
+    // `cargo build`, so it needs cargo + rustc. (Self-contained AOT without
+    // a toolchain — level 3 — is not implemented yet.)
+    if build && !rust_toolchain_present() {
         eprintln!(
-            "crabscheme aot: expected cs-vm at {} — \
-             this binary's emitted project depends on cs-vm at that path. \
-             AOT from a release-installed binary needs cs-vm published to \
-             crates.io (post-RC2 packaging work).",
-            cs_vm_path.display()
+            "crabscheme aot --build: no Rust toolchain (cargo + rustc) on PATH. \
+             Install rustup, or drop --build to emit the project for building \
+             elsewhere. (Toolchain-free native codegen is a planned follow-up.)"
         );
         return ExitCode::from(4);
     }
+    // Resolve cs-vm: the dev-tree path for a from-source build, else the
+    // workspace sources embedded in this binary (release tarball).
+    let cs_vm_path = match resolve_cs_vm_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("crabscheme aot: cannot locate cs-vm sources: {e}");
+            return ExitCode::from(4);
+        }
+    };
 
     let pkg_name = sanitize_pkg_name(&entry_name);
     let opts = ProjectOptions {
@@ -1515,10 +1587,22 @@ fn run_aot_multi(
     let out_dir = output
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{basename}-aot")));
-    let cs_vm_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/")
-        .join("cs-vm");
+    // Level-1 toolchain gate (see run_aot).
+    if build && !rust_toolchain_present() {
+        eprintln!(
+            "crabscheme aot --multi --build: no Rust toolchain (cargo + rustc) on PATH. \
+             Install rustup, or drop --build to emit the project for building elsewhere. \
+             (Toolchain-free native codegen is a planned follow-up.)"
+        );
+        return ExitCode::from(4);
+    }
+    let cs_vm_path = match resolve_cs_vm_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("crabscheme aot --multi: cannot locate cs-vm sources: {e}");
+            return ExitCode::from(4);
+        }
+    };
     let pkg_name = sanitize_pkg_name(&basename);
 
     let opts = ProjectOptions {
