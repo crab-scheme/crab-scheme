@@ -22,6 +22,13 @@ name: ci
 # (`cache-targets: false`) so the two don't fight over `target/`.
 # Tests run under cargo-nextest (faster, better parallelism);
 # doctests run separately since nextest doesn't execute them.
+#
+# Resilience: sccache hard-fails if its cache backend is
+# unreachable (the GitHub Actions cache service has outages). So we
+# only flip RUSTC_WRAPPER on *after* confirming the sccache server
+# starts; if it can't (cache backend down), the build proceeds
+# without sccache — slower, but green instead of spuriously red.
+# The "Enable sccache" step is the single gate for that.
 
 on:
   push:
@@ -39,8 +46,10 @@ env:
   # compilation units); release already defaults to incremental=false,
   # set explicitly so it holds for any profile.
   CARGO_INCREMENTAL: "0"
-  RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
+  # NOTE: RUSTC_WRAPPER is intentionally NOT set here — the "Enable
+  # sccache" step sets it only when the sccache server actually
+  # starts, so a cache-backend outage falls back to plain cargo.
 
 jobs:
   test:
@@ -75,6 +84,16 @@ jobs:
           key: ci-${{ matrix.os }}
           cache-targets: "false"
 
+      - name: Enable sccache (fall back to plain cargo if its backend is down)
+        shell: bash
+        run: |
+          if sccache --start-server; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "sccache enabled"
+          else
+            echo "::warning title=sccache::cache backend unavailable — building without sccache this run"
+          fi
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -91,14 +110,11 @@ jobs:
 
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: sccache --show-stats || true
 
   wasm-build:
     name: wasm32-wasip1 build
     runs-on: ubuntu-24.04
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
 
@@ -117,6 +133,16 @@ jobs:
           key: ci-wasm
           cache-targets: "false"
 
+      - name: Enable sccache (fall back to plain cargo if its backend is down)
+        shell: bash
+        run: |
+          if sccache --start-server; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "sccache enabled"
+          else
+            echo "::warning title=sccache::cache backend unavailable — building without sccache this run"
+          fi
+
       - name: Build wasm32-wasip1
         # Confirms the no-default-features build still produces a
         # valid WASM binary. Doesn't run it (no wasmtime on the
@@ -126,4 +152,4 @@ jobs:
 
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: sccache --show-stats || true
