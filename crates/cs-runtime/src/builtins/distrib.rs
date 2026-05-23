@@ -35,13 +35,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use cs_core::{Pair, SymbolTable, Value};
 
+use cs_distrib::handshake::{evaluate_hello, HandshakeOutcome, Hello};
 use cs_distrib::pid::DistPid;
 use cs_distrib::router::Router;
 use cs_distrib::NodeId;
 use cs_net::sim::SimPair;
-use cs_net::Transport;
+use cs_net::tcp::TcpTransport;
+use cs_net::{Transport, TransportConfig};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
-use super::beam::{from_sendable, to_sendable_in, SendableValue};
+use super::beam::{beam_state, from_sendable, to_sendable_in, SendableValue};
 
 // All single-process nodes share one host/epoch; a node is identified by name.
 const NODE_HOST: &str = "local";
@@ -132,6 +136,115 @@ pub fn primop_node_poll(node: &str) -> Result<Vec<SendableValue>, String> {
 }
 
 //
+// TCP transport — real cross-process / cross-machine sockets.
+//
+// node-link! is the in-memory sim transport; these connect nodes over actual
+// TCP. The socket I/O runs on cs-actor's tokio runtime (the one the cluster
+// already uses) via ActorSystem::runtime_handle — no second runtime. Once a
+// connection is up the routing/serialization is identical to the sim path
+// (same Router, same DistPid framing, same SendableValue codec), so the
+// consensus engine and the (node-send/node-poll) builtins are unchanged.
+//
+
+/// Exchange `Hello`s on a freshly connected stream (length-prefixed, before
+/// the [`TcpTransport`] framing takes over), returning the accepted peer's
+/// `NodeId`. Both sides write then read, so it works symmetrically for the
+/// connector and the acceptor.
+async fn exchange_hello(stream: &mut TcpStream, local: &NodeId) -> Result<NodeId, String> {
+    let bytes = Hello::new(local.clone(), 0).encode_vec();
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .await
+        .map_err(|e| format!("handshake write len: {e}"))?;
+    stream
+        .write_all(&bytes)
+        .await
+        .map_err(|e| format!("handshake write hello: {e}"))?;
+
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| format!("handshake read len: {e}"))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .map_err(|e| format!("handshake read hello: {e}"))?;
+    let peer = Hello::decode(&buf).map_err(|e| format!("handshake decode: {e}"))?;
+    match evaluate_hello(local, &peer, 0, None) {
+        HandshakeOutcome::Accepted { peer, .. } => Ok(peer),
+        HandshakeOutcome::Quarantine { reason } => Err(format!("handshake quarantine: {reason}")),
+    }
+}
+
+/// Bind `node` to a TCP `addr` and accept inbound connections forever (on the
+/// cluster runtime), handshaking + registering each as a peer. Returns the
+/// actual bound address (so callers can `(node-listen NODE "127.0.0.1:0")` and
+/// publish the chosen port).
+pub fn primop_node_listen(node: &str, addr: &str) -> Result<String, String> {
+    let router = lookup_router(node, "node-listen")?;
+    let local = node_id(node);
+    let handle = beam_state().actors.runtime_handle();
+
+    let addr_owned = addr.to_string();
+    let listener = handle
+        .block_on(async move { TcpListener::bind(&addr_owned).await })
+        .map_err(|e| format!("node-listen: bind {addr}: {e}"))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|e| format!("node-listen: local_addr: {e}"))?
+        .to_string();
+
+    let cfg = TransportConfig::default();
+    handle.spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    match exchange_hello(&mut stream, &local).await {
+                        Ok(peer) => {
+                            let t = TcpTransport::from_stream(stream, peer.label(), &cfg);
+                            router.add_peer(peer, Box::new(t) as Box<dyn Transport>);
+                        }
+                        Err(e) => eprintln!("node-listen {}: {e}", local.label()),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("node-listen {}: accept: {e}", local.label());
+                    break;
+                }
+            }
+        }
+    });
+    Ok(bound)
+}
+
+/// Connect `node` to a peer listening at `peer_addr` over TCP, handshake, and
+/// register the peer. Synchronous from the caller's view (the connection is up
+/// when this returns). Call from the cluster bootstrap (main) thread, not an
+/// actor body.
+pub fn primop_node_connect(node: &str, peer_addr: &str) -> Result<(), String> {
+    let router = lookup_router(node, "node-connect")?;
+    let local = node_id(node);
+    let handle = beam_state().actors.runtime_handle();
+    let cfg = TransportConfig::default();
+    let peer_addr_owned = peer_addr.to_string();
+
+    handle.block_on(async move {
+        let mut stream = TcpStream::connect(&peer_addr_owned)
+            .await
+            .map_err(|e| format!("node-connect: connect {peer_addr_owned}: {e}"))?;
+        let _ = stream.set_nodelay(true);
+        let peer = exchange_hello(&mut stream, &local).await?;
+        let t = TcpTransport::from_stream(stream, peer.label(), &cfg);
+        router.add_peer(peer, Box::new(t) as Box<dyn Transport>);
+        Ok::<(), String>(())
+    })
+}
+
+//
 // Scheme-builtin wrappers (Value <-> SendableValue at the boundary).
 //
 
@@ -192,6 +305,31 @@ pub fn b_node_poll(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
     Ok(list)
 }
 
+/// `(node-listen NODE ADDR)` — listen for TCP peers; returns the bound addr.
+/// Use `"127.0.0.1:0"` to bind an ephemeral port and read back the choice.
+pub fn b_node_listen(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("node-listen: expected (node-listen NODE ADDR)".into());
+    }
+    let node = name_of(&args[0], syms, "node-listen")?;
+    let addr = name_of(&args[1], syms, "node-listen")?;
+    let bound = primop_node_listen(&node, &addr)?;
+    Ok(Value::String(cs_core::Gc::new(std::cell::RefCell::new(
+        bound,
+    ))))
+}
+
+/// `(node-connect NODE PEER-ADDR)` — connect NODE to a peer over TCP.
+pub fn b_node_connect(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("node-connect: expected (node-connect NODE PEER-ADDR)".into());
+    }
+    let node = name_of(&args[0], syms, "node-connect")?;
+    let addr = name_of(&args[1], syms, "node-connect")?;
+    primop_node_connect(&node, &addr)?;
+    Ok(Value::Unspecified)
+}
+
 /// The Scheme-facing distrib builtins, in the `(name, fn)` shape the
 /// registration loops accept. Merged into cs-runtime's walker + VM env when
 /// the `distrib` feature is on.
@@ -202,6 +340,8 @@ pub fn distrib_syms_builtins() -> Vec<(
     vec![
         ("node-make", b_node_make),
         ("node-link!", b_node_link),
+        ("node-listen", b_node_listen),
+        ("node-connect", b_node_connect),
         ("node-send", b_node_send),
         ("node-poll", b_node_poll),
     ]
@@ -460,5 +600,42 @@ mod tests {
         .expect("self-send");
         let got = primop_node_poll("loopback-node").expect("poll");
         assert_eq!(got, vec![SendableValue::Symbol("campaign".into())]);
+    }
+
+    #[test]
+    fn two_nodes_send_and_poll_over_real_tcp() {
+        // The real-socket path: two nodes connected over loopback TCP, a
+        // message serialized + framed + routed across the socket, decoded on
+        // the far side. (Proves the cross-node path is genuinely over cs-net's
+        // TCP transport, not only the in-memory sim.)
+        primop_node_make("tcp-a").expect("make a");
+        primop_node_make("tcp-b").expect("make b");
+
+        // a listens on an ephemeral loopback port; b connects to it. One TCP
+        // connection is full-duplex, so the single handshake registers the
+        // peer on both routers.
+        let addr = primop_node_listen("tcp-a", "127.0.0.1:0").expect("listen");
+        primop_node_connect("tcp-b", &addr).expect("connect");
+
+        // b -> a over the wire.
+        let msg = SendableValue::Pair(
+            Box::new(SendableValue::Symbol("engine".into())),
+            Box::new(SendableValue::Fixnum(99)),
+        );
+        // a's accept loop registers b asynchronously; retry the poll until the
+        // framed message has crossed and a's router has the peer + frame.
+        primop_node_send("tcp-b", "tcp-a", &msg).expect("send");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let got = primop_node_poll("tcp-a").expect("poll");
+            if !got.is_empty() {
+                assert_eq!(got, vec![msg]);
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("message never arrived over TCP");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
