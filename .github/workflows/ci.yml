@@ -20,8 +20,10 @@ name: ci
 # Swatinem/rust-cache deliberately doesn't), so warm runs reuse
 # them. rust-cache stays for the registry/index only
 # (`cache-targets: false`) so the two don't fight over `target/`.
-# Tests run under cargo-nextest (faster, better parallelism);
-# doctests run separately since nextest doesn't execute them.
+# (cargo-nextest was tried but dropped: its process-per-test model
+# races on shared `target/` artifacts that some integration tests —
+# cs-cli's AOT level-3 — build + link, which `cargo test`'s
+# single-process run serializes.)
 #
 # Resilience: sccache hard-fails if its cache backend is
 # unreachable (the GitHub Actions cache service has outages). So we
@@ -72,9 +74,6 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.6
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
       # Registry/index cache only — sccache owns the compilation cache,
       # so caching `target/` here too would be redundant and can mask
       # sccache hits.
@@ -101,12 +100,12 @@ jobs:
         run: cargo build --workspace --release
 
       - name: Run workspace tests
-        run: cargo nextest run --workspace --release
-
-      - name: Run doctests
-        # nextest does not execute doctests; run them separately so
-        # coverage matches the previous `cargo test --workspace`.
-        run: cargo test --workspace --release --doc
+        # Plain `cargo test` (not nextest): some integration tests — e.g.
+        # cs-cli's AOT level-3 tests — shell out to `cargo build` and link the
+        # shared `target/release/libcs_aot_rt.a`, and rely on cargo test's
+        # single-process model to serialize that setup. nextest's
+        # process-per-test parallelism races on those shared artifacts.
+        run: cargo test --workspace --release
 
       - name: sccache stats
         if: always()
