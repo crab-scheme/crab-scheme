@@ -3,6 +3,9 @@
 #[cfg(feature = "actor")]
 pub mod beam;
 
+#[cfg(feature = "distrib")]
+pub mod distrib;
+
 #[cfg(feature = "channel")]
 pub mod channel;
 
@@ -1219,6 +1222,15 @@ pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
     #[cfg(feature = "actor")]
     {
         for (name, f) in beam::beam_syms_builtins() {
+            let sym = syms.intern(name);
+            env.define(sym, crate::proc::make_builtin_syms(name, f));
+        }
+    }
+    // Cross-node transport primops (node-make/link!/send/poll), gated on
+    // `distrib`. Same Syms shape, same registration loop.
+    #[cfg(feature = "distrib")]
+    {
+        for (name, f) in distrib::distrib_syms_builtins() {
             let sym = syms.intern(name);
             env.define(sym, crate::proc::make_builtin_syms(name, f));
         }

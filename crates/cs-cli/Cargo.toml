@@ -26,7 +26,7 @@ path = "src/main.rs"
 # - Bleeding-edge memory layers: layer-4 tracing GC is OFF by
 #   default; enable via `--features all-memory-layers` (or
 #   `tracing-cycle-collector` for just that one).
-default = ["jit", "ffi-dynamic", "aot", "stdlib", "actor", "sandbox"]
+default = ["jit", "ffi-dynamic", "aot", "stdlib", "actor", "distrib", "sandbox"]
 jit = ["cs-runtime/jit"]
 ffi-trait = ["cs-runtime/ffi-trait"]
 ffi-dynamic = ["cs-runtime/ffi-dynamic"]
@@ -176,6 +176,8 @@ all-memory-layers = ["tracing-cycle-collector"]
 # WASM builds can't link it. Enable for native CLI builds that
 # need actor-style concurrency.
 actor = ["cs-runtime/actor"]
+# Cross-node cluster transport (node-make/link!/send/poll). Implies actor.
+distrib = ["cs-runtime/distrib"]
 # L2 WASM-instance sandbox (`make-wasm-sandbox`, `sandbox-eval`,
 # `sandbox?`, `reset-sandbox!`). Pulls wasmtime 36.x LTS plus
 # cs-sandbox-wasm. Off by default — host wasmtime is a large
