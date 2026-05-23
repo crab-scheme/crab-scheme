@@ -4,6 +4,11 @@ Thanks for your interest. CrabScheme welcomes contributions across
 all milestones — bug fixes, AOT/JIT extensions, conformance fixes,
 docs, tooling, and tests.
 
+**Read [`CONSTITUTION.md`](CONSTITUTION.md) first.** It states the
+project's foundational laws — most importantly, that libraries are
+written in CrabScheme (`lib/*.scm`) and Rust is reserved for the
+machine and its primitives. Contributions are expected to follow it.
+
 ## Code of conduct
 
 Be excellent. We follow the spirit of the [Rust Code of
