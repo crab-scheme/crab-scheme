@@ -12,6 +12,16 @@ name: ci
 # its own job (no test step — WASM-runtime testing happens
 # through bench/wasm-conformance.sh which needs wasmtime; that's
 # a separate weekly job, not part of every-PR CI).
+#
+# Build speed: the bottleneck is release-compiling ~40 local
+# crates + heavy deps (wasmtime / cranelift x2 / quinn) every run.
+# sccache (RUSTC_WRAPPER + GitHub Actions cache backend) caches
+# compiler outputs across runs *including the local crates* (which
+# Swatinem/rust-cache deliberately doesn't), so warm runs reuse
+# them. rust-cache stays for the registry/index only
+# (`cache-targets: false`) so the two don't fight over `target/`.
+# Tests run under cargo-nextest (faster, better parallelism);
+# doctests run separately since nextest doesn't execute them.
 
 on:
   push:
@@ -25,6 +35,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # sccache needs incremental compilation off (it caches whole
+  # compilation units); release already defaults to incremental=false,
+  # set explicitly so it holds for any profile.
+  CARGO_INCREMENTAL: "0"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   test:
@@ -44,10 +60,20 @@ jobs:
           toolchain: "1.95"
           components: rustfmt, clippy
 
-      - name: Cache cargo
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Registry/index cache only — sccache owns the compilation cache,
+      # so caching `target/` here too would be redundant and can mask
+      # sccache hits.
+      - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
           key: ci-${{ matrix.os }}
+          cache-targets: "false"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -56,11 +82,23 @@ jobs:
         run: cargo build --workspace --release
 
       - name: Run workspace tests
-        run: cargo test --workspace --release
+        run: cargo nextest run --workspace --release
+
+      - name: Run doctests
+        # nextest does not execute doctests; run them separately so
+        # coverage matches the previous `cargo test --workspace`.
+        run: cargo test --workspace --release --doc
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   wasm-build:
     name: wasm32-wasip1 build
     runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
 
@@ -70,10 +108,14 @@ jobs:
           toolchain: "1.95"
           targets: wasm32-wasip1
 
-      - name: Cache cargo
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
           key: ci-wasm
+          cache-targets: "false"
 
       - name: Build wasm32-wasip1
         # Confirms the no-default-features build still produces a
@@ -81,3 +123,7 @@ jobs:
         # runner by default; see bench/wasm-conformance.sh for the
         # runtime sweep).
         run: cargo build --target wasm32-wasip1 --release -p cs-cli --no-default-features
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
