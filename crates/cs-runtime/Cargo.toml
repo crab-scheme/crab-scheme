@@ -62,6 +62,13 @@ tracing-cycle-collector = [
 # real threads) and on bare-AOT builds. The `lib/beam/prelude.scm`
 # library only loads when this feature is on.
 actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload", "dep:tokio"]
+# Cross-node cluster transport. Exposes (node-make / node-link! / node-send /
+# node-poll) Scheme builtins that drive cs-distrib's Router over cs-net
+# transports (sim today; tcp/quic share the same Transport trait). Implies
+# `actor` because cross-node consensus builds on the actor substrate and the
+# SendableValue boundary. Pulls cs-net (sim transport) + cs-distrib
+# (NodeId/DistPid/Router). Default-off on WASM/AOT like `actor`.
+distrib = ["actor", "dep:cs-net", "dep:cs-distrib", "cs-net/dev-certs", "cs-net/quic"]
 # First-class MPMC channels (spec: docs/research/channels_spec.md).
 # Implies `actor` because cs-channel shares the cs-actor tokio
 # runtime + the SendableValue boundary.
@@ -183,12 +190,25 @@ thiserror = { workspace = true }
 cs-actor = { workspace = true, optional = true }
 cs-channel = { workspace = true, optional = true }
 cs-table = { workspace = true, optional = true }
+# Cross-node transport (the `distrib` feature). cs-net default brings the
+# sim + tcp transports; cs-distrib brings NodeId/DistPid/Router.
+cs-net = { workspace = true, optional = true }
+cs-distrib = { workspace = true, optional = true }
 # tokio is pulled in transitively by cs-actor under the `actor`
 # feature, but cs-runtime needs a direct dep so it can use
 # `tokio::task_local!` for the region-stack task-local
-# (parallel-runtime spec C3). Only the rt + macros features —
-# the full multi-thread runtime is owned by cs-actor.
-tokio = { workspace = true, features = ["rt", "macros", "sync"], optional = true }
+# (parallel-runtime spec C3). `net` + `io-util` are used by the
+# `distrib` feature's TCP transport bootstrap (listener/stream +
+# the handshake read/write); the multi-thread runtime itself is
+# owned by cs-actor and reused via ActorSystem::runtime_handle.
+tokio = { workspace = true, features = [
+    "rt",
+    "macros",
+    "sync",
+    "net",
+    "io-util",
+    "time",
+], optional = true }
 cs-hotreload = { workspace = true, optional = true }
 cs-sandbox-wasm = { workspace = true, optional = true }
 # cs-web is pulled in when the `web` feature is on. Default

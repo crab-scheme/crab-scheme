@@ -32,6 +32,11 @@ use std::fmt;
 use thiserror::Error;
 
 pub mod framing;
+/// Dev-mode QUIC listen/connect helpers (shared self-signed mTLS identity).
+/// Wraps the quinn `Endpoint` so consumers (cs-runtime's `distrib` builtins)
+/// drive QUIC without naming quinn types.
+#[cfg(all(feature = "quic", feature = "dev-certs"))]
+pub mod quic_dev;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub mod tls;
 
@@ -1300,6 +1305,114 @@ mod mtls_tests {
         assert!(
             accept.await.unwrap().is_err(),
             "server must reject the certless client"
+        );
+    }
+
+    // ---- CA-issued per-node certs (real mutual auth of distinct identities) --
+
+    /// A fresh CA (root cert + signing key).
+    fn make_ca() -> (rcgen::Certificate, rcgen::KeyPair) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+        let mut p = CertificateParams::new(Vec::new()).unwrap();
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let key = KeyPair::generate().unwrap();
+        let cert = p.self_signed(&key).unwrap();
+        (cert, key)
+    }
+
+    /// A leaf cert (chain + key) for `name`, signed by `ca`. Usable as both a
+    /// server and client cert (serverAuth + clientAuth EKUs).
+    fn ca_leaf(
+        ca: &(rcgen::Certificate, rcgen::KeyPair),
+        name: &str,
+    ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
+        let mut p =
+            CertificateParams::new(vec![name.to_string(), "localhost".to_string()]).unwrap();
+        p.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let key = KeyPair::generate().unwrap();
+        let cert = p.signed_by(&key, &ca.0, &ca.1).unwrap();
+        (
+            vec![cert.der().clone()],
+            PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+        )
+    }
+
+    fn ca_roots(ca: &(rcgen::Certificate, rcgen::KeyPair)) -> RootCertStore {
+        let mut r = RootCertStore::empty();
+        r.add(ca.0.der().clone()).unwrap();
+        r
+    }
+
+    #[tokio::test]
+    async fn mtls_ca_accepts_peer_signed_by_cluster_ca() {
+        tls::install_crypto_provider();
+        let ca = make_ca();
+        let (s_chain, s_key) = ca_leaf(&ca, "server");
+        let (c_chain, c_key) = ca_leaf(&ca, "client");
+        let server_cfg = Arc::new(tls::server_config(ca_roots(&ca), s_chain, s_key).unwrap());
+        let client_cfg = Arc::new(tls::client_config(ca_roots(&ca), c_chain, c_key).unwrap());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            TcpTransport::accept_tls(tcp, "client", &TransportConfig::default(), server_cfg).await
+        });
+        let client = TcpTransport::connect_tls(
+            &addr.to_string(),
+            "localhost",
+            "server",
+            &TransportConfig::default(),
+            client_cfg,
+        )
+        .await
+        .expect("CA-signed client must be accepted");
+        let server = accept
+            .await
+            .unwrap()
+            .expect("server accepts CA-signed client");
+
+        client.send(Channel::Messages, b"ca-ping").unwrap();
+        assert_eq!(recv(&server, Channel::Messages).await, b"ca-ping");
+    }
+
+    #[tokio::test]
+    async fn mtls_ca_rejects_peer_signed_by_foreign_ca() {
+        tls::install_crypto_provider();
+        let cluster = make_ca();
+        let foreign = make_ca(); // a different CA, not in the cluster trust store
+        let (s_chain, s_key) = ca_leaf(&cluster, "server");
+        // Client trusts the cluster CA (so it accepts the server) but presents a
+        // cert signed by the FOREIGN CA — the server must reject it.
+        let (c_chain, c_key) = ca_leaf(&foreign, "intruder");
+        let server_cfg = Arc::new(tls::server_config(ca_roots(&cluster), s_chain, s_key).unwrap());
+        let client_cfg = Arc::new(tls::client_config(ca_roots(&cluster), c_chain, c_key).unwrap());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            TcpTransport::accept_tls(tcp, "intruder", &TransportConfig::default(), server_cfg).await
+        });
+        let _ = TcpTransport::connect_tls(
+            &addr.to_string(),
+            "localhost",
+            "server",
+            &TransportConfig::default(),
+            client_cfg,
+        )
+        .await;
+
+        // Server is authoritative: a cert that doesn't chain to the cluster CA
+        // is refused, proving the CA actually verifies the chain.
+        assert!(
+            accept.await.unwrap().is_err(),
+            "server must reject a peer whose cert is signed by a foreign CA"
         );
     }
 }

@@ -1053,6 +1053,17 @@ impl ActorSystem {
         Self { tokio_rt, inner }
     }
 
+    /// A handle to this system's tokio runtime, for subsystems that need to
+    /// run their own async I/O on the same runtime the cluster already uses
+    /// (e.g. cs-net TCP/QUIC socket pumps driven by cs-runtime's `distrib`
+    /// transport builtins). `Handle::spawn` schedules a task; `Handle::block_on`
+    /// runs a future to completion from a non-runtime thread (the cluster
+    /// bootstrap path) — do not call `block_on` from inside an actor body
+    /// (a runtime worker), which would panic.
+    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.inner.handle.clone()
+    }
+
     /// Spawn an actor running `body`, returning its handle.
     ///
     /// `body` receives a mutable [`Actor`] reference; from inside,

@@ -259,6 +259,15 @@ impl Runtime {
                 vm_env.define(sym, cs_vm::vm::make_vm_builtin_syms(name, f));
             }
         }
+        // Cross-node transport primops (the `distrib` feature) — same Syms
+        // shape, registered on the VM tier alongside the BEAM primops.
+        #[cfg(feature = "distrib")]
+        {
+            for (name, f) in builtins::distrib::distrib_syms_builtins() {
+                let sym = syms.intern(name);
+                vm_env.define(sym, cs_vm::vm::make_vm_builtin_syms(name, f));
+            }
+        }
         // Mirror the walker tier's record-parent registry so define-record-type
         // works the same on both tiers (predicates look it up at runtime).
         let registry_sym = syms.intern(builtins::RECORD_PARENTS_REGISTRY);

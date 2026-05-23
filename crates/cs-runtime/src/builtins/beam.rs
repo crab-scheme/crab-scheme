@@ -331,6 +331,215 @@ pub fn primop_spawn(name: &str, args: Vec<SendableValue>) -> Result<ActorPid, St
     Ok(actor_ref.pid())
 }
 
+/// `(spawn-source SOURCE ENTRY args...)` — spawn an actor whose body is a
+/// *Scheme* procedure, not a pre-registered Rust closure.
+///
+/// Why source + a name instead of a closure? A Scheme `Value::Procedure` is
+/// `Rc`-based and therefore `!Send`; an actor body must be `Send + 'static`
+/// because it runs via `block_in_place` on a worker of the multi-thread
+/// runtime (a *different* thread than the spawner). So a closure literally
+/// cannot cross the boundary. Instead we capture only `String`s (Send), and
+/// on the actor's own worker thread build a fresh per-actor [`crate::Runtime`],
+/// load `source` (rebuilding the whole global env — every `Rc` Value stays
+/// thread-local), resolve `entry`, and apply it. `args` cross as data
+/// (`SendableValue`), exactly like mailbox messages. This is the bridge that
+/// lets actor *logic live in Scheme* (Constitution Article I) while honoring
+/// the runtime's `!Send` Value type.
+pub fn primop_spawn_source(
+    source: String,
+    entry: String,
+    args: Vec<SendableValue>,
+) -> Result<ActorPid, String> {
+    let st = beam_state();
+    let body = scheme_source_entry(source, entry);
+    let actor_ref = st
+        .actors
+        .spawn_sync_body_on_task(move |actor| run_actor_body(actor, body, args));
+    Ok(actor_ref.pid())
+}
+
+/// Build a `Send + Sync` [`ActorEntry`] that runs a Scheme body. The closure
+/// captures only `String`s — never an `Rc`-based Scheme value — so it crosses
+/// onto the actor's worker thread cleanly. The `Rc` graph is created *inside*
+/// the closure, on that thread, and never escapes it.
+fn scheme_source_entry(source: String, entry: String) -> ActorEntry {
+    Arc::new(move |_actor, args| {
+        if let Err(e) = run_scheme_body(&source, &entry, &args) {
+            // The actor terminates (the body returned/aborted). Surface the
+            // reason loudly rather than dying silently — Article VI.
+            eprintln!("spawn-source: actor `{entry}` terminated: {e}");
+        }
+    })
+}
+
+/// On the actor's worker thread: stand up a fresh Runtime, load the body
+/// source, resolve `entry` to a procedure, and call it with `args`. The
+/// `(self)` / `(raw-receive)` / `(send …)` builtins the body uses reach this
+/// actor through `ACTOR_CTX`, which [`run_actor_body`] installed before
+/// invoking us.
+fn run_scheme_body(source: &str, entry: &str, args: &[SendableValue]) -> Result<(), String> {
+    let mut rt = crate::Runtime::new();
+    rt.eval_str("<spawn-source>", source)
+        .map_err(|d| format!("loading actor source failed: {d:?}"))?;
+    match rt.lookup(entry) {
+        Some(Value::Procedure(_)) => {}
+        Some(other) => {
+            return Err(format!(
+                "top-level `{entry}` is {}, not a procedure",
+                other.type_name()
+            ));
+        }
+        None => return Err(format!("no top-level `{entry}` defined in the source")),
+    }
+    // Apply by re-entering eval with the args rendered as quoted external
+    // datums: `(entry 'a0 'a1 ...)`. This needs only the public
+    // eval/lookup surface (no mutable SymbolTable access) and reuses the
+    // reader's own interning, so symbols/strings/lists round-trip exactly.
+    let call = build_call_expr(entry, args)?;
+    rt.eval_str("<spawn-call>", &call)
+        .map_err(|d| format!("actor body raised: {d:?}"))?;
+    Ok(())
+}
+
+/// Render `(entry 'arg0 'arg1 ...)`. Each argument is `quote`d so that a
+/// symbol stays a symbol and a list stays a list (rather than being read as a
+/// call). Nested data inside an argument needs no further quoting — it is
+/// already under the outer `quote`.
+fn build_call_expr(entry: &str, args: &[SendableValue]) -> Result<String, String> {
+    let mut s = String::from("(");
+    s.push_str(entry);
+    for a in args {
+        s.push_str(" '");
+        sendable_to_datum(a, &mut s)?;
+    }
+    s.push(')');
+    Ok(s)
+}
+
+/// Write a [`SendableValue`] as its Scheme external (read) representation.
+/// The result is a *datum* (no leading quote); callers that need it to
+/// self-evaluate add the `quote`. Matches the reader so a round-trip through
+/// `eval_str` reconstructs the same value.
+fn sendable_to_datum(s: &SendableValue, out: &mut String) -> Result<(), String> {
+    match s {
+        SendableValue::Null => out.push_str("()"),
+        SendableValue::Boolean(b) => out.push_str(if *b { "#t" } else { "#f" }),
+        SendableValue::Fixnum(n) => out.push_str(&n.to_string()),
+        SendableValue::Flonum(f) => out.push_str(&flonum_datum(*f)),
+        SendableValue::BigInt(d) => out.push_str(d), // decimal string reads as a bignum
+        SendableValue::Character(c) => out.push_str(&char_datum(*c)),
+        SendableValue::String(st) => string_datum(st, out),
+        // Inside the outer quote this becomes a symbol again.
+        SendableValue::Symbol(name) => out.push_str(name),
+        SendableValue::Pair(car, cdr) => {
+            out.push('(');
+            sendable_to_datum(car, out)?;
+            let mut rest = cdr.as_ref();
+            loop {
+                match rest {
+                    SendableValue::Null => break,
+                    SendableValue::Pair(h, t) => {
+                        out.push(' ');
+                        sendable_to_datum(h, out)?;
+                        rest = t.as_ref();
+                    }
+                    other => {
+                        out.push_str(" . ");
+                        sendable_to_datum(other, out)?;
+                        break;
+                    }
+                }
+            }
+            out.push(')');
+        }
+        SendableValue::Vector(items) => {
+            out.push_str("#(");
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                sendable_to_datum(it, out)?;
+            }
+            out.push(')');
+        }
+        SendableValue::ByteVector(bytes) => {
+            out.push_str("#vu8(");
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                out.push_str(&b.to_string());
+            }
+            out.push(')');
+        }
+        // A PID passed as a *spawn argument* is uncommon (peers normally
+        // arrive via messages, which use `from_sendable` directly). Reject it
+        // rather than emit a token whose symbol-readability we can't depend
+        // on — keeps the bridge honest about what it guarantees.
+        SendableValue::Pid(_) => {
+            return Err(
+                "a PID cannot be a spawn-source argument; send it as a message instead".into(),
+            );
+        }
+        SendableValue::Unspecified => {
+            return Err("the unspecified value cannot be a spawn-source argument".into());
+        }
+        SendableValue::Eof => {
+            return Err("the eof object cannot be a spawn-source argument".into());
+        }
+    }
+    Ok(())
+}
+
+/// A flonum in a form the reader takes as a flonum (never as a fixnum):
+/// always carries a `.`/exponent, with the R6RS spellings for the specials.
+fn flonum_datum(f: f64) -> String {
+    if f.is_nan() {
+        return "+nan.0".into();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 {
+            "+inf.0".into()
+        } else {
+            "-inf.0".into()
+        };
+    }
+    let s = format!("{f}");
+    if s.contains(['.', 'e', 'E']) {
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
+/// A character literal (`#\a`, with names for the unprintables).
+fn char_datum(c: char) -> String {
+    match c {
+        ' ' => "#\\space".into(),
+        '\n' => "#\\newline".into(),
+        '\t' => "#\\tab".into(),
+        '\r' => "#\\return".into(),
+        '\0' => "#\\nul".into(),
+        other => format!("#\\{other}"),
+    }
+}
+
+/// A string literal with the minimal escaping the reader needs.
+fn string_datum(st: &str, out: &mut String) {
+    out.push('"');
+    for ch in st.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+}
+
 /// Sync inner of the actor body: installs the yield hook,
 /// ACTOR_CTX, REDUCTIONS counter, runs `entry`, cleans up via
 /// RAII Guard. Factored out so the spawn_async closure shape
@@ -852,6 +1061,36 @@ pub fn b_beam_spawn(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Str
     Ok(from_sendable(&SendableValue::Pid(pid), syms))
 }
 
+/// `(spawn-source SOURCE ENTRY arg ...)` — spawn an actor running a Scheme
+/// body. `SOURCE` is a string of Scheme loaded into a fresh per-actor Runtime
+/// on the actor's own thread; `ENTRY` (symbol or string) names the top-level
+/// procedure to run; `arg ...` are passed to it. Returns the new PID.
+///
+/// This is the Scheme-on-actor path that `(spawn name …)` cannot be: a raw
+/// `(lambda …)` is `Rc`-based / `!Send` and so can't move onto the actor's
+/// worker thread. See [`primop_spawn_source`].
+pub fn b_beam_spawn_source(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err("spawn-source: expected a SOURCE string, an ENTRY name, and 0+ args".into());
+    }
+    let source = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        other => {
+            return Err(format!(
+                "spawn-source: SOURCE must be a string, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let entry = value_to_str(&args[1], syms, "spawn-source")?;
+    let mut sendable_args = Vec::with_capacity(args.len() - 2);
+    for a in &args[2..] {
+        sendable_args.push(to_sendable_in(a, syms)?);
+    }
+    let pid = primop_spawn_source(source, entry, sendable_args)?;
+    Ok(from_sendable(&SendableValue::Pid(pid), syms))
+}
+
 /// `(self)` — return the calling actor's PID as a symbol.
 /// Errors if called from outside an actor body.
 pub fn b_beam_self(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
@@ -1190,6 +1429,7 @@ pub fn beam_syms_builtins() -> Vec<(
         // actor
         ("send", b_beam_send),
         ("spawn", b_beam_spawn),
+        ("spawn-source", b_beam_spawn_source),
         ("self", b_beam_self),
         ("raw-receive", b_beam_raw_receive),
         // reductions (B3 first half: cooperative-yield seam)
@@ -1454,6 +1694,105 @@ mod tests {
         }
 
         assert_eq!(*received.lock().unwrap(), Some(SendableValue::Fixnum(42)));
+    }
+
+    #[test]
+    fn spawn_source_datum_rendering() {
+        // The arg bridge: a SendableValue must render to an external datum the
+        // reader reconstructs identically. (build_call_expr quotes each arg.)
+        fn d(s: &SendableValue) -> String {
+            let mut out = String::new();
+            sendable_to_datum(s, &mut out).expect("datum");
+            out
+        }
+        assert_eq!(d(&SendableValue::Fixnum(42)), "42");
+        assert_eq!(d(&SendableValue::Boolean(true)), "#t");
+        assert_eq!(d(&SendableValue::Boolean(false)), "#f");
+        assert_eq!(d(&SendableValue::Null), "()");
+        assert_eq!(d(&SendableValue::Symbol("foo".into())), "foo");
+        assert_eq!(d(&SendableValue::String("a\"b".into())), "\"a\\\"b\"");
+        assert_eq!(d(&SendableValue::Flonum(1.0)), "1.0"); // never reads back as a fixnum
+        assert_eq!(d(&SendableValue::Flonum(1.5)), "1.5");
+
+        // proper list (set "k" 7)
+        let lst = SendableValue::Pair(
+            Box::new(SendableValue::Symbol("set".into())),
+            Box::new(SendableValue::Pair(
+                Box::new(SendableValue::String("k".into())),
+                Box::new(SendableValue::Pair(
+                    Box::new(SendableValue::Fixnum(7)),
+                    Box::new(SendableValue::Null),
+                )),
+            )),
+        );
+        assert_eq!(d(&lst), "(set \"k\" 7)");
+
+        // improper pair (a . b) and a vector
+        let dotted = SendableValue::Pair(
+            Box::new(SendableValue::Symbol("a".into())),
+            Box::new(SendableValue::Symbol("b".into())),
+        );
+        assert_eq!(d(&dotted), "(a . b)");
+        assert_eq!(
+            d(&SendableValue::Vector(vec![
+                SendableValue::Fixnum(1),
+                SendableValue::Fixnum(2)
+            ])),
+            "#(1 2)"
+        );
+
+        // the call expr quotes each argument
+        let call = build_call_expr(
+            "main",
+            &[SendableValue::Symbol("x".into()), SendableValue::Fixnum(3)],
+        )
+        .unwrap();
+        assert_eq!(call, "(main 'x '3)");
+
+        // values with no readable datum are rejected at the boundary
+        let mut sink = String::new();
+        assert!(sendable_to_datum(&SendableValue::Unspecified, &mut sink).is_err());
+    }
+
+    #[test]
+    fn spawn_source_runs_scheme_body() {
+        // First end-to-end proof that a *Scheme* procedure runs as an actor
+        // body on its own worker thread (the !Send bridge). The body squares
+        // the number it receives and writes the result into the process-global
+        // table — the cross-thread channel the test thread reads. No PID
+        // round-trip, no Rust-registered closure: the logic is Scheme.
+        let table = "spawn-src-sq-test";
+        primop_make_table(table, "set").expect("make table");
+
+        let body = r#"
+            (define (squarer key)
+              (let ((n (raw-receive)))
+                (table-insert! 'spawn-src-sq-test key (* n n))))
+        "#;
+
+        let pid = primop_spawn_source(
+            body.to_string(),
+            "squarer".to_string(),
+            vec![SendableValue::String("sq".into())],
+        )
+        .expect("spawn-source");
+        primop_send(pid, SendableValue::Fixnum(9)).expect("send");
+
+        // Building a per-actor Runtime (full stdlib) then evaluating takes a
+        // moment in debug; poll generously.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let got = primop_table_lookup(table, &SendableValue::String("sq".into()))
+                .expect("table lookup");
+            if let Some(v) = got {
+                assert_eq!(v, SendableValue::Fixnum(81));
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("scheme actor body never wrote its result");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

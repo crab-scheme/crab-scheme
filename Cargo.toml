@@ -132,6 +132,11 @@ cs-actor = { path = "crates/cs-actor" }
 cs-channel = { path = "crates/cs-channel" }
 cs-table = { path = "crates/cs-table" }
 cs-hotreload = { path = "crates/cs-hotreload" }
+# Cluster transport substrate. Optional deps of cs-runtime behind the
+# `distrib` feature, which exposes cross-node send/poll builtins driving
+# cs-distrib's Router over cs-net transports.
+cs-net = { path = "crates/cs-net" }
+cs-distrib = { path = "crates/cs-distrib" }
 # cs-web declares `default-features = false` here so downstream
 # crates (like cs-web-mod-example, which compiles AS a cs-web
 # plugin and does NOT need libloading/cs-actor) can opt out.

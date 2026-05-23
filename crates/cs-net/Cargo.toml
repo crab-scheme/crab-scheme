@@ -29,6 +29,11 @@ ws = ["dep:tokio-tungstenite"]
 # In-memory simulation transport: deterministic, no syscalls. Used by
 # the unit-test suite and the future cs-sim deterministic simulator.
 sim = []
+# Dev/test self-signed mTLS identity (rcgen), shared process-wide. Lets a
+# single-process cluster exercise the real mutual-TLS handshake (TCP + QUIC)
+# without external cert management. NOT for production. Surfaced through
+# cs-runtime's `distrib` transport builtins.
+dev-certs = ["dep:rcgen"]
 
 [dependencies.rustls]
 version = "0.23"
@@ -50,6 +55,11 @@ features = ["runtime-tokio", "rustls"]
 
 [dependencies.tokio-tungstenite]
 version = "0.24"
+optional = true
+
+# Self-signed cert generation for the `dev-certs` feature (dev/test only).
+[dependencies.rcgen]
+version = "0.13"
 optional = true
 
 [dev-dependencies]

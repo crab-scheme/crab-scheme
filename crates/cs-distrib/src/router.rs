@@ -108,6 +108,13 @@ impl Router {
         &self.node
     }
 
+    /// Number of peers currently registered. Used to wait for a cluster's
+    /// connections to be fully established before driving traffic (peers are
+    /// added asynchronously on the accepting side of a TCP connection).
+    pub fn peer_count(&self) -> usize {
+        self.peers.lock().expect("peers poisoned").len()
+    }
+
     /// Register (or replace) the transport to `peer`.
     pub fn add_peer(&self, peer: NodeId, transport: Box<dyn Transport>) {
         self.peers.lock().expect("peers poisoned").insert(
