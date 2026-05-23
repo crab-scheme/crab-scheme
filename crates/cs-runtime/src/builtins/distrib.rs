@@ -135,6 +135,12 @@ pub fn primop_node_poll(node: &str) -> Result<Vec<SendableValue>, String> {
     Ok(out)
 }
 
+/// Number of peers currently registered on `node`. A cluster bootstrap waits
+/// on this because TCP peers are added asynchronously on the accepting side.
+pub fn primop_node_peer_count(node: &str) -> Result<usize, String> {
+    Ok(lookup_router(node, "node-peer-count")?.peer_count())
+}
+
 //
 // TCP transport — real cross-process / cross-machine sockets.
 //
@@ -330,6 +336,17 @@ pub fn b_node_connect(args: &[Value], syms: &mut SymbolTable) -> Result<Value, S
     Ok(Value::Unspecified)
 }
 
+/// `(node-peer-count NODE)` — how many peers NODE has registered.
+pub fn b_node_peer_count(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("node-peer-count: expected (node-peer-count NODE)".into());
+    }
+    let node = name_of(&args[0], syms, "node-peer-count")?;
+    Ok(Value::Number(cs_core::Number::Fixnum(
+        primop_node_peer_count(&node)? as i64,
+    )))
+}
+
 /// The Scheme-facing distrib builtins, in the `(name, fn)` shape the
 /// registration loops accept. Merged into cs-runtime's walker + VM env when
 /// the `distrib` feature is on.
@@ -342,6 +359,7 @@ pub fn distrib_syms_builtins() -> Vec<(
         ("node-link!", b_node_link),
         ("node-listen", b_node_listen),
         ("node-connect", b_node_connect),
+        ("node-peer-count", b_node_peer_count),
         ("node-send", b_node_send),
         ("node-poll", b_node_poll),
     ]

@@ -182,26 +182,33 @@ The actor cluster above shares one process's mailboxes. The next step out is a
 real cluster transport: replicas that exchange messages between **nodes**, each
 Raft RPC serialized, framed, and routed — the cs-net / cs-distrib stack.
 
-cs-runtime's `distrib` feature exposes four builtins driving cs-distrib's
+cs-runtime's `distrib` feature exposes builtins driving cs-distrib's
 synchronous `Router` over a cs-net `Transport`:
 
 - `(node-make NAME)` — a node (Router) named NAME.
-- `(node-link! A B)` — connect two nodes (sim transport; tcp/quic share the
-  same `Transport` trait).
+- `(node-link! A B)` — connect two nodes with the in-memory **sim** transport.
+- `(node-listen NODE ADDR)` / `(node-connect NODE PEER-ADDR)` — connect nodes
+  over real **TCP** (`node-listen` returns the bound addr; `"127.0.0.1:0"`
+  picks an ephemeral port). A length-prefixed cs-distrib `Hello` handshake
+  exchanges NodeIds; socket I/O runs on cs-actor's tokio runtime.
+- `(node-peer-count NODE)` — registered peers (TCP peers register
+  asynchronously on the accepting side, so a bootstrap waits on this).
 - `(node-send FROM TO MSG)` — MSG crosses as data: Scheme value →
   `SendableValue` → a compact byte frame → `Router.send` (framed `DistPid ‖
   payload`).
 - `(node-poll NODE)` — pump NODE's transports and return the decoded messages.
 
-`lib/consensus/raft-net.scm` (`crabscheme run lib/consensus/raft-net.scm`,
-body in `raft-net-body.scm`) runs 3 replicas as `spawn-source` actors that own
-their state and talk **only** over cs-net — every RequestVote/AppendEntries is
-serialized and routed through the transport, decoded on the far node. They
-elect a leader, replicate 3 writes, and converge (commit `(3 3 3)`, `user:1 =
-alice` on a/b/c); stable across 12/12 runs. The transport here is the
-deterministic in-memory `sim` transport, so the routing + serialization path is
-identical to a real socket hop — tcp/quic are the same trait, the remaining
-socket-bootstrap wiring aside.
+The replica body `raft-net-body.scm` is transport-agnostic (only
+`node-send`/`node-poll`), so the **same** 3 replicas run over either transport:
+
+- **sim:** `lib/consensus/raft-net.scm` — replicas as `spawn-source` actors that
+  own their state and talk only over cs-net; deterministic in-memory transport;
+  elect a leader, replicate 3 writes, converge (commit `(3 3 3)`, `user:1 =
+  alice` on a/b/c); 12/12 stable.
+- **real TCP:** `lib/consensus/raft-net-tcp.scm` — identical cluster over actual
+  loopback TCP sockets (every RPC over a real connection); 10/10 stable. The
+  Rust test `two_nodes_send_and_poll_over_real_tcp` proves the socket round-trip
+  directly.
 
 ## Remaining for a production benchmark
 
@@ -210,9 +217,10 @@ socket-bootstrap wiring aside.
    (`pmap.scm`, Article II intact).
 3. **EPaxos dependency index** — key-bucket `cmds` to flatten the
    non-conflicting `deps-and-seq` scan (couples to key-based interference).
-4. **Run over real transport** — ~~actor-driven in-process~~ (`raft-cluster.scm`)
-   and ~~cross-node over cs-net~~ (`raft-net.scm`, the `distrib` builtins over the
-   sim transport) both done. Remaining: the **tcp/quic socket bootstrap** (the
-   same `Transport` trait, plus listen/accept/connect wiring) for cross-*machine*
-   runs.
+4. **Run over real transport** — done: ~~actor-driven in-process~~
+   (`raft-cluster.scm`), ~~cross-node over the sim transport~~ (`raft-net.scm`),
+   and ~~cross-node over real TCP sockets~~ (`raft-net-tcp.scm`). Remaining for
+   production: **QUIC** transport selection + **mTLS** certs on the socket
+   bootstrap (both already implemented in cs-net; just not yet surfaced through
+   the `distrib` builtins).
 5. **JIT tier** instead of the tree-walker for the protocol compute.
