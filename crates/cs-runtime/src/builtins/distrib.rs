@@ -41,8 +41,7 @@ use cs_distrib::router::Router;
 use cs_distrib::NodeId;
 use cs_net::sim::SimPair;
 use cs_net::tcp::TcpTransport;
-use cs_net::{Transport, TransportConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use cs_net::{Channel, Transport, TransportConfig};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::beam::{beam_state, from_sendable, to_sendable_in, SendableValue};
@@ -142,54 +141,80 @@ pub fn primop_node_peer_count(node: &str) -> Result<usize, String> {
 }
 
 //
-// TCP transport — real cross-process / cross-machine sockets.
-//
-// node-link! is the in-memory sim transport; these connect nodes over actual
-// TCP. The socket I/O runs on cs-actor's tokio runtime (the one the cluster
-// already uses) via ActorSystem::runtime_handle — no second runtime. Once a
-// connection is up the routing/serialization is identical to the sim path
-// (same Router, same DistPid framing, same SendableValue codec), so the
-// consensus engine and the (node-send/node-poll) builtins are unchanged.
+// TCP transport — real cross-process / cross-machine sockets (plaintext or
+// mutual-TLS). node-link! is the in-memory sim transport; these connect nodes
+// over actual TCP. Socket I/O runs on cs-actor's tokio runtime (the one the
+// cluster already uses) via ActorSystem::runtime_handle — no second runtime.
+// Once a connection is up the routing/serialization is identical to the sim
+// path, so the consensus engine and the (node-send/node-poll) builtins are
+// unchanged.
 //
 
-/// Exchange `Hello`s on a freshly connected stream (length-prefixed, before
-/// the [`TcpTransport`] framing takes over), returning the accepted peer's
-/// `NodeId`. Both sides write then read, so it works symmetrically for the
-/// connector and the acceptor.
-async fn exchange_hello(stream: &mut TcpStream, local: &NodeId) -> Result<NodeId, String> {
-    let bytes = Hello::new(local.clone(), 0).encode_vec();
-    stream
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await
-        .map_err(|e| format!("handshake write len: {e}"))?;
-    stream
-        .write_all(&bytes)
-        .await
-        .map_err(|e| format!("handshake write hello: {e}"))?;
+/// Plaintext TCP vs. mutual-TLS (and below, QUIC, which is always mTLS).
+#[derive(Clone, Copy)]
+enum Security {
+    Plain,
+    Mtls,
+}
 
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| format!("handshake read len: {e}"))?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| format!("handshake read hello: {e}"))?;
-    let peer = Hello::decode(&buf).map_err(|e| format!("handshake decode: {e}"))?;
-    match evaluate_hello(local, &peer, 0, None) {
-        HandshakeOutcome::Accepted { peer, .. } => Ok(peer),
-        HandshakeOutcome::Quarantine { reason } => Err(format!("handshake quarantine: {reason}")),
+/// Exchange `Hello`s over an established transport's `Control` channel,
+/// returning the accepted peer's `NodeId`. Works for ANY transport — sim, TCP,
+/// mTLS-over-TCP, QUIC — because it only uses the `Transport` trait, so the
+/// node-identity handshake is independent of how the bytes are carried (and of
+/// any TLS handshake the transport already did). Both sides send then poll, so
+/// it is symmetric for connector and acceptor.
+async fn handshake_over_transport(t: &dyn Transport, local: &NodeId) -> Result<NodeId, String> {
+    t.send(Channel::Control, &Hello::new(local.clone(), 0).encode_vec())
+        .map_err(|e| format!("handshake send: {e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match t
+            .try_recv(Channel::Control)
+            .map_err(|e| format!("handshake recv: {e}"))?
+        {
+            Some(bytes) => {
+                let peer = Hello::decode(&bytes).map_err(|e| format!("handshake decode: {e}"))?;
+                return match evaluate_hello(local, &peer, 0, None) {
+                    HandshakeOutcome::Accepted { peer, .. } => Ok(peer),
+                    HandshakeOutcome::Quarantine { reason } => {
+                        Err(format!("handshake quarantine: {reason}"))
+                    }
+                };
+            }
+            None => {
+                if std::time::Instant::now() > deadline {
+                    return Err("handshake timed out waiting for peer Hello".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+    }
+}
+
+/// Wrap an accepted TCP stream per the security mode into a boxed transport.
+async fn wrap_accepted(
+    stream: TcpStream,
+    sec: Security,
+    cfg: &TransportConfig,
+) -> Result<Box<dyn Transport>, String> {
+    let _ = stream.set_nodelay(true);
+    match sec {
+        Security::Plain => Ok(Box::new(TcpTransport::from_stream(stream, "peer", cfg))),
+        Security::Mtls => {
+            let sc = cs_net::tls::dev::server_config().map_err(|e| format!("mtls config: {e}"))?;
+            let t = TcpTransport::accept_tls(stream, "peer", cfg, sc)
+                .await
+                .map_err(|e| format!("mtls accept: {e}"))?;
+            Ok(Box::new(t))
+        }
     }
 }
 
 /// Bind `node` to a TCP `addr` and accept inbound connections forever (on the
-/// cluster runtime), handshaking + registering each as a peer. Returns the
-/// actual bound address (so callers can `(node-listen NODE "127.0.0.1:0")` and
-/// publish the chosen port).
-pub fn primop_node_listen(node: &str, addr: &str) -> Result<String, String> {
+/// cluster runtime), running the identity handshake + registering each as a
+/// peer. Returns the actual bound address (so `(node-listen NODE "127.0.0.1:0")`
+/// can publish the chosen port).
+fn listen_impl(node: &str, addr: &str, sec: Security) -> Result<String, String> {
     let router = lookup_router(node, "node-listen")?;
     let local = node_id(node);
     let handle = beam_state().actors.runtime_handle();
@@ -207,16 +232,13 @@ pub fn primop_node_listen(node: &str, addr: &str) -> Result<String, String> {
     handle.spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((mut stream, _)) => {
-                    let _ = stream.set_nodelay(true);
-                    match exchange_hello(&mut stream, &local).await {
-                        Ok(peer) => {
-                            let t = TcpTransport::from_stream(stream, peer.label(), &cfg);
-                            router.add_peer(peer, Box::new(t) as Box<dyn Transport>);
-                        }
+                Ok((stream, _)) => match wrap_accepted(stream, sec, &cfg).await {
+                    Ok(t) => match handshake_over_transport(t.as_ref(), &local).await {
+                        Ok(peer) => router.add_peer(peer, t),
                         Err(e) => eprintln!("node-listen {}: {e}", local.label()),
-                    }
-                }
+                    },
+                    Err(e) => eprintln!("node-listen {}: {e}", local.label()),
+                },
                 Err(e) => {
                     eprintln!("node-listen {}: accept: {e}", local.label());
                     break;
@@ -227,11 +249,10 @@ pub fn primop_node_listen(node: &str, addr: &str) -> Result<String, String> {
     Ok(bound)
 }
 
-/// Connect `node` to a peer listening at `peer_addr` over TCP, handshake, and
-/// register the peer. Synchronous from the caller's view (the connection is up
-/// when this returns). Call from the cluster bootstrap (main) thread, not an
-/// actor body.
-pub fn primop_node_connect(node: &str, peer_addr: &str) -> Result<(), String> {
+/// Connect `node` to a peer listening at `peer_addr`, handshake, register the
+/// peer. Synchronous from the caller's view. Call from the cluster bootstrap
+/// (main) thread, not an actor body.
+fn connect_impl(node: &str, peer_addr: &str, sec: Security) -> Result<(), String> {
     let router = lookup_router(node, "node-connect")?;
     let local = node_id(node);
     let handle = beam_state().actors.runtime_handle();
@@ -239,15 +260,48 @@ pub fn primop_node_connect(node: &str, peer_addr: &str) -> Result<(), String> {
     let peer_addr_owned = peer_addr.to_string();
 
     handle.block_on(async move {
-        let mut stream = TcpStream::connect(&peer_addr_owned)
-            .await
-            .map_err(|e| format!("node-connect: connect {peer_addr_owned}: {e}"))?;
-        let _ = stream.set_nodelay(true);
-        let peer = exchange_hello(&mut stream, &local).await?;
-        let t = TcpTransport::from_stream(stream, peer.label(), &cfg);
-        router.add_peer(peer, Box::new(t) as Box<dyn Transport>);
+        let t: Box<dyn Transport> = match sec {
+            Security::Plain => {
+                let stream = TcpStream::connect(&peer_addr_owned)
+                    .await
+                    .map_err(|e| format!("node-connect: connect {peer_addr_owned}: {e}"))?;
+                let _ = stream.set_nodelay(true);
+                Box::new(TcpTransport::from_stream(stream, "peer", &cfg))
+            }
+            Security::Mtls => {
+                let cc =
+                    cs_net::tls::dev::client_config().map_err(|e| format!("mtls config: {e}"))?;
+                // server_name "localhost" matches the dev cert SAN.
+                let t = TcpTransport::connect_tls(&peer_addr_owned, "localhost", "peer", &cfg, cc)
+                    .await
+                    .map_err(|e| format!("mtls connect {peer_addr_owned}: {e}"))?;
+                Box::new(t)
+            }
+        };
+        let peer = handshake_over_transport(t.as_ref(), &local).await?;
+        router.add_peer(peer, t);
         Ok::<(), String>(())
     })
+}
+
+/// `(node-listen NODE ADDR)` — plaintext TCP.
+pub fn primop_node_listen(node: &str, addr: &str) -> Result<String, String> {
+    listen_impl(node, addr, Security::Plain)
+}
+
+/// `(node-connect NODE PEER-ADDR)` — plaintext TCP.
+pub fn primop_node_connect(node: &str, peer_addr: &str) -> Result<(), String> {
+    connect_impl(node, peer_addr, Security::Plain)
+}
+
+/// `(node-listen-tls NODE ADDR)` — TCP with mutual TLS (dev identity).
+pub fn primop_node_listen_tls(node: &str, addr: &str) -> Result<String, String> {
+    listen_impl(node, addr, Security::Mtls)
+}
+
+/// `(node-connect-tls NODE PEER-ADDR)` — TCP with mutual TLS (dev identity).
+pub fn primop_node_connect_tls(node: &str, peer_addr: &str) -> Result<(), String> {
+    connect_impl(node, peer_addr, Security::Mtls)
 }
 
 //
@@ -336,6 +390,30 @@ pub fn b_node_connect(args: &[Value], syms: &mut SymbolTable) -> Result<Value, S
     Ok(Value::Unspecified)
 }
 
+/// `(node-listen-tls NODE ADDR)` — listen for mTLS TCP peers; returns the addr.
+pub fn b_node_listen_tls(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("node-listen-tls: expected (node-listen-tls NODE ADDR)".into());
+    }
+    let node = name_of(&args[0], syms, "node-listen-tls")?;
+    let addr = name_of(&args[1], syms, "node-listen-tls")?;
+    let bound = primop_node_listen_tls(&node, &addr)?;
+    Ok(Value::String(cs_core::Gc::new(std::cell::RefCell::new(
+        bound,
+    ))))
+}
+
+/// `(node-connect-tls NODE PEER-ADDR)` — connect NODE to a peer with mutual TLS.
+pub fn b_node_connect_tls(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("node-connect-tls: expected (node-connect-tls NODE PEER-ADDR)".into());
+    }
+    let node = name_of(&args[0], syms, "node-connect-tls")?;
+    let addr = name_of(&args[1], syms, "node-connect-tls")?;
+    primop_node_connect_tls(&node, &addr)?;
+    Ok(Value::Unspecified)
+}
+
 /// `(node-peer-count NODE)` — how many peers NODE has registered.
 pub fn b_node_peer_count(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if args.len() != 1 {
@@ -359,6 +437,8 @@ pub fn distrib_syms_builtins() -> Vec<(
         ("node-link!", b_node_link),
         ("node-listen", b_node_listen),
         ("node-connect", b_node_connect),
+        ("node-listen-tls", b_node_listen_tls),
+        ("node-connect-tls", b_node_connect_tls),
         ("node-peer-count", b_node_peer_count),
         ("node-send", b_node_send),
         ("node-poll", b_node_poll),
@@ -652,6 +732,35 @@ mod tests {
             }
             if std::time::Instant::now() >= deadline {
                 panic!("message never arrived over TCP");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn two_nodes_send_and_poll_over_mtls() {
+        // The encrypted + mutually authenticated path: same as the TCP test but
+        // the connection runs a real TLS 1.3 mutual handshake (dev identity)
+        // before any frame flows. Proves node-listen-tls / node-connect-tls.
+        primop_node_make("mtls-a").expect("make a");
+        primop_node_make("mtls-b").expect("make b");
+        let addr = primop_node_listen_tls("mtls-a", "127.0.0.1:0").expect("listen-tls");
+        primop_node_connect_tls("mtls-b", &addr).expect("connect-tls");
+
+        let msg = SendableValue::Pair(
+            Box::new(SendableValue::Symbol("engine".into())),
+            Box::new(SendableValue::Fixnum(7)),
+        );
+        primop_node_send("mtls-b", "mtls-a", &msg).expect("send");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let got = primop_node_poll("mtls-a").expect("poll");
+            if !got.is_empty() {
+                assert_eq!(got, vec![msg]);
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("message never arrived over mTLS");
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

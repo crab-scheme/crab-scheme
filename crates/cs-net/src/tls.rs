@@ -115,3 +115,68 @@ pub fn quic_client_config(
     client.transport_config(quic_transport_config());
     Ok(client)
 }
+
+/// Dev/test self-signed mTLS identity, shared process-wide. NOT for
+/// production: a single self-signed cert is used as both the presented
+/// identity *and* the trusted root on every node, so the mutual-TLS handshake
+/// runs (encrypted + mutually authenticated at the transport) without external
+/// cert management. Node identity proper is the cs-distrib `Hello` (NodeId)
+/// exchanged after the TLS handshake, so distinct nodes stay distinguishable.
+#[cfg(feature = "dev-certs")]
+pub mod dev {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// (cert DER, key DER) for the one shared self-signed `localhost` identity.
+    fn identity() -> &'static (CertificateDer<'static>, Vec<u8>) {
+        static ID: OnceLock<(CertificateDer<'static>, Vec<u8>)> = OnceLock::new();
+        ID.get_or_init(|| {
+            let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("rcgen self-signed identity");
+            let cert = CertificateDer::from(ck.cert.der().to_vec());
+            (cert, ck.key_pair.serialize_der())
+        })
+    }
+
+    fn cert() -> CertificateDer<'static> {
+        identity().0.clone()
+    }
+    fn key() -> PrivateKeyDer<'static> {
+        PrivateKeyDer::try_from(identity().1.clone()).expect("valid dev key der")
+    }
+    fn roots() -> RootCertStore {
+        let mut r = RootCertStore::empty();
+        r.add(cert()).expect("add dev root");
+        r
+    }
+
+    /// TCP mTLS server config from the shared dev identity.
+    pub fn server_config() -> Result<Arc<ServerConfig>, TransportError> {
+        Ok(Arc::new(super::server_config(
+            roots(),
+            vec![cert()],
+            key(),
+        )?))
+    }
+
+    /// TCP mTLS client config from the shared dev identity.
+    pub fn client_config() -> Result<Arc<ClientConfig>, TransportError> {
+        Ok(Arc::new(super::client_config(
+            roots(),
+            vec![cert()],
+            key(),
+        )?))
+    }
+
+    /// QUIC mTLS server config from the shared dev identity.
+    #[cfg(feature = "quic")]
+    pub fn quic_server_config() -> Result<quinn::ServerConfig, TransportError> {
+        super::quic_server_config(roots(), vec![cert()], key())
+    }
+
+    /// QUIC mTLS client config from the shared dev identity.
+    #[cfg(feature = "quic")]
+    pub fn quic_client_config() -> Result<quinn::ClientConfig, TransportError> {
+        super::quic_client_config(roots(), vec![cert()], key())
+    }
+}
