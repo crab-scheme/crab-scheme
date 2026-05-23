@@ -12,6 +12,25 @@ name: ci
 # its own job (no test step — WASM-runtime testing happens
 # through bench/wasm-conformance.sh which needs wasmtime; that's
 # a separate weekly job, not part of every-PR CI).
+#
+# Build speed: the bottleneck is release-compiling ~40 local
+# crates + heavy deps (wasmtime / cranelift x2 / quinn) every run.
+# sccache (RUSTC_WRAPPER + GitHub Actions cache backend) caches
+# compiler outputs across runs *including the local crates* (which
+# Swatinem/rust-cache deliberately doesn't), so warm runs reuse
+# them. rust-cache stays for the registry/index only
+# (`cache-targets: false`) so the two don't fight over `target/`.
+# (cargo-nextest was tried but dropped: its process-per-test model
+# races on shared `target/` artifacts that some integration tests —
+# cs-cli's AOT level-3 — build + link, which `cargo test`'s
+# single-process run serializes.)
+#
+# Resilience: sccache hard-fails if its cache backend is
+# unreachable (the GitHub Actions cache service has outages). So we
+# only flip RUSTC_WRAPPER on *after* confirming the sccache server
+# starts; if it can't (cache backend down), the build proceeds
+# without sccache — slower, but green instead of spuriously red.
+# The "Enable sccache" step is the single gate for that.
 
 on:
   push:
@@ -25,6 +44,14 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # sccache needs incremental compilation off (it caches whole
+  # compilation units); release already defaults to incremental=false,
+  # set explicitly so it holds for any profile.
+  CARGO_INCREMENTAL: "0"
+  SCCACHE_GHA_ENABLED: "true"
+  # NOTE: RUSTC_WRAPPER is intentionally NOT set here — the "Enable
+  # sccache" step sets it only when the sccache server actually
+  # starts, so a cache-backend outage falls back to plain cargo.
 
 jobs:
   test:
@@ -44,10 +71,27 @@ jobs:
           toolchain: "1.95"
           components: rustfmt, clippy
 
-      - name: Cache cargo
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      # Registry/index cache only — sccache owns the compilation cache,
+      # so caching `target/` here too would be redundant and can mask
+      # sccache hits.
+      - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
           key: ci-${{ matrix.os }}
+          cache-targets: "false"
+
+      - name: Enable sccache (fall back to plain cargo if its backend is down)
+        shell: bash
+        run: |
+          if sccache --start-server; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "sccache enabled"
+          else
+            echo "::warning title=sccache::cache backend unavailable — building without sccache this run"
+          fi
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -56,7 +100,16 @@ jobs:
         run: cargo build --workspace --release
 
       - name: Run workspace tests
+        # Plain `cargo test` (not nextest): some integration tests — e.g.
+        # cs-cli's AOT level-3 tests — shell out to `cargo build` and link the
+        # shared `target/release/libcs_aot_rt.a`, and rely on cargo test's
+        # single-process model to serialize that setup. nextest's
+        # process-per-test parallelism races on those shared artifacts.
         run: cargo test --workspace --release
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
   wasm-build:
     name: wasm32-wasip1 build
@@ -70,10 +123,24 @@ jobs:
           toolchain: "1.95"
           targets: wasm32-wasip1
 
-      - name: Cache cargo
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
           key: ci-wasm
+          cache-targets: "false"
+
+      - name: Enable sccache (fall back to plain cargo if its backend is down)
+        shell: bash
+        run: |
+          if sccache --start-server; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "sccache enabled"
+          else
+            echo "::warning title=sccache::cache backend unavailable — building without sccache this run"
+          fi
 
       - name: Build wasm32-wasip1
         # Confirms the no-default-features build still produces a
@@ -81,3 +148,7 @@ jobs:
         # runner by default; see bench/wasm-conformance.sh for the
         # runtime sweep).
         run: cargo build --target wasm32-wasip1 --release -p cs-cli --no-default-features
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
