@@ -68,7 +68,7 @@ actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload", "dep:tokio"]
 # `actor` because cross-node consensus builds on the actor substrate and the
 # SendableValue boundary. Pulls cs-net (sim transport) + cs-distrib
 # (NodeId/DistPid/Router). Default-off on WASM/AOT like `actor`.
-distrib = ["actor", "dep:cs-net", "dep:cs-distrib", "cs-net/dev-certs"]
+distrib = ["actor", "dep:cs-net", "dep:cs-distrib", "cs-net/dev-certs", "cs-net/quic"]
 # First-class MPMC channels (spec: docs/research/channels_spec.md).
 # Implies `actor` because cs-channel shares the cs-actor tokio
 # runtime + the SendableValue boundary.

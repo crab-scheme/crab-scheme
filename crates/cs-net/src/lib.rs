@@ -32,6 +32,11 @@ use std::fmt;
 use thiserror::Error;
 
 pub mod framing;
+/// Dev-mode QUIC listen/connect helpers (shared self-signed mTLS identity).
+/// Wraps the quinn `Endpoint` so consumers (cs-runtime's `distrib` builtins)
+/// drive QUIC without naming quinn types.
+#[cfg(all(feature = "quic", feature = "dev-certs"))]
+pub mod quic_dev;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub mod tls;
 

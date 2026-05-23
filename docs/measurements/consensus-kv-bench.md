@@ -187,28 +187,43 @@ synchronous `Router` over a cs-net `Transport`:
 
 - `(node-make NAME)` — a node (Router) named NAME.
 - `(node-link! A B)` — connect two nodes with the in-memory **sim** transport.
-- `(node-listen NODE ADDR)` / `(node-connect NODE PEER-ADDR)` — connect nodes
-  over real **TCP** (`node-listen` returns the bound addr; `"127.0.0.1:0"`
-  picks an ephemeral port). A length-prefixed cs-distrib `Hello` handshake
-  exchanges NodeIds; socket I/O runs on cs-actor's tokio runtime.
-- `(node-peer-count NODE)` — registered peers (TCP peers register
+- `(node-listen NODE ADDR)` / `(node-connect NODE PEER-ADDR)` — plaintext **TCP**.
+- `(node-listen-tls …)` / `(node-connect-tls …)` — **TCP + mutual TLS**: a real
+  TLS 1.3 handshake (both nodes present + verify a cert; all traffic encrypted)
+  before any consensus traffic.
+- `(node-listen-quic …)` / `(node-connect-quic …)` — **QUIC**: TLS 1.3 mandatory
+  (always encrypted + mutually authenticated) and one stream per logical
+  `Channel`, so a stalled `Bulk` transfer can't head-of-line-block `Control`.
+- A length-prefixed cs-distrib `Hello` handshake (over the `Control` channel,
+  so it is identical across all four transports) exchanges NodeIds after any TLS
+  handshake; socket I/O runs on cs-actor's tokio runtime.
+- `(node-peer-count NODE)` — registered peers (socket peers register
   asynchronously on the accepting side, so a bootstrap waits on this).
 - `(node-send FROM TO MSG)` — MSG crosses as data: Scheme value →
   `SendableValue` → a compact byte frame → `Router.send` (framed `DistPid ‖
   payload`).
 - `(node-poll NODE)` — pump NODE's transports and return the decoded messages.
 
-The replica body `raft-net-body.scm` is transport-agnostic (only
-`node-send`/`node-poll`), so the **same** 3 replicas run over either transport:
+mTLS/QUIC use cs-net's shared self-signed **dev** identity (one cert as identity
++ root on every node, behind cs-net's `dev-certs` feature) — enough to run the
+real handshake in-process; a production cluster loads per-node certs from a CA.
+Node identity proper stays the cs-distrib `Hello` (NodeId), so distinct nodes
+remain distinguishable regardless of the shared transport cert.
 
-- **sim:** `lib/consensus/raft-net.scm` — replicas as `spawn-source` actors that
-  own their state and talk only over cs-net; deterministic in-memory transport;
-  elect a leader, replicate 3 writes, converge (commit `(3 3 3)`, `user:1 =
-  alice` on a/b/c); 12/12 stable.
-- **real TCP:** `lib/consensus/raft-net-tcp.scm` — identical cluster over actual
-  loopback TCP sockets (every RPC over a real connection); 10/10 stable. The
-  Rust test `two_nodes_send_and_poll_over_real_tcp` proves the socket round-trip
-  directly.
+The replica body `raft-net-body.scm` is transport-agnostic (only
+`node-send`/`node-poll`), so the **same** 3 replicas run over every transport:
+
+| transport | demo | stress |
+|---|---|---|
+| sim (in-memory) | `raft-net.scm` | 12/12 |
+| real TCP | `raft-net-tcp.scm` | 10/10 |
+| TCP + mutual TLS | `raft-net-tls.scm` | 8/8 |
+| QUIC (TLS 1.3) | `raft-net-quic.scm` | 8/8 |
+
+Each elects a leader, replicates 3 writes, and converges (commit `(3 3 3)`,
+`user:1 = alice` on a/b/c). Rust tests prove each transport's socket round-trip
+directly: `two_nodes_send_and_poll_over_{real_tcp,mtls,quic}` (+ sim + codec) —
+8 distrib tests.
 
 ## Remaining for a production benchmark
 
@@ -218,9 +233,8 @@ The replica body `raft-net-body.scm` is transport-agnostic (only
 3. **EPaxos dependency index** — key-bucket `cmds` to flatten the
    non-conflicting `deps-and-seq` scan (couples to key-based interference).
 4. **Run over real transport** — done: ~~actor-driven in-process~~
-   (`raft-cluster.scm`), ~~cross-node over the sim transport~~ (`raft-net.scm`),
-   and ~~cross-node over real TCP sockets~~ (`raft-net-tcp.scm`). Remaining for
-   production: **QUIC** transport selection + **mTLS** certs on the socket
-   bootstrap (both already implemented in cs-net; just not yet surfaced through
-   the `distrib` builtins).
+   (`raft-cluster.scm`), ~~cross-node over sim~~ (`raft-net.scm`), ~~real TCP~~
+   (`raft-net-tcp.scm`), ~~mutual TLS~~ (`raft-net-tls.scm`), and ~~QUIC~~
+   (`raft-net-quic.scm`). Remaining for production: load **per-node certs from a
+   CA** instead of the shared dev self-signed identity.
 5. **JIT tier** instead of the tree-walker for the protocol compute.

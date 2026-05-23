@@ -31,6 +31,7 @@
 #![cfg(feature = "distrib")]
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cs_core::{Pair, SymbolTable, Value};
@@ -305,6 +306,74 @@ pub fn primop_node_connect_tls(node: &str, peer_addr: &str) -> Result<(), String
 }
 
 //
+// QUIC transport — always mTLS (TLS 1.3), one stream per logical channel (so a
+// Bulk transfer can't head-of-line-block Control). Same identity handshake +
+// routing as the others; only the byte pipe differs. quinn lives entirely
+// behind cs-net::quic_dev, so cs-runtime never names a quinn type.
+//
+
+/// `(node-listen-quic NODE ADDR)` — listen for QUIC peers; returns the addr.
+pub fn primop_node_listen_quic(node: &str, addr: &str) -> Result<String, String> {
+    let router = lookup_router(node, "node-listen-quic")?;
+    let local = node_id(node);
+    let handle = beam_state().actors.runtime_handle();
+    let bind: SocketAddr = addr
+        .parse()
+        .map_err(|e| format!("node-listen-quic: bad addr {addr}: {e}"))?;
+
+    // Endpoint::server spawns a driver task, so build it inside the runtime.
+    let listener = {
+        let _g = handle.enter();
+        cs_net::quic_dev::listen(bind).map_err(|e| format!("node-listen-quic: {e}"))?
+    };
+    let bound = listener
+        .local_addr()
+        .map_err(|e| format!("node-listen-quic: {e}"))?;
+
+    let cfg = TransportConfig::default();
+    handle.spawn(async move {
+        loop {
+            match listener.accept(&cfg).await {
+                Ok(t) => {
+                    let t: Box<dyn Transport> = Box::new(t);
+                    match handshake_over_transport(t.as_ref(), &local).await {
+                        Ok(peer) => router.add_peer(peer, t),
+                        Err(e) => eprintln!("node-listen-quic {}: {e}", local.label()),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("node-listen-quic {}: accept: {e}", local.label());
+                    break;
+                }
+            }
+        }
+    });
+    Ok(bound)
+}
+
+/// `(node-connect-quic NODE PEER-ADDR)` — connect NODE to a QUIC peer (mTLS).
+pub fn primop_node_connect_quic(node: &str, peer_addr: &str) -> Result<(), String> {
+    let router = lookup_router(node, "node-connect-quic")?;
+    let local = node_id(node);
+    let handle = beam_state().actors.runtime_handle();
+    let cfg = TransportConfig::default();
+    let bind: SocketAddr = peer_addr
+        .parse()
+        .map_err(|e| format!("node-connect-quic: bad addr {peer_addr}: {e}"))?;
+
+    handle.block_on(async move {
+        // server_name "localhost" matches the dev cert SAN.
+        let t = cs_net::quic_dev::connect(bind, "localhost", "peer", &cfg)
+            .await
+            .map_err(|e| format!("node-connect-quic {peer_addr}: {e}"))?;
+        let t: Box<dyn Transport> = Box::new(t);
+        let peer = handshake_over_transport(t.as_ref(), &local).await?;
+        router.add_peer(peer, t);
+        Ok::<(), String>(())
+    })
+}
+
+//
 // Scheme-builtin wrappers (Value <-> SendableValue at the boundary).
 //
 
@@ -414,6 +483,30 @@ pub fn b_node_connect_tls(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
     Ok(Value::Unspecified)
 }
 
+/// `(node-listen-quic NODE ADDR)` — listen for QUIC peers; returns the addr.
+pub fn b_node_listen_quic(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("node-listen-quic: expected (node-listen-quic NODE ADDR)".into());
+    }
+    let node = name_of(&args[0], syms, "node-listen-quic")?;
+    let addr = name_of(&args[1], syms, "node-listen-quic")?;
+    let bound = primop_node_listen_quic(&node, &addr)?;
+    Ok(Value::String(cs_core::Gc::new(std::cell::RefCell::new(
+        bound,
+    ))))
+}
+
+/// `(node-connect-quic NODE PEER-ADDR)` — connect NODE to a QUIC peer (mTLS).
+pub fn b_node_connect_quic(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("node-connect-quic: expected (node-connect-quic NODE PEER-ADDR)".into());
+    }
+    let node = name_of(&args[0], syms, "node-connect-quic")?;
+    let addr = name_of(&args[1], syms, "node-connect-quic")?;
+    primop_node_connect_quic(&node, &addr)?;
+    Ok(Value::Unspecified)
+}
+
 /// `(node-peer-count NODE)` — how many peers NODE has registered.
 pub fn b_node_peer_count(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if args.len() != 1 {
@@ -439,6 +532,8 @@ pub fn distrib_syms_builtins() -> Vec<(
         ("node-connect", b_node_connect),
         ("node-listen-tls", b_node_listen_tls),
         ("node-connect-tls", b_node_connect_tls),
+        ("node-listen-quic", b_node_listen_quic),
+        ("node-connect-quic", b_node_connect_quic),
         ("node-peer-count", b_node_peer_count),
         ("node-send", b_node_send),
         ("node-poll", b_node_poll),
@@ -761,6 +856,35 @@ mod tests {
             }
             if std::time::Instant::now() >= deadline {
                 panic!("message never arrived over mTLS");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn two_nodes_send_and_poll_over_quic() {
+        // QUIC (mandatory TLS 1.3, one stream per channel). Same identity
+        // handshake + routing as the others; proves node-listen-quic /
+        // node-connect-quic.
+        primop_node_make("quic-a").expect("make a");
+        primop_node_make("quic-b").expect("make b");
+        let addr = primop_node_listen_quic("quic-a", "127.0.0.1:0").expect("listen-quic");
+        primop_node_connect_quic("quic-b", &addr).expect("connect-quic");
+
+        let msg = SendableValue::Pair(
+            Box::new(SendableValue::Symbol("engine".into())),
+            Box::new(SendableValue::Fixnum(11)),
+        );
+        primop_node_send("quic-b", "quic-a", &msg).expect("send");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let got = primop_node_poll("quic-a").expect("poll");
+            if !got.is_empty() {
+                assert_eq!(got, vec![msg]);
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("message never arrived over QUIC");
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
