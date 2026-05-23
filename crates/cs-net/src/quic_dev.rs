@@ -41,10 +41,11 @@ impl DevListener {
     }
 }
 
-/// Bind a dev QUIC listener (mTLS) on `addr`. Must be called inside a tokio
-/// runtime context (the quinn endpoint spawns a driver task).
-pub fn listen(addr: SocketAddr) -> Result<DevListener, TransportError> {
-    let ep = Endpoint::server(crate::tls::dev::quic_server_config()?, addr)?;
+/// Bind a dev QUIC listener (mTLS) on `addr`, presenting node `name`'s
+/// CA-signed cert. Must be called inside a tokio runtime context (the quinn
+/// endpoint spawns a driver task).
+pub fn listen(addr: SocketAddr, name: &str) -> Result<DevListener, TransportError> {
+    let ep = Endpoint::server(crate::tls::dev::quic_server_config(name)?, addr)?;
     Ok(DevListener { ep })
 }
 
@@ -63,18 +64,20 @@ fn client_endpoint() -> Result<Endpoint, TransportError> {
     Ok(EP.get().expect("client endpoint set").clone())
 }
 
-/// Connect to a dev QUIC listener at `addr` (mTLS; `server_name` must match the
-/// dev cert SAN, i.e. `"localhost"`). Must be called inside a tokio runtime.
+/// Connect to a dev QUIC listener at `addr` as node `name` (presenting `name`'s
+/// CA-signed cert). `server_name` must match the peer cert SAN (`"localhost"`).
+/// Must be called inside a tokio runtime.
 pub async fn connect(
     addr: SocketAddr,
     server_name: &str,
     peer_label: &str,
     cfg: &TransportConfig,
+    name: &str,
 ) -> Result<QuicTransport, TransportError> {
     let ep = client_endpoint()?;
     QuicTransport::connect(
         &ep,
-        crate::tls::dev::quic_client_config()?,
+        crate::tls::dev::quic_client_config(name)?,
         addr,
         server_name,
         peer_label,

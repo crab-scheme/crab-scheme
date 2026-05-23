@@ -193,16 +193,19 @@ async fn handshake_over_transport(t: &dyn Transport, local: &NodeId) -> Result<N
 }
 
 /// Wrap an accepted TCP stream per the security mode into a boxed transport.
+/// `name` is the local node's name (its mTLS server cert is per-node).
 async fn wrap_accepted(
     stream: TcpStream,
     sec: Security,
     cfg: &TransportConfig,
+    name: &str,
 ) -> Result<Box<dyn Transport>, String> {
     let _ = stream.set_nodelay(true);
     match sec {
         Security::Plain => Ok(Box::new(TcpTransport::from_stream(stream, "peer", cfg))),
         Security::Mtls => {
-            let sc = cs_net::tls::dev::server_config().map_err(|e| format!("mtls config: {e}"))?;
+            let sc =
+                cs_net::tls::dev::server_config(name).map_err(|e| format!("mtls config: {e}"))?;
             let t = TcpTransport::accept_tls(stream, "peer", cfg, sc)
                 .await
                 .map_err(|e| format!("mtls accept: {e}"))?;
@@ -233,7 +236,7 @@ fn listen_impl(node: &str, addr: &str, sec: Security) -> Result<String, String> 
     handle.spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => match wrap_accepted(stream, sec, &cfg).await {
+                Ok((stream, _)) => match wrap_accepted(stream, sec, &cfg, &local.name).await {
                     Ok(t) => match handshake_over_transport(t.as_ref(), &local).await {
                         Ok(peer) => router.add_peer(peer, t),
                         Err(e) => eprintln!("node-listen {}: {e}", local.label()),
@@ -270,8 +273,8 @@ fn connect_impl(node: &str, peer_addr: &str, sec: Security) -> Result<(), String
                 Box::new(TcpTransport::from_stream(stream, "peer", &cfg))
             }
             Security::Mtls => {
-                let cc =
-                    cs_net::tls::dev::client_config().map_err(|e| format!("mtls config: {e}"))?;
+                let cc = cs_net::tls::dev::client_config(&local.name)
+                    .map_err(|e| format!("mtls config: {e}"))?;
                 // server_name "localhost" matches the dev cert SAN.
                 let t = TcpTransport::connect_tls(&peer_addr_owned, "localhost", "peer", &cfg, cc)
                     .await
@@ -324,7 +327,7 @@ pub fn primop_node_listen_quic(node: &str, addr: &str) -> Result<String, String>
     // Endpoint::server spawns a driver task, so build it inside the runtime.
     let listener = {
         let _g = handle.enter();
-        cs_net::quic_dev::listen(bind).map_err(|e| format!("node-listen-quic: {e}"))?
+        cs_net::quic_dev::listen(bind, &local.name).map_err(|e| format!("node-listen-quic: {e}"))?
     };
     let bound = listener
         .local_addr()
@@ -363,7 +366,7 @@ pub fn primop_node_connect_quic(node: &str, peer_addr: &str) -> Result<(), Strin
 
     handle.block_on(async move {
         // server_name "localhost" matches the dev cert SAN.
-        let t = cs_net::quic_dev::connect(bind, "localhost", "peer", &cfg)
+        let t = cs_net::quic_dev::connect(bind, "localhost", "peer", &cfg, &local.name)
             .await
             .map_err(|e| format!("node-connect-quic {peer_addr}: {e}"))?;
         let t: Box<dyn Transport> = Box::new(t);
