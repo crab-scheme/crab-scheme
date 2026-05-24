@@ -5570,40 +5570,68 @@ impl<'a> Expander<'a> {
                 span: input.span(),
             })?;
         let parse_syms = self.parse_syms();
+        // Furthest-position failure across all clauses, used to build
+        // a pinpointed error when no clause matches (R6RS++ Phase 2A.4,
+        // issue #33).
+        let mut best: Option<syntax_parse::MatchError> = None;
+        let keep_best = |best: &mut Option<syntax_parse::MatchError>,
+                         me: syntax_parse::MatchError| {
+            if best.as_ref().is_none_or(|b| me.span.end >= b.span.end) {
+                *best = Some(me);
+            }
+        };
         for (pattern, template) in &macro_def.rules {
             let mut bindings: std::collections::HashMap<cs_core::Symbol, MatchBinding> =
                 std::collections::HashMap::new();
             // Combinator-using parsers (`~or`/`~optional`/`~once`) need the
             // backtracking matcher; plain syntax-rules macros keep the fast
             // deterministic path. (R6RS++ Phase 2A.3, issue #31.)
-            let matched = if macro_def.parser {
-                syntax_parse::match_parse_clause(
+            if macro_def.parser {
+                match syntax_parse::match_parse_clause(
                     pattern,
                     input,
                     &macro_def.literals,
                     &parse_syms,
                     self.syms,
                     &mut bindings,
-                )
-            } else {
-                match_pattern(
-                    pattern,
-                    input,
-                    &macro_def.literals,
-                    self.keywords.ellipsis,
-                    self.keywords.underscore,
-                    true,
-                    &mut bindings,
-                )
-            };
-            if matched {
+                ) {
+                    Ok(()) => return self.instantiate_template(template, &bindings),
+                    Err(me) => keep_best(&mut best, me),
+                }
+            } else if match_pattern(
+                pattern,
+                input,
+                &macro_def.literals,
+                self.keywords.ellipsis,
+                self.keywords.underscore,
+                true,
+                &mut bindings,
+            ) {
                 return self.instantiate_template(template, &bindings);
+            } else if let Some(me) = diagnose_sr(
+                pattern,
+                input,
+                &macro_def.literals,
+                self.keywords.ellipsis,
+                self.keywords.underscore,
+                true,
+                self.syms,
+            ) {
+                keep_best(&mut best, me);
             }
         }
-        Err(ExpandError::BadSyntax {
-            what: format!("no matching rule for macro '{}'", self.syms.name(name)),
-            span: input.span(),
-        })
+        let macro_name = self.syms.name(name).to_string();
+        let err = match best {
+            Some(me) => ExpandError::BadSyntax {
+                what: format!("`{}`: {}", macro_name, me.reason),
+                span: me.span,
+            },
+            None => ExpandError::BadSyntax {
+                what: format!("no matching rule for macro '{}'", macro_name),
+                span: input.span(),
+            },
+        };
+        Err(err)
     }
 
     fn instantiate_template(
@@ -6220,6 +6248,123 @@ fn match_dotted_list_pattern(
         false,
         bindings,
     )
+}
+
+/// Best-effort pinpoint of why a (combinator-free) syntax-rules pattern
+/// failed to match `input`, for `define-syntax-parser` / `syntax-rules`
+/// error messages (R6RS++ Phase 2A.4, issue #33). A deterministic
+/// mirror of [`match_list_pattern`] for the common cases — top-level
+/// arity and nested-shape mismatches — returning the furthest-reaching
+/// divergence (by source position). Patterns it can't reason about
+/// precisely (dotted tails, ellipsis) yield `None`, leaving the caller
+/// to emit its generic message. Runs only on the error path.
+fn diagnose_sr(
+    pattern: &Datum,
+    input: &Datum,
+    literals: &[Symbol],
+    ellipsis: Symbol,
+    underscore: Symbol,
+    is_outer: bool,
+    syms: &SymbolTable,
+) -> Option<syntax_parse::MatchError> {
+    let (pitems, ptail) = collect_pair_chain(pattern)?;
+    if !matches!(ptail, Datum::Null(_)) {
+        return None; // dotted pattern tail — out of scope
+    }
+    let iitems = collect_proper_list_strict(input)?;
+    if pitems
+        .iter()
+        .any(|d| matches!(d, Datum::Symbol(s, _) if *s == ellipsis))
+    {
+        return None; // ellipsis pattern — leave to the generic message
+    }
+    // Arity: surplus or missing arguments.
+    if iitems.len() > pitems.len() {
+        let extra = &iitems[pitems.len()];
+        return Some(syntax_parse::MatchError {
+            span: extra.span(),
+            reason: "unexpected extra form".to_string(),
+        });
+    }
+    if iitems.len() < pitems.len() {
+        return Some(syntax_parse::MatchError {
+            span: input.span(),
+            reason: format!(
+                "too few forms: this clause expects {} but got {}",
+                pitems.len().saturating_sub(1),
+                iitems.len().saturating_sub(1)
+            ),
+        });
+    }
+    // Same length: report the furthest element-level divergence.
+    let mut best: Option<syntax_parse::MatchError> = None;
+    for (idx, (p, i)) in pitems.iter().zip(iitems.iter()).enumerate() {
+        if is_outer && idx == 0 {
+            continue; // macro-keyword slot
+        }
+        if let Some(me) = diagnose_one_sr(p, i, literals, ellipsis, underscore, syms) {
+            if best.as_ref().is_none_or(|b| me.span.end >= b.span.end) {
+                best = Some(me);
+            }
+        }
+    }
+    best
+}
+
+/// Element-level companion to [`diagnose_sr`].
+fn diagnose_one_sr(
+    pat: &Datum,
+    inp: &Datum,
+    literals: &[Symbol],
+    ellipsis: Symbol,
+    underscore: Symbol,
+    syms: &SymbolTable,
+) -> Option<syntax_parse::MatchError> {
+    match pat {
+        Datum::Symbol(s, _) if *s == underscore => None,
+        Datum::Symbol(s, _) if literals.contains(s) => {
+            if matches!(inp, Datum::Symbol(t, _) if t == s) {
+                None
+            } else {
+                Some(syntax_parse::MatchError {
+                    span: inp.span(),
+                    reason: format!("expected `{}`", syms.name(*s)),
+                })
+            }
+        }
+        Datum::Symbol(_, _) => None, // pattern variable: matches anything
+        Datum::Null(_) => {
+            if matches!(inp, Datum::Null(_)) {
+                None
+            } else {
+                Some(syntax_parse::MatchError {
+                    span: inp.span(),
+                    reason: "expected `()`".to_string(),
+                })
+            }
+        }
+        Datum::Pair(_, _, _) => {
+            if collect_proper_list_strict(inp).is_none() {
+                Some(syntax_parse::MatchError {
+                    span: inp.span(),
+                    reason: "expected a list".to_string(),
+                })
+            } else {
+                diagnose_sr(pat, inp, literals, ellipsis, underscore, false, syms)
+            }
+        }
+        _ => {
+            // Self-evaluating literal datum.
+            if cs_core::eq::equal(&pat.to_value(), &inp.to_value()) {
+                None
+            } else {
+                Some(syntax_parse::MatchError {
+                    span: inp.span(),
+                    reason: "expected a specific literal".to_string(),
+                })
+            }
+        }
+    }
 }
 
 fn collect_pattern_vars(
