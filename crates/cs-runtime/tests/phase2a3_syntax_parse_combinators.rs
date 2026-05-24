@@ -302,3 +302,46 @@ fn once_combined_with_fixed_leading_element() {
     let v = rt.eval_str("<t>", "(named widget #:b 20 #:a 10)").unwrap();
     assert_eq!(disp(&rt, &v), "(widget 10 20)");
 }
+
+// =====================================================================
+// Composition with :class annotations (Phase 2A.1/2A.2). Works for a
+// single pvar inside a combinator; conflicting per-alternative class
+// annotations in ~or are unsupported (see syntax_parse module docs).
+// =====================================================================
+
+#[test]
+fn class_annotation_inside_optional() {
+    let mut rt = Runtime::new();
+    rt.eval_str(
+        "<t>",
+        r#"
+        (define-syntax-parser checked-opt
+          ((_ x (~optional n:number #:defaults ((n 1)))) (* x n)))
+        "#,
+    )
+    .unwrap();
+    // present + passes the :number check
+    let v = rt.eval_str("<t>", "(checked-opt 5 3)").unwrap();
+    assert_eq!(disp(&rt, &v), "15");
+    // absent -> default 1 (which also satisfies :number)
+    let v = rt.eval_str("<t>", "(checked-opt 5)").unwrap();
+    assert_eq!(disp(&rt, &v), "5");
+}
+
+#[test]
+fn class_annotation_inside_optional_rejects_bad_value() {
+    let mut rt = Runtime::new();
+    rt.eval_str(
+        "<t>",
+        r#"
+        (define-syntax-parser checked-opt
+          ((_ (~optional n:number #:defaults ((n 1)))) n))
+        "#,
+    )
+    .unwrap();
+    let err = rt
+        .eval_str("<t>", r#"(checked-opt "not-a-number")"#)
+        .expect_err(":number class check should fire on a string");
+    let s = format!("{}", err);
+    assert!(s.contains("expected number"), "got: {}", s);
+}

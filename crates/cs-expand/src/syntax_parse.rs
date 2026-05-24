@@ -41,6 +41,22 @@
 //! A `~once` / `~optional` EH-clause takes a *splice* of sub-patterns
 //! (`#:a a` is two elements consumed together) and binds its vars as
 //! scalars (`Single`); a plain EH-clause binds its vars as `Repeat`.
+//!
+//! ## Limitations
+//!
+//! - Clause patterns are **proper lists**; a dotted tail (`. rest`) in
+//!   a combinator-using clause is not matched.
+//! - One `...` per list level (same ceiling as the syntax-rules
+//!   engine); pattern-variable nesting depth tops out at 1.
+//! - `~or` / `~optional` alternatives consume a fixed number of
+//!   elements (no `~seq` with an internal `...`).
+//! - `:class` annotations (Phase 2A.1/2A.2) compose with a combinator
+//!   when they constrain a single pattern variable, but **conflicting**
+//!   per-alternative annotations on the *same* variable in a `~or`
+//!   (e.g. `(~or n:number n:string)`) are unsupported: class checks are
+//!   collected flatly and ANDed in the shared clause body, so the two
+//!   constraints would contradict. Use distinct variable names per
+//!   alternative, or check inside the body.
 
 use std::collections::HashMap;
 

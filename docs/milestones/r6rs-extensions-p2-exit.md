@@ -2,6 +2,8 @@
 
 > Status: **Phase 2 complete — 7 subphases shipped, 3 deferred
 > with documented rationale, 1 spillover bug filed.**
+> _Post-exit: 2A.3 (syntax-parse combinators) shipped — see the
+> Deferred section below; issue #31._
 > Branch: `r6rs-extensions`.
 > Spec: `docs/research/r6rs_extensions_spec.md` (§2 contracts, §3
 > records, §4 conditions, §5 parameters, §6 macro cache, §12
@@ -130,11 +132,23 @@ in `phase2_cache_dep_closure.rs`.
 
 ## Deferred
 
-### 2A.3 — syntax-parse combinators (`~or`, `~optional`, `~once`)
-**Why:** combinators need multi-clause expansion semantics and
-extra pattern-matching machinery that doesn't fit on top of the
-current syntax-rules infrastructure. Best layered after we have a
-fuller pattern compiler. Task: #142.
+### 2A.3 — syntax-parse combinators (`~or`, `~optional`, `~once`) — ✅ SHIPPED (issue #31)
+**Original deferral rationale:** combinators need multi-clause
+expansion semantics and extra pattern-matching machinery that
+doesn't fit on top of the current syntax-rules infrastructure. Best
+layered after we have a fuller pattern compiler. Task: #142.
+
+**Resolution:** shipped that fuller matcher — a small backtracking
+pattern matcher in `cs-expand/src/syntax_parse.rs` that produces the
+same `MatchBinding` map as the syntax-rules engine (so `instantiate`
+is reused). Only combinator-using parsers route through it (the
+`Macro::parser` flag); plain syntax-rules macros are untouched. Full
+Racket-style semantics: ordered `~or` alternation with backtracking,
+`~optional` with `#:defaults`, and ellipsis-head `~once`/`~optional`
+with cardinality accumulated across the repetition (order-free
+keyword parsing). Limitations (proper-list clauses, depth-1 nesting,
+conflicting per-`~or`-alternative `:class` annotations) documented in
+the module header. Tests: `phase2a3_syntax_parse_combinators.rs` (15).
 
 ### 2A.4 — expand-time error pinpoint
 **Why:** needs procedural macros so the parser can inspect
