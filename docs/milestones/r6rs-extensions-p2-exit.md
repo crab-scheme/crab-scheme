@@ -2,8 +2,8 @@
 
 > Status: **Phase 2 complete — 7 subphases shipped, 3 deferred
 > with documented rationale, 1 spillover bug filed.**
-> _Post-exit: 2A.3 (syntax-parse combinators) shipped — see the
-> Deferred section below; issue #31._
+> _Post-exit: 2A.3 (syntax-parse combinators) shipped — issue #31._
+> _Post-exit: 2A.4 (expand-time error pinpointing) shipped — issue #33._
 > Branch: `r6rs-extensions`.
 > Spec: `docs/research/r6rs_extensions_spec.md` (§2 contracts, §3
 > records, §4 conditions, §5 parameters, §6 macro cache, §12
@@ -150,11 +150,24 @@ keyword parsing). Limitations (proper-list clauses, depth-1 nesting,
 conflicting per-`~or`-alternative `:class` annotations) documented in
 the module header. Tests: `phase2a3_syntax_parse_combinators.rs` (15).
 
-### 2A.4 — expand-time error pinpoint
-**Why:** needs procedural macros so the parser can inspect
-intermediate parses and emit precise source-spanned errors.
-Current syntax-rules driver only produces a single "no rule
-matches" error. Task: #144.
+### 2A.4 — expand-time error pinpointing — ✅ SHIPPED (issue #33)
+**Original deferral rationale:** needs procedural macros so the
+parser can inspect intermediate parses and emit precise
+source-spanned errors. Current syntax-rules driver only produces a
+single "no rule matches" error. Task: #144.
+
+**Resolution:** the backtracking combinator matcher (2A.3) already
+*does* inspect intermediate parses — adding a furthest-position
+failure tracker on top of it (and a deterministic mirror
+`diagnose_sr` for plain syntax-rules patterns) gets us
+source-spanned pinpointing without committing to a full procedural
+macro system. Failures now name the offending sub-form (extra /
+missing argument, expected literal `#:b`, wrong list shape) and the
+specific cardinality violation (`#:a` may appear only once;
+missing required `#:b`), with the span of the form to blame riding
+on the `ExpandError` for tooling (LSP). The pick across clauses is
+furthest-position-wins (standard parser-error heuristic). Tests:
+`phase2a4_expand_error_pinpoint.rs` (7).
 
 ### 2A.5 — migrate in-tree macros to `define-syntax-parser`
 **Why:** no good migration candidate in the current tree —
