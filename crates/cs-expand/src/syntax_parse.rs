@@ -58,9 +58,11 @@
 //!   constraints would contradict. Use distinct variable names per
 //!   alternative, or check inside the body.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use cs_core::{Symbol, SymbolTable};
+use cs_diag::Span;
 use cs_parse::Datum;
 
 use crate::{collect_pair_chain, collect_proper_list_strict, MatchBinding};
@@ -76,11 +78,40 @@ pub(crate) struct ParseSyms {
     pub kw_defaults: Symbol,
 }
 
-/// Immutable matching context threaded through the recursion.
+/// A pinpointed match failure: which sub-form is to blame, and why
+/// (R6RS++ Phase 2A.4, issue #33). `span` rides on the `ExpandError`
+/// so tooling (LSP) can underline the offending form; `reason`
+/// surfaces in the human-readable message.
+pub(crate) struct MatchError {
+    pub span: Span,
+    pub reason: String,
+}
+
+/// Immutable matching context threaded through the recursion. `track`
+/// uses interior mutability so the deeply-recursive (and backtracking)
+/// matcher can record the *furthest* failure it sees without changing
+/// every signature; the furthest-position failure is the most useful
+/// diagnostic (standard parser-error heuristic).
 struct Ctx<'a> {
     literals: &'a [Symbol],
     ps: &'a ParseSyms,
     syms: &'a SymbolTable,
+    track: RefCell<Option<MatchError>>,
+}
+
+impl Ctx<'_> {
+    /// Record a failure, keeping the one that reached furthest into the
+    /// input (largest `span.end`). Ties favor the later record.
+    fn record(&self, span: Span, reason: impl Into<String>) {
+        let mut t = self.track.borrow_mut();
+        let keep = t.as_ref().is_none_or(|best| span.end >= best.span.end);
+        if keep {
+            *t = Some(MatchError {
+                span,
+                reason: reason.into(),
+            });
+        }
+    }
 }
 
 type Bindings = HashMap<Symbol, MatchBinding>;
@@ -119,20 +150,32 @@ pub(crate) fn match_parse_clause(
     ps: &ParseSyms,
     syms: &SymbolTable,
     bindings: &mut Bindings,
-) -> bool {
-    let pats = match collect_proper_list_strict(pattern) {
-        Some(v) => v,
-        None => return false,
+) -> Result<(), MatchError> {
+    let fallback = |reason: &str| MatchError {
+        span: input.span(),
+        reason: reason.to_string(),
     };
-    let ins = match collect_proper_list_strict(input) {
-        Some(v) => v,
-        None => return false,
-    };
+    let pats = collect_proper_list_strict(pattern)
+        .ok_or_else(|| fallback("macro clause pattern is not a proper list"))?;
+    let ins = collect_proper_list_strict(input)
+        .ok_or_else(|| fallback("macro call is not a proper list"))?;
     if pats.is_empty() || ins.is_empty() {
-        return false;
+        return Err(fallback("empty macro form"));
     }
-    let ctx = Ctx { literals, ps, syms };
-    match_seq(&pats[1..], &ins[1..], &ctx, bindings)
+    let ctx = Ctx {
+        literals,
+        ps,
+        syms,
+        track: RefCell::new(None),
+    };
+    if match_seq(&pats[1..], &ins[1..], &ctx, bindings) {
+        Ok(())
+    } else {
+        Err(ctx
+            .track
+            .into_inner()
+            .unwrap_or_else(|| fallback("call does not match this clause")))
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -141,7 +184,14 @@ pub(crate) fn match_parse_clause(
 
 fn match_seq(pats: &[Datum], ins: &[Datum], ctx: &Ctx, bindings: &mut Bindings) -> bool {
     let (p0, prest) = match pats.split_first() {
-        None => return ins.is_empty(),
+        None => {
+            if let Some(extra) = ins.first() {
+                // Pattern exhausted but input remains: a surplus argument.
+                ctx.record(extra.span(), "unexpected extra form");
+                return false;
+            }
+            return true;
+        }
         Some(x) => x,
     };
 
@@ -152,11 +202,16 @@ fn match_seq(pats: &[Datum], ins: &[Datum], ctx: &Ctx, bindings: &mut Bindings) 
 
     // `(~or ALT ...)` head pattern: each ALT consumes one element.
     if let Some(alts) = combinator_args(p0, ctx.ps.tilde_or, ctx) {
+        if ins.is_empty() {
+            ctx.record(
+                p0.span(),
+                "missing form (expected one of the ~or alternatives)",
+            );
+            return false;
+        }
         for alt in &alts {
             let snap = bindings.clone();
-            if !ins.is_empty()
-                && match_one(alt, &ins[0], ctx, bindings)
-                && match_seq(prest, &ins[1..], ctx, bindings)
+            if match_one(alt, &ins[0], ctx, bindings) && match_seq(prest, &ins[1..], ctx, bindings)
             {
                 // Vars of the alternatives not taken are absent.
                 bind_absent_others(&alts, alt, ctx, bindings);
@@ -186,7 +241,15 @@ fn match_seq(pats: &[Datum], ins: &[Datum], ctx: &Ctx, bindings: &mut Bindings) 
 
     // `(~once P)` outside an ellipsis — a required single element.
     if let Some(args) = combinator_args(p0, ctx.ps.tilde_once, ctx) {
-        if args.len() != 1 || ins.is_empty() {
+        if args.len() != 1 {
+            ctx.record(
+                p0.span(),
+                "~once outside an ellipsis takes exactly one pattern",
+            );
+            return false;
+        }
+        if ins.is_empty() {
+            ctx.record(p0.span(), "missing required form");
             return false;
         }
         return match_one(&args[0], &ins[0], ctx, bindings)
@@ -195,6 +258,7 @@ fn match_seq(pats: &[Datum], ins: &[Datum], ctx: &Ctx, bindings: &mut Bindings) 
 
     // Plain element: consume exactly one input.
     if ins.is_empty() {
+        ctx.record(p0.span(), "missing form (expected more arguments)");
         return false;
     }
     match_one(p0, &ins[0], ctx, bindings) && match_seq(prest, &ins[1..], ctx, bindings)
@@ -212,18 +276,53 @@ fn match_one(pat: &Datum, inp: &Datum, ctx: &Ctx, bindings: &mut Bindings) -> bo
             }
             if ctx.literals.contains(s) || is_keyword(*s, ctx.syms) {
                 // Literal / keyword: self-match by name.
-                return matches!(inp, Datum::Symbol(t, _) if t == s);
+                if matches!(inp, Datum::Symbol(t, _) if t == s) {
+                    return true;
+                }
+                ctx.record(inp.span(), format!("expected `{}`", ctx.syms.name(*s)));
+                return false;
             }
             bindings.insert(*s, MatchBinding::Single(inp.clone()));
             true
         }
-        Datum::Boolean(p, _) => matches!(inp, Datum::Boolean(i, _) if i == p),
-        Datum::Character(p, _) => matches!(inp, Datum::Character(i, _) if i == p),
-        Datum::String(p, _) => matches!(inp, Datum::String(i, _) if **i == **p),
-        Datum::Number(_, _) => {
-            matches!(inp, Datum::Number(_, _) if cs_core::eq::equal(&pat.to_value(), &inp.to_value()))
+        Datum::Boolean(p, _) => {
+            let ok = matches!(inp, Datum::Boolean(i, _) if i == p);
+            if !ok {
+                ctx.record(
+                    inp.span(),
+                    format!("expected the literal {}", if *p { "#t" } else { "#f" }),
+                );
+            }
+            ok
         }
-        Datum::Null(_) => matches!(inp, Datum::Null(_)),
+        Datum::Character(p, _) => {
+            let ok = matches!(inp, Datum::Character(i, _) if i == p);
+            if !ok {
+                ctx.record(inp.span(), "expected a specific character literal");
+            }
+            ok
+        }
+        Datum::String(p, _) => {
+            let ok = matches!(inp, Datum::String(i, _) if **i == **p);
+            if !ok {
+                ctx.record(inp.span(), "expected a specific string literal");
+            }
+            ok
+        }
+        Datum::Number(_, _) => {
+            let ok = matches!(inp, Datum::Number(_, _) if cs_core::eq::equal(&pat.to_value(), &inp.to_value()));
+            if !ok {
+                ctx.record(inp.span(), "expected a specific number literal");
+            }
+            ok
+        }
+        Datum::Null(_) => {
+            let ok = matches!(inp, Datum::Null(_));
+            if !ok {
+                ctx.record(inp.span(), "expected `()`");
+            }
+            ok
+        }
         Datum::Pair(_, _, _) => {
             // Sub-list pattern: recurse with the sequence matcher so
             // nested combinators / ellipses work. Proper lists only
@@ -234,7 +333,10 @@ fn match_one(pat: &Datum, inp: &Datum, ctx: &Ctx, bindings: &mut Bindings) -> bo
             };
             let isub = match collect_proper_list_strict(inp) {
                 Some(v) => v,
-                None => return false,
+                None => {
+                    ctx.record(inp.span(), "expected a list");
+                    return false;
+                }
             };
             match_seq(&psub, &isub, ctx, bindings)
         }
@@ -318,16 +420,46 @@ fn match_eh_ellipsis(
         Some(p) => p,
         None => return false,
     };
+    // A partition was found, so any failures recorded while exploring
+    // abandoned branches are moot — clear them so a cardinality failure
+    // below (the real reason) isn't outranked by a speculative one.
+    *ctx.track.borrow_mut() = None;
 
     // Cardinality: ~once exactly 1, ~optional ≤ 1, plain unconstrained.
     let mut counts = vec![0usize; clauses.len()];
     for (i, _) in &parts {
         counts[*i] += 1;
     }
+    // The whole repeated section's span, used to anchor cardinality
+    // (absence / surplus) diagnostics when there is no single token to
+    // blame; `head` (the EH pattern) is a reasonable fallback.
+    let section_span = eh_ins
+        .first()
+        .map(|d| d.span())
+        .unwrap_or_else(|| head.span());
     for (i, c) in clauses.iter().enumerate() {
         match c.kind {
-            EhKind::Once if counts[i] != 1 => return false,
-            EhKind::Optional if counts[i] > 1 => return false,
+            EhKind::Once if counts[i] == 0 => {
+                ctx.record(
+                    section_span,
+                    format!("missing required {}", clause_label(c, ctx)),
+                );
+                return false;
+            }
+            EhKind::Once if counts[i] > 1 => {
+                ctx.record(
+                    section_span,
+                    format!("{} may appear only once", clause_label(c, ctx)),
+                );
+                return false;
+            }
+            EhKind::Optional if counts[i] > 1 => {
+                ctx.record(
+                    section_span,
+                    format!("{} may appear at most once", clause_label(c, ctx)),
+                );
+                return false;
+            }
             _ => {}
         }
     }
@@ -475,6 +607,19 @@ fn parse_eh_clause(c: &Datum, ctx: &Ctx) -> EhClause {
             vars,
         }
     }
+}
+
+/// A human-friendly label for an EH clause in a diagnostic — the first
+/// keyword / literal in its splice (e.g. `` `#:b` ``), else "option".
+fn clause_label(c: &EhClause, ctx: &Ctx) -> String {
+    for p in &c.subpats {
+        if let Datum::Symbol(s, _) = p {
+            if is_keyword(*s, ctx.syms) || ctx.literals.contains(s) {
+                return format!("`{}`", ctx.syms.name(*s));
+            }
+        }
+    }
+    "option".to_string()
 }
 
 /// Parse `~optional` args in head-pattern position: a single pattern
