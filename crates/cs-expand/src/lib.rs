@@ -12,6 +12,8 @@ use cs_diag::Span;
 use cs_ir::{CoreExpr, Params};
 use cs_parse::Datum;
 
+mod syntax_parse;
+
 #[derive(Clone, Debug)]
 pub enum ExpandError {
     UnknownForm { name: String, span: Span },
@@ -277,13 +279,22 @@ fn standard_condition_field_count(tag: &str) -> usize {
     }
 }
 
-/// A user-defined macro, parsed from `(syntax-rules ...)`.
+/// A user-defined macro, parsed from `(syntax-rules ...)` or
+/// `(define-syntax-parser ...)`.
 #[derive(Clone, Debug)]
 pub struct Macro {
     pub literals: Vec<Symbol>,
     pub rules: Vec<(Datum, Datum)>,
     /// Name (for diagnostics).
     pub name: Symbol,
+    /// When true the rules use `syntax-parse` combinators (`~or`,
+    /// `~optional`, `~once`) and are matched by the backtracking
+    /// matcher in [`syntax_parse`] instead of the deterministic
+    /// `syntax-rules` matcher. Set only by `define-syntax-parser`
+    /// when a clause actually uses a combinator (R6RS++ Phase 2A.3,
+    /// issue #31); plain syntax-rules macros leave it `false` and
+    /// keep the original fast path unchanged.
+    pub parser: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -348,6 +359,13 @@ struct Keywords {
     include: Symbol,
     endianness: Symbol,
     submodule: Symbol,
+    // R6RS++ Phase 2A.3 syntax-parse combinators (issue #31). Recognized
+    // only inside `define-syntax-parser` patterns; ordinary identifiers
+    // everywhere else.
+    tilde_or: Symbol,
+    tilde_optional: Symbol,
+    tilde_once: Symbol,
+    kw_defaults: Symbol,
 }
 
 impl Keywords {
@@ -413,6 +431,10 @@ impl Keywords {
             include: syms.intern("include"),
             endianness: syms.intern("endianness"),
             submodule: syms.intern("submodule"),
+            tilde_or: syms.intern("~or"),
+            tilde_optional: syms.intern("~optional"),
+            tilde_once: syms.intern("~once"),
+            kw_defaults: syms.intern("#:defaults"),
         }
     }
 }
@@ -1518,6 +1540,12 @@ impl<'a> Expander<'a> {
         // For each clause: walk the pattern, strip ":class" annotations,
         // wrap body in class-check ifs.
         let mut translated_clauses: Vec<Datum> = Vec::with_capacity(clause_datums.len());
+        // Parallel (stripped-pattern, checked-body) rules for the
+        // combinator path (Phase 2A.3): if any clause uses `~or` /
+        // `~optional` / `~once`, these become a `parser`-flagged Macro
+        // matched by the backtracking `syntax_parse` matcher instead of
+        // being desugared to `syntax-rules` (which can't express them).
+        let mut parser_rules: Vec<(Datum, Datum)> = Vec::with_capacity(clause_datums.len());
         for clause in clause_datums {
             let parts = collect_proper_list_strict(clause).ok_or(ExpandError::BadSyntax {
                 what: "define-syntax-parser clause must be (pattern body ...)".into(),
@@ -1638,7 +1666,39 @@ impl<'a> Expander<'a> {
                     );
                 }
             }
+            parser_rules.push((stripped_pattern.clone(), checked_body.clone()));
             translated_clauses.push(mk_list(vec![stripped_pattern, checked_body], clause.span()));
+        }
+        // Combinator path: if any clause uses `~or` / `~optional` /
+        // `~once`, register a backtracking parser-macro directly and
+        // skip the syntax-rules desugar (which can't express them).
+        let parse_syms = self.parse_syms();
+        if parser_rules
+            .iter()
+            .any(|(p, _)| syntax_parse::pattern_uses_combinators(p, &parse_syms))
+        {
+            let name = match &name_datum {
+                Datum::Symbol(s, _) => *s,
+                other => {
+                    return Err(ExpandError::BadSyntax {
+                        what: "define-syntax-parser: name must be a symbol".into(),
+                        span: other.span(),
+                    });
+                }
+            };
+            self.macros.insert(
+                name,
+                Macro {
+                    literals: Vec::new(),
+                    rules: parser_rules,
+                    name,
+                    parser: true,
+                },
+            );
+            return Ok(CoreExpr::Const {
+                value: Value::Unspecified,
+                span,
+            });
         }
         // Build (define-syntax <name> (syntax-rules () <clauses>...))
         let mut sr_items = vec![
@@ -1751,6 +1811,7 @@ impl<'a> Expander<'a> {
             literals,
             rules,
             name,
+            parser: false,
         };
         self.macros.insert(name, m);
         Ok(CoreExpr::Const {
@@ -5482,6 +5543,19 @@ impl<'a> Expander<'a> {
 
     // ---- macro expansion (M3 first cut: non-hygienic syntax-rules) ----
 
+    /// Build the combinator-symbol bundle the `syntax_parse` matcher
+    /// needs, from the already-interned `Keywords`.
+    fn parse_syms(&self) -> syntax_parse::ParseSyms {
+        syntax_parse::ParseSyms {
+            ellipsis: self.keywords.ellipsis,
+            underscore: self.keywords.underscore,
+            tilde_or: self.keywords.tilde_or,
+            tilde_optional: self.keywords.tilde_optional,
+            tilde_once: self.keywords.tilde_once,
+            kw_defaults: self.keywords.kw_defaults,
+        }
+    }
+
     fn try_expand_macro(
         &mut self,
         name: cs_core::Symbol,
@@ -5495,18 +5569,34 @@ impl<'a> Expander<'a> {
                 what: "macro lookup failed".into(),
                 span: input.span(),
             })?;
+        let parse_syms = self.parse_syms();
         for (pattern, template) in &macro_def.rules {
             let mut bindings: std::collections::HashMap<cs_core::Symbol, MatchBinding> =
                 std::collections::HashMap::new();
-            if match_pattern(
-                pattern,
-                input,
-                &macro_def.literals,
-                self.keywords.ellipsis,
-                self.keywords.underscore,
-                true,
-                &mut bindings,
-            ) {
+            // Combinator-using parsers (`~or`/`~optional`/`~once`) need the
+            // backtracking matcher; plain syntax-rules macros keep the fast
+            // deterministic path. (R6RS++ Phase 2A.3, issue #31.)
+            let matched = if macro_def.parser {
+                syntax_parse::match_parse_clause(
+                    pattern,
+                    input,
+                    &macro_def.literals,
+                    &parse_syms,
+                    self.syms,
+                    &mut bindings,
+                )
+            } else {
+                match_pattern(
+                    pattern,
+                    input,
+                    &macro_def.literals,
+                    self.keywords.ellipsis,
+                    self.keywords.underscore,
+                    true,
+                    &mut bindings,
+                )
+            };
+            if matched {
                 return self.instantiate_template(template, &bindings);
             }
         }
@@ -5865,9 +5955,18 @@ fn rename_lambda_params(
 /// A match binding: either a single Datum or a list of repetitions
 /// (for ellipsis patterns).
 #[derive(Clone, Debug)]
-enum MatchBinding {
+pub(crate) enum MatchBinding {
     Single(Datum),
     Repeat(Vec<Datum>),
+    /// A pattern variable that an `~optional` / `~or` head pattern
+    /// (syntax-parse, Phase 2A.3) could have bound but didn't,
+    /// because the optional sub-pattern was absent / a different
+    /// alternative was taken. Referencing it in a template is an
+    /// error unless the `~optional` supplied `#:defaults` (which
+    /// turns it into a `Single`). Tracked explicitly rather than
+    /// left unbound so `instantiate` reports a clear diagnostic
+    /// instead of silently treating the name as a literal.
+    Absent,
 }
 
 /// Match `input` against `pattern`. Returns `true` if match succeeded.
@@ -6211,6 +6310,13 @@ fn instantiate(
                             span: *span,
                         })
                     }
+                    MatchBinding::Absent => Err(ExpandError::BadSyntax {
+                        what: format!(
+                            "pattern variable `{}` is absent here (its ~optional/~or alternative did not match); supply #:defaults or guard its use",
+                            syms.name(*s)
+                        ),
+                        span: *span,
+                    }),
                 }
             } else {
                 // Template-introduced (literal) symbol: mark it so the hygiene
@@ -6332,7 +6438,7 @@ fn rebuild_list(items: Vec<Datum>, span: Span) -> Datum {
 
 /// Collect a proper list of Datums from a Datum::Pair chain. Returns None
 /// for improper lists.
-fn collect_proper_list_strict(d: &Datum) -> Option<Vec<Datum>> {
+pub(crate) fn collect_proper_list_strict(d: &Datum) -> Option<Vec<Datum>> {
     let mut out = Vec::new();
     let mut cur = d.clone();
     loop {
@@ -6377,7 +6483,7 @@ fn parse_err(
 /// cdr of the last pair. For a proper list `(a b c)` the tail is
 /// `Datum::Null`. For an improper list `(a b . c)` the tail is the
 /// atom `c`. Returns None if `d` is not a Pair at all.
-fn collect_pair_chain(d: &Datum) -> Option<(Vec<Datum>, Datum)> {
+pub(crate) fn collect_pair_chain(d: &Datum) -> Option<(Vec<Datum>, Datum)> {
     let mut out = Vec::new();
     let mut cur = d.clone();
     loop {
@@ -6445,6 +6551,13 @@ fn strip_class_annotations(
     match pat {
         Datum::Symbol(s, span) => {
             let name = syms.name(*s).to_string();
+            // Keyword identifiers (`#:foo`, including the `~optional`
+            // `#:defaults` marker and `#:kw` pattern literals) keep
+            // their internal colon — never treat it as a `:class`
+            // annotation. (Phase 2A.3, issue #31.)
+            if name.starts_with('#') {
+                return pat.clone();
+            }
             // Find the first colon NOT at position 0 (so `:class`
             // alone or `_` alone passes through).
             if let Some(colon_idx) = name.find(':').filter(|&i| i > 0 && i < name.len() - 1) {
