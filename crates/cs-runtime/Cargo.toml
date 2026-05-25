@@ -181,6 +181,13 @@ cs-opt = { workspace = true }
 # the alias to accept hints from external callers (cs-cli, etc.).
 cs-rir = { workspace = true }
 cs-parse = { workspace = true }
+# Issue #11 ext-2: library-export auto-contracting. cs-runtime
+# runs cs-typer's `extract_annotations` + `auto_contract_library_exports`
+# on every `eval_data_in_env` so `(: NAME T)` declared inside a
+# library is recognized AND drives an automatic runtime contract
+# wrap of the exported binding. Untyped code pays a per-eval
+# walk that bails on the first non-typed Datum.
+cs-typer = { workspace = true }
 cs-vm = { workspace = true }
 cs-jit = { workspace = true, optional = true }
 cs-jit-cranelift = { workspace = true, optional = true }

@@ -93,6 +93,14 @@ pub struct Checker<'tab> {
     /// per-Span via `effect_for`.
     effects:
         std::cell::RefCell<std::collections::HashMap<cs_diag::Span, crate::effect::AllocEffect>>,
+    /// Cached symbol for `apply-contract`. Issue #11 ext-1: when
+    /// `check_set` sees the contract library's runtime wrap
+    /// `(apply-contract _ inner _)`, peel to `inner` before
+    /// checking against the binding's ascription. Without the
+    /// peel the wrap call infers to `Any` and the gradual
+    /// `subtype(Any, target)` fallback would silently accept any
+    /// EXPR for `(define/typed N T E)`.
+    apply_contract_sym: cs_core::Symbol,
 }
 
 impl<'tab> Checker<'tab> {
@@ -105,6 +113,7 @@ impl<'tab> Checker<'tab> {
         for ta in &table.top_level {
             env.define_top_level(ta.name, ta.type_ann.clone());
         }
+        let apply_contract_sym = syms.intern("apply-contract");
         Self {
             table,
             env,
@@ -113,7 +122,30 @@ impl<'tab> Checker<'tab> {
             top_level_call_arg_types: std::cell::RefCell::new(std::collections::HashMap::new()),
             current_lambda_stack: std::cell::RefCell::new(Vec::new()),
             effects: std::cell::RefCell::new(std::collections::HashMap::new()),
+            apply_contract_sym,
         }
+    }
+
+    /// Issue #11 ext-1: peel a `(apply-contract _ inner _)` call,
+    /// returning the inner expression. Used by `check_set` so a
+    /// `(define/typed N T E)` (which expands to
+    /// `(define N (apply-contract (__type->contract 'T) E 'N))`)
+    /// is type-checked against `T` based on `E` rather than on
+    /// the wrap call's opaque `Any` return type. Returns `value`
+    /// unchanged when the shape doesn't match — any non-typed
+    /// define still goes through the standard infer-then-subtype
+    /// path.
+    fn peel_apply_contract<'e>(&self, value: &'e CoreExpr) -> &'e CoreExpr {
+        if let CoreExpr::App { func, args, .. } = value {
+            if args.len() == 3 {
+                if let CoreExpr::Ref { name, .. } = func.as_ref() {
+                    if *name == self.apply_contract_sym {
+                        return &args[1];
+                    }
+                }
+            }
+        }
+        value
     }
 
     /// Infer the type of `expr`. Equivalent to the free
@@ -963,7 +995,12 @@ impl<'tab> Checker<'tab> {
         if is_lambda {
             self.current_lambda_stack.borrow_mut().push(name);
         }
-        let result = self.check(value, &target);
+        // Issue #11 ext-1: peel a `(apply-contract _ inner _)`
+        // wrap so `(define/typed N T E)`'s static check sees `E`
+        // directly. Otherwise the gradual fallback
+        // `subtype(Any, T) == true` would mask any mismatch.
+        let check_target = self.peel_apply_contract(value);
+        let result = self.check(check_target, &target);
         if is_lambda {
             self.current_lambda_stack.borrow_mut().pop();
         }

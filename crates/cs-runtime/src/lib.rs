@@ -2379,6 +2379,34 @@ impl Runtime {
         data: Vec<Datum>,
         base_env: Option<Rc<Frame>>,
     ) -> Result<Value, Diagnostic> {
+        // Issue #11 ext-1 + ext-2: cs-typer pre-passes.
+        //
+        // * `extract_annotations` strips `(: NAME T)` ascriptions and
+        //   typed-define brackets from the Datum stream so the
+        //   expander never sees them (and `:` doesn't fail as an
+        //   unbound reference). The returned table is used as
+        //   fallback by the auto-contract pass below.
+        //
+        // * `auto_contract_library_exports` finds typed library
+        //   exports and injects a `(set! NAME (apply-contract ...))`
+        //   wrap after each define so untyped callers hit a clear
+        //   `&contract-violation` on misuse — without the user
+        //   having to write `define/typed` explicitly.
+        //
+        // Both passes are cheap no-ops for untyped code.
+        //
+        // Typer diagnostics (e.g. `unknown type: ->*` because the
+        // typer's annotation grammar is narrower than the contract
+        // macro's) are dropped on the runtime path — the macro
+        // expander handles every form the runtime needs to accept,
+        // and `crabscheme check` is where typer feedback surfaces.
+        // Without this drop, valid `define/typed` programs whose
+        // type uses a contract-only constructor (e.g. `->*`) would
+        // fail at eval purely because the typer can't represent it.
+        let (data, annotation_table, _ann_diags) =
+            cs_typer::extract_annotations(&data, &mut self.syms);
+        let data = cs_typer::auto_contract_library_exports(data, &annotation_table, &mut self.syms);
+
         // Split off the fields the include resolver needs (`sources`) and the
         // ones the Expander itself takes (`syms`, `macros`) so they don't
         // overlap. This lets `(include "path")` register the file's source

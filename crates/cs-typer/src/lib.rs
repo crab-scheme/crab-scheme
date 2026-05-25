@@ -27,6 +27,7 @@
 //! - Phase 7 (optional): Polymorphism.
 
 pub mod annotate;
+pub mod auto_contract;
 pub mod builtins;
 pub mod check;
 pub mod checker;
@@ -46,6 +47,7 @@ pub mod types;
 pub use annotate::{
     AnnotationTable, LambdaAnnotation, LetrecAnnotation, TopLevelAnnotation, TypeAlias,
 };
+pub use auto_contract::{auto_contract_library_exports, type_to_contract_datum};
 pub use builtins::{install_primops, primop_pairs, primop_table};
 pub use check::{check, render_type, subtype, TypeError};
 pub use checker::Checker;
