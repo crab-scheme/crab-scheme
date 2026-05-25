@@ -2113,6 +2113,13 @@ impl Runtime {
         lang_name: &str,
         body: &str,
     ) -> Result<Value, Diagnostic> {
+        // Resolve the optional `base-env` (issue #70) once; it
+        // applies whether or not a `reader` is also exported.
+        // An error here means the lang exported a `base-env`
+        // that isn't a valid environment value — surface that as
+        // a hard error rather than silently falling back.
+        let base_env = self.resolve_lang_base_env(lang_name)?;
+
         // Phase 1 — does the lang declare `(export reader ...)`?
         // Mirror is populated as a side effect of `eval_data_in_file`
         // whenever a `(library ...)` form runs; libraries declared
@@ -2123,7 +2130,7 @@ impl Runtime {
                 .lookup("reader")
                 .filter(|v| matches!(v, Value::Procedure(_)))
             {
-                return self.eval_with_custom_reader(name, lang_name, body, &reader_proc);
+                return self.eval_with_custom_reader(name, lang_name, body, &reader_proc, base_env);
             }
             // Declared `reader` but no binding — fall through to
             // host reader rather than panic. Likely a library that
@@ -2134,31 +2141,74 @@ impl Runtime {
         // Phase 2 — no reader (or lang not declared). Phase 3C
         // MVP path: pad the header line with whitespace of the
         // same byte length so the body parses with the host
-        // reader at its original line / column positions.
+        // reader at its original line / column positions. Honors
+        // an exported `base-env` if present (issue #70).
         let header_len = original_src.len() - body.len();
         let mut rewritten = String::with_capacity(original_src.len());
         rewritten.extend(std::iter::repeat_n(' ', header_len));
         rewritten.push_str(body);
         let file_id = self.sources.add(name, &rewritten);
-        self.with_active(|rt| rt.eval_str_in_file(file_id, &rewritten))
+        self.with_active(|rt| rt.eval_str_in_env(file_id, &rewritten, base_env))
     }
 
-    /// True if a library named `(lang NAME)` has been declared in
-    /// this Runtime and its `(export ...)` clause lists `reader`.
-    fn lang_exports_reader(&self, lang_name: &str) -> bool {
+    /// Resolve the `base-env` export of `(lang NAME)`, if any.
+    /// Returns:
+    /// - `Ok(None)` — lang didn't export `base-env`, or didn't
+    ///   declare a value for the binding.
+    /// - `Ok(Some(frame))` — lang exported a valid environment
+    ///   value; `frame` is the [`Frame`] to use as the body's
+    ///   evaluation root (immutable or mutable per the env's
+    ///   `make-namespace` vs `environment` construction).
+    /// - `Err(diag)` — lang exported `base-env` but the value
+    ///   isn't a valid environment record.
+    fn resolve_lang_base_env(&self, lang_name: &str) -> Result<Option<Rc<Frame>>, Diagnostic> {
+        if !self.lang_exports_symbol(lang_name, "base-env") {
+            return Ok(None);
+        }
+        let Some(env_val) = self.lookup("base-env") else {
+            return Ok(None);
+        };
+        let Some((bindings, mutable)) = crate::builtins::decode_environment(&env_val) else {
+            return Err(Diagnostic::error(
+                format!(
+                    "`base-env` for (lang {}) must be an environment \
+                     (built with `environment` or `make-namespace`)",
+                    lang_name
+                ),
+                cs_diag::Span::DUMMY,
+            ));
+        };
+        let frame = if mutable {
+            Frame::mutable_root(bindings)
+        } else {
+            Frame::immutable_root(bindings)
+        };
+        Ok(Some(frame))
+    }
+
+    /// Helper variant of [`Self::lang_exports_reader`] that
+    /// checks for an arbitrary export symbol. Used by the
+    /// `base-env` check (issue #70).
+    fn lang_exports_symbol(&self, lang_name: &str, export_name: &str) -> bool {
         let Some(lang_sym) = self.syms.by_name_lookup("lang") else {
             return false;
         };
         let Some(name_sym) = self.syms.by_name_lookup(lang_name) else {
             return false;
         };
-        let Some(reader_sym) = self.syms.by_name_lookup("reader") else {
+        let Some(target_sym) = self.syms.by_name_lookup(export_name) else {
             return false;
         };
         let key = vec![lang_sym, name_sym];
         self.library_exports
             .get(&key)
-            .is_some_and(|exports| exports.contains(&reader_sym))
+            .is_some_and(|exports| exports.contains(&target_sym))
+    }
+
+    /// True if a library named `(lang NAME)` has been declared in
+    /// this Runtime and its `(export ...)` clause lists `reader`.
+    fn lang_exports_reader(&self, lang_name: &str) -> bool {
+        self.lang_exports_symbol(lang_name, "reader")
     }
 
     /// Phase 2 of the custom-reader pipeline — see
@@ -2173,15 +2223,22 @@ impl Runtime {
         lang_name: &str,
         body: &str,
         reader_proc: &Value,
+        base_env: Option<Rc<Frame>>,
     ) -> Result<Value, Diagnostic> {
         let body_file = self.sources.add(name, body);
         let synth_span = Span::new(body_file, 0, 0);
         let body_val = Value::string(body.to_string());
         let result_val = self.with_active(|rt| {
-            // The reader was defined by a user (walker-tier `Closure`)
-            // or by a host builtin — `apply_procedure` handles every
-            // procedure variant the runtime mints; `vm_call_sync` only
-            // dispatches VM-tier shapes and would refuse walker closures.
+            // The reader itself runs against the runtime's normal
+            // top env (not `base-env`) — the reader is *meta-level*
+            // code authored by the lang library, so it needs access
+            // to whatever utilities it imported when the library
+            // was declared. `base-env` restricts the *body*, not
+            // the reader. The reader was defined by a user
+            // (walker-tier `Closure`) or by a host builtin —
+            // `apply_procedure` handles every procedure variant
+            // the runtime mints; `vm_call_sync` only dispatches
+            // VM-tier shapes and would refuse walker closures.
             let mut ctx = EvalCtx::new(rt.top.clone(), &mut rt.syms, &mut rt.macros);
             ctx.sandbox_allowed_imports = rt.sandbox_import_policy.clone();
             crate::eval::apply_procedure(reader_proc, &[body_val], &mut ctx)
@@ -2207,7 +2264,7 @@ impl Runtime {
                 ));
             }
         };
-        self.with_active(|rt| rt.eval_data_in_file(data))
+        self.with_active(|rt| rt.eval_data_in_env(data, base_env))
     }
 
     /// Register a Rust procedure as a top-level Scheme binding. After
@@ -2270,6 +2327,27 @@ impl Runtime {
         );
     }
 
+    /// Variant of [`Self::eval_str_in_file`] that honors an
+    /// optional `base_env` — see [`Self::eval_data_in_env`]
+    /// (issue #70 — `#!lang` `base-env` export). When
+    /// `base_env` is `None`, behaviour is identical to
+    /// `eval_str_in_file`.
+    fn eval_str_in_env(
+        &mut self,
+        file_id: FileId,
+        src: &str,
+        base_env: Option<Rc<Frame>>,
+    ) -> Result<Value, Diagnostic> {
+        let data = match read_all(file_id, src, &mut self.syms) {
+            Ok(d) => d,
+            Err(errs) => {
+                let e = &errs[0];
+                return Err(Diagnostic::error(e.message(), e.span()));
+            }
+        };
+        self.eval_data_in_env(data, base_env)
+    }
+
     fn eval_str_in_file(&mut self, file_id: FileId, src: &str) -> Result<Value, Diagnostic> {
         let data = match read_all(file_id, src, &mut self.syms) {
             Ok(d) => d,
@@ -2281,12 +2359,26 @@ impl Runtime {
         self.eval_data_in_file(data)
     }
 
-    /// Expand and evaluate a pre-parsed datum sequence. Splits the
-    /// post-`read_all` portion of [`Self::eval_str_in_file`] out so
-    /// the `#!lang` custom-reader path (issue #10) can hand the
-    /// expander a datum list produced by a Scheme `reader`
-    /// procedure instead of host-parsed source.
+    /// Expand and evaluate a pre-parsed datum sequence against the
+    /// runtime's default top env. Splits the post-`read_all`
+    /// portion of [`Self::eval_str_in_file`] out so the `#!lang`
+    /// custom-reader path (issue #10) can hand the expander a
+    /// datum list produced by a Scheme `reader` procedure instead
+    /// of host-parsed source.
     fn eval_data_in_file(&mut self, data: Vec<Datum>) -> Result<Value, Diagnostic> {
+        self.eval_data_in_env(data, None)
+    }
+
+    /// Expand and evaluate a pre-parsed datum sequence against an
+    /// optional restricted environment. `base_env: Some(frame)`
+    /// activates the `#!lang` `base-env` export (issue #70) — the
+    /// body evaluates with `frame` as its root chain link instead
+    /// of `self.top`. `None` keeps the default behaviour.
+    fn eval_data_in_env(
+        &mut self,
+        data: Vec<Datum>,
+        base_env: Option<Rc<Frame>>,
+    ) -> Result<Value, Diagnostic> {
         // Split off the fields the include resolver needs (`sources`) and the
         // ones the Expander itself takes (`syms`, `macros`) so they don't
         // overlap. This lets `(include "path")` register the file's source
@@ -2322,9 +2414,10 @@ impl Runtime {
         for (name, exports) in lib_updates {
             self.library_exports.insert(name, exports);
         }
-        let mut ctx = EvalCtx::new(self.top.clone(), &mut self.syms, &mut self.macros);
+        let eval_env = base_env.unwrap_or_else(|| self.top.clone());
+        let mut ctx = EvalCtx::new(eval_env.clone(), &mut self.syms, &mut self.macros);
         ctx.sandbox_allowed_imports = self.sandbox_import_policy.clone();
-        let result = eval(&core, self.top.clone(), &mut ctx);
+        let result = eval(&core, eval_env, &mut ctx);
         // Drain pending side-channels before ctx drops so we can render
         // proper messages even when EvalError carried only the sentinel
         // string (e.g. "__escape__" or "__raised__" coming back through a

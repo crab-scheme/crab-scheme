@@ -121,15 +121,41 @@ Limitations rolling forward:
 - Datum spans synthesized by a custom reader collapse to the
   first byte of the body file (Scheme values carry no source-
   text origin; a future iter could thread richer span info if the
-  reader emits `(datum . span)` pairs).
-- The optional `expander` and `base-env` exports from the spec
-  aren't honored yet — only `reader` is wired through. Tracked
-  as a follow-up; not blocking for 1.0.
+  reader emits `(datum . span)` pairs). Tracked as #72.
+- The optional `expander` export (per-lang expansion) isn't yet
+  honored — tracked as #71.
 - The cs-expand "all bindings global" milestone means two langs
   that both export `reader` collide on the binding — the later
   declaration wins. Reflected in
   `lang_switch_between_eval_str_calls`; a future namespace-
   isolation pass will refine this.
+
+##### Follow-up — `base-env` export honored (issue #70) ✅
+
+When `(lang NAME)` exports `base-env` and binds it to an
+environment value (built via `environment` or `make-namespace`
+from ADR 0015 L1), the file body now evaluates against that env
+instead of the runtime's global top env. The reader itself still
+runs against the full env (it's meta-level code the lang author
+controls); only the body is restricted.
+
+Path: `Runtime::eval_data_in_env(data, Option<Rc<Frame>>)` is the
+new core entry that takes an explicit eval-time root frame.
+`eval_with_lang_header` resolves the optional env via
+`resolve_lang_base_env` (which calls
+`crate::builtins::decode_environment` to validate the export
+shape — non-env values produce a typed
+`base-env for (lang NAME) must be an environment` diagnostic).
+Both the custom-reader path and the host-reader fallback honor
+`base-env`. Mutable namespaces (from `make-namespace`) allow the
+body to `define` and `set!`; immutable envs (from
+`environment`) do not.
+
+7 new tests in `phase4_lang_base_env.rs` cover: restricted
+visibility (only `(rnrs base)` resolves), out-of-env bindings
+blocked, mutable namespace allows define, no-`base-env` falls
+through, non-env value diagnostic, reader output runs against
+restricted env, restrictive env blocks reader-emitted body forms.
 
 10 new tests in `phase4_custom_reader.rs` plus 5 unit tests in
 `lang_reader::tests` cover the reader-invoked path, the body-
