@@ -216,3 +216,101 @@ fn variadic_export_lowers_to_arrow_star_wrap() {
         .unwrap();
     assert_eq!(disp(&rt, &v), "caught");
 }
+
+// ---- Issue #11 ext-3: intra-library contract elision ----
+
+#[test]
+fn self_recursion_inside_typed_export_bypasses_contract() {
+    // ext-3 rename: the recursive call `(fact (- n 1))` inside
+    // `fact` is rewritten at the Datum level to
+    // `(fact$unwrapped (- n 1))`. That call skips the contract
+    // wrap and goes straight to the unwrapped binding —
+    // the contract still fires for the OUTER call from
+    // untyped client code, but every recursive call elides.
+    //
+    // We can't observe elision directly from Scheme (the
+    // contract pass-through is invisible when arguments
+    // conform), so this test checks that:
+    //   1. external typed call returns the right result
+    //   2. external call with bad arg fires &contract-violation
+    //      (proving the export-level wrap is intact)
+    let mut rt = Runtime::new();
+    load_contract(&mut rt);
+    rt.eval_str(
+        "<lib>",
+        "(library (math) \
+           (export fact) \
+           (import (rnrs)) \
+           (: fact (-> Fixnum Fixnum)) \
+           (define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))))",
+    )
+    .unwrap();
+    rt.eval_str("<use>", "(import (math))").unwrap();
+    let v = rt.eval_str("<good>", "(fact 5)").unwrap();
+    assert_eq!(disp(&rt, &v), "120");
+    // External call with wrong type still hits the wrap.
+    let v = rt
+        .eval_str(
+            "<bad>",
+            "(guard (c ((contract-violation? c) 'caught)) (fact 'oops))",
+        )
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "caught");
+}
+
+#[test]
+fn cross_binding_intra_library_call_bypasses_contract() {
+    // `g` calls `f` from inside the same library. ext-3 rewrites
+    // the `(f x)` call to `(f$unwrapped x)`, bypassing the
+    // contract. The OUTER call to `g` from untyped client code
+    // still hits g's contract (if g is also typed) — but g's
+    // body calling f doesn't double-check.
+    let mut rt = Runtime::new();
+    load_contract(&mut rt);
+    rt.eval_str(
+        "<lib>",
+        "(library (svc) \
+           (export f g) \
+           (import (rnrs)) \
+           (: f (-> Fixnum Fixnum)) \
+           (define (f x) (* x 2)) \
+           (: g (-> Fixnum Fixnum)) \
+           (define (g x) (f x)))",
+    )
+    .unwrap();
+    rt.eval_str("<use>", "(import (svc))").unwrap();
+    let v = rt.eval_str("<good>", "(g 21)").unwrap();
+    assert_eq!(disp(&rt, &v), "42");
+    let v = rt
+        .eval_str(
+            "<bad>",
+            "(guard (c ((contract-violation? c) 'caught)) (g 'oops))",
+        )
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "caught");
+}
+
+#[test]
+fn quoted_symbol_matching_export_name_is_preserved() {
+    // ext-3 rewrite must skip `(quote f)` forms — those are
+    // literal data, not references. A library that quotes its
+    // own export name (for error messages, dispatch tables, …)
+    // should still see the literal `f`, not `f$unwrapped`.
+    let mut rt = Runtime::new();
+    load_contract(&mut rt);
+    rt.eval_str(
+        "<lib>",
+        "(library (svc) \
+           (export name-of) \
+           (import (rnrs)) \
+           (: name-of (-> Fixnum Symbol)) \
+           (define (name-of _) (quote name-of)))",
+    )
+    .unwrap();
+    rt.eval_str("<use>", "(import (svc))").unwrap();
+    let v = rt.eval_str("<call>", "(name-of 1)").unwrap();
+    // The quoted `name-of` should NOT be rewritten to
+    // `name-of$unwrapped` — verified by checking the returned
+    // symbol equals the original name.
+    assert_eq!(disp(&rt, &v), "name-of");
+}

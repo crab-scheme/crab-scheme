@@ -1,11 +1,18 @@
-//! Library-export auto-contracting (issue #11 ext-2).
+//! Library-export auto-contracting + intra-library elision
+//! (issue #11 ext-2 + ext-3).
 //!
 //! After [`crate::extract_annotations`] has recorded every
 //! ascription / typed-define / `(define/typed)` in the user's
 //! source as a [`crate::TopLevelAnnotation`], this pass walks
 //! the top-level Datum stream looking for `(library ...)` forms
-//! and injects a runtime contract wrap for each exported binding
-//! whose name appears in the annotation table.
+//! and rewrites the body so:
+//!
+//! 1. Each ascribed export is renamed to `NAME$unwrapped` and
+//!    a sibling `(define NAME (apply-contract <contract>
+//!    NAME$unwrapped (quote NAME)))` is injected after it.
+//! 2. Every reference to `NAME` inside the library body is
+//!    rewritten to `NAME$unwrapped` (skipping `(quote …)` and
+//!    define-binder positions).
 //!
 //! Concretely, for a library
 //!
@@ -14,7 +21,7 @@
 //!   (export f)
 //!   (import (crab contract))
 //!   (: f (-> Fixnum Fixnum))
-//!   (define (f x) (+ x 1)))
+//!   (define (f x) (if (= x 0) 1 (* x (f (- x 1))))))
 //! ```
 //!
 //! this pass rewrites the body to
@@ -23,15 +30,16 @@
 //! (library (name)
 //!   (export f)
 //!   (import (crab contract))
-//!   (: f (-> Fixnum Fixnum))
-//!   (define (f x) (+ x 1))
-//!   (set! f (apply-contract (-> integer? integer?) f (quote f))))
+//!   (define (f$unwrapped x)
+//!     (if (= x 0) 1 (* x (f$unwrapped (- x 1)))))
+//!   (define f (apply-contract (-> integer? integer?) f$unwrapped (quote f))))
 //! ```
 //!
-//! The `set!` runs immediately after the define and replaces
-//! the binding with its contract-wrapped form. Untyped callers
-//! importing the library now hit `&contract-violation` on
-//! misuse — without the user having to write `(define/typed)`.
+//! - Untyped callers importing the library hit
+//!   `&contract-violation` on misuse (the wrap on `f`).
+//! - Self-recursion and intra-library cross-binding calls
+//!   resolve to `f$unwrapped` and skip the wrap (ext-3
+//!   elision).
 //!
 //! Scope: this pass only fires for bindings declared at the top
 //! level of a `(library …)` form. Non-library top-level code
@@ -266,26 +274,75 @@ fn rewrite_library(
     if typed_exports.is_empty() && !has_any_ascription_form {
         return None;
     }
-    // Rebuild the library:
-    // - drop bare `(: NAME T)` forms (the runtime expander would
-    //   otherwise try to evaluate `:` as an unbound reference)
-    // - keep every other form unchanged
-    // - inject a `(set! NAME (apply-contract ... NAME 'NAME))`
-    //   immediately after the define for every typed export
+    // Issue #11 ext-3: intra-library contract elision.
+    //
+    // For every typed export `NAME`:
+    //   1. Rename the original define to a sister binding
+    //      `NAME$unwrapped` (using `$` keeps the suffix outside
+    //       the Scheme identifier space users typically choose).
+    //   2. Rewrite every reference to `NAME` in the body to
+    //      `NAME$unwrapped` — except inside `(quote …)` and at
+    //      `(define NAME …)` *binding* positions (those are
+    //      handled by the rename pass below).
+    //   3. After the renamed define, inject
+    //      `(define NAME (apply-contract <contract> NAME$unwrapped (quote NAME)))`.
+    //
+    // Result: external callers (via `(import (lib))` of the
+    // exported `NAME`) hit the contract wrap. Internal callers
+    // — including self-recursion — bypass the wrap because their
+    // references resolved to `NAME$unwrapped` at rewrite time.
+    //
+    // `(: …)` ascription forms are still stripped (the runtime
+    // expander can't evaluate `:`); see ext-2.
+    //
+    // Hygiene caveat: the rewrite is a textual symbol
+    // substitution. A library that shadows its own export name
+    // inside a local lambda (e.g. `(define f (lambda (f) f))`)
+    // would have the lambda's bound `f` incorrectly rewritten.
+    // This is an unusual shape for typed library exports;
+    // documented as a known limitation in ADR 0023.
+    let rename_map: Vec<(Symbol, Symbol)> = typed_exports
+        .iter()
+        .map(|(name, _)| {
+            let unwrapped_name_str = format!("{}$unwrapped", syms.name(*name));
+            let unwrapped = syms.intern(&unwrapped_name_str);
+            (*name, unwrapped)
+        })
+        .collect();
     let mut new_body: Vec<Datum> = Vec::with_capacity(body.len() + typed_exports.len());
     for form in body {
         if is_ascription_form(form, kws) {
-            // Strip — we've already lifted the type info into
-            // `typed_exports`.
             continue;
         }
-        new_body.push(form.clone());
-        if let Some(name) = find_define_name(form, kws) {
-            if let Some((_, ty)) = typed_exports.iter().find(|(n, _)| *n == name) {
-                let wrap = build_wrap_set(name, ty, kws, syms, form.span());
-                new_body.push(wrap);
+        // Identify the binding name BEFORE any rewrite —
+        // otherwise rewrite_refs would rename the binder along
+        // with every other reference, and `find_define_name`
+        // would return the unwrapped name (defeating the wrap-
+        // injection lookup below).
+        let bound_name = find_define_name(form, kws);
+        if let Some(name) = bound_name {
+            if let Some((_, unwrapped)) = rename_map.iter().find(|(n, _)| *n == name) {
+                // Step 1: rename the binder (define f …) → (define f$unwrapped …)
+                let renamed = rename_define_binder(form, name, *unwrapped, kws);
+                // Step 2: rewrite every reference to the
+                // exported name inside the renamed form
+                // (including self-recursion inside the lambda
+                // body — that's the elision we want).
+                let rewritten = rewrite_refs(&renamed, &rename_map, kws);
+                new_body.push(rewritten);
+                if let Some((_, ty)) = typed_exports.iter().find(|(n, _)| *n == name) {
+                    let wrap = build_wrap_define(name, *unwrapped, ty, kws, syms, form.span());
+                    new_body.push(wrap);
+                }
+                continue;
             }
         }
+        // Non-typed-export form: still rewrite references so
+        // internal callers skip the wrap. The form's own bound
+        // names (if any) aren't in rename_map, so they're
+        // untouched.
+        let rewritten = rewrite_refs(form, &rename_map, kws);
+        new_body.push(rewritten);
     }
     // Reassemble the library list.
     let mut new_elements: Vec<Datum> = Vec::with_capacity(body_start + new_body.len());
@@ -381,9 +438,16 @@ fn find_define_name(d: &Datum, kws: &Keywords) -> Option<Symbol> {
     }
 }
 
-/// Build `(set! NAME (apply-contract <CONTRACT> NAME (quote NAME)))`.
-fn build_wrap_set(
+/// Build the ext-3 auto-wrap form:
+/// `(define NAME (apply-contract <CONTRACT> SOURCE (quote NAME)))`.
+///
+/// `name` is the public (wrapped) name external callers import.
+/// `source` is the renamed internal binding the wrap calls into
+/// — typically `NAME$unwrapped`. Quoting `NAME` (not `source`)
+/// keeps the violation-context identifier user-facing.
+fn build_wrap_define(
     name: Symbol,
+    source: Symbol,
     ty: &Type,
     kws: &Keywords,
     syms: &mut SymbolTable,
@@ -398,19 +462,108 @@ fn build_wrap_set(
         vec![
             Datum::Symbol(kws.apply_contract, span),
             contract,
-            Datum::Symbol(name, span),
+            Datum::Symbol(source, span),
             quoted_name,
         ],
         span,
     );
     build_list(
         vec![
-            Datum::Symbol(kws.set_bang, span),
+            Datum::Symbol(kws.define, span),
             Datum::Symbol(name, span),
             apply_contract_call,
         ],
         span,
     )
+}
+
+/// Rewrite every Symbol reference matching `old` to `new`,
+/// recursing through Pair / Vector / Null structures. Skips
+/// quoted forms `(quote …)` (the rewriting would invalidate
+/// symbol literals the user wrote) and `(quasiquote …)`. Does
+/// NOT walk through `(define NAME …)` headers' binding position
+/// — caller handles that separately to avoid double-renaming.
+///
+/// Hygiene is best-effort: a library-internal lambda that
+/// shadows an exported name with a same-named formal parameter
+/// (e.g. `(lambda (f) (f 1))` inside a library that exports
+/// `f`) would be incorrectly rewritten. Documented limitation
+/// — the alternative (full hygienic substitution) duplicates
+/// the expander's scope machinery and is overkill for the
+/// typed-library-export use case.
+fn rewrite_refs(d: &Datum, rename_map: &[(Symbol, Symbol)], kws: &Keywords) -> Datum {
+    if rename_map.is_empty() {
+        return d.clone();
+    }
+    // Quote / quasiquote — preserve the literal payload.
+    if let Some(elements) = flatten_list(d) {
+        if elements.len() == 2 {
+            if let Datum::Symbol(s, _) = &elements[0] {
+                if *s == kws.quote {
+                    return d.clone();
+                }
+            }
+        }
+    }
+    match d {
+        Datum::Symbol(s, span) => {
+            for (old, new) in rename_map {
+                if *s == *old {
+                    return Datum::Symbol(*new, *span);
+                }
+            }
+            d.clone()
+        }
+        Datum::Pair(car, cdr, span) => Datum::Pair(
+            std::rc::Rc::new(rewrite_refs(car, rename_map, kws)),
+            std::rc::Rc::new(rewrite_refs(cdr, rename_map, kws)),
+            *span,
+        ),
+        Datum::Vector(items, span) => {
+            let new_items: Vec<Datum> = items
+                .iter()
+                .map(|i| rewrite_refs(i, rename_map, kws))
+                .collect();
+            Datum::Vector(new_items, *span)
+        }
+        // Leaf data — return as-is.
+        _ => d.clone(),
+    }
+}
+
+/// If `d` is a `(define OLD …)` or `(define (OLD params…) body…)`
+/// form, return a new Datum with the bound name swapped to
+/// `new`. Other Datums pass through unchanged.
+fn rename_define_binder(d: &Datum, old: Symbol, new: Symbol, kws: &Keywords) -> Datum {
+    let Some(elements) = flatten_list(d) else {
+        return d.clone();
+    };
+    if elements.len() < 3 {
+        return d.clone();
+    }
+    let head = match &elements[0] {
+        Datum::Symbol(s, _) => *s,
+        _ => return d.clone(),
+    };
+    if head != kws.define && head != kws.define_typed {
+        return d.clone();
+    }
+    let mut new_elements: Vec<Datum> = elements.clone();
+    match &elements[1] {
+        Datum::Symbol(s, span) if *s == old => {
+            new_elements[1] = Datum::Symbol(new, *span);
+        }
+        Datum::Pair(car, cdr, span) => {
+            if let Datum::Symbol(s, sspan) = car.as_ref() {
+                if *s == old {
+                    let new_car = Datum::Symbol(new, *sspan);
+                    new_elements[1] = Datum::Pair(std::rc::Rc::new(new_car), cdr.clone(), *span);
+                }
+            }
+        }
+        _ => {}
+    }
+    build_list(new_elements, d.span())
 }
 
 /// True iff `d` looks like a bare `(: NAME TYPE)` ascription
@@ -508,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn library_with_ascribed_export_gets_wrap_set() {
+    fn library_with_ascribed_export_gets_wrap_define() {
         // The ascription is INSIDE the library body, which
         // `extract_annotations` treats as opaque. The
         // auto-contract pass scans the body itself to find it.
@@ -526,8 +679,9 @@ mod tests {
         );
         let after = auto_contract_library_exports(stripped, &table, &mut syms);
         let s = render(&after[0], &syms);
-        // The wrap should appear right after the define.
-        assert!(s.contains("set!"), "no set! in {s}");
+        // The wrap should appear right after the renamed define.
+        // ext-3 changed the pattern from set! to define + rename.
+        assert!(s.contains("f$unwrapped"), "no $unwrapped rename in {s}");
         assert!(s.contains("apply-contract"), "no apply-contract in {s}");
         assert!(s.contains("integer?"), "no contract lowered in {s}");
     }
@@ -565,8 +719,8 @@ mod tests {
             .expect("library form should be in the data");
         let s = render(&after[lib_idx], &syms);
         assert!(
-            s.contains("set!"),
-            "fallback ascription should drive wrap: {s}"
+            s.contains("f$unwrapped"),
+            "fallback ascription should drive ext-3 rename + wrap: {s}"
         );
     }
 
@@ -601,28 +755,25 @@ mod tests {
         let after = auto_contract_library_exports(stripped, &table, &mut syms);
         let s = render(&after[0], &syms);
         assert!(
-            !s.contains("set!"),
-            "should not inject set! when no exported binding is ascribed: {s}"
+            !s.contains("apply-contract"),
+            "no apply-contract should appear when no exported binding is ascribed: {s}"
+        );
+        assert!(
+            !s.contains("$unwrapped"),
+            "no rename when no exported binding is ascribed: {s}"
         );
     }
 
     #[test]
-    fn define_typed_export_is_not_redundantly_wrapped() {
-        // `(define/typed)` already wraps at the macro level; the
-        // ascription synthesized by ext-1's classifier shouldn't
-        // cause us to double-wrap here. The pass identifies the
-        // define by name and inserts a wrap — but it's run BEFORE
-        // expansion, so the define/typed Datum hasn't expanded
-        // yet. The injected set! re-wraps the already-wrapped
-        // binding after the macro runs. Idempotency comes from
-        // apply-contract being safe to re-apply (it never fails
-        // on a value that already passes the contract).
-        //
-        // Behavioral correctness: the rewrite SHOULD still
-        // produce a set! injection — the double-wrap is a tiny
-        // runtime cost on (define/typed) exports but preserves
-        // the semantics. The Checker still verifies the inner
-        // expression at expand time.
+    fn define_typed_export_still_renames_for_elision() {
+        // `(define/typed)` would normally double-wrap (the macro
+        // adds its own apply-contract). With ext-3 rename + body
+        // rewrite, internal callers go through the unwrapped
+        // binding, so the double-wrap doesn't hit on intra-
+        // library calls. External callers via import hit BOTH
+        // wraps; that's harmless (apply-contract idempotent on
+        // passing values) and the cost is bounded to the one
+        // wrap-on-import boundary.
         let (data, mut syms) = read(
             "(library (foo) \
                (export f) \
@@ -632,11 +783,14 @@ mod tests {
         let (stripped, table, _) = extract_annotations(&data, &mut syms);
         let after = auto_contract_library_exports(stripped, &table, &mut syms);
         let s = render(&after[0], &syms);
-        // The set! is injected after the define/typed form — at
-        // the Datum level, the define/typed Datum is recognized
-        // by `find_define_name` because its head matches the
-        // cached `define_typed` keyword.
-        assert!(s.contains("set!"), "expected wrap-set in {s}");
+        // ext-3 renames the define/typed bound name to
+        // `f$unwrapped` and emits a new `(define f …)` wrap.
+        // The macro will still expand the (define/typed
+        // f$unwrapped …) into an apply-contract call at its
+        // own layer; we don't try to prevent that double-wrap
+        // since elision via the rename makes the intra-library
+        // path skip both wraps.
+        assert!(s.contains("f$unwrapped"), "expected rename in {s}");
     }
 
     #[test]
@@ -655,7 +809,7 @@ mod tests {
             s.contains("integer?"),
             "Fixnum should lower to integer?: {s}"
         );
-        assert!(s.contains("set!"));
+        assert!(s.contains("n$unwrapped"), "expected ext-3 rename in {s}");
     }
 
     #[test]

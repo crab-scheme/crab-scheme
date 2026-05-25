@@ -1,8 +1,9 @@
 # R6RS++ Phase 4 — typed-boundaries arc, interim status
 
-> Status: **5 iters substrate + 2 extensions shipped (static check
-> at expand time, library-export auto-contracting at runtime);
-> 2 extensions tracked in issue #11.**
+> Status: **5 iters substrate + 3 extensions shipped (static
+> check at expand time, library-export auto-contracting at
+> runtime, intra-library contract elision); 1 partial extension
+> tracked, 1 deferred indefinitely.**
 > Branch: `r6rs-extensions`.
 > Spec: `docs/research/r6rs_extensions_spec.md` (§12).
 > Predecessor: Phase 3 (closed in `c0cca4b`).
@@ -174,6 +175,70 @@ falling back to "unknown type constructor".
   library fallback, `(: x T)` strips cleanly even outside any
   library, variadic-tail export wraps.
 
+### Iter 8 — intra-library contract elision (issue #11 ext-3) ✅
+
+The ext-2 pattern wrapped exports with a trailing `set!` —
+correct at the export boundary but perf-hostile inside the
+library: self-recursion and cross-binding calls all went
+through the wrap a second (or n-th) time, even though they were
+already inside a contract-checked context.
+
+ext-3 closes the intra-library half of the typed→typed elision
+gap. The auto-contract pass now:
+
+1. Renames the original define from `f` → `f$unwrapped`.
+2. Rewrites every reference to `f` inside the library body to
+   `f$unwrapped`, recursing through Pair / Vector / Null
+   structures, skipping `(quote …)` forms (literal data, not
+   references) and the new `(define f …)` wrap's binding slot.
+3. Inserts `(define f (apply-contract <contract> f$unwrapped (quote f)))`
+   immediately after the renamed define.
+
+External callers (via `(import (lib))` of the exported name)
+hit the contract wrap. Internal callers — including self-
+recursion — bypass it because their references resolved to
+`f$unwrapped` at rewrite time.
+
+The pattern shift replaces ext-2's `set!`-based wrap with a
+clean `define + rename`:
+
+```text
+;; before (ext-2):
+(define f LAMBDA)
+(set! f (apply-contract <contract> f 'f))
+
+;; after (ext-3):
+(define f$unwrapped LAMBDA-with-internal-refs-rewritten)
+(define f (apply-contract <contract> f$unwrapped 'f))
+```
+
+Design call in `docs/adr/0023-contract-elision-intra-library.md`.
+Includes a hygiene caveat: the rewrite is a textual symbol
+substitution, so an exotic shape like
+`(define use-f (lambda (f) (f 1)))` inside a library exporting
+`f` would incorrectly rewrite the lambda's bound `f`. Full
+hygienic substitution requires duplicating cs-expand's scope
+machinery; deferred as a known limitation.
+
+3 new e2e tests in `phase4_auto_contract.rs`:
+- `self_recursion_inside_typed_export_bypasses_contract` —
+  external call returns the right result, external bad-arg call
+  fires `&contract-violation` (export wrap intact, internal
+  self-recursion elides).
+- `cross_binding_intra_library_call_bypasses_contract` — `g`
+  calling `f` from inside the same library skips f's wrap;
+  external call from untyped code to `g` still hits the export
+  boundary.
+- `quoted_symbol_matching_export_name_is_preserved` — `(quote
+  name-of)` inside a library exporting `name-of` is NOT
+  rewritten; the symbol literal survives.
+
+Cross-library typed→typed elision (the "full" version of
+ext-3) is deferred: it requires the library import/export
+machinery to expose both wrapped and unwrapped ports, and
+cs-expand to track caller types at every import boundary —
+multi-iter scope. Tracked in issue #11 ext-3's open follow-up.
+
 ## Test additions
 
 | Suite                                                  | New tests |
@@ -208,10 +273,14 @@ The typed-boundaries arc could keep iterating along several axes
    binding type table the runtime can consume — tracked but
    unimplemented in this iter.
 
-3. **Contract elision at typed→typed boundaries**: when both sides
-   of a call are statically type-checked, the contract is
-   redundant; drop it for zero-overhead. Requires call-site
-   typing information at link / load time. Issue #11 ext-3.
+3. ~~**Contract elision at typed→typed boundaries**~~ ✅
+   shipped iter 8 (see above) for the *intra-library* variant:
+   rename + body rewrite makes internal callers (self-recursion,
+   cross-binding helper calls) skip the contract wrap. The
+   *cross-library* variant (typed library A imports typed
+   library B; A's calls into B elide the wrap) requires
+   library two-port semantics and cs-expand type tracking —
+   tracked but unimplemented.
 
 4. **Eta-elision for monomorphic contracts** (Phase 2B.7 task
    #150 already on the queue): the same optimization applied to
