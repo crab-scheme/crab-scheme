@@ -11430,6 +11430,16 @@ struct Frame {
     env: Rc<Env>,
     /// Captured shared bytecode (so closures can resolve their lambda body).
     bc: Rc<Bytecode>,
+    /// Tail-safe continuation marks installed on THIS frame (issue #36):
+    /// `(key, val)` pairs, upserted by the `PushMark` opcode. `None`
+    /// until the frame first installs a mark, so mark-free code pays
+    /// nothing. `TailCall` reuses the frame in place and deliberately
+    /// preserves this slot — a wcm reached via a tail call shares the
+    /// frame and replaces, giving constant mark-space in tail loops.
+    /// `Call` pushes a fresh frame with `marks: None`, so non-tail
+    /// nesting accumulates. Captured for free in `VmContSnapshot`
+    /// (frame clone), so full continuations restore marks correctly.
+    marks: Option<Vec<(Value, Value)>>,
 }
 
 /// Snapshot of the VM's frame stack and value stack, captured at
@@ -11484,6 +11494,7 @@ pub fn run_with_entry(
         ip: 0,
         env: top_env,
         bc,
+        marks: None,
     }];
     let result = run_dispatch(&mut stack, &mut frames, syms);
     result.map_err(|mut e| {
@@ -11604,6 +11615,27 @@ fn run_dispatch(
                     }
                 };
                 frame.env = parent;
+            }
+            Inst::PushMark => {
+                // Tail-safe continuation marks (issue #36). The compiler
+                // emitted `<key> <val> PushMark`, so `val` is on top.
+                // Upsert `(key → val)` on the CURRENT frame, replacing an
+                // existing mark for the same key (equal? identity) on this
+                // frame. TailCall reuses this frame in place and preserves
+                // `marks`, so a wcm reached via a tail call replaces rather
+                // than accumulates — constant mark-space in tail loops.
+                let val = stack
+                    .pop()
+                    .ok_or_else(|| VmError::new("stack underflow on PushMark (val)"))?;
+                let key = stack
+                    .pop()
+                    .ok_or_else(|| VmError::new("stack underflow on PushMark (key)"))?;
+                let marks = frame.marks.get_or_insert_with(Vec::new);
+                if let Some(slot) = marks.iter_mut().find(|(k, _)| cs_core::eq::equal(k, &key)) {
+                    slot.1 = val;
+                } else {
+                    marks.push((key, val));
+                }
             }
             Inst::Pop => {
                 let nb = stack
@@ -11789,6 +11821,7 @@ fn run_dispatch(
                                 ip: 0,
                                 env: new_env,
                                 bc: closure.bc.clone(),
+                                marks: None,
                             });
                         }
                         continue;
@@ -12926,6 +12959,30 @@ fn run_dispatch(
                         }
                         continue;
                     }
+                    if p.as_any()
+                        .downcast_ref::<VmCurrentContinuationMarks>()
+                        .is_some()
+                    {
+                        // Tail-safe continuation marks (issue #36). Walk
+                        // the live frame stack collecting per-frame marks.
+                        // `frames` here is the caller's chain (the callee
+                        // frame isn't pushed for special procs), so this
+                        // observes exactly the current continuation's marks.
+                        if args.len() > 1 {
+                            return Err(VmError::new("current-continuation-marks: 0 or 1 args"));
+                        }
+                        let result = build_continuation_marks(frames, args.first());
+                        stack.push(result);
+                        if is_tail {
+                            frames.pop();
+                            if frames.is_empty() {
+                                return stack.pop().ok_or_else(|| {
+                                    VmError::new("empty stack at tail-current-continuation-marks")
+                                });
+                            }
+                        }
+                        continue;
+                    }
                     if p.as_any().downcast_ref::<VmCallCc>().is_some() {
                         if args.len() != 1 {
                             return Err(VmError::new("call/cc: 1 arg"));
@@ -13199,6 +13256,7 @@ fn run_dispatch(
                                     ip: 0,
                                     env: new_env,
                                     bc: closure.bc.clone(),
+                                    marks: None,
                                 });
                             }
                         } else if let Some(b) = any.downcast_ref::<VmBuiltin>() {
@@ -14280,6 +14338,10 @@ pub struct VmWithExceptionHandler;
 pub struct VmCallCc;
 #[derive(Debug)]
 pub struct VmDynamicWind;
+/// Tail-safe continuation marks reader (issue #36). Dispatched
+/// specially in `run_dispatch` so it can walk the live frame stack.
+#[derive(Debug)]
+pub struct VmCurrentContinuationMarks;
 
 /// Escape-only continuation produced by `call/cc`. Holds the unique id
 /// installed by the originating call/cc; invoking it triggers a VmError
@@ -14312,6 +14374,7 @@ impl_proc_named!(VmAssertionViolation, "assertion-violation");
 impl_proc_named!(VmWithExceptionHandler, "with-exception-handler");
 impl_proc_named!(VmCallCc, "call/cc");
 impl_proc_named!(VmDynamicWind, "dynamic-wind");
+impl_proc_named!(VmCurrentContinuationMarks, "current-continuation-marks");
 impl_proc_named!(VmContinuation, "continuation");
 
 pub fn make_vm_raise() -> Value {
@@ -14331,6 +14394,38 @@ pub fn make_vm_dynamic_wind() -> Value {
 }
 pub fn make_vm_call_cc() -> Value {
     Value::Procedure(Rc::new(VmCallCc) as Rc<dyn Procedure>)
+}
+pub fn make_vm_current_continuation_marks() -> Value {
+    Value::Procedure(Rc::new(VmCurrentContinuationMarks) as Rc<dyn Procedure>)
+}
+
+/// Build the result of `current-continuation-marks` by walking the
+/// live frame stack (issue #36). Frames in `frames[0..]` run from
+/// outermost (bottom) to innermost (top); marks within a frame are in
+/// install order. Iterating both forward and prepending each pair puts
+/// the innermost / most-recent mark at the list head, matching the
+/// walker tier's ordering. With `key`, returns the list of values
+/// marked under that key (equal?); without, the full `(key . val)`
+/// alist.
+fn build_continuation_marks(frames: &[Frame], key: Option<&Value>) -> Value {
+    let mut out = Value::Null;
+    for frame in frames.iter() {
+        let Some(marks) = &frame.marks else { continue };
+        for (k, v) in marks.iter() {
+            match key {
+                Some(want) => {
+                    if cs_core::eq::equal(k, want) {
+                        out = Value::Pair(cs_core::Pair::new(v.clone(), out));
+                    }
+                }
+                None => {
+                    let entry = Value::Pair(cs_core::Pair::new(k.clone(), v.clone()));
+                    out = Value::Pair(cs_core::Pair::new(entry, out));
+                }
+            }
+        }
+    }
+    out
 }
 pub fn make_vm_continuation(id: u64) -> Value {
     Value::Procedure(Rc::new(VmContinuation {

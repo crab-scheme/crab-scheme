@@ -8134,6 +8134,7 @@ fn opcode_name(inst: &Inst) -> &'static str {
         Inst::BranchOnNeFx2(_) => "BranchOnNeFx2",
         Inst::EnterScope => "EnterScope",
         Inst::LeaveScope => "LeaveScope",
+        Inst::PushMark => "PushMark",
     }
 }
 

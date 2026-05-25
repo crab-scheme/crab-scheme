@@ -1,63 +1,34 @@
-; R6RS++ §6 Phase 3A — continuation marks (naive impl).
+; R6RS++ §6 — continuation marks.
 ;
-; Continuation marks let user code attach key/value pairs to the
-; dynamic context. They're the substrate for stack annotations,
-; profilers, debuggers, tracing libraries, and dynamic context
-; propagation — Racket's most-underrated feature.
+; As of issue #36 the continuation-mark forms are implemented
+; NATIVELY and are tail-safe, so this library no longer defines
+; them in Scheme:
 ;
-; THIS IS THE NAIVE IMPL. It uses an internal parameter to model
-; the mark chain. Differences from Racket semantics:
+;   * `with-continuation-mark` is a core special form recognised by
+;     the expander (cs-expand). It installs `key -> val` on the
+;     CURRENT continuation frame for the dynamic extent of its body.
+;     Because the body is in tail position, a wcm reached through a
+;     tail call replaces the frame's mark for that key rather than
+;     accumulating — so a tail loop with a wcm runs in constant
+;     mark-space (R7RS / Racket tail-mark semantics).
 ;
-;   1. Marks are NOT tail-safe: each `with-continuation-mark` in
-;      a tail-recursive loop grows the chain rather than replacing
-;      the current frame's mark. A tail-call-aware VM-level
-;      implementation is the next iteration of this work.
+;   * `current-continuation-marks` is a builtin: zero args returns
+;     the full `(key . val)` alist innermost-first; one arg returns
+;     the list of values marked under that key, innermost-first.
 ;
-;   2. Marks are dynamic-scope only. There's no notion of a
-;      "captured" mark set you can pass around independent of
-;      the current dynamic context (no continuation-mark-set
-;      first-class value yet).
+; Both work identically on the tree-walker and bytecode-VM tiers
+; (the walker keeps a depth-tagged mark stack on its EvalCtx; the VM
+; keeps a per-frame mark slot). See
+; docs/adr/0027-tail-safe-continuation-marks.md.
 ;
-; The surface API is fully Racket-compatible at the call shape
-; level; only the timing/sharing differs. User code written
-; against this layer migrates unchanged when the tail-safe impl
-; lands.
+; This file is retained as a no-op so existing load/import sites keep
+; working; it intentionally defines nothing.
 ;
-; Surface:
-;   (with-continuation-mark key val body ...)
-;     Evaluates body... with the dynamic chain extended by
-;     (key . val). Returns the body's value.
+; Superseded caveats from the naive (parameter-based) implementation:
+;   1. NOT tail-safe  -> fixed (constant mark-space in tail loops).
+;   2. Same-key marks in tail position now REPLACE (Racket semantics)
+;      rather than accumulate.
 ;
-;   (current-continuation-marks)
-;     Returns the full alist of (key . val) pairs, innermost-first.
-;
-;   (current-continuation-marks key)
-;     Returns the list of all values for `key` along the current
-;     chain, innermost-first.
-
-(define *cmarks* (make-parameter '()))
-
-(define-syntax with-continuation-mark
-  (syntax-rules ()
-    ((_ key val body ...)
-     (parameterize ((*cmarks* (cons (cons key val) (*cmarks*))))
-       body ...))))
-
-; Two-arity: zero args returns the full alist; one arg filters by
-; key. Variadic-lambda form because cs-expand doesn't yet support
-; dotted-pair `define (name . args)` heads.
-(define current-continuation-marks
-  (lambda args
-    (let ((chain (*cmarks*)))
-      (cond
-        ((null? args) chain)
-        ((null? (cdr args))
-         (let loop ((rest chain) (acc '()))
-           (cond
-             ((null? rest) (reverse acc))
-             ((equal? (car (car rest)) (car args))
-              (loop (cdr rest) (cons (cdr (car rest)) acc)))
-             (else (loop (cdr rest) acc)))))
-        (else
-         (error 'current-continuation-marks
-                "expected 0 or 1 args, got" (length args)))))))
+; Still deferred (post-#36): a first-class `continuation-mark-set`
+; value you can capture and pass around independent of the current
+; dynamic context (`continuation-mark-set->list`, etc.).

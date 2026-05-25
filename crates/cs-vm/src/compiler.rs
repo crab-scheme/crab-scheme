@@ -139,6 +139,11 @@ fn collect_assigned_names(expr: &CoreExpr, out: &mut HashSet<Symbol>) {
             }
             collect_assigned_names(body, out);
         }
+        CoreExpr::WithContinuationMark { key, val, body, .. } => {
+            collect_assigned_names(key, out);
+            collect_assigned_names(val, out);
+            collect_assigned_names(body, out);
+        }
     }
 }
 
@@ -385,6 +390,24 @@ fn compile_expr(
                     out.push(Inst::Pop, e.span());
                 }
             }
+            Ok(())
+        }
+        CoreExpr::WithContinuationMark {
+            key,
+            val,
+            body,
+            span: s,
+        } => {
+            // Tail-safe continuation marks (issue #36). Evaluate key
+            // then val (non-tail), install the mark on the current
+            // frame via `PushMark`, then compile `body` in the caller's
+            // tail position. When `body` ends in a `TailCall`, the
+            // frame (and its mark) is reused, so a wcm reached through
+            // the tail call replaces rather than accumulates.
+            compile_expr(key, out, lambdas, false, globals, primops, scope)?;
+            compile_expr(val, out, lambdas, false, globals, primops, scope)?;
+            out.push(Inst::PushMark, *s);
+            compile_expr(body, out, lambdas, is_tail, globals, primops, scope)?;
             Ok(())
         }
         CoreExpr::App {

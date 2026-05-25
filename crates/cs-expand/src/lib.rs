@@ -350,6 +350,7 @@ struct Keywords {
     let_values: Symbol,
     let_star_values: Symbol,
     parameterize: Symbol,
+    with_continuation_mark: Symbol,
     quasiquote: Symbol,
     unquote: Symbol,
     unquote_splicing: Symbol,
@@ -422,6 +423,7 @@ impl Keywords {
             let_values: syms.intern("let-values"),
             let_star_values: syms.intern("let*-values"),
             parameterize: syms.intern("parameterize"),
+            with_continuation_mark: syms.intern("with-continuation-mark"),
             quasiquote: syms.intern("quasiquote"),
             unquote: syms.intern("unquote"),
             unquote_splicing: syms.intern("unquote-splicing"),
@@ -1979,6 +1981,9 @@ impl<'a> Expander<'a> {
             }
             if s == self.keywords.parameterize {
                 return self.expand_parameterize(&tail_items, span);
+            }
+            if s == self.keywords.with_continuation_mark {
+                return self.expand_with_continuation_mark(&tail_items, span);
             }
             if s == self.keywords.quasiquote {
                 if tail_items.len() != 1 {
@@ -3831,6 +3836,42 @@ impl<'a> Expander<'a> {
     ///       (lambda () (p1 new1) (p2 new2) ...)
     ///       (lambda () body ...)
     ///       (lambda () (p1 old1) (p2 old2) ...)))
+    /// `(with-continuation-mark key val body ...)` → a dedicated
+    /// `CoreExpr::WithContinuationMark` (issue #36), rather than the
+    /// old `parameterize`/`dynamic-wind` desugaring. The dedicated form
+    /// lets both tiers install the mark on the current continuation
+    /// frame so a wcm in tail position replaces rather than accumulates
+    /// (tail-safe). `body ...` is an implicit `begin`.
+    fn expand_with_continuation_mark(
+        &mut self,
+        items: &[Datum],
+        span: Span,
+    ) -> Result<CoreExpr, ExpandError> {
+        if items.len() < 3 {
+            return Err(ExpandError::BadSyntax {
+                what: "with-continuation-mark needs key, val, and body...".into(),
+                span,
+            });
+        }
+        let key = self.expand(&items[0])?;
+        let val = self.expand(&items[1])?;
+        let body = if items.len() == 3 {
+            self.expand(&items[2])?
+        } else {
+            let mut exprs = Vec::with_capacity(items.len() - 2);
+            for d in &items[2..] {
+                exprs.push(self.expand(d)?);
+            }
+            CoreExpr::Begin { exprs, span }
+        };
+        Ok(CoreExpr::WithContinuationMark {
+            key: Rc::new(key),
+            val: Rc::new(val),
+            body: Rc::new(body),
+            span,
+        })
+    }
+
     fn expand_parameterize(
         &mut self,
         items: &[Datum],

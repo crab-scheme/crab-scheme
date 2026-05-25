@@ -35,6 +35,16 @@ pub enum Inst {
     MakeClosure(usize),
     /// Return from current call frame; top of stack is the return value.
     Return,
+    /// Tail-safe continuation marks (issue #36). Pops `val` then
+    /// `key` and upserts `(key → val)` on the CURRENT call frame's
+    /// mark slot (replacing an existing mark for `key` on this frame).
+    /// Because `TailCall` reuses the current frame in place, a wcm
+    /// reached through a tail call lands on the same frame and
+    /// replaces — so a tail loop runs in constant mark-space. `Call`
+    /// pushes a fresh frame whose marks start empty, so non-tail
+    /// nesting accumulates. The mark is read back by
+    /// `current-continuation-marks`, which walks the frame stack.
+    PushMark,
     /// Push a new lexical sub-scope onto the current call frame's env
     /// (an `Env::child` layer parented to the current env). Locals
     /// `DefineLocal`'d after this land in the new layer and shadow
