@@ -7,6 +7,7 @@ pub mod builtins;
 pub mod countable_memory_cycle;
 pub mod env;
 pub mod eval;
+mod lang_reader;
 #[cfg(feature = "regions")]
 pub mod regions;
 // The `ffi` module contains only the libloading-using dlopen path
@@ -25,9 +26,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use cs_core::{SymbolTable, Value, WriteMode};
-use cs_diag::{Diagnostic, FileId, SourceMap};
+use cs_diag::{Diagnostic, FileId, SourceMap, Span};
 use cs_expand::Expander;
-use cs_parse::read_all;
+use cs_parse::{read_all, Datum};
 
 use crate::builtins::{NULL_ENV_SENTINEL, TOP_LEVEL_ENV_SENTINEL};
 use crate::env::Frame;
@@ -40,6 +41,15 @@ pub struct Runtime {
     sources: SourceMap,
     top: Rc<Frame>,
     macros: std::collections::HashMap<cs_core::Symbol, cs_expand::Macro>,
+    /// Library exports declared across the runtime's lifetime,
+    /// mirrored from each per-call `Expander::libraries()` map
+    /// (which only survives the call that built it). Keyed by the
+    /// library name (e.g. `[sym("lang"), sym("foo")]`); value is
+    /// the declared export list. Used by the `#!lang` custom-
+    /// reader pipeline (issue #10) to decide whether `(lang NAME)`
+    /// opted into the parse-time reader protocol via
+    /// `(export reader ...)`.
+    library_exports: std::collections::HashMap<Vec<cs_core::Symbol>, Vec<cs_core::Symbol>>,
     /// VM-tier persistent root env (lazily populated with pure builtins at construction).
     vm_env: Rc<cs_vm::vm::Env>,
     /// Slab of pinned values that survive intervening collects.
@@ -1789,6 +1799,7 @@ impl Runtime {
             sources: SourceMap::new(),
             top,
             macros: std::collections::HashMap::new(),
+            library_exports: std::collections::HashMap::new(),
             vm_env,
             pinned,
             // Start at 1 so handle 0 can be reserved as the FFI
@@ -2058,14 +2069,145 @@ impl Runtime {
 
     /// Evaluate a string of Scheme source. Returns the value of the final
     /// top-level expression (or `Unspecified` for empty/define-only input).
+    ///
+    /// A leading `#!lang NAME` (or `#lang NAME`) header triggers the
+    /// custom-reader protocol (R6RS++ Phase 4, issue #10): the host
+    /// loads `(lang NAME)`, and if it exports a `reader` procedure
+    /// the body is routed through that proc (yielding a list of
+    /// datums) rather than the host reader. When no `reader` is
+    /// exported, behaviour falls back to the Phase 3C MVP — the
+    /// header is rewritten in place to `(import (lang NAME))` so
+    /// line numbers stay aligned for diagnostic spans.
     pub fn eval_str(&mut self, name: &str, src: &str) -> Result<Value, Diagnostic> {
-        // Phase 3C: detect and rewrite a leading `#!lang NAME`
-        // header into `(import (lang NAME))`. The rewritten source
-        // (same line count as original) is what gets registered
-        // and parsed; downstream line numbers stay accurate.
-        let rewritten = rewrite_lang_header(src);
+        if let Some((lang_name, body)) = lang_reader::parse_lang_header(src) {
+            return self.eval_with_lang_header(name, src, lang_name, body);
+        }
+        let file_id = self.sources.add(name, src);
+        self.with_active(|rt| rt.eval_str_in_file(file_id, src))
+    }
+
+    /// Custom-reader pipeline for a source file that begins with a
+    /// `#!lang NAME` header. Issue #10 — see [`eval_str`].
+    ///
+    /// 1. If `(lang NAME)` has been declared (its name appears in
+    ///    [`Self::library_exports`]) AND that declaration listed
+    ///    `reader` in its `(export ...)` clause, look up the
+    ///    `reader` binding and route the body through it: call
+    ///    the procedure on the body source (as a Scheme string),
+    ///    convert the returned proper list to a datum sequence,
+    ///    expand+eval those datums.
+    /// 2. Otherwise fall back to the Phase 3C MVP — rewrite the
+    ///    header line to whitespace of the same byte length (so
+    ///    diagnostic spans stay aligned) and run the body through
+    ///    the host reader against the runtime's current top env.
+    ///
+    /// The declared-export check (rather than a bare
+    /// `lookup("reader")`) keeps the protocol robust against a
+    /// pre-existing user-defined top-level `reader`: only a lang
+    /// that explicitly opts in via `(export reader ...)` activates
+    /// the parse-time hook.
+    fn eval_with_lang_header(
+        &mut self,
+        name: &str,
+        original_src: &str,
+        lang_name: &str,
+        body: &str,
+    ) -> Result<Value, Diagnostic> {
+        // Phase 1 — does the lang declare `(export reader ...)`?
+        // Mirror is populated as a side effect of `eval_data_in_file`
+        // whenever a `(library ...)` form runs; libraries declared
+        // earlier in the same Runtime session are visible here.
+        let opts_into_reader = self.lang_exports_reader(lang_name);
+        if opts_into_reader {
+            if let Some(reader_proc) = self
+                .lookup("reader")
+                .filter(|v| matches!(v, Value::Procedure(_)))
+            {
+                return self.eval_with_custom_reader(name, lang_name, body, &reader_proc);
+            }
+            // Declared `reader` but no binding — fall through to
+            // host reader rather than panic. Likely a library that
+            // failed to define the binding for some reason; the
+            // host-reader path at least gets a sensible diagnostic.
+        }
+
+        // Phase 2 — no reader (or lang not declared). Phase 3C
+        // MVP path: pad the header line with whitespace of the
+        // same byte length so the body parses with the host
+        // reader at its original line / column positions.
+        let header_len = original_src.len() - body.len();
+        let mut rewritten = String::with_capacity(original_src.len());
+        rewritten.extend(std::iter::repeat_n(' ', header_len));
+        rewritten.push_str(body);
         let file_id = self.sources.add(name, &rewritten);
         self.with_active(|rt| rt.eval_str_in_file(file_id, &rewritten))
+    }
+
+    /// True if a library named `(lang NAME)` has been declared in
+    /// this Runtime and its `(export ...)` clause lists `reader`.
+    fn lang_exports_reader(&self, lang_name: &str) -> bool {
+        let Some(lang_sym) = self.syms.by_name_lookup("lang") else {
+            return false;
+        };
+        let Some(name_sym) = self.syms.by_name_lookup(lang_name) else {
+            return false;
+        };
+        let Some(reader_sym) = self.syms.by_name_lookup("reader") else {
+            return false;
+        };
+        let key = vec![lang_sym, name_sym];
+        self.library_exports
+            .get(&key)
+            .is_some_and(|exports| exports.contains(&reader_sym))
+    }
+
+    /// Phase 2 of the custom-reader pipeline — see
+    /// [`Self::eval_with_lang_header`]. The reader has been
+    /// resolved as a procedure; this method calls it on `body`,
+    /// converts the returned list to datums, and hands them to the
+    /// expander. All datum spans point at the first byte of the
+    /// body file — coarse but stable.
+    fn eval_with_custom_reader(
+        &mut self,
+        name: &str,
+        lang_name: &str,
+        body: &str,
+        reader_proc: &Value,
+    ) -> Result<Value, Diagnostic> {
+        let body_file = self.sources.add(name, body);
+        let synth_span = Span::new(body_file, 0, 0);
+        let body_val = Value::string(body.to_string());
+        let result_val = self.with_active(|rt| {
+            // The reader was defined by a user (walker-tier `Closure`)
+            // or by a host builtin — `apply_procedure` handles every
+            // procedure variant the runtime mints; `vm_call_sync` only
+            // dispatches VM-tier shapes and would refuse walker closures.
+            let mut ctx = EvalCtx::new(rt.top.clone(), &mut rt.syms, &mut rt.macros);
+            ctx.sandbox_allowed_imports = rt.sandbox_import_policy.clone();
+            crate::eval::apply_procedure(reader_proc, &[body_val], &mut ctx)
+        });
+        let result_val = match result_val {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(Diagnostic::error(
+                    format!("reader for (lang {}) raised: {}", lang_name, e.message()),
+                    synth_span,
+                ));
+            }
+        };
+        let data = match lang_reader::value_to_datum_list(&result_val, synth_span) {
+            Ok(d) => d,
+            Err(msg) => {
+                return Err(Diagnostic::error(
+                    format!(
+                        "reader for (lang {}) returned non-datum: {}",
+                        lang_name, msg
+                    ),
+                    synth_span,
+                ));
+            }
+        };
+        self.with_active(|rt| rt.eval_data_in_file(data))
     }
 
     /// Register a Rust procedure as a top-level Scheme binding. After
@@ -2136,6 +2278,15 @@ impl Runtime {
                 return Err(Diagnostic::error(e.message(), e.span()));
             }
         };
+        self.eval_data_in_file(data)
+    }
+
+    /// Expand and evaluate a pre-parsed datum sequence. Splits the
+    /// post-`read_all` portion of [`Self::eval_str_in_file`] out so
+    /// the `#!lang` custom-reader path (issue #10) can hand the
+    /// expander a datum list produced by a Scheme `reader`
+    /// procedure instead of host-parsed source.
+    fn eval_data_in_file(&mut self, data: Vec<Datum>) -> Result<Value, Diagnostic> {
         // Split off the fields the include resolver needs (`sources`) and the
         // ones the Expander itself takes (`syms`, `macros`) so they don't
         // overlap. This lets `(include "path")` register the file's source
@@ -2156,8 +2307,21 @@ impl Runtime {
             Ok(c) => c,
             Err(e) => return Err(Diagnostic::error(e.message(), e.span())),
         };
+        // Mirror this call's library declarations into the
+        // Runtime so the `#!lang` custom-reader pipeline (issue
+        // #10) can consult exports declared in earlier `eval_str`
+        // calls. The per-call expander is dropped below; without
+        // mirroring, that knowledge would vanish.
+        let lib_updates: Vec<(Vec<cs_core::Symbol>, Vec<cs_core::Symbol>)> = expander
+            .libraries()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.exports.clone()))
+            .collect();
         drop(expander);
         drop(resolver);
+        for (name, exports) in lib_updates {
+            self.library_exports.insert(name, exports);
+        }
         let mut ctx = EvalCtx::new(self.top.clone(), &mut self.syms, &mut self.macros);
         ctx.sandbox_allowed_imports = self.sandbox_import_policy.clone();
         let result = eval(&core, self.top.clone(), &mut ctx);
@@ -2359,40 +2523,6 @@ impl Runtime {
 ///
 /// The output reads like:
 ///   error in <who>: <message> (<irritant ...>) [<other tags>]
-/// Phase 3C — rewrite a leading `#!lang NAME` header into the
-/// equivalent `(import (lang NAME))` form. The replacement
-/// happens in-place on line 1 only, preserving the file's line
-/// count so source-span line numbers reported in diagnostics
-/// continue to point at the right source line. Column positions
-/// on line 1 may shift, but that's acceptable for an MVP.
-///
-/// If no `#!lang` header is present, the source is returned
-/// unchanged. Allows leading whitespace and/or a UTF-8 BOM before
-/// the directive.
-fn rewrite_lang_header(src: &str) -> String {
-    let no_bom = src.strip_prefix('\u{FEFF}').unwrap_or(src);
-    let (first_line, rest) = match no_bom.find('\n') {
-        Some(idx) => (&no_bom[..idx], Some(&no_bom[idx..])),
-        None => (no_bom, None),
-    };
-    let trimmed = first_line.trim_start();
-    let lang_name = trimmed
-        .strip_prefix("#!lang ")
-        .or_else(|| trimmed.strip_prefix("#lang "))
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && s.chars().all(|c| !c.is_whitespace()));
-    match lang_name {
-        Some(name) => {
-            let mut out = format!("(import (lang {}))", name);
-            if let Some(r) = rest {
-                out.push_str(r);
-            }
-            out
-        }
-        None => src.to_string(),
-    }
-}
-
 /// or:
 ///   assertion-violation in <who>: <message> ...
 /// with each section omitted when not present. `who` is rendered with

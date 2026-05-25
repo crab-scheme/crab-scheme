@@ -3,6 +3,8 @@
 > Status: **Phase 3 complete — 3 subphases shipped, 2 follow-ups
 > tracked for the post-1.0 sweep, 30 new tests, full workspace
 > sweep clean.**
+> _Post-exit: 3C.full (parse-time custom reader protocol) shipped
+> — issue #10. See "3C update" below._
 > Branch: `r6rs-extensions`.
 > Spec: `docs/research/r6rs_extensions_spec.md` (§4 submodules, §5
 > `#lang` reader, §6 continuation marks).
@@ -91,27 +93,80 @@ imports, source-line preservation (verified via the new
 `Runtime::sources_line_col` accessor), and the no-header /
 header-only edge cases.
 
+#### 3C update — full reader protocol shipped (issue #10) ✅
+
+The parse-time reader hook called out in the MVP-scope note now
+ships. If `(lang NAME)` was declared with `(export reader ...)`,
+`Runtime::eval_str` calls that procedure on the file body and
+feeds its returned datum list to the expander in place of the
+host reader. Lang libraries that don't export `reader` keep the
+3C MVP behavior unchanged (header line padded with whitespace so
+diagnostic spans stay aligned, body parses with the host reader).
+
+Key pieces:
+- `crates/cs-runtime/src/lang_reader.rs` — the value→datum bridge
+  and `parse_lang_header` helper.
+- `Runtime::library_exports` — mirror of each per-call
+  `Expander::libraries()`, populated as a side effect of
+  `eval_data_in_file`. Lets the pipeline consult declared exports
+  across `eval_str` invocations.
+- `Runtime::eval_with_lang_header` — dispatches to the custom-
+  reader path or the MVP rewrite path based on the
+  `library_exports` query.
+- The reader proc itself runs through `eval::apply_procedure`
+  (walker-tier), not `vm_call_sync` — readers may be user-defined
+  closures which the VM-only path can't dispatch.
+
+Limitations rolling forward:
+- Datum spans synthesized by a custom reader collapse to the
+  first byte of the body file (Scheme values carry no source-
+  text origin; a future iter could thread richer span info if the
+  reader emits `(datum . span)` pairs).
+- The optional `expander` and `base-env` exports from the spec
+  aren't honored yet — only `reader` is wired through. Tracked
+  as a follow-up; not blocking for 1.0.
+- The cs-expand "all bindings global" milestone means two langs
+  that both export `reader` collide on the binding — the later
+  declaration wins. Reflected in
+  `lang_switch_between_eval_str_calls`; a future namespace-
+  isolation pass will refine this.
+
+10 new tests in `phase4_custom_reader.rs` plus 5 unit tests in
+`lang_reader::tests` cover the reader-invoked path, the body-
+sees-other-exports composition, the no-reader fallback (Phase 3C
+behaviour preserved), pre-existing user `reader` not mistaken,
+lang-reader-overrides-user-reader, and three error paths
+(non-list return, improper-list return, reader-raise).
+
+Example lang library: `lib/lang/passthrough-reader.scm`. A
+minimal lang that defers entirely to the host reader using
+`open-input-string`+`read` in a loop — useful as a starting
+point for transformer-style readers.
+
 ## What's deferred (tracked post-1.0)
 
 | ID    | Title                                                         |
 |-------|---------------------------------------------------------------|
 | #155  | Phase 3A.tail-safe — VM-level marks with tail-call replacement|
-| #156  | Phase 3C.full — `#lang` parse-time custom reader protocol     |
+| ~~#156~~ | ~~Phase 3C.full — `#lang` parse-time custom reader protocol~~ ✅ shipped as issue #10 (see "3C update") |
 
-Both are non-blocking for 1.0: the surface API lands now; the
+#155 remains non-blocking for 1.0: the surface API lands now; the
 "real" implementation can replace the MVP without surface
 changes.
 
 ## Test additions
 
-| Suite                            | New tests |
-|----------------------------------|-----------|
-| phase3_submodules.rs (3B)        |  9        |
-| phase3_continuation_marks.rs (3A)| 12        |
-| phase3_hashlang.rs (3C)          |  9        |
-| **Total Phase 3**                | **30**    |
+| Suite                                                  | New tests |
+|--------------------------------------------------------|-----------|
+| phase3_submodules.rs (3B)                              |  9        |
+| phase3_continuation_marks.rs (3A)                      | 12        |
+| phase3_hashlang.rs (3C MVP)                            |  9        |
+| phase4_custom_reader.rs (3C.full / issue #10)          | 12        |
+| lang_reader::tests (3C.full unit, in `cs-runtime/src`) |  5        |
+| **Total Phase 3 + 3C.full follow-up**                  | **47**    |
 
-All green; full workspace test sweep is clean.
+All green; full workspace test sweep is clean (1018 cs-runtime
+tests post-#10).
 
 ## What's next
 
