@@ -122,8 +122,6 @@ Limitations rolling forward:
   first byte of the body file~~ — opt-in span threading via
   `(syntax-datum d start end)` shipped as issue #72. See
   "Follow-up — `syntax-datum`" below.
-- The optional `expander` export (per-lang expansion) isn't yet
-  honored — tracked as #71.
 - The cs-expand "all bindings global" milestone means two langs
   that both export `reader` collide on the binding — the later
   declaration wins. Reflected in
@@ -187,6 +185,60 @@ Builtins added:
 reader emitting a wrapped form (diagnostic line resolves to the
 wrapped offset, not line 1), an unwrapped reader (legacy anchor
 preserved), and the nested-wrap re-anchor case.
+
+##### Follow-up — `expander` export honored (issue #71) ✅
+
+When `(lang NAME)` declares `(export expander ...)` and binds it
+to a procedure, the host calls that procedure with the datum
+list produced by the host reader (or the lang's `reader`, if
+also exported) and feeds the returned datums to the standard
+host expander. Option-2 MVP from the #71 issue body — the user
+expander is effectively a datum→datum macro pass with the full
+runtime available; hygiene, macros, and library scope still
+land in the host expander downstream.
+
+Pipeline summary:
+
+```text
+body string
+   → reader (optional, lang-defined) | host reader
+       → vec<Datum>
+   → expander (optional, lang-defined)
+       → vec<Datum>
+   → host expander
+       → CoreExpr
+   → eval
+```
+
+Key pieces:
+- `lang_reader::datum_list_to_value` — forward bridge converting
+  a `Vec<Datum>` to a Scheme proper list so the user expander
+  receives a normal list value.
+- `Runtime::invoke_lang_expander` — calls the procedure via
+  `eval::apply_procedure`, converts the returned value back to
+  `Vec<Datum>` via the existing `value_to_datum_list`. Raises and
+  non-datum returns yield typed diagnostics naming the lang.
+- `Runtime::lang_exports_symbol` — generic export-list query
+  shared with the reader and `base-env` checks. `lang_exports_reader`
+  now delegates to it.
+
+Refactor of `eval_with_lang_header`: the function now dispatches
+on `(opts_into_reader, opts_into_expander)`. When neither is
+declared, it stays on the Phase 3C MVP fast path (header → space
+pad → host reader). When at least one is declared, it
+explicitly runs read-phase (custom or host) then optionally
+threads through the user expander before calling the host eval
+via `eval_data_in_env` so an exported `base-env` is honored too.
+
+7 new tests in `phase4_lang_expander.rs` cover:
+- expander alone replaces body datums
+- expander receives host-reader datum list
+- reader + expander composition (full pipeline)
+- expander emits multiple top-level forms
+- non-procedure `expander` binding silently degrades to plain
+  host expansion (rather than panic)
+- expander raise → diagnostic names the lang
+- expander returns non-datum → typed `non-datum` error
 
 10 new tests in `phase4_custom_reader.rs` plus 5 unit tests in
 `lang_reader::tests` cover the reader-invoked path, the body-

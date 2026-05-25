@@ -31,6 +31,14 @@ use cs_core::Value;
 use cs_diag::Span;
 use cs_parse::Datum;
 
+/// Convert a slice of [`Datum`]s into a Scheme proper list of
+/// datum values. Used by the `#!lang` `expander` hook (issue #71)
+/// to pass the reader's output to a user-defined expander
+/// procedure as a normal Scheme list.
+pub(crate) fn datum_list_to_value(datums: &[Datum]) -> Value {
+    Value::list(datums.iter().map(|d| d.to_value()))
+}
+
 /// Convert the result of `(reader body)` into a list of datums.
 ///
 /// `v` must be a proper Scheme list. Each element is converted via
