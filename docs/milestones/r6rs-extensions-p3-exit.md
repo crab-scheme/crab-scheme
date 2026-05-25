@@ -118,10 +118,10 @@ Key pieces:
   closures which the VM-only path can't dispatch.
 
 Limitations rolling forward:
-- Datum spans synthesized by a custom reader collapse to the
-  first byte of the body file (Scheme values carry no source-
-  text origin; a future iter could thread richer span info if the
-  reader emits `(datum . span)` pairs). Tracked as #72.
+- ~~Datum spans synthesized by a custom reader collapse to the
+  first byte of the body file~~ — opt-in span threading via
+  `(syntax-datum d start end)` shipped as issue #72. See
+  "Follow-up — `syntax-datum`" below.
 - The optional `expander` export (per-lang expansion) isn't yet
   honored — tracked as #71.
 - The cs-expand "all bindings global" milestone means two langs
@@ -156,6 +156,37 @@ visibility (only `(rnrs base)` resolves), out-of-env bindings
 blocked, mutable namespace allows define, no-`base-env` falls
 through, non-env value diagnostic, reader output runs against
 restricted env, restrictive env blocks reader-emitted body forms.
+
+##### Follow-up — `syntax-datum` span threading (issue #72) ✅
+
+A reader proc can now opt into source-accurate diagnostics by
+wrapping returned forms with the new `syntax-datum` constructor:
+
+```text
+(syntax-datum DATUM START END)
+```
+
+where `START` and `END` are non-negative byte offsets into the
+body string the reader was invoked with. The bridge in
+`crate::lang_reader::value_to_datum` recognises the resulting
+tagged-vector record (sentinel `__syntax-datum__`) and stamps
+the inner datum with `Span::new(body_file, start, end)` instead
+of the coarse zero anchor. Wrappers nest naturally — an inner
+wrap re-anchors only its own subtree.
+
+Plain (unwrapped) datums keep today's collapsed-to-byte-zero
+anchor, so this is purely additive and backward compatible.
+
+Builtins added:
+- `(syntax-datum d start end)` — constructor; rejects non-int
+  offsets, negatives, or `end < start`.
+- `(syntax-datum? v)` — predicate.
+
+5 new tests in `phase4_reader_spans.rs` cover the round-trip
+(constructor + predicate), arity / type / order validation, a
+reader emitting a wrapped form (diagnostic line resolves to the
+wrapped offset, not line 1), an unwrapped reader (legacy anchor
+preserved), and the nested-wrap re-anchor case.
 
 10 new tests in `phase4_custom_reader.rs` plus 5 unit tests in
 `lang_reader::tests` cover the reader-invoked path, the body-
