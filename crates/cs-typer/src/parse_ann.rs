@@ -201,6 +201,12 @@ fn parse_list_dispatch(
     match head_name {
         "U" => parse_union(rest, aliases, tvars),
         "->" => parse_arrow(rest, aliases, tvars),
+        // Phase 4 iter 3: variadic-tail arrow
+        // `(->* (mandatory-doms ...) rest-pred rng)`. Lowers to
+        // the same `Type::Procedure_` as `->` but with an
+        // explicit `rest` slot. Issue #11 ext-2 needs this so the
+        // auto-contract pass can wrap variadic library exports.
+        "->*" => parse_arrow_star(rest, aliases, tvars),
         "Listof" => parse_unary("Listof", rest, Type::Listof, aliases, tvars),
         "Vectorof" => parse_unary("Vectorof", rest, Type::Vectorof, aliases, tvars),
         // Phase 7: `(All (T1 T2 …) body)`.
@@ -209,6 +215,49 @@ fn parse_list_dispatch(
             "unknown type constructor: {head_name}"
         ))),
     }
+}
+
+/// `(->* (mandatory-doms ...) rest-pred rng)`.
+///
+/// Three arguments: the mandatory-doms LIST, the rest-pred
+/// element type, and the return type. The mandatory list may be
+/// empty (`()`) for a fully-variadic procedure.
+fn parse_arrow_star(
+    args: &[TypeDatum],
+    aliases: &[(String, Type)],
+    tvars: &[(String, cs_core::Symbol)],
+) -> Result<TypeAnn, TypeAnnError> {
+    if args.len() != 3 {
+        return Err(TypeAnnError::MalformedConstructor(
+            "->*",
+            format!(
+                "expected `(->* (doms ...) rest-pred rng)`, got {} argument{}",
+                args.len(),
+                if args.len() == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    let doms_list = match &args[0] {
+        TypeDatum::List(items) => items,
+        TypeDatum::Sym(_) => {
+            return Err(TypeAnnError::MalformedConstructor(
+                "->*",
+                "first argument must be a list of mandatory dom types".into(),
+            ));
+        }
+    };
+    let parsed_params: Result<Vec<Type>, _> = doms_list
+        .iter()
+        .map(|d| parse_type_ann_with_context(d, aliases, tvars))
+        .collect();
+    let rest_type = parse_type_ann_with_context(&args[1], aliases, tvars)?;
+    let return_type = parse_type_ann_with_context(&args[2], aliases, tvars)?;
+    Ok(Type::Procedure_(Box::new(ProcType {
+        params: parsed_params?,
+        return_type,
+        rest: Some(rest_type),
+        filter: None,
+    })))
 }
 
 fn parse_all(

@@ -1138,6 +1138,7 @@ dependencies = [
  "cs-stdlib-uuid",
  "cs-stdlib-websocket",
  "cs-table",
+ "cs-typer",
  "cs-vm",
  "cs-web",
  "libloading",

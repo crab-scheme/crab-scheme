@@ -1,7 +1,8 @@
 # R6RS++ Phase 4 — typed-boundaries arc, interim status
 
-> Status: **5 iters substrate + 1 extension (static check at expand
-> time) shipped; 3 extensions tracked in issue #11.**
+> Status: **5 iters substrate + 2 extensions shipped (static check
+> at expand time, library-export auto-contracting at runtime);
+> 2 extensions tracked in issue #11.**
 > Branch: `r6rs-extensions`.
 > Spec: `docs/research/r6rs_extensions_spec.md` (§12).
 > Predecessor: Phase 3 (closed in `c0cca4b`).
@@ -114,6 +115,65 @@ Design call in `docs/adr/0021-define-typed-static-check.md`.
   three peel-soundness cases (wrong arity, wrong head symbol,
   non-app value).
 
+### Iter 7 — library-export auto-contracting (issue #11 ext-2) ✅
+
+Library exports whose names are ascribed (via `(: NAME T)`
+inside the library body, or at the file's top level above the
+library) are now auto-wrapped with a runtime contract derived
+from the type. Untyped callers hit `&contract-violation` on
+misuse — without users having to write `define/typed` for every
+exported binding.
+
+New crate module `cs_typer::auto_contract`:
+- **`type_to_contract_datum`** mirrors `type_to_contract` but
+  builds a Datum tree directly, avoiding stringify-and-reparse
+  in the runtime hot path. Procedure types lower to
+  `(-> doms... rng)`; variadic-tail types lower to
+  `(->* (list doms...) rest-pred rng)` — the `(list ...)` form
+  is important: it tells the contract library's `->*` constructor
+  to BUILD a runtime list of dom contracts, instead of treating
+  the parenthesized doms as a procedure application.
+- **`auto_contract_library_exports`** walks the top-level
+  Datums looking for `(library …)` forms. For each, it scans
+  the body for `(: NAME T)` and `(define/typed NAME T E)`
+  ascriptions (extract_annotations doesn't recurse into library
+  bodies — library-local scope), strips the bare `(: …)` forms
+  (otherwise the expander would later fail on `:` as an unbound
+  reference), and injects
+  `(set! NAME (apply-contract <contract-datum> NAME (quote NAME)))`
+  immediately after the matching define. Top-level ascriptions
+  in the [`AnnotationTable`] are used as a fallback when no
+  library-internal ascription is found.
+
+Wiring: `cs_runtime::Runtime::eval_data_in_env` now runs
+`extract_annotations` + `auto_contract_library_exports` before
+calling the expander. Untyped code pays a per-eval walk that
+bails on the first non-typed Datum; typer diagnostics are
+dropped on the runtime path (contract-only constructors like
+`->*` may not parse against the typer grammar, but the macro
+expander handles them — `crabscheme check` remains the place
+typer feedback surfaces).
+
+Typer grammar extension: `parse_ann::parse_arrow_star` now
+recognizes `(->* (mandatory-doms ...) rest-pred rng)` so the
+auto-contract pass can wrap variadic library exports without
+falling back to "unknown type constructor".
+
+17 new tests:
+- `cs_typer::auto_contract::tests::*` (10) — Datum-level
+  rewriting: untyped library passthrough, ascribed export wrap,
+  unrelated internal ascription stripped without wrap injection,
+  union / Listof / ->* lowering, define/typed fallthrough,
+  outside-library ascription fallback, non-library top-level
+  passthrough.
+- `crates/cs-runtime/tests/phase4_auto_contract.rs` (7) —
+  Runtime e2e: ascribed library export rejects bad calls with
+  `&contract-violation`, untyped library unchanged,
+  mixed ascribed + unascribed exports (only ascribed wraps),
+  unrelated internal ascription doesn't drive wrap, outside-the-
+  library fallback, `(: x T)` strips cleanly even outside any
+  library, variadic-tail export wraps.
+
 ## Test additions
 
 | Suite                                                  | New tests |
@@ -138,11 +198,15 @@ The typed-boundaries arc could keep iterating along several axes
 1. ~~**Static check at definition time**~~ ✅ shipped iter 6
    (see above). `(define/typed)` now fails at expand time.
 
-2. **Library-export auto-contracting from inferred types**: if
-   cs-typer infers a type for an exported binding (no annotation
-   required), the library expander would auto-wrap the export with
-   the corresponding contract. Removes the need for explicit
-   `(define/typed ...)` for fully-inferable code. Issue #11 ext-2.
+2. ~~**Library-export auto-contracting from inferred types**~~ ✅
+   shipped iter 7 (see above) for the *ascription-driven*
+   variant: any `(: NAME T)` declared inside a library body (or
+   above it at file scope) drives an auto-wrap on the exported
+   binding. The "pure inference" variant (no annotation
+   required, type pulled from the Checker's inference) is a
+   stretch goal: it depends on the Checker emitting a per-
+   binding type table the runtime can consume — tracked but
+   unimplemented in this iter.
 
 3. **Contract elision at typed→typed boundaries**: when both sides
    of a call are statically type-checked, the contract is

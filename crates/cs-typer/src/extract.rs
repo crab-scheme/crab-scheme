@@ -445,6 +445,18 @@ fn parse_datum_as_type(
     parse_type_ann_with_aliases(&td, aliases)
 }
 
+/// Issue #11 ext-2: public re-export of [`parse_datum_as_type`]
+/// for the `auto_contract` module, which needs to parse
+/// library-internal `(: NAME T)` annotations (extract_annotations
+/// doesn't recurse into library bodies). Module-private otherwise.
+pub fn parse_datum_as_type_pub(
+    d: &Datum,
+    syms: &SymbolTable,
+    aliases: &[(String, Type)],
+) -> Result<Type, TypeAnnError> {
+    parse_datum_as_type(d, syms, aliases)
+}
+
 fn datum_to_type_datum(d: &Datum, syms: &SymbolTable) -> Result<TypeDatum, TypeAnnError> {
     match d {
         Datum::Symbol(s, _) => Ok(TypeDatum::Sym(syms.name(*s).to_string())),
