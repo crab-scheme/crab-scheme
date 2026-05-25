@@ -317,6 +317,10 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("string-copy", b_string_copy),
         ("number->string", b_number_to_string),
         ("string->number", b_string_to_number),
+        // `#!lang` reader span threading (issue #72) — pure constructors
+        // and predicate for the tagged-vector positioned-datum record.
+        ("syntax-datum", b_syntax_datum),
+        ("syntax-datum?", b_syntax_datum_p),
         // vectors
         ("make-vector", b_make_vector),
         ("vector", b_vector),
@@ -10656,6 +10660,20 @@ pub fn exact_integer_sqrt_num(x: &Value) -> Result<(Value, Value), String> {
 /// Sentinel marking a Vector value as an R6RS environment record.
 pub(crate) const ENV_TAG: &str = "__environment__";
 
+/// Sentinel marking a Vector value as a positioned syntax datum
+/// (issue #72 — `#!lang` reader span threading). Shape:
+///
+/// ```text
+/// #('__syntax-datum__ <datum> <start> <end>)
+/// ```
+///
+/// where `start` and `end` are byte offsets into the body string
+/// the reader was called with. The reader bridge in
+/// `crate::lang_reader::value_to_datum` recognises this tag and
+/// builds a `Datum` whose [`cs_diag::Span`] points at the named
+/// byte range instead of the synthetic body-file-zero anchor.
+pub(crate) const SYNTAX_DATUM_TAG: &str = "__syntax-datum__";
+
 /// Sentinel symbol returned by `(interaction-environment)` and
 /// `(scheme-report-environment N)`. Pure marker — `eval`'s 2nd-arg
 /// handler recognizes it as "no L1.1 restriction; use ctx.top".
@@ -10967,6 +10985,90 @@ fn b_environment_p(args: &[Value], _ctx: &mut EvalCtx) -> Result<Value, String> 
 /// Internal: check the L1.1 environment-record shape.
 pub(crate) fn is_environment_value(v: &Value) -> bool {
     matches!(classify_env_record(v), EnvShape::Valid { .. })
+}
+
+/// `(syntax-datum d start end)` — wrap a datum value with the
+/// byte-range span the host should attach when the lang's
+/// `reader` returns it (issue #72).
+///
+/// `start` and `end` are non-negative integers measured in bytes
+/// from the start of the body string the reader was called with.
+/// The bridge in `crate::lang_reader::value_to_datum` recognises
+/// the resulting record and uses the named span; non-wrapped
+/// datums collapse to the synthetic anchor as before.
+fn b_syntax_datum(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(arity_err("syntax-datum", "3", args.len()));
+    }
+    let start = decode_non_negative_offset("syntax-datum", "start", &args[1])?;
+    let end = decode_non_negative_offset("syntax-datum", "end", &args[2])?;
+    if end < start {
+        return Err(format!(
+            "syntax-datum: end ({}) must be >= start ({})",
+            end, start
+        ));
+    }
+    Ok(new_vector(vec![
+        Value::string(SYNTAX_DATUM_TAG),
+        args[0].clone(),
+        Value::Number(cs_core::Number::from_i64(start as i64)),
+        Value::Number(cs_core::Number::from_i64(end as i64)),
+    ]))
+}
+
+/// `(syntax-datum? v)` — true when `v` is a syntax-datum record
+/// built by [`b_syntax_datum`].
+fn b_syntax_datum_p(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("syntax-datum?", "1", args.len()));
+    }
+    Ok(Value::Boolean(is_syntax_datum_value(&args[0])))
+}
+
+/// Internal: shape predicate matching [`SYNTAX_DATUM_TAG`].
+pub(crate) fn is_syntax_datum_value(v: &Value) -> bool {
+    let Value::Vector(items) = v else {
+        return false;
+    };
+    let items = items.borrow();
+    if items.len() != 4 {
+        return false;
+    }
+    matches!(&items[0], Value::String(s) if s.borrow().as_str() == SYNTAX_DATUM_TAG)
+}
+
+/// Internal: extract `(datum, start, end)` from a syntax-datum
+/// record. Returns `None` for any malformed shape.
+pub(crate) fn decode_syntax_datum(v: &Value) -> Option<(Value, u32, u32)> {
+    if !is_syntax_datum_value(v) {
+        return None;
+    }
+    let Value::Vector(items) = v else {
+        return None;
+    };
+    let items = items.borrow();
+    let start = value_to_u32_offset(&items[2])?;
+    let end = value_to_u32_offset(&items[3])?;
+    Some((items[1].clone(), start, end))
+}
+
+fn decode_non_negative_offset(who: &str, label: &str, v: &Value) -> Result<u32, String> {
+    value_to_u32_offset(v).ok_or_else(|| {
+        format!(
+            "{}: {} must be a non-negative integer that fits in u32",
+            who, label
+        )
+    })
+}
+
+fn value_to_u32_offset(v: &Value) -> Option<u32> {
+    let Value::Number(cs_core::Number::Fixnum(i)) = v else {
+        return None;
+    };
+    if *i < 0 {
+        return None;
+    }
+    u32::try_from(*i).ok()
 }
 
 /// Internal: extract (bindings_map, mutable) from an environment

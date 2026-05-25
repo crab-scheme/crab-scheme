@@ -60,7 +60,18 @@ pub(crate) fn value_to_datum_list(v: &Value, span: Span) -> Result<Vec<Datum>, S
 /// (handling improper / dotted pairs naturally) and vectors.
 /// Non-datum values (procedures, ports, records, continuations,
 /// hash tables, etc.) are rejected with a typed error message.
+///
+/// **Span threading** (issue #72): if `v` is a `(syntax-datum
+/// inner start end)` record built by the `syntax-datum` builtin,
+/// `inner` is converted with the embedded byte range applied to
+/// `span.file` instead of the caller-supplied `span`. Wrappers
+/// nest naturally — a `syntax-datum` inside a list element re-
+/// anchors only its own subtree.
 pub(crate) fn value_to_datum(v: &Value, span: Span) -> Result<Datum, String> {
+    if let Some((inner, start, end)) = crate::builtins::decode_syntax_datum(v) {
+        let inner_span = Span::new(span.file, start, end);
+        return value_to_datum(&inner, inner_span);
+    }
     match v {
         Value::Boolean(b) => Ok(Datum::Boolean(*b, span)),
         Value::Number(n) => Ok(Datum::Number(n.clone(), span)),
