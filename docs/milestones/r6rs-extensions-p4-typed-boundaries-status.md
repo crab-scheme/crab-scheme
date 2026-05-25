@@ -1,26 +1,28 @@
-# R6RS++ Phase 4 — typed-boundaries arc, interim status
+# R6RS++ Phase 4 — typed-boundaries arc, EXIT REPORT
 
-> Status: **5 iters substrate + 3 extensions shipped (static
-> check at expand time, library-export auto-contracting at
-> runtime, intra-library contract elision); 1 partial extension
-> tracked, 1 deferred indefinitely.**
-> Branch: `r6rs-extensions`.
+> Status: **5 iters substrate + 4 extensions shipped (static
+> check at expand time, library-export auto-contracting,
+> intra-library contract elision, eta-elision verification);
+> 1 extension formally deferred (ProcType.filter lowering).
+> Issue #11 closed.**
+> Branch: `r6rs-extensions` (substrate), `feat/issue-11-static-define-typed` (extensions).
 > Spec: `docs/research/r6rs_extensions_spec.md` (§12).
 > Predecessor: Phase 3 (closed in `c0cca4b`).
 
 Captures what shipped in the typed-boundaries subgoal of Phase 4
 and what's natural-but-not-yet-built.
 
-## Why interim, not exit
+## What this report covers
 
 Phase 4 is "advanced research" per the spec's phased rollout
 table — it has four broad deliverables (typed integration,
-optimizer plugins, sandboxing, custom readers) and the spec is
-deliberately sparse on three of them. The typed-boundaries arc is
-the one with concrete prior art (cs-typer + Phase 2 contracts);
-the others are open design questions. This report covers ONLY
-the typed-boundaries subgoal so the writeup matches what's
-actually shipped.
+optimizer plugins, sandboxing, custom readers). The other
+three deliverables have their own exit reports (optimizer
+plugins, sandboxing L1+L2, custom readers). This report
+covers the typed-boundaries subgoal, now closed via the 5-
+iter substrate + 4 of 5 extensions tracked in issue #11. The
+5th extension (ProcType.filter lowering) is formally deferred
+in ADR 0025.
 
 ## What shipped
 
@@ -239,26 +241,86 @@ machinery to expose both wrapped and unwrapped ports, and
 cs-expand to track caller types at every import boundary —
 multi-iter scope. Tracked in issue #11 ext-3's open follow-up.
 
+### Iter 9 — eta-elision verification (issue #11 ext-4) ✅
+
+Phase 2B.7 (issue #150) shipped an eta-elision fast path in
+`lib/contract/contract.scm`: when every dom spec and the
+range spec of an `(-> doms… rng)` contract is a plain
+predicate, `apply-contract` returns a specialized wrapper
+(`__apply-contract-fast-fixed` / `__apply-contract-fast-variadic`)
+that inlines the predicate calls and skips generic dispatch.
+
+ext-4 asks: do typed-derived contracts (from ext-2's
+auto-contract lowering) also take the fast path? Answer:
+**yes**, automatically. The typed lowering emits contracts via
+the same `->` constructor, with every spec a plain predicate
+(`integer?`, `string?`, …). `__all-simple-preds?` returns true,
+so the fast path triggers. No new implementation code needed;
+the optimisation is shared.
+
+Design call in `docs/adr/0024-eta-elision-typed-contracts.md`.
+Documents what the optimisation does (and doesn't do):
+- Monomorphic atomic types: fast path.
+- Structured types (Union, Listof, Vectorof, higher-order
+  arrows): slow path, semantically correct.
+
+4 new e2e tests in `phase4_eta_elision.rs`:
+- `monomorphic_typed_export_uses_fast_path_correctly` —
+  single-arg fast path, tight loop sanity check.
+- `monomorphic_multi_arg_typed_contract_works` —
+  multi-domain fixed-arity fast path, arity-mismatch raises
+  `&contract-violation`.
+- `higher_order_typed_contract_falls_through_to_slow_path` —
+  `(-> (-> A B) C)` correctly uses the slow path; still
+  semantically correct.
+- `union_typed_contract_does_not_use_fast_path_but_still_works` —
+  union types lower to `(or/c …)` sub-contract → slow path;
+  semantically correct.
+
+Stretch goals (deferred): hand-rolled inline predicate
+lambdas at lowering time (further perf win); AOT-time
+monomorphisation of typed contracts.
+
+### Iter 10 — ProcType.filter deferral (issue #11 ext-5) ⏸
+
+Per ADR 0025: the semantic mismatch between filter types
+(compile-time narrowing propositions per Tobin-Hochstadt +
+Felleisen's occurrence typing paper) and contracts (runtime
+value predicates) is deep enough that no contract-grammar
+extension within reach would close it without changing
+procedure semantics. Filter dropped at lowering time;
+occurrence typing remains a pure compile-time feature.
+
+Issue #11 ext-5 is formally closed via this deferral; the
+filter slot in `ProcType` still drives compile-time narrowing
+via `narrow_positive` / `narrow_negative` in `cs_typer::check`.
+
 ## Test additions
 
-| Suite                                                  | New tests |
-|--------------------------------------------------------|-----------|
-| crates/cs-typer/tests/contract_lowering.rs             | 20        |
-| crates/cs-typer/tests/contract_lowering_e2e.rs         |  7        |
-| crates/cs-runtime/tests/phase4_list_vector_of_c.rs     | 10        |
-| crates/cs-runtime/tests/phase4_arrow_star.rs           |  8        |
-| crates/cs-runtime/tests/phase4_define_typed.rs         | 13        |
-| crates/cs-runtime/tests/phase4_define_typed_library.rs |  4        |
-| crates/cs-typer/src/extract.rs (define_typed_* iter 6) |  6        |
-| crates/cs-typer/tests/define_typed_static.rs (iter 6)  |  9        |
-| **Total**                                              | **77**    |
+| Suite                                                    | New tests |
+|----------------------------------------------------------|-----------|
+| crates/cs-typer/tests/contract_lowering.rs (iter 1)      | 20        |
+| crates/cs-typer/tests/contract_lowering_e2e.rs (iter 2)  |  7        |
+| crates/cs-runtime/tests/phase4_list_vector_of_c.rs (i2)  | 10        |
+| crates/cs-runtime/tests/phase4_arrow_star.rs (iter 3)    |  8        |
+| crates/cs-runtime/tests/phase4_define_typed.rs (iter 4)  | 13        |
+| crates/cs-runtime/tests/phase4_define_typed_library.rs   |  4        |
+| crates/cs-typer/src/extract.rs (define_typed_* iter 6)   |  6        |
+| crates/cs-typer/tests/define_typed_static.rs (iter 6)    |  9        |
+| crates/cs-typer/src/auto_contract.rs (iter 7+8)          | 10        |
+| crates/cs-runtime/tests/phase4_auto_contract.rs (iter 7+8) | 10      |
+| crates/cs-runtime/tests/phase4_eta_elision.rs (iter 9)   |  4        |
+| **Total**                                                | **101**   |
 
 All green; full workspace test sweep is clean.
 
-## What's natural but not yet built
+Final tallies on `feat/issue-11-static-define-typed`:
+- cs-typer: 326 passed, 0 failed
+- cs-runtime: 1039 passed, 0 failed
 
-The typed-boundaries arc could keep iterating along several axes
-(tracked in issue #11):
+## Issue #11 ext summary
+
+The 5 issue-#11 extensions, all resolved:
 
 1. ~~**Static check at definition time**~~ ✅ shipped iter 6
    (see above). `(define/typed)` now fails at expand time.
@@ -282,27 +344,31 @@ The typed-boundaries arc could keep iterating along several axes
    library two-port semantics and cs-expand type tracking —
    tracked but unimplemented.
 
-4. **Eta-elision for monomorphic contracts** (Phase 2B.7 task
-   #150 already on the queue): the same optimization applied to
-   typed-derived contracts. Issue #11 ext-4.
+4. ~~**Eta-elision for monomorphic contracts**~~ ✅ shipped
+   iter 9 (see "Iter 9" below). Verification + tests
+   confirming Phase 2B.7's fast path automatically covers
+   typed-derived contracts whose specs are plain predicates
+   (no sub-contracts).
 
-5. **Cover ProcType.filter** (predicate-narrowing types): the
-   iter-1 lowering currently ignores `filter` because contracts
-   don't express occurrence typing. Could lower to a contract +
-   side-effect that narrows the runtime type for downstream
-   readers, but the semantic mismatch is deep. Issue #11 ext-5
-   (deferred indefinitely per the issue body).
+5. ~~**Cover ProcType.filter**~~ ⏸ deferred indefinitely
+   (ADR 0025). The semantic mismatch between filter types
+   (compile-time narrowing propositions) and contracts
+   (runtime value predicates) is deep enough that no contract-
+   grammar extension within reach would close it without
+   adding non-Scheme behavior. Occurrence typing remains a
+   pure compile-time feature.
 
-None of these block 1.0. Each is a single iter on its own once
-the design question is answered.
+No 1.0 blocker. The follow-up tasks (pure-inference auto-
+contracting, cross-library typed→typed elision) are post-1.0
+quality-of-life improvements that don't change the surface.
 
-## Other Phase 4 deliverables (still untouched)
+## Other Phase 4 deliverables — all closed
 
 | Deliverable          | Status                                       |
 |----------------------|----------------------------------------------|
-| Optimizer plugins    | no design                                    |
-| Sandboxing           | no design                                    |
-| Custom readers       | tracked as #156 (Phase 3C.full)              |
+| Typed boundaries     | ✅ closed (this report)                      |
+| Optimizer plugins    | ✅ closed (ADR 0014, exit report)            |
+| Sandboxing L1+L2     | ✅ closed (ADR 0015, exit reports)           |
+| Custom readers       | ✅ closed (issue #10, p3-exit update)        |
 
-Each requires a design ADR before implementation. None are 1.0-
-blocking. Pick up when specific use cases motivate.
+All four Phase 4 deliverables have shipped. Phase 4 is closed.
