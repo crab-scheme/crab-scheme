@@ -43,14 +43,18 @@ high σ this session (machine not fully quiesced) and are marked noisy.
 
 | benchmark (scaled N) | rc5            | rc6            | Δ        | clean? |
 |----------------------|----------------|----------------|----------|--------|
-| `fib(32)`            | 540 ± 38 ms    | 595 ± 146 ms   | noisy    | ✗ (cur σ 24%) |
-| `alloc-stress(6000)` | 1.49 ± 0.34 s  | 1.07 ± 0.10 s  | noisy    | ✗ (rc5 σ 23%) |
+| `fib(32)`            | 452.6 ± 5.0 ms | 456.0 ± 9.5 ms | **~0%**  | ✓ (re-run, σ 1–2%) |
+| `alloc-stress(6000)` | 859.7 ± 51 ms  | 822.2 ± 13 ms  | **−4%**  | ✓ (re-run, cur σ 1.6%) |
 | `binary-trees(16)`   | 5.88 ± 0.43 s  | 5.13 ± 0.07 s  | −13%     | ~ (cur clean) |
 | `spectral-norm(500)` | 8.75 ± 0.07 s  | 8.47 ± 0.08 s  | **−3%**  | ✓ (both σ < 1%) |
 
-VM verdict: **no regression.** The cleanest row (`spectral-norm`,
-both σ < 1%) shows a 3% improvement; `binary-trees` agrees at the
-current-side. The two "noisy" rows never favor rc5 with tight σ.
+VM verdict: **no regression — flat to slightly faster.** `fib` is
+dead even (1.01×, both clean); `alloc-stress` −4%, `spectral-norm`
+−3%, `binary-trees` agrees on the current side. A confirming detail:
+on the quiesced re-run the rc5 binary clocked `fib`-VM at 452.6 ms —
+matching rc5-results.md's original 452.3 ms recording to within
+0.3 ms, which is what told us the earlier 540–595 ms readings were
+machine-load noise, not a code change.
 
 ### JIT (Cranelift)
 
@@ -131,8 +135,11 @@ alloc-stress       0.151s   0.045s  0.025s   0.047  0.026   0.021   0.150*
   "<bin> --tier <vm|vm-jit> run <scaled.scm>"`, scaled inputs
   identical to `bench/microbench/scaled.sh`.
 - "clean?" column flags rows where both sides had σ small enough
-  (roughly < 5%) to trust the delta. Noisy rows are reported but not
-  interpreted.
-- Host was under moderate background load during capture (concurrent
-  release builds finishing). The low-σ rows are robust to this; a
-  fully-quiesced re-run would tighten `fib`-VM and `alloc-stress`-VM.
+  (roughly < 5%) to trust the delta.
+- The first A/B pass ran while concurrent release builds were
+  finishing, leaving `fib`-VM and `alloc-stress`-VM with high σ.
+  Those two rows were re-run (`warmup 5`, `runs 15`) once load
+  dropped; the table above reflects the tightened numbers. The
+  rc5-binary `fib`-VM landing at 452.6 ms — vs the 452.3 ms in
+  rc5-results.md — confirms the re-run conditions matched the
+  original recording.
