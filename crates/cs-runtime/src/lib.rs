@@ -2114,41 +2114,81 @@ impl Runtime {
         body: &str,
     ) -> Result<Value, Diagnostic> {
         // Resolve the optional `base-env` (issue #70) once; it
-        // applies whether or not a `reader` is also exported.
-        // An error here means the lang exported a `base-env`
-        // that isn't a valid environment value — surface that as
-        // a hard error rather than silently falling back.
+        // applies whether or not a `reader` / `expander` is also
+        // exported. An error here means the lang exported a
+        // `base-env` that isn't a valid environment value —
+        // surface that as a hard error rather than silently
+        // falling back.
         let base_env = self.resolve_lang_base_env(lang_name)?;
 
-        // Phase 1 — does the lang declare `(export reader ...)`?
-        // Mirror is populated as a side effect of `eval_data_in_file`
-        // whenever a `(library ...)` form runs; libraries declared
-        // earlier in the same Runtime session are visible here.
+        // Phase 1 — does the lang declare `(export reader ...)`
+        // or `(export expander ...)`? The `library_exports`
+        // mirror is populated as a side effect of
+        // `eval_data_in_file` whenever a `(library ...)` form
+        // runs; libraries declared earlier in the same Runtime
+        // session are visible here.
         let opts_into_reader = self.lang_exports_reader(lang_name);
-        if opts_into_reader {
-            if let Some(reader_proc) = self
+        let opts_into_expander = self.lang_exports_symbol(lang_name, "expander");
+
+        // No custom-reader and no user-expander → the Phase 3C
+        // MVP fast path. Pad the header line with whitespace of
+        // the same byte length so the body parses with the host
+        // reader at its original line / column positions. Honors
+        // an exported `base-env` if present (issue #70).
+        if !opts_into_reader && !opts_into_expander {
+            let header_len = original_src.len() - body.len();
+            let mut rewritten = String::with_capacity(original_src.len());
+            rewritten.extend(std::iter::repeat_n(' ', header_len));
+            rewritten.push_str(body);
+            let file_id = self.sources.add(name, &rewritten);
+            return self.with_active(|rt| rt.eval_str_in_env(file_id, &rewritten, base_env));
+        }
+
+        // At least one of `reader` / `expander` is declared. Run
+        // the appropriate read-phase, then optionally pipe the
+        // resulting datums through the lang's expander before
+        // handing them to the host expander.
+        let body_file = self.sources.add(name, body);
+        let synth_span = Span::new(body_file, 0, 0);
+
+        let mut datums = if opts_into_reader {
+            match self
                 .lookup("reader")
                 .filter(|v| matches!(v, Value::Procedure(_)))
             {
-                return self.eval_with_custom_reader(name, lang_name, body, &reader_proc, base_env);
+                Some(reader_proc) => {
+                    self.invoke_lang_reader(lang_name, body, &reader_proc, synth_span)?
+                }
+                None => {
+                    // Declared `reader` but no binding (library
+                    // failed to define it). Degrade gracefully to
+                    // the host reader so the body still parses.
+                    self.read_body_host(body_file, body)?
+                }
             }
-            // Declared `reader` but no binding — fall through to
-            // host reader rather than panic. Likely a library that
-            // failed to define the binding for some reason; the
-            // host-reader path at least gets a sensible diagnostic.
+        } else {
+            // Only `expander` is declared — host reader produces
+            // the datums; the lang's expander rewrites them.
+            self.read_body_host(body_file, body)?
+        };
+
+        if opts_into_expander {
+            if let Some(expander_proc) = self
+                .lookup("expander")
+                .filter(|v| matches!(v, Value::Procedure(_)))
+            {
+                datums =
+                    self.invoke_lang_expander(lang_name, datums, &expander_proc, synth_span)?;
+            }
+            // Declared `expander` but no binding → silent no-op,
+            // same degradation policy as the reader case.
         }
 
-        // Phase 2 — no reader (or lang not declared). Phase 3C
-        // MVP path: pad the header line with whitespace of the
-        // same byte length so the body parses with the host
-        // reader at its original line / column positions. Honors
-        // an exported `base-env` if present (issue #70).
-        let header_len = original_src.len() - body.len();
-        let mut rewritten = String::with_capacity(original_src.len());
-        rewritten.extend(std::iter::repeat_n(' ', header_len));
-        rewritten.push_str(body);
-        let file_id = self.sources.add(name, &rewritten);
-        self.with_active(|rt| rt.eval_str_in_env(file_id, &rewritten, base_env))
+        // Final eval of the datum stream produced by the
+        // reader+expander pipeline. Honors an exported `base-env`
+        // (issue #70) by routing through `eval_data_in_env`
+        // rather than `eval_data_in_file`.
+        self.with_active(|rt| rt.eval_data_in_env(datums, base_env))
     }
 
     /// Resolve the `base-env` export of `(lang NAME)`, if any.
@@ -2186,9 +2226,18 @@ impl Runtime {
         Ok(Some(frame))
     }
 
-    /// Helper variant of [`Self::lang_exports_reader`] that
-    /// checks for an arbitrary export symbol. Used by the
-    /// `base-env` check (issue #70).
+    /// True if a library named `(lang NAME)` has been declared in
+    /// this Runtime and its `(export ...)` clause lists `reader`.
+    fn lang_exports_reader(&self, lang_name: &str) -> bool {
+        self.lang_exports_symbol(lang_name, "reader")
+    }
+
+    /// Generic export-list query: did `(lang NAME)` declare
+    /// `(export EXPORT_NAME ...)`? Returns false when any of the
+    /// involved names haven't been interned yet (a sufficient
+    /// proxy for "the lang library can't have referenced
+    /// EXPORT_NAME because no one has"). Used by the reader (#10),
+    /// `base-env` (#70), and expander (#71) export checks.
     fn lang_exports_symbol(&self, lang_name: &str, export_name: &str) -> bool {
         let Some(lang_sym) = self.syms.by_name_lookup("lang") else {
             return false;
@@ -2205,28 +2254,27 @@ impl Runtime {
             .is_some_and(|exports| exports.contains(&target_sym))
     }
 
-    /// True if a library named `(lang NAME)` has been declared in
-    /// this Runtime and its `(export ...)` clause lists `reader`.
-    fn lang_exports_reader(&self, lang_name: &str) -> bool {
-        self.lang_exports_symbol(lang_name, "reader")
+    /// Read the body source through the host reader. Used by the
+    /// `#!lang` pipeline when the lang doesn't (or can't) supply
+    /// its own reader. `body_file` is the [`FileId`] the body's
+    /// source was registered under.
+    fn read_body_host(&mut self, body_file: FileId, body: &str) -> Result<Vec<Datum>, Diagnostic> {
+        read_all(body_file, body, &mut self.syms).map_err(|errs| {
+            let e = &errs[0];
+            Diagnostic::error(e.message(), e.span())
+        })
     }
 
-    /// Phase 2 of the custom-reader pipeline — see
-    /// [`Self::eval_with_lang_header`]. The reader has been
-    /// resolved as a procedure; this method calls it on `body`,
-    /// converts the returned list to datums, and hands them to the
-    /// expander. All datum spans point at the first byte of the
-    /// body file — coarse but stable.
-    fn eval_with_custom_reader(
+    /// Invoke the lang's `reader` procedure on `body`. Returns
+    /// the converted [`Datum`] list. Diagnostics name the offending
+    /// lang and the failure mode (raise vs non-datum return).
+    fn invoke_lang_reader(
         &mut self,
-        name: &str,
         lang_name: &str,
         body: &str,
         reader_proc: &Value,
-        base_env: Option<Rc<Frame>>,
-    ) -> Result<Value, Diagnostic> {
-        let body_file = self.sources.add(name, body);
-        let synth_span = Span::new(body_file, 0, 0);
+        synth_span: Span,
+    ) -> Result<Vec<Datum>, Diagnostic> {
         let body_val = Value::string(body.to_string());
         let result_val = self.with_active(|rt| {
             // The reader itself runs against the runtime's normal
@@ -2243,28 +2291,58 @@ impl Runtime {
             ctx.sandbox_allowed_imports = rt.sandbox_import_policy.clone();
             crate::eval::apply_procedure(reader_proc, &[body_val], &mut ctx)
         });
-        let result_val = match result_val {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(Diagnostic::error(
-                    format!("reader for (lang {}) raised: {}", lang_name, e.message()),
-                    synth_span,
-                ));
-            }
-        };
-        let data = match lang_reader::value_to_datum_list(&result_val, synth_span) {
-            Ok(d) => d,
-            Err(msg) => {
-                return Err(Diagnostic::error(
-                    format!(
-                        "reader for (lang {}) returned non-datum: {}",
-                        lang_name, msg
-                    ),
-                    synth_span,
-                ));
-            }
-        };
-        self.with_active(|rt| rt.eval_data_in_env(data, base_env))
+        let result_val = result_val.map_err(|e| {
+            Diagnostic::error(
+                format!("reader for (lang {}) raised: {}", lang_name, e.message()),
+                synth_span,
+            )
+        })?;
+        lang_reader::value_to_datum_list(&result_val, synth_span).map_err(|msg| {
+            Diagnostic::error(
+                format!(
+                    "reader for (lang {}) returned non-datum: {}",
+                    lang_name, msg
+                ),
+                synth_span,
+            )
+        })
+    }
+
+    /// Invoke the lang's `expander` procedure on a datum sequence
+    /// (issue #71). The expander is a Scheme procedure of one
+    /// argument — a list of datums — that returns a list of
+    /// datums. This is option (2) from the #71 issue body: the
+    /// host expander still runs afterwards, so the user expander
+    /// is effectively a datum→datum macro pass with the full
+    /// runtime available.
+    fn invoke_lang_expander(
+        &mut self,
+        lang_name: &str,
+        datums: Vec<Datum>,
+        expander_proc: &Value,
+        synth_span: Span,
+    ) -> Result<Vec<Datum>, Diagnostic> {
+        let input_val = lang_reader::datum_list_to_value(&datums);
+        let result_val = self.with_active(|rt| {
+            let mut ctx = EvalCtx::new(rt.top.clone(), &mut rt.syms, &mut rt.macros);
+            ctx.sandbox_allowed_imports = rt.sandbox_import_policy.clone();
+            crate::eval::apply_procedure(expander_proc, &[input_val], &mut ctx)
+        });
+        let result_val = result_val.map_err(|e| {
+            Diagnostic::error(
+                format!("expander for (lang {}) raised: {}", lang_name, e.message()),
+                synth_span,
+            )
+        })?;
+        lang_reader::value_to_datum_list(&result_val, synth_span).map_err(|msg| {
+            Diagnostic::error(
+                format!(
+                    "expander for (lang {}) returned non-datum: {}",
+                    lang_name, msg
+                ),
+                synth_span,
+            )
+        })
     }
 
     /// Register a Rust procedure as a top-level Scheme binding. After
