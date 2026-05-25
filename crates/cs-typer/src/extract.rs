@@ -61,6 +61,17 @@ pub fn extract_annotations(
             TopForm::Ascription(ann) => {
                 table.top_level.push(ann);
             }
+            TopForm::DefineTypedAscription(ann) => {
+                // Issue #11 ext-1: record the ascription AND keep
+                // the original Datum so the contract macro still
+                // runs. The Checker uses the ascription to verify
+                // the expression at expand time; the macro's
+                // runtime contract wrap guards untyped callers.
+                if table.ascription(ann.name).is_none() {
+                    table.top_level.push(ann);
+                }
+                out_data.push(d.clone());
+            }
             TopForm::DefineType(alias) => {
                 alias_scratch.push((syms.name(alias.name).to_string(), alias.target.clone()));
                 table.aliases.push(alias);
@@ -100,6 +111,13 @@ pub fn extract_annotations(
 /// What the classifier returns for a top-level Datum.
 enum TopForm {
     Ascription(TopLevelAnnotation),
+    /// `(define/typed N T E)` — same as `Ascription` plus the
+    /// original Datum survives so the contract library's macro
+    /// can perform its runtime contract wrap. Issue #11 ext-1:
+    /// the synthesized ascription drives the Checker to verify
+    /// E against T at expand time, flipping the binding from
+    /// "fail on first call" to "fail at load".
+    DefineTypedAscription(TopLevelAnnotation),
     DefineType(TypeAlias),
     TypedDefine {
         stripped: Datum,
@@ -122,6 +140,7 @@ struct Keywords {
     colon: Symbol,
     define: Symbol,
     define_type: Symbol,
+    define_typed: Symbol,
 }
 
 impl Keywords {
@@ -130,6 +149,7 @@ impl Keywords {
             colon: syms.intern(":"),
             define: syms.intern("define"),
             define_type: syms.intern("define-type"),
+            define_typed: syms.intern("define/typed"),
         }
     }
 }
@@ -155,6 +175,9 @@ fn classify_top_level(
     if head_sym == kws.define_type {
         return classify_define_type(&elements, d.span(), syms, aliases, diags);
     }
+    if head_sym == kws.define_typed {
+        return classify_define_typed(&elements, syms, aliases, diags);
+    }
     if head_sym == kws.define {
         return classify_define(&elements, d.span(), syms, kws, aliases, diags);
     }
@@ -177,6 +200,43 @@ fn classify_ascription(
     let type_datum = &elements[2];
     match parse_datum_as_type(type_datum, syms, aliases) {
         Ok(t) => TopForm::Ascription(TopLevelAnnotation {
+            name,
+            type_ann: t,
+            ascription_span: elements[0].span(),
+        }),
+        Err(e) => {
+            diags.push(type_ann_diag(e, type_datum.span()));
+            TopForm::Passthrough
+        }
+    }
+}
+
+/// Classify a `(define/typed NAME TYPE EXPR)` form. Issue #11
+/// ext-1: synthesize a top-level ascription `(: NAME TYPE)` so
+/// the Checker's `check_set` validates EXPR against TYPE at
+/// expansion time. The Datum itself passes through unchanged —
+/// the contract library's macro will expand it at the usual time
+/// to wrap EXPR with a runtime contract, preserving the dynamic
+/// check for callers we couldn't see statically.
+fn classify_define_typed(
+    elements: &[Datum],
+    syms: &SymbolTable,
+    aliases: &[(String, Type)],
+    diags: &mut Vec<Diagnostic>,
+) -> TopForm {
+    // (define/typed NAME TYPE EXPR) — exactly 4 elements.
+    // Other arities fall through; the contract macro will raise
+    // its own syntax error.
+    if elements.len() != 4 {
+        return TopForm::Passthrough;
+    }
+    let name = match &elements[1] {
+        Datum::Symbol(s, _) => *s,
+        _ => return TopForm::Passthrough,
+    };
+    let type_datum = &elements[2];
+    match parse_datum_as_type(type_datum, syms, aliases) {
+        Ok(t) => TopForm::DefineTypedAscription(TopLevelAnnotation {
             name,
             type_ann: t,
             ascription_span: elements[0].span(),
@@ -682,5 +742,109 @@ mod tests {
         let ann = table.lambdas.values().next().unwrap();
         assert!(ann.param_types.is_empty());
         assert_eq!(ann.return_type, Some(Type::Fixnum));
+    }
+
+    // ---- Issue #11 ext-1: (define/typed N T E) recognition ----
+
+    #[test]
+    fn define_typed_synthesizes_ascription_and_keeps_form() {
+        // `(define/typed N T E)` should add a top-level
+        // ascription to the table AND pass the original Datum
+        // through so the contract macro can expand it at the
+        // normal time.
+        let (data, mut syms) = read("(define/typed sq (-> Fixnum Fixnum) (lambda (x) (* x x)))");
+        let (stripped, table, diags) = extract_annotations(&data, &mut syms);
+        assert!(diags.is_empty(), "diags: {diags:?}");
+        assert_eq!(stripped.len(), 1, "the define/typed Datum should survive");
+        assert_eq!(table.top_level.len(), 1);
+        let ann = &table.top_level[0];
+        assert_eq!(syms.name(ann.name), "sq");
+        let want = Type::Procedure_(Box::new(ProcType {
+            params: vec![Type::Fixnum],
+            return_type: Type::Fixnum,
+            rest: None,
+            filter: None,
+        }));
+        assert_eq!(ann.type_ann, want);
+    }
+
+    #[test]
+    fn define_typed_with_atomic_type() {
+        let (data, mut syms) = read("(define/typed n Fixnum 42)");
+        let (stripped, table, diags) = extract_annotations(&data, &mut syms);
+        assert!(diags.is_empty(), "diags: {diags:?}");
+        assert_eq!(stripped.len(), 1);
+        assert_eq!(table.top_level.len(), 1);
+        assert_eq!(table.top_level[0].type_ann, Type::Fixnum);
+    }
+
+    #[test]
+    fn define_typed_with_unknown_type_emits_diagnostic() {
+        let (data, mut syms) = read("(define/typed x Zorblax 0)");
+        let (stripped, _table, diags) = extract_annotations(&data, &mut syms);
+        assert_eq!(diags.len(), 1, "expected one diag, got {diags:?}");
+        assert!(
+            diags[0].message.contains("Zorblax"),
+            "diag should name `Zorblax`, got: {}",
+            diags[0].message
+        );
+        // Even on failure the Datum passes through so the macro
+        // can still run (the runtime contract wrap will fire its
+        // own error on a bad type form).
+        assert_eq!(stripped.len(), 1);
+    }
+
+    #[test]
+    fn define_typed_wrong_arity_passes_through_silently() {
+        // Missing EXPR — let the macro expander complain.
+        let (data, mut syms) = read("(define/typed only-three-args Fixnum)");
+        let (stripped, table, diags) = extract_annotations(&data, &mut syms);
+        assert!(diags.is_empty(), "no typer diag for malformed shape");
+        assert_eq!(stripped.len(), 1);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn define_typed_does_not_clobber_existing_ascription() {
+        // If the user already wrote `(: f T)`, the explicit one
+        // wins — don't push a duplicate.
+        let (data, mut syms) = read(
+            "(: sq (-> Flonum Flonum)) \
+             (define/typed sq (-> Fixnum Fixnum) (lambda (x) (* x x)))",
+        );
+        let (stripped, table, diags) = extract_annotations(&data, &mut syms);
+        assert!(diags.is_empty(), "diags: {diags:?}");
+        // ascription form dropped, define/typed Datum kept.
+        assert_eq!(stripped.len(), 1);
+        assert_eq!(table.top_level.len(), 1, "duplicate ascription created");
+        // The explicit `(: sq Flonum→Flonum)` wins.
+        assert_eq!(
+            table.top_level[0].type_ann,
+            Type::Procedure_(Box::new(ProcType {
+                params: vec![Type::Flonum],
+                return_type: Type::Flonum,
+                rest: None,
+                filter: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn define_typed_with_alias() {
+        let (data, mut syms) = read(
+            "(define-type Number (U Fixnum Flonum)) \
+             (define/typed inc (-> Number Number) (lambda (n) (+ n 1)))",
+        );
+        let (_, table, diags) = extract_annotations(&data, &mut syms);
+        assert!(diags.is_empty(), "diags: {diags:?}");
+        assert_eq!(table.top_level.len(), 1);
+        let want_num = Type::union(vec![Type::Fixnum, Type::Flonum]);
+        let want = Type::Procedure_(Box::new(ProcType {
+            params: vec![want_num.clone()],
+            return_type: want_num,
+            rest: None,
+            filter: None,
+        }));
+        assert_eq!(table.top_level[0].type_ann, want);
     }
 }

@@ -1,8 +1,7 @@
 # R6RS++ Phase 4 — typed-boundaries arc, interim status
 
-> Status: **5 iters shipped; substrate complete for user-facing
-> typed defines. Phase 4 as a whole remains open research per the
-> spec — this report covers only the typed-layer subgoal (§12).**
+> Status: **5 iters substrate + 1 extension (static check at expand
+> time) shipped; 3 extensions tracked in issue #11.**
 > Branch: `r6rs-extensions`.
 > Spec: `docs/research/r6rs_extensions_spec.md` (§12).
 > Predecessor: Phase 3 (closed in `c0cca4b`).
@@ -77,6 +76,44 @@ typed binding inside a library is exported as the wrapped value;
 violations fire at call sites; Phase 3B submodules can `guard`
 typed-export violations. 4 tests.
 
+### Iter 6 — static check at definition time (issue #11 ext-1) ✅
+
+`(define/typed N T E)` now fails at expand / `crabscheme check`
+time when `E` mismatches `T`, in addition to the existing
+runtime contract wrap. Closes the largest user-visible gap in
+the substrate — the binding flips from "fail on first call" to
+"fail at load" (Typed-Racket semantics).
+
+Two surgical changes:
+
+- **`cs_typer::extract::classify_define_typed`** recognizes
+  `(define/typed N T E)` at the Datum level (before
+  cs-expand sees it) and synthesizes a `TopLevelAnnotation
+  { name: N, type_ann: T }`. The original Datum survives in the
+  stripped output so the contract macro still runs at the
+  usual expansion time and produces the runtime wrap. An
+  explicit `(: N T)` ascription written by the user wins on
+  conflict.
+- **`cs_typer::checker::Checker::peel_apply_contract`** strips
+  a `(apply-contract _ inner _)` wrap so `check_set` checks the
+  inner expression against the binding's declared type. Without
+  the peel, the wrap call's inferred type `Any` defeats the
+  gradual check.
+
+The peel is unconditional — any hand-written
+`(apply-contract _ inner _)` against an ascribed binding gets
+the same static guarantee, not just macro-emitted ones.
+
+Design call in `docs/adr/0021-define-typed-static-check.md`.
+
+15 new tests:
+- `extract::tests::define_typed_*` (6) — Datum-level recognition
+- `crates/cs-typer/tests/define_typed_static.rs` (9) — full
+  parse → extract → expand → check pipeline, covering literal
+  conform / mismatch, Ref-to-helper conform / mismatch, and
+  three peel-soundness cases (wrong arity, wrong head symbol,
+  non-app value).
+
 ## Test additions
 
 | Suite                                                  | New tests |
@@ -87,40 +124,41 @@ typed-export violations. 4 tests.
 | crates/cs-runtime/tests/phase4_arrow_star.rs           |  8        |
 | crates/cs-runtime/tests/phase4_define_typed.rs         | 13        |
 | crates/cs-runtime/tests/phase4_define_typed_library.rs |  4        |
-| **Total**                                              | **62**    |
+| crates/cs-typer/src/extract.rs (define_typed_* iter 6) |  6        |
+| crates/cs-typer/tests/define_typed_static.rs (iter 6)  |  9        |
+| **Total**                                              | **77**    |
 
 All green; full workspace test sweep is clean.
 
 ## What's natural but not yet built
 
-The typed-boundaries arc could keep iterating along several axes:
+The typed-boundaries arc could keep iterating along several axes
+(tracked in issue #11):
 
-1. **Static check at definition time**: today `define/typed` only
-   wraps EXPR with a contract; cs-typer could ALSO check EXPR
-   against the annotated type at expansion time, catching errors
-   that the dynamic wrap would otherwise only catch on first
-   misuse. Bigger scope — requires cs-expand→cs-typer plumbing.
+1. ~~**Static check at definition time**~~ ✅ shipped iter 6
+   (see above). `(define/typed)` now fails at expand time.
 
 2. **Library-export auto-contracting from inferred types**: if
    cs-typer infers a type for an exported binding (no annotation
    required), the library expander would auto-wrap the export with
    the corresponding contract. Removes the need for explicit
-   `(define/typed ...)` for fully-inferable code.
+   `(define/typed ...)` for fully-inferable code. Issue #11 ext-2.
 
 3. **Contract elision at typed→typed boundaries**: when both sides
    of a call are statically type-checked, the contract is
    redundant; drop it for zero-overhead. Requires call-site
-   typing information at link / load time.
+   typing information at link / load time. Issue #11 ext-3.
 
 4. **Eta-elision for monomorphic contracts** (Phase 2B.7 task
    #150 already on the queue): the same optimization applied to
-   typed-derived contracts.
+   typed-derived contracts. Issue #11 ext-4.
 
 5. **Cover ProcType.filter** (predicate-narrowing types): the
    iter-1 lowering currently ignores `filter` because contracts
    don't express occurrence typing. Could lower to a contract +
    side-effect that narrows the runtime type for downstream
-   readers, but the semantic mismatch is deep.
+   readers, but the semantic mismatch is deep. Issue #11 ext-5
+   (deferred indefinitely per the issue body).
 
 None of these block 1.0. Each is a single iter on its own once
 the design question is answered.
