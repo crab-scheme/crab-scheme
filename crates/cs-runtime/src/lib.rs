@@ -232,6 +232,15 @@ impl Runtime {
                 .expect("pass registry poisoned"),
         );
 
+        // #28 — turn on `scalar-replace-cons` by default for every
+        // JIT compile (all threads). The pass eliminates non-escaping
+        // cons allocations and is unconditionally sound (it only
+        // removes pairs proven unobservable), so unlike the opt-in
+        // region/escape passes it's safe to seed as always-on. Users
+        // can still layer additional passes via the
+        // `active-optimizer-passes` parameter / `install-optimizer-pass!`.
+        cs_opt::set_default_on_passes(&["scalar-replace-cons"]);
+
         // Gap B-3: wire cs-vm's region-resolver function-
         // pointer hook to cs-runtime's per-thread REGION_STACK
         // accessor. This lets `vm_alloc_pair_region_gc` (the
