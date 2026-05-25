@@ -1,18 +1,20 @@
 name: m5-fuzz
 
-# Nightly fuzz job for the M5 GC. Runs the deterministic LCG fuzz
+# Nightly fuzz job for the countable-memory cycle detector
+# (M5 successor — ADR 0014 iter 12b). Runs the deterministic LCG
 # harness in `crates/cs-runtime/tests/gc_fuzz.rs` for ~1 hour by
-# bumping the seed range via an env var. Failures upload the seed
-# and the panic trace as an artifact.
+# extending the seed range via `CRABSCHEME_FUZZ_SEEDS`. Failures
+# upload the test binary as an artifact for offline replay.
 #
 # This complements the in-tree fast tests that gate every PR; this
-# workflow is the long-running stability gate that contributes to
-# the M5 spec's "24-hour fuzz with leak detector reports no leaks
-# on cyclic structures" exit criterion.
+# workflow is the long-running stability gate for the synchronous
+# Bacon-Rajan detector in `cs_gc::cycle`. The detector fires from
+# inside mutation primitives (set-cdr!, vector-set!, hashtable-set!)
+# whenever an operation could close a cycle, so the harness leans
+# on cycle-closing Scheme programs rather than the legacy
+# `Runtime::collect()` shim.
 #
-# Owner: M5 milestone driver.
-# Status: scaffolded; the seed-loop logic is a TODO until the fuzz
-# harness can take a seed-range arg or env var.
+# Owner: countable-memory maintainer.
 
 on:
   schedule:
