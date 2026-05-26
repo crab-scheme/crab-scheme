@@ -404,6 +404,12 @@ fn infer_effect_with_scope(expr: &CoreExpr, self_bound: &HashSet<Symbol>) -> All
             }
             acc.join(infer_effect_with_scope(body, &inner))
         }
+
+        CoreExpr::WithContinuationMark { key, val, body, .. } => {
+            infer_effect_with_scope(key, self_bound)
+                .join(infer_effect_with_scope(val, self_bound))
+                .join(infer_effect_with_scope(body, self_bound))
+        }
     }
 }
 
@@ -449,6 +455,11 @@ fn ref_captures_any(expr: &CoreExpr, names: &HashSet<Symbol>) -> bool {
             }
             bindings.iter().any(|(_, e)| ref_captures_any(e, &inner))
                 || ref_captures_any(body, &inner)
+        }
+        CoreExpr::WithContinuationMark { key, val, body, .. } => {
+            ref_captures_any(key, names)
+                || ref_captures_any(val, names)
+                || ref_captures_any(body, names)
         }
     }
 }

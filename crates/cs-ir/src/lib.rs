@@ -50,6 +50,19 @@ pub enum CoreExpr {
         body: Rc<CoreExpr>,
         span: Span,
     },
+    /// `(with-continuation-mark key val body)` — install `key→val` on
+    /// the *current continuation frame* for the dynamic extent of
+    /// `body`, which is in tail position. Unlike a `parameterize`
+    /// desugaring, this is tail-safe: a wcm reached via a tail call
+    /// replaces the current frame's mark for `key` rather than
+    /// accumulating, so a tail loop with a wcm runs in constant
+    /// mark-space (R7RS/Racket tail-mark semantics — issue #36).
+    WithContinuationMark {
+        key: Rc<CoreExpr>,
+        val: Rc<CoreExpr>,
+        body: Rc<CoreExpr>,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -96,7 +109,8 @@ impl CoreExpr {
             | CoreExpr::App { span, .. }
             | CoreExpr::If { span, .. }
             | CoreExpr::Begin { span, .. }
-            | CoreExpr::Letrec { span, .. } => *span,
+            | CoreExpr::Letrec { span, .. }
+            | CoreExpr::WithContinuationMark { span, .. } => *span,
         }
     }
 }

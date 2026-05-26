@@ -35,6 +35,7 @@ pub fn infer(expr: &CoreExpr, env: &TypeEnv) -> Type {
         // `Any` (best-effort) instead of crashing.
         CoreExpr::Lambda { .. } => Type::Procedure,
         CoreExpr::Letrec { body, .. } => infer(body, env),
+        CoreExpr::WithContinuationMark { body, .. } => infer(body, env),
         CoreExpr::Set { .. } => Type::Any,
     }
 }

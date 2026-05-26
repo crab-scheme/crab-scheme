@@ -63,7 +63,13 @@ fn mark_chain_unwinds_after_body() {
 }
 
 #[test]
-fn nested_marks_collect_innermost_first() {
+fn nested_same_key_marks_in_tail_position_replace() {
+    // Tail-safe semantics (issue #36): each inner `with-continuation-mark`
+    // is in tail position of the enclosing one, so all three target the
+    // SAME continuation frame and the same key — the innermost replaces
+    // the others (Racket / R7RS tail-mark semantics). The naive
+    // parameter-based impl accumulated `(3 2 1)`; the correct answer is
+    // just the innermost value.
     let mut rt = load_cmarks();
     let v = rt
         .eval_str(
@@ -74,8 +80,24 @@ fn nested_marks_collect_innermost_first() {
                    (current-continuation-marks 'k))))",
         )
         .unwrap();
-    // Innermost-first: 3, 2, 1.
-    assert_eq!(disp(&rt, &v), "(3 2 1)");
+    assert_eq!(disp(&rt, &v), "(3)");
+}
+
+#[test]
+fn nested_distinct_key_marks_collect_innermost_first() {
+    // Distinct keys don't replace each other — the full alist collects
+    // all of them, innermost (most recently installed) first.
+    let mut rt = load_cmarks();
+    let v = rt
+        .eval_str(
+            "<t>",
+            "(with-continuation-mark 'a 1
+               (with-continuation-mark 'b 2
+                 (with-continuation-mark 'c 3
+                   (current-continuation-marks))))",
+        )
+        .unwrap();
+    assert_eq!(disp(&rt, &v), "((c . 3) (b . 2) (a . 1))");
 }
 
 #[test]
@@ -204,5 +226,5 @@ fn current_continuation_marks_too_many_args() {
         .eval_str("<t>", "(current-continuation-marks 'a 'b)")
         .expect_err("> 1 arg should error");
     let s = format!("{}", err);
-    assert!(s.contains("expected 0 or 1 args"), "got: {}", s);
+    assert!(s.contains("expected 0 or 1"), "got: {}", s);
 }

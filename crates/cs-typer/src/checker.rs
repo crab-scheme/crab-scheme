@@ -252,6 +252,11 @@ impl<'tab> Checker<'tab> {
                 }
                 self.populate_effects(body);
             }
+            CoreExpr::WithContinuationMark { key, val, body, .. } => {
+                self.populate_effects(key);
+                self.populate_effects(val);
+                self.populate_effects(body);
+            }
         }
     }
 
@@ -387,6 +392,15 @@ impl<'tab> Checker<'tab> {
                 }
                 self.check_collect(body, expected, out);
                 self.env.pop_to(mark);
+            }
+            CoreExpr::WithContinuationMark { key, val, body, .. } => {
+                // Like a sequence: key and val are evaluated for
+                // their effects (checked against `Any`), the
+                // form's value/type is the body's (checked
+                // against `expected`).
+                self.check_collect(key, &Type::Any, out);
+                self.check_collect(val, &Type::Any, out);
+                self.check_collect(body, expected, out);
             }
             CoreExpr::Set { name, value, span } => {
                 if let Err(e) = self.check_set(*name, value, *span, expected) {

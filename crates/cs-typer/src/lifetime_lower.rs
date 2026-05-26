@@ -180,6 +180,17 @@ impl<'s> LoweringCtx<'s> {
                 body: Rc::new(self.lower(body, effects)),
                 span: *span,
             },
+            CoreExpr::WithContinuationMark {
+                key,
+                val,
+                body,
+                span,
+            } => CoreExpr::WithContinuationMark {
+                key: Rc::new(self.lower(key, effects)),
+                val: Rc::new(self.lower(val, effects)),
+                body: Rc::new(self.lower(body, effects)),
+                span: *span,
+            },
         }
     }
 }

@@ -965,6 +965,9 @@ pub fn higher_order_builtins() -> Vec<HoEntry> {
         ("partition", b_partition),
         ("force", b_force),
         ("dynamic-wind", b_dynamic_wind),
+        // Tail-safe continuation marks (issue #36) — reads the
+        // walker's per-frame mark stack from `EvalCtx`.
+        ("current-continuation-marks", b_current_continuation_marks),
         ("with-input-from-string", b_with_input_from_string),
         ("with-output-to-string", b_with_output_to_string),
         ("call-with-port", b_call_with_port),
@@ -9220,6 +9223,38 @@ fn b_make_pending_promise(args: &[Value]) -> Result<Value, String> {
 /// propagates. Foundation simplification: doesn't yet handle non-local
 /// re-entry through continuations (because we don't have first-class
 /// continuations), only the unwind direction.
+/// `(current-continuation-marks)` → full alist of `(key . val)`,
+/// innermost-first. `(current-continuation-marks key)` → list of all
+/// values marked under `key`, innermost-first. Reads the walker's
+/// tail-safe per-frame mark stack (issue #36); the VM tier has its own
+/// frame-walking implementation.
+fn b_current_continuation_marks(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(arity_err(
+            "current-continuation-marks",
+            "0 or 1",
+            args.len(),
+        ));
+    }
+    // Forward iteration + prepend yields innermost (most-recently
+    // installed) at the head, matching the prior parameter-based impl.
+    let mut out = Value::Null;
+    if args.is_empty() {
+        for (_, k, v) in ctx.cont_marks.iter() {
+            let entry = Value::Pair(cs_core::Pair::new(k.clone(), v.clone()));
+            out = Value::Pair(cs_core::Pair::new(entry, out));
+        }
+    } else {
+        let key = &args[0];
+        for (_, k, v) in ctx.cont_marks.iter() {
+            if cs_core::eq::equal(k, key) {
+                out = Value::Pair(cs_core::Pair::new(v.clone(), out));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn b_dynamic_wind(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if args.len() != 3 {
         return Err(arity_err("dynamic-wind", "3", args.len()));

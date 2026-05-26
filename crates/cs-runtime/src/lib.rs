@@ -1177,6 +1177,11 @@ impl Runtime {
         vm_env.define(cc_sym, cs_vm::vm::make_vm_call_cc());
         let cwcc_sym = syms.intern("call-with-current-continuation");
         vm_env.define(cwcc_sym, cs_vm::vm::make_vm_call_cc());
+        // Tail-safe continuation marks (issue #36): the VM tier reads
+        // marks off its frame stack, so `current-continuation-marks`
+        // is a VM-special proc (the walker uses a ctx-taking builtin).
+        let ccm_sym = syms.intern("current-continuation-marks");
+        vm_env.define(ccm_sym, cs_vm::vm::make_vm_current_continuation_marks());
         // read: needs symbol table to intern parsed symbols. With 0 args,
         // falls back to the VM thread-local current-input-port.
         let read_sym = syms.intern("read");

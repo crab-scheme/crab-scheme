@@ -379,6 +379,12 @@ pub fn infer_side_effects(
             acc
         }
 
+        CoreExpr::WithContinuationMark { key, val, body, .. } => {
+            infer_side_effects(key, syms, declared)
+                .union(infer_side_effects(val, syms, declared))
+                .union(infer_side_effects(body, syms, declared))
+        }
+
         CoreExpr::App { func, args, .. } => {
             // Evaluating the callee + args.
             let mut acc = infer_side_effects(func, syms, declared);

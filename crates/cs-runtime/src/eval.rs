@@ -101,6 +101,17 @@ pub struct EvalCtx<'a> {
     /// list with an explicit error naming the disallowed library. `None`
     /// means unrestricted (normal non-sandbox eval).
     pub sandbox_allowed_imports: Option<Vec<String>>,
+    /// Tail-safe continuation marks (issue #36). Each entry is
+    /// `(frame_depth, key, val)`. `with-continuation-mark` upserts at
+    /// the current `depth`; because tail calls reuse the same
+    /// `eval_inner` activation (the loop `continue`s without bumping
+    /// `depth`), a wcm reached through tail calls replaces the mark for
+    /// its key at that depth instead of accumulating — so a tail loop
+    /// runs in constant mark-space. A non-tail call bumps `depth` via
+    /// `eval`, which clears marks at the abandoned depth on return.
+    /// Empty in the overwhelmingly common case (no marks in use), so
+    /// the per-`eval` bookkeeping is gated to near-zero cost.
+    pub cont_marks: Vec<(u32, Value, Value)>,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -123,6 +134,7 @@ impl<'a> EvalCtx<'a> {
             current_output_port: None,
             current_error_port: None,
             sandbox_allowed_imports: None,
+            cont_marks: Vec::new(),
         }
     }
 }
@@ -285,6 +297,14 @@ pub fn eval(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Value,
     if r.is_ok() {
         ctx.call_stack.truncate(stack_snapshot);
     }
+    // Tail-safe continuation marks (issue #36): marks installed at a
+    // depth deeper than the one we've returned to belong to the
+    // now-completed dynamic extent — drop them. Gated on non-empty so
+    // mark-free code (the overwhelming majority) pays nothing here.
+    if !ctx.cont_marks.is_empty() {
+        let d = ctx.depth;
+        ctx.cont_marks.retain(|(md, _, _)| *md <= d);
+    }
     r
 }
 
@@ -374,6 +394,29 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
                     new_env.define(*name, v);
                 }
                 cur_env = new_env;
+                cur_expr = (*body).clone();
+                continue;
+            }
+            CoreExpr::WithContinuationMark { key, val, body, .. } => {
+                // Tail-safe continuation marks (issue #36). `body` is in
+                // tail position (we `continue` into it at the same
+                // `depth`), so a wcm reached through tail calls lands at
+                // the same depth and replaces — constant mark-space in a
+                // tail loop. Non-tail nesting bumps `depth` via `eval`
+                // and accumulates (then clears on return). key/val are
+                // evaluated non-tail.
+                let k = eval(&key, cur_env.clone(), ctx)?;
+                let v = eval(&val, cur_env.clone(), ctx)?;
+                let d = ctx.depth;
+                if let Some(slot) = ctx
+                    .cont_marks
+                    .iter_mut()
+                    .find(|(md, mk, _)| *md == d && cs_core::eq::equal(mk, &k))
+                {
+                    slot.2 = v;
+                } else {
+                    ctx.cont_marks.push((d, k, v));
+                }
                 cur_expr = (*body).clone();
                 continue;
             }
