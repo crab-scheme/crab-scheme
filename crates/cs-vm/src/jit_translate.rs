@@ -1217,6 +1217,30 @@ pub fn bytecode_to_rir_full(
                                     }
                                 }
                             }
+                            // JIT loop-var capture fix: a self-tail-call is
+                            // loop-converted, so the callee's params become
+                            // block-params updated in registers across
+                            // iterations. If this body builds an inner closure
+                            // (`body_has_makeclosure`), that closure captures
+                            // the params through the frame env that
+                            // `vm_make_closure` snapshots from JIT_CALLER_ENV
+                            // — but the loop only advances the registers,
+                            // leaving the env's param bindings frozen at their
+                            // tier-up entry values. The inner closure then
+                            // reads stale params (silently wrong results once
+                            // the loop tiers up; found via a spectral-norm
+                            // miscompile). Sync each updated param into the
+                            // frame env on the back-edge so the next
+                            // iteration's MakeClosure captures current values.
+                            // Mirrors the `SetVar` arm's "always EnvSet so a
+                            // captured closure sees the new value"; gated so
+                            // non-capturing loops keep the bare register
+                            // back-edge.
+                            if body_has_makeclosure {
+                                for (p, a) in lambda.params.iter().zip(args.iter()) {
+                                    insts.push(RirInst::EnvSet(p.0, *a));
+                                }
+                            }
                             let dst = alloc();
                             insts.push(RirInst::CallSelf(dst, args));
                             sim_stack.push(StackEntry::Value(dst));
