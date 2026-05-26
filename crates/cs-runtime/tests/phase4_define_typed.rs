@@ -238,3 +238,17 @@ fn arrow_with_no_args_errors() {
     let s = format!("{}", err);
     assert!(s.contains("(->"), "got: {}", s);
 }
+
+// `define/typed`'s `name` argument now carries an `:id` syntax class
+// (R6RS++ #32 follow-up), so a non-identifier name is rejected at expand
+// time -- the macro body is a `(define name ...)`, which is exactly the
+// definition-bodied case that could not be class-validated before.
+#[test]
+fn define_typed_rejects_non_identifier_name() {
+    let mut rt = load_typed_contract();
+    let err = rt
+        .eval_str("<t>", "(define/typed 5 (-> Fixnum Fixnum) (lambda (x) x))")
+        .expect_err("a number is not a valid name");
+    let s = format!("{}", err);
+    assert!(s.contains("expected id"), "got: {}", s);
+}

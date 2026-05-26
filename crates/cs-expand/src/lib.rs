@@ -295,6 +295,61 @@ pub struct Macro {
     /// issue #31); plain syntax-rules macros leave it `false` and
     /// keep the original fast path unchanged.
     pub parser: bool,
+    /// Expand-time built-in syntax-class checks, parallel to `rules`
+    /// (one inner `Vec` per rule, in pattern order). Built only by
+    /// `define-syntax-parser` for the built-in *structural* classes
+    /// (`id` / `number` / `string`); they are verified against the
+    /// matched syntax after a rule matches but before the template is
+    /// instantiated, so a violation is a pinpointed *expand-time*
+    /// error and the rule body is emitted unwrapped (R6RS++ Phase
+    /// 2A.4 follow-up to #32). User-defined (predicate) classes are
+    /// NOT here — they remain runtime checks baked into the template,
+    /// since their predicate can only run against a runtime value.
+    /// Empty for plain `syntax-rules` macros.
+    pub class_checks: Vec<Vec<ClassCheck>>,
+}
+
+/// A built-in structural syntax class checkable at expand time by
+/// inspecting the matched [`Datum`]'s shape (R6RS++ #32 follow-up).
+/// `expr` is intentionally absent: it matches any syntax, so it needs
+/// no check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinClass {
+    /// `id` — an identifier (a bare symbol).
+    Id,
+    /// `number` — a numeric literal.
+    Number,
+    /// `string` — a string literal.
+    Str,
+}
+
+impl BuiltinClass {
+    /// The class name as written in a `pvar:class` annotation, used in
+    /// diagnostics (e.g. "expected id for `x`").
+    fn label(self) -> &'static str {
+        match self {
+            BuiltinClass::Id => "id",
+            BuiltinClass::Number => "number",
+            BuiltinClass::Str => "string",
+        }
+    }
+
+    /// Does the matched syntax `d` satisfy this class?
+    fn matches(self, d: &Datum) -> bool {
+        match self {
+            BuiltinClass::Id => matches!(d, Datum::Symbol(_, _)),
+            BuiltinClass::Number => matches!(d, Datum::Number(_, _)),
+            BuiltinClass::Str => matches!(d, Datum::String(_, _)),
+        }
+    }
+}
+
+/// One expand-time class check: the pattern variable to inspect and
+/// the built-in class it must satisfy.
+#[derive(Clone, Copy, Debug)]
+pub struct ClassCheck {
+    pub pvar: Symbol,
+    pub class: BuiltinClass,
 }
 
 #[derive(Clone, Copy)]
@@ -1515,22 +1570,29 @@ impl<'a> Expander<'a> {
     /// in `(syntax-rules (lit ...) ...)`. It threads into both the
     /// syntax-rules desugar below and the combinator (`parser`) path.
     ///
-    /// Implementation strategy: desugar to `(define-syntax name
-    /// (syntax-rules (<lits>) (<stripped-pat> <class-checked-body>)
-    /// ...))` where `:class` annotations are stripped from the
-    /// pattern (leaving just the pvar name) and each annotated
-    /// pvar gains a runtime predicate check at the top of the
-    /// template body. If the check fails, an error is raised.
+    /// Implementation strategy: `:class` annotations are stripped from
+    /// the pattern (leaving just the pvar name), then split by kind:
     ///
-    /// Supported classes (resolved via builtin predicates):
-    ///   id       -> identifier?
-    ///   expr     -> (always #t)
-    ///   number   -> number?
-    ///   string   -> string?
+    /// Built-in *structural* classes are checked at EXPAND time, by
+    /// inspecting the matched syntax after a rule matches but before the
+    /// template instantiates (see [`Macro::class_checks`] and
+    /// `try_expand_macro`). A violation is a pinpointed expand-time
+    /// error, and the body is emitted unwrapped:
+    ///   id       -> the matched form is an identifier (a symbol)
+    ///   number   -> the matched form is a number literal
+    ///   string   -> the matched form is a string literal
+    ///   expr     -> matches any syntax (no check)
     ///
-    /// Limitation: the class check fires at RUNTIME of the
-    /// expanded code, not at expand time. Phase 2A.4 lifts this
-    /// to expand-time pinpointing.
+    /// User-defined classes (registered via `define-syntax-class` with a
+    /// predicate) stay RUNTIME checks: the body keeps an `(if (pred pvar)
+    /// body (error ...))` wrap, since the predicate can only run against
+    /// a runtime value. A definition-bodied macro therefore composes
+    /// with built-in classes (`name:id`) but not with a user value-class.
+    ///
+    /// The common case (no class checks, no combinators) still desugars
+    /// to `(define-syntax name (syntax-rules (<lits>) ...))`; clauses
+    /// with class metadata or combinators build the `Macro` directly,
+    /// since neither survives a syntax-rules desugar.
     fn expand_define_syntax_parser(
         &mut self,
         items: &[Datum],
@@ -1585,16 +1647,29 @@ impl<'a> Expander<'a> {
                 span,
             });
         }
-        // Build the syntax-rules form: (syntax-rules () <translated-clauses>...)
-        // For each clause: walk the pattern, strip ":class" annotations,
-        // wrap body in class-check ifs.
+        // For each clause: strip `:class` annotations from the pattern,
+        // then split the recorded classes two ways:
+        //   * built-in structural classes (id/number/string) become
+        //     EXPAND-TIME checks recorded as metadata on the `Macro`
+        //     (`class_checks_per_rule`). The body is left UNWRAPPED, so
+        //     a definition body stays a definition -- the whole point of
+        //     this path (R6RS++ #32 follow-up). `expr` is a no-op class.
+        //   * user-defined (define-syntax-class) classes keep the
+        //     runtime predicate `if`-wrap, since the predicate can only
+        //     run against a runtime value.
         let mut translated_clauses: Vec<Datum> = Vec::with_capacity(clause_datums.len());
         // Parallel (stripped-pattern, checked-body) rules for the
-        // combinator path (Phase 2A.3): if any clause uses `~or` /
-        // `~optional` / `~once`, these become a `parser`-flagged Macro
-        // matched by the backtracking `syntax_parse` matcher instead of
-        // being desugared to `syntax-rules` (which can't express them).
+        // direct-build path: if any clause uses `~or` / `~optional` /
+        // `~once` (combinators) OR carries an expand-time class check,
+        // these become a `Macro` built directly -- matched by the
+        // backtracking `syntax_parse` matcher when `parser` is set, the
+        // deterministic matcher otherwise -- instead of being desugared
+        // to `syntax-rules` (which can express neither combinators nor
+        // class metadata).
         let mut parser_rules: Vec<(Datum, Datum)> = Vec::with_capacity(clause_datums.len());
+        // Expand-time built-in class checks, one list per clause/rule.
+        let mut class_checks_per_rule: Vec<Vec<ClassCheck>> =
+            Vec::with_capacity(clause_datums.len());
         for clause in clause_datums {
             let parts = collect_proper_list_strict(clause).ok_or(ExpandError::BadSyntax {
                 what: "define-syntax-parser clause must be (pattern body ...)".into(),
@@ -1608,13 +1683,10 @@ impl<'a> Expander<'a> {
             }
             let pattern = &parts[0];
             let body_datums = &parts[1..];
-            // Walk the pattern, collecting class checks.
-            // class_checks: each entry is (pvar-sym, class-name-str)
-            let mut class_checks: Vec<(Symbol, String)> = Vec::new();
-            let stripped_pattern = strip_class_annotations(pattern, &mut class_checks, self.syms);
-            // Wrap body in a (begin) and prepend class-check ifs from
-            // OUTSIDE in (deepest check innermost so first-failing
-            // check fires its error first).
+            // Walk the pattern, collecting (pvar, class-name) pairs in
+            // left-to-right (pattern) order.
+            let mut raw_checks: Vec<(Symbol, String)> = Vec::new();
+            let stripped_pattern = strip_class_annotations(pattern, &mut raw_checks, self.syms);
             let body_begin = if body_datums.len() == 1 {
                 body_datums[0].clone()
             } else {
@@ -1622,21 +1694,34 @@ impl<'a> Expander<'a> {
                 all.extend(body_datums.iter().cloned());
                 mk_list(all, clause.span())
             };
-            // Build the class-checked body bottom-up.
-            let mut checked_body = body_begin;
-            for (pvar, class_name) in class_checks.iter().rev() {
-                let pred = match class_name.as_str() {
-                    "id" => Some(self.syms.intern("identifier?")),
-                    "number" => Some(self.syms.intern("number?")),
-                    "string" => Some(self.syms.intern("string?")),
-                    "expr" => None, // matches anything
+            // Partition the classes. Built-in structural classes are
+            // checked at expand time (recorded in pattern order so the
+            // first-listed check fires first); user-defined classes are
+            // collected for a runtime predicate `if`-wrap; `expr` is a
+            // no-op; an unknown class is an error at definition time.
+            let mut expand_checks: Vec<ClassCheck> = Vec::new();
+            // (pvar, predicate-symbol, class-name) for runtime wraps.
+            let mut runtime_checks: Vec<(Symbol, Symbol, String)> = Vec::new();
+            for (pvar, class_name) in &raw_checks {
+                match class_name.as_str() {
+                    "id" => expand_checks.push(ClassCheck {
+                        pvar: *pvar,
+                        class: BuiltinClass::Id,
+                    }),
+                    "number" => expand_checks.push(ClassCheck {
+                        pvar: *pvar,
+                        class: BuiltinClass::Number,
+                    }),
+                    "string" => expand_checks.push(ClassCheck {
+                        pvar: *pvar,
+                        class: BuiltinClass::Str,
+                    }),
+                    "expr" => {} // no-op class: matches any syntax
                     other => {
-                        // Phase 2A.2: consult user-defined
-                        // syntax-class registry. Intern the
-                        // class-name symbol and look up.
+                        // Phase 2A.2: user-defined syntax-class registry.
                         let name_sym = self.syms.intern(other);
                         match self.syntax_classes.get(&name_sym) {
-                            Some(p) => Some(*p),
+                            Some(p) => runtime_checks.push((*pvar, *p, class_name.clone())),
                             None => {
                                 return Err(ExpandError::BadSyntax {
                                     what: format!(
@@ -1648,84 +1733,75 @@ impl<'a> Expander<'a> {
                             }
                         }
                     }
-                };
-                if let Some(pred_sym) = pred {
-                    // For :id, the matched pvar is a literal
-                    // identifier -- evaluating it as a variable
-                    // ref would crash with undefined. Wrap in
-                    // (quote pvar) so the predicate sees the
-                    // symbol itself. For value-classes (:number,
-                    // :string), the bare pvar is fine: the
-                    // matched expression evaluates to a value
-                    // and the predicate checks it.
-                    let pvar_for_check = if class_name == "id" {
+                }
+            }
+            // Wrap the body for user-defined (runtime) classes only,
+            // bottom-up so the first-listed check is the outermost `if`.
+            // Built-in classes deliberately leave the body untouched.
+            let macro_name_sym = match &name_datum {
+                Datum::Symbol(s, _) => *s,
+                _ => self.syms.intern("define-syntax-parser"),
+            };
+            let mut checked_body = body_begin;
+            for (pvar, pred_sym, class_name) in runtime_checks.iter().rev() {
+                // (if (pred pvar) checked_body
+                //   (error 'name "expected <class> for `pvar`" pvar))
+                let pred_call = mk_list(
+                    vec![
+                        Datum::Symbol(*pred_sym, clause.span()),
+                        Datum::Symbol(*pvar, clause.span()),
+                    ],
+                    clause.span(),
+                );
+                let error_call = mk_list(
+                    vec![
+                        Datum::Symbol(self.syms.intern("error"), clause.span()),
                         mk_list(
                             vec![
                                 Datum::Symbol(self.keywords.quote, clause.span()),
-                                Datum::Symbol(*pvar, clause.span()),
+                                Datum::Symbol(macro_name_sym, clause.span()),
                             ],
                             clause.span(),
-                        )
-                    } else {
-                        Datum::Symbol(*pvar, clause.span())
-                    };
-                    // (if (pred pvar-for-check) checked_body
-                    //   (error 'name "expected <class>" pvar-for-check))
-                    let pred_call = mk_list(
-                        vec![
-                            Datum::Symbol(pred_sym, clause.span()),
-                            pvar_for_check.clone(),
-                        ],
-                        clause.span(),
-                    );
-                    let macro_name_sym = match &name_datum {
-                        Datum::Symbol(s, _) => *s,
-                        _ => self.syms.intern("define-syntax-parser"),
-                    };
-                    let error_call = mk_list(
-                        vec![
-                            Datum::Symbol(self.syms.intern("error"), clause.span()),
-                            mk_list(
-                                vec![
-                                    Datum::Symbol(self.keywords.quote, clause.span()),
-                                    Datum::Symbol(macro_name_sym, clause.span()),
-                                ],
-                                clause.span(),
-                            ),
-                            Datum::String(
-                                Rc::new(format!(
-                                    "expected {} for `{}`",
-                                    class_name,
-                                    self.syms.name(*pvar)
-                                )),
-                                clause.span(),
-                            ),
-                            pvar_for_check,
-                        ],
-                        clause.span(),
-                    );
-                    checked_body = mk_list(
-                        vec![
-                            Datum::Symbol(self.keywords.if_, clause.span()),
-                            pred_call,
-                            checked_body,
-                            error_call,
-                        ],
-                        clause.span(),
-                    );
-                }
+                        ),
+                        Datum::String(
+                            Rc::new(format!(
+                                "expected {} for `{}`",
+                                class_name,
+                                self.syms.name(*pvar)
+                            )),
+                            clause.span(),
+                        ),
+                        Datum::Symbol(*pvar, clause.span()),
+                    ],
+                    clause.span(),
+                );
+                checked_body = mk_list(
+                    vec![
+                        Datum::Symbol(self.keywords.if_, clause.span()),
+                        pred_call,
+                        checked_body,
+                        error_call,
+                    ],
+                    clause.span(),
+                );
             }
             parser_rules.push((stripped_pattern.clone(), checked_body.clone()));
             translated_clauses.push(mk_list(vec![stripped_pattern, checked_body], clause.span()));
+            class_checks_per_rule.push(expand_checks);
         }
-        // Combinator path: if any clause uses `~or` / `~optional` /
-        // `~once`, register a backtracking parser-macro directly and
-        // skip the syntax-rules desugar (which can't express them).
+        // Direct-build path: a clause that uses a combinator (`~or` /
+        // `~optional` / `~once`) or carries an expand-time class check
+        // can't round-trip through a `syntax-rules` desugar, so register
+        // the `Macro` directly. `parser` is set only for the combinator
+        // case (selects the backtracking matcher); a class-only macro
+        // keeps the deterministic matcher and just rides its class
+        // metadata to the application site.
         let parse_syms = self.parse_syms();
-        if parser_rules
+        let uses_combinators = parser_rules
             .iter()
-            .any(|(p, _)| syntax_parse::pattern_uses_combinators(p, &parse_syms))
-        {
+            .any(|(p, _)| syntax_parse::pattern_uses_combinators(p, &parse_syms));
+        let has_class_checks = class_checks_per_rule.iter().any(|c| !c.is_empty());
+        if uses_combinators || has_class_checks {
             let name = match &name_datum {
                 Datum::Symbol(s, _) => *s,
                 other => {
@@ -1741,7 +1817,8 @@ impl<'a> Expander<'a> {
                     literals: parser_literals,
                     rules: parser_rules,
                     name,
-                    parser: true,
+                    parser: uses_combinators,
+                    class_checks: class_checks_per_rule,
                 },
             );
             return Ok(CoreExpr::Const {
@@ -1867,11 +1944,15 @@ impl<'a> Expander<'a> {
             }
             rules.push((rparts[0].clone(), rparts[1].clone()));
         }
+        // Plain `syntax-rules` has no `:class` annotations, so no
+        // expand-time class checks (one empty list per rule).
+        let class_checks = vec![Vec::new(); rules.len()];
         let m = Macro {
             literals,
             rules,
             name,
             parser: false,
+            class_checks,
         };
         self.macros.insert(name, m);
         Ok(CoreExpr::Const {
@@ -5679,13 +5760,13 @@ impl<'a> Expander<'a> {
                 *best = Some(me);
             }
         };
-        for (pattern, template) in &macro_def.rules {
+        for (i, (pattern, template)) in macro_def.rules.iter().enumerate() {
             let mut bindings: std::collections::HashMap<cs_core::Symbol, MatchBinding> =
                 std::collections::HashMap::new();
             // Combinator-using parsers (`~or`/`~optional`/`~once`) need the
             // backtracking matcher; plain syntax-rules macros keep the fast
             // deterministic path. (R6RS++ Phase 2A.3, issue #31.)
-            if macro_def.parser {
+            let matched = if macro_def.parser {
                 match syntax_parse::match_parse_clause(
                     pattern,
                     input,
@@ -5694,8 +5775,11 @@ impl<'a> Expander<'a> {
                     self.syms,
                     &mut bindings,
                 ) {
-                    Ok(()) => return self.instantiate_template(template, &bindings),
-                    Err(me) => keep_best(&mut best, me),
+                    Ok(()) => true,
+                    Err(me) => {
+                        keep_best(&mut best, me);
+                        false
+                    }
                 }
             } else if match_pattern(
                 pattern,
@@ -5706,17 +5790,32 @@ impl<'a> Expander<'a> {
                 true,
                 &mut bindings,
             ) {
+                true
+            } else {
+                if let Some(me) = diagnose_sr(
+                    pattern,
+                    input,
+                    &macro_def.literals,
+                    self.keywords.ellipsis,
+                    self.keywords.underscore,
+                    true,
+                    self.syms,
+                ) {
+                    keep_best(&mut best, me);
+                }
+                false
+            };
+            if matched {
+                // Expand-time built-in syntax-class checks for this rule
+                // (id/number/string), run on the matched syntax before
+                // the template instantiates. A violation is a pinpointed
+                // expand error -- and, unlike the old runtime `if`-wrap,
+                // it leaves a definition body in definition position.
+                // (R6RS++ #32 follow-up.)
+                if let Some(checks) = macro_def.class_checks.get(i) {
+                    self.check_expand_classes(name, checks, &bindings)?;
+                }
                 return self.instantiate_template(template, &bindings);
-            } else if let Some(me) = diagnose_sr(
-                pattern,
-                input,
-                &macro_def.literals,
-                self.keywords.ellipsis,
-                self.keywords.underscore,
-                true,
-                self.syms,
-            ) {
-                keep_best(&mut best, me);
             }
         }
         let macro_name = self.syms.name(name).to_string();
@@ -5731,6 +5830,41 @@ impl<'a> Expander<'a> {
             },
         };
         Err(err)
+    }
+
+    /// Run a matched rule's expand-time built-in class checks against
+    /// the bound pattern variables (R6RS++ #32 follow-up). On a
+    /// violation, return a pinpointed `ExpandError` anchored at the
+    /// offending sub-form. A pvar bound by an absent `~optional` (no
+    /// default) has nothing to check and is skipped; a `Repeat`
+    /// (ellipsis) pvar checks every element.
+    fn check_expand_classes(
+        &self,
+        macro_name: cs_core::Symbol,
+        checks: &[ClassCheck],
+        bindings: &std::collections::HashMap<cs_core::Symbol, MatchBinding>,
+    ) -> Result<(), ExpandError> {
+        for chk in checks {
+            let data: &[Datum] = match bindings.get(&chk.pvar) {
+                Some(MatchBinding::Single(d)) => std::slice::from_ref(d),
+                Some(MatchBinding::Repeat(ds)) => ds.as_slice(),
+                Some(MatchBinding::Absent) | None => continue,
+            };
+            for d in data {
+                if !chk.class.matches(d) {
+                    return Err(ExpandError::BadSyntax {
+                        what: format!(
+                            "{}: expected {} for `{}`",
+                            self.syms.name(macro_name),
+                            chk.class.label(),
+                            self.syms.name(chk.pvar),
+                        ),
+                        span: d.span(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     fn instantiate_template(
