@@ -1504,13 +1504,19 @@ impl<'a> Expander<'a> {
         })
     }
 
-    /// R6RS++ Phase 2A.1: `(define-syntax-parser name clause ...)`.
-    /// Each clause is `[(_ pat ...) body ...]` where pattern items
-    /// may be annotated `id:class` to constrain the matched value
-    /// to a specific syntax class.
+    /// R6RS++ Phase 2A.1: `(define-syntax-parser name [#:literals
+    /// (lit ...)] clause ...)`. Each clause is `[(_ pat ...) body ...]`
+    /// where pattern items may be annotated `id:class` to constrain the
+    /// matched value to a specific syntax class.
+    ///
+    /// The optional `#:literals (lit ...)` clause (Racket-style, #32)
+    /// lists identifiers that match by name in patterns rather than
+    /// binding pattern variables -- the same role as the literals list
+    /// in `(syntax-rules (lit ...) ...)`. It threads into both the
+    /// syntax-rules desugar below and the combinator (`parser`) path.
     ///
     /// Implementation strategy: desugar to `(define-syntax name
-    /// (syntax-rules () (<stripped-pat> <class-checked-body>)
+    /// (syntax-rules (<lits>) (<stripped-pat> <class-checked-body>)
     /// ...))` where `:class` annotations are stripped from the
     /// pattern (leaving just the pvar name) and each annotated
     /// pvar gains a runtime predicate check at the top of the
@@ -1537,7 +1543,48 @@ impl<'a> Expander<'a> {
             });
         }
         let name_datum = items[0].clone();
-        let clause_datums = &items[1..];
+        // Optional `#:literals (lit ...)` clause immediately after the
+        // name (Racket-style). Listed identifiers match by name in
+        // patterns instead of binding pattern variables -- exactly the
+        // role of the literals list in `(syntax-rules (lit ...) ...)`.
+        // Without it, keyword-driven macros (match clauses, select arms,
+        // gen-server callbacks, …) would bind their keywords as pattern
+        // vars rather than matching them. (#32)
+        let mut parser_literals: Vec<Symbol> = Vec::new();
+        let mut clause_datums = &items[1..];
+        let literals_kw = self.syms.intern("#:literals");
+        if let Some(Datum::Symbol(s, _)) = clause_datums.first() {
+            if *s == literals_kw {
+                let lits_datum = clause_datums.get(1).ok_or(ExpandError::BadSyntax {
+                    what: "define-syntax-parser: #:literals must be followed by a list".into(),
+                    span,
+                })?;
+                let lits =
+                    collect_proper_list_strict(lits_datum).ok_or(ExpandError::BadSyntax {
+                        what: "define-syntax-parser: #:literals must be a list of symbols".into(),
+                        span: lits_datum.span(),
+                    })?;
+                for l in &lits {
+                    match l {
+                        Datum::Symbol(ls, _) => parser_literals.push(*ls),
+                        other => {
+                            return Err(ExpandError::BadSyntax {
+                                what: "define-syntax-parser: #:literals entries must be symbols"
+                                    .into(),
+                                span: other.span(),
+                            });
+                        }
+                    }
+                }
+                clause_datums = &clause_datums[2..];
+            }
+        }
+        if clause_datums.is_empty() {
+            return Err(ExpandError::BadSyntax {
+                what: "define-syntax-parser: needs at least one (pattern body ...) clause".into(),
+                span,
+            });
+        }
         // Build the syntax-rules form: (syntax-rules () <translated-clauses>...)
         // For each clause: walk the pattern, strip ":class" annotations,
         // wrap body in class-check ifs.
@@ -1691,7 +1738,7 @@ impl<'a> Expander<'a> {
             self.macros.insert(
                 name,
                 Macro {
-                    literals: Vec::new(),
+                    literals: parser_literals,
                     rules: parser_rules,
                     name,
                     parser: true,
@@ -1702,10 +1749,21 @@ impl<'a> Expander<'a> {
                 span,
             });
         }
-        // Build (define-syntax <name> (syntax-rules () <clauses>...))
+        // Build (define-syntax <name> (syntax-rules (<lits>) <clauses>...))
+        let literals_list = if parser_literals.is_empty() {
+            Datum::Null(span)
+        } else {
+            mk_list(
+                parser_literals
+                    .iter()
+                    .map(|s| Datum::Symbol(*s, span))
+                    .collect(),
+                span,
+            )
+        };
         let mut sr_items = vec![
             Datum::Symbol(self.keywords.syntax_rules, span),
-            Datum::Null(span), // empty literals list
+            literals_list,
         ];
         sr_items.extend(translated_clauses);
         let syntax_rules_form = mk_list(sr_items, span);
