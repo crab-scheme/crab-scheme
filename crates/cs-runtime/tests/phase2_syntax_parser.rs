@@ -5,9 +5,12 @@
 //! - `(define-syntax-parser name (pat body ...) ...)`
 //! - Pattern symbols may carry `:class` annotations: `id:id`,
 //!   `n:number`, `s:string`, `e:expr` (the last is no-op-class).
-//! - On class mismatch the expanded code raises an `error` at
-//!   RUNTIME (the macro expansion site reports the bad arg).
-//!   Phase 2A.4 lifts this to expand-time pinpointing.
+//! - On a built-in class mismatch the macro raises a pinpointed
+//!   error at EXPAND time, with the body emitted unwrapped (R6RS++
+//!   #32 follow-up; see `phase2a4_expand_class_checks.rs`). The
+//!   built-in classes are syntactic: `:number` means "a number
+//!   literal". User-defined value-classes stay runtime checks
+//!   (see `phase2_syntax_class.rs`).
 
 use cs_core::WriteMode;
 use cs_runtime::Runtime;
@@ -70,7 +73,7 @@ fn id_class_accepts_symbol() {
 }
 
 #[test]
-fn id_class_rejects_non_identifier_at_runtime() {
+fn id_class_rejects_non_identifier() {
     let mut rt = Runtime::new();
     rt.eval_str(
         "<t>",
@@ -80,8 +83,8 @@ fn id_class_rejects_non_identifier_at_runtime() {
         "#,
     )
     .unwrap();
-    // Passing a number where an identifier is expected -- the
-    // class check fires at runtime of the expansion.
+    // Passing a number where an identifier is expected -- the built-in
+    // class check fires at expand time of the macro use.
     let err = rt
         .eval_str("<t>", "(id-only 42)")
         .expect_err("class violation should error");

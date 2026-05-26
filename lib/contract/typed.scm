@@ -104,6 +104,6 @@
 ;                                    expr
 ;                                    'name))
 (define-syntax-parser define/typed
-  ((_ name type-ann expr)
+  ((_ name:id type-ann expr)
    (define name
      (apply-contract (__type->contract (quote type-ann)) expr (quote name)))))

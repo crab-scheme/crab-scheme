@@ -21,9 +21,9 @@
 ; one-arg shorthand, which the expander recognizes and auto-names.
 
 (define-syntax-parser define-record
-  ((_ name (field ...))
+  ((_ name:id (field ...))
    (define-record-type name (fields field ...))))
 
 (define-syntax-parser define-record-mutable
-  ((_ name (field ...))
+  ((_ name:id (field ...))
    (define-record-type name (fields (mutable field) ...))))

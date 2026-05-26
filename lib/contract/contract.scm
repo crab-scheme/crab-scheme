@@ -427,11 +427,11 @@
 ; library boundary closes) is the intended call order.
 
 (define-syntax-parser define/contract
-  ((_ name contract expr)
+  ((_ name:id contract expr)
    (define name (apply-contract contract expr (quote name)))))
 
 (define-syntax-parser provide/contract
-  ((_ (name contract) ...)
+  ((_ (name:id contract) ...)
    (begin
      (define name (apply-contract contract name (quote name)))
      ...)))
