@@ -106,8 +106,20 @@ belongs at the frame level.
 - Correct R7RS/Racket tail-mark replace-semantics.
 - Marks compose correctly with full `call/cc` on the VM (captured
   in the snapshot).
-- Zero cost when unused: the walker stack is gated on non-empty;
-  the VM frame slot is `None` until a mark is installed.
+- VM / JIT tiers: **no measurable regression** when marks are unused
+  (the `Frame` mark slot is `None`; a wcm-bearing function declines to
+  JIT). A/B (`origin/main` vs `+#28+#36`, release, same machine):
+  fib / binary-trees / spectral-norm on both JIT and VM within ±2%
+  (noise).
+- Walker tier: a **~5% regression** on mark-free hot loops. Correct
+  extent-scoped marks need per-`eval` bookkeeping (clearing
+  completed-extent marks on return) — one extra branch on the
+  walker's universal evaluation entry. It is gated behind a hot
+  `marks_active` flag next to `depth` (cutting an initial ~9–12%
+  cold-cache-line version to ~5%), but a host-recursion walker can't
+  make it truly free without a same-depth-sibling correctness hole.
+  Accepted: the walker is the slow reference/fallback tier; real
+  workloads run on VM/JIT, which are unaffected.
 
 ### Negative / migration
 - **Behavior change:** same-key marks nested in tail position now

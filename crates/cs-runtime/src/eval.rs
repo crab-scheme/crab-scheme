@@ -73,6 +73,14 @@ pub struct EvalCtx<'a> {
     pub macros: &'a mut std::collections::HashMap<cs_core::Symbol, cs_expand::Macro>,
     pub depth: u32,
     pub max_depth: u32,
+    /// Tail-safe continuation marks fast-path gate (issue #36). `false`
+    /// until the first `with-continuation-mark` runs; checked on every
+    /// `eval` return to decide whether the (cold) `cont_marks` clearing
+    /// is needed. Placed next to `depth` (already hot) so the
+    /// overwhelmingly-common mark-free path never touches the cold
+    /// `cont_marks` Vec at the end of the struct — a per-eval cold
+    /// cache-line load measured ~9% on the walker hot loop.
+    pub marks_active: bool,
     /// Side channel: when a builtin (`raise`, `error`) wants to raise a
     /// condition, it stashes the value here and returns `Err`. eval picks
     /// it up and converts to `EvalErrorKind::Raised`.
@@ -126,6 +134,7 @@ impl<'a> EvalCtx<'a> {
             macros,
             depth: 0,
             max_depth: 1_000_000,
+            marks_active: false,
             pending_raise: None,
             pending_escape: None,
             pending_values: None,
@@ -299,9 +308,11 @@ pub fn eval(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Value,
     }
     // Tail-safe continuation marks (issue #36): marks installed at a
     // depth deeper than the one we've returned to belong to the
-    // now-completed dynamic extent — drop them. Gated on non-empty so
-    // mark-free code (the overwhelming majority) pays nothing here.
-    if !ctx.cont_marks.is_empty() {
+    // now-completed dynamic extent — drop them. Gated on the hot
+    // `marks_active` flag (next to `depth`) so mark-free code never
+    // touches the cold `cont_marks` Vec; the inner `is_empty` guards
+    // the rare empty-but-active window.
+    if ctx.marks_active && !ctx.cont_marks.is_empty() {
         let d = ctx.depth;
         ctx.cont_marks.retain(|(md, _, _)| *md <= d);
     }
@@ -407,6 +418,11 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
                 // evaluated non-tail.
                 let k = eval(&key, cur_env.clone(), ctx)?;
                 let v = eval(&val, cur_env.clone(), ctx)?;
+                // Light the fast-path gate so `eval` begins clearing
+                // completed-extent marks. Once lit it stays lit for the
+                // rest of this eval context — the per-eval `is_empty`
+                // guard handles the empty windows.
+                ctx.marks_active = true;
                 let d = ctx.depth;
                 if let Some(slot) = ctx
                     .cont_marks
