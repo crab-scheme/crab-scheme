@@ -19,13 +19,12 @@
 ;;; `(make-channel …)` call), runs body, then closes the channel
 ;;; — even if body raises. Returns body's last value.
 
-(define-syntax with-channel
-  (syntax-rules ()
-    [(_ (name expr) body0 body ...)
-     (let ([name expr])
-       (let ([__result (begin body0 body ...)])
-         (channel-close! name)
-         __result))]))
+(define-syntax-parser with-channel
+  [(_ (name expr) body0 body ...)
+   (let ([name expr])
+     (let ([__result (begin body0 body ...)])
+       (channel-close! name)
+       __result))])
 
 ;;; ----- select ----------------------------------------------------
 ;;;
@@ -54,60 +53,58 @@
 ;;;     [(send! ch3 val)  (display "queued on ch3")]
 ;;;     [(after 1000)     (display "1s timeout")])
 
-(define-syntax select
-  (syntax-rules ()
-    [(_ clause ...)
-     (select-build #f () () clause ...)]))
+(define-syntax-parser select
+  [(_ clause ...)
+   (select-build #f () () clause ...)])
 
-(define-syntax select-biased
-  (syntax-rules ()
-    [(_ clause ...)
-     (select-build #t () () clause ...)]))
+(define-syntax-parser select-biased
+  [(_ clause ...)
+   (select-build #t () () clause ...)])
 
 ;;; Helper: accumulate clause specs + thunks, then dispatch.
 ;;; Each thunk takes one arg (the received value for recv clauses,
 ;;; ignored otherwise) so the index-driven dispatch is uniform.
 
-(define-syntax select-build
-  (syntax-rules (recv send! after else)
-    ;; No more clauses — emit the call + dispatch.
-    ;; Use a single `let` (not `let*`) so all three references
-    ;; to `__r` share one expander rename / hygienic mark.
-    [(_ biased (spec ...) (thunk ...))
-     (let ([__r (channel-select (list spec ...) biased)])
-       ((list-ref (list thunk ...) (car __r)) (cdr __r)))]
-    ;; (recv ch) var body...
-    [(_ biased (spec ...) (thunk ...)
-        [(recv ch) var body0 body ...]
-        rest ...)
-     (select-build biased
-                   (spec ... (list 'recv ch))
-                   (thunk ... (lambda (var) body0 body ...))
-                   rest ...)]
-    ;; (send! ch v) body...
-    [(_ biased (spec ...) (thunk ...)
-        [(send! ch v) body0 body ...]
-        rest ...)
-     (select-build biased
-                   (spec ... (list 'send! ch v))
-                   (thunk ... (lambda (__sel-ignored) body0 body ...))
-                   rest ...)]
-    ;; (after ms) body...
-    [(_ biased (spec ...) (thunk ...)
-        [(after ms) body0 body ...]
-        rest ...)
-     (select-build biased
-                   (spec ... (list 'after ms))
-                   (thunk ... (lambda (__sel-ignored) body0 body ...))
-                   rest ...)]
-    ;; else body...
-    [(_ biased (spec ...) (thunk ...)
-        [else body0 body ...]
-        rest ...)
-     (select-build biased
-                   (spec ... (list 'else))
-                   (thunk ... (lambda (__sel-ignored) body0 body ...))
-                   rest ...)]))
+(define-syntax-parser select-build
+  #:literals (recv send! after else)
+  ;; No more clauses — emit the call + dispatch.
+  ;; Use a single `let` (not `let*`) so all three references
+  ;; to `__r` share one expander rename / hygienic mark.
+  [(_ biased (spec ...) (thunk ...))
+   (let ([__r (channel-select (list spec ...) biased)])
+     ((list-ref (list thunk ...) (car __r)) (cdr __r)))]
+  ;; (recv ch) var body...
+  [(_ biased (spec ...) (thunk ...)
+      [(recv ch) var body0 body ...]
+      rest ...)
+   (select-build biased
+                 (spec ... (list 'recv ch))
+                 (thunk ... (lambda (var) body0 body ...))
+                 rest ...)]
+  ;; (send! ch v) body...
+  [(_ biased (spec ...) (thunk ...)
+      [(send! ch v) body0 body ...]
+      rest ...)
+   (select-build biased
+                 (spec ... (list 'send! ch v))
+                 (thunk ... (lambda (__sel-ignored) body0 body ...))
+                 rest ...)]
+  ;; (after ms) body...
+  [(_ biased (spec ...) (thunk ...)
+      [(after ms) body0 body ...]
+      rest ...)
+   (select-build biased
+                 (spec ... (list 'after ms))
+                 (thunk ... (lambda (__sel-ignored) body0 body ...))
+                 rest ...)]
+  ;; else body...
+  [(_ biased (spec ...) (thunk ...)
+      [else body0 body ...]
+      rest ...)
+   (select-build biased
+                 (spec ... (list 'else))
+                 (thunk ... (lambda (__sel-ignored) body0 body ...))
+                 rest ...)])
 
 ;;; ----- channel-for-each -----------------------------------------
 ;;;

@@ -80,14 +80,14 @@
 ;;; the chain reads inline with the lambda — same pattern as
 ;;; `define-behavior`'s clause syntax.
 
-(define-syntax define-handler
-  (syntax-rules (middleware)
-    [(_ name (middleware mw ...) body-lambda)
-     (define (name h)
-       (run-middleware-chain h (list mw ...) body-lambda))]
-    [(_ name body-lambda)
-     (define (name h)
-       (body-lambda h))]))
+(define-syntax-parser define-handler
+  #:literals (middleware)
+  [(_ name (middleware mw ...) body-lambda)
+   (define (name h)
+     (run-middleware-chain h (list mw ...) body-lambda))]
+  [(_ name body-lambda)
+   (define (name h)
+     (body-lambda h))])
 
 ;;; ----- define-server ---------------------------------------------
 ;;;
@@ -130,43 +130,42 @@
 ;;;     (route 'POST "/users"    users-pid))
 ;;;   (server-start! my-app)
 
-(define-syntax define-server
-  (syntax-rules ()
-    [(_ name addr action ...)
-     (define name
-       (let ([__sid (web-server-create addr)])
-         (server-action __sid action) ...
-         __sid))]))
+(define-syntax-parser define-server
+  [(_ name addr action ...)
+   (define name
+     (let ([__sid (web-server-create addr)])
+       (server-action __sid action) ...
+       __sid))])
 
-(define-syntax server-action
-  (syntax-rules (middleware access-log route)
-    ;; Middleware list — expand each item via server-mw.
-    [(_ sid (middleware m ...))
-     (begin (server-mw sid m) ...)]
-    ;; Access log → cs-table OrderedSet by name.
-    [(_ sid (access-log table-name))
-     (web-access-log! sid table-name)]
-    ;; Static-body routes (with + without explicit status).
-    [(_ sid (route method path (static body)))
-     (web-route-static! sid method path body)]
-    [(_ sid (route method path (static body status)))
-     (web-route-static! sid method path body status)]
-    ;; Actor-backed routes (with + without timeout-ms).
-    [(_ sid (route method path pid))
-     (web-route-actor! sid method path pid)]
-    [(_ sid (route method path pid timeout-ms))
-     (web-route-actor! sid method path pid timeout-ms)]))
+(define-syntax-parser server-action
+  #:literals (middleware access-log route)
+  ;; Middleware list — expand each item via server-mw.
+  [(_ sid (middleware m ...))
+   (begin (server-mw sid m) ...)]
+  ;; Access log → cs-table OrderedSet by name.
+  [(_ sid (access-log table-name))
+   (web-access-log! sid table-name)]
+  ;; Static-body routes (with + without explicit status).
+  [(_ sid (route method path (static body)))
+   (web-route-static! sid method path body)]
+  [(_ sid (route method path (static body status)))
+   (web-route-static! sid method path body status)]
+  ;; Actor-backed routes (with + without timeout-ms).
+  [(_ sid (route method path pid))
+   (web-route-actor! sid method path pid)]
+  [(_ sid (route method path pid timeout-ms))
+   (web-route-actor! sid method path pid timeout-ms)])
 
-(define-syntax server-mw
-  (syntax-rules (request-id trace catch-panic timeout layer-actor)
-    [(_ sid request-id)            (web-layer-request-id! sid)]
-    [(_ sid trace)                 (web-layer-trace! sid)]
-    [(_ sid catch-panic)           (web-layer-catch-panic! sid)]
-    [(_ sid (timeout ms))          (web-layer-timeout! sid ms)]
-    ;; (layer-actor pid)            uses the default 30s decision
-    ;; (layer-actor pid ms)         caps decisions at ms milliseconds
-    [(_ sid (layer-actor pid))     (web-layer-actor! sid pid)]
-    [(_ sid (layer-actor pid ms))  (web-layer-actor! sid pid ms)]))
+(define-syntax-parser server-mw
+  #:literals (request-id trace catch-panic timeout layer-actor)
+  [(_ sid request-id)            (web-layer-request-id! sid)]
+  [(_ sid trace)                 (web-layer-trace! sid)]
+  [(_ sid catch-panic)           (web-layer-catch-panic! sid)]
+  [(_ sid (timeout ms))          (web-layer-timeout! sid ms)]
+  ;; (layer-actor pid)            uses the default 30s decision
+  ;; (layer-actor pid ms)         caps decisions at ms milliseconds
+  [(_ sid (layer-actor pid))     (web-layer-actor! sid pid)]
+  [(_ sid (layer-actor pid ms))  (web-layer-actor! sid pid ms)])
 
 ;;; Tidy aliases over the canonical primops — matches the
 ;;; `req-*` style used elsewhere in this library.

@@ -103,8 +103,7 @@
 ;   ==> (define name (apply-contract (__type->contract 'type-ann)
 ;                                    expr
 ;                                    'name))
-(define-syntax define/typed
-  (syntax-rules ()
-    ((_ name type-ann expr)
-     (define name
-       (apply-contract (__type->contract (quote type-ann)) expr (quote name))))))
+(define-syntax-parser define/typed
+  ((_ name type-ann expr)
+   (define name
+     (apply-contract (__type->contract (quote type-ann)) expr (quote name)))))

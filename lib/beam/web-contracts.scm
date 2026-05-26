@@ -68,16 +68,15 @@
 ;;; the success body. The macro is non-cooperative — once 400
 ;;; is sent the request is finalized; the handler's outer
 ;;; `receive` loop continues normally.
-(define-syntax check-request
-  (syntax-rules ()
-    [(_ h () success ...)
-     (begin success ...)]
-    [(_ h ([name val contract] rest ...) success ...)
-     (let ([name val])
-       (if (contract name)
-           (check-request h (rest ...) success ...)
-           (web-respond! h 400
-                         (string-append "invalid " (symbol->string 'name)))))]))
+(define-syntax-parser check-request
+  [(_ h () success ...)
+   (begin success ...)]
+  [(_ h ([name val contract] rest ...) success ...)
+   (let ([name val])
+     (if (contract name)
+         (check-request h (rest ...) success ...)
+         (web-respond! h 400
+                       (string-append "invalid " (symbol->string 'name)))))])
 
 ;;; --- HTTP status codes --------------------------------------------
 ;;;
@@ -236,18 +235,20 @@
 ;;; `body` is both a top-level alias and a local nullary form — the
 ;;; local one wins inside the macro's scope by hygienic shadowing.
 
-(define-syntax with-request
-  (syntax-rules ()
-    [(_ h body* ...)
-     (let-syntax ([method   (syntax-rules () [(_)    (web-request-method  h)])]
-                  [path     (syntax-rules () [(_)    (web-request-path    h)])]
-                  [body     (syntax-rules () [(_)    (web-request-body    h)])]
-                  [param    (syntax-rules () [(_ k)  (web-request-param   h k)])]
-                  [params   (syntax-rules () [(_)    (web-request-params  h)])]
-                  [header   (syntax-rules () [(_ k)  (web-request-header  h k)])]
-                  [headers  (syntax-rules () [(_)    (web-request-headers h)])]
-                  [respond! (syntax-rules () [(_ s b*) (web-respond!      h s b*)])])
-       body* ...)]))
+(define-syntax-parser with-request
+  [(_ h body* ...)
+   ;; Inner `let-syntax` locals stay `syntax-rules` — there is no
+   ;; local `define-syntax-parser` form; only the outer macro
+   ;; definition migrates (#32).
+   (let-syntax ([method   (syntax-rules () [(_)    (web-request-method  h)])]
+                [path     (syntax-rules () [(_)    (web-request-path    h)])]
+                [body     (syntax-rules () [(_)    (web-request-body    h)])]
+                [param    (syntax-rules () [(_ k)  (web-request-param   h k)])]
+                [params   (syntax-rules () [(_)    (web-request-params  h)])]
+                [header   (syntax-rules () [(_ k)  (web-request-header  h k)])]
+                [headers  (syntax-rules () [(_)    (web-request-headers h)])]
+                [respond! (syntax-rules () [(_ s b*) (web-respond!      h s b*)])])
+     body* ...)])
 
 ;;; `with-validated-request` — sugar over `check-request` for the
 ;;; common case where every clause has the same shape: a
@@ -271,25 +272,25 @@
 ;;; required (use empty `()` if you don't need any). `#:body` is
 ;;; optional and binds a single `body` name.
 
-(define-syntax with-validated-request
-  (syntax-rules (#:param #:header #:body)
-    ;; Form WITH body contract.
-    [(_ h
-        #:param  ([p-name p-contract] ...)
-        #:header ([h-name h-contract] ...)
-        #:body   b-contract
-        success-lambda)
-     (check-request h
-       ([p-name (web-request-param  h (symbol->string 'p-name))  p-contract] ...
-        [h-name (web-request-header h (symbol->string 'h-name))  h-contract] ...
-        [body   (web-request-body   h)                           b-contract])
-       (success-lambda p-name ... h-name ... body))]
-    ;; Form WITHOUT body contract.
-    [(_ h
-        #:param  ([p-name p-contract] ...)
-        #:header ([h-name h-contract] ...)
-        success-lambda)
-     (check-request h
-       ([p-name (web-request-param  h (symbol->string 'p-name))  p-contract] ...
-        [h-name (web-request-header h (symbol->string 'h-name))  h-contract] ...)
-       (success-lambda p-name ... h-name ...))]))
+(define-syntax-parser with-validated-request
+  #:literals (#:param #:header #:body)
+  ;; Form WITH body contract.
+  [(_ h
+      #:param  ([p-name p-contract] ...)
+      #:header ([h-name h-contract] ...)
+      #:body   b-contract
+      success-lambda)
+   (check-request h
+     ([p-name (web-request-param  h (symbol->string 'p-name))  p-contract] ...
+      [h-name (web-request-header h (symbol->string 'h-name))  h-contract] ...
+      [body   (web-request-body   h)                           b-contract])
+     (success-lambda p-name ... h-name ... body))]
+  ;; Form WITHOUT body contract.
+  [(_ h
+      #:param  ([p-name p-contract] ...)
+      #:header ([h-name h-contract] ...)
+      success-lambda)
+   (check-request h
+     ([p-name (web-request-param  h (symbol->string 'p-name))  p-contract] ...
+      [h-name (web-request-header h (symbol->string 'h-name))  h-contract] ...)
+     (success-lambda p-name ... h-name ...))])
