@@ -10669,3 +10669,70 @@ fn diff_jit_nested_closure_captures_params() {
         other => panic!("walker disagreed: {:?}", other),
     }
 }
+
+// ---- Regression: inner closure capturing a LOOP-UPDATED variable ----
+//
+// Found 2026-05-26 via a spectral-norm miscompile. A self-recursive
+// (loop-converted) JIT body that builds an inner closure capturing one
+// of its OWN loop variables used to freeze that capture at the value the
+// loop var held when the body tiered up: the inner closure reads the var
+// via the frame env that `vm_make_closure` snapshots, but the
+// register-only loop back-edge never wrote updated loop vars back into
+// that env. Manifested as silently-wrong results — int AND float — once
+// the outer loop crossed the 1024-call tier-up threshold. The
+// `apply-captured` test above only captures a loop-INVARIANT param, so it
+// never exercised this path. Fix: sync updated loop vars into the frame
+// env on the self-call back-edge (jit_translate.rs).
+
+#[test]
+fn diff_inner_closure_captures_outer_loop_var() {
+    // Inner loop `jl` reads outer loop var `i`. Correct result is
+    // n*(0+1+..+(n-1)) = n^2*(n-1)/2; n=1500 -> 1686375000. n>1024 so
+    // `il` tiers up mid-loop. Pre-fix the JIT returned 1516086000 (the
+    // inner closure saw `i` frozen at its tier-up value, 1023).
+    let defines = &["(define (f n) \
+        (let il ((i 0) (acc 0)) \
+          (if (< i n) \
+              (il (+ i 1) (+ acc (let jl ((j 0) (s 0)) \
+                                   (if (< j n) (jl (+ j 1) (+ s i)) s)))) \
+              acc)))"];
+    assert_three_tier_agreement(defines, Some("(f 1500)"), "(f 1500)");
+
+    // Pin the exact value so an "all tiers agree but all wrong"
+    // regression can't slip through.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
+    rt.eval_str_via_vm("<diff>", "(f 1500)").unwrap();
+    match rt.eval_str_via_vm("<diff>", "(f 1500)").unwrap() {
+        Value::Number(n) => assert_eq!(n.to_f64(), 1686375000.0),
+        other => panic!("expected number, got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_inner_closure_captures_loop_accumulator() {
+    // The inner closure captures `acc`, the OTHER (also loop-updated)
+    // variable — guards against a fix that only syncs the first param.
+    let defines = &["(define (f n) \
+        (let il ((i 0) (acc 1)) \
+          (if (< i n) \
+              (il (+ i 1) (+ 1 (let jl ((j 0) (s 0)) \
+                                 (if (< j n) (jl (+ j 1) acc) s)))) \
+              acc)))"];
+    assert_three_tier_agreement(defines, Some("(f 1500)"), "(f 1500)");
+}
+
+#[test]
+fn diff_inner_closure_captures_outer_loop_var_float() {
+    // The spectral-norm shape that surfaced the bug: a FLOAT inner
+    // accumulation whose summand reads the outer loop var `i`. Confirms
+    // the fix is not int-specific.
+    let defines = &["(define (f n) \
+        (let il ((i 0) (acc 0.0)) \
+          (if (< i n) \
+              (il (+ i 1) (+ acc (let jl ((j 0) (s 0.0)) \
+                                   (if (< j n) (jl (+ j 1) (+ s (/ 1.0 (+ i j 1)))) s)))) \
+              acc)))"];
+    assert_three_tier_agreement(defines, Some("(f 1100)"), "(f 1100)");
+}
