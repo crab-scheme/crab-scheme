@@ -426,14 +426,12 @@
 ; `provide/contract` AFTER the relevant defines (and before the
 ; library boundary closes) is the intended call order.
 
-(define-syntax define/contract
-  (syntax-rules ()
-    ((_ name contract expr)
-     (define name (apply-contract contract expr (quote name))))))
+(define-syntax-parser define/contract
+  ((_ name contract expr)
+   (define name (apply-contract contract expr (quote name)))))
 
-(define-syntax provide/contract
-  (syntax-rules ()
-    ((_ (name contract) ...)
-     (begin
-       (define name (apply-contract contract name (quote name)))
-       ...))))
+(define-syntax-parser provide/contract
+  ((_ (name contract) ...)
+   (begin
+     (define name (apply-contract contract name (quote name)))
+     ...)))

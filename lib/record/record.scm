@@ -20,12 +20,10 @@
 ; instead. See expand_define_record_type for the (mutable FIELD)
 ; one-arg shorthand, which the expander recognizes and auto-names.
 
-(define-syntax define-record
-  (syntax-rules ()
-    ((_ name (field ...))
-     (define-record-type name (fields field ...)))))
+(define-syntax-parser define-record
+  ((_ name (field ...))
+   (define-record-type name (fields field ...))))
 
-(define-syntax define-record-mutable
-  (syntax-rules ()
-    ((_ name (field ...))
-     (define-record-type name (fields (mutable field) ...)))))
+(define-syntax-parser define-record-mutable
+  ((_ name (field ...))
+   (define-record-type name (fields (mutable field) ...))))
