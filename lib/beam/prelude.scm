@@ -53,33 +53,33 @@
 
 ; Each clause is `(pat body ...)` with an implicit `begin` around
 ; the body — the standard Scheme convention.
-(define-syntax receive
-  (syntax-rules (after)
-    ((_ (pat body ...) ...)
+(define-syntax-parser receive
+  #:literals (after)
+  ((_ (pat body ...) ...)
+   (let loop ()
+     (let ((msg (raw-receive #f)))
+       (cond
+         ((match-and-bind msg pat) body ...) ...
+         (else (loop))))))
+  ((_ (pat body ...) ... (after timeout-ms timeout-action))
+   (let ((deadline (+ (current-jiffy)
+                      (* timeout-ms (/ (jiffies-per-second) 1000)))))
      (let loop ()
-       (let ((msg (raw-receive #f)))
+       (let* ((remaining (- deadline (current-jiffy)))
+              (remaining-ms (if (< remaining 0)
+                                0
+                                (quotient (* remaining 1000)
+                                          (jiffies-per-second))))
+              (msg (raw-receive remaining-ms)))
          (cond
+           ; Raw-receive uses the sentinel symbol `'*timeout*`
+           ; (introduced post-#6) rather than `#f` so a legit
+           ; `(send pid #f)` payload doesn't collide with the
+           ; timeout case. Old `(not msg)` check would have
+           ; misclassified `#f` payload as timeout.
+           ((eq? msg '*timeout*) timeout-action)
            ((match-and-bind msg pat) body ...) ...
-           (else (loop))))))
-    ((_ (pat body ...) ... (after timeout-ms timeout-action))
-     (let ((deadline (+ (current-jiffy)
-                        (* timeout-ms (/ (jiffies-per-second) 1000)))))
-       (let loop ()
-         (let* ((remaining (- deadline (current-jiffy)))
-                (remaining-ms (if (< remaining 0)
-                                  0
-                                  (quotient (* remaining 1000)
-                                            (jiffies-per-second))))
-                (msg (raw-receive remaining-ms)))
-           (cond
-             ; Raw-receive uses the sentinel symbol `'*timeout*`
-             ; (introduced post-#6) rather than `#f` so a legit
-             ; `(send pid #f)` payload doesn't collide with the
-             ; timeout case. Old `(not msg)` check would have
-             ; misclassified `#f` payload as timeout.
-             ((eq? msg '*timeout*) timeout-action)
-             ((match-and-bind msg pat) body ...) ...
-             (else (loop)))))))))
+           (else (loop))))))))
 
 ; Predicate for the receive sentinel. Use in user code when
 ; not going through the `(receive … (after …))` macro.
@@ -89,11 +89,11 @@
 ; prelude draft we expand to a simple equal? check on a quoted
 ; pattern. Returns truthy/falsy so the surrounding cond can run
 ; the clause body via implicit begin.
-(define-syntax match-and-bind
-  (syntax-rules (_)
-    ((_ msg _) #t)
-    ((_ msg pat)
-     (equal? msg 'pat))))
+(define-syntax-parser match-and-bind
+  #:literals (_)
+  ((_ msg _) #t)
+  ((_ msg pat)
+   (equal? msg 'pat)))
 
 ; ============================================================
 ; PART 2 — call (synchronous RPC) over send + receive
@@ -365,26 +365,26 @@
 ; iter can lift the order constraint via a richer macro that
 ; sorts / defaults missing clauses.
 
-(define-syntax define-behavior
-  (syntax-rules (init handle-call handle-cast handle-info terminate code-change)
-    ((_ name
-        (init         init-fn)
-        (handle-call  call-fn)
-        (handle-cast  cast-fn)
-        (handle-info  info-fn)
-        (terminate    term-fn)
-        (code-change  cc-fn))
-     (begin
-       (define (name-start . args)
-         (spawn
-           (lambda ()
-             (let ((state (apply init-fn args)))
-               (behavior-loop state call-fn cast-fn info-fn
-                              term-fn cc-fn)))))
-       (define (name-call pid msg)
-         (call pid (cons 'call msg)))
-       (define (name-cast pid msg)
-         (send pid (cons 'cast msg)))))))
+(define-syntax-parser define-behavior
+  #:literals (init handle-call handle-cast handle-info terminate code-change)
+  ((_ name
+      (init         init-fn)
+      (handle-call  call-fn)
+      (handle-cast  cast-fn)
+      (handle-info  info-fn)
+      (terminate    term-fn)
+      (code-change  cc-fn))
+   (begin
+     (define (name-start . args)
+       (spawn
+         (lambda ()
+           (let ((state (apply init-fn args)))
+             (behavior-loop state call-fn cast-fn info-fn
+                            term-fn cc-fn)))))
+     (define (name-call pid msg)
+       (call pid (cons 'call msg)))
+     (define (name-cast pid msg)
+       (send pid (cons 'cast msg))))))
 
 (define (behavior-loop state call-fn cast-fn info-fn term-fn cc-fn)
   (receive
@@ -485,18 +485,17 @@
 
 (define state-migrations (make-table 'beam:state-migrations 'set))
 
-(define-syntax define-state-migration
-  (syntax-rules ()
-    ((_ module-name
-        ((from-version from-ver-str) state-arg)
-        body ...)
-     (let ((existing (or (table-lookup 'beam:state-migrations 'module-name) '())))
-       (table-insert!
-         'beam:state-migrations 'module-name
-         (cons
-           (cons from-ver-str
-                 (lambda (state-arg) body ...))
-           existing))))))
+(define-syntax-parser define-state-migration
+  ((_ module-name
+      ((from-version from-ver-str) state-arg)
+      body ...)
+   (let ((existing (or (table-lookup 'beam:state-migrations 'module-name) '())))
+     (table-insert!
+       'beam:state-migrations 'module-name
+       (cons
+         (cons from-ver-str
+               (lambda (state-arg) body ...))
+         existing)))))
 
 (define (run-state-migration module-name from-version state)
   (let ((migrations (or (table-lookup 'beam:state-migrations module-name) '())))
