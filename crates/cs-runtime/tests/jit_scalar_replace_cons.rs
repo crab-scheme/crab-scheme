@@ -81,11 +81,15 @@ fn jit_eliminates_directly_consumed_cons_allocations() {
     let expected = iters * (iters + 1) / 2 + iters;
     assert_eq!(as_i64(&result), expected, "result correctness");
 
-    // Both per-iteration conses are scalar-replaced, so the run
-    // allocates far below the iteration count. Generous ceiling (1% of
-    // iters) absorbs incidental runtime allocations while failing loudly
-    // if the ~400k conses were NOT eliminated.
-    let ceiling = (iters as u64) / 100;
+    // Without SRA each iteration heap-allocates two conses, i.e.
+    // 2*iters allocations. With SRA the per-iteration conses are gone;
+    // the only residue is incidental runtime allocation (cycle-detector
+    // / telemetry bookkeeping plus the brief JIT tier-up transient) —
+    // observed at a few thousand and machine/profile-dependent, but
+    // always well under one allocation per iteration. So `allocs <
+    // iters` both proves the conses were eliminated (the un-optimized
+    // run can't get below 2*iters) and tolerates the incidental noise.
+    let ceiling = iters as u64;
     assert!(
         allocs < ceiling,
         "expected directly-consumed conses eliminated: {allocs} allocations across \
