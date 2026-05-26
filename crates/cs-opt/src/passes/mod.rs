@@ -10,6 +10,7 @@ pub mod constant_fold;
 pub mod dead_block_elim;
 pub mod escape_to_region;
 pub mod inst_stats;
+pub mod scalar_replace_cons;
 
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ pub fn register_builtins(registry: &mut PassRegistry) -> Result<(), RegisterErro
     registry.register(Arc::new(dead_block_elim::DeadBlockElim))?;
     registry.register(Arc::new(escape_to_region::EscapeToRegion))?;
     registry.register(Arc::new(inst_stats::InstStats))?;
+    registry.register(Arc::new(scalar_replace_cons::ScalarReplaceCons))?;
     Ok(())
 }
 
@@ -39,4 +41,5 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "dead-block-elim",
     "escape-to-region",
     "inst-stats",
+    "scalar-replace-cons",
 ];

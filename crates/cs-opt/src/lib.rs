@@ -522,6 +522,49 @@ pub fn clear_active_passes() {
     ACTIVE_PASSES.with(|c| c.borrow_mut().clear());
 }
 
+// Process-global "always-on" pass list. Distinct from the per-thread
+// `ACTIVE_PASSES`: passes here run on *every* `run_active_pipeline`
+// call on *every* thread, ahead of the thread-local user-installed
+// passes. The embedder (cs-runtime) seeds this once at startup with
+// passes that are unconditionally sound and beneficial — currently
+// `scalar-replace-cons` (#28), which eliminates non-escaping cons
+// allocations and so should fire for all JIT-compiled code by default.
+//
+// Process-global (not thread-local) so worker threads that JIT-compile
+// independently (cs-actor) get the default passes too. The user's
+// `active-optimizer-passes` parameter and `install-optimizer-pass!`
+// remain orthogonal: they tune the per-thread list on top of these.
+static DEFAULT_ON_PASSES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Replace the process-global always-on pass list. Seeded by the
+/// embedder at startup (see [`DEFAULT_ON_PASSES`] docs). Names must be
+/// registered in the [`PassRegistry`]; unknown names are silently
+/// skipped at pipeline-construction time, same as the thread-local path.
+pub fn set_default_on_passes(names: &[&str]) {
+    let mut g = DEFAULT_ON_PASSES
+        .write()
+        .expect("default-on passes lock poisoned");
+    g.clear();
+    g.extend(names.iter().map(|s| s.to_string()));
+}
+
+/// Snapshot the process-global always-on pass list.
+pub fn default_on_passes() -> Vec<String> {
+    DEFAULT_ON_PASSES
+        .read()
+        .expect("default-on passes lock poisoned")
+        .clone()
+}
+
+/// Clear the process-global always-on pass list. Used by tests that
+/// need to exercise a pass in isolation; production code seeds once.
+pub fn clear_default_on_passes() {
+    DEFAULT_ON_PASSES
+        .write()
+        .expect("default-on passes lock poisoned")
+        .clear();
+}
+
 /// Replace the current thread's active-pass list with `names`.
 /// Used by the `active-optimizer-passes` Scheme parameter setter
 /// (cs-runtime) so `parameterize` can back the parameter with
@@ -596,7 +639,16 @@ where
 /// propagates into every subsequent JIT compile on the same thread
 /// without cs-vm needing to know about Scheme parameters.
 pub fn run_active_pipeline(func: &mut Function) {
-    let names = active_passes();
+    // Process-global always-on passes run first, then the thread-local
+    // user-installed list (deduped, original order preserved). Pipeline
+    // construction re-sorts by `Bucket`, so the merge order here only
+    // controls dedup precedence, not final pass order.
+    let mut names = default_on_passes();
+    for n in active_passes() {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
     if names.is_empty() {
         return;
     }
