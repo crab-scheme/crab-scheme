@@ -8,6 +8,53 @@ version `1.0.0-rcN` corresponds to the git tag `1.0-rcN`, which drives the
 release workflow (`.github/workflows/release.yml`). See
 [`docs/RELEASING.md`](docs/RELEASING.md) for how a release candidate is cut.
 
+## [1.0-rc7] — 2026-05-26
+
+### Added
+- **Distributed-actor SDK foundations.** `#:effects` declarations on
+  `define`/`lambda`, inferred and checked by `crabscheme check` (#58); a
+  cluster substrate — `cs-net` (Sim + TCP transports, framing) and
+  `cs-distrib` (DistPid / Router / RemoteRef / handshake / DOWN) (#59);
+  and a `cs-consensus` library — homegrown Raft (election / replication /
+  ReadIndex / snapshots / joint membership) + EPaxos, over a persistent-map
+  state machine (#64, #1).
+- **`syntax-parse` combinators** for `define-syntax-parser`:
+  `~or` / `~optional` / `~once` with ellipsis-head cardinality, via a
+  backtracking matcher (#31); plus **expand-time error pinpointing** that
+  blames the offending sub-form (#33).
+- **`#!lang` custom-reader protocol** — parse-time reader dispatch, and
+  honoring a language's `expander` (#71) and `base-env` (#70) exports
+  (#69, #73, #75).
+- **R6RS++ Phase 4 typed boundaries — closed** (#11): static
+  `define/typed` checking, library-export auto-contracting, intra-library
+  contract elision, and eta-elision verification (#76).
+- **`#:literals` for `define-syntax-parser`** plus migration of all 27
+  in-tree macros onto it (#32, #81), and **expand-time built-in
+  syntax-class checks** (`id` / `number` / `string`) so definition-bodied
+  macros (`define/contract`, `define/typed`, `define-record`) can validate
+  their `name:id` argument — the body is emitted unwrapped (#82, ADR 0029).
+- **scalar-replace non-escaping cons cells** — a default-on JIT
+  optimization that eliminates directly-consumed transient pairs (#28,
+  #79).
+- **tail-safe continuation marks** — native frame-based marks; tail loops
+  under `parameterize`-style marks now run in constant space (#36, #80).
+
+### Changed
+- Reader threads source spans through syntax data for sharper diagnostics
+  (#72, #74).
+- Project constitution doc (#63); CI moved to sccache + nextest (#65).
+- Recorded 1.0-rc6 microbenchmark results (controlled rc5 A/B) (#78).
+
+### Fixed
+- **JIT silent miscompile (#83, ADR 0030).** An inner closure capturing a
+  *loop-updated* variable of a tiered-up, loop-converted self-recursive
+  procedure read that variable **frozen** at its value when the procedure
+  crossed the tier-up threshold — returning silently-wrong results (integer
+  and float) past ~1024 iterations. The loop back-edge now syncs updated
+  loop vars into the frame env the closure captures.
+- `cs-actor` `receive` made async cancel-safe (#62).
+- Rebuilt the m5-fuzz harness for the cycle detector (#77).
+
 ## [1.0-rc6] — 2026-05-22
 
 ### Added
@@ -93,6 +140,7 @@ The major feature wave.
   + the AOT pipeline; nan-boxing value representation; countable and region
   memory management; R7RS core conformance.
 
+[1.0-rc7]: https://github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc7
 [1.0-rc6]: https://github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc6
 [1.0-rc5]: https://github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc5
 [1.0-rc4]: https://github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc4

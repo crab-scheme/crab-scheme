@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "cs-actor"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-table",
  "cs-vm",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "cs-channel"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "dashmap 6.2.1",
  "futures-util",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "cs-cli"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "clap",
  "cs-aot",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "cs-core"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-diag",
  "cs-gc",
@@ -876,11 +876,11 @@ dependencies = [
 
 [[package]]
 name = "cs-diag"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 
 [[package]]
 name = "cs-discovery"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "async-trait",
  "thiserror 1.0.69",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "cs-distrib"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-net",
  "thiserror 1.0.69",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "cs-expand"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -951,14 +951,14 @@ dependencies = [
 
 [[package]]
 name = "cs-gc"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "bumpalo",
 ]
 
 [[package]]
 name = "cs-hotreload"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "dashmap 6.2.1",
  "rustc-hash",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "cs-ir"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "cs-lex"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -1010,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "cs-lsp"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "clap",
  "cs-core",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "cs-net"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "bytes",
  "quinn",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "cs-opt"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-rir",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "cs-opt-example"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-opt",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "cs-parse"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "cs-pkg"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "cs-runtime"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-actor",
  "cs-channel",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "cs-sandbox-wasm"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "wasmtime",
  "wasmtime-wasi",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-archive"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1168,7 +1168,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-base"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "base64",
  "cs-core",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-collection"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-compress"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-csv"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-deflate"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-format"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-fs"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-hash"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "blake3",
  "cs-core",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-http"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-json"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-log"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-math"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-meta"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-metrics"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-net"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1331,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-os"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-path"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1348,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-process"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1357,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-random"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1366,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-regex"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-signal"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-string"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-time"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "chrono",
  "cs-core",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-toml"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-tty"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-url"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-uuid"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-websocket"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-ffi",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "cs-table"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "dashmap 6.2.1",
  "thiserror 1.0.69",
@@ -1455,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "cs-typer"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -1469,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "cs-vm"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-core",
  "cs-diag",
@@ -1485,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "cs-web"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "cs-web-mod-example"
-version = "1.0.0-rc6"
+version = "1.0.0-rc7"
 dependencies = [
  "cs-web",
 ]
