@@ -10401,6 +10401,16 @@ pub fn vm_tick_reductions() {
     });
 }
 
+/// C-ABI entry point so JIT-compiled code can tick a reduction at loop
+/// back-edges (#30 iter-1). Delegates to [`vm_tick_reductions`]; the
+/// wrapper keeps that hot VM-loop fn at the plain Rust ABI (preserving
+/// its `#[inline]`) while giving Cranelift a callable symbol. Safe in
+/// any context: the yield hook is a one-tick yield inside an actor and a
+/// no-op outside one (no current tokio runtime).
+pub extern "C" fn vm_jit_tick_reductions() {
+    vm_tick_reductions();
+}
+
 /// Fire the tier-up hook for the given closure if one is installed.
 /// Independent of whether the threshold actually crossed — callers
 /// should only invoke this after [`cs_jit::Tier::bump`] returned

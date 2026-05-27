@@ -79,6 +79,15 @@ pub struct Lowerer<M: Module = JITModule> {
     /// it. `None` (JIT default) keeps the legacy `Linkage::Local`
     /// auto-generated name. Set via [`Lowerer::set_entry_export`].
     export_outer_as: Option<String>,
+    /// True for the object (AOT) backend, false for the in-process JIT.
+    /// Gates JIT-only runtime-helper calls (e.g. the #30 reduction-tick
+    /// for actor preemption) so AOT binaries — which have no actor
+    /// scheduler — neither emit them nor need them in `libcs_aot_rt.a`.
+    is_aot: bool,
+    /// FuncId of `vm_jit_tick_reductions() -> ()` (#30 iter-1). Emitted
+    /// at JIT tail-self back-edges so a hot JIT-compiled actor loop ticks
+    /// a reduction and yields at budget; the call is gated on `!is_aot`.
+    tick_reductions_func: cranelift_module::FuncId,
     /// FuncId of the imported `vm_env_lookup_any` helper.
     /// `Inst::EnvLookupAny` lowers to a Cranelift call against
     /// this. Used by iter BU's translator when a free-var load
@@ -835,6 +844,11 @@ impl Lowerer<JITModule> {
         // Stage 3 baseline-JIT env-set helper (iter 3.5): accepts a
         // raw NanboxValue, decodes internally.
         builder.symbol("vm_env_set_nb", cs_vm::vm::vm_env_set_nb as *const u8);
+        // #30 iter-1 — reduction-tick for JIT actor preemption.
+        builder.symbol(
+            "vm_jit_tick_reductions",
+            cs_vm::vm::vm_jit_tick_reductions as *const u8,
+        );
         builder.symbol(
             "vm_env_define_local_nb",
             cs_vm::vm::vm_env_define_local_nb as *const u8,
@@ -1784,7 +1798,7 @@ impl Lowerer<JITModule> {
         // `finish_construction` takes ownership and does the mutation
         // (declare_function); nothing here mutates `module`.
         let module = JITModule::new(builder);
-        Self::finish_construction(module)
+        Self::finish_construction(module, false)
     }
 
     /// JIT entry point (#50 — uniform-NB is the sole backend): lower `rir`,
@@ -1840,7 +1854,7 @@ impl Lowerer<ObjectModule> {
         let builder = ObjectBuilder::new(isa, name, cranelift_module::default_libcall_names())
             .map_err(|e| JitError::Codegen(format!("object builder: {e}")))?;
         let module = ObjectModule::new(builder);
-        Self::finish_construction(module)
+        Self::finish_construction(module, true)
     }
 
     /// Set the symbol name the *next* [`Self::define_uniform_nb`] exports its
@@ -1869,7 +1883,7 @@ impl<M: Module> Lowerer<M> {
     /// `JITBuilder::symbol` *before* this runs; the object backend leaves
     /// them as undefined imports the system `cc` resolves against the
     /// prebuilt `libcs_aot_rt.a` archive (AOT L3).
-    fn finish_construction(mut module: M) -> Result<Self, JitError> {
+    fn finish_construction(mut module: M, is_aot: bool) -> Result<Self, JitError> {
         // Import env-lookup helpers: extern "C" fn(i64) -> i64.
         let mut env_lookup_sig = module.make_signature();
         env_lookup_sig.params.push(AbiParam::new(I64));
@@ -1896,6 +1910,17 @@ impl<M: Module> Lowerer<M> {
                 &env_set_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function env_set_nb: {e}")))?;
+        // #30 iter-1 — reduction-tick for JIT actor preemption:
+        // extern "C" fn() -> (). Declared for both backends (a harmless
+        // unused import on AOT, where the call is gated off by `is_aot`).
+        let tick_reductions_sig = module.make_signature();
+        let tick_reductions_func = module
+            .declare_function(
+                "vm_jit_tick_reductions",
+                cranelift_module::Linkage::Import,
+                &tick_reductions_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function tick_reductions: {e}")))?;
         let env_define_local_nb_func = module
             .declare_function(
                 "vm_env_define_local_nb",
@@ -4413,6 +4438,8 @@ impl<M: Module> Lowerer<M> {
             ctx,
             func_ctx: FunctionBuilderContext::new(),
             next_id: 0,
+            is_aot,
+            tick_reductions_func,
             env_lookup_any_func,
             env_set_nb_func,
             env_define_local_nb_func,
@@ -5363,6 +5390,15 @@ impl<M: Module> Lowerer<M> {
                 env_set_nb: self
                     .module
                     .declare_func_in_func(self.env_set_nb_func, builder.func),
+                // #30 iter-1 — JIT-only reduction-tick (None on AOT).
+                tick_reductions: if self.is_aot {
+                    None
+                } else {
+                    Some(
+                        self.module
+                            .declare_func_in_func(self.tick_reductions_func, builder.func),
+                    )
+                },
                 env_define_local_nb: self
                     .module
                     .declare_func_in_func(self.env_define_local_nb_func, builder.func),
@@ -6181,6 +6217,16 @@ impl<M: Module> Lowerer<M> {
                         .iter()
                         .map(|a| lookup(if raw_abi { &raw_map } else { &value_map }, *a))
                         .collect::<Result<_, _>>()?;
+                    // #30 iter-1 — tick a reduction at the tail-self
+                    // back-edge so a hot JIT-compiled actor loop fires the
+                    // yield hook at budget (a one-tick yield inside an
+                    // actor, a no-op outside one). JIT-only:
+                    // `tick_reductions` is `None` on the AOT backend, which
+                    // has no scheduler. Non-tail self-recursion (e.g. fib)
+                    // takes the regular `CallSelf` path and is untouched.
+                    if let Some(tick) = nb_helpers.tick_reductions {
+                        builder.ins().call(tick, &[]);
+                    }
                     builder.ins().return_call(nb_helpers.self_fn, &cargs);
                 } else if let Some((callee, gargs)) = detect_tail_call_general(rir, blk) {
                     // ADR 0019 — tail-position Call / CallGeneral. Lower
@@ -6689,6 +6735,10 @@ struct NbHelpers {
     // thread-local installed by `try_dispatch_jit_nb`.
     env_lookup_any: cranelift_codegen::ir::FuncRef,
     env_set_nb: cranelift_codegen::ir::FuncRef,
+    /// `vm_jit_tick_reductions` — reduction-tick for actor preemption,
+    /// emitted at JIT tail-self back-edges (#30 iter-1). `None` on the
+    /// AOT backend (no actor scheduler), which gates the call off.
+    tick_reductions: Option<cranelift_codegen::ir::FuncRef>,
     env_define_local_nb: cranelift_codegen::ir::FuncRef,
     make_closure: cranelift_codegen::ir::FuncRef,
     // IC hot path (CallGeneral): `vm_closure_id_peek(callee) -> u32`
