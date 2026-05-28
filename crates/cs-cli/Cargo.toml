@@ -153,6 +153,7 @@ wasm-stdlib-full = [
     "wasm-stdlib",
     "stdlib-net",
     "stdlib-http",
+    "stdlib-websocket",
 ]
 # Backward-compat alias matching the W1 feature name.
 ffi = ["cs-runtime/ffi"]
