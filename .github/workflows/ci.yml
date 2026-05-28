@@ -152,3 +152,57 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
+
+  wasm-build-wasip2-full:
+    # #9 iter-7 — exercise the `wasm-stdlib-full` networking subset
+    # under `wasm32-wasip2` in CI. Builds cs-cli with the wasi:sockets-
+    # 0.2 + wasi:http-0.2 modules wired in (cs-stdlib-net + cs-stdlib-
+    # http client/server scaffold + cs-stdlib-websocket); proves the
+    # full chain compiles every PR.
+    #
+    # Runtime conformance (wasmtime 28+ end-to-end exercise of crab-net
+    # / crab-http / crab-websocket fixtures) is deferred to a follow-up
+    # iter — that step needs `wasm-tools component new` plus a
+    # sidecar test server for HTTP/WS round-trips, which is its own
+    # CI orchestration project. See ADR 0033 + the docs/examples/
+    # wasip2-http-server-cond-expand.scm sample for the expected
+    # programming model.
+    name: wasm32-wasip2 build (wasm-stdlib-full)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + wasm32-wasip2 target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          targets: wasm32-wasip2
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-wasm-p2-full
+          cache-targets: "false"
+
+      - name: Enable sccache (fall back to plain cargo if its backend is down)
+        shell: bash
+        run: |
+          if sccache --start-server; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "sccache enabled"
+          else
+            echo "::warning title=sccache::cache backend unavailable — building without sccache this run"
+          fi
+
+      - name: Build wasm32-wasip2 with wasm-stdlib-full
+        # Same `--no-default-features` posture as the wasip1 job above
+        # (excludes JIT / FFI / actor / AOT — those don't link on wasm),
+        # plus the wasip2 networking subset.
+        run: cargo build --target wasm32-wasip2 --release -p cs-cli --no-default-features --features wasm-stdlib-full
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
