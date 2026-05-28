@@ -764,6 +764,8 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // (hashtable-update! is higher-order — see below)
         // R7RS portability
         ("crabscheme-version", b_crabscheme_version),
+        // #9 iter-6 — build-target identification for cond-expand.
+        ("crab-target", b_crab_target),
         // Layer-4 tracing-cycle-collector (tracing-revival
         // iter 4). Triggers a sweep of the cycle-candidate
         // registry. Under default features (no
@@ -3894,6 +3896,35 @@ fn b_crabscheme_version(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("crabscheme-version", "0", args.len()));
     }
     Ok(Value::string(env!("CARGO_PKG_VERSION")))
+}
+
+/// `(crab-target)` — returns a string identifying the build target so
+/// Scheme code can `cond-expand` across native vs the two wasi worlds.
+/// Values: `"native"` for any non-wasi target; `"wasi-p1"` for
+/// `wasm32-wasip1`; `"wasi-p2"` for `wasm32-wasip2`. Added by #9 iter-6
+/// to support the wasi:http server-shape divergence (native uses the
+/// accept loop, wasip2 uses `http-incoming-handler`; see ADR 0033).
+fn b_crab_target(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(arity_err("crab-target", "0", args.len()));
+    }
+    // wasip1 and wasip2 both report `target_os = "wasi"`; they're
+    // distinguished by `target_env` ("p1" / "p2"). Detect statically so
+    // the value is a build-time constant, not a runtime probe.
+    let target: &'static str = if cfg!(all(target_os = "wasi", target_env = "p2")) {
+        "wasi-p2"
+    } else if cfg!(all(target_os = "wasi", target_env = "p1")) {
+        "wasi-p1"
+    } else if cfg!(target_os = "wasi") {
+        // Future wasi-pN before our cfg list catches up — surface the
+        // raw `target_env` so cond-expand still gets a useful value.
+        // (The `target_env` cfg has no `cfg!` accessor for arbitrary
+        // values; fall back to a generic marker.)
+        "wasi"
+    } else {
+        "native"
+    };
+    Ok(Value::string(target))
 }
 
 fn b_newline(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {

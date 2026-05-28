@@ -98,3 +98,17 @@ connection refused, TLS handshake failure) raise as conditions.
 - Header decoding via `ureq::Response::headers_names` returns
   lowercased names per HTTP/2 norms; some servers' headers will
   appear in lowercase even if sent uppercase.
+
+## WASM targets (#9 wasip2-networking)
+
+On `wasm32-wasip2` with the cs-cli `wasm-stdlib-full` feature, the
+client is implemented in `src/client/client_wasi.rs` via the
+`wasi-http-client` crate (binding `wasi:http/0.2.0` outgoing-handler);
+the response-alist shape is identical to the native ureq backend. The
+**server** shape diverges: the native accept-loop procs
+(`http-server-bind` / `-accept` / `-respond` / etc.) raise on wasi.
+Servers use `(http-incoming-handler <lambda>)` + the
+`wasi:http/incoming-handler` component export instead — see
+`src/server/server_wasi.rs` and `docs/examples/wasip2-http-server-cond-
+expand.scm`. Iter-5b will wire the actual Scheme-lambda invocation from
+`handle()`. Requires Wasmtime 28+. See ADR 0033.
