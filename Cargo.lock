@@ -3807,6 +3807,7 @@ dependencies = [
  "sha1",
  "thiserror 1.0.69",
  "utf-8",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

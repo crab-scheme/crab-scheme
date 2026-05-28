@@ -10,4 +10,16 @@ description = "CrabScheme stdlib module (crab websocket) — sync WebSocket clie
 [dependencies]
 cs-core = { workspace = true }
 cs-ffi = { workspace = true }
+
+# Tungstenite's TLS cert source differs per target (#9 iter-4):
+#  - native: `rustls-tls-native-roots` reads the OS certificate store
+#    (system root store, macOS keychain, /etc/ssl/certs, …).
+#  - wasip2: the host has no portable native cert store, so use
+#    `rustls-tls-webpki-roots` — a bundled, compiled-in Mozilla CA list.
+# Same `tungstenite` crate + `handshake` feature on both; only the
+# rustls cert source switches. See ADR 0033 (TLS-trust tradeoff).
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
 tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
