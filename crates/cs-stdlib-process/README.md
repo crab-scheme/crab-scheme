@@ -58,3 +58,11 @@ synchronous convenience — fire, wait, collect.
 - `which` returns `#f` when the lookup fails for *any* reason
   (not found, IO error, ambiguity). The error detail is currently
   discarded; future iter may add `which/explain`.
+
+## WASM targets (#9 wasip2-networking)
+
+On wasi targets, `which` is target-cfg-gated out of the dep tree (no
+PATH on wasi, and `which`'s transitive `rustix` 0.38 needs nightly on
+`wasm32-wasip2`). The `(which …)` Scheme proc still registers but
+raises `HostFailure` at call time, matching the existing pattern for
+process ops wasi can't perform (`run`, `spawn`). See ADR 0033.
