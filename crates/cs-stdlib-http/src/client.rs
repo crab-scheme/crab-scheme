@@ -37,6 +37,23 @@ use cs_core::{Pair, Value};
 use cs_ffi::error::FfiError;
 use cs_ffi::host::{HostProcedure, UntypedProc};
 
+// #9 iter-3 — back-end split. The portable surface (procs +
+// arg-decoding + alist construction) lives in this module; the actual
+// request execution is delegated to a target-gated sub-module so the
+// native build keeps using `ureq` (no Tokio, doesn't build on wasm) and
+// the `wasm32-wasip2` build uses `wasi-http-client` (the only sync HTTP
+// client that binds `wasi:http/0.2.0`). Both expose the same
+// `run_request` signature and emit the same response-alist shape.
+#[cfg(not(target_os = "wasi"))]
+mod client_native;
+#[cfg(not(target_os = "wasi"))]
+use client_native::run_request;
+
+#[cfg(target_os = "wasi")]
+mod client_wasi;
+#[cfg(target_os = "wasi")]
+use client_wasi::run_request;
+
 pub(crate) fn procs() -> Vec<Arc<dyn HostProcedure>> {
     vec![
         UntypedProc::new("http-get", http_get),
@@ -131,62 +148,8 @@ fn opt_headers(args: &[Value], idx: usize) -> Result<Vec<(String, String)>, FfiE
     }
 }
 
-fn run_request(
-    method: &str,
-    url: &str,
-    body: Option<&[u8]>,
-    headers: &[(String, String)],
-) -> Result<Value, FfiError> {
-    let mut req = ureq::request(method, url);
-    for (k, v) in headers {
-        req = req.set(k, v);
-    }
-    let resp_result = match body {
-        Some(b) if !b.is_empty() => req.send_bytes(b),
-        _ => req.call(),
-    };
-    let resp = match resp_result {
-        Ok(r) => r,
-        // ureq distinguishes "got a response, status != 2xx" via
-        // `Error::Status`, where the response body is still
-        // available. Surface both shapes as the same response-alist.
-        Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => {
-            return Err(FfiError::HostFailure(format!(
-                "http {} {}: {}",
-                method, url, e
-            )))
-        }
-    };
-    Ok(response_to_value(resp))
-}
-
-fn response_to_value(resp: ureq::Response) -> Value {
-    let status = resp.status() as i64;
-    let header_names: Vec<String> = resp.headers_names();
-    let headers_alist: Vec<Value> = header_names
-        .iter()
-        .filter_map(|name| {
-            resp.header(name)
-                .map(|val| Value::Pair(Pair::new(string_value(name.clone()), string_value(val))))
-        })
-        .collect();
-
-    // Slurp body to bytes (cap at 32 MB so a malicious server can't
-    // OOM us silently). Future iter wires a streaming port wrapper.
-    use std::io::Read;
-    let mut buf = Vec::new();
-    let _ = resp
-        .into_reader()
-        .take(32 * 1024 * 1024)
-        .read_to_end(&mut buf);
-
-    Value::list(vec![
-        pair("status", Value::fixnum(status)),
-        pair("headers", Value::list(headers_alist)),
-        pair("body", bv_value(buf)),
-    ])
-}
+// `run_request` + the response→alist converter now live in the
+// cfg-selected back-end submodule (`client_native` / `client_wasi`).
 
 // ----- procedures -----
 
