@@ -21,9 +21,12 @@ cs-ffi = { workspace = true }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 tiny_http = "0.12"
 
-# wasi HTTP stack (#9 iter-3 client; iter-5 server). `wasi-http-client`
-# binds the `wasi:http/0.2.0` outgoing-handler world and exposes a sync
-# blocking client compatible with our existing alist response shape.
-# Requires Wasmtime 28+; see ADR 0033.
+# wasi HTTP stack (#9 iter-3 client + iter-5 server). Both require
+# Wasmtime 28+ at runtime; see ADR 0033.
+#  - `wasi-http-client` binds the `wasi:http/0.2.0` outgoing-handler
+#    world (client side).
+#  - `wasi` provides the `wasi:http/proxy::export!` macro + the
+#    `incoming_handler::Guest` trait for the server side (iter-5).
 [target.'cfg(target_os = "wasi")'.dependencies]
 wasi-http-client = "0.2.1"
+wasi = { version = "0.13", default-features = false }

@@ -1249,6 +1249,7 @@ dependencies = [
  "cs-ffi",
  "tiny_http",
  "ureq",
+ "wasi 0.13.3+wasi-0.2.2",
  "wasi-http-client",
 ]
 
