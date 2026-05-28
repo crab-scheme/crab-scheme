@@ -140,6 +140,20 @@ wasm-stdlib = [
     "stdlib-tty",
     "stdlib-meta",
 ]
+# `wasm-stdlib` plus the networking modules that wasm32-wasip2 can host
+# (#9 iter-2). Use on `wasm32-wasip2` only — wasip1 lacks the wasi:sockets
+# 0.2 + wasi:http 0.2 worlds these modules build against:
+#   cargo build --target wasm32-wasip2 -p cs-cli \
+#     --no-default-features --features wasm-stdlib-full
+# Iter-2 only pulls in `stdlib-net` (TCP client + DNS via std::net;
+# `tcp-listen`/`tcp-accept`/`udp-bind` raise on wasi — see
+# cs-stdlib-net/src/lib.rs cfg gates). Iters 3-4 extend this feature to
+# include `stdlib-http` and `stdlib-websocket` once their wasi back-ends
+# land. See docs/adr/0033-wasip2-networking.md.
+wasm-stdlib-full = [
+    "wasm-stdlib",
+    "stdlib-net",
+]
 # Backward-compat alias matching the W1 feature name.
 ffi = ["cs-runtime/ffi"]
 # RC2 iter G — wire the AOT subcommand. Default-on for native; the

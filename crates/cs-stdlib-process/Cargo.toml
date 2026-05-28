@@ -10,6 +10,12 @@ description = "CrabScheme stdlib module (crab process) — subprocess spawn + ru
 [dependencies]
 cs-core = { workspace = true }
 cs-ffi = { workspace = true }
+
 # `which` provides PATH-searching plus AbsoluteName resolution and is
-# the de-facto Rust ecosystem crate for that operation.
+# the de-facto Rust ecosystem crate for that operation. Restricted to
+# non-wasi targets: wasi has no PATH / process spawning, and `which`'s
+# transitive `rustix` dep pulls nightly features under `wasm32-wasip2`
+# (#9 iter-2). The `which_proc` Scheme builtin raises `HostFailure` on
+# wasi at call time.
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
 which = "6"
