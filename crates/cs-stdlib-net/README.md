@@ -67,3 +67,15 @@ concurrent network IO, drive these from BEAM actors.
     (udp-send-to s payload host port))    ; echo back
   (loop))
 ```
+
+## WASM targets (#9 wasip2-networking)
+
+On `wasm32-wasip2` with the cs-cli `wasm-stdlib-full` feature, the
+**client** procs (`tcp-connect` / `tcp-send` / `tcp-recv` / `tcp-close`,
+all UDP send-to / recv-from / close, `dns-resolve`) work via `std::net`
+on top of `wasi:sockets 0.2` (Rust 1.83+). The **passive-socket** procs
+(`tcp-listen` / `tcp-accept` / `udp-bind`) raise `FfiError::HostFailure`
+at call time — `wasi:sockets 0.2` doesn't standardize socket creation;
+use `wasi:http/incoming-handler` (cs-stdlib-http) for HTTP servers. On
+`wasm32-wasip1` the crate isn't compiled (excluded from `wasm-stdlib`).
+See ADR 0033.
