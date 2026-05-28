@@ -37,3 +37,15 @@ predicate + RAII Drop lands when `Value::Opaque` does.
   (display (car m)) (display ": ") (display (cdr m)) (newline))
 (ws-close ws)
 ```
+
+## WASM targets (#9 wasip2-networking)
+
+On `wasm32-wasip2` with the cs-cli `wasm-stdlib-full` feature, the
+client works as-is via tungstenite-on-`std::net`. The only build
+adjustment is the rustls cert source: native uses
+`rustls-tls-native-roots` (OS cert store), wasi uses
+`rustls-tls-webpki-roots` (bundled Mozilla CAs) because
+`rustls-native-certs` doesn't build on wasm32-wasip2. The crate is
+client-only; a WS server lands when `wasi:sockets 0.2` adds socket
+creation or `wasi:websocket` is standardized. Requires Wasmtime 28+.
+See ADR 0033.

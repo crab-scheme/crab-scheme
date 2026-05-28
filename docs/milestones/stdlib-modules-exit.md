@@ -170,6 +170,21 @@ debug, smaller in release).
   APIs, not drop-in. Tracked as a separate `wasip2-networking`
   spec; effective runtime support narrows to Wasmtime 16+.
 
+  > **Closed (2026-05-28).** Issue #9 / the `wasip2-networking`
+  > project landed across 8 iters (PRs #87..#94). On
+  > `wasm32-wasip2` with the new `wasm-stdlib-full` Cargo feature
+  > all three modules ship: `cs-stdlib-net` via `std::net` (passive
+  > sockets raise — `wasi:sockets 0.2` doesn't standardize socket
+  > creation), `cs-stdlib-http` client via `wasi-http-client` /
+  > server via `wasi:http/incoming-handler`, and
+  > `cs-stdlib-websocket` via tungstenite-on-`std::net` (bundled CAs
+  > on wasi). Coverage is now **29 of 29 modules portable** on
+  > `wasm32-wasip2` (with the wasi:sockets-creation + server-shape
+  > caveats called out above). Runtime support narrows to **Wasmtime
+  > 28+** for the networking subset; the wasip1 build stays
+  > broader-runtime. See **ADR 0033** + `docs/milestones/
+  > wasip2-networking-exit.md`.
+
 Iter-19 stub-via-Err work resolved the process exclusion:
 
 - `process` — `Command::spawn()` on WASI returns
