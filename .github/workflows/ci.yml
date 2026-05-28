@@ -152,3 +152,51 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
+
+  wasm-build-wasip2:
+    name: wasm32-wasip2 build
+    # #9 iter-1 — establish a wasip2 build baseline. The networking
+    # modules (cs-stdlib-net / http / websocket) stay out of this build
+    # (the `--no-default-features` set excludes them); later iters add
+    # them behind the `wasm-stdlib-full` feature. This job just confirms
+    # cs-cli compiles for `wasm32-wasip2` so subsequent iters have a
+    # green starting point on this target.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + wasm32-wasip2 target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          targets: wasm32-wasip2
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Separate key from `ci-wasm` so the wasip1 and wasip2 caches
+          # don't fight; sccache covers the compilation cache for both.
+          key: ci-wasm-p2
+          cache-targets: "false"
+
+      - name: Enable sccache (fall back to plain cargo if its backend is down)
+        shell: bash
+        run: |
+          if sccache --start-server; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "sccache enabled"
+          else
+            echo "::warning title=sccache::cache backend unavailable — building without sccache this run"
+          fi
+
+      - name: Build wasm32-wasip2
+        # Same shape as the wasip1 job: confirms the no-default-features
+        # build produces a valid component for the wasip2 target.
+        run: cargo build --target wasm32-wasip2 --release -p cs-cli --no-default-features
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
