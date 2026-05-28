@@ -198,34 +198,67 @@ fn tcp_connect(args: &[Value]) -> Result<Value, FfiError> {
 }
 
 fn tcp_listen(args: &[Value]) -> Result<Value, FfiError> {
-    let host = expect_string("tcp-listen", args, 0)?;
-    let port = expect_fixnum("tcp-listen", args, 1)?;
-    let addr = format!("{}:{}", host, port);
-    let l = TcpListener::bind(&addr).map_err(|e| io_fail("tcp-listen", e))?;
-    Ok(Value::fixnum(insert(Slot::TcpListener(l))?))
+    // #9 iter-2 — wasi:sockets 0.2 (wasm32-wasip2) doesn't standardize
+    // socket creation, so passive sockets can't be made portably. Raise
+    // a clear error instead of letting a std::net call's wasi behavior
+    // leak through. For HTTP servers, use the wasi:http/incoming-handler
+    // shape that iter-5 exposes.
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = args;
+        return Err(FfiError::HostFailure(
+            "tcp-listen: not supported on wasm32-wasi — wasi:sockets 0.2 does \
+             not standardize socket creation; use a host-driven accept loop \
+             (e.g. wasi:http/incoming-handler for HTTP)"
+                .into(),
+        ));
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let host = expect_string("tcp-listen", args, 0)?;
+        let port = expect_fixnum("tcp-listen", args, 1)?;
+        let addr = format!("{}:{}", host, port);
+        let l = TcpListener::bind(&addr).map_err(|e| io_fail("tcp-listen", e))?;
+        Ok(Value::fixnum(insert(Slot::TcpListener(l))?))
+    }
 }
 
 fn tcp_accept(args: &[Value]) -> Result<Value, FfiError> {
-    let id = expect_fixnum("tcp-accept", args, 0)?;
-    let r = lock()?;
-    let listener = match r.slots.get(&id) {
-        Some(Slot::TcpListener(l)) => l.try_clone().map_err(|e| io_fail("tcp-accept", e))?,
-        Some(_) => {
-            return Err(FfiError::HostFailure(format!(
-                "tcp-accept: handle {} is not a TCP listener",
-                id
-            )))
-        }
-        None => {
-            return Err(FfiError::HostFailure(format!(
-                "tcp-accept: bad handle {}",
-                id
-            )))
-        }
-    };
-    drop(r);
-    let (stream, _peer) = listener.accept().map_err(|e| io_fail("tcp-accept", e))?;
-    Ok(Value::fixnum(insert(Slot::Tcp(stream))?))
+    // #9 iter-2 — paired with `tcp-listen`'s wasi gate above. No
+    // listener can be produced on wasi, so reject explicitly rather than
+    // bottoming out as a "bad handle" message.
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = args;
+        return Err(FfiError::HostFailure(
+            "tcp-accept: not supported on wasm32-wasi (paired with \
+             tcp-listen; see that error for the wasi:sockets 0.2 gap)"
+                .into(),
+        ));
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let id = expect_fixnum("tcp-accept", args, 0)?;
+        let r = lock()?;
+        let listener = match r.slots.get(&id) {
+            Some(Slot::TcpListener(l)) => l.try_clone().map_err(|e| io_fail("tcp-accept", e))?,
+            Some(_) => {
+                return Err(FfiError::HostFailure(format!(
+                    "tcp-accept: handle {} is not a TCP listener",
+                    id
+                )))
+            }
+            None => {
+                return Err(FfiError::HostFailure(format!(
+                    "tcp-accept: bad handle {}",
+                    id
+                )))
+            }
+        };
+        drop(r);
+        let (stream, _peer) = listener.accept().map_err(|e| io_fail("tcp-accept", e))?;
+        Ok(Value::fixnum(insert(Slot::Tcp(stream))?))
+    }
 }
 
 fn tcp_send(args: &[Value]) -> Result<Value, FfiError> {
@@ -334,11 +367,26 @@ fn close_kind(
 // ----- UDP -----
 
 fn udp_bind(args: &[Value]) -> Result<Value, FfiError> {
-    let host = expect_string("udp-bind", args, 0)?;
-    let port = expect_fixnum("udp-bind", args, 1)?;
-    let addr = format!("{}:{}", host, port);
-    let s = UdpSocket::bind(&addr).map_err(|e| io_fail("udp-bind", e))?;
-    Ok(Value::fixnum(insert(Slot::Udp(s))?))
+    // #9 iter-2 — same wasi:sockets 0.2 gap as tcp-listen: wasi sockets
+    // 0.2 doesn't standardize socket creation, so UdpSocket::bind on
+    // wasm32-wasi is unreliable. Raise explicitly.
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = args;
+        return Err(FfiError::HostFailure(
+            "udp-bind: not supported on wasm32-wasi — wasi:sockets 0.2 does \
+             not standardize socket creation"
+                .into(),
+        ));
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let host = expect_string("udp-bind", args, 0)?;
+        let port = expect_fixnum("udp-bind", args, 1)?;
+        let addr = format!("{}:{}", host, port);
+        let s = UdpSocket::bind(&addr).map_err(|e| io_fail("udp-bind", e))?;
+        Ok(Value::fixnum(insert(Slot::Udp(s))?))
+    }
 }
 
 fn udp_send_to(args: &[Value]) -> Result<Value, FfiError> {

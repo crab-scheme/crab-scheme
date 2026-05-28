@@ -191,9 +191,24 @@ fn which_proc(args: &[Value]) -> Result<Value, FfiError> {
             got: args.len(),
         });
     }
-    let cmd = expect_string("which", args, 0)?;
-    match which::which(&cmd) {
-        Ok(path) => Ok(string_value(path.to_string_lossy().into_owned())),
-        Err(_) => Ok(Value::Boolean(false)),
+    // #9 iter-2 — `which` is non-wasi only (no PATH on wasi, and the
+    // crate's transitive `rustix` doesn't build on `wasm32-wasip2`
+    // without nightly). Mirror this module's existing pattern of
+    // raising `HostFailure` at call time on wasi rather than offering
+    // a stub.
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = expect_string("which", args, 0)?;
+        Err(FfiError::HostFailure(
+            "which: not supported on wasm32-wasi (no PATH)".into(),
+        ))
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let cmd = expect_string("which", args, 0)?;
+        match which::which(&cmd) {
+            Ok(path) => Ok(string_value(path.to_string_lossy().into_owned())),
+            Err(_) => Ok(Value::Boolean(false)),
+        }
     }
 }

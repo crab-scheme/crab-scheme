@@ -10,11 +10,20 @@ description = "CrabScheme stdlib module (crab http client + server) — synchron
 [dependencies]
 cs-core = { workspace = true }
 cs-ffi = { workspace = true }
-# ureq is the sync HTTP client of choice for CrabScheme — no
-# Tokio dep, smaller than reqwest, blocks the calling thread
-# which matches our concurrency posture (drive concurrent IO
-# from BEAM actors).
+
+# Native HTTP stack (#9 iter-3):
+# - `ureq` — sync HTTP client. No Tokio dep, smaller than reqwest,
+#   blocks the caller (matches our "drive concurrency from BEAM actors"
+#   posture). Doesn't build on any wasm32 target.
+# - `tiny_http` — matching sync server. Accept loop blocks; needs
+#   `std::thread::spawn`, also not portable to wasm32.
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
 ureq = { version = "2", default-features = false, features = ["tls"] }
-# tiny_http is the matching sync server — no Tokio dep, accept
-# loop blocks. Drive concurrent connections from BEAM actors.
 tiny_http = "0.12"
+
+# wasi HTTP stack (#9 iter-3 client; iter-5 server). `wasi-http-client`
+# binds the `wasi:http/0.2.0` outgoing-handler world and exposes a sync
+# blocking client compatible with our existing alist response shape.
+# Requires Wasmtime 28+; see ADR 0033.
+[target.'cfg(target_os = "wasi")'.dependencies]
+wasi-http-client = "0.2.1"
