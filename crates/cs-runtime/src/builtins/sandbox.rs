@@ -13,14 +13,20 @@
 //!   string from the guest's stdout. Errors raise an
 //!   `&error` condition with the SandboxError's display text.
 //! - `(reset-sandbox! s)` — rebuilds the guest instance.
+//! - `(drop-sandbox! s)` — releases the instance's wasmtime
+//!   resources (Engine, Module cache, Linker, memory). After a
+//!   drop, the sandbox value is still a valid `#('__sandbox__
+//!   id)` shape (`sandbox?` returns `#t`) but `sandbox-eval` /
+//!   `reset-sandbox!` raise `"sandbox has been dropped"`.
 //!
 //! Sandbox instances are stored in a thread-local registry
 //! keyed by `u32` id. The Scheme value is `#('__sandbox__ id)`.
-//! Sandboxes are leaked on the host (one per call to
-//! `make-wasm-sandbox`); production embedders that need
-//! GC-tied cleanup should add an explicit `drop-sandbox!` in a
-//! future iter. Memory cost: ~MB per sandbox (wasmtime Engine
-//! + Module cache); intended for low-cardinality use.
+//! Without `drop-sandbox!` callers, sandboxes accumulate for the
+//! thread's lifetime — fine for low-cardinality use (1–3 per
+//! process) but a leak in long-lived servers that spawn many
+//! sandboxes per request. Use `drop-sandbox!` explicitly in that
+//! shape. Memory cost: ~MB per live sandbox (wasmtime Engine +
+//! Module cache).
 
 use std::cell::RefCell;
 
@@ -33,8 +39,15 @@ pub(crate) const SANDBOX_TAG: &str = "__sandbox__";
 
 thread_local! {
     /// Per-thread sandbox registry. Indexed by `u32` id stored
-    /// in the Scheme `#('__sandbox__ id)` record. Leaked across
-    /// the program's lifetime; future iter adds explicit drop.
+    /// in the Scheme `#('__sandbox__ id)` record. The `Option`
+    /// shape distinguishes a live slot (`Some(inst)`) from a
+    /// dropped one (`None`) — ids stay stable across drops so
+    /// `decode_sandbox_id` continues to work for diagnostics
+    /// even after `drop-sandbox!`. The `Vec` is monotonic
+    /// (ids never repurposed) which keeps the id space
+    /// dead-tomb-stoning rather than reuse-after-free; for
+    /// processes that spawn many sandboxes the right pattern is
+    /// to call `drop-sandbox!` on each as soon as you're done.
     static SANDBOXES: RefCell<Vec<Option<SandboxInstance>>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -175,6 +188,38 @@ fn b_reset_sandbox(args: &[Value], _syms: &mut cs_core::SymbolTable) -> Result<V
     Ok(Value::Unspecified)
 }
 
+/// `(drop-sandbox! s)` — release the instance's wasmtime
+/// resources. The slot is tomb-stoned (set to `None`) rather
+/// than removed so id stability holds; subsequent `sandbox-eval`
+/// / `reset-sandbox!` on the same value raise `"sandbox has been
+/// dropped"`. Idempotent: dropping an already-dropped sandbox is
+/// a no-op (Unspecified). A non-sandbox argument is the same
+/// type error every other primop returns.
+fn b_drop_sandbox(args: &[Value], _syms: &mut cs_core::SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("drop-sandbox!", "1", args.len()));
+    }
+    let id = decode_sandbox_id(&args[0])
+        .ok_or_else(|| "drop-sandbox!: argument is not a sandbox".to_string())?;
+    SANDBOXES.with(|slot| {
+        let mut v = slot.borrow_mut();
+        let idx = id as usize;
+        if let Some(opt) = v.get_mut(idx) {
+            // Drop the inner SandboxInstance (releases wasmtime
+            // Engine + Module cache + Linker + Store). Tomb-stone
+            // the slot to None so id stability holds for
+            // diagnostics. Idempotent on an already-None slot.
+            *opt = None;
+        }
+        // Out-of-range id is a no-op rather than an error: the
+        // value's id space is monotonic; an id that's "past the
+        // end" can only happen via a forged record, in which
+        // case dropping is the right thing anyway.
+        Ok::<(), String>(())
+    })?;
+    Ok(Value::Unspecified)
+}
+
 type SandboxSymsFn = fn(&[Value], &mut cs_core::SymbolTable) -> Result<Value, String>;
 
 /// Entries to fold into `syms_builtins()`. Gated by the `sandbox`
@@ -189,5 +234,6 @@ pub fn builtins() -> Vec<(&'static str, SandboxSymsFn)> {
         ("sandbox?", b_sandbox_p as SandboxSymsFn),
         ("sandbox-eval", b_sandbox_eval as SandboxSymsFn),
         ("reset-sandbox!", b_reset_sandbox as SandboxSymsFn),
+        ("drop-sandbox!", b_drop_sandbox as SandboxSymsFn),
     ]
 }
