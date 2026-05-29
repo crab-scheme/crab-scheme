@@ -92,7 +92,33 @@ pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, St
             Ok(SendableValue::Vector(items?))
         }
         Value::ByteVector(bv) => Ok(SendableValue::ByteVector(bv.borrow().clone())),
-        Value::Procedure(_) => Err("to_sendable: procedures cannot cross actor boundaries".into()),
+        // Procedures own an Rc<Env> (the closure capture environment),
+        // and Rc is !Send. Two consumers funnel through this arm and
+        // hit the same wall for different reasons:
+        //
+        // - **Cross-actor `(send pid …)`**: as named. The receiver's
+        //   heap is a different Rc graph; even with a hypothetical
+        //   Send-wrapped Rc the closure env points at the *sender's*
+        //   bindings, which the receiver cannot resolve. Rehydration
+        //   needs the receiver to re-evaluate the lambda against its
+        //   own definition environment — outside the scope of this
+        //   value-projection helper.
+        //
+        // - **`load-module!`**: less obviously a "cross-actor" use,
+        //   but it goes through the same `SendableValue` projection
+        //   (cs-hotreload's `Export = Arc<dyn Any + Send + Sync>` is
+        //   the registry's storage shape). The BEAM-style "module
+        //   exports are code" model needs procedures here; today the
+        //   gap blocks #29 (JIT-invalidation on hot reload) because
+        //   no procedure can reach the version registry in the first
+        //   place. See ADR 0034 for the deferral analysis + the two
+        //   paths past this wall (Send heaps vs. per-actor
+        //   rehydration).
+        Value::Procedure(_) => Err(
+            "to_sendable: procedures cannot cross actor boundaries (also blocks procedures \
+             as `load-module!` exports — see ADR 0034 for the architectural prerequisite)"
+                .into(),
+        ),
         Value::Hashtable(_) => {
             Err("to_sendable: hashtables are per-actor; use cs-table for shared state".into())
         }
