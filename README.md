@@ -11,57 +11,122 @@ $ crabscheme -e '(letrec ((fib (lambda (n) (if (< n 2) n (+ (fib (- n 1)) (fib (
 
 ## Status
 
-**1.0 Release Candidate 3** in progress on the `rc3` branch
-(AOT hardening per
-[`docs/milestones/aot-hardening-plan.md`](docs/milestones/aot-hardening-plan.md)).
-**1.0-rc2** tagged with native + WASM release binaries at
-[github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc2](https://github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc2);
-**1.0-rc1** at
-[github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc1](https://github.com/crab-scheme/crab-scheme/releases/tag/1.0-rc1).
-All ROADMAP milestones M0–M10 are complete and tagged. See
-[`docs/measurements/2026-05-16-1.0-rc-readiness.md`](docs/measurements/2026-05-16-1.0-rc-readiness.md)
-for the full RC sign-off framing,
-[`docs/measurements/2026-05-16-rc2-status.md`](docs/measurements/2026-05-16-rc2-status.md)
-for the RC2 iter inventory, and
-[`docs/user/aot.md`](docs/user/aot.md) for the AOT user guide.
+**1.0 Release Candidate 7** on `main`. ROADMAP milestones M0–M10 all
+tagged; R6RS++ Phases 1–4 closed (typed boundaries, optimizer plugins,
+L1+L2 sandboxing, custom `#!lang` readers, syntax-case + SyntaxObject);
+BEAM v1 closed (actors + hot reload + distributed transport); SDK
+foundations M01 (effects) and M02 (cluster substrate) shipped; LSP +
+MCP servers shipped for editor + AI-agent integration. Tagged
+releases at
+[releases](https://github.com/crab-scheme/crab-scheme/releases).
 
-| Surface          | State                                                       |
-|------------------|-------------------------------------------------------------|
-| R6RS conformance | **100%** on the 117-fixture corpus (2,464 assertions)       |
-| WASM conformance | **100%** — 0pp gap to native via `bench/wasm-conformance.sh`|
-| Workspace tests  | 0 failures across 24 test executables                       |
-| JIT perf gates   | All three ADR-0013 gates **MET** — ~10× walker geomean      |
-| AOT pipeline     | `crabscheme aot prog.scm --build` → standalone native binary |
-| cs-aot test count | 43 tests (50+ supported `cs_rir::Inst` variants)           |
+| Surface | State |
+|---|---|
+| R6RS conformance | **100%** on the 117-fixture corpus (2,464 assertions) |
+| WASM conformance | **100%** — 0pp gap to native; both `wasm32-wasip1` and `wasm32-wasip2` build under CI |
+| Workspace tests  | 0 failures across 40+ test executables |
+| JIT perf gates   | All three ADR-0013 gates **MET** — 1.4–2.4× faster than Chez/Guile/Gambit on the microbench geomean |
+| AOT pipeline     | `crabscheme aot prog.scm --build` → standalone native binary (level-3 toolchain-free via cranelift-object, level-1 cargo project) |
+| Open issues      | 3 (all explicitly post-1.0 per [ADR 0034](docs/adr/0034-post-1.0-open-issue-landscape.md)) |
 
 ## What works
 
-- **Lexer + reader + R6RS-flavored expander.** `syntax-rules` with
-  hygienic binder renaming; `let`, `let*`, `letrec`, `do`, `case`,
-  `cond`, `guard`, `quasiquote`, `define-record-type`.
+### Language
+
+- **Lexer + reader + R6RS-flavored expander.** `syntax-rules`,
+  `syntax-case` with full R6RS hygiene primitives (`bound-identifier=?`,
+  `free-identifier=?`, mark-aware identifier comparison),
+  `define-syntax-parser` (Racket-style combinators with `~or`,
+  `~optional`, `~once`, ellipsis-head cardinality), `let`, `let*`,
+  `letrec`, `do`, `case`, `cond`, `guard`, `quasiquote`,
+  `define-record-type`, submodules, continuation marks (tail-safe).
 - **Full numeric tower:** fixnum, bignum, rational, flonum, with
   auto-promote on overflow; NaN-boxed compact representation in the
   VM/JIT tiers.
 - **Strings, characters, vectors, bytevectors, hashtables** (eq/eqv/
   equal); ports (string-in, string-out, file-in/out, binary,
   transcoded); promises, parameters, conditions.
-- **Four execution tiers:**
-  - Tree-walking interpreter with proper tail-call elimination.
-  - Bytecode VM with stack machine + TCE + const-folded globals.
-  - Cranelift JIT with type-feedback specialization, NB-typed slow
-    paths, and inline caches. Beats Chez/Guile/Gambit-interp geomean.
-  - AOT compiler: `cs_rir::Function` → Rust source → cargo project →
-    standalone native binary. RawI64 ABI matches hand-written Rust;
-    Nb ABI within 2× of `rustc -O` on fib post-RC2 fast-path inlining.
-- **WASM target.** `cargo build --target wasm32-wasip1 -p cs-cli
-  --no-default-features` produces a 2.2 MB `crabscheme.wasm` that runs
-  under wasmtime. Conformance matches native to the byte.
-- **First-class call/cc** on the VM tier (M8).
-- **Rust FFI** with two flavors: trait-based (WASM-portable) and
-  dynamic-library (`libloading`, native-only). See `crates/cs-ffi*`.
-- **R6RS standard library foundation** (M9): `(rnrs)`, `(rnrs base)`,
+- **Typed boundaries** — `define/typed` static type-check + automatic
+  contract generation at library exports + intra-library elision
+  (ADRs 0021–0025). See [`docs/user/types.md`](docs/user/types.md).
+- **Custom `#!lang` readers** — define a language as a Scheme procedure
+  that consumes a port and returns a datum (parse-time reader
+  protocol, all 4 R6RS++ Phase 4 deliverables closed).
+
+### Execution
+
+- **Four execution tiers** sharing the `cs_rir` IR — tree-walker → VM
+  bytecode → Cranelift JIT (uniform-NB ABI, type-feedback
+  specialization, inline caches) → AOT (cranelift-object level-3
+  toolchain-free, or level-1 cargo-project).
+- **Optimizer plugins** — register Scheme-callable passes via
+  `install-optimizer-pass!`; passes operate on shared `cs_rir`
+  benefiting both JIT and AOT (ADR 0014). See
+  [`docs/user/optimizer-plugins.md`](docs/user/optimizer-plugins.md).
+- **Both ahead-of-time levels** — `crabscheme aot prog.scm --build`
+  produces a native binary with no Rust toolchain required (level 3,
+  cranelift-object → system `cc`) or via cargo (level 1). See
+  [`docs/user/aot.md`](docs/user/aot.md).
+
+### Concurrency, distribution, hot reload
+
+- **BEAM-style actors** — `(spawn thunk)` / `(send pid msg)` /
+  `(receive ...)`, supervision trees + worker pools in pure Scheme
+  (`lib/beam/prelude.scm`).
+- **Hot reload** — two-version code dispatch (`current` / `old` +
+  `code-soft-purge!` / `code-purge!`), state-migration callbacks; the
+  `beam_counter_migration` E2E exercises v1 → v2 with added fields.
+- **Distributed transport** — `cs-net` (Sim, TCP, QUIC with mTLS) +
+  `cs-distrib` (DistPid, Router, RemoteRef, DOWN propagation).
+- **Consensus library** — full Raft (election / replication / commit /
+  ReadIndex / snapshots / joint-membership) + EPaxos in pure Scheme
+  on top of the transport substrate (`lib/consensus/`).
+- **Reduction-tick preemption** — actors yield cooperatively even
+  inside JIT-compiled hot loops (ADR 0031).
+- See [`docs/user/actors.md`](docs/user/actors.md).
+
+### Sandboxing
+
+- **L1 — immutable environments** — `(environment '(rnrs base) ...)`
+  returns a frozen binding snapshot; pair with `eval` to restrict the
+  import set of untrusted code.
+- **L2 — WASM-instance sandboxes** — `(make-wasm-sandbox)` spawns a
+  real wasmtime instance hosting `crabscheme.wasm`; fuel + epoch +
+  wall-clock limits; three threat-model presets (`hygiene` / `plugin` /
+  `adversarial`). L1+L2 compose for defense-in-depth.
+- See [`docs/user/sandboxing.md`](docs/user/sandboxing.md).
+
+### Editor + AI-agent integration
+
+- **LSP server** (cs-lsp) — diagnostics, symbols, hover, definition,
+  references, completion, signature help, format, workspace-symbol,
+  rename, semanticTokens. VS Code scaffold in `crabscheme-vscode/`.
+- **MCP server** (crabscheme-mcp) — 7 tools (cs_diagnostics,
+  cs_symbols, cs_definition, cs_references, cs_hover, cs_format,
+  cs_workspace_symbols), validated against MCP 2025-06-18.
+- Shared harness so CLI + LSP + MCP cannot drift in their reasoning.
+- See [`docs/user/lsp.md`](docs/user/lsp.md) and
+  [`docs/user/mcp.md`](docs/user/mcp.md).
+
+### Standard library + portability
+
+- **R6RS standard library** (M9): `(rnrs)`, `(rnrs base)`,
   `(rnrs lists)`, `(rnrs sorting)`, `(rnrs hashtables)`, `(rnrs io
   ports)`, `(rnrs records)`, `(rnrs enums)`, plus prioritized SRFIs.
+- **26-module `(crab …)` stdlib** — path, fs, os, process, string,
+  format, regex, time, random, uuid, json, csv, toml, url, hash,
+  compress, deflate, archive, log, metrics, net, http, websocket,
+  collection, math, tty, signal, meta, base. WASM-safe subset of 21
+  modules built under `wasm-stdlib` for wasip1; `wasm-stdlib-full`
+  adds net/http/websocket on wasip2.
+- **`wasm32-wasip1`** — 2.2 MB `crabscheme.wasm` runs under wasmtime;
+  conformance matches native to the byte.
+- **`wasm32-wasip2`** — `wasi:sockets-0.2` + `wasi:http-0.2`
+  incoming-handler scaffold; component-model-aware (ADR 0033).
+- **Rust FFI** — trait-based (WASM-portable) + dynamic-library
+  (`libloading`, native-only). See `crates/cs-ffi*` +
+  [`docs/ffi-limitations.md`](docs/ffi-limitations.md).
+- **First-class `call/cc`** on the walker + VM tiers.
 
 ## Quickstart
 
@@ -221,16 +286,43 @@ list.
 
 ## Documentation
 
+### User guides
+
+- **[`docs/user/types.md`](docs/user/types.md)** — typed boundaries:
+  `define/typed`, library auto-contracting, intra-library elision.
+- **[`docs/user/aot.md`](docs/user/aot.md)** — AOT user guide
+  (level 1 cargo, level 3 toolchain-free).
+- **[`docs/user/lsp.md`](docs/user/lsp.md)** — LSP + headless CLI for
+  editors and agents.
+- **[`docs/user/mcp.md`](docs/user/mcp.md)** — MCP server for
+  AI-agent integration (Claude / ChatGPT / any MCP client).
+- **[`docs/user/actors.md`](docs/user/actors.md)** — BEAM-style
+  actors, supervision, hot reload, distributed transport.
+- **[`docs/user/optimizer-plugins.md`](docs/user/optimizer-plugins.md)**
+  — register Scheme-callable passes operating on shared `cs_rir`.
+- **[`docs/user/sandboxing.md`](docs/user/sandboxing.md)** — L1
+  environment sandboxing + L2 WASM-instance sandboxing.
+
+### Project history & internals
+
 - **[ROADMAP.md](ROADMAP.md)** — milestone plan + RC posture.
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** — dev workflow, dev env, test discipline, file map.
-- **[docs/user/aot.md](docs/user/aot.md)** — AOT user guide.
-- **[docs/milestones/](docs/milestones/)** — per-milestone exit reports.
-  Notable: `m6-phase6-exit.md` (Phase 6 JIT close), `m10-trackW-exit.md`
-  (WASM ship), `m10-trackA-exit.md` (AOT ship).
-- **[docs/adr/](docs/adr/)** — architecture decisions. Notable: ADR
-  0013 (perf-gate reframe), ADR 0009 (HolyJIT parked).
+- **[CONSTITUTION.md](CONSTITUTION.md)** — design philosophy
+  ("Rust is the machine; Scheme is the logic").
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — dev workflow, dev env,
+  test discipline, file map.
+- **[docs/milestones/](docs/milestones/)** — per-milestone exit
+  reports. Notable: `m6-phase6-exit.md` (Phase 6 JIT close),
+  `m10-trackW-exit.md` (WASM ship), `m10-trackA-exit.md` (AOT ship),
+  `beam-v1-exit.md` (BEAM v1 ship), `stdlib-modules-exit.md` (26
+  modules), `wasip2-networking-exit.md` (wasi:sockets + wasi:http).
+- **[docs/adr/](docs/adr/)** — architecture decisions (0001–0034).
+  Notable: ADR 0013 (perf-gate reframe), ADR 0014 (optimizer plugins),
+  ADR 0015 (sandboxing L1+L2), ADR 0033 (wasip2 networking), ADR 0034
+  (post-1.0 deferral landscape).
 - **[docs/measurements/](docs/measurements/)** — perf + conformance
   measurement snapshots.
+- **[docs/ffi-limitations.md](docs/ffi-limitations.md)** — FFI surface
+  status and known gaps.
 
 ## License
 
