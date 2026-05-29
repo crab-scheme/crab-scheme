@@ -356,6 +356,40 @@ mod bundled_sources {
     }
 }
 
+/// Build the standard primop table the AOT bytecode→RIR pipeline
+/// expects.
+///
+/// Mirrors the names cs-runtime registers for the same `PrimOp`
+/// kinds: `+`, `-`, `*`, `<`, `<=`, `>`, `>=`, `=`. Without these
+/// the compiler lowers e.g. `(+ a b)` to a generic `Call`, which
+/// cs-aot's bytecode→RIR translator then refuses with an
+/// `UnsupportedInst`. Shared across every AOT entry point
+/// (`run_aot`, `run_aot_doctor`, `run_aot_explain`, `run_aot_multi`)
+/// so adding a primop is one edit, not four. `run_aot_doctor`
+/// previously declared a 5-op subset of this list; the extra
+/// entries are harmless (the bytecode→RIR translator emits a
+/// primop inst only when the source actually references it).
+#[cfg(feature = "aot")]
+fn aot_primop_table(
+    syms: &mut cs_core::SymbolTable,
+) -> std::collections::HashMap<cs_core::Symbol, cs_vm::compiler::PrimOp> {
+    use cs_vm::compiler::PrimOp;
+    let mut m = std::collections::HashMap::new();
+    for (op, kind) in &[
+        ("+", PrimOp::Add),
+        ("-", PrimOp::Sub),
+        ("*", PrimOp::Mul),
+        ("<", PrimOp::Lt),
+        ("<=", PrimOp::Le),
+        (">", PrimOp::Gt),
+        (">=", PrimOp::Ge),
+        ("=", PrimOp::Eq),
+    ] {
+        m.insert(syms.intern(op), *kind);
+    }
+    m
+}
+
 /// Prints each step's result; exits 0 if all pass.
 #[cfg(feature = "aot")]
 fn run_aot_doctor() -> ExitCode {
@@ -367,7 +401,6 @@ fn run_aot_doctor() -> ExitCode {
     use cs_core::SymbolTable;
     use cs_expand::Expander;
     use cs_parse::read_all;
-    use cs_vm::compiler::PrimOp;
     use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir_aot};
 
     println!("crabscheme aot-doctor: self-test");
@@ -423,19 +456,7 @@ fn run_aot_doctor() -> ExitCode {
     drop(expander);
 
     let globals = HashMap::new();
-    let primops = {
-        let mut m = HashMap::new();
-        for (op, kind) in &[
-            ("+", PrimOp::Add),
-            ("-", PrimOp::Sub),
-            ("*", PrimOp::Mul),
-            ("=", PrimOp::Eq),
-            ("<", PrimOp::Lt),
-        ] {
-            m.insert(syms.intern(op), *kind);
-        }
-        m
-    };
+    let primops = aot_primop_table(&mut syms);
     let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
         Ok(b) => {
             report(
@@ -683,7 +704,6 @@ fn run_aot(
     use cs_core::SymbolTable;
     use cs_expand::Expander;
     use cs_parse::read_all;
-    use cs_vm::compiler::PrimOp;
     use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir_aot};
 
     // --- Read source ----
@@ -726,21 +746,7 @@ fn run_aot(
     drop(expander);
 
     let globals = HashMap::new();
-    // Primop table mirrors cs-runtime's; without it `(+ a b)` compiles
-    // to a generic Call and the bytecode→RIR translator emits Insts
-    // cs-aot doesn't yet handle.
-    let primops = {
-        let mut m = HashMap::new();
-        m.insert(syms.intern("+"), PrimOp::Add);
-        m.insert(syms.intern("-"), PrimOp::Sub);
-        m.insert(syms.intern("*"), PrimOp::Mul);
-        m.insert(syms.intern("<"), PrimOp::Lt);
-        m.insert(syms.intern("<="), PrimOp::Le);
-        m.insert(syms.intern(">"), PrimOp::Gt);
-        m.insert(syms.intern(">="), PrimOp::Ge);
-        m.insert(syms.intern("="), PrimOp::Eq);
-        m
-    };
+    let primops = aot_primop_table(&mut syms);
     let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
         Ok(b) => b,
         Err(e) => {
@@ -1250,7 +1256,6 @@ fn run_aot_explain(file: &str) -> ExitCode {
     use cs_core::SymbolTable;
     use cs_expand::Expander;
     use cs_parse::read_all;
-    use cs_vm::compiler::PrimOp;
     use cs_vm::{compile_with_globals_and_primops, jit_translate::bytecode_to_rir_aot};
 
     let src = match fs::read_to_string(file) {
@@ -1285,22 +1290,7 @@ fn run_aot_explain(file: &str) -> ExitCode {
     };
     drop(expander);
     let globals = HashMap::new();
-    let primops = {
-        let mut m = HashMap::new();
-        for (op, kind) in &[
-            ("+", PrimOp::Add),
-            ("-", PrimOp::Sub),
-            ("*", PrimOp::Mul),
-            ("<", PrimOp::Lt),
-            ("<=", PrimOp::Le),
-            (">", PrimOp::Gt),
-            (">=", PrimOp::Ge),
-            ("=", PrimOp::Eq),
-        ] {
-            m.insert(syms.intern(op), *kind);
-        }
-        m
-    };
+    let primops = aot_primop_table(&mut syms);
     let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
         Ok(b) => b,
         Err(e) => {
@@ -1622,7 +1612,6 @@ fn run_aot_multi(
     use cs_expand::Expander;
     use cs_parse::read_all;
     use cs_vm::compile_with_globals_and_primops;
-    use cs_vm::compiler::PrimOp;
 
     let src = match fs::read_to_string(file) {
         Ok(s) => s,
@@ -1712,22 +1701,7 @@ fn run_aot_multi(
         let sym = syms.intern(&name);
         globals.insert(sym, val);
     }
-    let primops = {
-        let mut m = HashMap::new();
-        for (op, kind) in &[
-            ("+", PrimOp::Add),
-            ("-", PrimOp::Sub),
-            ("*", PrimOp::Mul),
-            ("<", PrimOp::Lt),
-            ("<=", PrimOp::Le),
-            (">", PrimOp::Gt),
-            (">=", PrimOp::Ge),
-            ("=", PrimOp::Eq),
-        ] {
-            m.insert(syms.intern(op), *kind);
-        }
-        m
-    };
+    let primops = aot_primop_table(&mut syms);
     let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
         Ok(b) => b,
         Err(e) => {
