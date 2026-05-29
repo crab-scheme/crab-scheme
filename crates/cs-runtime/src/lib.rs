@@ -232,14 +232,29 @@ impl Runtime {
                 .expect("pass registry poisoned"),
         );
 
-        // #28 — turn on `scalar-replace-cons` by default for every
-        // JIT compile (all threads). The pass eliminates non-escaping
-        // cons allocations and is unconditionally sound (it only
-        // removes pairs proven unobservable), so unlike the opt-in
-        // region/escape passes it's safe to seed as always-on. Users
-        // can still layer additional passes via the
-        // `active-optimizer-passes` parameter / `install-optimizer-pass!`.
-        cs_opt::set_default_on_passes(&["scalar-replace-cons"]);
+        // Default-on optimizer passes — always run during JIT compile,
+        // regardless of the thread-local `active-optimizer-passes` list.
+        //
+        // - **`scalar-replace-cons`** (#28). Eliminates non-escaping
+        //   cons allocations. Unconditionally sound — only removes
+        //   pairs proven unobservable.
+        //
+        // - **`escape-to-region`** (#51). Promotes non-escaping conses
+        //   to region allocation. The escape analysis is conservative:
+        //   a cons is promoted only when every use is `car`/`cdr`/
+        //   `pair?`/`null?` and it never reaches a `Return` / block-arg
+        //   / call / env-store, so the rewrite is never unsafe — inside
+        //   `(with-region …)` the pair bump-allocates; outside,
+        //   `vm_alloc_pair_region_gc` falls back to the Rc heap so the
+        //   rewrite is a no-op. Default-on per the post-1.0 perf plan
+        //   (the agent A/B analysis). #51b/#51c (let-bound promotion +
+        //   closure escape) remain deferred — see ADR 0034.
+        //
+        // Both passes are semantics-preserving and ship with unit +
+        // e2e coverage. Users can still layer additional passes via
+        // the `active-optimizer-passes` parameter or
+        // `install-optimizer-pass!`.
+        cs_opt::set_default_on_passes(&["scalar-replace-cons", "escape-to-region"]);
 
         // Gap B-3: wire cs-vm's region-resolver function-
         // pointer hook to cs-runtime's per-thread REGION_STACK
