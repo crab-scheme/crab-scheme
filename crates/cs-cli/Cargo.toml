@@ -68,6 +68,7 @@ stdlib = [
     "stdlib-math",
     "stdlib-tty",
     "stdlib-signal",
+    "stdlib-cli",
     "stdlib-meta",
 ]
 stdlib-path = ["cs-runtime/stdlib-path"]
@@ -98,6 +99,7 @@ stdlib-collection = ["cs-runtime/stdlib-collection"]
 stdlib-math = ["cs-runtime/stdlib-math"]
 stdlib-tty = ["cs-runtime/stdlib-tty"]
 stdlib-signal = ["cs-runtime/stdlib-signal"]
+stdlib-cli = ["cs-runtime/stdlib-cli"]
 stdlib-meta = ["cs-runtime/stdlib-meta"]
 # cs-web tower-style framework + Scheme-actor-as-Layer primops.
 # Implies `actor` via the cs-runtime forwarding chain.
@@ -138,6 +140,7 @@ wasm-stdlib = [
     "stdlib-process",
     "stdlib-signal",
     "stdlib-tty",
+    "stdlib-cli",
     "stdlib-meta",
 ]
 # `wasm-stdlib` plus the networking modules wasm32-wasip2 can host
