@@ -167,7 +167,9 @@ stdlib-net = ["ffi-trait", "dep:cs-stdlib-net", "cs-stdlib-meta?/meta-net"]
 stdlib-http = ["ffi-trait", "dep:cs-stdlib-http", "cs-stdlib-meta?/meta-http"]
 stdlib-websocket = ["ffi-trait", "dep:cs-stdlib-websocket", "cs-stdlib-meta?/meta-websocket"]
 stdlib-collection = ["ffi-trait", "dep:cs-stdlib-collection", "cs-stdlib-meta?/meta-collection"]
-stdlib-math = ["ffi-trait", "dep:cs-stdlib-math", "cs-stdlib-meta?/meta-math"]
+# stdlib-math also pulls a bundled Scheme extension (combinatorics +
+# numeric helpers); `bundled-scheme` gates its load at startup.
+stdlib-math = ["ffi-trait", "dep:cs-stdlib-math", "cs-stdlib-meta?/meta-math", "bundled-scheme"]
 stdlib-tty = ["ffi-trait", "dep:cs-stdlib-tty", "cs-stdlib-meta?/meta-tty"]
 stdlib-signal = ["ffi-trait", "dep:cs-stdlib-signal", "cs-stdlib-meta?/meta-signal"]
 stdlib-cli = ["ffi-trait", "dep:cs-stdlib-cli", "cs-stdlib-meta?/meta-cli"]

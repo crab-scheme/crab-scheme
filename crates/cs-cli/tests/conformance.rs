@@ -277,6 +277,12 @@ fn conformance_crab_math() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-math")]
+fn conformance_crab_math_extra() {
+    run_conformance_file("crab-math-extra.scm");
+}
+
+#[test]
 #[cfg(feature = "stdlib-tty")]
 fn conformance_crab_tty() {
     run_conformance_file("crab-tty.scm");

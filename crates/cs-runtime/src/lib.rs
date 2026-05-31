@@ -2036,6 +2036,10 @@ impl Runtime {
         self.load_bundled_library("(crab pprint)", include_str!("scheme/pprint.scm"));
         #[cfg(feature = "stdlib-dict")]
         self.load_bundled_library("(crab dict)", include_str!("scheme/dict.scm"));
+        // Scheme extension of the Rust `(crab math)` module (combinatorics
+        // + numeric helpers).
+        #[cfg(feature = "stdlib-math")]
+        self.load_bundled_library("(crab math)", include_str!("scheme/math.scm"));
     }
 
     /// Evaluate one bundled library's source into the global env. A
