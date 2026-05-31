@@ -312,6 +312,12 @@ fn conformance_crab_crypto() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-crypto")]
+fn conformance_crab_crypto_kex() {
+    run_conformance_file("crab-crypto-kex.scm");
+}
+
+#[test]
 #[cfg(feature = "stdlib-sql")]
 fn conformance_crab_sql() {
     run_conformance_file("crab-sql.scm");

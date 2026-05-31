@@ -1,4 +1,4 @@
-# `(crab crypto)` — secure randomness, AEAD encryption, Ed25519 signatures
+# `(crab crypto)` — randomness, AEAD, Ed25519/X25519, HKDF, Argon2
 
 CrabScheme stdlib module — modern, misuse-resistant cryptography
 beyond the digests in `(crab hash)`. The `(crab …)` answer to Go's
@@ -26,6 +26,12 @@ signatures) is passed and returned as **bytevectors**; data inputs
 (crypto-ed25519-keypair)                   ;-> #(secret public)
 (crypto-ed25519-sign secret message)       ;-> bytevector ; 64-byte signature
 (crypto-ed25519-verify public message sig) ;-> boolean
+
+(crypto-x25519-keypair)                    ;-> #(secret public)
+(crypto-x25519-shared secret their-public) ;-> bytevector ; 32-byte ECDH secret
+(crypto-hkdf-sha256 ikm salt info length)  ;-> bytevector ; derived key
+(crypto-password-hash password)            ;-> string     ; Argon2id PHC string
+(crypto-password-verify password phc)      ;-> boolean
 ```
 
 ## AEAD (ChaCha20-Poly1305)
@@ -59,12 +65,24 @@ tampering, wrong key/nonce, or `aad` mismatch.
 (crypto-ed25519-verify pk "tampered" sig)   ; => #f
 ```
 
-## Scope
+## Key agreement, derivation, and passwords
 
-This first cut covers the "secure a message" core: randomness,
-authenticated symmetric encryption, and signatures. Key agreement
-(X25519 ECDH), key derivation (HKDF), and password hashing (Argon2)
-are natural follow-ups.
+X25519 ECDH gives both peers the same shared secret; run it through
+HKDF before using it as a symmetric key (the raw DH output isn't
+uniform). Argon2id hashes user passwords for storage.
+
+```scheme
+;; ECDH → HKDF → AEAD key
+(define a (crypto-x25519-keypair))
+(define b (crypto-x25519-keypair))
+(define shared (crypto-x25519-shared (vector-ref a 0) (vector-ref b 1)))
+(define key (crypto-hkdf-sha256 shared "" "chat-v1" 32))
+
+;; Passwords
+(define h (crypto-password-hash "hunter2"))
+(crypto-password-verify "hunter2" h)        ; => #t
+(crypto-password-verify "wrong" h)          ; => #f
+```
 
 [RustCrypto]: https://github.com/RustCrypto
 [dalek]: https://github.com/dalek-cryptography
