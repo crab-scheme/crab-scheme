@@ -2010,28 +2010,21 @@ impl Runtime {
         for p in cs_stdlib_meta::procs() {
             self.register_host_procedure(p);
         }
-        // Bundled Scheme libraries (functional / iter / test) — these
-        // are defined in Scheme rather than Rust because they take
-        // procedure arguments (compose, memoize, group-by, deftest),
-        // which a host procedure cannot call back into. Their defines
-        // are evaluated into the global environment here, so
-        // `(import (crab …))` is a no-op exactly like the Rust modules.
-        #[cfg(any(
-            feature = "stdlib-functional",
-            feature = "stdlib-iter",
-            feature = "stdlib-test"
-        ))]
+        // Bundled Scheme libraries — these are defined in Scheme rather
+        // than Rust because they take procedure arguments (compose,
+        // memoize, group-by, deftest, update-in), which a host procedure
+        // cannot call back into; pprint just reuses the reader/writer.
+        // Their defines are evaluated into the global environment here,
+        // so `(import (crab …))` is a no-op exactly like the Rust
+        // modules. Each `stdlib-<lib>` feature pulls in `bundled-scheme`.
+        #[cfg(feature = "bundled-scheme")]
         self.register_bundled_libraries();
     }
 
     /// Evaluate the enabled bundled Scheme libraries into the global
-    /// environment. Loaded in dependency order (none currently depend
-    /// on another, but `functional` is loaded first by convention).
-    #[cfg(any(
-        feature = "stdlib-functional",
-        feature = "stdlib-iter",
-        feature = "stdlib-test"
-    ))]
+    /// environment. `functional` loads first by convention; the others
+    /// are independent.
+    #[cfg(feature = "bundled-scheme")]
     fn register_bundled_libraries(&mut self) {
         #[cfg(feature = "stdlib-functional")]
         self.load_bundled_library("(crab functional)", include_str!("scheme/functional.scm"));
@@ -2039,16 +2032,16 @@ impl Runtime {
         self.load_bundled_library("(crab iter)", include_str!("scheme/iter.scm"));
         #[cfg(feature = "stdlib-test")]
         self.load_bundled_library("(crab test)", include_str!("scheme/test.scm"));
+        #[cfg(feature = "stdlib-pprint")]
+        self.load_bundled_library("(crab pprint)", include_str!("scheme/pprint.scm"));
+        #[cfg(feature = "stdlib-dict")]
+        self.load_bundled_library("(crab dict)", include_str!("scheme/dict.scm"));
     }
 
     /// Evaluate one bundled library's source into the global env. A
     /// failure means a shipped library is malformed — a build bug, not
     /// a user error — so it panics loudly rather than failing silently.
-    #[cfg(any(
-        feature = "stdlib-functional",
-        feature = "stdlib-iter",
-        feature = "stdlib-test"
-    ))]
+    #[cfg(feature = "bundled-scheme")]
     fn load_bundled_library(&mut self, name: &str, src: &str) {
         if let Err(d) = self.eval_str(name, src) {
             panic!(
