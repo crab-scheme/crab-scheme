@@ -2006,6 +2006,10 @@ impl Runtime {
         for p in cs_stdlib_sql::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-xml")]
+        for p in cs_stdlib_xml::procs() {
+            self.register_host_procedure(p);
+        }
         #[cfg(feature = "stdlib-meta")]
         for p in cs_stdlib_meta::procs() {
             self.register_host_procedure(p);

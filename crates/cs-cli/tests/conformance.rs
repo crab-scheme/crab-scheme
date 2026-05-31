@@ -324,6 +324,12 @@ fn conformance_crab_sql() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-xml")]
+fn conformance_crab_xml() {
+    run_conformance_file("crab-xml.scm");
+}
+
+#[test]
 #[cfg(feature = "stdlib-functional")]
 fn conformance_crab_functional() {
     run_conformance_file("crab-functional.scm");
