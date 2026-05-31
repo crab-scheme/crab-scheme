@@ -128,6 +128,7 @@ stdlib = [
     "stdlib-signal",
     "stdlib-cli",
     "stdlib-crypto",
+    "stdlib-sql",
     "stdlib-meta",
 ]
 # Each `stdlib-<name>` feature also enables the matching
@@ -166,6 +167,7 @@ stdlib-tty = ["ffi-trait", "dep:cs-stdlib-tty", "cs-stdlib-meta?/meta-tty"]
 stdlib-signal = ["ffi-trait", "dep:cs-stdlib-signal", "cs-stdlib-meta?/meta-signal"]
 stdlib-cli = ["ffi-trait", "dep:cs-stdlib-cli", "cs-stdlib-meta?/meta-cli"]
 stdlib-crypto = ["ffi-trait", "dep:cs-stdlib-crypto", "cs-stdlib-meta?/meta-crypto"]
+stdlib-sql = ["ffi-trait", "dep:cs-stdlib-sql", "cs-stdlib-meta?/meta-sql"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -257,6 +259,7 @@ cs-stdlib-tty = { workspace = true, optional = true }
 cs-stdlib-signal = { workspace = true, optional = true }
 cs-stdlib-cli = { workspace = true, optional = true }
 cs-stdlib-crypto = { workspace = true, optional = true }
+cs-stdlib-sql = { workspace = true, optional = true }
 cs-stdlib-meta = { workspace = true, optional = true }
 
 [dev-dependencies]
