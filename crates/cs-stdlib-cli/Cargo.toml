@@ -1,0 +1,15 @@
+[package]
+name = "cs-stdlib-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab cli) — command-line argument & flag parsing."
+
+# Pure Rust: no external dependencies. Parsing is a function of an
+# option spec + an argument list, so the module is portable to every
+# target (including wasm32) without conditional compilation.
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }

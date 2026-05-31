@@ -293,6 +293,42 @@ fn conformance_crab_signal() {
     run_conformance_file("crab-signal.scm");
 }
 
+#[test]
+#[cfg(feature = "stdlib-cli")]
+fn conformance_crab_cli() {
+    run_conformance_file("crab-cli.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-crypto")]
+fn conformance_crab_crypto() {
+    run_conformance_file("crab-crypto.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-sql")]
+fn conformance_crab_sql() {
+    run_conformance_file("crab-sql.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-functional")]
+fn conformance_crab_functional() {
+    run_conformance_file("crab-functional.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-iter")]
+fn conformance_crab_iter() {
+    run_conformance_file("crab-iter.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-test")]
+fn conformance_crab_test() {
+    run_conformance_file("crab-test.scm");
+}
+
 // `(crab)` meta needs the umbrella `stdlib` feature on so the
 // manifest actually has the modules the test spot-checks for
 // (path, fs, json, hash, http, collection, signal). Subset

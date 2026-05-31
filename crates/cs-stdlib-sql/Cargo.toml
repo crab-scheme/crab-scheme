@@ -1,0 +1,17 @@
+[package]
+name = "cs-stdlib-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab sql) — embedded SQLite database access."
+
+# rusqlite with the `bundled` feature vendors and compiles the SQLite
+# C amalgamation, so this crate needs a C compiler at build time and
+# does NOT cross-compile to wasm32-wasip1 — it is excluded from the
+# `wasm-stdlib` feature (like the networking modules).
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
