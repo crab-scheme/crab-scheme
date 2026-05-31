@@ -85,6 +85,7 @@ members = [
     "crates/cs-stdlib-tty",
     "crates/cs-stdlib-signal",
     "crates/cs-stdlib-cli",
+    "crates/cs-stdlib-crypto",
     "crates/cs-stdlib-meta",
 ]
 
@@ -175,6 +176,7 @@ cs-stdlib-math = { path = "crates/cs-stdlib-math" }
 cs-stdlib-tty = { path = "crates/cs-stdlib-tty" }
 cs-stdlib-signal = { path = "crates/cs-stdlib-signal" }
 cs-stdlib-cli = { path = "crates/cs-stdlib-cli" }
+cs-stdlib-crypto = { path = "crates/cs-stdlib-crypto" }
 cs-stdlib-meta = { path = "crates/cs-stdlib-meta" }
 
 # External crates

@@ -299,6 +299,12 @@ fn conformance_crab_cli() {
     run_conformance_file("crab-cli.scm");
 }
 
+#[test]
+#[cfg(feature = "stdlib-crypto")]
+fn conformance_crab_crypto() {
+    run_conformance_file("crab-crypto.scm");
+}
+
 // `(crab)` meta needs the umbrella `stdlib` feature on so the
 // manifest actually has the modules the test spot-checks for
 // (path, fs, json, hash, http, collection, signal). Subset

@@ -45,6 +45,7 @@ cs-stdlib-math = { workspace = true, optional = true }
 cs-stdlib-tty = { workspace = true, optional = true }
 cs-stdlib-signal = { workspace = true, optional = true }
 cs-stdlib-cli = { workspace = true, optional = true }
+cs-stdlib-crypto = { workspace = true, optional = true }
 
 [features]
 meta-path = ["dep:cs-stdlib-path"]
@@ -76,3 +77,4 @@ meta-math = ["dep:cs-stdlib-math"]
 meta-tty = ["dep:cs-stdlib-tty"]
 meta-signal = ["dep:cs-stdlib-signal"]
 meta-cli = ["dep:cs-stdlib-cli"]
+meta-crypto = ["dep:cs-stdlib-crypto"]

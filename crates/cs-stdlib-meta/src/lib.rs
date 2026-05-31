@@ -81,6 +81,7 @@ fn manifest() -> Vec<(&'static str, Vec<String>)> {
     add!("tty", "meta-tty", cs_stdlib_tty);
     add!("signal", "meta-signal", cs_stdlib_signal);
     add!("cli", "meta-cli", cs_stdlib_cli);
+    add!("crypto", "meta-crypto", cs_stdlib_crypto);
 
     out.sort_by_key(|(n, _)| *n);
     out
