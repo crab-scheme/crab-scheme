@@ -129,6 +129,9 @@ stdlib = [
     "stdlib-cli",
     "stdlib-crypto",
     "stdlib-sql",
+    "stdlib-functional",
+    "stdlib-iter",
+    "stdlib-test",
     "stdlib-meta",
 ]
 # Each `stdlib-<name>` feature also enables the matching
@@ -168,6 +171,11 @@ stdlib-signal = ["ffi-trait", "dep:cs-stdlib-signal", "cs-stdlib-meta?/meta-sign
 stdlib-cli = ["ffi-trait", "dep:cs-stdlib-cli", "cs-stdlib-meta?/meta-cli"]
 stdlib-crypto = ["ffi-trait", "dep:cs-stdlib-crypto", "cs-stdlib-meta?/meta-crypto"]
 stdlib-sql = ["ffi-trait", "dep:cs-stdlib-sql", "cs-stdlib-meta?/meta-sql"]
+# Bundled Scheme libraries (no Rust crate / no host procs): the feature
+# just gates the include_str! + eval at startup in register_stdlib.
+stdlib-functional = []
+stdlib-iter = []
+stdlib-test = []
 
 [dependencies]
 cs-core = { workspace = true }
