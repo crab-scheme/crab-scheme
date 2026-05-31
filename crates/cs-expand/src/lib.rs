@@ -2326,12 +2326,8 @@ impl<'a> Expander<'a> {
                 let value = self.expand(&items[1])?;
                 Ok((*name, value))
             }
-            Datum::Pair(_, _, _) => {
-                let (head, rest) = collect_list(&items[0]).ok_or(ExpandError::BadSyntax {
-                    what: "define: bad function form".into(),
-                    span,
-                })?;
-                let name = match &*head {
+            Datum::Pair(head, formals, _) => {
+                let name = match &**head {
                     Datum::Symbol(s, _) => *s,
                     _ => {
                         return Err(ExpandError::BadSyntax {
@@ -2340,7 +2336,11 @@ impl<'a> Expander<'a> {
                         });
                     }
                 };
-                let params = build_params_from_datums(&rest)?;
+                // `formals` may be a proper list, a dotted/improper list,
+                // or a bare rest symbol — parse with the same rest-aware
+                // helper `lambda` uses, so `(define (f . xs) …)` and
+                // `(define (f a . xs) …)` work like the lambda forms.
+                let params = build_params_from_datums_loose(formals)?;
                 let body = self.expand_body(&items[1..], span)?;
                 let lam = CoreExpr::Lambda {
                     params,
@@ -2378,13 +2378,11 @@ impl<'a> Expander<'a> {
                     span,
                 })
             }
-            // (define (name args...) body...) sugar
-            Datum::Pair(_, _, _) => {
-                let (head, rest) = collect_list(&items[0]).ok_or(ExpandError::BadSyntax {
-                    what: "define: bad function form".into(),
-                    span,
-                })?;
-                let name = match &*head {
+            // (define (name args...) body...) sugar — `args` may include a
+            // dotted/rest tail, e.g. (define (f . xs) …) or
+            // (define (f a . xs) …), parsed like the matching lambda forms.
+            Datum::Pair(head, formals, _) => {
+                let name = match &**head {
                     Datum::Symbol(s, _) => *s,
                     _ => {
                         return Err(ExpandError::BadSyntax {
@@ -2393,7 +2391,7 @@ impl<'a> Expander<'a> {
                         });
                     }
                 };
-                let params = build_params_from_datums(&rest)?;
+                let params = build_params_from_datums_loose(formals)?;
                 let body = self.expand_body(&items[1..], span)?;
                 let lam = CoreExpr::Lambda {
                     params,
@@ -7725,26 +7723,10 @@ fn parse_lambda_params(d: &Datum) -> Result<Params, ExpandError> {
     }
 }
 
-fn build_params_from_datums(items: &[Datum]) -> Result<Params, ExpandError> {
-    let mut fixed = Vec::with_capacity(items.len());
-    for d in items {
-        match d {
-            Datum::Symbol(s, _) => fixed.push(*s),
-            _ => {
-                return Err(ExpandError::BadSyntax {
-                    what: "param must be symbol".into(),
-                    span: d.span(),
-                });
-            }
-        }
-    }
-    Ok(Params::fixed(fixed))
-}
-
-/// Like `build_params_from_datums` but accepts a single datum that can be
-/// any of the lambda formals shapes: a proper list `(a b c)`, an improper
-/// list `(a b . rest)`, a bare symbol `rest`, or `()` (empty fixed).
-/// Used by `define-values` where the formals appear as one form.
+/// Parse lambda/define formals from a single datum, accepting any of the
+/// formals shapes: a proper list `(a b c)`, an improper list
+/// `(a b . rest)`, a bare symbol `rest`, or `()` (empty fixed). Shared by
+/// `lambda`, the `(define (f . xs) …)` shorthand, and `define-values`.
 fn build_params_from_datums_loose(d: &Datum) -> Result<Params, ExpandError> {
     let mut fixed: Vec<Symbol> = Vec::new();
     let mut rest: Option<Symbol> = None;
