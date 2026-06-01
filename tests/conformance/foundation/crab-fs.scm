@@ -96,3 +96,30 @@
             (file-exists? "/tmp/__definitely-missing-crab-fs-conformance__"))
 (test-false "directory-exists? on missing dir"
             (directory-exists? "/tmp/__definitely-missing-crab-fs-conformance__"))
+
+(test-section "(crab fs) — temp / glob / tree ops")
+(test-true "temp-dir is a non-empty string" (> (string-length (temp-dir)) 0))
+
+(define __td__ (make-temp-dir))
+(test-true "make-temp-dir creates a directory" (directory-exists? __td__))
+
+(write-file-string (string-append __td__ "/a.txt") "A")
+(write-file-string (string-append __td__ "/b.txt") "B")
+(write-file-string (string-append __td__ "/c.dat") "C")
+(test-equal "glob matches by extension" 2 (length (glob (string-append __td__ "/*.txt"))))
+(test-equal "glob matches everything" 3 (length (glob (string-append __td__ "/*"))))
+
+(define __tf__ (make-temp-file))
+(test-true "make-temp-file creates a file" (file-exists? __tf__))
+(delete-file __tf__)
+
+(define __dst__ (string-append __td__ "-copy"))
+(copy-tree __td__ __dst__)
+(test-true "copy-tree replicates the directory" (directory-exists? __dst__))
+(test-equal "copy-tree copies file content" "A"
+            (read-file-string (string-append __dst__ "/a.txt")))
+
+(remove-tree __dst__)
+(test-false "remove-tree deletes recursively" (directory-exists? __dst__))
+(remove-tree __td__)
+(test-false "remove-tree cleans up the original tree" (directory-exists? __td__))

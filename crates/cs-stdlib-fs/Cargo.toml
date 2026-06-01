@@ -10,3 +10,5 @@ description = "CrabScheme stdlib module (crab fs) — filesystem operations back
 [dependencies]
 cs-core = { workspace = true }
 cs-ffi = { workspace = true }
+# Pure-Rust shell-style path globbing (over std::fs); keeps fs portable.
+glob = "0.3"
