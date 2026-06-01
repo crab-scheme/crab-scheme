@@ -25,37 +25,32 @@
 
 ;; Right-to-left composition: ((compose f g) x) = (f (g x)).
 ;; With no arguments, returns `identity`.
-;; (Written with an explicit `lambda` rest list rather than the
-;; `(define (compose . fs) …)` sugar, which the reader doesn't accept.)
-(define compose
-  (lambda fs
-    (cond
-      ((null? fs) identity)
-      ((null? (cdr fs)) (car fs))
-      (else
-       (let ((rfs (reverse fs)))
-         (lambda args
-           (let loop ((gs (cdr rfs))
-                      (v (apply (car rfs) args)))
-             (if (null? gs)
-                 v
-                 (loop (cdr gs) ((car gs) v))))))))))
+(define (compose . fs)
+  (cond
+    ((null? fs) identity)
+    ((null? (cdr fs)) (car fs))
+    (else
+     (let ((rfs (reverse fs)))
+       (lambda args
+         (let loop ((gs (cdr rfs))
+                    (v (apply (car rfs) args)))
+           (if (null? gs)
+               v
+               (loop (cdr gs) ((car gs) v)))))))))
 
 ;; Left-to-right composition: ((pipe f g) x) = (g (f x)).
-(define pipe
-  (lambda fs (apply compose (reverse fs))))
+(define (pipe . fs)
+  (apply compose (reverse fs)))
 
 ;; Partial application: prepend `bound` to the arguments of `f`.
-(define partial
-  (lambda (f . bound)
-    (lambda args (apply f (append bound args)))))
+(define (partial f . bound)
+  (lambda args (apply f (append bound args))))
 
 ;; Apply each of `fs` to the same arguments, returning the list of
 ;; results: ((juxt f g) x) = (list (f x) (g x)).
-(define juxt
-  (lambda fs
-    (lambda args
-      (map (lambda (f) (apply f args)) fs))))
+(define (juxt . fs)
+  (lambda args
+    (map (lambda (f) (apply f args)) fs)))
 
 ;; Like `f`, but a #f first argument is replaced by `default`.
 (define (fnil f default)
