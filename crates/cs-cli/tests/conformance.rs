@@ -359,6 +359,18 @@ fn conformance_crab_dict() {
     run_conformance_file("crab-dict.scm");
 }
 
+#[test]
+#[cfg(feature = "stdlib-walk")]
+fn conformance_crab_walk() {
+    run_conformance_file("crab-walk.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-sync")]
+fn conformance_crab_sync() {
+    run_conformance_file("crab-sync.scm");
+}
+
 // `(crab)` meta needs the umbrella `stdlib` feature on so the
 // manifest actually has the modules the test spot-checks for
 // (path, fs, json, hash, http, collection, signal). Subset

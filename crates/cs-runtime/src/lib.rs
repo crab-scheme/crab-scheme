@@ -2040,6 +2040,10 @@ impl Runtime {
         self.load_bundled_library("(crab pprint)", include_str!("scheme/pprint.scm"));
         #[cfg(feature = "stdlib-dict")]
         self.load_bundled_library("(crab dict)", include_str!("scheme/dict.scm"));
+        #[cfg(feature = "stdlib-walk")]
+        self.load_bundled_library("(crab walk)", include_str!("scheme/walk.scm"));
+        #[cfg(feature = "stdlib-sync")]
+        self.load_bundled_library("(crab sync)", include_str!("scheme/sync.scm"));
         // Scheme extension of the Rust `(crab math)` module (combinatorics
         // + numeric helpers).
         #[cfg(feature = "stdlib-math")]

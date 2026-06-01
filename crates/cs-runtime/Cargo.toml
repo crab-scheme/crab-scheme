@@ -135,6 +135,8 @@ stdlib = [
     "stdlib-test",
     "stdlib-pprint",
     "stdlib-dict",
+    "stdlib-walk",
+    "stdlib-sync",
     "stdlib-meta",
 ]
 # Each `stdlib-<name>` feature also enables the matching
@@ -186,6 +188,8 @@ stdlib-iter = ["bundled-scheme"]
 stdlib-test = ["bundled-scheme"]
 stdlib-pprint = ["bundled-scheme"]
 stdlib-dict = ["bundled-scheme"]
+stdlib-walk = ["bundled-scheme"]
+stdlib-sync = ["bundled-scheme"]
 
 [dependencies]
 cs-core = { workspace = true }
