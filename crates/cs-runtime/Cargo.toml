@@ -129,9 +129,12 @@ stdlib = [
     "stdlib-cli",
     "stdlib-crypto",
     "stdlib-sql",
+    "stdlib-xml",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",
+    "stdlib-pprint",
+    "stdlib-dict",
     "stdlib-meta",
 ]
 # Each `stdlib-<name>` feature also enables the matching
@@ -165,17 +168,24 @@ stdlib-net = ["ffi-trait", "dep:cs-stdlib-net", "cs-stdlib-meta?/meta-net"]
 stdlib-http = ["ffi-trait", "dep:cs-stdlib-http", "cs-stdlib-meta?/meta-http"]
 stdlib-websocket = ["ffi-trait", "dep:cs-stdlib-websocket", "cs-stdlib-meta?/meta-websocket"]
 stdlib-collection = ["ffi-trait", "dep:cs-stdlib-collection", "cs-stdlib-meta?/meta-collection"]
-stdlib-math = ["ffi-trait", "dep:cs-stdlib-math", "cs-stdlib-meta?/meta-math"]
+# stdlib-math also pulls a bundled Scheme extension (combinatorics +
+# numeric helpers); `bundled-scheme` gates its load at startup.
+stdlib-math = ["ffi-trait", "dep:cs-stdlib-math", "cs-stdlib-meta?/meta-math", "bundled-scheme"]
 stdlib-tty = ["ffi-trait", "dep:cs-stdlib-tty", "cs-stdlib-meta?/meta-tty"]
 stdlib-signal = ["ffi-trait", "dep:cs-stdlib-signal", "cs-stdlib-meta?/meta-signal"]
 stdlib-cli = ["ffi-trait", "dep:cs-stdlib-cli", "cs-stdlib-meta?/meta-cli"]
 stdlib-crypto = ["ffi-trait", "dep:cs-stdlib-crypto", "cs-stdlib-meta?/meta-crypto"]
 stdlib-sql = ["ffi-trait", "dep:cs-stdlib-sql", "cs-stdlib-meta?/meta-sql"]
-# Bundled Scheme libraries (no Rust crate / no host procs): the feature
-# just gates the include_str! + eval at startup in register_stdlib.
-stdlib-functional = []
-stdlib-iter = []
-stdlib-test = []
+stdlib-xml = ["ffi-trait", "dep:cs-stdlib-xml", "cs-stdlib-meta?/meta-xml"]
+# Bundled Scheme libraries (no Rust crate / no host procs): each pulls
+# in `bundled-scheme`, which gates the include_str! + eval at startup in
+# register_stdlib. Adding a new bundled lib needs only its own feature.
+bundled-scheme = []
+stdlib-functional = ["bundled-scheme"]
+stdlib-iter = ["bundled-scheme"]
+stdlib-test = ["bundled-scheme"]
+stdlib-pprint = ["bundled-scheme"]
+stdlib-dict = ["bundled-scheme"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -268,6 +278,7 @@ cs-stdlib-signal = { workspace = true, optional = true }
 cs-stdlib-cli = { workspace = true, optional = true }
 cs-stdlib-crypto = { workspace = true, optional = true }
 cs-stdlib-sql = { workspace = true, optional = true }
+cs-stdlib-xml = { workspace = true, optional = true }
 cs-stdlib-meta = { workspace = true, optional = true }
 
 [dev-dependencies]

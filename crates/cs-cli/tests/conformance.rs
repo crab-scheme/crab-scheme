@@ -277,6 +277,12 @@ fn conformance_crab_math() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-math")]
+fn conformance_crab_math_extra() {
+    run_conformance_file("crab-math-extra.scm");
+}
+
+#[test]
 #[cfg(feature = "stdlib-tty")]
 fn conformance_crab_tty() {
     run_conformance_file("crab-tty.scm");
@@ -306,9 +312,21 @@ fn conformance_crab_crypto() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-crypto")]
+fn conformance_crab_crypto_kex() {
+    run_conformance_file("crab-crypto-kex.scm");
+}
+
+#[test]
 #[cfg(feature = "stdlib-sql")]
 fn conformance_crab_sql() {
     run_conformance_file("crab-sql.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-xml")]
+fn conformance_crab_xml() {
+    run_conformance_file("crab-xml.scm");
 }
 
 #[test]
@@ -327,6 +345,18 @@ fn conformance_crab_iter() {
 #[cfg(feature = "stdlib-test")]
 fn conformance_crab_test() {
     run_conformance_file("crab-test.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-pprint")]
+fn conformance_crab_pprint() {
+    run_conformance_file("crab-pprint.scm");
+}
+
+#[test]
+#[cfg(feature = "stdlib-dict")]
+fn conformance_crab_dict() {
+    run_conformance_file("crab-dict.scm");
 }
 
 // `(crab)` meta needs the umbrella `stdlib` feature on so the

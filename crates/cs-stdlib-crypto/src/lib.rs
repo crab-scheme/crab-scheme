@@ -28,6 +28,11 @@
 //! | `crypto-ed25519-keypair`| —                       | #(secret public) | 32-byte secret + 32-byte public. |
 //! | `crypto-ed25519-sign`   | secret message          | bytevector | 64-byte signature. |
 //! | `crypto-ed25519-verify` | public message signature | boolean   | Strict verification. |
+//! | `crypto-x25519-keypair` | —                       | #(secret public) | 32-byte X25519 keypair. |
+//! | `crypto-x25519-shared`  | secret their-public     | bytevector | 32-byte ECDH shared secret (run through HKDF). |
+//! | `crypto-hkdf-sha256`    | ikm salt info length    | bytevector | Derive `length` bytes (≤ 8160). |
+//! | `crypto-password-hash`  | password                | string     | Argon2id PHC string (random salt). |
+//! | `crypto-password-verify`| password phc            | boolean    | Verify against a PHC string. |
 //!
 //! ## AEAD usage
 //!
@@ -56,6 +61,24 @@
 //! (crypto-ed25519-verify pk "msg" sig)        ; => #t
 //! (crypto-ed25519-verify pk "tampered" sig)   ; => #f
 //! ```
+//!
+//! ## Key agreement, derivation, and passwords
+//!
+//! X25519 ECDH: both peers compute the same shared secret; run it through
+//! HKDF before using it as a key. Argon2id is for hashing user passwords
+//! at rest.
+//!
+//! ```scheme
+//! ;; ECDH + HKDF
+//! (define a (crypto-x25519-keypair))
+//! (define b (crypto-x25519-keypair))
+//! (define shared (crypto-x25519-shared (vector-ref a 0) (vector-ref b 1)))
+//! (define key (crypto-hkdf-sha256 shared "" "chat-v1" 32))   ; 32-byte AEAD key
+//!
+//! ;; Passwords
+//! (define h (crypto-password-hash "hunter2"))
+//! (crypto-password-verify "hunter2" h)        ; => #t
+//! ```
 
 use std::sync::Arc;
 
@@ -63,16 +86,22 @@ use cs_core::Value;
 use cs_ffi::error::FfiError;
 use cs_ffi::host::{HostProcedure, UntypedProc};
 
+use argon2::password_hash::{PasswordHash, SaltString};
+use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 const AEAD_KEY_LEN: usize = 32;
 const AEAD_NONCE_LEN: usize = 12;
 const ED25519_KEY_LEN: usize = 32;
 const ED25519_SIG_LEN: usize = 64;
+const X25519_KEY_LEN: usize = 32;
 
 pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
     vec![
@@ -86,6 +115,11 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("crypto-ed25519-keypair", crypto_ed25519_keypair),
         UntypedProc::new("crypto-ed25519-sign", crypto_ed25519_sign),
         UntypedProc::new("crypto-ed25519-verify", crypto_ed25519_verify),
+        UntypedProc::new("crypto-x25519-keypair", crypto_x25519_keypair),
+        UntypedProc::new("crypto-x25519-shared", crypto_x25519_shared),
+        UntypedProc::new("crypto-hkdf-sha256", crypto_hkdf_sha256),
+        UntypedProc::new("crypto-password-hash", crypto_password_hash),
+        UntypedProc::new("crypto-password-verify", crypto_password_verify),
     ]
 }
 
@@ -352,4 +386,118 @@ fn crypto_ed25519_verify(args: &[Value]) -> Result<Value, FfiError> {
     sig_arr.copy_from_slice(&sig_bytes);
     let sig = Signature::from_bytes(&sig_arr);
     Ok(Value::Boolean(vk.verify(&message, &sig).is_ok()))
+}
+
+// ----- X25519 key agreement (ECDH) -----
+
+fn crypto_x25519_keypair(args: &[Value]) -> Result<Value, FfiError> {
+    if !args.is_empty() {
+        return Err(arity("crypto-x25519-keypair", "0", args.len()));
+    }
+    let mut seed = [0u8; X25519_KEY_LEN];
+    getrandom::getrandom(&mut seed)
+        .map_err(|e| fail(format!("crypto-x25519-keypair: CSPRNG unavailable: {}", e)))?;
+    let secret = StaticSecret::from(seed);
+    let public = X25519Public::from(&secret);
+    Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(
+        vec![
+            bv_value(secret.to_bytes().to_vec()),
+            bv_value(public.to_bytes().to_vec()),
+        ],
+    ))))
+}
+
+/// `(crypto-x25519-shared secret their-public)` — Diffie-Hellman shared
+/// secret. Both peers derive the same 32 bytes from their own secret and
+/// the other's public key. Run the result through `crypto-hkdf-sha256`
+/// before using it as a symmetric key (the raw DH output is not uniform).
+fn crypto_x25519_shared(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() != 2 {
+        return Err(arity("crypto-x25519-shared", "2", args.len()));
+    }
+    let secret = expect_bv("crypto-x25519-shared", args, 0)?;
+    let their = expect_bv("crypto-x25519-shared", args, 1)?;
+    require_len(
+        "crypto-x25519-shared",
+        "secret key",
+        &secret,
+        X25519_KEY_LEN,
+    )?;
+    require_len("crypto-x25519-shared", "public key", &their, X25519_KEY_LEN)?;
+    let mut sk = [0u8; X25519_KEY_LEN];
+    sk.copy_from_slice(&secret);
+    let mut pk = [0u8; X25519_KEY_LEN];
+    pk.copy_from_slice(&their);
+    let shared = StaticSecret::from(sk).diffie_hellman(&X25519Public::from(pk));
+    Ok(bv_value(shared.to_bytes().to_vec()))
+}
+
+// ----- HKDF-SHA256 key derivation -----
+
+/// `(crypto-hkdf-sha256 ikm salt info length)` — derive `length` bytes of
+/// key material from input keying material `ikm`, an optional `salt`, and
+/// context `info`. `length` is at most 255*32 = 8160.
+fn crypto_hkdf_sha256(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() != 4 {
+        return Err(arity("crypto-hkdf-sha256", "4", args.len()));
+    }
+    let ikm = expect_bytes("crypto-hkdf-sha256", args, 0)?;
+    let salt = expect_bytes("crypto-hkdf-sha256", args, 1)?;
+    let info = expect_bytes("crypto-hkdf-sha256", args, 2)?;
+    let length = expect_count("crypto-hkdf-sha256", args, 3)?;
+    let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);
+    let mut okm = vec![0u8; length];
+    hk.expand(&info, &mut okm).map_err(|_| {
+        fail("crypto-hkdf-sha256: output length too large (max 255*32 = 8160 bytes)".to_string())
+    })?;
+    Ok(bv_value(okm))
+}
+
+// ----- Argon2 password hashing -----
+
+/// `(crypto-password-hash password)` — hash a password with Argon2id
+/// (random salt), returning a self-describing PHC string suitable for
+/// storage. Verify it later with `crypto-password-verify`.
+fn crypto_password_hash(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() != 1 {
+        return Err(arity("crypto-password-hash", "1", args.len()));
+    }
+    let password = expect_bytes("crypto-password-hash", args, 0)?;
+    let mut salt_bytes = [0u8; 16];
+    getrandom::getrandom(&mut salt_bytes)
+        .map_err(|e| fail(format!("crypto-password-hash: CSPRNG unavailable: {}", e)))?;
+    let salt = SaltString::encode_b64(&salt_bytes)
+        .map_err(|e| fail(format!("crypto-password-hash: {}", e)))?;
+    let hash = Argon2::default()
+        .hash_password(&password, &salt)
+        .map_err(|e| fail(format!("crypto-password-hash: {}", e)))?;
+    Ok(Value::string(hash.to_string()))
+}
+
+/// `(crypto-password-verify password phc)` — check `password` against a
+/// PHC string from `crypto-password-hash`. A malformed hash returns `#f`
+/// rather than raising.
+fn crypto_password_verify(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() != 2 {
+        return Err(arity("crypto-password-verify", "2", args.len()));
+    }
+    let password = expect_bytes("crypto-password-verify", args, 0)?;
+    let phc = match &args[1] {
+        Value::String(s) => s.borrow().clone(),
+        other => {
+            return Err(FfiError::TypeMismatch {
+                expected: "string (PHC hash)",
+                got: other.type_name().to_string(),
+            })
+        }
+    };
+    let parsed = match PasswordHash::new(&phc) {
+        Ok(h) => h,
+        Err(_) => return Ok(Value::Boolean(false)),
+    };
+    Ok(Value::Boolean(
+        Argon2::default()
+            .verify_password(&password, &parsed)
+            .is_ok(),
+    ))
 }

@@ -1,0 +1,15 @@
+[package]
+name = "cs-stdlib-xml"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab xml) — XML parsing and serialization."
+
+# roxmltree is pure Rust (only xmlparser/memchr), so this module
+# cross-compiles to wasm32-wasip1. Serialization is hand-written here.
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+roxmltree = "0.20"

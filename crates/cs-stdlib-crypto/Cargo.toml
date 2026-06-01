@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-description = "CrabScheme stdlib module (crab crypto) — secure randomness, AEAD encryption, and Ed25519 signatures."
+description = "CrabScheme stdlib module (crab crypto) — randomness, AEAD, Ed25519/X25519, HKDF, and Argon2."
 
 # All pure-Rust (RustCrypto + dalek) crates — no C, no OpenSSL — so
 # the module cross-compiles to wasm32-wasip1 (getrandom uses the WASI
@@ -17,5 +17,9 @@ cs-ffi = { workspace = true }
 getrandom = "0.2"
 chacha20poly1305 = "0.10"
 ed25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+sha2 = "0.10"
+argon2 = "0.5"
 subtle = "2"
 base64 = "0.22"

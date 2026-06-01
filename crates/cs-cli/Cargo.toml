@@ -71,9 +71,12 @@ stdlib = [
     "stdlib-cli",
     "stdlib-crypto",
     "stdlib-sql",
+    "stdlib-xml",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",
+    "stdlib-pprint",
+    "stdlib-dict",
     "stdlib-meta",
 ]
 stdlib-path = ["cs-runtime/stdlib-path"]
@@ -107,9 +110,12 @@ stdlib-signal = ["cs-runtime/stdlib-signal"]
 stdlib-cli = ["cs-runtime/stdlib-cli"]
 stdlib-crypto = ["cs-runtime/stdlib-crypto"]
 stdlib-sql = ["cs-runtime/stdlib-sql"]
+stdlib-xml = ["cs-runtime/stdlib-xml"]
 stdlib-functional = ["cs-runtime/stdlib-functional"]
 stdlib-iter = ["cs-runtime/stdlib-iter"]
 stdlib-test = ["cs-runtime/stdlib-test"]
+stdlib-pprint = ["cs-runtime/stdlib-pprint"]
+stdlib-dict = ["cs-runtime/stdlib-dict"]
 stdlib-meta = ["cs-runtime/stdlib-meta"]
 # cs-web tower-style framework + Scheme-actor-as-Layer primops.
 # Implies `actor` via the cs-runtime forwarding chain.
@@ -152,9 +158,12 @@ wasm-stdlib = [
     "stdlib-tty",
     "stdlib-cli",
     "stdlib-crypto",
+    "stdlib-xml",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",
+    "stdlib-pprint",
+    "stdlib-dict",
     "stdlib-meta",
 ]
 # `wasm-stdlib` plus the networking modules wasm32-wasip2 can host
