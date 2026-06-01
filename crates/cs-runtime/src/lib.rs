@@ -2052,6 +2052,16 @@ impl Runtime {
         self.load_bundled_library("(crab walk)", include_str!("scheme/walk.scm"));
         #[cfg(feature = "stdlib-sync")]
         self.load_bundled_library("(crab sync)", include_str!("scheme/sync.scm"));
+        // Testing toolkit. `prop` uses expect's printer + `spec` runs specs
+        // written with expect matchers, so load expect first.
+        #[cfg(feature = "stdlib-expect")]
+        self.load_bundled_library("(crab expect)", include_str!("scheme/expect.scm"));
+        #[cfg(feature = "stdlib-mock")]
+        self.load_bundled_library("(crab mock)", include_str!("scheme/mock.scm"));
+        #[cfg(feature = "stdlib-prop")]
+        self.load_bundled_library("(crab prop)", include_str!("scheme/prop.scm"));
+        #[cfg(feature = "stdlib-spec")]
+        self.load_bundled_library("(crab spec)", include_str!("scheme/spec.scm"));
         // Scheme extension of the Rust `(crab math)` module (combinatorics
         // + numeric helpers).
         #[cfg(feature = "stdlib-math")]

@@ -139,6 +139,10 @@ stdlib = [
     "stdlib-dict",
     "stdlib-walk",
     "stdlib-sync",
+    "stdlib-expect",
+    "stdlib-mock",
+    "stdlib-prop",
+    "stdlib-spec",
     "stdlib-meta",
 ]
 # Each `stdlib-<name>` feature also enables the matching
@@ -194,6 +198,10 @@ stdlib-pprint = ["bundled-scheme"]
 stdlib-dict = ["bundled-scheme"]
 stdlib-walk = ["bundled-scheme"]
 stdlib-sync = ["bundled-scheme"]
+stdlib-expect = ["bundled-scheme"]
+stdlib-mock = ["bundled-scheme"]
+stdlib-prop = ["bundled-scheme"]
+stdlib-spec = ["bundled-scheme"]
 
 [dependencies]
 cs-core = { workspace = true }

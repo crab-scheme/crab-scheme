@@ -81,6 +81,10 @@ stdlib = [
     "stdlib-dict",
     "stdlib-walk",
     "stdlib-sync",
+    "stdlib-expect",
+    "stdlib-mock",
+    "stdlib-prop",
+    "stdlib-spec",
     "stdlib-meta",
 ]
 stdlib-path = ["cs-runtime/stdlib-path"]
@@ -124,6 +128,10 @@ stdlib-pprint = ["cs-runtime/stdlib-pprint"]
 stdlib-dict = ["cs-runtime/stdlib-dict"]
 stdlib-walk = ["cs-runtime/stdlib-walk"]
 stdlib-sync = ["cs-runtime/stdlib-sync"]
+stdlib-expect = ["cs-runtime/stdlib-expect"]
+stdlib-mock = ["cs-runtime/stdlib-mock"]
+stdlib-prop = ["cs-runtime/stdlib-prop"]
+stdlib-spec = ["cs-runtime/stdlib-spec"]
 stdlib-meta = ["cs-runtime/stdlib-meta"]
 # cs-web tower-style framework + Scheme-actor-as-Layer primops.
 # Implies `actor` via the cs-runtime forwarding chain.
@@ -176,6 +184,10 @@ wasm-stdlib = [
     "stdlib-dict",
     "stdlib-walk",
     "stdlib-sync",
+    "stdlib-expect",
+    "stdlib-mock",
+    "stdlib-prop",
+    "stdlib-spec",
     "stdlib-meta",
 ]
 # `wasm-stdlib` plus the networking modules wasm32-wasip2 can host
