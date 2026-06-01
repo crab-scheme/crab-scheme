@@ -72,11 +72,15 @@ stdlib = [
     "stdlib-crypto",
     "stdlib-sql",
     "stdlib-xml",
+    "stdlib-binary",
+    "stdlib-template",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",
     "stdlib-pprint",
     "stdlib-dict",
+    "stdlib-walk",
+    "stdlib-sync",
     "stdlib-meta",
 ]
 stdlib-path = ["cs-runtime/stdlib-path"]
@@ -111,11 +115,15 @@ stdlib-cli = ["cs-runtime/stdlib-cli"]
 stdlib-crypto = ["cs-runtime/stdlib-crypto"]
 stdlib-sql = ["cs-runtime/stdlib-sql"]
 stdlib-xml = ["cs-runtime/stdlib-xml"]
+stdlib-binary = ["cs-runtime/stdlib-binary"]
+stdlib-template = ["cs-runtime/stdlib-template"]
 stdlib-functional = ["cs-runtime/stdlib-functional"]
 stdlib-iter = ["cs-runtime/stdlib-iter"]
 stdlib-test = ["cs-runtime/stdlib-test"]
 stdlib-pprint = ["cs-runtime/stdlib-pprint"]
 stdlib-dict = ["cs-runtime/stdlib-dict"]
+stdlib-walk = ["cs-runtime/stdlib-walk"]
+stdlib-sync = ["cs-runtime/stdlib-sync"]
 stdlib-meta = ["cs-runtime/stdlib-meta"]
 # cs-web tower-style framework + Scheme-actor-as-Layer primops.
 # Implies `actor` via the cs-runtime forwarding chain.
@@ -159,11 +167,15 @@ wasm-stdlib = [
     "stdlib-cli",
     "stdlib-crypto",
     "stdlib-xml",
+    "stdlib-binary",
+    "stdlib-template",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",
     "stdlib-pprint",
     "stdlib-dict",
+    "stdlib-walk",
+    "stdlib-sync",
     "stdlib-meta",
 ]
 # `wasm-stdlib` plus the networking modules wasm32-wasip2 can host

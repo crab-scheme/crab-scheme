@@ -45,3 +45,20 @@
 
 (test-false "parse-time returns #f on garbage"
             (parse-time "not a date" "%Y-%m-%d"))
+
+(test-section "(crab time) — date components")
+; Build a known instant so the test is self-consistent regardless of tz.
+(define __dt__ (time-make 2023 11 14 22 13 20))  ; 2023-11-14 22:13:20 UTC
+(test-equal "time-make matches the known epoch" 1700000000 __dt__)
+(test-equal "time-year" 2023 (time-year __dt__))
+(test-equal "time-month" 11 (time-month __dt__))
+(test-equal "time-day" 14 (time-day __dt__))
+(test-equal "time-hour" 22 (time-hour __dt__))
+(test-equal "time-minute" 13 (time-minute __dt__))
+(test-equal "time-second" 20 (time-second __dt__))
+(test-equal "time-weekday (2023-11-14 is Tuesday = 2)" 2 (time-weekday __dt__))
+
+(test-section "(crab time) — date arithmetic")
+(test-equal "time-add-days advances one day" 1700086400 (time-add-days __dt__ 1))
+(test-equal "time-add-days goes backward" 1699913600 (time-add-days __dt__ -1))
+(test-equal "make then extract round-trips the day" 25 (time-day (time-make 2020 12 25 0 0 0)))

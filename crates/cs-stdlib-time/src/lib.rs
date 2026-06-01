@@ -24,7 +24,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
 use cs_core::Value;
 use cs_ffi::error::FfiError;
 use cs_ffi::host::{HostProcedure, UntypedProc};
@@ -37,6 +37,15 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("sleep-ms", sleep_ms),
         UntypedProc::new("format-time", format_time),
         UntypedProc::new("parse-time", parse_time),
+        UntypedProc::new("time-year", time_year),
+        UntypedProc::new("time-month", time_month),
+        UntypedProc::new("time-day", time_day),
+        UntypedProc::new("time-hour", time_hour),
+        UntypedProc::new("time-minute", time_minute),
+        UntypedProc::new("time-second", time_second),
+        UntypedProc::new("time-weekday", time_weekday),
+        UntypedProc::new("time-make", time_make),
+        UntypedProc::new("time-add-days", time_add_days),
     ]
 }
 
@@ -154,4 +163,74 @@ fn parse_time(args: &[Value]) -> Result<Value, FfiError> {
         Ok(naive) => Ok(Value::fixnum(naive.and_utc().timestamp())),
         Err(_) => Ok(Value::Boolean(false)),
     }
+}
+
+// ----- date components + arithmetic (UTC) -----
+
+fn epoch_to_dt(name: &str, secs: i64) -> Result<DateTime<Utc>, FfiError> {
+    Utc.timestamp_opt(secs, 0)
+        .single()
+        .ok_or_else(|| FfiError::HostFailure(format!("{}: epoch {} out of range", name, secs)))
+}
+
+/// Extract one UTC component from an epoch-seconds timestamp.
+fn component(
+    name: &str,
+    args: &[Value],
+    f: impl FnOnce(&DateTime<Utc>) -> i64,
+) -> Result<Value, FfiError> {
+    let secs = expect_fixnum(name, args, 0)?;
+    Ok(Value::fixnum(f(&epoch_to_dt(name, secs)?)))
+}
+
+fn time_year(args: &[Value]) -> Result<Value, FfiError> {
+    component("time-year", args, |d| d.year() as i64)
+}
+fn time_month(args: &[Value]) -> Result<Value, FfiError> {
+    component("time-month", args, |d| d.month() as i64)
+}
+fn time_day(args: &[Value]) -> Result<Value, FfiError> {
+    component("time-day", args, |d| d.day() as i64)
+}
+fn time_hour(args: &[Value]) -> Result<Value, FfiError> {
+    component("time-hour", args, |d| d.hour() as i64)
+}
+fn time_minute(args: &[Value]) -> Result<Value, FfiError> {
+    component("time-minute", args, |d| d.minute() as i64)
+}
+fn time_second(args: &[Value]) -> Result<Value, FfiError> {
+    component("time-second", args, |d| d.second() as i64)
+}
+/// Day of week as 0 = Sunday .. 6 = Saturday (matches C `tm_wday`).
+fn time_weekday(args: &[Value]) -> Result<Value, FfiError> {
+    component("time-weekday", args, |d| {
+        d.weekday().num_days_from_sunday() as i64
+    })
+}
+
+/// `(time-make year month day hour minute second)` → epoch seconds (UTC).
+fn time_make(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() != 6 {
+        return Err(arity("time-make", "6", args.len()));
+    }
+    let y = expect_fixnum("time-make", args, 0)? as i32;
+    let mo = expect_fixnum("time-make", args, 1)? as u32;
+    let d = expect_fixnum("time-make", args, 2)? as u32;
+    let h = expect_fixnum("time-make", args, 3)? as u32;
+    let mi = expect_fixnum("time-make", args, 4)? as u32;
+    let se = expect_fixnum("time-make", args, 5)? as u32;
+    match Utc.with_ymd_and_hms(y, mo, d, h, mi, se).single() {
+        Some(dt) => Ok(Value::fixnum(dt.timestamp())),
+        None => Err(FfiError::HostFailure(format!(
+            "time-make: invalid date/time {}-{:02}-{:02} {:02}:{:02}:{:02}",
+            y, mo, d, h, mi, se
+        ))),
+    }
+}
+
+/// `(time-add-days ts n)` → ts advanced by `n` whole days (n may be negative).
+fn time_add_days(args: &[Value]) -> Result<Value, FfiError> {
+    let secs = expect_fixnum("time-add-days", args, 0)?;
+    let days = expect_fixnum("time-add-days", args, 1)?;
+    Ok(Value::fixnum(secs + days * 86_400))
 }

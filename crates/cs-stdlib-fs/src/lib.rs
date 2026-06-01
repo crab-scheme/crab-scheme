@@ -30,7 +30,8 @@
 //! | `file-size`            | string         | fixnum     | Bytes. |
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cs_core::Value;
@@ -58,6 +59,12 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("directory-create-all", directory_create_all),
         UntypedProc::new("directory-delete", directory_delete),
         UntypedProc::new("file-size", file_size),
+        UntypedProc::new("glob", glob_paths),
+        UntypedProc::new("copy-tree", copy_tree),
+        UntypedProc::new("remove-tree", remove_tree),
+        UntypedProc::new("temp-dir", temp_dir),
+        UntypedProc::new("make-temp-dir", make_temp_dir),
+        UntypedProc::new("make-temp-file", make_temp_file),
     ]
 }
 
@@ -249,4 +256,126 @@ fn directory_delete(args: &[Value]) -> Result<Value, FfiError> {
     fs::remove_dir(&p)
         .map(|_| Value::Unspecified)
         .map_err(|e| io_fail("directory-delete", &p, e))
+}
+
+// ----- glob / recursive copy+remove / temp -----
+
+/// `(glob pattern)` — list paths matching a shell-style glob (e.g.
+/// `"src/*.scm"`, `"**/*.txt"`). Unreadable matches are skipped.
+fn glob_paths(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() != 1 {
+        return Err(arity("glob", 1, args.len()));
+    }
+    let pat = expect_string("glob", args, 0)?;
+    let matches =
+        glob::glob(&pat).map_err(|e| FfiError::HostFailure(format!("glob: bad pattern: {}", e)))?;
+    let out: Vec<Value> = matches
+        .flatten()
+        .map(|p| string_value(p.to_string_lossy().into_owned()))
+        .collect();
+    Ok(Value::list(out))
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// `(copy-tree src dst)` — recursively copy a directory.
+fn copy_tree(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() != 2 {
+        return Err(arity("copy-tree", 2, args.len()));
+    }
+    let src = expect_string("copy-tree", args, 0)?;
+    let dst = expect_string("copy-tree", args, 1)?;
+    copy_dir_recursive(Path::new(&src), Path::new(&dst))
+        .map(|_| Value::Unspecified)
+        .map_err(|e| io_fail("copy-tree", &src, e))
+}
+
+/// `(remove-tree path)` — recursively delete a directory (rm -rf).
+fn remove_tree(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() != 1 {
+        return Err(arity("remove-tree", 1, args.len()));
+    }
+    let p = expect_string("remove-tree", args, 0)?;
+    fs::remove_dir_all(&p)
+        .map(|_| Value::Unspecified)
+        .map_err(|e| io_fail("remove-tree", &p, e))
+}
+
+/// `(temp-dir)` — the system temporary directory.
+fn temp_dir(args: &[Value]) -> Result<Value, FfiError> {
+    if !args.is_empty() {
+        return Err(arity("temp-dir", 0, args.len()));
+    }
+    Ok(string_value(
+        std::env::temp_dir().to_string_lossy().into_owned(),
+    ))
+}
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_temp_path(prefix: &str) -> PathBuf {
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("{}{}-{}-{}", prefix, pid, nanos, n))
+}
+
+fn temp_prefix(name: &str, args: &[Value]) -> Result<String, FfiError> {
+    match args.len() {
+        0 => Ok("crab-".to_string()),
+        1 => expect_string(name, args, 0),
+        n => Err(arity(name, 1, n)),
+    }
+}
+
+/// `(make-temp-dir [prefix])` — create and return a fresh temp directory.
+fn make_temp_dir(args: &[Value]) -> Result<Value, FfiError> {
+    let prefix = temp_prefix("make-temp-dir", args)?;
+    for _ in 0..100 {
+        let path = unique_temp_path(&prefix);
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(string_value(path.to_string_lossy().into_owned())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(io_fail("make-temp-dir", &path.to_string_lossy(), e)),
+        }
+    }
+    Err(FfiError::HostFailure(
+        "make-temp-dir: could not create a unique directory".into(),
+    ))
+}
+
+/// `(make-temp-file [prefix])` — create and return a fresh empty temp file.
+fn make_temp_file(args: &[Value]) -> Result<Value, FfiError> {
+    let prefix = temp_prefix("make-temp-file", args)?;
+    for _ in 0..100 {
+        let path = unique_temp_path(&prefix);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(string_value(path.to_string_lossy().into_owned())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(io_fail("make-temp-file", &path.to_string_lossy(), e)),
+        }
+    }
+    Err(FfiError::HostFailure(
+        "make-temp-file: could not create a unique file".into(),
+    ))
 }

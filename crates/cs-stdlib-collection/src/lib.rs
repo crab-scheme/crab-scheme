@@ -118,6 +118,10 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("set-contains?", set_contains_p),
         UntypedProc::new("set-size", set_size),
         UntypedProc::new("set->list", set_to_list),
+        UntypedProc::new("set-union", set_union),
+        UntypedProc::new("set-intersection", set_intersection),
+        UntypedProc::new("set-difference", set_difference),
+        UntypedProc::new("set-subset?", set_subset_p),
         UntypedProc::new("heap-new", heap_new),
         UntypedProc::new("heap-push!", heap_push),
         UntypedProc::new("heap-pop!", heap_pop),
@@ -295,6 +299,68 @@ fn set_to_list(args: &[Value]) -> Result<Value, FfiError> {
                 .collect::<Vec<_>>(),
         )),
         _ => Err(bad_kind("set->list", id, "set")),
+    })
+}
+
+/// Clone the `HashSet` behind a set handle (read-only).
+fn read_set(r: &Registry, name: &str, id: i64) -> Result<HashSet<String>, FfiError> {
+    match r.slots.get(&id) {
+        Some(Slot::Set(s)) => Ok(s.clone()),
+        Some(_) => Err(bad_kind(name, id, "set")),
+        None => Err(FfiError::HostFailure(format!(
+            "{}: bad handle {}",
+            name, id
+        ))),
+    }
+}
+
+/// Build a fresh set slot from `elems`, returning its handle. Done inside
+/// an existing `with_registry` borrow (can't call `insert`, which re-borrows).
+fn insert_set(r: &mut Registry, elems: HashSet<String>) -> Value {
+    let id = r.next_id;
+    r.next_id += 1;
+    r.slots.insert(id, Slot::Set(elems));
+    Value::fixnum(id)
+}
+
+/// Shared body for the binary set-combining ops.
+fn set_binop(
+    name: &str,
+    args: &[Value],
+    combine: impl FnOnce(&HashSet<String>, &HashSet<String>) -> HashSet<String>,
+) -> Result<Value, FfiError> {
+    let a = expect_fixnum(name, args, 0)?;
+    let b = expect_fixnum(name, args, 1)?;
+    with_registry(|r| {
+        let sa = read_set(r, name, a)?;
+        let sb = read_set(r, name, b)?;
+        Ok(insert_set(r, combine(&sa, &sb)))
+    })
+}
+
+fn set_union(args: &[Value]) -> Result<Value, FfiError> {
+    set_binop("set-union", args, |a, b| a.union(b).cloned().collect())
+}
+
+fn set_intersection(args: &[Value]) -> Result<Value, FfiError> {
+    set_binop("set-intersection", args, |a, b| {
+        a.intersection(b).cloned().collect()
+    })
+}
+
+fn set_difference(args: &[Value]) -> Result<Value, FfiError> {
+    set_binop("set-difference", args, |a, b| {
+        a.difference(b).cloned().collect()
+    })
+}
+
+fn set_subset_p(args: &[Value]) -> Result<Value, FfiError> {
+    let a = expect_fixnum("set-subset?", args, 0)?;
+    let b = expect_fixnum("set-subset?", args, 1)?;
+    with_registry(|r| {
+        let sa = read_set(r, "set-subset?", a)?;
+        let sb = read_set(r, "set-subset?", b)?;
+        Ok(Value::Boolean(sa.is_subset(&sb)))
     })
 }
 

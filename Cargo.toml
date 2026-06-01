@@ -88,6 +88,8 @@ members = [
     "crates/cs-stdlib-crypto",
     "crates/cs-stdlib-sql",
     "crates/cs-stdlib-xml",
+    "crates/cs-stdlib-binary",
+    "crates/cs-stdlib-template",
     "crates/cs-stdlib-meta",
 ]
 
@@ -181,6 +183,8 @@ cs-stdlib-cli = { path = "crates/cs-stdlib-cli" }
 cs-stdlib-crypto = { path = "crates/cs-stdlib-crypto" }
 cs-stdlib-sql = { path = "crates/cs-stdlib-sql" }
 cs-stdlib-xml = { path = "crates/cs-stdlib-xml" }
+cs-stdlib-binary = { path = "crates/cs-stdlib-binary" }
+cs-stdlib-template = { path = "crates/cs-stdlib-template" }
 cs-stdlib-meta = { path = "crates/cs-stdlib-meta" }
 
 # External crates

@@ -2010,6 +2010,14 @@ impl Runtime {
         for p in cs_stdlib_xml::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-binary")]
+        for p in cs_stdlib_binary::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-template")]
+        for p in cs_stdlib_template::procs() {
+            self.register_host_procedure(p);
+        }
         #[cfg(feature = "stdlib-meta")]
         for p in cs_stdlib_meta::procs() {
             self.register_host_procedure(p);
@@ -2040,6 +2048,10 @@ impl Runtime {
         self.load_bundled_library("(crab pprint)", include_str!("scheme/pprint.scm"));
         #[cfg(feature = "stdlib-dict")]
         self.load_bundled_library("(crab dict)", include_str!("scheme/dict.scm"));
+        #[cfg(feature = "stdlib-walk")]
+        self.load_bundled_library("(crab walk)", include_str!("scheme/walk.scm"));
+        #[cfg(feature = "stdlib-sync")]
+        self.load_bundled_library("(crab sync)", include_str!("scheme/sync.scm"));
         // Scheme extension of the Rust `(crab math)` module (combinatorics
         // + numeric helpers).
         #[cfg(feature = "stdlib-math")]
