@@ -48,6 +48,7 @@ cs-stdlib-cli = { workspace = true, optional = true }
 cs-stdlib-crypto = { workspace = true, optional = true }
 cs-stdlib-sql = { workspace = true, optional = true }
 cs-stdlib-xml = { workspace = true, optional = true }
+cs-stdlib-binary = { workspace = true, optional = true }
 
 [features]
 meta-path = ["dep:cs-stdlib-path"]
@@ -82,3 +83,4 @@ meta-cli = ["dep:cs-stdlib-cli"]
 meta-crypto = ["dep:cs-stdlib-crypto"]
 meta-sql = ["dep:cs-stdlib-sql"]
 meta-xml = ["dep:cs-stdlib-xml"]
+meta-binary = ["dep:cs-stdlib-binary"]

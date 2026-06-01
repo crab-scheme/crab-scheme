@@ -1201,6 +1201,7 @@ dependencies = [
  "cs-sandbox-wasm",
  "cs-stdlib-archive",
  "cs-stdlib-base",
+ "cs-stdlib-binary",
  "cs-stdlib-cli",
  "cs-stdlib-collection",
  "cs-stdlib-compress",
@@ -1269,6 +1270,14 @@ dependencies = [
  "cs-core",
  "cs-ffi",
  "hex",
+]
+
+[[package]]
+name = "cs-stdlib-binary"
+version = "1.0.0-rc7"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
 ]
 
 [[package]]
@@ -1408,6 +1417,7 @@ dependencies = [
  "cs-ffi",
  "cs-stdlib-archive",
  "cs-stdlib-base",
+ "cs-stdlib-binary",
  "cs-stdlib-cli",
  "cs-stdlib-collection",
  "cs-stdlib-compress",
