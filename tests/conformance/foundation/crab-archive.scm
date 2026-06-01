@@ -102,5 +102,17 @@
 (test-true "tar-extract refuses output exceeding max-bytes cap"
            (guard (e (#t #t)) (tar-extract __tar__ __extract__ 1) #f))
 
+(test-section "(crab archive) — zip-create")
+
+(define __myzip__ (string-append __tmp__ "/created.zip"))
+(zip-create __myzip__ (list (cons "a.txt" "alpha") (cons "b.txt" "beta")))
+(test-equal "zip-create then zip-list" '("a.txt" "b.txt") (zip-list __myzip__))
+
+(define __zout__ (string-append __tmp__ "/zout"))
+(zip-extract __myzip__ __zout__)
+(test-equal "zip-create content round-trips"
+            "alpha"
+            (read-file-string (string-append __zout__ "/a.txt")))
+
 ;; ---- cleanup ----
 (rm-rf __tmp__)

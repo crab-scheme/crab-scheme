@@ -45,8 +45,10 @@
 //! | `tar-gz-extract`   | archive-path dest-dir [max] | unspec          | max default 256 MB. |
 //! | `zip-list`         | archive-path                | list of strings |
 //! | `zip-extract`      | archive-path dest-dir [max] | unspec          | max default 256 MB. |
+//! | `zip-create`       | archive-path entries        | unspec          | entries: list of (name . string-or-bytevector); deflate. |
 
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -70,7 +72,63 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("tar-gz-extract", tar_gz_extract),
         UntypedProc::new("zip-list", zip_list),
         UntypedProc::new("zip-extract", zip_extract),
+        UntypedProc::new("zip-create", zip_create),
     ]
+}
+
+/// `(zip-create archive-path entries)` — write a zip (deflate) from a list
+/// of `(name . content)` pairs, where content is a string or bytevector.
+fn zip_create(args: &[Value]) -> Result<Value, FfiError> {
+    let name = "zip-create";
+    let path = expect_string(name, args, 0)?;
+    let entries = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| arity(name, "2", args.len()))?;
+    let f = File::create(&path).map_err(|e| io_fail(name, &path, e))?;
+    let mut zip = zip::ZipWriter::new(f);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    let mut cur = entries;
+    while let Value::Pair(p) = cur {
+        let (ename, content) = match p.car() {
+            Value::Pair(ep) => (ep.car(), ep.cdr()),
+            other => {
+                return Err(FfiError::HostFailure(format!(
+                    "{}: each entry must be a (name . content) pair, got {}",
+                    name,
+                    other.type_name()
+                )))
+            }
+        };
+        let ename = match ename {
+            Value::String(s) => s.borrow().clone(),
+            other => {
+                return Err(FfiError::TypeMismatch {
+                    expected: "string (entry name)",
+                    got: other.type_name().to_string(),
+                })
+            }
+        };
+        let bytes: Vec<u8> = match content {
+            Value::String(s) => s.borrow().as_bytes().to_vec(),
+            Value::ByteVector(b) => b.borrow().clone(),
+            other => {
+                return Err(FfiError::TypeMismatch {
+                    expected: "string or bytevector (entry content)",
+                    got: other.type_name().to_string(),
+                })
+            }
+        };
+        zip.start_file(ename, options)
+            .map_err(|e| FfiError::HostFailure(format!("{}: {}", name, e)))?;
+        zip.write_all(&bytes).map_err(|e| io_fail(name, &path, e))?;
+        cur = p.cdr();
+    }
+    zip.finish()
+        .map_err(|e| FfiError::HostFailure(format!("{}: {}", name, e)))?;
+    Ok(Value::Unspecified)
 }
 
 // ----- helpers -----
