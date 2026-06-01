@@ -6775,6 +6775,28 @@ fn ht_eq_ctx(
     Ok(r.is_truthy())
 }
 
+/// Index of an entry whose key matches `key`, if any. Custom-equiv tables
+/// apply the user's equiv procedure (via `ht_eq_ctx`); built-in kinds use
+/// the host comparator. Centralizes the Custom/built-in dispatch so callers
+/// (e.g. `hashtable-update!`) don't accidentally route a Custom table
+/// through `ht_eq`, which panics on the Custom kind.
+fn ht_find_index(h: &Hashtable, key: &Value, ctx: &mut EvalCtx) -> Result<Option<usize>, String> {
+    if h.eq_kind == HtEqKind::Custom {
+        let len = h.items.borrow().len();
+        for i in 0..len {
+            let k = h.items.borrow()[i].0.clone();
+            if ht_eq_ctx(h, &k, key, ctx)? {
+                return Ok(Some(i));
+            }
+        }
+        Ok(None)
+    } else {
+        let kind = h.eq_kind;
+        let items = h.items.borrow();
+        Ok(items.iter().position(|(k, _)| ht_eq(kind, k, key)))
+    }
+}
+
 fn as_ht<'a>(name: &str, v: &'a Value) -> Result<&'a cs_core::Gc<Hashtable>, String> {
     match v {
         Value::Hashtable(h) => Ok(h),
@@ -7043,23 +7065,21 @@ fn b_hashtable_update_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
     if args.len() != 4 {
         return Err(arity_err("hashtable-update!", "4", args.len()));
     }
-    let h = as_ht("hashtable-update!", &args[0])?;
-    let kind = h.eq_kind;
-    let current = {
-        let items = h.items.borrow();
-        items
-            .iter()
-            .find(|(k, _)| ht_eq(kind, k, &args[1]))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| args[3].clone())
+    let h = as_ht("hashtable-update!", &args[0])?.clone();
+    // Look up via ht_find_index so custom-equiv (equal?) tables apply the
+    // user's equiv proc instead of routing through ht_eq (which panics on
+    // the Custom kind) — matches set!/ref/contains!/delete!.
+    let current = match ht_find_index(&h, &args[1], ctx)? {
+        Some(i) => h.items.borrow()[i].1.clone(),
+        None => args[3].clone(),
     };
     let new_val =
         apply_procedure(&args[2], &[current], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
-    let mut items = h.items.borrow_mut();
-    if let Some(slot) = items.iter_mut().find(|(k, _)| ht_eq(kind, k, &args[1])) {
-        slot.1 = new_val;
+    // Re-locate after the update proc runs — it may have mutated the table.
+    if let Some(i) = ht_find_index(&h, &args[1], ctx)? {
+        h.items.borrow_mut()[i].1 = new_val;
     } else {
-        items.push((args[1].clone(), new_val));
+        h.items.borrow_mut().push((args[1].clone(), new_val));
     }
     Ok(Value::Unspecified)
 }

@@ -365,6 +365,16 @@ fn conformance_control() {
 }
 
 #[test]
+fn conformance_define_rest_args() {
+    run_conformance_file("define-rest-args.scm");
+}
+
+#[test]
+fn conformance_hashtable_custom_equiv() {
+    run_conformance_file("hashtable-custom-equiv.scm");
+}
+
+#[test]
 fn conformance_strings() {
     run_conformance_file("strings.scm");
 }
