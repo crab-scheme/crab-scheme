@@ -66,3 +66,29 @@
            (guard (e (#t #t))
              (queue-push! __h__ "x")
              #f))
+
+(test-section "(crab collection) — set algebra")
+(define __s1__ (set-new))
+(set-add! __s1__ "a") (set-add! __s1__ "b") (set-add! __s1__ "c")
+(define __s2__ (set-new))
+(set-add! __s2__ "b") (set-add! __s2__ "c") (set-add! __s2__ "d")
+
+(define __u__ (set-union __s1__ __s2__))
+(test-equal "union size" 4 (set-size __u__))
+(test-true "union contains a" (set-contains? __u__ "a"))
+(test-true "union contains d" (set-contains? __u__ "d"))
+
+(define __i__ (set-intersection __s1__ __s2__))
+(test-equal "intersection size" 2 (set-size __i__))
+(test-true "intersection contains b" (set-contains? __i__ "b"))
+(test-false "intersection excludes a" (set-contains? __i__ "a"))
+
+(define __d__ (set-difference __s1__ __s2__))
+(test-equal "difference (s1 - s2) size" 1 (set-size __d__))
+(test-true "difference contains a" (set-contains? __d__ "a"))
+(test-false "difference excludes b" (set-contains? __d__ "b"))
+
+(define __sub__ (set-new))
+(set-add! __sub__ "a") (set-add! __sub__ "b")
+(test-true "subset? holds" (set-subset? __sub__ __s1__))
+(test-false "subset? fails the other way" (set-subset? __s1__ __sub__))

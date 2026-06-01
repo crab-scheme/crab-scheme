@@ -53,3 +53,30 @@
        (cond ((> (* d d) n) #t)
              ((= 0 (modulo n d)) #f)
              (else (loop (+ d 2))))))))
+
+;; --- bit operations (width-relative; Scheme integers are unbounded, so
+;; rotates/leading-zeros take an explicit bit `width`). Popcount and
+;; bit length already exist as R6RS `bitwise-bit-count`/`bitwise-length`.
+
+;; Rotate the low `width` bits of `x` left by `n` positions.
+(define (bit-rotate-left x n width)
+  (let* ((mask (- (expt 2 width) 1))
+         (x (bitwise-and x mask))
+         (n (modulo n width)))
+    (bitwise-and mask
+                 (bitwise-or (bitwise-arithmetic-shift x n)
+                             (bitwise-arithmetic-shift x (- n width))))))
+
+;; Rotate the low `width` bits of `x` right by `n` positions.
+(define (bit-rotate-right x n width)
+  (bit-rotate-left x (- width (modulo n width)) width))
+
+;; Leading zero bits in the `width`-bit representation of `x` (x >= 0).
+(define (bit-leading-zeros x width)
+  (- width (bitwise-length x)))
+
+;; Trailing zero bits of `x` (the index of its lowest set bit); 0 has none.
+(define (bit-trailing-zeros x)
+  (if (= x 0)
+      0
+      (- (bitwise-length (bitwise-and x (- x))) 1)))
