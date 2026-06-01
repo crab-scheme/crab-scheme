@@ -1226,6 +1226,7 @@ dependencies = [
  "cs-stdlib-signal",
  "cs-stdlib-sql",
  "cs-stdlib-string",
+ "cs-stdlib-template",
  "cs-stdlib-time",
  "cs-stdlib-toml",
  "cs-stdlib-tty",
@@ -1441,6 +1442,7 @@ dependencies = [
  "cs-stdlib-signal",
  "cs-stdlib-sql",
  "cs-stdlib-string",
+ "cs-stdlib-template",
  "cs-stdlib-time",
  "cs-stdlib-toml",
  "cs-stdlib-tty",
@@ -1530,6 +1532,14 @@ dependencies = [
 
 [[package]]
 name = "cs-stdlib-string"
+version = "1.0.0-rc7"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
+]
+
+[[package]]
+name = "cs-stdlib-template"
 version = "1.0.0-rc7"
 dependencies = [
  "cs-core",

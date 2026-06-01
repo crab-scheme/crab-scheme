@@ -73,6 +73,7 @@ stdlib = [
     "stdlib-sql",
     "stdlib-xml",
     "stdlib-binary",
+    "stdlib-template",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",
@@ -115,6 +116,7 @@ stdlib-crypto = ["cs-runtime/stdlib-crypto"]
 stdlib-sql = ["cs-runtime/stdlib-sql"]
 stdlib-xml = ["cs-runtime/stdlib-xml"]
 stdlib-binary = ["cs-runtime/stdlib-binary"]
+stdlib-template = ["cs-runtime/stdlib-template"]
 stdlib-functional = ["cs-runtime/stdlib-functional"]
 stdlib-iter = ["cs-runtime/stdlib-iter"]
 stdlib-test = ["cs-runtime/stdlib-test"]
@@ -166,6 +168,7 @@ wasm-stdlib = [
     "stdlib-crypto",
     "stdlib-xml",
     "stdlib-binary",
+    "stdlib-template",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",

@@ -2014,6 +2014,10 @@ impl Runtime {
         for p in cs_stdlib_binary::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-template")]
+        for p in cs_stdlib_template::procs() {
+            self.register_host_procedure(p);
+        }
         #[cfg(feature = "stdlib-meta")]
         for p in cs_stdlib_meta::procs() {
             self.register_host_procedure(p);

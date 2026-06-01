@@ -336,6 +336,12 @@ fn conformance_crab_binary() {
 }
 
 #[test]
+#[cfg(feature = "stdlib-template")]
+fn conformance_crab_template() {
+    run_conformance_file("crab-template.scm");
+}
+
+#[test]
 #[cfg(feature = "stdlib-functional")]
 fn conformance_crab_functional() {
     run_conformance_file("crab-functional.scm");

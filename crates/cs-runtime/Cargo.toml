@@ -131,6 +131,7 @@ stdlib = [
     "stdlib-sql",
     "stdlib-xml",
     "stdlib-binary",
+    "stdlib-template",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",
@@ -181,6 +182,7 @@ stdlib-crypto = ["ffi-trait", "dep:cs-stdlib-crypto", "cs-stdlib-meta?/meta-cryp
 stdlib-sql = ["ffi-trait", "dep:cs-stdlib-sql", "cs-stdlib-meta?/meta-sql"]
 stdlib-xml = ["ffi-trait", "dep:cs-stdlib-xml", "cs-stdlib-meta?/meta-xml"]
 stdlib-binary = ["ffi-trait", "dep:cs-stdlib-binary", "cs-stdlib-meta?/meta-binary"]
+stdlib-template = ["ffi-trait", "dep:cs-stdlib-template", "cs-stdlib-meta?/meta-template"]
 # Bundled Scheme libraries (no Rust crate / no host procs): each pulls
 # in `bundled-scheme`, which gates the include_str! + eval at startup in
 # register_stdlib. Adding a new bundled lib needs only its own feature.
@@ -286,6 +288,7 @@ cs-stdlib-crypto = { workspace = true, optional = true }
 cs-stdlib-sql = { workspace = true, optional = true }
 cs-stdlib-xml = { workspace = true, optional = true }
 cs-stdlib-binary = { workspace = true, optional = true }
+cs-stdlib-template = { workspace = true, optional = true }
 cs-stdlib-meta = { workspace = true, optional = true }
 
 [dev-dependencies]

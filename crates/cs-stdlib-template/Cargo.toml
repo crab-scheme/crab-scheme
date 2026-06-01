@@ -1,0 +1,13 @@
+[package]
+name = "cs-stdlib-template"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab template) — mustache-style text/HTML templating."
+
+# Pure Rust, no dependencies — portable everywhere including wasm32.
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
