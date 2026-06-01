@@ -13,37 +13,26 @@
 
 ;; (range end) | (range start end) | (range start end step).
 ;; Half-open: the result excludes `end`. `step` may be negative.
-;; (Explicit `lambda` rest list — the `(define (range . args) …)` sugar
-;; isn't accepted by the reader.)
-(define range
-  (lambda args
-    (let ((start (if (null? (cdr args)) 0 (car args)))
-          (end (if (null? (cdr args)) (car args) (cadr args)))
-          (step (if (or (null? (cdr args)) (null? (cddr args))) 1 (caddr args))))
-      (when (= step 0) (error "range: step must be non-zero"))
-      (let loop ((i start) (acc '()))
-        (if (if (> step 0) (>= i end) (<= i end))
-            (reverse acc)
-            (loop (+ i step) (cons i acc)))))))
+(define (range . args)
+  (let ((start (if (null? (cdr args)) 0 (car args)))
+        (end (if (null? (cdr args)) (car args) (cadr args)))
+        (step (if (or (null? (cdr args)) (null? (cddr args))) 1 (caddr args))))
+    (when (= step 0) (error "range: step must be non-zero"))
+    (let loop ((i start) (acc '()))
+      (if (if (> step 0) (>= i end) (<= i end))
+          (reverse acc)
+          (loop (+ i step) (cons i acc))))))
 
 ;; Remove duplicates (compared with `equal?`), keeping first occurrence
 ;; and preserving order.
-;;
-;; NB: the grouping/dedup procedures here use only hashtable-ref and
-;; hashtable-set! (with a unique sentinel for "absent"). hashtable-
-;; contains? / hashtable-update! currently hit an internal-error on
-;; custom-equiv (equal?) hashtables in the runtime, so we route around
-;; them. (Tracked as a runtime bug to fix separately.)
 (define (distinct lst)
-  (let ((seen (make-hashtable equal-hash equal?))
-        (missing (list 'missing)))
+  (let ((seen (make-hashtable equal-hash equal?)))
     (let loop ((lst lst) (acc '()))
       (cond
         ((null? lst) (reverse acc))
-        ((eq? (hashtable-ref seen (car lst) missing) missing)
-         (hashtable-set! seen (car lst) #t)
-         (loop (cdr lst) (cons (car lst) acc)))
-        (else (loop (cdr lst) acc))))))
+        ((hashtable-contains? seen (car lst)) (loop (cdr lst) acc))
+        (else (hashtable-set! seen (car lst) #t)
+              (loop (cdr lst) (cons (car lst) acc)))))))
 
 ;; (iterate f x n) = (x (f x) (f (f x)) …) of length n.
 (define (iterate f x n)
@@ -56,16 +45,13 @@
 ;; original order.
 (define (group-by key-fn lst)
   (let ((tbl (make-hashtable equal-hash equal?))
-        (missing (list 'missing))
         (order '()))
     (for-each
      (lambda (x)
-       (let* ((k (key-fn x))
-              (cur (hashtable-ref tbl k missing)))
-         (if (eq? cur missing)
-             (begin (set! order (cons k order))
-                    (hashtable-set! tbl k (list x)))
-             (hashtable-set! tbl k (cons x cur)))))
+       (let ((k (key-fn x)))
+         (unless (hashtable-contains? tbl k)
+           (set! order (cons k order)))
+         (hashtable-update! tbl k (lambda (cur) (cons x cur)) '())))
      lst)
     (map (lambda (k) (cons k (reverse (hashtable-ref tbl k '()))))
          (reverse order))))
@@ -74,15 +60,12 @@
 ;; in first-seen order.
 (define (frequencies lst)
   (let ((tbl (make-hashtable equal-hash equal?))
-        (missing (list 'missing))
         (order '()))
     (for-each
      (lambda (x)
-       (let ((cur (hashtable-ref tbl x missing)))
-         (if (eq? cur missing)
-             (begin (set! order (cons x order))
-                    (hashtable-set! tbl x 1))
-             (hashtable-set! tbl x (+ cur 1)))))
+       (unless (hashtable-contains? tbl x)
+         (set! order (cons x order)))
+       (hashtable-update! tbl x (lambda (c) (+ c 1)) 0))
      lst)
     (map (lambda (x) (cons x (hashtable-ref tbl x 0))) (reverse order))))
 
@@ -100,11 +83,10 @@
               (take-n (cdr rest) (- k 1) (cons (car rest) head)))))))
 
 ;; Interleave elements of several lists, stopping at the shortest.
-(define interleave
-  (lambda lsts
-    (if (or (null? lsts) (memv '() lsts))
-        '()
-        (append (map car lsts) (apply interleave (map cdr lsts))))))
+(define (interleave . lsts)
+  (if (or (null? lsts) (memv '() lsts))
+      '()
+      (append (map car lsts) (apply interleave (map cdr lsts)))))
 
 ;; Deeply flatten a nested list into a flat list.
 (define (flatten lst)

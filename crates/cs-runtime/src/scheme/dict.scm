@@ -12,12 +12,11 @@
 ;;; are linear.)
 
 ;; (dict-ref d key [default]) — value for `key`, or `default` (or #f).
-(define dict-ref
-  (lambda (d key . default)
-    (let ((p (assoc key d)))
-      (cond (p (cdr p))
-            ((null? default) #f)
-            (else (car default))))))
+(define (dict-ref d key . default)
+  (let ((p (assoc key d)))
+    (cond (p (cdr p))
+          ((null? default) #f)
+          (else (car default)))))
 
 (define (dict-has? d key)
   (if (assoc key d) #t #f))
@@ -45,15 +44,14 @@
 
 ;; (get-in d path [default]) — follow `path` (a list of keys) through
 ;; nested dicts; return the value found, or `default` (or #f).
-(define get-in
-  (lambda (d path . default)
-    (let loop ((d d) (path path))
-      (if (null? path)
-          d
-          (let ((p (and (pair? d) (assoc (car path) d))))
-            (if p
-                (loop (cdr p) (cdr path))
-                (if (null? default) #f (car default))))))))
+(define (get-in d path . default)
+  (let loop ((d d) (path path))
+    (if (null? path)
+        d
+        (let ((p (and (pair? d) (assoc (car path) d))))
+          (if p
+              (loop (cdr p) (cdr path))
+              (if (null? default) #f (car default)))))))
 
 ;; Set the value at nested `path`, creating intermediate dicts as
 ;; needed; returns a new nested structure.
@@ -68,10 +66,9 @@
   (assoc-in d path (f (get-in d path))))
 
 ;; Merge dicts left-to-right; later dicts win on key collisions.
-(define merge
-  (lambda dicts
-    (fold-left
-     (lambda (acc d)
-       (fold-left (lambda (acc p) (dict-set acc (car p) (cdr p))) acc d))
-     '()
-     dicts)))
+(define (merge . dicts)
+  (fold-left
+   (lambda (acc d)
+     (fold-left (lambda (acc p) (dict-set acc (car p) (cdr p))) acc d))
+   '()
+   dicts))
