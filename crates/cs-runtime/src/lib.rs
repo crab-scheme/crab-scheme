@@ -2018,6 +2018,14 @@ impl Runtime {
         for p in cs_stdlib_template::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-ini")]
+        for p in cs_stdlib_ini::procs() {
+            self.register_host_procedure(p);
+        }
+        #[cfg(feature = "stdlib-yaml")]
+        for p in cs_stdlib_yaml::procs() {
+            self.register_host_procedure(p);
+        }
         #[cfg(feature = "stdlib-meta")]
         for p in cs_stdlib_meta::procs() {
             self.register_host_procedure(p);

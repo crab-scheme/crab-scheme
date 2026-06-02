@@ -50,6 +50,8 @@ cs-stdlib-sql = { workspace = true, optional = true }
 cs-stdlib-xml = { workspace = true, optional = true }
 cs-stdlib-binary = { workspace = true, optional = true }
 cs-stdlib-template = { workspace = true, optional = true }
+cs-stdlib-ini = { workspace = true, optional = true }
+cs-stdlib-yaml = { workspace = true, optional = true }
 
 [features]
 meta-path = ["dep:cs-stdlib-path"]
@@ -86,3 +88,5 @@ meta-sql = ["dep:cs-stdlib-sql"]
 meta-xml = ["dep:cs-stdlib-xml"]
 meta-binary = ["dep:cs-stdlib-binary"]
 meta-template = ["dep:cs-stdlib-template"]
+meta-ini = ["dep:cs-stdlib-ini"]
+meta-yaml = ["dep:cs-stdlib-yaml"]

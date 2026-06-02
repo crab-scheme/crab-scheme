@@ -74,6 +74,8 @@ stdlib = [
     "stdlib-xml",
     "stdlib-binary",
     "stdlib-template",
+    "stdlib-ini",
+    "stdlib-yaml",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",
@@ -121,6 +123,8 @@ stdlib-sql = ["cs-runtime/stdlib-sql"]
 stdlib-xml = ["cs-runtime/stdlib-xml"]
 stdlib-binary = ["cs-runtime/stdlib-binary"]
 stdlib-template = ["cs-runtime/stdlib-template"]
+stdlib-ini = ["cs-runtime/stdlib-ini"]
+stdlib-yaml = ["cs-runtime/stdlib-yaml"]
 stdlib-functional = ["cs-runtime/stdlib-functional"]
 stdlib-iter = ["cs-runtime/stdlib-iter"]
 stdlib-test = ["cs-runtime/stdlib-test"]
@@ -177,6 +181,8 @@ wasm-stdlib = [
     "stdlib-xml",
     "stdlib-binary",
     "stdlib-template",
+    "stdlib-ini",
+    "stdlib-yaml",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",

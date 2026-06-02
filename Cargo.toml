@@ -90,6 +90,8 @@ members = [
     "crates/cs-stdlib-xml",
     "crates/cs-stdlib-binary",
     "crates/cs-stdlib-template",
+    "crates/cs-stdlib-ini",
+    "crates/cs-stdlib-yaml",
     "crates/cs-stdlib-meta",
 ]
 
@@ -185,6 +187,8 @@ cs-stdlib-sql = { path = "crates/cs-stdlib-sql" }
 cs-stdlib-xml = { path = "crates/cs-stdlib-xml" }
 cs-stdlib-binary = { path = "crates/cs-stdlib-binary" }
 cs-stdlib-template = { path = "crates/cs-stdlib-template" }
+cs-stdlib-ini = { path = "crates/cs-stdlib-ini" }
+cs-stdlib-yaml = { path = "crates/cs-stdlib-yaml" }
 cs-stdlib-meta = { path = "crates/cs-stdlib-meta" }
 
 # External crates
