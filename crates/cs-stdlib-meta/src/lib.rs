@@ -88,6 +88,7 @@ fn manifest() -> Vec<(&'static str, Vec<String>)> {
     add!("template", "meta-template", cs_stdlib_template);
     add!("ini", "meta-ini", cs_stdlib_ini);
     add!("yaml", "meta-yaml", cs_stdlib_yaml);
+    add!("tls", "meta-tls", cs_stdlib_tls);
 
     out.sort_by_key(|(n, _)| *n);
     out

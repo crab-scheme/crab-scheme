@@ -1235,6 +1235,7 @@ dependencies = [
  "cs-stdlib-string",
  "cs-stdlib-template",
  "cs-stdlib-time",
+ "cs-stdlib-tls",
  "cs-stdlib-toml",
  "cs-stdlib-tty",
  "cs-stdlib-url",
@@ -1461,6 +1462,7 @@ dependencies = [
  "cs-stdlib-string",
  "cs-stdlib-template",
  "cs-stdlib-time",
+ "cs-stdlib-tls",
  "cs-stdlib-toml",
  "cs-stdlib-tty",
  "cs-stdlib-url",
@@ -1571,6 +1573,17 @@ dependencies = [
  "chrono",
  "cs-core",
  "cs-ffi",
+]
+
+[[package]]
+name = "cs-stdlib-tls"
+version = "1.0.0-rc7"
+dependencies = [
+ "cs-core",
+ "cs-ffi",
+ "rustls",
+ "rustls-pki-types",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

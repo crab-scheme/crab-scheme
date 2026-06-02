@@ -406,6 +406,12 @@ fn conformance_crab_yaml() {
     run_conformance_file("crab-yaml.scm");
 }
 
+#[test]
+#[cfg(feature = "stdlib-tls")]
+fn conformance_crab_tls() {
+    run_conformance_file("crab-tls.scm");
+}
+
 // `(crab)` meta needs the umbrella `stdlib` feature on so the
 // manifest actually has the modules the test spot-checks for
 // (path, fs, json, hash, http, collection, signal). Subset
