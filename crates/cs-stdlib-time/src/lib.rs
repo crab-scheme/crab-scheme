@@ -46,6 +46,9 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("time-weekday", time_weekday),
         UntypedProc::new("time-make", time_make),
         UntypedProc::new("time-add-days", time_add_days),
+        UntypedProc::new("time-leap-year?", time_leap_year_p),
+        UntypedProc::new("time-days-in-month", time_days_in_month),
+        UntypedProc::new("time-day-of-year", time_day_of_year),
     ]
 }
 
@@ -233,4 +236,51 @@ fn time_add_days(args: &[Value]) -> Result<Value, FfiError> {
     let secs = expect_fixnum("time-add-days", args, 0)?;
     let days = expect_fixnum("time-add-days", args, 1)?;
     Ok(Value::fixnum(secs + days * 86_400))
+}
+
+// ----- calendar helpers -----
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0)
+}
+
+/// `(time-leap-year? year)` → whether `year` is a Gregorian leap year.
+fn time_leap_year_p(args: &[Value]) -> Result<Value, FfiError> {
+    Ok(Value::Boolean(is_leap(expect_fixnum(
+        "time-leap-year?",
+        args,
+        0,
+    )?)))
+}
+
+/// `(time-days-in-month year month)` → days in `month` (1-12) of `year`.
+fn time_days_in_month(args: &[Value]) -> Result<Value, FfiError> {
+    let y = expect_fixnum("time-days-in-month", args, 0)?;
+    let m = expect_fixnum("time-days-in-month", args, 1)?;
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap(y) {
+                29
+            } else {
+                28
+            }
+        }
+        other => {
+            return Err(FfiError::HostFailure(format!(
+                "time-days-in-month: month must be 1-12, got {}",
+                other
+            )))
+        }
+    };
+    Ok(Value::fixnum(days))
+}
+
+/// `(time-day-of-year ts)` → day of the year (1-366) for an epoch timestamp.
+fn time_day_of_year(args: &[Value]) -> Result<Value, FfiError> {
+    let secs = expect_fixnum("time-day-of-year", args, 0)?;
+    Ok(Value::fixnum(
+        epoch_to_dt("time-day-of-year", secs)?.ordinal() as i64,
+    ))
 }

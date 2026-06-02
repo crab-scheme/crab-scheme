@@ -30,7 +30,51 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("base64url-decode", base64url_decode),
         UntypedProc::new("hex-encode", hex_encode),
         UntypedProc::new("hex-decode", hex_decode),
+        UntypedProc::new("pem-encode", pem_encode),
+        UntypedProc::new("pem-decode", pem_decode),
     ]
+}
+
+/// `(pem-encode label data)` — wrap `data` (bytevector) as a PEM block:
+/// `-----BEGIN <label>-----`, base64 (64-char lines), `-----END <label>-----`.
+fn pem_encode(args: &[Value]) -> Result<Value, FfiError> {
+    let label = expect_string("pem-encode", args, 0)?;
+    let data = expect_bv("pem-encode", args, 1)?;
+    let b64 = general_purpose::STANDARD.encode(&data);
+    let mut out = String::new();
+    out.push_str("-----BEGIN ");
+    out.push_str(&label);
+    out.push_str("-----\n");
+    let mut i = 0;
+    while i < b64.len() {
+        let end = (i + 64).min(b64.len());
+        out.push_str(&b64[i..end]); // base64 is ASCII, so byte slicing is safe
+        out.push('\n');
+        i = end;
+    }
+    out.push_str("-----END ");
+    out.push_str(&label);
+    out.push_str("-----\n");
+    Ok(string_value(out))
+}
+
+/// `(pem-decode pem-string)` — decode the base64 body of a PEM block,
+/// ignoring the `-----BEGIN/END-----` armor and whitespace. Returns a
+/// bytevector. (Concatenates the body of a single block.)
+fn pem_decode(args: &[Value]) -> Result<Value, FfiError> {
+    let s = expect_string("pem-decode", args, 0)?;
+    let mut b64 = String::new();
+    for line in s.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("-----") {
+            continue;
+        }
+        b64.push_str(t);
+    }
+    let bytes = general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| FfiError::HostFailure(format!("pem-decode: invalid base64: {}", e)))?;
+    Ok(bv_value(bytes))
 }
 
 // ----- helpers -----
