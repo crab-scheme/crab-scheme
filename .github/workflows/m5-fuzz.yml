@@ -33,7 +33,12 @@ jobs:
   fuzz:
     name: m5 gc fuzz (1h)
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    # Budget = the ~45-min release build of cs-runtime's test deps +
+    # the 1-hour fuzz loop below + the gc_timing snapshot, with margin.
+    # The old 75-min cap cut the fuzz loop off mid-run (the build alone
+    # eats ~45 min, leaving <30 min of the intended 60-min loop), which
+    # surfaced as a "runner received a shutdown signal" cancellation.
+    timeout-minutes: 150
 
     steps:
       - uses: actions/checkout@v4
