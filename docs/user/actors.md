@@ -49,11 +49,51 @@ The seven primop surface area (all single-arity, all sync):
 |---|---|
 | `(spawn 'name arg ...)` | Spawn an actor body registered under `'name`. Returns a PID. |
 | `(spawn-source "source-text")` | Spawn from a Scheme source string. Useful for dynamic actors. |
+| `(spawn-activation "source" 'handler)` | Spawn a **parking** actor on the LocalSet pool: a framework loop calls `(handler msg)` per message, releasing its worker between messages. Scales past the 4096 thread-per-actor ceiling — see [Two scheduling models](#two-scheduling-models-blocking-vs-parking). |
 | `(send pid msg)` | Send `msg` (any `SendableValue` shape — no procedures) to `pid`. |
 | `(self)` | This actor's PID. |
 | `(raw-receive)` | Block until a message arrives. |
 | `(reductions)` / `(bump-reductions! n)` / `(yield)` | Cooperative-yield seam. JIT-compiled hot loops also tick reductions automatically (ADR 0031). |
 | Supervision: `(system-link! pid)` / `(system-monitor! pid)` / `(system-trap-exit! #t)` / etc. | Low-level supervision primops; the higher-level `link` / `monitor` / `trap-exit!` wrappers live in `lib/beam/prelude.scm`. |
+
+## Two scheduling models: blocking vs. parking
+
+`(spawn 'name)` and `(spawn-source …)` run an actor body that owns its
+own `(receive)` loop. That body **blocks** its worker thread while waiting
+for a message (`block_in_place`), so each live actor consumes one OS
+thread — capped at 4096 per process. Fine for hundreds of actors; a wall
+for hundreds of thousands.
+
+`(spawn-activation "source" 'handler)` instead hands the receive loop to
+the runtime: it calls `(handler msg)` once per delivered message and
+**parks** (releases the worker thread) while the mailbox is empty, so many
+mailbox-bound actors multiplex onto a small pool of worker threads. This
+breaks the 4096 ceiling for idle / mailbox-bound actors (#30 iter-2a, ADR
+0032). The practical limit becomes memory — each actor still has its own
+`Runtime` — not threads.
+
+```scheme
+; handler is a unary (handler msg) -> continue? procedure.
+; Return #f to stop the actor; any other value keeps it alive.
+; Per-actor state lives in the handler's own (mutable) bindings —
+; the Runtime persists across activations, so state survives the park.
+(define source "
+  (define total 0)
+  (define (handler msg)
+    (cond ((eq? msg 'stop) #f)
+          (else (set! total (+ total msg)) #t)))")
+(define pid (spawn-activation source 'handler))
+(send pid 5) (send pid 7) (send pid 'stop)  ; total accumulates across parks
+```
+
+**Semantics seam** (ADR 0032): only the framework-owned top-level receive
+parks. A `(raw-receive)` *inside* a handler still blocks — the synchronous
+VM cannot suspend mid-call — so write actors you want to scale in the
+activation shape (one message per call, state in the handler). A CPU-bound
+handler holds its worker until it returns; the win is parking *between*
+messages, not mid-handler preemption. Free migration between workers
+(true work-stealing) needs `Send` actor heaps and stays deferred (iter-2b,
+ADR 0032 / 0034).
 
 ## Supervision trees
 

@@ -1,6 +1,9 @@
 # ADR 0032: Work-stealing scheduler (#30 second half) — scoping, tokio-vs-custom, and deferral
 
-> Status: Accepted (deferral; design captured)
+> Status: Accepted (deferral; design captured). **iter-2a SHIPPED 2026-06-03**
+> (parking activation actors on per-worker `LocalSet`s — see the Decision
+> section + `docs/milestones/m30-iter2a-localset-exit.md`); iter-2b/2c remain
+> deferred on `Send` heaps.
 > Date: 2026-05-26
 > Authors: crab-scheme contributors
 
@@ -107,14 +110,21 @@ heap-isolation work, not the scheduler.
 **Defer Part 2 (the work-stealing scheduler) — likely post-1.0** — and
 record the staged path:
 
-- **iter-2a — async Scheme actors (M:N, no migration):** an
-  activation-model spawn path (`spawn_async` + `receive_async` driving a
-  sync Scheme handler per message) hosted on **per-worker `LocalSet`s** so
-  `!Send` heaps survive across the mailbox await with thread-affinity.
-  Breaks the 4096-thread ceiling for mailbox-bound actors. **Carries a
-  semantics change**: only the top-level loop `(receive)` can park;
-  arbitrary mid-stack `(receive)` keeps the blocking behavior (or is
-  disallowed on this path). A substantial multi-file cs-actor change.
+- **iter-2a — async Scheme actors (M:N, no migration): SHIPPED
+  (2026-06-03).** A `LocalWorkerPool` (`cs-actor/src/local_pool.rs`) of
+  single-threaded `LocalSet` workers + `ActorSystem::spawn_local_activation`
+  host `!Send` actor futures; the Scheme `(spawn-activation SOURCE HANDLER)`
+  builtin (`cs-runtime/src/builtins/beam.rs`) runs a framework-owned
+  activation loop — park on `receive_async().await`, then call a per-message
+  `(handler msg) -> continue?` with `ACTOR_CTX` scoped to that one call.
+  `!Send` heaps survive the await with thread-affinity; the 4096-thread
+  ceiling no longer bounds mailbox-bound actors (a Rust test runs 5000 on
+  the small pool). **The semantics change landed as designed**: the
+  framework owns the parking receive; a `(raw-receive)` *inside* a handler
+  still blocks (sync VM can't suspend mid-call). No yield hook on this path
+  — a CPU-bound handler holds its worker until it returns (mid-handler
+  preemption is out of scope; the win is parking between messages). See
+  `docs/milestones/m30-iter2a-localset-exit.md`.
 - **iter-2b — isolated (`Send`) actor heaps:** the real prerequisite for
   *true* work-stealing migration, under tokio or a custom scheduler
   equally. A large GC / value-representation project.
@@ -126,11 +136,18 @@ preempt), so deferring the scheduler does not leave actors able to starve
 a worker via a hot JIT loop.
 
 ## Consequences
-- No code change in this ADR — design capture + deferral only.
-- The thread-per-actor model (4096-actor ceiling) remains for now; that
-  is acceptable for 1.0 and documented here as the known limit.
-- A future contributor has the full constraint map and staged plan, so
-  the scheduler work doesn't restart from scratch.
+- The ADR itself captured the design + deferral; **iter-2a was
+  subsequently built** (2026-06-03) — see the Decision section and the
+  exit doc.
+- The thread-per-actor model (4096 ceiling) still applies to the
+  *blocking* paths (`spawn` / `spawn-source`, whose Scheme body owns a
+  blocking `(receive)` loop). The new **parking** path
+  (`spawn-activation`) is not bound by it — mailbox-bound activation
+  actors multiplex onto the `LocalSet` pool; their practical limit is
+  per-actor `Runtime` memory.
+- iter-2b (`Send` actor heaps) + iter-2c (true work-stealing migration)
+  remain deferred; a future contributor has the full constraint map and
+  staged plan, so that work doesn't restart from scratch.
 
 ## References
 - Issue #30 (second half); ADR 0031 (#30 iter-1, JIT reduction tick).

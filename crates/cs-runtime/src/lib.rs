@@ -3211,6 +3211,26 @@ impl Runtime {
             }
         }
     }
+
+    /// Apply an already-resolved procedure `Value` to `Value` args via the
+    /// walker tier (the same dispatch path as [`Self::aot_dispatch_builtin`]).
+    /// Used by the actor activation loop (`builtins::beam::spawn-activation`)
+    /// to invoke a Scheme message handler once per delivered message. A raised
+    /// condition is flattened to its message string — the actor logs and
+    /// terminates on error, matching `run_scheme_body`.
+    #[cfg(feature = "actor")]
+    pub fn apply_value(&mut self, proc: &Value, args: &[Value]) -> Result<Value, String> {
+        let mut ctx = EvalCtx::new(self.top.clone(), &mut self.syms, &mut self.macros);
+        crate::eval::apply_procedure(proc, args, &mut ctx).map_err(|e| e.message())
+    }
+
+    /// Decode a cross-actor [`crate::builtins::beam::SendableValue`] into a
+    /// `Value` interned in this runtime's symbol table. A thin wrapper so the
+    /// activation loop need not reach into private fields.
+    #[cfg(feature = "actor")]
+    pub fn sendable_to_value(&mut self, sv: &crate::builtins::beam::SendableValue) -> Value {
+        crate::builtins::beam::from_sendable(sv, &mut self.syms)
+    }
 }
 
 /// Generic-builtin dispatch entry point for AOT'd binaries.
