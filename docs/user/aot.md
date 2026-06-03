@@ -166,9 +166,10 @@ crabscheme aot: project emit error: cs-aot project: emit error in function `main
     reference: docs/user/aot.md (Supported/Unsupported tables)
 ```
 
-The Inst names a program is most likely to hit today are `MakeClosure`
-(closure values) and `EnvSet` (`set!` on globals); each `UnsupportedInst`
-carries its own description + actionable workaround. See
+The Inst a program is most likely to hit today is `EnvSet` (`set!` on a
+global or a captured variable). `MakeClosure` only surfaces in single
+`--entry` mode — `--multi` compiles closures fine. Each `UnsupportedInst`
+carries its own description + actionable workaround; see
 `crates/cs-aot/src/lib.rs` `inst_user_hint(...)`.
 
 ## What works
@@ -186,6 +187,12 @@ a broad slice of the R6RS foundation:
   `(define c 10)` isn't supported yet — see "What doesn't work".)*
 - `--multi`: emit one binary exposing every compatible define via
   `<binary> <fn> <args…>`
+- **Closures (via `--multi`)**: `let`-bound lambdas, procedures that
+  *return* a lambda, and lambdas passed as arguments (higher-order) all
+  compile and run — the closure captures its free variables by value.
+  *Single `--entry` mode doesn't enumerate nested lambdas, so use
+  `--multi` for any program with closures.* (Mutating a captured variable
+  with `set!` is the one closure gap — see "What doesn't work".)
 
 **Operations** (the supported `cs_rir::Inst` set):
 
@@ -244,7 +251,8 @@ builtins AOTs and runs correctly.
 
 | Construct | Blocker | Tracking |
 |-----------|---------|----------|
-| Capturing closures / closure *values* | `Inst::MakeClosure` — any expression that **creates** a closure: a `lambda` passed as an argument (incl. `(map (lambda …) …)`), a `let`-bound lambda, or a returned lambda. The cs-vm capture ABI (`vm_alloc_aot_procedure_with_captures`) is in place; the cs-aot lowering is the remaining coverage work. | #280 |
+| `set!` on a *captured* closure variable | `Inst::EnvSet` — a mutable-state closure like `(lambda () (set! n (+ n 1)) n)` fails (same env-write gap as `set!` on globals). Non-mutating closures compile via `--multi` — see "What works". | post-1.0 |
+| Closures in single `--entry` mode | `--entry` doesn't enumerate nested lambdas, so `MakeClosure` surfaces. Use `--multi` (it enumerates them) — non-mutating closures then compile. | #280 |
 | `set!` on free / global variables | `Inst::EnvSet` needs runtime env write-back | post-1.0 |
 | Reading a top-level *value* binding | `(define c 10) (define (f) (+ c 1))` — `c` becomes an env capture (single `--entry` arg-mismatch; `--multi` skips the capturing fn). Same env-install gap as `set!` / closures. `--explain` over-reports this as compatible. | post-1.0 |
 | Bare top-level side effects | AOT needs ≥1 `(define (name …) …)`; a bare `(display …)` at top level isn't an entry — wrap it in `(define (main) …)` and use `--entry main` | by design |
@@ -253,9 +261,12 @@ builtins AOTs and runs correctly.
 | Browser WASM | `wasm32-unknown-unknown` (no WASI; needs JS-bound stdio) | future |
 
 > **Previously listed here, now working:** non-self procedure calls,
-> mutual recursion, free-variable reads, multi-block `let`, and strings /
-> general builtins. An older doc or error message implying these don't
-> compile predates the RC3 coverage iters.
+> mutual recursion, multi-block `let`, strings / general builtins, and
+> **closures** (`let`-bound / returned / higher-order, via `--multi`).
+> (Free-variable references to a top-level *procedure* work; reading a
+> top-level *value* binding still doesn't — see the table.) An older doc
+> or error message implying the rest don't compile predates the RC3
+> coverage iters.
 
 When you hit one of these, the CLI prints the Inst plus a
 user-meaningful description, e.g.:

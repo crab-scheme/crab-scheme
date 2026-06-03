@@ -345,3 +345,42 @@ fn diff_flonum_sqrt() {
         "5",
     );
 }
+
+// ---- closures (compile via --multi; single --entry doesn't enumerate
+// nested lambdas, so MakeClosure surfaces there — see docs/user/aot.md) ----
+
+#[test]
+fn diff_closure_let_bound() {
+    // A let-bound lambda, called in place. f(5) = 5 * 2 = 10.
+    assert_diff_multi(
+        "(define (f x) (let ((dbl (lambda (y) (* y 2)))) (dbl x)))",
+        "f",
+        &["5"],
+        "10",
+    );
+}
+
+#[test]
+fn diff_closure_returned() {
+    // A procedure that returns a closure over its arg, then calls it:
+    // ((adder 10) 5) = 15. Exercises capture-by-value across the
+    // MakeClosure → vm_alloc_aot_procedure_with_captures path.
+    assert_diff_multi(
+        "(define (adder n) (lambda (x) (+ x n))) (define (test) ((adder 10) 5))",
+        "test",
+        &[],
+        "15",
+    );
+}
+
+#[test]
+fn diff_closure_higher_order_arg() {
+    // A lambda passed as an argument and applied:
+    // (apply-g (lambda (x) (+ x 100)) 5) = 105.
+    assert_diff_multi(
+        "(define (apply-g g v) (g v)) (define (test) (apply-g (lambda (x) (+ x 100)) 5))",
+        "test",
+        &[],
+        "105",
+    );
+}
