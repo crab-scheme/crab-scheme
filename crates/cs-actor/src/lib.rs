@@ -73,7 +73,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use cs_table::{Mailbox as DurableMailbox, TableRegistry};
@@ -81,6 +81,9 @@ use dashmap::DashMap;
 use rustc_hash::FxBuildHasher;
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+mod local_pool;
+use local_pool::LocalWorkerPool;
 
 // ---------- Mailbox backing strategy ----------
 
@@ -842,6 +845,11 @@ impl Actor {
 pub struct ActorSystem {
     tokio_rt: tokio::runtime::Runtime,
     inner: ActorSystemRef,
+    /// Lazily-built pool of single-threaded `LocalSet` workers that host
+    /// `!Send` actor futures for [`ActorSystem::spawn_local_activation`]
+    /// (#30 iter-2a). `None` until the first local-activation spawn, so
+    /// systems that never use that path pay nothing for it.
+    local_pool: OnceLock<LocalWorkerPool>,
 }
 
 #[derive(Clone)]
@@ -1050,7 +1058,11 @@ impl ActorSystem {
             idle_notify: Arc::new((Mutex::new(()), Condvar::new())),
             handle,
         };
-        Self { tokio_rt, inner }
+        Self {
+            tokio_rt,
+            inner,
+            local_pool: OnceLock::new(),
+        }
     }
 
     /// A handle to this system's tokio runtime, for subsystems that need to
@@ -1279,6 +1291,120 @@ impl ActorSystem {
             let fut = std::panic::AssertUnwindSafe(body(actor));
             let _ = futures::FutureExt::catch_unwind(fut).await;
         });
+        ActorRef { pid, mailbox }
+    }
+
+    /// Worker-thread count for the `LocalSet` pool that backs
+    /// [`Self::spawn_local_activation`]. Honors
+    /// `CRABSCHEME_ACTOR_LOCAL_WORKERS` (numeric, > 0); otherwise
+    /// defaults to the host's logical core count (min 2) — the same rule
+    /// `new` uses for tokio worker threads.
+    fn local_worker_count() -> usize {
+        std::env::var("CRABSCHEME_ACTOR_LOCAL_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2)
+            })
+    }
+
+    /// Lazily-built pool of single-threaded `LocalSet` workers used by
+    /// [`Self::spawn_local_activation`]. The pool's threads are created
+    /// on first use, so systems that never spawn a local-activation actor
+    /// never pay for them.
+    fn local_pool(&self) -> &LocalWorkerPool {
+        self.local_pool
+            .get_or_init(|| LocalWorkerPool::new(Self::local_worker_count()))
+    }
+
+    /// Spawn an actor whose body future may be **`!Send`** — it can hold
+    /// an `Rc`-based Scheme heap across mailbox `await`s — by hosting it
+    /// on a per-worker [`LocalSet`] (#30 iter-2a / ADR 0032).
+    ///
+    /// How this differs from the other spawn paths:
+    /// - [`Self::spawn_async`] requires `Fut: Send`, so a stateful Scheme
+    ///   actor's `!Send` heap can't survive a mailbox `await`. This path
+    ///   drops the `Send` bound on the future.
+    /// - [`Self::spawn_sync_body_on_task`] keeps state but pins an OS
+    ///   thread via `block_in_place`, so it is capped by
+    ///   `max_blocking_threads(4096)`. This path parks (releases the
+    ///   worker) on an empty-mailbox `await`, so many actors multiplex
+    ///   onto the small `LocalSet` pool — **breaking the 4096 ceiling**
+    ///   for mailbox-bound actors.
+    ///
+    /// The actor is pinned to one worker for life (thread-affinity; **no
+    /// migration** — that needs `Send` heaps, iter-2b). `body` itself
+    /// must be `Send` (it crosses to the worker thread), but the future
+    /// it returns need not be — the future is built on the worker, so its
+    /// `Rc` graph never crosses a thread boundary (mirrors how
+    /// `spawn-source` actors build their heap on the spawned thread).
+    ///
+    /// The "only a top-level loop `(receive)` parks" semantics of ADR
+    /// 0032 live in *how the caller writes the body loop* (cs-runtime),
+    /// exactly as cs-web's `spawn_handler_actor` writes its own
+    /// `while let Some(msg) = actor.receive_async().await { … }` loop.
+    pub fn spawn_local_activation<F, Fut>(&self, body: F) -> ActorRef
+    where
+        F: FnOnce(Actor) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.spawn_local_activation_with_kind(MailboxKind::default(), body)
+    }
+
+    /// Like [`Self::spawn_local_activation`] but with an explicit mailbox
+    /// backing.
+    pub fn spawn_local_activation_with_kind<F, Fut>(&self, kind: MailboxKind, body: F) -> ActorRef
+    where
+        F: FnOnce(Actor) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        let pid = self.inner.next_pid();
+        let mailbox = self.inner.build_mailbox(pid, kind);
+        let state = Arc::new(ActorState::new(mailbox.clone()));
+        self.inner.register_actor(pid, Arc::clone(&state));
+
+        let system_for_actor = self.inner.clone();
+        let inner_for_cleanup = self.inner.clone();
+        let state_for_actor = Arc::clone(&state);
+        let mailbox_for_actor = mailbox.clone();
+        let pid_for_cleanup = pid;
+
+        // The job closure is `Send` (captures only `Send` data); it runs
+        // on the worker thread, where it builds the `!Send` future and
+        // `spawn_local`s it. The future never crosses back.
+        let dispatched = self.local_pool().dispatch(Box::new(move || {
+            let actor = Actor {
+                pid,
+                mailbox: mailbox_for_actor,
+                system: system_for_actor,
+                state: state_for_actor,
+            };
+            tokio::task::spawn_local(async move {
+                // Mirror `spawn_async`'s panic capture: a panicking actor
+                // logs + deregisters rather than aborting the worker.
+                let fut = std::panic::AssertUnwindSafe(body(actor));
+                let result = futures::FutureExt::catch_unwind(fut).await;
+                let reason = match &result {
+                    Ok(()) => ExitReason::Normal,
+                    Err(payload) => {
+                        let msg = panic_message(payload);
+                        eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
+                        ExitReason::Error(msg)
+                    }
+                };
+                inner_for_cleanup.on_actor_termination(pid_for_cleanup, reason);
+            });
+        }));
+
+        if !dispatched {
+            // Only reachable if the pool has shut down (system teardown).
+            // Deregister so the never-started actor doesn't linger.
+            self.inner.on_actor_termination(pid, ExitReason::Normal);
+        }
+
         ActorRef { pid, mailbox }
     }
 
