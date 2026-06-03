@@ -400,6 +400,26 @@ fn write_aot_dispatch_wrapper(src: &mut String, f: &Function) {
     src.push_str(&format!("    {fn_name}({})\n}}\n\n", all_loads.join(", ")));
 }
 
+/// Emit a panic hook as the first statement of an AOT'd `main` so a
+/// runtime panic — a failed integer-arg parse, an arithmetic overflow,
+/// a builtin-dispatch error surfaced as a panic — prints a single clean
+/// `crabscheme(aot): <msg>` line to stderr instead of a Rust backtrace.
+///
+/// This covers the common *unwinding* panics. True stack-overflow / OOM
+/// / Ctrl-C interception needs platform-specific signal + alloc-hook
+/// code (a guard-page SIGSEGV handler, `set_alloc_error_hook`) and is
+/// deliberately out of scope here — documented as deferred hardening.
+fn push_panic_hook(src: &mut String) {
+    src.push_str(concat!(
+        "    std::panic::set_hook(Box::new(|info| {\n",
+        "        let msg = info.payload().downcast_ref::<&str>().map(|s| s.to_string())\n",
+        "            .or_else(|| info.payload().downcast_ref::<String>().cloned())\n",
+        "            .unwrap_or_else(|| \"fatal runtime error\".to_string());\n",
+        "        eprintln!(\"crabscheme(aot): {}\", msg);\n",
+        "    }));\n",
+    ));
+}
+
 /// Single-entry main shim (RC2 baseline; default).
 fn write_single_entry_main(src: &mut String, entry: &Function, mode: EmitMode, aot_version: &str) {
     let entry_name = sanitize_ident_for_project(&entry.name);
@@ -411,6 +431,7 @@ fn write_single_entry_main(src: &mut String, entry: &Function, mode: EmitMode, a
     ));
 
     src.push_str("fn main() {\n");
+    push_panic_hook(src);
     src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
     src.push_str(
         "    if args.iter().any(|a| a == \"--version\" || a == \"-V\") {\n\
@@ -506,6 +527,7 @@ fn write_multi_procedure_main(
     ));
 
     src.push_str("fn main() {\n");
+    push_panic_hook(src);
     src.push_str("    let args: Vec<String> = std::env::args().collect();\n");
     src.push_str(
         "    if args.iter().any(|a| a == \"--version\" || a == \"-V\") {\n\
@@ -662,5 +684,20 @@ mod tests {
             multi_procedure: false,
         };
         assert!(opts.effective_cs_vm_dep().is_none());
+    }
+
+    #[test]
+    fn panic_hook_emits_clean_stderr_handler() {
+        // #278: every AOT'd `main` installs a hook so a runtime panic
+        // prints one clean `crabscheme(aot): <msg>` line, not a Rust
+        // backtrace. (Wiring into both single + multi mains and the fact
+        // that it compiles are covered by the project-pipeline tests.)
+        let mut s = String::new();
+        push_panic_hook(&mut s);
+        assert!(s.contains("std::panic::set_hook"), "installs a panic hook");
+        assert!(
+            s.contains("crabscheme(aot):"),
+            "prints the clean error prefix"
+        );
     }
 }
