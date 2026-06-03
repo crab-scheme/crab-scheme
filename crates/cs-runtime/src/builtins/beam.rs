@@ -384,6 +384,106 @@ pub fn primop_spawn_source(
     Ok(actor_ref.pid())
 }
 
+/// `(spawn-activation SOURCE HANDLER)` — spawn a Scheme actor on the
+/// `LocalSet` worker pool (#30 iter-2a / ADR 0032) so it **parks** (releases
+/// its worker) while waiting on an empty mailbox instead of pinning an OS
+/// thread. This is what breaks the `max_blocking_threads(4096)` ceiling for
+/// mailbox-bound actors that `spawn-source` (blocking `(receive)` loop +
+/// `block_in_place`) is bound by.
+///
+/// `SOURCE` is loaded into a fresh per-actor [`crate::Runtime`] on the worker
+/// thread (every `Rc` Value stays thread-local, exactly like `spawn-source`).
+/// `HANDLER` names a top-level unary procedure `(handler msg) -> continue?`
+/// that the framework calls once per delivered message; it returns `#f` to
+/// stop the actor, any other value to continue. Per-actor state lives in the
+/// handler's own (mutable) top-level bindings — the Runtime persists on the
+/// worker across activations, so state survives the parking await.
+///
+/// The "top-level loop receive parks; mid-stack `(raw-receive)` blocks" seam
+/// of ADR 0032 falls out for free: the **framework** owns the parking
+/// `receive_async().await`, while a `(raw-receive)` *inside* a handler still
+/// blocks via `ACTOR_CTX` (the existing primop, unchanged).
+pub fn primop_spawn_activation(source: String, handler: String) -> Result<ActorPid, String> {
+    let st = beam_state();
+    let actor_ref = st
+        .actors
+        .spawn_local_activation(move |actor| activation_body(actor, source, handler));
+    Ok(actor_ref.pid())
+}
+
+/// The framework-driven activation loop, run on a `LocalSet` worker thread.
+/// Builds the per-actor Runtime once, resolves the handler, then loops:
+/// park on `receive_async().await`, decode the message to a `Value`, and
+/// invoke the handler with `ACTOR_CTX` pointing at this actor for the
+/// duration of that synchronous call only.
+async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: String) {
+    let mut rt = crate::Runtime::new();
+    if let Err(d) = rt.eval_str("<spawn-activation>", &source) {
+        eprintln!("spawn-activation: loading actor source failed: {d:?}");
+        return;
+    }
+    let handler_proc = match rt.lookup(&handler) {
+        Some(v @ Value::Procedure(_)) => v,
+        Some(other) => {
+            eprintln!(
+                "spawn-activation: top-level `{handler}` is {}, not a procedure",
+                other.type_name()
+            );
+            return;
+        }
+        None => {
+            eprintln!("spawn-activation: no top-level `{handler}` defined in the source");
+            return;
+        }
+    };
+    while let Some(msg) = actor.receive_async().await {
+        let sv = message_to_sendable(msg);
+        let msg_val = rt.sendable_to_value(&sv);
+        // Scope ACTOR_CTX + a fresh reduction budget to *this* synchronous
+        // handler call. It is never held across the `.await` above, so actors
+        // sharing a worker thread never see each other's context. Mirrors
+        // run_actor_body's Guard, but per-activation.
+        let outcome = {
+            let _ctx = ActivationCtx::install(&mut actor);
+            rt.apply_value(&handler_proc, &[msg_val])
+        };
+        match outcome {
+            Ok(Value::Boolean(false)) => break, // handler asked to stop
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("spawn-activation: handler `{handler}` raised: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// RAII guard for one activation: points `ACTOR_CTX` at `actor` (so `(self)`
+/// / `(send)` / a nested `(raw-receive)` reach it) and resets the per-actor
+/// reduction counter, clearing `ACTOR_CTX` again on drop. It deliberately
+/// installs **no** yield hook: a synchronous handler cannot cooperatively
+/// yield mid-call (the sync-VM constraint), so mid-handler preemption is out
+/// of scope for iter-2a — the win is parking *between* messages. A CPU-bound
+/// handler holds its worker until it returns (documented limitation).
+struct ActivationCtx;
+impl ActivationCtx {
+    fn install(actor: &mut cs_actor::Actor) -> Self {
+        // Raw pointer only — no live `&mut` borrow is retained across the
+        // handler call (the worker is single-threaded and runs one handler at
+        // a time, so the pointer never aliases a concurrent borrow).
+        let ptr: *mut cs_actor::Actor = actor;
+        ACTOR_CTX.with(|c| c.set(ptr));
+        REDUCTIONS.with(|c| c.set(0));
+        ActivationCtx
+    }
+}
+impl Drop for ActivationCtx {
+    fn drop(&mut self) {
+        ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
+        REDUCTIONS.with(|c| c.set(0));
+    }
+}
+
 /// Build a `Send + Sync` [`ActorEntry`] that runs a Scheme body. The closure
 /// captures only `String`s — never an `Rc`-based Scheme value — so it crosses
 /// onto the actor's worker thread cleanly. The `Rc` graph is created *inside*
@@ -1117,6 +1217,26 @@ pub fn b_beam_spawn_source(args: &[Value], syms: &mut SymbolTable) -> Result<Val
     Ok(from_sendable(&SendableValue::Pid(pid), syms))
 }
 
+/// `(spawn-activation SOURCE HANDLER)` — spawn a Scheme actor on the parking
+/// `LocalSet` worker pool. `SOURCE` is a Scheme string; `HANDLER` is a symbol
+/// or string naming the top-level per-message handler `(handler msg) ->
+/// continue?`. Returns the new actor's PID. See [`primop_spawn_activation`].
+pub fn b_beam_spawn_activation(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("spawn-activation", args, 2)?;
+    let source = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        other => {
+            return Err(format!(
+                "spawn-activation: SOURCE must be a string, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let handler = value_to_str(&args[1], syms, "spawn-activation")?;
+    let pid = primop_spawn_activation(source, handler)?;
+    Ok(from_sendable(&SendableValue::Pid(pid), syms))
+}
+
 /// `(self)` — return the calling actor's PID as a symbol.
 /// Errors if called from outside an actor body.
 pub fn b_beam_self(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
@@ -1456,6 +1576,7 @@ pub fn beam_syms_builtins() -> Vec<(
         ("send", b_beam_send),
         ("spawn", b_beam_spawn),
         ("spawn-source", b_beam_spawn_source),
+        ("spawn-activation", b_beam_spawn_activation),
         ("self", b_beam_self),
         ("raw-receive", b_beam_raw_receive),
         // reductions (B3 first half: cooperative-yield seam)
@@ -1720,6 +1841,74 @@ mod tests {
         }
 
         assert_eq!(*received.lock().unwrap(), Some(SendableValue::Fixnum(42)));
+    }
+
+    #[test]
+    fn spawn_activation_accumulates_persistent_state() {
+        // A parking activation actor (#30 iter-2a): the framework owns the
+        // receive loop and calls `handler` once per message. The handler keeps
+        // a running total in its own persistent top-level binding ACROSS
+        // separate activations — proving the `!Send` Scheme heap survives the
+        // `receive_async().await` between messages. On `stop` it forwards the
+        // final total to a collector actor (a registered Rust proc) that
+        // records it where the test thread can read it.
+        let result: Arc<std::sync::Mutex<Option<SendableValue>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+        beam_state().procs.register(
+            "test:collect-total",
+            Arc::new(move |actor, _args| {
+                if let Ok(Some(msg)) = primop_raw_receive(actor, None) {
+                    *result_clone.lock().unwrap() = Some(msg);
+                }
+            }),
+        );
+        let collector = primop_spawn("test:collect-total", vec![]).expect("spawn collector");
+
+        let source = r#"
+            (define collector #f)
+            (define total 0)
+            (define (handler msg)
+              (cond
+                ((and (pair? msg) (eq? (car msg) 'collector))
+                 (set! collector (cdr msg)) #t)
+                ((eq? msg 'stop)
+                 (send collector total)
+                 #f)
+                (else
+                 (set! total (+ total msg))
+                 #t)))
+        "#;
+        let pid = primop_spawn_activation(source.to_string(), "handler".to_string())
+            .expect("spawn-activation");
+
+        // Tell the actor where to report, feed it 1..=5 (sum 15), then stop.
+        // The Fast mailbox is FIFO, so the collector pid lands before the
+        // numbers and `stop` lands last.
+        primop_send(
+            pid,
+            SendableValue::Pair(
+                Box::new(SendableValue::Symbol("collector".into())),
+                Box::new(SendableValue::Pid(collector)),
+            ),
+        )
+        .expect("send collector pid");
+        for n in 1..=5 {
+            primop_send(pid, SendableValue::Fixnum(n)).expect("send n");
+        }
+        primop_send(pid, SendableValue::Symbol("stop".into())).expect("send stop");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if result.lock().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("activation actor never reported its total");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(*result.lock().unwrap(), Some(SendableValue::Fixnum(15)));
     }
 
     #[test]
