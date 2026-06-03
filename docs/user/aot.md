@@ -181,7 +181,9 @@ a broad slice of the R6RS foundation:
 - Self-recursion **and** tail recursion (looping kernels)
 - Cross-procedure calls — `f` calling `g` (`Inst::Call` / `CallGeneral`)
 - **Mutual recursion** — `even?`/`odd?`-style co-recursive defines
-- Global free-variable *reads* (`(define c 10) (define (f) (+ c 1))`)
+- References to other top-level **procedures** (cross-procedure calls +
+  mutual recursion). *(Reading a top-level **value** binding like
+  `(define c 10)` isn't supported yet — see "What doesn't work".)*
 - `--multi`: emit one binary exposing every compatible define via
   `<binary> <fn> <args…>`
 
@@ -227,8 +229,8 @@ a broad slice of the R6RS foundation:
 - Terminators: `Return`, `Jump` (with block-param args), `Branch`
 - `let` / `if` / `cond` across **multiple basic blocks** (the
   demote-env-to-SSA pass handles multi-block, not just single-block)
-- Global free-variable reads (`EnvLookup` / `EnvLookupAny` resolving to
-  a top-level define)
+- `EnvLookup` / `EnvLookupAny` resolving to a top-level **procedure**
+  define (cross-procedure references)
 
 ### Strings & general builtins
 Arbitrary stdlib builtins (`string-append`, `string-length`,
@@ -244,6 +246,7 @@ builtins AOTs and runs correctly.
 |-----------|---------|----------|
 | Capturing closures / closure *values* | `Inst::MakeClosure` — any expression that **creates** a closure: a `lambda` passed as an argument (incl. `(map (lambda …) …)`), a `let`-bound lambda, or a returned lambda. The cs-vm capture ABI (`vm_alloc_aot_procedure_with_captures`) is in place; the cs-aot lowering is the remaining coverage work. | #280 |
 | `set!` on free / global variables | `Inst::EnvSet` needs runtime env write-back | post-1.0 |
+| Reading a top-level *value* binding | `(define c 10) (define (f) (+ c 1))` — `c` becomes an env capture (single `--entry` arg-mismatch; `--multi` skips the capturing fn). Same env-install gap as `set!` / closures. `--explain` over-reports this as compatible. | post-1.0 |
 | Bare top-level side effects | AOT needs ≥1 `(define (name …) …)`; a bare `(display …)` at top level isn't an entry — wrap it in `(define (main) …)` and use `--entry main` | by design |
 | FFI in AOT'd binaries | AOT'd binaries are short-lived; FFI assumes a long-running runtime | future (separate plan) |
 | Multi-shot `call/cc` | inherits the M8 walker-tier deferral | future |
