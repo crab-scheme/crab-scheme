@@ -1,0 +1,18 @@
+[package]
+name = "cs-stdlib-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab tls) — blocking TLS client (rustls)."
+
+# Native-only: rustls + std::net don't apply to the wasm builds, so this
+# module is excluded from `wasm-stdlib` (like cs-stdlib-sql). Inherits the
+# workspace rustls (ring provider, std, tls12).
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }

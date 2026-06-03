@@ -41,3 +41,13 @@
 (test-eqv "hex decode length"
           5
           (bytevector-length (hex-decode "0102030405")))
+
+(test-section "(crab base) — PEM")
+(define __pem__ (pem-encode "TEST KEY" (string->utf8 "secret-bytes")))
+(test-true "pem-encode returns a string" (string? __pem__))
+(test-equal "pem-decode inverts pem-encode"
+            "secret-bytes"
+            (utf8->string (pem-decode __pem__)))
+(test-true "round-trips arbitrary bytes"
+           (equal? (string->utf8 "the quick brown fox")
+                   (pem-decode (pem-encode "DATA" (string->utf8 "the quick brown fox")))))

@@ -43,3 +43,12 @@
 (test-eqv "hmac-sha256 empty/empty first byte"
           182
           (bytevector-u8-ref (hmac-sha256 "" "") 0))
+
+(test-section "(crab hash) — checksums")
+(test-equal "crc32 of the standard check string" 3421780262 (crc32 "123456789"))
+(test-equal "crc32 of the empty string is 0" 0 (crc32 ""))
+(test-true "crc32 is deterministic" (= (crc32 "hello") (crc32 "hello")))
+(test-false "crc32 distinguishes inputs" (= (crc32 "hello") (crc32 "world")))
+(test-true "crc32 accepts a bytevector too" (= (crc32 "abc") (crc32 (string->utf8 "abc"))))
+(test-equal "adler32 of the empty string is 1" 1 (adler32 ""))
+(test-equal "fnv1a-32 of empty is the offset basis" 2166136261 (fnv1a-32 ""))

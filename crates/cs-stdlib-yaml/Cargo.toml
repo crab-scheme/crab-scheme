@@ -1,0 +1,14 @@
+[package]
+name = "cs-stdlib-yaml"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "CrabScheme stdlib module (crab yaml) — YAML parsing and serialization."
+
+# Pure-Rust YAML (the maintained yaml-rust2); wasm-portable.
+[dependencies]
+cs-core = { workspace = true }
+cs-ffi = { workspace = true }
+yaml-rust2 = "0.10"

@@ -90,6 +90,9 @@ members = [
     "crates/cs-stdlib-xml",
     "crates/cs-stdlib-binary",
     "crates/cs-stdlib-template",
+    "crates/cs-stdlib-ini",
+    "crates/cs-stdlib-yaml",
+    "crates/cs-stdlib-tls",
     "crates/cs-stdlib-meta",
 ]
 
@@ -185,6 +188,9 @@ cs-stdlib-sql = { path = "crates/cs-stdlib-sql" }
 cs-stdlib-xml = { path = "crates/cs-stdlib-xml" }
 cs-stdlib-binary = { path = "crates/cs-stdlib-binary" }
 cs-stdlib-template = { path = "crates/cs-stdlib-template" }
+cs-stdlib-ini = { path = "crates/cs-stdlib-ini" }
+cs-stdlib-yaml = { path = "crates/cs-stdlib-yaml" }
+cs-stdlib-tls = { path = "crates/cs-stdlib-tls" }
 cs-stdlib-meta = { path = "crates/cs-stdlib-meta" }
 
 # External crates
@@ -252,6 +258,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"
+# Mozilla CA root bundle (static data) — the trust anchors the
+# `(crab tls)` client validates server certificates against. Pure
+# Rust, no system trust-store dependency.
+webpki-roots = "0.26"
 # HTTP/3 stack. h3 + h3-quinn + quinn give us a QUIC transport
 # implementing draft-34+ / RFC 9114 compatible h3. Versions move
 # in lockstep — h3 0.0.x is still pre-1.0.

@@ -43,6 +43,9 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("hash-md5", hash_md5),
         UntypedProc::new("hash-blake3", hash_blake3),
         UntypedProc::new("hmac-sha256", hmac_sha256),
+        UntypedProc::new("crc32", crc32),
+        UntypedProc::new("adler32", adler32),
+        UntypedProc::new("fnv1a-32", fnv1a_32),
     ]
 }
 
@@ -115,4 +118,46 @@ fn hmac_sha256(args: &[Value]) -> Result<Value, FfiError> {
         .map_err(|e| FfiError::HostFailure(format!("hmac-sha256: key length {}", e)))?;
     mac.update(&msg);
     Ok(bv_value(mac.finalize().into_bytes().to_vec()))
+}
+
+// ----- non-cryptographic checksums (return a fixnum, not a bytevector) -----
+
+/// `(crc32 data)` — CRC-32 (IEEE, the zip/png/gzip polynomial).
+fn crc32(args: &[Value]) -> Result<Value, FfiError> {
+    let input = expect_bytes("crc32", args, 0)?;
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in &input {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    Ok(Value::fixnum((!crc) as i64))
+}
+
+/// `(adler32 data)` — Adler-32 (the zlib checksum).
+fn adler32(args: &[Value]) -> Result<Value, FfiError> {
+    let input = expect_bytes("adler32", args, 0)?;
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    for &x in &input {
+        a = (a + x as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    Ok(Value::fixnum((((b << 16) | a) as i64) & 0xFFFF_FFFF))
+}
+
+/// `(fnv1a-32 data)` — 32-bit FNV-1a hash (fast non-cryptographic hash).
+fn fnv1a_32(args: &[Value]) -> Result<Value, FfiError> {
+    let input = expect_bytes("fnv1a-32", args, 0)?;
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in &input {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    Ok(Value::fixnum(h as i64))
 }

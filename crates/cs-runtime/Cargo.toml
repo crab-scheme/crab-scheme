@@ -132,6 +132,9 @@ stdlib = [
     "stdlib-xml",
     "stdlib-binary",
     "stdlib-template",
+    "stdlib-ini",
+    "stdlib-yaml",
+    "stdlib-tls",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",
@@ -139,6 +142,10 @@ stdlib = [
     "stdlib-dict",
     "stdlib-walk",
     "stdlib-sync",
+    "stdlib-expect",
+    "stdlib-mock",
+    "stdlib-prop",
+    "stdlib-spec",
     "stdlib-meta",
 ]
 # Each `stdlib-<name>` feature also enables the matching
@@ -183,6 +190,9 @@ stdlib-sql = ["ffi-trait", "dep:cs-stdlib-sql", "cs-stdlib-meta?/meta-sql"]
 stdlib-xml = ["ffi-trait", "dep:cs-stdlib-xml", "cs-stdlib-meta?/meta-xml"]
 stdlib-binary = ["ffi-trait", "dep:cs-stdlib-binary", "cs-stdlib-meta?/meta-binary"]
 stdlib-template = ["ffi-trait", "dep:cs-stdlib-template", "cs-stdlib-meta?/meta-template"]
+stdlib-ini = ["ffi-trait", "dep:cs-stdlib-ini", "cs-stdlib-meta?/meta-ini"]
+stdlib-yaml = ["ffi-trait", "dep:cs-stdlib-yaml", "cs-stdlib-meta?/meta-yaml"]
+stdlib-tls = ["ffi-trait", "dep:cs-stdlib-tls", "cs-stdlib-meta?/meta-tls"]
 # Bundled Scheme libraries (no Rust crate / no host procs): each pulls
 # in `bundled-scheme`, which gates the include_str! + eval at startup in
 # register_stdlib. Adding a new bundled lib needs only its own feature.
@@ -194,6 +204,10 @@ stdlib-pprint = ["bundled-scheme"]
 stdlib-dict = ["bundled-scheme"]
 stdlib-walk = ["bundled-scheme"]
 stdlib-sync = ["bundled-scheme"]
+stdlib-expect = ["bundled-scheme"]
+stdlib-mock = ["bundled-scheme"]
+stdlib-prop = ["bundled-scheme"]
+stdlib-spec = ["bundled-scheme"]
 
 [dependencies]
 cs-core = { workspace = true }
@@ -289,6 +303,9 @@ cs-stdlib-sql = { workspace = true, optional = true }
 cs-stdlib-xml = { workspace = true, optional = true }
 cs-stdlib-binary = { workspace = true, optional = true }
 cs-stdlib-template = { workspace = true, optional = true }
+cs-stdlib-ini = { workspace = true, optional = true }
+cs-stdlib-yaml = { workspace = true, optional = true }
+cs-stdlib-tls = { workspace = true, optional = true }
 cs-stdlib-meta = { workspace = true, optional = true }
 
 [dev-dependencies]
