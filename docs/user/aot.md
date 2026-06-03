@@ -1,9 +1,12 @@
 # CrabScheme AOT Compiler — User Guide
 
-> Status: RC2 work. The AOT pipeline ships as `crabscheme aot
-> prog.scm`; see `docs/milestones/m10-trackA-exit.md` for the
-> M10 close-out and `docs/measurements/2026-05-16-rc2-aot-*` for
-> per-iter perf and coverage data.
+> Status: Active (post-RC2 hardening). The AOT pipeline ships as
+> `crabscheme aot prog.scm`. The coverage tables below were verified
+> against the built binary on 2026-06-02 (they were substantially
+> narrower at RC2). See `docs/milestones/m10-trackA-exit.md` for the
+> M10 close-out, `docs/milestones/aot-hardening-plan.md` for the
+> ongoing hardening phases, and `docs/measurements/2026-05-16-rc2-aot-*`
+> for per-iter perf and coverage data.
 
 ## What it does
 
@@ -104,6 +107,15 @@ crabscheme aot <file> [flags]
       --explain           Survey lambdas + report AOT compatibility per entry
                           (RC3 Phase 4). Doesn't emit a project; exits 0 if
                           ≥1 entry is compatible, 3 if none.
+      --multi             Emit one multi-procedure binary; dispatches
+                          `<binary> <fn> <args…>`. Incompatible defines are
+                          skipped with a warning at emit time.
+      --verify "ARGS"     After --build, run BOTH the AOT'd binary and the JIT
+                          tier on ARGS and warn if the outputs disagree.
+      --target TRIPLE     Cross-compile (passed to `cargo build --target`;
+                          requires `rustup target add TRIPLE`). Level 1 only.
+      --typecheck         Run the typer's checker before AOT; exit 1 on
+                          type / arity errors instead of warn-and-proceed.
 
 crabscheme aot-doctor                    (RC3 Phase 4)
 
@@ -154,14 +166,26 @@ crabscheme aot: project emit error: cs-aot project: emit error in function `main
     reference: docs/user/aot.md (Supported/Unsupported tables)
 ```
 
-The 7 most-likely-to-be-hit Inst names (MakeClosure, Call, CallGeneral,
-EnvLookupAny, EnvLookup, EnvDefineLocal, EnvSet, Div) each have their
-own description + actionable workaround. See
+The Inst names a program is most likely to hit today are `MakeClosure`
+(closure values) and `EnvSet` (`set!` on globals); each `UnsupportedInst`
+carries its own description + actionable workaround. See
 `crates/cs-aot/src/lib.rs` `inst_user_hint(...)`.
 
 ## What works
 
-cs-aot's iter-as-of-RC2 supported `cs_rir::Inst` set:
+Verified against the built binary on 2026-06-02. The AOT path compiles
+a broad slice of the R6RS foundation:
+
+**Program shape**
+- Multiple top-level `(define (name args) body)` forms in one file
+- Self-recursion **and** tail recursion (looping kernels)
+- Cross-procedure calls — `f` calling `g` (`Inst::Call` / `CallGeneral`)
+- **Mutual recursion** — `even?`/`odd?`-style co-recursive defines
+- Global free-variable *reads* (`(define c 10) (define (f) (+ c 1))`)
+- `--multi`: emit one binary exposing every compatible define via
+  `<binary> <fn> <args…>`
+
+**Operations** (the supported `cs_rir::Inst` set):
 
 ### Arithmetic
 - Integer: `LoadConst(Fixnum)`, `Add`, `Sub`, `Mul`, `Div` (wrapping;
@@ -198,35 +222,53 @@ cs-aot's iter-as-of-RC2 supported `cs_rir::Inst` set:
 `AnyTruthy`, `AnyClone`
 
 ### Control flow
-- `CallSelf` (recursive call to the function being emitted)
+- `CallSelf` (self-recursion) + `Call` / `CallGeneral` (calls to other
+  top-level defines, including mutual recursion)
 - Terminators: `Return`, `Jump` (with block-param args), `Branch`
-- `let` bindings in single-block functions (via the demote-env-to-SSA pass)
+- `let` / `if` / `cond` across **multiple basic blocks** (the
+  demote-env-to-SSA pass handles multi-block, not just single-block)
+- Global free-variable reads (`EnvLookup` / `EnvLookupAny` resolving to
+  a top-level define)
+
+### Strings & general builtins
+Arbitrary stdlib builtins (`string-append`, `string-length`,
+`number->string`, `reverse`, `assoc`, `display`, …) lower via a generic
+by-name dispatch into the bundled runtime. These run at **walker speed**
+(not the inline-NB fast path the numeric kernels get), but they *work* —
+a program mixing tight numeric loops with occasional string / list / I-O
+builtins AOTs and runs correctly.
 
 ## What doesn't work yet
 
 | Construct | Blocker | Tracking |
 |-----------|---------|----------|
-| Non-self procedure calls | `Inst::Call` / `Inst::CallGeneral` need Procedure heap + dispatch | iter K (post-RC2) |
-| Nested lambdas / closures | `Inst::MakeClosure` needs Procedure heap | iter K |
-| Free variables (cross-procedure refs) | `Inst::EnvLookupAny` needs JIT_CALLER_ENV API | iter U |
-| Multi-block `let` bindings | Demote pass only handles single-block | iter O (deferred) |
-| Top-level side effects | `(display ...)` outside of `(define ...)` | iter Q |
-| Mutually recursive defines | Global Procedure registry | iter K + W |
-| Strings / bytevectors | Most string Insts not yet lowered | future |
-| `set!` on globals | `Inst::EnvSet` needs JIT_CALLER_ENV API | iter U |
-| Browser WASM | `wasm32-unknown-unknown` (no WASI) | future |
+| Capturing closures / closure *values* | `Inst::MakeClosure` — any expression that **creates** a closure: a `lambda` passed as an argument (incl. `(map (lambda …) …)`), a `let`-bound lambda, or a returned lambda. The cs-vm capture ABI (`vm_alloc_aot_procedure_with_captures`) is in place; the cs-aot lowering is the remaining coverage work. | #280 |
+| `set!` on free / global variables | `Inst::EnvSet` needs runtime env write-back | post-1.0 |
+| Bare top-level side effects | AOT needs ≥1 `(define (name …) …)`; a bare `(display …)` at top level isn't an entry — wrap it in `(define (main) …)` and use `--entry main` | by design |
+| FFI in AOT'd binaries | AOT'd binaries are short-lived; FFI assumes a long-running runtime | future (separate plan) |
+| Multi-shot `call/cc` | inherits the M8 walker-tier deferral | future |
+| Browser WASM | `wasm32-unknown-unknown` (no WASI; needs JS-bound stdio) | future |
 
-When you hit one of these, the CLI prints:
+> **Previously listed here, now working:** non-self procedure calls,
+> mutual recursion, free-variable reads, multi-block `let`, and strings /
+> general builtins. An older doc or error message implying these don't
+> compile predates the RC3 coverage iters.
+
+When you hit one of these, the CLI prints the Inst plus a
+user-meaningful description, e.g.:
 
 ```
-crabscheme aot: project emit error: cs-aot project: emit error in function `f`: cs-aot: Inst::<name> not yet supported (iter 1)
+cs-aot: Inst::MakeClosure not yet supported — your program uses a
+nested lambda or closure that captures variables from an enclosing
+scope (e.g., `(lambda (x) ...)` inside another function, or
+`(let* ((f (lambda ...))) ...)`)
 ```
 
-The `<name>` tells you which Inst the bytecode→RIR translator emitted
-that cs-aot doesn't yet handle. Use `--emit-rir` to see the full
-RIR — sometimes a slightly different Scheme phrasing avoids the
-unsupported Inst (e.g., a `let` that's pure SSA-style demotes
-cleanly; one that's captured by a closure surfaces `MakeClosure`).
+`--explain` surveys every top-level define and reports which compile;
+`--emit-rir` shows the full RIR. Sometimes a slightly different Scheme
+phrasing avoids the unsupported Inst (e.g., hoist a `let`-bound lambda
+to a top-level `define` so it's a named procedure rather than a
+`MakeClosure` closure value).
 
 ## Debugging
 

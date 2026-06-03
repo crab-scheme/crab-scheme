@@ -70,12 +70,15 @@ enum Cmd {
     /// Start an interactive REPL.
     Repl,
     /// Ahead-of-time compile a Scheme source file to a cargo project
-    /// (and optionally a native binary). RC2 iter G — accepts the
-    /// subset of Scheme that lowers to cs-aot's supported RIR Insts
-    /// (self-recursive numeric kernels: LoadConst/Add/Sub/Mul/Div +
-    /// Lt/Eq + CallSelf + Flonum surface). Single-define-per-file
-    /// programs at this iter; multi-define + top-level entry-point
-    /// synthesis is post-RC2 work.
+    /// (and optionally a native binary). Compiles the subset of Scheme
+    /// that lowers to cs-aot's supported RIR Insts: numeric + flonum
+    /// kernels, self- and mutual recursion, cross-procedure calls,
+    /// global free-variable reads, multi-block let/if/cond, vectors,
+    /// pairs/lists, and strings + general builtins (via walker-speed
+    /// generic dispatch). Multi-define files and `--multi`
+    /// multi-procedure binaries are supported. Not yet: closure values
+    /// (`MakeClosure`) and `set!` on globals (`EnvSet`). See
+    /// docs/user/aot.md for the full supported/unsupported tables.
     #[cfg(feature = "aot")]
     Aot {
         /// Path to the .scm source file.
