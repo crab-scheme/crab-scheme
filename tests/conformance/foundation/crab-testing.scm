@@ -3,6 +3,13 @@
 ; Uses the outer conformance prelude (test-equal/-true/-false) to assert
 ; on the toolkit's own behavior.
 
+;; The testing toolkit is opt-in: its DSL macros use common identifiers
+;; (`describe`/`it`/`expect`/…), so they are NOT auto-loaded into every
+;; Runtime (that shadowed user bindings — see PR #105). A program pulls
+;; them in explicitly. Importing (crab prop)/(crab spec) also loads
+;; (crab expect), which they depend on.
+(import (crab expect) (crab mock) (crab prop) (crab spec))
+
 (test-section "(crab expect) — matchers")
 (test-true "equal passes" (guard (e (#t #f)) (expect 5 (equal 5))))
 (test-true "equal failure raises" (guard (e (#t #t)) (expect 5 (equal 6)) #f))

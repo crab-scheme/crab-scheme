@@ -41,6 +41,15 @@ pub struct Runtime {
     sources: SourceMap,
     top: Rc<Frame>,
     macros: std::collections::HashMap<cs_core::Symbol, cs_expand::Macro>,
+    /// Opt-in testing-toolkit libraries (expect/mock/prop/spec) loaded
+    /// on demand by `(import (crab …))` this session. They are NOT
+    /// auto-loaded with the always-on bundled libs because their DSL
+    /// macros (`describe`/`it`/`expect`/…) use common identifiers that
+    /// would shadow user/test bindings in every Runtime (PR #105: a
+    /// global `describe` macro broke a `define/contract describe` test).
+    /// Tracks which have loaded so each loads at most once.
+    #[cfg(feature = "bundled-scheme")]
+    loaded_optin_libs: std::collections::HashSet<String>,
     /// Library exports declared across the runtime's lifetime,
     /// mirrored from each per-call `Expander::libraries()` map
     /// (which only survives the call that built it). Keyed by the
@@ -1828,6 +1837,8 @@ impl Runtime {
             sources: SourceMap::new(),
             top,
             macros: std::collections::HashMap::new(),
+            #[cfg(feature = "bundled-scheme")]
+            loaded_optin_libs: std::collections::HashSet::new(),
             library_exports: std::collections::HashMap::new(),
             vm_env,
             pinned,
@@ -2064,16 +2075,12 @@ impl Runtime {
         self.load_bundled_library("(crab walk)", include_str!("scheme/walk.scm"));
         #[cfg(feature = "stdlib-sync")]
         self.load_bundled_library("(crab sync)", include_str!("scheme/sync.scm"));
-        // Testing toolkit. `prop` uses expect's printer + `spec` runs specs
-        // written with expect matchers, so load expect first.
-        #[cfg(feature = "stdlib-expect")]
-        self.load_bundled_library("(crab expect)", include_str!("scheme/expect.scm"));
-        #[cfg(feature = "stdlib-mock")]
-        self.load_bundled_library("(crab mock)", include_str!("scheme/mock.scm"));
-        #[cfg(feature = "stdlib-prop")]
-        self.load_bundled_library("(crab prop)", include_str!("scheme/prop.scm"));
-        #[cfg(feature = "stdlib-spec")]
-        self.load_bundled_library("(crab spec)", include_str!("scheme/spec.scm"));
+        // Testing toolkit (expect/mock/prop/spec) is NOT auto-loaded: its
+        // DSL macros (`describe`/`it`/`expect`/…) use common identifiers
+        // that would shadow user/test bindings in every Runtime (PR #105 —
+        // a global `describe` macro broke a `define/contract describe`
+        // test). It loads on demand instead — see `load_optin_libs_for`,
+        // run when a program does `(import (crab expect|mock|prop|spec))`.
         // Scheme extension of the Rust `(crab math)` module (combinatorics
         // + numeric helpers).
         #[cfg(feature = "stdlib-math")]
@@ -2091,6 +2098,114 @@ impl Runtime {
                 name, d.message
             );
         }
+    }
+
+    /// Load any opt-in testing-toolkit libraries a freshly-parsed program
+    /// imports via `(import (crab expect|mock|prop|spec))`, with their
+    /// dependencies, into the global env — once each. Must run BEFORE the
+    /// program is expanded so the toolkit's macros are visible to it.
+    ///
+    /// Unlike the always-on bundled libs, these are loaded only on
+    /// explicit import: their DSL macros (`describe`/`it`/`expect`/…) use
+    /// common identifiers that would otherwise shadow user/test bindings
+    /// in every Runtime (PR #105). The `(import …)` form itself stays an
+    /// expander no-op; this pre-pass is what actually makes them available.
+    #[cfg(feature = "bundled-scheme")]
+    fn load_optin_libs_for(&mut self, data: &[Datum]) {
+        let mut wanted: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::new();
+        for form in data {
+            let Some(items) = Self::datum_proper_list(form) else {
+                continue;
+            };
+            let Some(head) = items.first() else { continue };
+            if Self::datum_symbol_name(head, &self.syms) != Some("import") {
+                continue;
+            }
+            for spec in &items[1..] {
+                let Some(parts) = Self::datum_symbol_list(spec, &self.syms) else {
+                    continue;
+                };
+                if parts.len() == 2 && parts[0] == "crab" {
+                    match parts[1].as_str() {
+                        "expect" => {
+                            wanted.insert("expect");
+                        }
+                        "mock" => {
+                            wanted.insert("mock");
+                        }
+                        // prop + spec report failures through expect's
+                        // matcher printer, so they depend on (crab expect).
+                        "prop" => {
+                            wanted.insert("prop");
+                            wanted.insert("expect");
+                        }
+                        "spec" => {
+                            wanted.insert("spec");
+                            wanted.insert("expect");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Load in dependency order, each at most once.
+        for lib in ["expect", "mock", "prop", "spec"] {
+            if !wanted.contains(lib) || self.loaded_optin_libs.contains(lib) {
+                continue;
+            }
+            let src: Option<&str> = match lib {
+                #[cfg(feature = "stdlib-expect")]
+                "expect" => Some(include_str!("scheme/expect.scm")),
+                #[cfg(feature = "stdlib-mock")]
+                "mock" => Some(include_str!("scheme/mock.scm")),
+                #[cfg(feature = "stdlib-prop")]
+                "prop" => Some(include_str!("scheme/prop.scm")),
+                #[cfg(feature = "stdlib-spec")]
+                "spec" => Some(include_str!("scheme/spec.scm")),
+                _ => None,
+            };
+            if let Some(src) = src {
+                self.loaded_optin_libs.insert(lib.to_string());
+                self.load_bundled_library(&format!("(crab {lib})"), src);
+            }
+        }
+    }
+
+    /// Elements of a proper-list `Datum` (Pair-chain ending in Null);
+    /// None for an improper list or a non-list.
+    #[cfg(feature = "bundled-scheme")]
+    fn datum_proper_list(d: &Datum) -> Option<Vec<&Datum>> {
+        let mut out = Vec::new();
+        let mut cur = d;
+        loop {
+            match cur {
+                Datum::Null(_) => return Some(out),
+                Datum::Pair(car, cdr, _) => {
+                    out.push(car.as_ref());
+                    cur = cdr.as_ref();
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// The printable name of a `Datum::Symbol`, else None.
+    #[cfg(feature = "bundled-scheme")]
+    fn datum_symbol_name<'a>(d: &Datum, syms: &'a SymbolTable) -> Option<&'a str> {
+        match d {
+            Datum::Symbol(s, _) => Some(syms.name(*s)),
+            _ => None,
+        }
+    }
+
+    /// A proper list of symbols → their printable names; else None.
+    #[cfg(feature = "bundled-scheme")]
+    fn datum_symbol_list(d: &Datum, syms: &SymbolTable) -> Option<Vec<String>> {
+        Self::datum_proper_list(d)?
+            .iter()
+            .map(|it| Self::datum_symbol_name(it, syms).map(|s| s.to_string()))
+            .collect()
     }
 
     /// Set the `(command-line)` override for this runtime. Call
@@ -2579,6 +2694,11 @@ impl Runtime {
         data: Vec<Datum>,
         base_env: Option<Rc<Frame>>,
     ) -> Result<Value, Diagnostic> {
+        // Load any opt-in testing-toolkit libs this program imports
+        // (e.g. `(import (crab spec))`) before expansion, so their macros
+        // are visible. No-op for programs that don't import them.
+        #[cfg(feature = "bundled-scheme")]
+        self.load_optin_libs_for(&data);
         // Issue #11 ext-1 + ext-2: cs-typer pre-passes.
         //
         // * `extract_annotations` strips `(: NAME T)` ascriptions and
@@ -2749,6 +2869,10 @@ impl Runtime {
                 return Err(Diagnostic::error(e.message(), e.span()));
             }
         };
+        // Opt-in testing-toolkit libs (see eval_data_in_env) — must load
+        // before expansion so their macros are visible to this program.
+        #[cfg(feature = "bundled-scheme")]
+        self.load_optin_libs_for(&data);
         let Self {
             sources,
             syms,
