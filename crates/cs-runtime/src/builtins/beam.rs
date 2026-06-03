@@ -1912,6 +1912,88 @@ mod tests {
     }
 
     #[test]
+    fn multiple_activation_actors_multiplex_on_the_pool() {
+        // Several parking activation actors coexist on the shared LocalSet
+        // worker pool (more actors than workers) and all complete. Each is
+        // told its id + the collector pid, replies `id * 10` on `go`, then
+        // stops. The collector (a registered Rust proc) gathers all N replies.
+        let n: i64 = 8;
+        let got: Arc<std::sync::Mutex<Vec<SendableValue>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let got_clone = got.clone();
+        beam_state().procs.register(
+            "test:collect-n",
+            Arc::new(move |actor, _args| {
+                for _ in 0..n {
+                    match primop_raw_receive(actor, None) {
+                        Ok(Some(msg)) => got_clone.lock().unwrap().push(msg),
+                        _ => break,
+                    }
+                }
+            }),
+        );
+        let collector = primop_spawn("test:collect-n", vec![]).expect("spawn collector");
+
+        let source = r#"
+            (define collector #f)
+            (define id #f)
+            (define (handler msg)
+              (cond
+                ((and (pair? msg) (eq? (car msg) 'init))
+                 (set! collector (cadr msg))
+                 (set! id (caddr msg))
+                 #t)
+                ((eq? msg 'go)
+                 (send collector (* id 10))
+                 #f)
+                (else #t)))
+        "#;
+
+        for i in 0..n {
+            let pid = primop_spawn_activation(source.to_string(), "handler".to_string())
+                .expect("spawn-activation");
+            // (list 'init <collector-pid> i)
+            let init = SendableValue::Pair(
+                Box::new(SendableValue::Symbol("init".into())),
+                Box::new(SendableValue::Pair(
+                    Box::new(SendableValue::Pid(collector)),
+                    Box::new(SendableValue::Pair(
+                        Box::new(SendableValue::Fixnum(i)),
+                        Box::new(SendableValue::Null),
+                    )),
+                )),
+            );
+            primop_send(pid, init).expect("send init");
+            primop_send(pid, SendableValue::Symbol("go".into())).expect("send go");
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if got.lock().unwrap().len() == n as usize {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "only {} of {n} activation actors reported",
+                    got.lock().unwrap().len()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Replies are id*10 for id in 0..n, in any arrival order — sum them.
+        let sum: i64 = got
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|v| match v {
+                SendableValue::Fixnum(k) => *k,
+                _ => panic!("unexpected reply {v:?}"),
+            })
+            .sum();
+        assert_eq!(sum, (0..n).map(|i| i * 10).sum::<i64>());
+    }
+
+    #[test]
     fn spawn_source_datum_rendering() {
         // The arg bridge: a SendableValue must render to an external datum the
         // reader reconstructs identically. (build_call_expr quotes each arg.)
