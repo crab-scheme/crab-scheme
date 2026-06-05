@@ -135,6 +135,7 @@ stdlib = [
     "stdlib-ini",
     "stdlib-yaml",
     "stdlib-tls",
+    "stdlib-store",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",
