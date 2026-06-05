@@ -96,6 +96,8 @@ members = [
     "crates/cs-stdlib-yaml",
     "crates/cs-stdlib-tls",
     "crates/cs-stdlib-meta",
+    # RocksDB FFI binding for crab-cache (native-only; excluded from wasm-stdlib).
+    "crates/cs-store",
 ]
 
 [workspace.package]
@@ -195,6 +197,8 @@ cs-stdlib-ini = { path = "crates/cs-stdlib-ini" }
 cs-stdlib-yaml = { path = "crates/cs-stdlib-yaml" }
 cs-stdlib-tls = { path = "crates/cs-stdlib-tls" }
 cs-stdlib-meta = { path = "crates/cs-stdlib-meta" }
+cs-store = { path = "crates/cs-store" }
+rocksdb = "0.21"
 
 # External crates
 logos = "0.14"

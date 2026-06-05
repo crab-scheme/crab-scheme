@@ -77,6 +77,7 @@ stdlib = [
     "stdlib-ini",
     "stdlib-yaml",
     "stdlib-tls",
+    "stdlib-store",
     "stdlib-functional",
     "stdlib-iter",
     "stdlib-test",
@@ -127,6 +128,7 @@ stdlib-template = ["cs-runtime/stdlib-template"]
 stdlib-ini = ["cs-runtime/stdlib-ini"]
 stdlib-yaml = ["cs-runtime/stdlib-yaml"]
 stdlib-tls = ["cs-runtime/stdlib-tls"]
+stdlib-store = ["cs-runtime/stdlib-store"]
 stdlib-functional = ["cs-runtime/stdlib-functional"]
 stdlib-iter = ["cs-runtime/stdlib-iter"]
 stdlib-test = ["cs-runtime/stdlib-test"]
