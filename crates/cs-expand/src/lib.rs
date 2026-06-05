@@ -4995,8 +4995,10 @@ impl<'a> Expander<'a> {
 
         // Each field-decl is either:
         //   field-name → immutable, accessor = NAME-FIELD
-        //   (immutable field-name accessor)
-        //   (mutable field-name accessor mutator)
+        //   (immutable field-name) → accessor = NAME-FIELD (auto-derived)
+        //   (immutable field-name accessor) → explicit accessor
+        //   (mutable field-name) → accessor = NAME-FIELD, mutator = set-NAME-FIELD! (auto-derived)
+        //   (mutable field-name accessor mutator) → explicit
         struct FieldDecl {
             name: cs_core::Symbol,
             accessor: cs_core::Symbol,
@@ -5036,9 +5038,9 @@ impl<'a> Expander<'a> {
                         }
                     };
                     if kind == self.keywords.immutable {
-                        if parts.len() != 3 {
+                        if parts.len() != 2 && parts.len() != 3 {
                             return Err(ExpandError::BadSyntax {
-                                what: "(immutable field accessor) needs 3 elements".into(),
+                                what: "(immutable field) or (immutable field accessor)".into(),
                                 span: f.span(),
                             });
                         }
@@ -5051,13 +5053,18 @@ impl<'a> Expander<'a> {
                                 });
                             }
                         };
-                        let accessor = match &parts[2] {
-                            Datum::Symbol(s, _) => *s,
-                            _ => {
-                                return Err(ExpandError::BadSyntax {
-                                    what: "accessor name must be symbol".into(),
-                                    span: f.span(),
-                                });
+                        let accessor = if parts.len() == 2 {
+                            let fname = self.syms.name(name).to_string();
+                            self.syms.intern(&format!("{}-{}", type_name_str, fname))
+                        } else {
+                            match &parts[2] {
+                                Datum::Symbol(s, _) => *s,
+                                _ => {
+                                    return Err(ExpandError::BadSyntax {
+                                        what: "accessor name must be symbol".into(),
+                                        span: f.span(),
+                                    });
+                                }
                             }
                         };
                         fields.push(FieldDecl {
@@ -8277,6 +8284,173 @@ mod tests {
                 .any(|(n, h)| n == &b_name_strs && *h == b_hash),
             "expected A's dep list to include ([depr, b], B's hash); got {:?}",
             entry.deps
+        );
+    }
+
+    // ---------- define-record-type auto-derived accessor/mutator names ----------
+
+    /// Collect every `Set` name reachable from a CoreExpr tree.
+    fn collect_set_names(e: &CoreExpr, out: &mut Vec<Symbol>) {
+        match e {
+            CoreExpr::Set { name, value, .. } => {
+                out.push(*name);
+                collect_set_names(value, out);
+            }
+            CoreExpr::Begin { exprs, .. } => {
+                for sub in exprs {
+                    collect_set_names(sub, out);
+                }
+            }
+            CoreExpr::Letrec { bindings, body, .. } => {
+                for (_, sub) in bindings {
+                    collect_set_names(sub, out);
+                }
+                collect_set_names(body, out);
+            }
+            CoreExpr::Lambda { body, .. } => collect_set_names(body, out),
+            CoreExpr::App { func, args, .. } => {
+                collect_set_names(func, out);
+                for a in args {
+                    collect_set_names(a, out);
+                }
+            }
+            CoreExpr::If {
+                cond, then, alt, ..
+            } => {
+                collect_set_names(cond, out);
+                collect_set_names(then, out);
+                collect_set_names(alt, out);
+            }
+            CoreExpr::WithContinuationMark { key, val, body, .. } => {
+                collect_set_names(key, out);
+                collect_set_names(val, out);
+                collect_set_names(body, out);
+            }
+            CoreExpr::Const { .. } | CoreExpr::Ref { .. } => {}
+        }
+    }
+
+    /// `(immutable f)` with omitted accessor name auto-derives `type-f`.
+    #[test]
+    fn record_immutable_shorthand_derives_accessor() {
+        let (e, syms) = expand_str(
+            "(define-record-type point
+               (fields (immutable x) (immutable y)))",
+        );
+        let mut names = Vec::new();
+        collect_set_names(&e, &mut names);
+        let name_strs: Vec<&str> = names.iter().map(|s| syms.name(*s)).collect();
+        assert!(
+            name_strs.contains(&"point-x"),
+            "expected point-x in set names; got {:?}",
+            name_strs
+        );
+        assert!(
+            name_strs.contains(&"point-y"),
+            "expected point-y in set names; got {:?}",
+            name_strs
+        );
+        // immutable fields must NOT produce mutators
+        assert!(
+            !name_strs.contains(&"set-point-x!"),
+            "immutable field must not produce mutator; got {:?}",
+            name_strs
+        );
+    }
+
+    /// `(mutable f)` with omitted names auto-derives `type-f` + `set-type-f!`.
+    /// This was already implemented; verify it still works.
+    #[test]
+    fn record_mutable_shorthand_derives_accessor_and_mutator() {
+        let (e, syms) = expand_str(
+            "(define-record-type counter
+               (fields (mutable value)))",
+        );
+        let mut names = Vec::new();
+        collect_set_names(&e, &mut names);
+        let name_strs: Vec<&str> = names.iter().map(|s| syms.name(*s)).collect();
+        assert!(
+            name_strs.contains(&"counter-value"),
+            "expected counter-value; got {:?}",
+            name_strs
+        );
+        assert!(
+            name_strs.contains(&"set-counter-value!"),
+            "expected set-counter-value!; got {:?}",
+            name_strs
+        );
+    }
+
+    /// Mixed record: `(mutable x)` + `(immutable y)` — both auto-derived.
+    #[test]
+    fn record_mixed_shorthand_derives_all_names() {
+        let (e, syms) = expand_str(
+            "(define-record-type shard-ctx
+               (fields (mutable clock) (immutable handle)))",
+        );
+        let mut names = Vec::new();
+        collect_set_names(&e, &mut names);
+        let name_strs: Vec<&str> = names.iter().map(|s| syms.name(*s)).collect();
+        assert!(
+            name_strs.contains(&"shard-ctx-clock"),
+            "expected shard-ctx-clock; got {:?}",
+            name_strs
+        );
+        assert!(
+            name_strs.contains(&"set-shard-ctx-clock!"),
+            "expected set-shard-ctx-clock!; got {:?}",
+            name_strs
+        );
+        assert!(
+            name_strs.contains(&"shard-ctx-handle"),
+            "expected shard-ctx-handle; got {:?}",
+            name_strs
+        );
+        // immutable handle must not produce a mutator
+        assert!(
+            !name_strs.contains(&"set-shard-ctx-handle!"),
+            "immutable field must not produce mutator; got {:?}",
+            name_strs
+        );
+    }
+
+    /// Explicit accessor/mutator names (original R6RS form) remain unchanged.
+    #[test]
+    fn record_explicit_names_unchanged() {
+        let (e, syms) = expand_str(
+            "(define-record-type pt
+               (fields (immutable x pt-x) (mutable y pt-y set-pt-y!)))",
+        );
+        let mut names = Vec::new();
+        collect_set_names(&e, &mut names);
+        let name_strs: Vec<&str> = names.iter().map(|s| syms.name(*s)).collect();
+        assert!(
+            name_strs.contains(&"pt-x"),
+            "expected explicit pt-x; got {:?}",
+            name_strs
+        );
+        assert!(
+            name_strs.contains(&"pt-y"),
+            "expected explicit pt-y; got {:?}",
+            name_strs
+        );
+        assert!(
+            name_strs.contains(&"set-pt-y!"),
+            "expected explicit set-pt-y!; got {:?}",
+            name_strs
+        );
+    }
+
+    /// `(immutable f)` — error message improved for wrong arity.
+    #[test]
+    fn record_immutable_wrong_arity_errors() {
+        let r = try_expand(
+            "(define-record-type bad
+               (fields (immutable x acc extra)))",
+        );
+        assert!(
+            matches!(r, Err(ExpandError::BadSyntax { .. })),
+            "expected BadSyntax for 4-element immutable spec"
         );
     }
 }
