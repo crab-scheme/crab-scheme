@@ -46,6 +46,8 @@ members = [
     "crates/cs-net",
     "crates/cs-distrib",
     "crates/cs-discovery",
+    # Consensus engines (Raft + EPaxos) over cs-net/cs-actor — M06.
+    "crates/cs-consensus",
     # Tower-style async web framework. Builds on tokio/hyper, integrates
     # with cs-actor (actor-backed handlers), cs-table (access log +
     # sessions), and cs-runtime (Scheme route registration).
@@ -146,6 +148,7 @@ cs-hotreload = { path = "crates/cs-hotreload" }
 # cs-distrib's Router over cs-net transports.
 cs-net = { path = "crates/cs-net" }
 cs-distrib = { path = "crates/cs-distrib" }
+cs-consensus = { path = "crates/cs-consensus" }
 # cs-web declares `default-features = false` here so downstream
 # crates (like cs-web-mod-example, which compiles AS a cs-web
 # plugin and does NOT need libloading/cs-actor) can opt out.

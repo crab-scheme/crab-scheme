@@ -961,6 +961,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs-consensus"
+version = "1.0.0-rc7"
+dependencies = [
+ "cs-actor",
+ "cs-distrib",
+ "cs-net",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cs-core"
 version = "1.0.0-rc7"
 dependencies = [

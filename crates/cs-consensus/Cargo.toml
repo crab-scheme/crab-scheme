@@ -1,0 +1,25 @@
+[package]
+name = "cs-consensus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CrabScheme consensus engines: homegrown Raft (leader election, log replication, ReadIndex, snapshots, joint-consensus membership) and EPaxos (leaderless, dependency-graph execution) over cs-net's consensus channel and cs-actor. Deterministic cores with a Sim cluster harness. See docs/research/sdk_spec/tasks/M06-consensus.md."
+
+[dependencies]
+# The deterministic cores depend on nothing; the networking/actor driver
+# (added with the cs-net adapter) pulls these in.
+cs-net = { path = "../cs-net", default-features = false, features = ["tcp", "sim"] }
+cs-distrib = { path = "../cs-distrib" }
+cs-actor = { path = "../cs-actor" }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
+thiserror = "1"
+tracing = "0.1"
+
+[features]
+default = []
+quic = ["cs-net/quic"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "sync", "macros", "test-util", "time"] }
