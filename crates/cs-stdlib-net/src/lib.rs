@@ -264,20 +264,27 @@ fn tcp_accept(args: &[Value]) -> Result<Value, FfiError> {
 fn tcp_send(args: &[Value]) -> Result<Value, FfiError> {
     let id = expect_fixnum("tcp-send", args, 0)?;
     let payload = expect_bv("tcp-send", args, 1)?;
-    let mut r = lock()?;
-    let stream = match r.slots.get_mut(&id) {
-        Some(Slot::Tcp(s)) => s,
-        Some(_) => {
-            return Err(FfiError::HostFailure(format!(
-                "tcp-send: handle {} is not a TCP socket",
-                id
-            )))
-        }
-        None => {
-            return Err(FfiError::HostFailure(format!(
-                "tcp-send: bad handle {}",
-                id
-            )))
+    // Clone the stream handle (a dup of the same fd) and RELEASE the registry
+    // lock before the blocking write. Holding the global lock across the
+    // syscall would serialize every socket in the process onto one mutex —
+    // fatal for a concurrent server (e.g. redis-benchmark's many connections).
+    // `tcp-accept` / the UDP ops already follow this clone-then-unlock shape.
+    let mut stream = {
+        let r = lock()?;
+        match r.slots.get(&id) {
+            Some(Slot::Tcp(s)) => s.try_clone().map_err(|e| io_fail("tcp-send", e))?,
+            Some(_) => {
+                return Err(FfiError::HostFailure(format!(
+                    "tcp-send: handle {} is not a TCP socket",
+                    id
+                )))
+            }
+            None => {
+                return Err(FfiError::HostFailure(format!(
+                    "tcp-send: bad handle {}",
+                    id
+                )))
+            }
         }
     };
     stream
@@ -296,20 +303,25 @@ fn tcp_recv(args: &[Value]) -> Result<Value, FfiError> {
         ));
     }
     let mut buf = vec![0u8; max_len as usize];
-    let mut r = lock()?;
-    let stream = match r.slots.get_mut(&id) {
-        Some(Slot::Tcp(s)) => s,
-        Some(_) => {
-            return Err(FfiError::HostFailure(format!(
-                "tcp-recv: handle {} is not a TCP socket",
-                id
-            )))
-        }
-        None => {
-            return Err(FfiError::HostFailure(format!(
-                "tcp-recv: bad handle {}",
-                id
-            )))
+    // Clone + release the lock before the blocking read (see tcp-send): a
+    // recv that blocks waiting for the next client request must not hold the
+    // global registry mutex, or it freezes every other socket in the process.
+    let mut stream = {
+        let r = lock()?;
+        match r.slots.get(&id) {
+            Some(Slot::Tcp(s)) => s.try_clone().map_err(|e| io_fail("tcp-recv", e))?,
+            Some(_) => {
+                return Err(FfiError::HostFailure(format!(
+                    "tcp-recv: handle {} is not a TCP socket",
+                    id
+                )))
+            }
+            None => {
+                return Err(FfiError::HostFailure(format!(
+                    "tcp-recv: bad handle {}",
+                    id
+                )))
+            }
         }
     };
     let n = stream.read(&mut buf).map_err(|e| io_fail("tcp-recv", e))?;
