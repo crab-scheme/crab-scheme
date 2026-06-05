@@ -141,6 +141,15 @@ pub fn primop_node_peer_count(node: &str) -> Result<usize, String> {
     Ok(lookup_router(node, "node-peer-count")?.peer_count())
 }
 
+/// Prune peers whose transport has closed (a crashed or departed node) and
+/// return how many were dropped (also fires any pending DOWN monitors). Call
+/// periodically so `node-peer-count` reflects reality — `node-poll` does not
+/// prune on its own — which lets reconnection logic notice a gap and re-dial a
+/// peer that has come back.
+pub fn primop_node_detect_disconnects(node: &str) -> Result<usize, String> {
+    Ok(lookup_router(node, "node-detect-disconnects")?.detect_disconnects())
+}
+
 //
 // TCP transport — real cross-process / cross-machine sockets (plaintext or
 // mutual-TLS). node-link! is the in-memory sim transport; these connect nodes
@@ -521,6 +530,19 @@ pub fn b_node_peer_count(args: &[Value], syms: &mut SymbolTable) -> Result<Value
     )))
 }
 
+/// `(node-detect-disconnects NODE)` — drop peers whose link has closed and
+/// return how many were dropped. Call periodically (e.g. from a poll loop) so
+/// `node-peer-count` drops when a peer dies and a reconnector can re-dial.
+pub fn b_node_detect_disconnects(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("node-detect-disconnects: expected (node-detect-disconnects NODE)".into());
+    }
+    let node = name_of(&args[0], syms, "node-detect-disconnects")?;
+    Ok(Value::Number(cs_core::Number::Fixnum(
+        primop_node_detect_disconnects(&node)? as i64,
+    )))
+}
+
 /// The Scheme-facing distrib builtins, in the `(name, fn)` shape the
 /// registration loops accept. Merged into cs-runtime's walker + VM env when
 /// the `distrib` feature is on.
@@ -538,6 +560,7 @@ pub fn distrib_syms_builtins() -> Vec<(
         ("node-listen-quic", b_node_listen_quic),
         ("node-connect-quic", b_node_connect_quic),
         ("node-peer-count", b_node_peer_count),
+        ("node-detect-disconnects", b_node_detect_disconnects),
         ("node-send", b_node_send),
         ("node-poll", b_node_poll),
     ]
