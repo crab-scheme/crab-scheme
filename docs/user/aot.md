@@ -257,6 +257,7 @@ builtins AOTs and runs correctly.
 | Reading a top-level *value* binding | `(define c 10) (define (f) (+ c 1))` — `c` becomes an env capture (single `--entry` arg-mismatch; `--multi` skips the capturing fn). Same env-install gap as `set!` / closures. `--explain` over-reports this as compatible. | post-1.0 |
 | Bare top-level side effects | AOT needs ≥1 `(define (name …) …)`; a bare `(display …)` at top level isn't an entry — wrap it in `(define (main) …)` and use `--entry main` | by design |
 | FFI in AOT'd binaries | AOT'd binaries are short-lived; FFI assumes a long-running runtime | future (separate plan) |
+| Constant-space *cross-procedure* tail calls | Only *self* tail-calls become loops (back-edges). A tail call to **another** procedure — including mutual recursion between two defines or two named-lets — builds a stack frame, so very deep mutual recursion can overflow. Self-recursive loops and bounded mutual recursion (e.g. mandelbrot's N×N grid) run fine. | post-1.0 |
 | Multi-shot `call/cc` | inherits the M8 walker-tier deferral | future |
 | Browser WASM | `wasm32-unknown-unknown` (no WASI; needs JS-bound stdio) | future |
 

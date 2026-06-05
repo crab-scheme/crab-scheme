@@ -384,3 +384,39 @@ fn diff_closure_higher_order_arg() {
         "105",
     );
 }
+
+#[test]
+fn diff_nested_named_let_mutual_recursion() {
+    // Regression for issue #108 — mandelbrot's row-loop/col-loop shape.
+    // An OUTER named-let whose body is an INNER named-let; the inner
+    // loop tail-calls itself AND its sibling outer loop, so both are a
+    // mutual-recursion cluster. The translator binds each loop name in
+    // a local frame, so the self-reference lowers to `EnvLookup`+`Call`
+    // (NOT `CallSelf`).
+    //
+    // Two bugs this guards, both at once via the large N:
+    //   1. The inner self-call routed through the function's own
+    //      handle, but the MakeClosure→direct-call elision passed a
+    //      `0i64` self-handle — `vm_call_aot_procedure(0, …)` aborted
+    //      (null Procedure handle) from the very first iteration.
+    //   2. Even with a real handle, that self-call was a
+    //      `vm_call_aot_procedure`-then-return (no TCO), so the inner
+    //      recursion accumulated O(N²) stack frames and overflowed.
+    //
+    // `f(n)` counts one per (i, j) in an N×N grid → N². N=300 → 90000;
+    // pre-fix that depth overflows, post-fix the inner self-call is a
+    // back-edge (O(1)) and total depth is O(N).
+    assert_diff_multi(
+        "(define (f n) \
+           (let outer ((i 0) (acc 0)) \
+             (if (= i n) \
+                 acc \
+                 (let inner ((j 0) (s acc)) \
+                   (if (= j n) \
+                       (outer (+ i 1) s) \
+                       (inner (+ j 1) (+ s 1)))))))",
+        "f",
+        &["300"],
+        "90000",
+    );
+}

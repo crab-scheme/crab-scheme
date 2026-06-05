@@ -354,11 +354,28 @@ impl std::fmt::Display for AotError {
 /// guidance instead of internal Inst names.
 
 /// Detect a tail-call pattern at the end of `block`: when the
-/// block's last inst is `CallSelf(dst, args)` and the
+/// block's last inst is a recursive self-call and the
 /// terminator flows the call's result straight into a
 /// `Return`, return the call's args so the emitter can
 /// rewrite the call into "rebind params + continue to entry"
 /// — replacing the recursive function call with a loop.
+///
+/// Two self-call shapes count:
+///   - `CallSelf(dst, args)` — the translator's direct
+///     self-recursion form (simple self-recursive named-lets,
+///     `fib`, `fact`, …).
+///   - `Call(dst, callee, args)` / `CallGeneral(…)` where
+///     `callee` is in `self_refs` — a self-call routed through
+///     the function's own handle. The translator emits this
+///     shape (an `EnvLookup` of the self-name + a `Call`)
+///     instead of `CallSelf` when the self-name is also bound
+///     in an enclosing local frame, i.e. for a named-let in a
+///     mutual-recursion cluster (mandelbrot's `col-loop`, which
+///     tail-calls itself AND its sibling `row-loop`). Without
+///     this arm the self-call lowers to `vm_call_aot_procedure`
+///     -then-return, which is NOT tail-call-optimized, so the
+///     recursion accumulates a stack frame per iteration and
+///     overflows at moderate N (issue #108, large-N regime).
 ///
 /// Two terminator shapes count as a tail call:
 ///   1. `Return(dst)` directly — the call result is the
@@ -369,10 +386,19 @@ impl std::fmt::Display for AotError {
 ///      trivial join block.
 ///
 /// Returns `None` for anything more complicated.
-fn detect_tail_call<'a>(block: &'a cs_rir::Block, func: &'a Function) -> Option<&'a [Value]> {
+fn detect_tail_call<'a>(
+    block: &'a cs_rir::Block,
+    func: &'a Function,
+    self_refs: &HashSet<Value>,
+) -> Option<&'a [Value]> {
     let last = block.insts.last()?;
     let (call_dst, args) = match last {
         Inst::CallSelf(dst, args) => (*dst, args.as_slice()),
+        Inst::Call(dst, callee, args) | Inst::CallGeneral(dst, callee, args)
+            if self_refs.contains(callee) =>
+        {
+            (*dst, args.as_slice())
+        }
         _ => return None,
     };
     match &block.terminator {
@@ -390,6 +416,101 @@ fn detect_tail_call<'a>(block: &'a cs_rir::Block, func: &'a Function) -> Option<
         }
         _ => None,
     }
+}
+
+/// Return the argument lists every terminator passes to block
+/// `target` (one entry per in-edge). A `Jump` contributes its
+/// args; a `Branch` contributes its shared arg list once per
+/// matching successor (both successors receive the same args —
+/// see the `Term::Branch` emit arm). Used by
+/// [`compute_self_ref_values`] to reason about block-param
+/// provenance.
+fn edges_into(func: &Function, target: cs_rir::BlockId) -> Vec<&[Value]> {
+    let mut out = Vec::new();
+    for block in &func.blocks {
+        match &block.terminator {
+            Term::Jump(t, args) if *t == target => out.push(args.as_slice()),
+            Term::Branch(_, then_t, else_t, args) if *then_t == target || *else_t == target => {
+                out.push(args.as_slice());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Compute the set of Values that provably hold this function's
+/// own Procedure handle (`__self_handle`).
+///
+/// Seeded from `EnvLookup`/`EnvLookupAny` of the function's
+/// `self_binding_sym` — the emit arm (see ~line 1850) resolves
+/// such a lookup to `__self_handle`, so its result IS the self
+/// handle by construction. The set is then closed under the two
+/// ways a Value can be an alias of another:
+///   - `Move(dst, src)` → `dst` is self iff `src` is.
+///   - a block param is self iff EVERY in-edge passes a self
+///     Value in that param's position (a conservative,
+///     all-predecessors join — a param fed a non-self value on
+///     any edge is left out).
+///
+/// Soundness matters: a false positive would let
+/// [`detect_tail_call`] rewrite a call to a *different*
+/// procedure into a self-loop. The all-edges join guarantees no
+/// false positives. Returns an empty set when the function never
+/// references its own binding (the common case — e.g. functions
+/// whose self-recursion is already `CallSelf`), so `detect_tail_call`'s
+/// self-handle arm is inert for them.
+fn compute_self_ref_values(func: &Function, self_binding_sym: Option<u32>) -> HashSet<Value> {
+    let self_sym = match self_binding_sym {
+        Some(s) => s,
+        None => return HashSet::new(),
+    };
+    let mut tainted: HashSet<Value> = HashSet::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let Inst::EnvLookup(dst, sym) | Inst::EnvLookupAny(dst, sym) = inst {
+                if *sym == self_sym {
+                    tainted.insert(*dst);
+                }
+            }
+        }
+    }
+    if tainted.is_empty() {
+        return tainted;
+    }
+    // Fixpoint over Move aliases + all-predecessor block-param joins.
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.insts {
+                if let Inst::Move(dst, src) = inst {
+                    if tainted.contains(src) && tainted.insert(*dst) {
+                        changed = true;
+                    }
+                }
+            }
+            let preds = edges_into(func, block.id);
+            if preds.is_empty() {
+                continue;
+            }
+            for (i, (param_v, _)) in block.params.iter().enumerate() {
+                if tainted.contains(param_v) {
+                    continue;
+                }
+                if preds
+                    .iter()
+                    .all(|args| args.get(i).is_some_and(|a| tainted.contains(a)))
+                {
+                    tainted.insert(*param_v);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    tainted
 }
 
 /// Walk a `Function` in block order and infer each Value's
@@ -661,13 +782,30 @@ impl LambdaResolver {
             }
         }
         // Pass 2: for each fn whose self_binding_sym is Some(s),
-        // scan its body for any MakeClosure(_, idx) where the
-        // resolved lambda's captures contain s. That's exactly
-        // the codegen path that emits `__self_handle` as a
-        // capture expr — regardless of whether the MakeClosure
-        // itself gets elided. (Direct-call elision still
-        // materializes captures at the call site, so the
-        // outer's __self_handle is still referenced.)
+        // scan its body for either codegen path that emits
+        // `__self_handle`:
+        //
+        //   (a) a MakeClosure(_, idx) where the resolved lambda's
+        //       captures contain s — an inner closure with a
+        //       forward self-reference. (Direct-call elision still
+        //       materializes captures at the call site, so the
+        //       outer's __self_handle is still referenced.)
+        //   (b) an EnvLookup/EnvLookupAny of s — the function
+        //       references its own binding as a value. The emit arm
+        //       (see ~line 1812) resolves such a lookup to
+        //       `__self_handle`; the only reason to materialize self
+        //       as a value is to call (or pass) it. This is exactly
+        //       the self-recursion-by-handle shape a named-let in a
+        //       mutual-recursion cluster lowers to (e.g. mandelbrot's
+        //       `col-loop`, which calls itself AND its sibling
+        //       `row-loop`). Without (b), such a fn was eligible for
+        //       MakeClosure→direct-call elision, which passes `0i64`
+        //       for the handle slot — then its self-recursive
+        //       `vm_call_aot_procedure(__self_handle, …)` dereferences
+        //       a null Procedure handle and aborts (issue #108).
+        //
+        // In both cases the handle must be real, so the closure's
+        // allocation must NOT be elided.
         for f in funcs {
             let self_sym = match f.self_binding_sym {
                 Some(s) => s,
@@ -676,13 +814,22 @@ impl LambdaResolver {
             let mut uses = false;
             'outer: for block in &f.blocks {
                 for inst in &block.insts {
-                    if let Inst::MakeClosure(_, lambda_idx) = inst {
-                        if let Some(info) = by_idx.get(&(*lambda_idx as usize)) {
-                            if info.captures.contains(&self_sym) {
-                                uses = true;
-                                break 'outer;
+                    match inst {
+                        Inst::MakeClosure(_, lambda_idx) => {
+                            if let Some(info) = by_idx.get(&(*lambda_idx as usize)) {
+                                if info.captures.contains(&self_sym) {
+                                    uses = true;
+                                    break 'outer;
+                                }
                             }
                         }
+                        Inst::EnvLookup(_, sym) | Inst::EnvLookupAny(_, sym)
+                            if *sym == self_sym =>
+                        {
+                            uses = true;
+                            break 'outer;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -915,17 +1062,25 @@ fn emit_loop_match(
 
     let fn_name = sanitize_ident(&func.name);
     let local_defs = collect_local_defines(func);
+    // Values that provably hold this function's own handle, so a
+    // tail `Call` through one of them is a self-loop (see
+    // `detect_tail_call`'s self-handle arm). Empty for functions
+    // that never reference their own binding — the common case.
+    let self_refs = compute_self_ref_values(func, func.self_binding_sym);
     for block in &func.blocks {
         writeln!(out, "            {} => {{", block.id.0).unwrap();
         // Phase 5++++: tail-call detection. If the block's
-        // last inst is a `CallSelf(dst, args)` whose result
+        // last inst is a self-call (`CallSelf`, or a `Call`
+        // through the function's own handle) whose result
         // flows straight into a Return (either directly via
         // this block's terminator OR via a Jump to a Return-
         // only block), replace the recursive function call
         // with "rebind params + continue to entry" — saves
         // a stack frame per iteration, which matters a lot
-        // for inner-loop kernels like mandelbrot's proc_loop.
-        let tco = detect_tail_call(block, func);
+        // for inner-loop kernels like mandelbrot's proc_loop
+        // (and keeps mutual-recursion named-lets like
+        // mandelbrot's col-loop from overflowing the stack).
+        let tco = detect_tail_call(block, func, &self_refs);
         let last_inst_is_tco = tco.is_some();
         // Emit insts except the trailing CallSelf when
         // TCO is firing — the CallSelf gets replaced
