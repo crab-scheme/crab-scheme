@@ -83,7 +83,10 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         // bitwise (R6RS arithmetic bitwise)
         ("bitwise-and", b_bitwise_and),
         ("bitwise-or", b_bitwise_or),
+        // R6RS standard name (rnrs arithmetic bitwise); same impl as bitwise-or
+        ("bitwise-ior", b_bitwise_or),
         ("bitwise-xor", b_bitwise_xor),
+        ("bitwise-if", b_bitwise_if),
         ("bitwise-not", b_bitwise_not),
         ("bitwise-arithmetic-shift", b_bitwise_arith_shift),
         ("arithmetic-shift", b_bitwise_arith_shift),
@@ -10699,6 +10702,18 @@ fn b_bitwise_bit_set_p(args: &[Value]) -> Result<Value, String> {
         return Ok(Value::Boolean(false));
     }
     Ok(Value::Boolean((n >> bit) & 1 == 1))
+}
+
+fn b_bitwise_if(args: &[Value]) -> Result<Value, String> {
+    // R6RS: (bitwise-if ei1 ei2 ei3)
+    // = (bitwise-ior (bitwise-and ei1 ei2) (bitwise-and (bitwise-not ei1) ei3))
+    if args.len() != 3 {
+        return Err(arity_err("bitwise-if", "3", args.len()));
+    }
+    let mask = as_int_i64("bitwise-if", &args[0])?;
+    let then = as_int_i64("bitwise-if", &args[1])?;
+    let else_ = as_int_i64("bitwise-if", &args[2])?;
+    Ok(Value::fixnum((mask & then) | (!mask & else_)))
 }
 
 // ---- exact-integer-sqrt ----

@@ -1,10 +1,14 @@
 (test-section "Bitwise + eval + error-object")
 
-; bitwise-and / or / xor / not
+; bitwise-and / or / ior (R6RS standard name) / xor / not
 (test-eqv "and-12-10"   8    (bitwise-and 12 10))
 (test-eqv "and-empty"   -1   (bitwise-and))
 (test-eqv "or-5-3"      7    (bitwise-or 5 3))
 (test-eqv "or-empty"    0    (bitwise-or))
+; bitwise-ior is the R6RS standard name and must be identical to bitwise-or
+(test-eqv "ior-5-3"     7    (bitwise-ior 5 3))
+(test-eqv "ior-12-10"   14   (bitwise-ior 12 10))
+(test-eqv "ior-empty"   0    (bitwise-ior))
 (test-eqv "xor-12-10"   6    (bitwise-xor 12 10))
 (test-eqv "not-0"       -1   (bitwise-not 0))
 (test-eqv "not-1"       -2   (bitwise-not 1))
@@ -26,6 +30,11 @@
 (test-eqv "length-256"   9   (bitwise-length 256))
 (test-true  "bit-set-yes" (bitwise-bit-set? 4 2))   ; 4 = b100, bit 2 set
 (test-false "bit-set-no"  (bitwise-bit-set? 4 1))   ; 4 = b100, bit 1 not set
+
+; bitwise-if: selects bits from ei2 where mask=1, from ei3 where mask=0
+(test-eqv "if-all-mask"  6  (bitwise-if 15 6 9))   ; mask=1111 => 15&6=6, ~15&9=0 => 6
+(test-eqv "if-no-mask"   9  (bitwise-if 0 6 9))    ; mask=0 => else entirely => 9
+(test-eqv "if-partial"  10  (bitwise-if 10 15 0))  ; 0b1010 & 0b1111 = 10
 
 ; exact-integer-sqrt returns (sqrt remainder) via 2 values (R6RS)
 (call-with-values (lambda () (exact-integer-sqrt 16))
