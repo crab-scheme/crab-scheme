@@ -16,10 +16,17 @@ cs-actor = { path = "../cs-actor" }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
 thiserror = "1"
 tracing = "0.1"
+# Optional: the RocksDB-backed durable Raft log store (the `rocksdb-log`
+# feature). RocksDB vendors + compiles its C++ library and can't target wasm,
+# so it is strictly opt-in; the default build is in-memory only (MemLogStore).
+rocksdb = { workspace = true, optional = true }
 
 [features]
 default = []
 quic = ["cs-net/quic"]
+# Durable Raft log/hard-state/snapshot persistence via RocksDB (RocksLogStore).
+rocksdb-log = ["dep:rocksdb"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "test-util", "time"] }
+tempfile = "3"

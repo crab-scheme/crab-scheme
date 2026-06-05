@@ -139,6 +139,13 @@ pub fn encode(msg: &Message) -> Vec<u8> {
     out
 }
 
+/// Encode a single log [`Entry`] to bytes (for the durable log store).
+pub fn encode_entry(e: &Entry) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    put_entry(&mut out, e);
+    out
+}
+
 // ---- reader ----
 
 /// Decode error: a frame was malformed or truncated.
@@ -263,6 +270,11 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
         _ => return Err(DecodeError("bad message tag")),
     };
     Ok(msg)
+}
+
+/// Decode a single log [`Entry`] produced by [`encode_entry`].
+pub fn decode_entry(buf: &[u8]) -> Result<Entry, DecodeError> {
+    Cursor::new(buf).entry()
 }
 
 // ---- EPaxos wire codec ----

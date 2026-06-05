@@ -14,6 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sim::SimNode;
+use crate::store::{HardState, MemLogStore, RaftLogStore, SnapshotMeta};
 use crate::{ReplicaId, StateMachine};
 
 /// A Raft term — a logical election epoch, monotonically increasing.
@@ -197,9 +198,31 @@ impl Default for Config {
 
 type Out = (ReplicaId, Message);
 
+/// A committed entry surfaced to the driver after it is applied to the state
+/// machine, so the driver can ack the proposer and notify a commit observer
+/// (the commit→ack bridge). The pure core never touches actors itself — it just
+/// records what was applied; the driver drains [`take_applied`](RaftNode::take_applied).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Applied {
+    /// Log index that was applied (1-based).
+    pub index: Index,
+    /// The committed command bytes (empty for `Noop`/`Config` entries — those
+    /// are not client commands but are still surfaced so observers see the
+    /// full committed sequence by index).
+    pub command: Vec<u8>,
+    /// Opaque result from `StateMachine::apply` (empty for non-`Command`
+    /// entries, which are not applied to the state machine).
+    pub result: Vec<u8>,
+}
+
 /// A single Raft replica.
+///
+/// `S` is the [`RaftLogStore`] backing the log + hard-state + snapshot; it
+/// defaults to the in-memory [`MemLogStore`] so existing `RaftNode<SM>` uses
+/// (Sim, tests) are unchanged. A durable store (`RocksLogStore`) makes the same
+/// protocol crash-safe.
 #[derive(Debug)]
-pub struct RaftNode<SM: StateMachine> {
+pub struct RaftNode<SM: StateMachine, S: RaftLogStore = MemLogStore> {
     id: ReplicaId,
     /// Effective membership: the config of the last `Config` entry in the log
     /// (committed or not), else `base_config`. Recomputed on every log change.
@@ -208,23 +231,27 @@ pub struct RaftNode<SM: StateMachine> {
     base_config: ConfState,
     cfg: Config,
 
-    // ---- persistent state (would be fsync'd in production) ----
+    // ---- persistent state ----
+    // The log + snapshot live in `store`; the hard-state fields below are the
+    // live mirror of what `store` persists (kept here so the protocol reads
+    // stay branch-cheap). Every mutation of term/vote/commit writes through to
+    // `store` via `persist_hard_state`, and every log/snapshot mutation goes
+    // through `store` directly — so by the time the core returns the outbound
+    // messages that ack a write, the bytes are already durable (a synced store).
     current_term: Term,
     voted_for: Option<ReplicaId>,
-    log: Vec<Entry>,
-    /// Index/term of the last entry folded into the latest snapshot; the live
-    /// `log` holds only entries after `base_index`.
-    base_index: Index,
-    base_term: Term,
-    /// Serialized state machine as of `base_index` — shipped verbatim in
-    /// `InstallSnapshot` (it must reflect `base_index`, not the latest apply).
-    snapshot_data: Vec<u8>,
+    /// Membership as of the snapshot base — persisted alongside the snapshot.
+    /// (The snapshot blob/index/term live in `store`; `base_config` is core
+    /// metadata reconstructed on restore from the snapshot's config entry.)
+    store: S,
 
     // ---- volatile state ----
     role: Role,
     leader_id: Option<ReplicaId>,
     commit_index: Index,
     last_applied: Index,
+    /// Entries applied since the driver last drained them (commit→ack bridge).
+    applied_outbox: Vec<Applied>,
 
     // ---- candidate state ----
     votes: BTreeSet<ReplicaId>,
@@ -250,13 +277,28 @@ pub struct RaftNode<SM: StateMachine> {
     sm: SM,
 }
 
-impl<SM: StateMachine> RaftNode<SM> {
-    /// Create a follower whose initial membership is `voters`.
+impl<SM: StateMachine> RaftNode<SM, MemLogStore> {
+    /// Create a follower whose initial membership is `voters`, backed by an
+    /// in-memory log ([`MemLogStore`]).
     ///
     /// Usually `voters` contains `id`. If it doesn't, this node starts as a
     /// non-voting **learner**: it won't campaign and isn't counted in quorums
     /// until a `Config` entry adds it (the join-via-membership-change path).
     pub fn new(id: ReplicaId, voters: Vec<ReplicaId>, cfg: Config, sm: SM) -> Self {
+        RaftNode::new_with_store(id, voters, cfg, sm, MemLogStore::new())
+    }
+}
+
+impl<SM: StateMachine, S: RaftLogStore> RaftNode<SM, S> {
+    /// Create a fresh follower backed by `store` (which must be empty — for
+    /// resuming a populated store, use [`restore_from`](Self::restore_from)).
+    pub fn new_with_store(
+        id: ReplicaId,
+        voters: Vec<ReplicaId>,
+        cfg: Config,
+        sm: SM,
+        store: S,
+    ) -> Self {
         let initial = ConfState::Simple(ConfState::sorted(voters));
         let mut node = RaftNode {
             id,
@@ -265,14 +307,12 @@ impl<SM: StateMachine> RaftNode<SM> {
             cfg,
             current_term: 0,
             voted_for: None,
-            log: Vec::new(),
-            base_index: 0,
-            base_term: 0,
-            snapshot_data: Vec::new(),
+            store,
             role: Role::Follower,
             leader_id: None,
             commit_index: 0,
             last_applied: 0,
+            applied_outbox: Vec::new(),
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
@@ -288,6 +328,51 @@ impl<SM: StateMachine> RaftNode<SM> {
             sm,
         };
         node.reset_election_timer();
+        node
+    }
+
+    /// Resume a node from a populated `store` after a restart (Raft §5.1
+    /// recovery). Reloads hard-state (term / vote / commit), the latest
+    /// snapshot (restoring the state machine and snapshot base), and the live
+    /// log tail; sets `commit_index`/`last_applied` and replays any committed
+    /// suffix into `sm` so the node resumes exactly where it crashed.
+    ///
+    /// `voters` is the bootstrap membership used only if the store carries no
+    /// snapshot config; otherwise the persisted config wins. The node always
+    /// comes back as a `Follower` (Raft never persists the leader role).
+    pub fn restore_from(
+        id: ReplicaId,
+        voters: Vec<ReplicaId>,
+        cfg: Config,
+        sm: SM,
+        store: S,
+    ) -> Self {
+        let mut node = RaftNode::new_with_store(id, voters, cfg, sm, store);
+
+        // 1. Hard-state: term / vote / commit.
+        let hs = node.store.load_hard_state();
+        node.current_term = hs.term;
+        node.voted_for = hs.voted_for;
+
+        // 2. Snapshot: restore the SM to the snapshot base; later steps replay
+        //    the live tail on top. (The snapshot blob + base index/term are
+        //    already loaded into the store; `last_applied` starts at the base.)
+        if let Some(snap) = node.store.load_snapshot() {
+            node.sm.restore(&snap.data);
+            node.last_applied = snap.last_included_index;
+        }
+        // Membership at the snapshot base: the last Config entry at/under the
+        // base if the live log still holds one, else the bootstrap `voters`.
+        // (Persisting joint-config across a snapshot boundary is deferred — see
+        // the design doc's checkpoint-snapshot note.)
+        node.base_config = node.config_at(node.store.base_index());
+
+        // 3. Commit/applied: never below the snapshot base; replay the
+        //    committed suffix into the (snapshot-restored) state machine.
+        node.commit_index = hs.commit_index.max(node.store.base_index());
+        node.last_applied = node.last_applied.max(node.store.base_index());
+        node.recompute_config();
+        node.apply_committed();
         node
     }
 
@@ -317,13 +402,22 @@ impl<SM: StateMachine> RaftNode<SM> {
         &self.sm
     }
 
-    // ---- log helpers (1-based; `base_index` entries are compacted away into
-    // the latest snapshot, so live entries are `base_index+1 ..= last`) ----
+    // ---- log helpers (1-based; entries up to `base_index` are compacted away
+    // into the latest snapshot, so live entries are `base_index+1 ..= last`) ----
+
+    /// The full live log suffix `(base_index, last_index]`, in index order.
+    /// A convenience over the store for the few sites that must scan the log
+    /// (config tracking); hot paths use the indexed store accessors directly.
+    fn live_entries(&self) -> Vec<Entry> {
+        let base = self.store.base_index();
+        self.store.entries(base + 1, self.store.last_index())
+    }
+
     pub fn last_log_index(&self) -> Index {
-        self.log.last().map(|e| e.index).unwrap_or(self.base_index)
+        self.store.last_index()
     }
     fn last_log_term(&self) -> Term {
-        self.log.last().map(|e| e.term).unwrap_or(self.base_term)
+        self.store.last_term()
     }
     /// Term of the entry at `index`, or `None` if it's unknown (beyond the log)
     /// or already compacted (`index < base_index`). `base_index` itself is the
@@ -332,21 +426,20 @@ impl<SM: StateMachine> RaftNode<SM> {
         if index == 0 {
             return Some(0);
         }
-        if index == self.base_index {
-            return Some(self.base_term);
+        let base = self.store.base_index();
+        if index == base {
+            return Some(self.store.base_term());
         }
-        if index < self.base_index {
+        if index < base {
             return None; // compacted
         }
-        self.log
-            .get((index - self.base_index - 1) as usize)
-            .map(|e| e.term)
+        self.store.entry_term(index)
     }
-    fn entry_at(&self, index: Index) -> Option<&Entry> {
-        if index <= self.base_index {
+    fn entry_at(&self, index: Index) -> Option<Entry> {
+        if index <= self.store.base_index() {
             return None; // zero or compacted
         }
-        self.log.get((index - self.base_index - 1) as usize)
+        self.store.entry(index)
     }
 
     /// Peers to replicate to: every voter in the effective config (the union
@@ -365,7 +458,7 @@ impl<SM: StateMachine> RaftNode<SM> {
 
     /// Index of the last `Config` entry in the live log, if any.
     fn last_config_index(&self) -> Option<Index> {
-        self.log
+        self.live_entries()
             .iter()
             .rev()
             .find(|e| matches!(e.payload, EntryPayload::Config(_)))
@@ -374,7 +467,7 @@ impl<SM: StateMachine> RaftNode<SM> {
     /// The config in effect at `index`: the last `Config` entry at or before
     /// `index`, else the snapshot's `base_config`.
     fn config_at(&self, index: Index) -> ConfState {
-        self.log
+        self.live_entries()
             .iter()
             .rev()
             .find(|e| e.index <= index && matches!(e.payload, EntryPayload::Config(_)))
@@ -388,7 +481,7 @@ impl<SM: StateMachine> RaftNode<SM> {
     /// `Config` entry wins, even uncommitted).
     fn recompute_config(&mut self) {
         self.config = self
-            .log
+            .live_entries()
             .iter()
             .rev()
             .find_map(|e| match &e.payload {
@@ -396,6 +489,20 @@ impl<SM: StateMachine> RaftNode<SM> {
                 _ => None,
             })
             .unwrap_or_else(|| self.base_config.clone());
+    }
+
+    // ---- hard-state persistence ----
+
+    /// Write the current hard-state (term / vote / commit) through to the
+    /// store. Called after any change to those fields; the durable store fsyncs
+    /// here, so a synced node has persisted its vote/term/commit before it
+    /// returns the message that acts on them (persist-before-ack).
+    fn persist_hard_state(&mut self) {
+        self.store.save_hard_state(HardState {
+            term: self.current_term,
+            voted_for: self.voted_for,
+            commit_index: self.commit_index,
+        });
     }
 
     // ---- PRNG (xorshift64) ----
@@ -452,6 +559,11 @@ impl<SM: StateMachine> RaftNode<SM> {
         }
         let index = self.append_local(EntryPayload::Command(command));
         let outs = self.broadcast_append();
+        // The leader already holds the entry; let it count its own ack so a
+        // single-node group commits immediately (mirrors `become_leader`'s
+        // post-Noop call). In a multi-node group `{leader}` isn't yet a quorum,
+        // so this advances nothing until peers ack — behavior is unchanged.
+        self.maybe_advance_commit();
         (Some(index), outs)
     }
 
@@ -583,9 +695,17 @@ impl<SM: StateMachine> RaftNode<SM> {
     // ---- role transitions ----
 
     fn become_follower(&mut self, term: Term, leader: Option<ReplicaId>) {
+        let term_changed = term != self.current_term;
         self.role = Role::Follower;
         self.current_term = term;
         self.leader_id = leader;
+        // A new term invalidates any vote cast in the old one (Raft §5.1). On a
+        // same-term re-sync (a valid AppendEntries/InstallSnapshot) the vote is
+        // preserved — matching the previous explicit `voted_for = None` only on
+        // the term-bump call sites.
+        if term_changed {
+            self.voted_for = None;
+        }
         self.votes.clear();
         // Reads can only be served by a leader; fail any in flight so the
         // caller retries on the new one.
@@ -594,6 +714,12 @@ impl<SM: StateMachine> RaftNode<SM> {
         }
         self.acked_seq.clear();
         self.reset_election_timer();
+        // Persisting the bumped term is a safety requirement (Raft §5.1). When
+        // the term is unchanged this is a no-op write; skip it to keep the
+        // common AppendEntries re-sync off the durable path.
+        if term_changed {
+            self.persist_hard_state();
+        }
     }
 
     fn start_election(&mut self) -> Vec<Out> {
@@ -604,6 +730,8 @@ impl<SM: StateMachine> RaftNode<SM> {
         self.votes.clear();
         self.votes.insert(self.id);
         self.reset_election_timer();
+        // New term + self-vote must be durable before we solicit votes.
+        self.persist_hard_state();
 
         // Single-node cluster: an instant majority.
         if self.is_quorum(&self.votes) {
@@ -642,11 +770,12 @@ impl<SM: StateMachine> RaftNode<SM> {
     fn append_local(&mut self, payload: EntryPayload) -> Index {
         let index = self.last_log_index() + 1;
         let is_config = matches!(payload, EntryPayload::Config(_));
-        self.log.push(Entry {
+        // Durable append before the caller broadcasts/acks the new entry.
+        self.store.append(&[Entry {
             term: self.current_term,
             index,
             payload,
-        });
+        }]);
         if let Some(m) = self.match_index.get_mut(&self.id) {
             *m = index;
         }
@@ -667,7 +796,6 @@ impl<SM: StateMachine> RaftNode<SM> {
     ) -> Vec<Out> {
         if term > self.current_term {
             self.become_follower(term, None);
-            self.voted_for = None;
         }
         let mut granted = false;
         if term == self.current_term {
@@ -678,6 +806,10 @@ impl<SM: StateMachine> RaftNode<SM> {
                 granted = true;
                 self.voted_for = Some(candidate);
                 self.reset_election_timer();
+                // The vote must be durable before we tell the candidate we
+                // granted it — otherwise a crash could let us vote twice in one
+                // term (Raft §5.1).
+                self.persist_hard_state();
             }
         }
         vec![(
@@ -692,7 +824,6 @@ impl<SM: StateMachine> RaftNode<SM> {
     fn handle_request_vote_resp(&mut self, from: ReplicaId, term: Term, granted: bool) -> Vec<Out> {
         if term > self.current_term {
             self.become_follower(term, None);
-            self.voted_for = None;
             return Vec::new();
         }
         if self.role != Role::Candidate || term != self.current_term {
@@ -762,19 +893,22 @@ impl<SM: StateMachine> RaftNode<SM> {
 
         // The highest index this AppendEntries lets us match the leader on.
         let match_index = prev_log_index + entries.len() as Index;
-        // Splice in entries, truncating on the first conflict.
+        // Splice in entries, truncating on the first conflict. Each append /
+        // truncate goes through the store, so a synced store has the new tail
+        // on disk before we ack below (persist-before-ack).
         for e in entries {
-            if e.index <= self.base_index {
+            if e.index <= self.store.base_index() {
                 continue; // already folded into our snapshot
             }
             match self.term_at(e.index) {
                 Some(t) if t == e.term => {} // already have it; skip
                 Some(_) => {
-                    // Conflict: drop this entry and everything after it.
-                    self.log.truncate((e.index - self.base_index - 1) as usize);
-                    self.log.push(e);
+                    // Conflict: drop this entry and everything after it, then
+                    // take the leader's.
+                    self.store.truncate_suffix(e.index);
+                    self.store.append(&[e]);
                 }
-                None => self.log.push(e),
+                None => self.store.append(&[e]),
             }
         }
         // Entries may have added or truncated a Config entry.
@@ -783,6 +917,7 @@ impl<SM: StateMachine> RaftNode<SM> {
         // Advance commit to the leader's, bounded by what we now hold.
         if leader_commit > self.commit_index {
             self.commit_index = leader_commit.min(self.last_log_index());
+            self.persist_hard_state();
             self.apply_committed();
         }
         vec![(
@@ -827,23 +962,28 @@ impl<SM: StateMachine> RaftNode<SM> {
         }
         self.become_follower(term, Some(leader));
         // Stale / already-covered snapshot: ack our current position.
-        if last_included_index <= self.base_index {
+        if last_included_index <= self.store.base_index() {
             return ack(self, true, self.last_log_index());
         }
-        // Keep a consistent suffix if we have a matching entry at the snapshot
-        // boundary; otherwise the whole log is superseded.
-        if self.term_at(last_included_index) == Some(last_included_term) {
-            self.log.retain(|e| e.index > last_included_index);
-        } else {
-            self.log.clear();
+        // If we don't have a matching entry at the snapshot boundary, the whole
+        // live log is superseded — drop it before installing (save_snapshot
+        // keeps only `index > last_included_index`, which is exactly the
+        // consistent-suffix case).
+        if self.term_at(last_included_index) != Some(last_included_term) {
+            self.store.truncate_suffix(self.store.base_index() + 1);
         }
         self.sm.restore(&data);
-        self.snapshot_data = data;
-        self.base_index = last_included_index;
-        self.base_term = last_included_term;
+        // Persist the installed snapshot (blob + new base) durably; this also
+        // trims any live entries at or below the new base.
+        self.store.save_snapshot(SnapshotMeta {
+            last_included_index,
+            last_included_term,
+            data,
+        });
         self.base_config = last_included_config;
         self.commit_index = self.commit_index.max(last_included_index);
         self.last_applied = self.last_applied.max(last_included_index);
+        self.persist_hard_state();
         self.recompute_config();
         ack(self, true, last_included_index)
     }
@@ -861,7 +1001,6 @@ impl<SM: StateMachine> RaftNode<SM> {
     ) -> Vec<Out> {
         if term > self.current_term {
             self.become_follower(term, None);
-            self.voted_for = None;
             return Vec::new();
         }
         if self.role != Role::Leader || term != self.current_term {
@@ -897,25 +1036,20 @@ impl<SM: StateMachine> RaftNode<SM> {
     fn append_for(&self, peer: ReplicaId) -> Message {
         let next = self.next_index.get(&peer).copied().unwrap_or(1);
         // The entry just before `next` is gone (compacted) → ship the snapshot.
-        if next <= self.base_index {
+        if next <= self.store.base_index() {
             return Message::InstallSnapshot {
                 term: self.current_term,
                 leader: self.id,
-                last_included_index: self.base_index,
-                last_included_term: self.base_term,
+                last_included_index: self.store.base_index(),
+                last_included_term: self.store.base_term(),
                 last_included_config: self.base_config.clone(),
-                data: self.snapshot_data.clone(),
+                data: self.store.snapshot_data(),
                 read_seq: self.read_seq,
             };
         }
         let prev_log_index = next - 1;
         let prev_log_term = self.term_at(prev_log_index).unwrap_or(0);
-        let entries: Vec<Entry> = self
-            .log
-            .iter()
-            .filter(|e| e.index >= next)
-            .cloned()
-            .collect();
+        let entries: Vec<Entry> = self.store.entries(next, self.store.last_index());
         Message::AppendEntries {
             term: self.current_term,
             leader: self.id,
@@ -962,6 +1096,7 @@ impl<SM: StateMachine> RaftNode<SM> {
             }
         }
         if advanced {
+            self.persist_hard_state();
             self.apply_committed();
             self.finalize_joint_if_committed();
         }
@@ -992,10 +1127,22 @@ impl<SM: StateMachine> RaftNode<SM> {
             self.last_applied += 1;
             let idx = self.last_applied;
             if let Some(entry) = self.entry_at(idx) {
-                if let EntryPayload::Command(cmd) = &entry.payload {
-                    let cmd = cmd.clone();
-                    self.sm.apply(&cmd);
-                }
+                // Apply client commands to the SM; record every applied index
+                // (command + result, empty for Noop/Config) into the outbox so
+                // the driver can ack the proposer and notify a commit observer.
+                let (command, result) = match &entry.payload {
+                    EntryPayload::Command(cmd) => {
+                        let cmd = cmd.clone();
+                        let result = self.sm.apply(&cmd);
+                        (cmd, result)
+                    }
+                    EntryPayload::Noop | EntryPayload::Config(_) => (Vec::new(), Vec::new()),
+                };
+                self.applied_outbox.push(Applied {
+                    index: idx,
+                    command,
+                    result,
+                });
             }
         }
         // Newly-applied state may satisfy a pending read's read_index.
@@ -1007,16 +1154,20 @@ impl<SM: StateMachine> RaftNode<SM> {
     /// The snapshot blob is captured from the state machine *now*, while it
     /// reflects exactly `last_applied`. No-op if nothing new was applied.
     pub fn compact(&mut self) {
-        if self.last_applied <= self.base_index {
+        if self.last_applied <= self.store.base_index() {
             return;
         }
         let new_base = self.last_applied;
         let new_base_term = self.term_at(new_base).expect("applied entry is present");
         let new_base_config = self.config_at(new_base);
-        self.snapshot_data = self.sm.snapshot();
-        self.log.retain(|e| e.index > new_base);
-        self.base_index = new_base;
-        self.base_term = new_base_term;
+        let data = self.sm.snapshot();
+        // Persist the snapshot (blob + new base) and trim the now-compacted
+        // prefix from the live log, all through the store.
+        self.store.save_snapshot(SnapshotMeta {
+            last_included_index: new_base,
+            last_included_term: new_base_term,
+            data,
+        });
         self.base_config = new_base_config;
         // A dropped Config entry is now captured in base_config.
         self.recompute_config();
@@ -1026,7 +1177,7 @@ impl<SM: StateMachine> RaftNode<SM> {
     /// past the snapshot base.
     fn maybe_compact(&mut self) {
         let thr = self.cfg.snapshot_threshold;
-        if thr > 0 && self.last_applied.saturating_sub(self.base_index) >= thr {
+        if thr > 0 && self.last_applied.saturating_sub(self.store.base_index()) >= thr {
             self.compact();
         }
     }
@@ -1034,7 +1185,21 @@ impl<SM: StateMachine> RaftNode<SM> {
     /// Snapshot bookkeeping accessor (for tests/metrics): the highest index
     /// folded into a snapshot.
     pub fn snapshot_index(&self) -> Index {
-        self.base_index
+        self.store.base_index()
+    }
+
+    /// Drain the entries applied since the last call (the commit→ack bridge).
+    /// The driver calls this after every drive step and, for each [`Applied`],
+    /// acks the proposer (if it tracked that index) and notifies the commit
+    /// observer. Keeping the actor-messaging in the driver leaves the core
+    /// deterministic and I/O-free.
+    pub fn take_applied(&mut self) -> Vec<Applied> {
+        std::mem::take(&mut self.applied_outbox)
+    }
+
+    /// Borrow the backing log store (for tests / driver bookkeeping).
+    pub fn store(&self) -> &S {
+        &self.store
     }
 
     /// Highest `read_seq` a quorum has confirmed (the leader counts itself at
@@ -1083,7 +1248,7 @@ impl<SM: StateMachine> RaftNode<SM> {
     }
 }
 
-impl<SM: StateMachine> SimNode for RaftNode<SM> {
+impl<SM: StateMachine, S: RaftLogStore> SimNode for RaftNode<SM, S> {
     type Msg = Message;
     fn id(&self) -> ReplicaId {
         self.id
