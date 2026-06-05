@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::{Signed, ToPrimitive, Zero};
+use num_traits::{Num, Signed, ToPrimitive, Zero};
 
 #[derive(Clone)]
 pub enum Number {
@@ -35,6 +35,21 @@ impl Number {
         }
         // Out of i64 range — try BigInt.
         s.parse::<BigInt>().ok().map(|b| Number::Big(Rc::new(b)))
+    }
+
+    /// Parse a radix integer literal (base 2, 8, 10, or 16), returning
+    /// Fixnum when it fits in i64 or Big otherwise. The input `s` may
+    /// carry a leading `'-'` sign (matching what `i64::from_str_radix`
+    /// and `BigInt::from_str_radix` both accept). Returns None on bad
+    /// input (invalid digits for the given radix).
+    pub fn parse_radix_integer(s: &str, radix: u32) -> Option<Self> {
+        if let Ok(v) = i64::from_str_radix(s, radix) {
+            return Some(Number::Fixnum(v));
+        }
+        // Out of i64 range — try BigInt.
+        BigInt::from_str_radix(s, radix)
+            .ok()
+            .map(|b| Number::Big(Rc::new(b)))
     }
 
     pub fn is_exact(&self) -> bool {
@@ -488,6 +503,44 @@ impl fmt::Debug for Number {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_radix_integer_fixnum() {
+        // Small hex — fits in i64 → Fixnum.
+        assert!(matches!(
+            Number::parse_radix_integer("ff", 16),
+            Some(Number::Fixnum(255))
+        ));
+    }
+
+    #[test]
+    fn parse_radix_integer_big_hex() {
+        // 2^63 in hex — exceeds i64::MAX → Big.
+        let n = Number::parse_radix_integer("8000000000000000", 16).unwrap();
+        match n {
+            Number::Big(b) => {
+                let expected: BigInt = "9223372036854775808".parse().unwrap();
+                assert_eq!(*b, expected);
+            }
+            _ => panic!("expected Big, got {:?}", n),
+        }
+    }
+
+    #[test]
+    fn parse_radix_integer_negative_fixnum() {
+        // Negative hex that fits in i64 → Fixnum.
+        assert!(matches!(
+            Number::parse_radix_integer("-ff", 16),
+            Some(Number::Fixnum(-255))
+        ));
+    }
+
+    #[test]
+    fn parse_radix_integer_bad_input() {
+        // Invalid digits → None.
+        assert!(Number::parse_radix_integer("xyz", 16).is_none());
+        assert!(Number::parse_radix_integer("2", 2).is_none());
+    }
 
     #[test]
     fn add_fixnum() {
