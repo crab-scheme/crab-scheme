@@ -1389,6 +1389,80 @@ pub fn b_beam_yield(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, St
     Ok(Value::Unspecified)
 }
 
+/// `(sleep-ms n)` — sleep for `n` milliseconds (non-negative
+/// integer). Returns unspecified. Zero-duration call returns
+/// immediately without a syscall.
+///
+/// # Implementation note — Option 2 (std::thread::sleep)
+///
+/// Each actor in the current model runs on a dedicated
+/// `spawn_blocking` OS thread (not a tokio task). The builtin
+/// layer is synchronous: there is no async executor context
+/// available from inside a `fn(&[Value], &mut SymbolTable)`
+/// call. Cooperative tokio parking (Option 1) would require
+/// restructuring actor dispatch to expose a `tokio::time::sleep`
+/// future — a large post-1.0 change. `std::thread::sleep` is
+/// the correct choice here: it releases the OS thread (and
+/// therefore the CPU) for the full duration, which is strictly
+/// better than the current busy-spin `(yield)` loop. This
+/// mirrors exactly how `raw-receive` with a timeout parks today
+/// (see `primop_raw_receive` — it also uses `thread::sleep`).
+pub fn b_beam_sleep_ms(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("sleep-ms", args, 1)?;
+    let ms = match &args[0] {
+        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as u64,
+        Value::Number(Number::Fixnum(n)) => {
+            return Err(format!(
+                "sleep-ms: duration must be non-negative, got {}",
+                n
+            ))
+        }
+        other => {
+            return Err(format!(
+                "sleep-ms: expected non-negative integer, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    if ms > 0 {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+    Ok(Value::Unspecified)
+}
+
+/// `(sleep secs)` — sleep for `secs` seconds (fixnum or flonum,
+/// non-negative). Fractional seconds are supported. Returns
+/// unspecified. Zero-duration call returns immediately.
+///
+/// Converts to a `Duration` and delegates to `thread::sleep`;
+/// see `sleep-ms` for the implementation rationale.
+pub fn b_beam_sleep(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("sleep", args, 1)?;
+    let secs_f: f64 = match &args[0] {
+        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as f64,
+        Value::Number(Number::Fixnum(n)) => {
+            return Err(format!("sleep: duration must be non-negative, got {}", n))
+        }
+        Value::Number(Number::Flonum(f)) if *f >= 0.0 => *f,
+        Value::Number(Number::Flonum(f)) => {
+            return Err(format!("sleep: duration must be non-negative, got {}", f))
+        }
+        other => {
+            return Err(format!(
+                "sleep: expected non-negative number, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    if secs_f > 0.0 {
+        let ms = (secs_f * 1000.0).round() as u64;
+        if ms > 0 {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
+    Ok(Value::Unspecified)
+}
+
 /// `(raw-receive)` blocks until a message arrives;
 /// `(raw-receive timeout-ms)` returns `#f` if the deadline
 /// passes without one. System messages (Exit/Down) surface as
@@ -1583,6 +1657,9 @@ pub fn beam_syms_builtins() -> Vec<(
         ("reductions", b_beam_reductions),
         ("bump-reductions!", b_beam_bump_reductions),
         ("yield", b_beam_yield),
+        // timed sleep (releases OS thread for the duration)
+        ("sleep-ms", b_beam_sleep_ms),
+        ("sleep", b_beam_sleep),
         // supervision (bridges to lib/beam/prelude.scm's
         // user-facing (link), (monitor), (unlink), (demonitor),
         // (trap-exit!) wrappers)
@@ -2236,5 +2313,87 @@ mod tests {
     fn table_unknown_type_errors() {
         let err = primop_make_table("test:bad-type-table", "bag").expect_err("bag unsupported");
         assert!(err.contains("unknown type"), "got: {}", err);
+    }
+
+    // ---- sleep-ms / sleep tests ----
+
+    #[test]
+    fn sleep_ms_zero_returns_immediately() {
+        let mut syms = SymbolTable::new();
+        let start = std::time::Instant::now();
+        let v =
+            b_beam_sleep_ms(&[Value::Number(Number::Fixnum(0))], &mut syms).expect("sleep-ms 0");
+        assert!(matches!(v, Value::Unspecified));
+        // Zero-sleep must not take more than a generous 50ms (scheduler jitter).
+        assert!(start.elapsed().as_millis() < 50);
+    }
+
+    #[test]
+    fn sleep_ms_waits_at_least_requested_duration() {
+        let mut syms = SymbolTable::new();
+        let start = std::time::Instant::now();
+        b_beam_sleep_ms(&[Value::Number(Number::Fixnum(20))], &mut syms).expect("sleep-ms 20");
+        // Relax lower bound to 15ms to tolerate OS timer granularity.
+        assert!(
+            start.elapsed().as_millis() >= 15,
+            "elapsed {:?} < 15ms",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn sleep_ms_negative_errors() {
+        let mut syms = SymbolTable::new();
+        let err = b_beam_sleep_ms(&[Value::Number(Number::Fixnum(-1))], &mut syms)
+            .expect_err("negative should error");
+        assert!(err.contains("non-negative"), "got: {}", err);
+    }
+
+    #[test]
+    fn sleep_ms_wrong_type_errors() {
+        let mut syms = SymbolTable::new();
+        let err =
+            b_beam_sleep_ms(&[Value::Boolean(true)], &mut syms).expect_err("bool should error");
+        assert!(err.contains("sleep-ms"), "got: {}", err);
+    }
+
+    #[test]
+    fn sleep_zero_seconds_returns_immediately() {
+        let mut syms = SymbolTable::new();
+        let start = std::time::Instant::now();
+        let v = b_beam_sleep(&[Value::Number(Number::Fixnum(0))], &mut syms).expect("sleep 0");
+        assert!(matches!(v, Value::Unspecified));
+        assert!(start.elapsed().as_millis() < 50);
+    }
+
+    #[test]
+    fn sleep_zero_float_returns_immediately() {
+        let mut syms = SymbolTable::new();
+        let start = std::time::Instant::now();
+        b_beam_sleep(&[Value::Number(Number::Flonum(0.0))], &mut syms).expect("sleep 0.0");
+        assert!(start.elapsed().as_millis() < 50);
+    }
+
+    #[test]
+    fn sleep_negative_errors() {
+        let mut syms = SymbolTable::new();
+        let err = b_beam_sleep(&[Value::Number(Number::Fixnum(-1))], &mut syms)
+            .expect_err("negative int should error");
+        assert!(err.contains("non-negative"), "got: {}", err);
+    }
+
+    #[test]
+    fn sleep_negative_float_errors() {
+        let mut syms = SymbolTable::new();
+        let err = b_beam_sleep(&[Value::Number(Number::Flonum(-0.5))], &mut syms)
+            .expect_err("negative float should error");
+        assert!(err.contains("non-negative"), "got: {}", err);
+    }
+
+    #[test]
+    fn sleep_wrong_type_errors() {
+        let mut syms = SymbolTable::new();
+        let err = b_beam_sleep(&[Value::Null], &mut syms).expect_err("null should error");
+        assert!(err.contains("sleep"), "got: {}", err);
     }
 }
