@@ -610,11 +610,11 @@ impl<'src> Lexer<'src> {
                 src: text.into(),
             });
         }
-        let num = i64::from_str_radix(text, radix).map_err(|_| LexError::BadNumber {
+        let num = Number::parse_radix_integer(text, radix).ok_or_else(|| LexError::BadNumber {
             span,
             src: text.into(),
         })?;
-        Ok((Token::Number(Number::Fixnum(num)), span))
+        Ok((Token::Number(num), span))
     }
 
     fn read_character(&mut self, start: usize) -> Result<(Token, Span), LexError> {
@@ -996,6 +996,84 @@ mod tests {
     fn radix_negative() {
         let toks = lex("#x-ff");
         assert!(matches!(toks[0], Token::Number(Number::Fixnum(-255))));
+    }
+
+    #[test]
+    fn hex_radix_big() {
+        // #x8000000000000000 == 2^63 == 9223372036854775808 — exceeds i64::MAX.
+        let toks = lex("#x8000000000000000");
+        match &toks[0] {
+            Token::Number(Number::Big(b)) => {
+                let expected = match Number::parse_decimal_integer("9223372036854775808").unwrap() {
+                    Number::Big(e) => e,
+                    _ => unreachable!("2^63 must parse as Big"),
+                };
+                assert_eq!(*b, expected);
+            }
+            other => panic!("expected Big, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hex_radix_small_still_fixnum() {
+        // Small hex values must still produce Fixnum, not Big.
+        let toks = lex("#xFF");
+        assert!(matches!(toks[0], Token::Number(Number::Fixnum(255))));
+    }
+
+    #[test]
+    fn binary_radix_big() {
+        // 2^64 in binary — 65 '1' bits; clearly exceeds i64 range.
+        let src = format!("#b1{}", "0".repeat(63)); // 2^63 as binary
+        let toks = lex(&src);
+        match &toks[0] {
+            Token::Number(Number::Big(b)) => {
+                let expected = match Number::parse_decimal_integer("9223372036854775808").unwrap() {
+                    Number::Big(e) => e,
+                    _ => unreachable!("2^63 must parse as Big"),
+                };
+                assert_eq!(*b, expected);
+            }
+            other => panic!("expected Big for large binary, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn octal_radix_big() {
+        // 8^22 = 2^66 — exceeds i64 range.
+        // 1 followed by 22 zeros in base-8 = 8^22.
+        let src = format!("#o1{}", "0".repeat(22));
+        let toks = lex(&src);
+        match &toks[0] {
+            Token::Number(Number::Big(b)) => {
+                // 8^22 = (2^3)^22 = 2^66
+                let expected = match Number::parse_decimal_integer("73786976294838206464").unwrap()
+                {
+                    Number::Big(e) => e,
+                    _ => unreachable!("2^66 must parse as Big"),
+                };
+                assert_eq!(*b, expected);
+            }
+            other => panic!("expected Big for large octal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hex_radix_negative_big() {
+        // -(2^63) fits in i64 (it is i64::MIN), so go one larger: -(2^63+1).
+        // #x-8000000000000001 = -(2^63 + 1), which underflows i64.
+        let toks = lex("#x-8000000000000001");
+        match &toks[0] {
+            Token::Number(Number::Big(b)) => {
+                let expected = match Number::parse_decimal_integer("-9223372036854775809").unwrap()
+                {
+                    Number::Big(e) => e,
+                    _ => unreachable!("-(2^63+1) must parse as Big"),
+                };
+                assert_eq!(*b, expected);
+            }
+            other => panic!("expected Big for negative large hex, got {:?}", other),
+        }
     }
 
     fn lex_with_syms(src: &str) -> (Vec<Token>, SymbolTable) {
