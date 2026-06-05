@@ -2041,6 +2041,10 @@ impl Runtime {
         for p in cs_stdlib_tls::procs() {
             self.register_host_procedure(p);
         }
+        #[cfg(feature = "stdlib-store")]
+        for p in cs_store::procs() {
+            self.register_host_procedure(p);
+        }
         #[cfg(feature = "stdlib-meta")]
         for p in cs_stdlib_meta::procs() {
             self.register_host_procedure(p);
