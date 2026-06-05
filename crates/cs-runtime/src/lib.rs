@@ -2089,6 +2089,11 @@ impl Runtime {
         // + numeric helpers).
         #[cfg(feature = "stdlib-math")]
         self.load_bundled_library("(crab math)", include_str!("scheme/math.scm"));
+        // Synchronous actor RPC (`call`). Gated on `actor` (not a
+        // stdlib-* flag) because it is built on the actor primitives
+        // send/raw-receive/self, which only exist with that feature.
+        #[cfg(feature = "actor")]
+        self.load_bundled_library("(crab actor)", include_str!("scheme/actor.scm"));
     }
 
     /// Evaluate one bundled library's source into the global env. A
