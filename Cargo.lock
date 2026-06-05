@@ -1036,6 +1036,8 @@ dependencies = [
  "cs-actor",
  "cs-distrib",
  "cs-net",
+ "rocksdb",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

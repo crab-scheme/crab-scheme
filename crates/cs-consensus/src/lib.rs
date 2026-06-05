@@ -30,8 +30,12 @@ pub mod driver;
 pub mod epaxos;
 pub mod raft;
 pub mod sim;
+pub mod store;
 
-pub use driver::{spawn_raft_actor, EpaxosDriver, RaftCommand, RaftDriver};
+pub use driver::{spawn_raft_actor, Applied, Committed, EpaxosDriver, RaftCommand, RaftDriver};
+#[cfg(feature = "rocksdb-log")]
+pub use store::RocksLogStore;
+pub use store::{HardState, MemLogStore, RaftLogStore, SnapshotMeta};
 
 /// Stable identity of one replica within a consensus group.
 ///
