@@ -387,6 +387,31 @@ pub fn primop_spawn_source(
     Ok(actor_ref.pid())
 }
 
+/// `(spawn-source-green SOURCE ENTRY args...)` — like [`primop_spawn_source`]
+/// but runs the body on the parking `LocalSet` worker pool (green) instead of a
+/// dedicated `block_in_place` thread. The actor **parks** (releases its worker)
+/// on `(receive)` / `(raw-receive)` / `(sleep)`, and many such actors multiplex
+/// onto each worker — no thread-per-actor `max_blocking_threads` ceiling.
+///
+/// Unlike `spawn-activation` (framework-driven, one `(handler msg)` call per
+/// message), this runs an arbitrary free-form body with its own receive loop —
+/// the shape every `spawn-source` actor (and all of crab-cache) uses — via
+/// [`green_source_body`].
+///
+/// M1: an explicit opt-in sibling of `spawn-source` (default stays dedicated;
+/// INV-1 — cooperative async TCP must land before the default can flip).
+pub fn primop_spawn_source_green(
+    source: String,
+    entry: String,
+    args: Vec<SendableValue>,
+) -> Result<ActorPid, String> {
+    let st = beam_state();
+    let actor_ref = st
+        .actors
+        .spawn_local_activation(move |actor| green_source_body(actor, source, entry, args));
+    Ok(actor_ref.pid())
+}
+
 /// `(spawn-activation SOURCE HANDLER)` — spawn a Scheme actor on the
 /// `LocalSet` worker pool (#30 iter-2a / ADR 0032) so it **parks** (releases
 /// its worker) while waiting on an empty mailbox instead of pinning an OS
@@ -589,6 +614,71 @@ async fn pump_coroutine(
     }
 }
 
+/// Whole-body green actor driver — the free-form analog of [`activation_body`]
+/// and the green analog of [`run_scheme_body`]. Runs an entire `spawn-source`
+/// body (with its *own* `(receive)`/`(raw-receive)`/`(sleep)` loop) inside a
+/// stackful coroutine on a `LocalSet` worker, so every cooperative suspend point
+/// the body hits **parks** (releasing the worker for co-located actors) instead
+/// of blocking the worker thread.
+///
+/// No body or receive/sleep-primop changes are needed: the body's own
+/// `(raw-receive)` / `(sleep)` already route through the `YIELDER`-gated
+/// cooperative hooks ([`cooperative_raw_receive`] / [`cooperative_sleep_hook`]),
+/// and this driver — via [`pump_coroutine`] — publishes that `YIELDER`. The
+/// difference from [`drive_handler`] is only *what the coroutine runs*: a whole
+/// body that loops until the actor exits, rather than one handler invocation.
+///
+/// ## Drop order
+///
+/// `rt`/`actor` live in this frame; `co` is built here and moved into
+/// [`pump_coroutine`], whose frame is awaited from this one — so `co` stays
+/// innermost and force-unwinds (running `Rc` dtors that touch `rt`'s heap)
+/// *before* `rt`/`actor` drop on teardown. Do not hoist `co` above `rt`/`actor`.
+/// See [`drive_handler`]'s safety doc for the full single-thread aliasing
+/// argument (identical here — one worker, strictly-alternating control).
+async fn green_source_body(
+    mut actor: cs_actor::Actor,
+    source: String,
+    entry: String,
+    args: Vec<SendableValue>,
+) {
+    let mut rt = crate::Runtime::new();
+    // Load on the VM tier in the driver frame (no YIELDER installed yet:
+    // top-level `(define …)`s don't park). Mirrors `run_scheme_body`.
+    if let Err(d) = rt.eval_str_via_vm("<spawn-source-green>", &source) {
+        eprintln!("spawn-source(green): loading actor source failed: {d:?}");
+        return;
+    }
+    let call = match resolve_and_build_call(&rt, &entry, &args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("spawn-source(green): {e}");
+            return;
+        }
+    };
+
+    let rt_ptr: *mut crate::Runtime = &mut rt;
+    let actor_ptr: *mut cs_actor::Actor = &mut actor;
+    // `co` declared after `rt`/`actor` (drop-order — see fn doc). The closure
+    // seeds the yielder, then runs the WHOLE body; its (raw-receive)/(sleep)
+    // suspend back to `pump_coroutine`, which lives until the body returns.
+    let co: Coroutine<CoResume, CoYield, Result<Value, String>, DefaultStack> =
+        Coroutine::with_stack(checkout_stack(), move |yielder, _first: CoResume| {
+            YIELDER.with(|y| y.set(yielder as *const _));
+            // Sound: the driver is parked in `resume()` right now (see fn doc).
+            let rt = unsafe { &mut *rt_ptr };
+            rt.eval_str_via_vm("<spawn-source-green-body>", &call)
+                .map_err(|d| format!("actor body raised: {d:?}"))
+        });
+
+    // P6.1 maps the outcome to a proper ExitReason for link/monitor parity; for
+    // now match the dedicated path (`scheme_source_entry`): surface a body error
+    // loudly and exit (Article VI — never die silently).
+    if let Err(e) = pump_coroutine(co, actor_ptr).await {
+        eprintln!("spawn-source(green): actor `{entry}` terminated: {e}");
+    }
+}
+
 /// The async side of a cooperative `(raw-receive)`: pop a message from the
 /// mailbox — parking on the async mailbox (cancel-safe) so co-located actors run
 /// — then apply the same trap-exit + system-message processing as the blocking
@@ -652,6 +742,25 @@ fn run_scheme_body(source: &str, entry: &str, args: &[SendableValue]) -> Result<
     // (`-c 50` SET); VM-only resolves that and is faster across the board.
     rt.eval_str_via_vm("<spawn-source>", source)
         .map_err(|d| format!("loading actor source failed: {d:?}"))?;
+    let call = resolve_and_build_call(&rt, entry, args)?;
+    rt.eval_str_via_vm("<spawn-call>", &call)
+        .map_err(|d| format!("actor body raised: {d:?}"))?;
+    Ok(())
+}
+
+/// Resolve `entry` to a top-level procedure in `rt` and render the call
+/// expression `(entry 'a0 'a1 ...)` that runs it. Shared by the dedicated
+/// [`run_scheme_body`] and the green [`green_source_body`].
+///
+/// Each argument is rendered as a quoted external datum, so this needs only the
+/// public eval/lookup surface (no mutable `SymbolTable` access) and reuses the
+/// reader's own interning — symbols/strings/lists round-trip exactly. Errors if
+/// `entry` is missing or is bound to a non-procedure.
+fn resolve_and_build_call(
+    rt: &crate::Runtime,
+    entry: &str,
+    args: &[SendableValue],
+) -> Result<String, String> {
     match rt.lookup(entry) {
         Some(Value::Procedure(_)) => {}
         Some(other) => {
@@ -662,14 +771,7 @@ fn run_scheme_body(source: &str, entry: &str, args: &[SendableValue]) -> Result<
         }
         None => return Err(format!("no top-level `{entry}` defined in the source")),
     }
-    // Apply by re-entering eval with the args rendered as quoted external
-    // datums: `(entry 'a0 'a1 ...)`. This needs only the public
-    // eval/lookup surface (no mutable SymbolTable access) and reuses the
-    // reader's own interning, so symbols/strings/lists round-trip exactly.
-    let call = build_call_expr(entry, args)?;
-    rt.eval_str_via_vm("<spawn-call>", &call)
-        .map_err(|d| format!("actor body raised: {d:?}"))?;
-    Ok(())
+    build_call_expr(entry, args)
 }
 
 /// Render `(entry 'arg0 'arg1 ...)`. Each argument is `quote`d so that a
@@ -1444,6 +1546,34 @@ pub fn b_beam_spawn_source(args: &[Value], syms: &mut SymbolTable) -> Result<Val
     Ok(from_sendable(&SendableValue::Pid(pid), syms))
 }
 
+/// `(spawn-source-green SOURCE ENTRY arg ...)` — like [`b_beam_spawn_source`]
+/// but runs the body green (on the parking `LocalSet` pool) instead of a
+/// dedicated thread, so the actor parks on receive/sleep and many actors share a
+/// worker. M1 opt-in sibling of `spawn-source`. See [`primop_spawn_source_green`].
+pub fn b_beam_spawn_source_green(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err(
+            "spawn-source-green: expected a SOURCE string, an ENTRY name, and 0+ args".into(),
+        );
+    }
+    let source = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        other => {
+            return Err(format!(
+                "spawn-source-green: SOURCE must be a string, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let entry = value_to_str(&args[1], syms, "spawn-source-green")?;
+    let mut sendable_args = Vec::with_capacity(args.len() - 2);
+    for a in &args[2..] {
+        sendable_args.push(to_sendable_in(a, syms)?);
+    }
+    let pid = primop_spawn_source_green(source, entry, sendable_args)?;
+    Ok(from_sendable(&SendableValue::Pid(pid), syms))
+}
+
 /// `(spawn-activation SOURCE HANDLER)` — spawn a Scheme actor on the parking
 /// `LocalSet` worker pool. `SOURCE` is a Scheme string; `HANDLER` is a symbol
 /// or string naming the top-level per-message handler `(handler msg) ->
@@ -1938,6 +2068,7 @@ pub fn beam_syms_builtins() -> Vec<(
         ("send", b_beam_send),
         ("spawn", b_beam_spawn),
         ("spawn-source", b_beam_spawn_source),
+        ("spawn-source-green", b_beam_spawn_source_green),
         ("spawn-activation", b_beam_spawn_activation),
         ("self", b_beam_self),
         ("raw-receive", b_beam_raw_receive),
@@ -2502,6 +2633,118 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn spawn_source_green_runs_whole_body_loop() {
+        // P1.2 gate: a free-form green spawn-source body with its OWN
+        // (raw-receive) loop runs on the LocalSet pool and parks between
+        // receives — no body or primop change vs the dedicated path (the spec
+        // §0.2 insight: the body's own (raw-receive) already routes through the
+        // YIELDER-gated cooperative hook, which green_source_body publishes).
+        // The body sums three received numbers in a self-recursive loop, then
+        // writes the total to the global table (the cross-thread channel).
+        let table = "spawn-src-green-loop-test";
+        primop_make_table(table, "set").expect("make table");
+
+        let body = r#"
+            (define (summer key)
+              (let loop ((remaining 3) (acc 0))
+                (if (= remaining 0)
+                    (table-insert! 'spawn-src-green-loop-test key acc)
+                    (loop (- remaining 1) (+ acc (raw-receive))))))
+        "#;
+
+        let pid = primop_spawn_source_green(
+            body.to_string(),
+            "summer".to_string(),
+            vec![SendableValue::String("s".into())],
+        )
+        .expect("spawn-source-green");
+        primop_send(pid, SendableValue::Fixnum(10)).expect("send 10");
+        primop_send(pid, SendableValue::Fixnum(20)).expect("send 20");
+        primop_send(pid, SendableValue::Fixnum(12)).expect("send 12");
+
+        // acc = 10 + 20 + 12 = 42
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(v) =
+                primop_table_lookup(table, &SendableValue::String("s".into())).expect("lookup")
+            {
+                assert_eq!(v, SendableValue::Fixnum(42));
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("green whole-body actor never wrote its result");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn green_source_actors_multiplex_on_the_pool() {
+        // P1.3 gate: many whole-body green spawn-source actors coexist on the
+        // shared LocalSet pool and all complete — multiplexing, not
+        // thread-per-actor (these would blow the 4096 block_in_place ceiling on
+        // the dedicated path at scale). Each receives (collector-pid . id),
+        // replies id*10, then exits; a registered Rust collector gathers all N.
+        let n: i64 = 50;
+        let got: Arc<std::sync::Mutex<Vec<SendableValue>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let got_clone = got.clone();
+        beam_state().procs.register(
+            "test:collect-green",
+            Arc::new(move |actor, _args| {
+                for _ in 0..n {
+                    match primop_raw_receive(actor, None) {
+                        Ok(Some(msg)) => got_clone.lock().unwrap().push(msg),
+                        _ => break,
+                    }
+                }
+            }),
+        );
+        let collector = primop_spawn("test:collect-green", vec![]).expect("spawn collector");
+
+        // PIDs can't be spawn args (rejected by the datum bridge) — deliver the
+        // collector pid + id as the first message instead.
+        let body = r#"
+            (define (worker)
+              (let ((msg (raw-receive)))
+                (send (car msg) (* (cdr msg) 10))))
+        "#;
+        for i in 0..n {
+            let pid = primop_spawn_source_green(body.to_string(), "worker".to_string(), vec![])
+                .expect("spawn-source-green");
+            let msg = SendableValue::Pair(
+                Box::new(SendableValue::Pid(collector)),
+                Box::new(SendableValue::Fixnum(i)),
+            );
+            primop_send(pid, msg).expect("send");
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if got.lock().unwrap().len() == n as usize {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "only {} of {n} green source actors reported",
+                    got.lock().unwrap().len()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let sum: i64 = got
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|v| match v {
+                SendableValue::Fixnum(k) => *k,
+                _ => panic!("unexpected reply {v:?}"),
+            })
+            .sum();
+        assert_eq!(sum, (0..n).map(|i| i * 10).sum::<i64>());
     }
 
     #[test]
