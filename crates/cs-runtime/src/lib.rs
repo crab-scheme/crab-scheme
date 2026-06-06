@@ -191,7 +191,10 @@ impl Drop for Pinned {
 pub struct RuntimeImage {
     vm_env: Rc<cs_vm::vm::Env>,
     top: Rc<Frame>,
-    syms: SymbolTable,
+    /// The base symbol table, shared (`Rc`) by every per-actor table layered over
+    /// it via [`SymbolTable::with_base`] — so builtin/library symbol ids stay
+    /// consistent with the base env, and each actor pays only for its own symbols.
+    syms: Rc<SymbolTable>,
     macros: std::collections::HashMap<cs_core::Symbol, cs_expand::Macro>,
     library_exports: std::collections::HashMap<Vec<cs_core::Symbol>, Vec<cs_core::Symbol>>,
     #[cfg(feature = "bundled-scheme")]
@@ -208,7 +211,7 @@ impl RuntimeImage {
         RuntimeImage {
             vm_env: rt.vm_env.clone(),
             top: rt.top.clone(),
-            syms: rt.syms.clone(),
+            syms: Rc::new(rt.syms),
             macros: rt.macros.clone(),
             library_exports: rt.library_exports.clone(),
             #[cfg(feature = "bundled-scheme")]
@@ -280,7 +283,9 @@ impl Runtime {
     pub fn from_image(image: &RuntimeImage) -> Self {
         let vm_env = cs_vm::vm::Env::child_define_root(image.vm_env.clone());
         Self {
-            syms: image.syms.clone(),
+            // Layer a tiny per-actor extension over the shared base table (an Rc
+            // bump, not a full copy) — the syms RSS lever.
+            syms: SymbolTable::with_base(image.syms.clone()),
             sources: SourceMap::new(),
             top: image.top.clone(),
             macros: image.macros.clone(),
