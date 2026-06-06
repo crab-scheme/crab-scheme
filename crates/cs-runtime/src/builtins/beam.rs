@@ -586,6 +586,11 @@ async fn pump_coroutine(
         }
     }
     let _clear_ctx = ClearCtx;
+    // Region-park guard baseline (P0.1): the depth of the shared TLS region stack
+    // when this body/handler started. Every suspend must return to this depth —
+    // see the check after each resume below.
+    #[cfg(feature = "regions")]
+    let region_entry_depth = crate::regions::region_stack_depth();
     // The yielder pointer is stable for the coroutine's life; cache it after
     // the first resume so we can re-publish it before every later resume (a
     // co-located actor that ran during our suspend clobbered the thread-local).
@@ -610,6 +615,25 @@ async fn pump_coroutine(
         // run a co-located actor, and it must never observe our stale pointers.
         ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
         YIELDER.with(|y| y.set(std::ptr::null()));
+
+        // Region-park guard (P0.1): the TLS region stack is shared by every actor
+        // co-located on this worker, so suspending (any Yield arm awaits) with an
+        // extra `(with-region)` scope still open would interleave with a peer's
+        // regions and corrupt the stack. Refuse it loudly → ExitReason::Error via
+        // the wrapper; `co`'s RegionScope drops run as it unwinds, and ClearCtx
+        // restores the thread-locals. (Save/restore-around-suspend is the proper
+        // fix and a tracked follow-up; it needs the blocked region-as-task-local
+        // work — see primop_spawn's note. crab-cache's green actors hold no region
+        // across a receive, so this only guards genuine misuse.)
+        #[cfg(feature = "regions")]
+        if matches!(result, CoroutineResult::Yield(_)) {
+            let depth = crate::regions::region_stack_depth();
+            assert!(
+                depth == region_entry_depth,
+                "cannot park inside (with-region): a region scope ({depth} deep, entry \
+                 {region_entry_depth}) would span a suspend on a shared worker"
+            );
+        }
 
         match result {
             CoroutineResult::Yield(CoYield::Sleep(dur)) => {

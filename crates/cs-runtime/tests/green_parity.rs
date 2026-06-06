@@ -176,3 +176,102 @@ fn green_trap_exit_receives_linked_exit_from_dedicated() {
     let got = out.lock().unwrap().clone();
     assert_eq!(got, vec!["armed", "got-exit"]);
 }
+
+#[test]
+#[cfg(feature = "regions")]
+fn green_park_inside_with_region_terminates_with_error() {
+    // P0.1: the TLS region stack is shared by co-located actors, so suspending
+    // with a `(with-region)` scope still open is unsound. The driver must refuse
+    // it — the actor dies with an Error reason naming the violation. A monitor
+    // observes the *down* reason. G parks at depth 0 first (fine) so the watcher
+    // can arm its monitor before G trips the guard.
+    let out = Arc::new(Mutex::new(Vec::<String>::new()));
+    register_markers("test:green-region-col", 2, out.clone());
+    let col = primop_spawn("test:green-region-col", vec![]).expect("spawn collector");
+
+    let g = primop_spawn_source_green(
+        r#"
+        (define (g)
+          (raw-receive)
+          (with-region (lambda () (raw-receive))))
+        "#
+        .to_string(),
+        "g".to_string(),
+        vec![],
+    )
+    .expect("spawn g");
+
+    let watcher = primop_spawn_source_green(
+        r#"
+        (define (watcher)
+          (let ((col (cdr (raw-receive))))
+            (let ((g (cdr (raw-receive))))
+              (system-monitor! g)
+              (send col 'armed)
+              (let loop ()
+                (let ((m (raw-receive)))
+                  (if (and (pair? m) (eq? (car m) '*down*))
+                      (send col (cadddr m))
+                      (loop)))))))
+        "#
+        .to_string(),
+        "watcher".to_string(),
+        vec![],
+    )
+    .expect("spawn watcher");
+
+    primop_send(watcher, tagged("col", SendableValue::Pid(col))).unwrap();
+    primop_send(watcher, tagged("mon", SendableValue::Pid(g))).unwrap();
+    wait_until(Duration::from_secs(10), "watcher never armed", || {
+        out.lock().unwrap().iter().any(|s| s == "armed")
+    });
+    // Trigger: G enters (with-region …) and tries to receive INSIDE it.
+    primop_send(g, sym("go")).unwrap();
+
+    wait_until(Duration::from_secs(10), "G never reported a *down*", || {
+        out.lock().unwrap().len() >= 2
+    });
+    let reason = out
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|s| *s != "armed")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        reason.contains("with-region"),
+        "G must die with the region-park error; got reason {reason:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "regions")]
+fn green_region_closed_before_receive_runs_fine() {
+    // The control: a region opened and CLOSED before the next receive does not
+    // trip the guard — only a scope that *spans* a suspend does.
+    let out = Arc::new(Mutex::new(Vec::<String>::new()));
+    register_markers("test:green-region-ok-col", 1, out.clone());
+    let col = primop_spawn("test:green-region-ok-col", vec![]).expect("spawn collector");
+
+    let g = primop_spawn_source_green(
+        r#"
+        (define (g)
+          (let ((col (cdr (raw-receive))))
+            (with-region (lambda () 42))
+            (raw-receive)
+            (send col 'ok)))
+        "#
+        .to_string(),
+        "g".to_string(),
+        vec![],
+    )
+    .expect("spawn g");
+
+    primop_send(g, tagged("col", SendableValue::Pid(col))).unwrap();
+    primop_send(g, sym("go")).unwrap();
+    wait_until(
+        Duration::from_secs(10),
+        "green actor with a closed region did not run fine",
+        || out.lock().unwrap().iter().any(|s| s == "ok"),
+    );
+}
