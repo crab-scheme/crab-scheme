@@ -1389,24 +1389,44 @@ pub fn b_beam_yield(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, St
     Ok(Value::Unspecified)
 }
 
-/// `(sleep-ms n)` — sleep for `n` milliseconds (non-negative
-/// integer). Returns unspecified. Zero-duration call returns
-/// immediately without a syscall.
+/// True when the calling thread is a [`cs_actor::LocalWorkerPool`] worker —
+/// a *shared*, current-thread `LocalSet` host for `spawn-activation` actors
+/// (these threads are named `cs-actor-local-{i}`; see `cs_actor::local_pool`).
+/// Blocking such a thread starves every co-located activation actor, and a
+/// synchronous builtin cannot cooperatively yield mid-call (the sync-VM
+/// constraint — see `ActivationCtx`), so `sleep`/`sleep-ms` refuse to run
+/// here rather than silently stalling peers.
+fn on_cooperative_worker() -> bool {
+    std::thread::current()
+        .name()
+        .is_some_and(|n| n.starts_with("cs-actor-local-"))
+}
+
+const COOP_SLEEP_MSG: &str = "cannot block a shared cooperative actor worker \
+(a spawn-activation handler): it would starve co-located actors, and a synchronous \
+handler cannot yield mid-call. Run timed waits as a dedicated-thread `spawn`/`spawn-source` \
+actor, or park on `(receive)` with a timeout.";
+
+/// `(sleep-ms n)` — sleep for `n` milliseconds (non-negative integer).
+/// Returns unspecified; a zero-duration call returns immediately.
 ///
-/// # Implementation note — Option 2 (std::thread::sleep)
+/// # Execution model
 ///
-/// Each actor in the current model runs on a dedicated
-/// `spawn_blocking` OS thread (not a tokio task). The builtin
-/// layer is synchronous: there is no async executor context
-/// available from inside a `fn(&[Value], &mut SymbolTable)`
-/// call. Cooperative tokio parking (Option 1) would require
-/// restructuring actor dispatch to expose a `tokio::time::sleep`
-/// future — a large post-1.0 change. `std::thread::sleep` is
-/// the correct choice here: it releases the OS thread (and
-/// therefore the CPU) for the full duration, which is strictly
-/// better than the current busy-spin `(yield)` loop. This
-/// mirrors exactly how `raw-receive` with a timeout parks today
-/// (see `primop_raw_receive` — it also uses `thread::sleep`).
+/// `std::thread::sleep` is correct for the contexts where a *synchronous*
+/// sleep belongs: non-actor code (scripts, the main thread), and
+/// `spawn`/`spawn-source` actors, which run on a dedicated thread
+/// (`block_in_place` on the multi-thread runtime) so blocking that thread
+/// never starves another actor — tokio migrates other tasks away.
+///
+/// It is **rejected** inside a `spawn-activation` handler (see
+/// [`on_cooperative_worker`]). Those actors multiplex onto a shared
+/// current-thread `LocalSet` worker; a truly cooperative sleep there would
+/// have to park the task and wake on a timer, which needs an async-VM seam
+/// like `receive`'s between-message park (out of scope, ADR 0032). So
+/// instead of silently stalling co-located actors we error and point at the
+/// right pattern. (The Raft-poller lesson from crab-cache is separate: a
+/// poller's idle loop often doubles as a tick clock + sole I/O drainer, so
+/// *any* sleep there slows the protocol — keep `(yield)`.)
 pub fn b_beam_sleep_ms(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("sleep-ms", args, 1)?;
     let ms = match &args[0] {
@@ -1425,6 +1445,9 @@ pub fn b_beam_sleep_ms(args: &[Value], _syms: &mut SymbolTable) -> Result<Value,
         }
     };
     if ms > 0 {
+        if on_cooperative_worker() {
+            return Err(format!("sleep-ms: {COOP_SLEEP_MSG}"));
+        }
         std::thread::sleep(Duration::from_millis(ms));
     }
     Ok(Value::Unspecified)
@@ -1434,8 +1457,9 @@ pub fn b_beam_sleep_ms(args: &[Value], _syms: &mut SymbolTable) -> Result<Value,
 /// non-negative). Fractional seconds are supported. Returns
 /// unspecified. Zero-duration call returns immediately.
 ///
-/// Converts to a `Duration` and delegates to `thread::sleep`;
-/// see `sleep-ms` for the implementation rationale.
+/// Converts to a `Duration` and delegates to `thread::sleep`; see
+/// [`b_beam_sleep_ms`] for the execution-model rules (rejected on a shared
+/// cooperative worker).
 pub fn b_beam_sleep(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("sleep", args, 1)?;
     let secs_f: f64 = match &args[0] {
@@ -1457,6 +1481,9 @@ pub fn b_beam_sleep(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, St
     if secs_f > 0.0 {
         let ms = (secs_f * 1000.0).round() as u64;
         if ms > 0 {
+            if on_cooperative_worker() {
+                return Err(format!("sleep: {COOP_SLEEP_MSG}"));
+            }
             std::thread::sleep(Duration::from_millis(ms));
         }
     }
@@ -2395,5 +2422,54 @@ mod tests {
         let mut syms = SymbolTable::new();
         let err = b_beam_sleep(&[Value::Null], &mut syms).expect_err("null should error");
         assert!(err.contains("sleep"), "got: {}", err);
+    }
+
+    #[test]
+    fn sleep_ms_rejects_cooperative_worker() {
+        // spawn-activation actors run on LocalSet workers named
+        // "cs-actor-local-{i}"; blocking one starves co-located actors, so
+        // sleep must error there instead of stalling them silently.
+        // (The closure maps away the !Send Value before returning.)
+        let res: Result<(), String> = std::thread::Builder::new()
+            .name("cs-actor-local-0".to_string())
+            .spawn(|| {
+                let mut syms = SymbolTable::new();
+                b_beam_sleep_ms(&[Value::Number(Number::Fixnum(20))], &mut syms).map(|_| ())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        let err = res.expect_err("sleep on a cooperative worker must error");
+        assert!(err.contains("cooperative"), "got: {err}");
+    }
+
+    #[test]
+    fn sleep_rejects_cooperative_worker() {
+        let res: Result<(), String> = std::thread::Builder::new()
+            .name("cs-actor-local-7".to_string())
+            .spawn(|| {
+                let mut syms = SymbolTable::new();
+                b_beam_sleep(&[Value::Number(Number::Flonum(0.02))], &mut syms).map(|_| ())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(res.is_err(), "sleep on a cooperative worker must error");
+    }
+
+    #[test]
+    fn sleep_ms_ok_on_dedicated_thread() {
+        // A normally-named thread (a dedicated spawn-source/block_in_place
+        // actor, or non-actor code) sleeps fine.
+        let res: Result<(), String> = std::thread::Builder::new()
+            .name("tokio-runtime-worker".to_string())
+            .spawn(|| {
+                let mut syms = SymbolTable::new();
+                b_beam_sleep_ms(&[Value::Number(Number::Fixnum(5))], &mut syms).map(|_| ())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(res.is_ok());
     }
 }
