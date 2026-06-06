@@ -476,11 +476,15 @@ pub fn primop_spawn_activation(source: String, handler: String) -> Result<ActorP
 /// invoke the handler with `ACTOR_CTX` pointing at this actor for the
 /// duration of that synchronous call only.
 async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: String) {
-    let mut rt = crate::Runtime::new();
+    // Shared-Runtime: overlay this worker's shared base (builtins + bundled libs)
+    // instead of a full Runtime::new() per actor (same lever as green_source_body).
+    let mut rt = crate::Runtime::from_image(&worker_runtime_image());
     // VM bytecode tier for the handler (see run_scheme_body re: no JIT). The
     // handler is loaded as a VM closure; `apply_value` (below, per message)
     // delegates VM closures to the VM caller, so each invocation runs on the VM.
-    if let Err(d) = rt.eval_str_via_vm("<spawn-activation>", &source) {
+    // Cached per source per worker — activation actors sharing a handler body
+    // reuse the compiled bytecode (closures share the cached code chunks).
+    if let Err(d) = rt.eval_str_via_vm_cached("<spawn-activation>", &source) {
         eprintln!("spawn-activation: loading actor source failed: {d:?}");
         return;
     }
