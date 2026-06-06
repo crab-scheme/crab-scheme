@@ -387,7 +387,7 @@ pub extern "C" fn vm_env_set_fixnum(sym: i64, value: i64) {
         // No existing binding — define at root. Walk parent
         // chain holding Rc clones so each step keeps the parent
         // alive while we examine the next.
-        let mut root: Rc<Env> = unsafe {
+        let env_rc: Rc<Env> = unsafe {
             // Rebuild an Rc from the raw pointer by cloning. The
             // closure that owns the Env is still alive (held by
             // the JIT-dispatching closure value) so the strong
@@ -399,10 +399,9 @@ pub extern "C" fn vm_env_set_fixnum(sym: i64, value: i64) {
             std::mem::forget(raw_rc);
             cloned
         };
-        while let Some(p) = root.parent.clone() {
-            root = p;
-        }
-        root.define(sym, v);
+        // Install at the define-root: the nearest define boundary, or the chain
+        // root if none (a shared-Runtime overlay marks itself a boundary).
+        env_rc.define_root().define(sym, v);
     }
 }
 
@@ -427,16 +426,13 @@ pub unsafe extern "C" fn vm_env_set_nb(sym: i64, value: i64) {
     let sym = Symbol(sym as u32);
     let v = unsafe { NanboxValue(value).to_value() };
     if !env.set_existing(sym, v.clone()) {
-        let mut root: Rc<Env> = unsafe {
+        let env_rc: Rc<Env> = unsafe {
             let raw_rc = Rc::from_raw(env_ptr);
             let cloned = raw_rc.clone();
             std::mem::forget(raw_rc);
             cloned
         };
-        while let Some(p) = root.parent.clone() {
-            root = p;
-        }
-        root.define(sym, v);
+        env_rc.define_root().define(sym, v);
     }
 }
 
@@ -11344,6 +11340,12 @@ impl Bindings {
 pub struct Env {
     bindings: RefCell<Bindings>,
     pub parent: Option<Rc<Env>>,
+    /// Marks this env as the install target for top-level `(define …)` and
+    /// `set!`-of-undefined: [`Env::define_root`] stops the walk-to-root here. A
+    /// shared-Runtime per-actor overlay sets this so its defines don't leak into
+    /// the shared base parent; standalone chains mark nothing, so the walk falls
+    /// back to the actual root (unchanged behavior). Default `false`.
+    define_boundary: bool,
 }
 
 impl Env {
@@ -11355,7 +11357,39 @@ impl Env {
         Rc::new(Self {
             bindings: RefCell::new(Bindings::default()),
             parent: Some(parent),
+            define_boundary: false,
         })
+    }
+
+    /// A child env that is a **define boundary**: top-level `(define …)` /
+    /// `set!`-of-undefined install here rather than walking up into `parent`.
+    /// Used as the per-actor overlay over a shared (immutable) base env in the
+    /// shared-Runtime model, so one actor's defines never leak into the base
+    /// that its peers also see. Lookups still fall through to `parent`.
+    pub fn child_define_root(parent: Rc<Self>) -> Rc<Self> {
+        Rc::new(Self {
+            bindings: RefCell::new(Bindings::default()),
+            parent: Some(parent),
+            define_boundary: true,
+        })
+    }
+
+    /// The env where a top-level `(define …)` / `set!`-of-undefined installs:
+    /// the nearest [`define_boundary`](Self::define_boundary) ancestor walking up
+    /// from `self`, or the chain root if none is marked. Standalone Runtimes mark
+    /// no boundary, so this is the actual root — identical to the previous
+    /// walk-to-root. A shared-Runtime overlay marks itself, so defines stop there.
+    pub fn define_root(self: &Rc<Self>) -> Rc<Self> {
+        let mut cur = self.clone();
+        loop {
+            if cur.define_boundary {
+                return cur;
+            }
+            match cur.parent.clone() {
+                Some(p) => cur = p,
+                None => return cur,
+            }
+        }
     }
 
     pub fn get(&self, name: Symbol) -> Option<Value> {
@@ -11576,11 +11610,7 @@ fn run_dispatch(
                     .ok_or_else(|| VmError::new("stack underflow on Set"))?;
                 stamp_self_name_if_closure(&v, s);
                 if !frame.env.set_existing(s, v.clone()) {
-                    let mut root = frame.env.clone();
-                    while let Some(p) = root.parent.clone() {
-                        root = p;
-                    }
-                    root.define(s, v);
+                    frame.env.define_root().define(s, v);
                 }
             }
             Inst::DefineGlobal(s) => {
@@ -11589,11 +11619,7 @@ fn run_dispatch(
                     .pop()
                     .ok_or_else(|| VmError::new("stack underflow on Define"))?;
                 stamp_self_name_if_closure(&v, s);
-                let mut root = frame.env.clone();
-                while let Some(p) = root.parent.clone() {
-                    root = p;
-                }
-                root.define(s, v);
+                frame.env.define_root().define(s, v);
             }
             Inst::DefineLocal(s) => {
                 let s = *s;
@@ -16499,6 +16525,57 @@ mod gc_helper_tests_extra {
             1
         );
         assert_eq!(unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Null)) }, 1);
+    }
+
+    // ===== define-boundary (shared-Runtime Wall 1) =====
+
+    #[test]
+    fn define_root_respects_per_actor_boundary() {
+        // Shared base (immutable) → per-actor overlay (a define boundary) → a
+        // transient scope on top — the shared-Runtime env shape.
+        let base = Env::root();
+        let builtin = Symbol(1);
+        base.define(builtin, Value::Number(cs_core::Number::Fixnum(100)));
+
+        let overlay = Env::child_define_root(base.clone());
+        let scope = Env::child(overlay.clone()); // EnterScope-style transient child
+
+        // A top-level define from within the transient scope installs in the
+        // overlay (nearest boundary), NOT in the shared base.
+        let user = Symbol(2);
+        scope
+            .define_root()
+            .define(user, Value::Number(cs_core::Number::Fixnum(7)));
+
+        assert!(matches!(
+            overlay.get(user),
+            Some(Value::Number(cs_core::Number::Fixnum(7)))
+        ));
+        assert!(
+            base.get(user).is_none(),
+            "a user define must not leak into the shared base"
+        );
+        // Lookups still fall through to the base (builtins visible).
+        assert!(matches!(
+            overlay.get(builtin),
+            Some(Value::Number(cs_core::Number::Fixnum(100)))
+        ));
+
+        // define_root resolves to the overlay from the scope and the overlay, and
+        // to the base (actual root, unmarked) from the base itself.
+        assert!(Rc::ptr_eq(&scope.define_root(), &overlay));
+        assert!(Rc::ptr_eq(&overlay.define_root(), &overlay));
+        assert!(Rc::ptr_eq(&base.define_root(), &base));
+    }
+
+    #[test]
+    fn define_root_unmarked_chain_falls_back_to_actual_root() {
+        // No boundary marked (standalone-Runtime shape): define_root is the
+        // actual chain root — identical to the previous walk-to-root behavior.
+        let root = Env::root();
+        let a = Env::child(root.clone());
+        let b = Env::child(a);
+        assert!(Rc::ptr_eq(&b.define_root(), &root));
     }
 
     // ===== NanboxValue (K1 step 2) — NaN-box encoding tests =====
