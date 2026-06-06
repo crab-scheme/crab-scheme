@@ -70,6 +70,11 @@ thread-bound. Two layered levers brought it down ~11–20×:
   compiled bytecode (sharing its code chunks) instead of re-compiling.
   118 → ~40 KiB (trivial) / ~72 KiB (200-define body).
 
+Both green paths use these: `green_source_body` (`spawn-source-green`) and
+`activation_body` (`spawn-activation`, e.g. cs-web handlers) — per-actor
+isolation preserved (handler/body defines land in the per-actor overlay; the
+`spawn_activation_accumulates_persistent_state` test covers the mutable-state case).
+
 ## Discoveries surfaced during implementation
 
 ### The stack is not the RSS lever; the per-actor `Runtime` was
@@ -141,8 +146,6 @@ and **crab-cache** conformance/crash-recovery/failover/linearizability.
 
 ## Follow-ups (not blocking)
 
-- **`spawn-activation` could adopt `Runtime::from_image` + the body cache** too
-  (same shared-base win for the framework-handler path; currently `Runtime::new`).
 - **100k on Linux** needs `vm.max_map_count` raised (one VMA per coroutine stack).
 - The remaining ~40–72 KiB/actor floor (coroutine-stack touched pages + per-actor
   closures/bindings) is genuinely per-actor; reducing it would need a different
