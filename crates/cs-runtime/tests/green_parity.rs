@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cs_runtime::builtins::beam::{
-    beam_state, primop_raw_receive, primop_send, primop_spawn, primop_spawn_source,
+    beam_state, primop_raw_receive, primop_send, primop_spawn, primop_spawn_source_dedicated,
     primop_spawn_source_green, SendableValue,
 };
 
@@ -127,8 +127,9 @@ fn green_trap_exit_receives_linked_exit_from_dedicated() {
     register_markers("test:green-link-col", 2, out.clone());
     let col = primop_spawn("test:green-link-col", vec![]).expect("spawn collector");
 
-    // Dedicated peer: receive one message ('stop) then return → exits Normal.
-    let peer = primop_spawn_source(
+    // Dedicated peer (explicit, so this stays a green↔dedicated cross-path test
+    // now that spawn-source defaults to green): receive 'stop, then exit Normal.
+    let peer = primop_spawn_source_dedicated(
         "(define (x) (raw-receive))".to_string(),
         "x".to_string(),
         vec![],

@@ -360,21 +360,52 @@ pub fn primop_spawn(name: &str, args: Vec<SendableValue>) -> Result<ActorPid, St
     Ok(actor_ref.pid())
 }
 
+/// Whether `(spawn-source …)` defaults to a dedicated thread rather than green.
+/// Reads `CRABSCHEME_ACTOR_DEFAULT` once (`dedicated` → true; anything else /
+/// unset → green, the default). The escape hatch makes the flip reversible
+/// without a code change. Set the env before the first spawn (it is cached).
+fn spawn_source_default_is_dedicated() -> bool {
+    static DEDICATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEDICATED.get_or_init(|| {
+        std::env::var("CRABSCHEME_ACTOR_DEFAULT")
+            .map(|v| v.eq_ignore_ascii_case("dedicated"))
+            .unwrap_or(false)
+    })
+}
+
 /// `(spawn-source SOURCE ENTRY args...)` — spawn an actor whose body is a
 /// *Scheme* procedure, not a pre-registered Rust closure.
 ///
-/// Why source + a name instead of a closure? A Scheme `Value::Procedure` is
-/// `Rc`-based and therefore `!Send`; an actor body must be `Send + 'static`
-/// because it runs via `block_in_place` on a worker of the multi-thread
-/// runtime (a *different* thread than the spawner). So a closure literally
-/// cannot cross the boundary. Instead we capture only `String`s (Send), and
-/// on the actor's own worker thread build a fresh per-actor [`crate::Runtime`],
-/// load `source` (rebuilding the whole global env — every `Rc` Value stays
-/// thread-local), resolve `entry`, and apply it. `args` cross as data
-/// (`SendableValue`), exactly like mailbox messages. This is the bridge that
-/// lets actor *logic live in Scheme* (Constitution Article I) while honoring
-/// the runtime's `!Send` Value type.
+/// **Green by default** (whole-body coroutine on the parking `LocalSet` pool —
+/// parks on `(receive)`/`(sleep)`/`(tcp-recv)`, no thread-per-actor ceiling). Use
+/// [`primop_spawn_source_dedicated`] (`spawn-source-dedicated`) for an actor that
+/// must own an OS thread — one doing blocking work that has no cooperative
+/// counterpart (a long blocking `fsync`, a sole-drainer poll loop). Override the
+/// default globally with `CRABSCHEME_ACTOR_DEFAULT=dedicated`.
 pub fn primop_spawn_source(
+    source: String,
+    entry: String,
+    args: Vec<SendableValue>,
+) -> Result<ActorPid, String> {
+    if spawn_source_default_is_dedicated() {
+        primop_spawn_source_dedicated(source, entry, args)
+    } else {
+        primop_spawn_source_green(source, entry, args)
+    }
+}
+
+/// Dedicated-thread `spawn-source`: the body runs via `block_in_place` on its own
+/// worker thread (the original `spawn-source` semantics, now opt-in).
+///
+/// Why source + a name instead of a closure? A Scheme `Value::Procedure` is
+/// `Rc`-based and therefore `!Send`; a `block_in_place` body must be
+/// `Send + 'static` (it runs on a *different* thread than the spawner). So a
+/// closure can't cross the boundary. Instead we capture only `String`s (Send),
+/// and on the actor's own worker thread build a fresh per-actor
+/// [`crate::Runtime`], load `source` (every `Rc` Value stays thread-local),
+/// resolve `entry`, and apply it. `args` cross as data (`SendableValue`), exactly
+/// like mailbox messages.
+pub fn primop_spawn_source_dedicated(
     source: String,
     entry: String,
     args: Vec<SendableValue>,
@@ -1819,6 +1850,38 @@ pub fn b_beam_spawn_source_green(args: &[Value], syms: &mut SymbolTable) -> Resu
     Ok(from_sendable(&SendableValue::Pid(pid), syms))
 }
 
+/// `(spawn-source-dedicated SOURCE ENTRY arg ...)` — like [`b_beam_spawn_source`]
+/// but always runs the body on its own dedicated OS thread (the pre-flip
+/// `spawn-source` semantics). For actors doing blocking work with no cooperative
+/// counterpart (long `fsync`, a sole-drainer poll loop). See
+/// [`primop_spawn_source_dedicated`].
+pub fn b_beam_spawn_source_dedicated(
+    args: &[Value],
+    syms: &mut SymbolTable,
+) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err(
+            "spawn-source-dedicated: expected a SOURCE string, an ENTRY name, and 0+ args".into(),
+        );
+    }
+    let source = match &args[0] {
+        Value::String(s) => s.borrow().clone(),
+        other => {
+            return Err(format!(
+                "spawn-source-dedicated: SOURCE must be a string, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let entry = value_to_str(&args[1], syms, "spawn-source-dedicated")?;
+    let mut sendable_args = Vec::with_capacity(args.len() - 2);
+    for a in &args[2..] {
+        sendable_args.push(to_sendable_in(a, syms)?);
+    }
+    let pid = primop_spawn_source_dedicated(source, entry, sendable_args)?;
+    Ok(from_sendable(&SendableValue::Pid(pid), syms))
+}
+
 /// `(spawn-activation SOURCE HANDLER)` — spawn a Scheme actor on the parking
 /// `LocalSet` worker pool. `SOURCE` is a Scheme string; `HANDLER` is a symbol
 /// or string naming the top-level per-message handler `(handler msg) ->
@@ -2361,6 +2424,7 @@ pub fn beam_syms_builtins() -> Vec<(
         ("spawn", b_beam_spawn),
         ("spawn-source", b_beam_spawn_source),
         ("spawn-source-green", b_beam_spawn_source_green),
+        ("spawn-source-dedicated", b_beam_spawn_source_dedicated),
         ("spawn-activation", b_beam_spawn_activation),
         ("self", b_beam_self),
         ("raw-receive", b_beam_raw_receive),
