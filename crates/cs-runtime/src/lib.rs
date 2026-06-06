@@ -2982,6 +2982,22 @@ impl Runtime {
     }
 
     fn eval_str_via_vm_inner(&mut self, file_id: FileId, src: &str) -> Result<Value, Diagnostic> {
+        let bc = self.compile_program_via_vm(file_id, src)?;
+        self.run_bytecode(&bc)
+    }
+
+    /// Parse + expand + compile `src` to reusable VM [`Bytecode`] **without
+    /// running it** — so the bytecode can be cached and re-run against many
+    /// per-actor environments (shared body compilation; [`cs_vm::run`] borrows
+    /// it). Globals const-folding uses this runtime's `vm_env` snapshot, so cached
+    /// reuse is sound only when the reusing runtimes share the same base env (the
+    /// shared-Runtime model — the base builtins are identical and the per-actor
+    /// overlay is empty at compile time).
+    fn compile_program_via_vm(
+        &mut self,
+        file_id: FileId,
+        src: &str,
+    ) -> Result<cs_vm::Bytecode, Diagnostic> {
         let data = match read_all(file_id, src, &mut self.syms) {
             Ok(d) => d,
             Err(errs) => {
@@ -3019,12 +3035,20 @@ impl Runtime {
         // dominant case, and tests don't (re)set! the captured snapshot.
         let globals = self.vm_env.snapshot_bindings();
         let primops = primop_table(&mut self.syms);
-        let bc = cs_vm::compile_with_globals_and_primops(&core, &globals, &primops)
-            .map_err(|e| Diagnostic::error(e.message, e.span))?;
+        cs_vm::compile_with_globals_and_primops(&core, &globals, &primops)
+            .map_err(|e| Diagnostic::error(e.message, e.span))
+    }
+
+    /// Run already-compiled [`Bytecode`] against this runtime's `vm_env`,
+    /// rendering VM errors. Shared by [`eval_str_via_vm_inner`] and the
+    /// shared-body-compilation cache (which runs the *same* cached bytecode
+    /// against each actor's per-actor overlay env — the body's closures share the
+    /// bytecode's code chunks, only the closures + bindings are per-actor).
+    fn run_bytecode(&mut self, bc: &cs_vm::Bytecode) -> Result<Value, Diagnostic> {
         // Install the `eval` hook + root env so VmEval can call back into us.
         let prev_hook = cs_vm::vm::install_eval_hook(Some(vm_eval_callback));
         let prev_env = cs_vm::vm::install_eval_root_env(Some(self.vm_env.clone()));
-        let result = cs_vm::run(&bc, self.vm_env.clone(), &mut self.syms);
+        let result = cs_vm::run(bc, self.vm_env.clone(), &mut self.syms);
         cs_vm::vm::install_eval_hook(prev_hook);
         cs_vm::vm::install_eval_root_env(prev_env);
         // Render VM errors with proper condition formatting; carry the
