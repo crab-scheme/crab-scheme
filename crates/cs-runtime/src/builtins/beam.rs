@@ -421,7 +421,10 @@ pub fn primop_spawn_activation(source: String, handler: String) -> Result<ActorP
 /// duration of that synchronous call only.
 async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: String) {
     let mut rt = crate::Runtime::new();
-    if let Err(d) = rt.eval_str("<spawn-activation>", &source) {
+    // VM bytecode tier for the handler (see run_scheme_body re: no JIT). The
+    // handler is loaded as a VM closure; `apply_value` (below, per message)
+    // delegates VM closures to the VM caller, so each invocation runs on the VM.
+    if let Err(d) = rt.eval_str_via_vm("<spawn-activation>", &source) {
         eprintln!("spawn-activation: loading actor source failed: {d:?}");
         return;
     }
@@ -612,7 +615,13 @@ fn scheme_source_entry(source: String, entry: String) -> ActorEntry {
 /// invoking us.
 fn run_scheme_body(source: &str, entry: &str, args: &[SendableValue]) -> Result<(), String> {
     let mut rt = crate::Runtime::new();
-    rt.eval_str("<spawn-source>", source)
+    // Run the actor body on the VM bytecode tier, not the walker — the VM is
+    // ~2.8× faster than the tree-walker on this kind of code (RESP parse,
+    // command dispatch, store ops, Raft logic). JIT is intentionally NOT
+    // installed: a microbench showed it adds only ~5% over the VM tier, and it
+    // hung the cache's concurrent write path (Raft propose/apply) under load
+    // (`-c 50` SET); VM-only resolves that and is faster across the board.
+    rt.eval_str_via_vm("<spawn-source>", source)
         .map_err(|d| format!("loading actor source failed: {d:?}"))?;
     match rt.lookup(entry) {
         Some(Value::Procedure(_)) => {}
@@ -629,7 +638,7 @@ fn run_scheme_body(source: &str, entry: &str, args: &[SendableValue]) -> Result<
     // eval/lookup surface (no mutable SymbolTable access) and reuses the
     // reader's own interning, so symbols/strings/lists round-trip exactly.
     let call = build_call_expr(entry, args)?;
-    rt.eval_str("<spawn-call>", &call)
+    rt.eval_str_via_vm("<spawn-call>", &call)
         .map_err(|d| format!("actor body raised: {d:?}"))?;
     Ok(())
 }
@@ -2414,6 +2423,94 @@ mod tests {
             }
             if std::time::Instant::now() >= deadline {
                 panic!("scheme actor body never wrote its result");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn spawn_source_vm_tier_helper_and_mutable_state() {
+        // Stage-1 (VM+JIT actor bodies) guards two risks of the walker->VM
+        // switch in `run_scheme_body`:
+        // (1) cross-eval visibility — the body's top-level defs are loaded with
+        //     one `eval_str_via_vm`, the `(run …)` entry call with a SECOND, and
+        //     the entry must see the separately-defined `double` helper; `lookup`
+        //     must find the entry in `vm_env` (walker `top` is empty on VM).
+        // (2) the const-folding `set!` hazard — a mutable top-level (`acc`) the
+        //     body `set!`s and re-reads must not be folded to a stale Const.
+        let table = "spawn-src-vm-test";
+        primop_make_table(table, "set").expect("make table");
+
+        let body = r#"
+            (define (double x) (* 2 x))
+            (define acc 0)
+            (define (run key)
+              (set! acc (+ acc (double (raw-receive))))
+              (set! acc (+ acc (double (raw-receive))))
+              (table-insert! 'spawn-src-vm-test key acc))
+        "#;
+
+        let pid = primop_spawn_source(
+            body.to_string(),
+            "run".to_string(),
+            vec![SendableValue::String("r".into())],
+        )
+        .expect("spawn-source");
+        primop_send(pid, SendableValue::Fixnum(5)).expect("send 5");
+        primop_send(pid, SendableValue::Fixnum(8)).expect("send 8");
+
+        // acc = double(5) + double(8) = 10 + 16 = 26.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(v) =
+                primop_table_lookup(table, &SendableValue::String("r".into())).expect("lookup")
+            {
+                assert_eq!(v, SendableValue::Fixnum(26));
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("vm-tier actor body never wrote its result");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn spawn_source_vm_sees_bundled_library_prelude() {
+        // Regression for the VM-tier actor bug: a spawn-source body runs on the
+        // VM tier, and bundled Scheme libraries (loaded by `load_bundled_library`)
+        // must be visible there too. Before the both-tier load, `(crab actor)`'s
+        // `call` was walker-only, so a body referencing it raised "undefined
+        // variable: call" — exactly how crab-cache's conn actor died. The body
+        // guards the reference so a miss is a clear `'undefined` rather than a
+        // 30 s timeout.
+        let table = "spawn-src-bundled-test";
+        primop_make_table(table, "set").expect("make table");
+        let body = r#"
+            (define (run key)
+              (table-insert! 'spawn-src-bundled-test key
+                (guard (e (#t 'undefined)) (if (procedure? call) 'ok 'not-proc))))
+        "#;
+        primop_spawn_source(
+            body.to_string(),
+            "run".to_string(),
+            vec![SendableValue::String("c".into())],
+        )
+        .expect("spawn-source");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(v) =
+                primop_table_lookup(table, &SendableValue::String("c".into())).expect("lookup")
+            {
+                assert_eq!(
+                    v,
+                    SendableValue::Symbol("ok".into()),
+                    "`call` from (crab actor) must resolve to a procedure on the VM tier"
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("bundled-library actor never reported");
             }
             std::thread::sleep(Duration::from_millis(5));
         }
