@@ -88,6 +88,37 @@ fn insert(slot: Slot) -> Result<i64, FfiError> {
     Ok(id)
 }
 
+// ----- cooperative async I/O hook (inverted dependency) -----
+//
+// cs-stdlib-net can't depend on the actor layer, so cs-runtime installs a hook
+// (when the `actor` layer is present) that lets a coroutine driver service a
+// socket read by *parking* its green worker instead of blocking it. Same shape
+// as `cs_stdlib_time::install_cooperative_sleep`.
+
+/// `(handle, max_len) -> Some(result)` if the cooperative path handled the read
+/// (the hook decides, based on whether a coroutine driver is active on this
+/// thread), or `None` to fall through to the blocking read. `Ok(empty)` on a
+/// clean EOF, matching the blocking path's contract.
+type AsyncRecvHook = fn(i64, usize) -> Option<Result<Vec<u8>, String>>;
+static ASYNC_RECV: OnceLock<AsyncRecvHook> = OnceLock::new();
+
+/// Install the cooperative async-recv hook (idempotent; first wins). Called by
+/// cs-runtime at startup when the actor layer is built.
+pub fn install_async_recv(hook: AsyncRecvHook) {
+    let _ = ASYNC_RECV.set(hook);
+}
+
+/// Clone the underlying std `TcpStream` for socket handle `id`, so a cooperative
+/// driver can build a tokio stream for the async read. `None` if `id` is not a
+/// live TCP socket. No tokio types cross this crate boundary.
+pub fn clone_tcp_std(id: i64) -> Option<std::net::TcpStream> {
+    let r = lock().ok()?;
+    match r.slots.get(&id) {
+        Some(Slot::Tcp(s)) => s.try_clone().ok(),
+        _ => None,
+    }
+}
+
 pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
     vec![
         UntypedProc::new("dns-resolve", dns_resolve),
@@ -301,6 +332,16 @@ fn tcp_recv(args: &[Value]) -> Result<Value, FfiError> {
         return Err(FfiError::HostFailure(
             "tcp-recv: max-len must be positive".into(),
         ));
+    }
+    // Cooperative path: if a coroutine driver installed the async-recv hook and
+    // it claims this read (we're inside a green driver on this thread), let it
+    // park instead of blocking the shared worker. `None` ⇒ no driver ⇒ fall
+    // through to the blocking read below (dedicated thread / non-actor —
+    // unchanged). `Ok(empty)` from the hook is a clean EOF, same as below.
+    if let Some(hook) = ASYNC_RECV.get() {
+        if let Some(res) = hook(id, max_len as usize) {
+            return res.map(bv_value).map_err(FfiError::HostFailure);
+        }
     }
     let mut buf = vec![0u8; max_len as usize];
     // Clone + release the lock before the blocking read (see tcp-send): a
