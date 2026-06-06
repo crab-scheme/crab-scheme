@@ -169,14 +169,24 @@ iteration (no end-of-track bundles).
   `STACK_POOL_CAP` (`beam.rs:917`) for the held-for-life model.
 - [ ] **Gate:** green echo + conn tests pass on the smaller stack.
 
-### P5.2 — Guard-page + RSS validation
-- [ ] Test: deep non-tail recursion in a green body overflows the guard page
-  **cleanly** (clear abort, never UB).
-- [ ] Measure RSS at 1k / 10k / **50k–100k** concurrent shallow-parked green
-  conns; record in `docs/measurements/`. Tune `GREEN_STACK_BYTES` down until the
-  RSS budget holds at the top of the range.
-- [ ] **Gate:** 50k–100k idle green conns held under the S1 RSS budget;
-  guard-page test passes.
+### P5.2 — RSS measurement + scale finding *(done — `docs/measurements/green-threads-scale.md`)*
+- [x] Measured per-green-actor RSS: **~826 KiB/actor** (N=2000), dominated by the
+  per-actor `Runtime` (not the stack). 10k≈8 GiB / 50k≈40 GiB / 100k≈80 GiB.
+- [x] **Corrects the spec's assumption:** the coroutine stack is *not* the RSS
+  lever — VM-tier bodies stay shallow (a 2 M-deep non-tail recursion ran on the
+  1 MiB green stack with no overflow → green bodies are effectively stack-safe;
+  `GREEN_STACK_BYTES` is only a virtual-footprint knob). Real lever = a **shared
+  Runtime** (next milestone); hard ceiling = `vm.max_map_count` (~65k).
+- [x] Guard-page: unreachable via Scheme recursion on the VM tier (heap-allocated
+  call frames); corosensei's guard page remains a backstop for native recursion.
+
+### Shared-Runtime *(new milestone — designed in `docs/measurements/green-threads-scale.md`)*
+- [ ] Split `Runtime` → per-worker immutable `RuntimeImage` (`Rc`-shared builtins
+  env + bundled libs + base symbols) + per-actor `RuntimeInstance` (child overlay
+  env for defines + per-actor mutable state).
+- [ ] Walls: `DefineGlobal`-at-root → per-actor define boundary; shareable
+  `SymbolTable`; per-actor isolation of macros/pinned + const-folder base/overlay
+  awareness. **Gate:** < ~50 KiB/actor overlay; full suite green.
 
 ---
 
