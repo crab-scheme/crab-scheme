@@ -177,6 +177,46 @@ impl Drop for Pinned {
     }
 }
 
+/// The immutable, shareable base of a [`Runtime`] — its builtins env (both
+/// tiers), bundled libraries, symbol table, and macros — built **once** and
+/// shared (by `Rc` / cheap clone) across many per-actor Runtimes via
+/// [`Runtime::from_image`]. The shared-Runtime model (green-threads): a worker
+/// builds one image, then each green actor gets a cheap per-actor Runtime that
+/// overlays its own defines on this base instead of rebuilding the whole env
+/// (~826 KiB → a small overlay). The base is never mutated after construction.
+///
+/// `Rc`-based, so `!Send`: an image lives on one thread (the LocalSet worker
+/// that built it), shared only by actors on that worker — the same isolation
+/// the per-actor Runtimes already rely on.
+pub struct RuntimeImage {
+    vm_env: Rc<cs_vm::vm::Env>,
+    top: Rc<Frame>,
+    syms: SymbolTable,
+    macros: std::collections::HashMap<cs_core::Symbol, cs_expand::Macro>,
+    library_exports: std::collections::HashMap<Vec<cs_core::Symbol>, Vec<cs_core::Symbol>>,
+    #[cfg(feature = "bundled-scheme")]
+    loaded_optin_libs: std::collections::HashSet<String>,
+}
+
+impl RuntimeImage {
+    /// Build the base once: a full [`Runtime::new`], keeping its builtins/bundled
+    /// env (`vm_env`/`top`, `Rc`-shared so they outlive the template), symbol
+    /// table, and macros. The template's per-instance state (pinned slab, JIT,
+    /// command-line, …) is dropped — only the immutable base is retained.
+    pub fn build() -> Self {
+        let rt = Runtime::new();
+        RuntimeImage {
+            vm_env: rt.vm_env.clone(),
+            top: rt.top.clone(),
+            syms: rt.syms.clone(),
+            macros: rt.macros.clone(),
+            library_exports: rt.library_exports.clone(),
+            #[cfg(feature = "bundled-scheme")]
+            loaded_optin_libs: rt.loaded_optin_libs.clone(),
+        }
+    }
+}
+
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
@@ -223,6 +263,45 @@ impl Runtime {
         let mut rt = Self::new_inner();
         rt.register_stdlib();
         rt
+    }
+
+    /// A cheap per-actor Runtime that **shares** `image`'s immutable base
+    /// (builtins env + bundled libs + macros) instead of rebuilding it. The VM
+    /// env is a per-actor [`Env::child_define_root`](cs_vm::vm::Env::child_define_root)
+    /// overlay: the body's top-level `(define …)`s land in the overlay (isolated
+    /// from the shared base and from peer actors — Wall 1's define-boundary),
+    /// while lookups fall through to the base for builtins/libraries. `top` is
+    /// shared read-only (a green VM-tier body never defines into the walker env);
+    /// `syms`/`macros` are cheap clones (interned `Rc<str>` shared) so each actor
+    /// can intern/define freely with builtin ids consistent with the base.
+    ///
+    /// This is the shared-Runtime memory lever (green-threads): N actors cost one
+    /// base + N small overlays, not N × full `Runtime::new()`.
+    pub fn from_image(image: &RuntimeImage) -> Self {
+        let vm_env = cs_vm::vm::Env::child_define_root(image.vm_env.clone());
+        Self {
+            syms: image.syms.clone(),
+            sources: SourceMap::new(),
+            top: image.top.clone(),
+            macros: image.macros.clone(),
+            #[cfg(feature = "bundled-scheme")]
+            loaded_optin_libs: image.loaded_optin_libs.clone(),
+            library_exports: image.library_exports.clone(),
+            vm_env,
+            pinned: Rc::new(RefCell::new(HashMap::new())),
+            next_pin_id: Rc::new(Cell::new(1)),
+            #[cfg(feature = "ffi-dynamic")]
+            loaded_libs: Vec::new(),
+            #[cfg(feature = "ffi-dynamic")]
+            ffi_ctx: None,
+            #[cfg(feature = "jit")]
+            jit_lowerer: None,
+            #[cfg(feature = "jit")]
+            jit_poisoned: Rc::new(Cell::new(false)),
+            command_line: None,
+            typer_hints_by_lambda_id: RefCell::new(std::collections::HashMap::new()),
+            sandbox_import_policy: None,
+        }
     }
 
     /// Body of `Runtime::new` minus the post-construction stdlib

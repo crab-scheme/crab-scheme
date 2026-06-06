@@ -711,6 +711,24 @@ async fn pump_coroutine(
     }
 }
 
+std::thread_local! {
+    /// This LocalSet worker's shared [`crate::RuntimeImage`] — the immutable
+    /// builtins/bundled-libs base that every green actor on this worker overlays
+    /// via [`crate::Runtime::from_image`]. Built once on first green spawn here;
+    /// `Rc`-based + thread-local, so it never crosses a thread (same isolation as
+    /// the per-actor Runtimes). This is the shared-Runtime memory lever.
+    static WORKER_RUNTIME_IMAGE: std::cell::OnceCell<std::rc::Rc<crate::RuntimeImage>> =
+        const { std::cell::OnceCell::new() };
+}
+
+/// This worker's shared `RuntimeImage`, building it on first use.
+fn worker_runtime_image() -> std::rc::Rc<crate::RuntimeImage> {
+    WORKER_RUNTIME_IMAGE.with(|c| {
+        c.get_or_init(|| std::rc::Rc::new(crate::RuntimeImage::build()))
+            .clone()
+    })
+}
+
 /// Whole-body green actor driver — the free-form analog of [`activation_body`]
 /// and the green analog of [`run_scheme_body`]. Runs an entire `spawn-source`
 /// body (with its *own* `(receive)`/`(raw-receive)`/`(sleep)` loop) inside a
@@ -739,7 +757,12 @@ async fn green_source_body(
     entry: String,
     args: Vec<SendableValue>,
 ) {
-    let mut rt = crate::Runtime::new();
+    // Shared-Runtime: a cheap per-actor Runtime overlaying this worker's shared
+    // base (builtins + bundled libs), instead of a full `Runtime::new()` per
+    // actor. The body's defines land in the per-actor overlay env; builtins /
+    // libraries resolve through to the shared base. This is the green-threads
+    // memory lever (N actors → one base + N small overlays).
+    let mut rt = crate::Runtime::from_image(&worker_runtime_image());
     // Load on the VM tier in the driver frame (no YIELDER installed yet:
     // top-level `(define …)`s don't park). Mirrors `run_scheme_body`.
     if let Err(d) = rt.eval_str_via_vm("<spawn-source-green>", &source) {
