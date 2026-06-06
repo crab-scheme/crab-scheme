@@ -22,6 +22,7 @@
 //! | `parse-time`         | string string      | fixnum or #f | strptime; returns epoch seconds. |
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
@@ -133,12 +134,33 @@ fn monotonic_time_ns(args: &[Value]) -> Result<Value, FfiError> {
 
 // ----- sleep -----
 
+/// Optional cooperative-sleep hook, installed by the host runtime (cs-runtime).
+/// Given a duration in ms, it returns `true` if it parked the caller
+/// cooperatively (e.g. by suspending an actor coroutine onto a timer), or
+/// `false` if there's no cooperative context and the caller should block
+/// normally. cs-stdlib-time can't depend on the actor layer, so the runtime
+/// installs the implementation — mirroring `cs_vm::install_yield_hook`.
+static COOPERATIVE_SLEEP: OnceLock<fn(u64) -> bool> = OnceLock::new();
+
+/// Install the cooperative-sleep hook (idempotent — only the first call wins).
+pub fn install_cooperative_sleep(hook: fn(u64) -> bool) {
+    let _ = COOPERATIVE_SLEEP.set(hook);
+}
+
 fn sleep_ms(args: &[Value]) -> Result<Value, FfiError> {
     let ms = expect_fixnum("sleep-ms", args, 0)?;
     if ms < 0 {
         return Err(FfiError::HostFailure("sleep-ms: negative duration".into()));
     }
-    std::thread::sleep(Duration::from_millis(ms as u64));
+    if ms > 0 {
+        let ms = ms as u64;
+        // Cooperative inside an actor coroutine (parks on a timer, letting
+        // co-located actors run); a plain blocking sleep everywhere else.
+        let parked = COOPERATIVE_SLEEP.get().is_some_and(|hook| hook(ms));
+        if !parked {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
     Ok(Value::Unspecified)
 }
 
