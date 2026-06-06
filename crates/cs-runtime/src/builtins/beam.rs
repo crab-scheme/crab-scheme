@@ -497,11 +497,11 @@ async fn drive_handler(
     let actor_ptr: *mut cs_actor::Actor = actor;
     let handler = handler.clone();
 
-    let mut co: Coroutine<(), CoYield, Result<Value, String>, DefaultStack> =
-        Coroutine::with_stack(checkout_stack(), move |yielder, ()| {
-            // Publish the yielder FIRST, before the handler can `(sleep)`: on
-            // the first resume the driver can't pre-install it (the closure
-            // hasn't run yet), so the closure seeds it here.
+    let mut co: Coroutine<CoResume, CoYield, Result<Value, String>, DefaultStack> =
+        Coroutine::with_stack(checkout_stack(), move |yielder, _first: CoResume| {
+            // Publish the yielder FIRST, before the handler can suspend: on the
+            // first resume the driver can't pre-install it (the closure hasn't
+            // run yet), so the closure seeds it here.
             YIELDER.with(|y| y.set(yielder as *const _));
             // Sound: see fn doc — the driver is parked in `resume()` right now.
             let rt = unsafe { &mut *rt_ptr };
@@ -510,8 +510,11 @@ async fn drive_handler(
 
     // The yielder pointer is stable for the coroutine's life; cache it after
     // the first resume so we can re-publish it before every later resume (a
-    // co-located actor that ran during our sleep clobbered the thread-local).
-    let mut cached_yielder: *const Yielder<(), CoYield> = std::ptr::null();
+    // co-located actor that ran during our suspend clobbered the thread-local).
+    let mut cached_yielder: *const Yielder<CoResume, CoYield> = std::ptr::null();
+    // The value handed to the next `resume`: ignored on the first resume; `Woke`
+    // after a sleep; the mailbox result after a receive.
+    let mut resume_input = CoResume::Woke;
 
     loop {
         // Install OUR actor's context for the duration of this resume only.
@@ -519,20 +522,31 @@ async fn drive_handler(
         YIELDER.with(|y| y.set(cached_yielder));
         REDUCTIONS.with(|c| c.set(0));
 
-        let result = co.resume(());
+        let result = co.resume(resume_input);
 
         // Capture the yielder the closure published on the first resume.
         if cached_yielder.is_null() {
             cached_yielder = YIELDER.with(|y| y.get());
         }
-        // Clear context BEFORE any await: while we sleep, the LocalSet may run
-        // a co-located actor, and it must never observe our stale pointers.
+        // Clear context BEFORE any await: while we're parked, the LocalSet may
+        // run a co-located actor, and it must never observe our stale pointers.
         ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
         YIELDER.with(|y| y.set(std::ptr::null()));
 
         match result {
             CoroutineResult::Yield(CoYield::Sleep(dur)) => {
                 tokio::time::sleep(dur).await;
+                resume_input = CoResume::Woke;
+            }
+            CoroutineResult::Yield(CoYield::Recv { timeout }) => {
+                // Park on the async mailbox (releasing the worker) and process
+                // the message exactly as the blocking path would, then resume
+                // the handler with the result. `actor_ptr` is sound here for the
+                // same reason as elsewhere: the coroutine is suspended (not
+                // touching the actor) while we await, ACTOR_CTX is cleared, and
+                // this driver is single-threaded.
+                let act = unsafe { &mut *actor_ptr };
+                resume_input = CoResume::Received(driver_receive(act, timeout).await);
             }
             CoroutineResult::Return(outcome) => {
                 // `into_stack` asserts the coroutine is done — only valid here.
@@ -541,6 +555,40 @@ async fn drive_handler(
             }
         }
     }
+}
+
+/// The async side of a cooperative `(raw-receive)`: pop a message from the
+/// mailbox — parking on the async mailbox (cancel-safe) so co-located actors run
+/// — then apply the same trap-exit + system-message processing as the blocking
+/// [`primop_raw_receive`]. `timeout`: `None` = block, `Some(0)` = try-once,
+/// `Some(ms)` = wait up to `ms` then report a timeout.
+async fn driver_receive(
+    actor: &mut cs_actor::Actor,
+    timeout: Option<u64>,
+) -> Result<Option<SendableValue>, String> {
+    let msg = match timeout {
+        None => match actor.receive_async().await {
+            Some(m) => m,
+            None => return Err("raw-receive: mailbox closed".into()),
+        },
+        Some(0) => match actor.try_receive() {
+            Ok(m) => m,
+            Err(cs_actor::TryRecvError::Empty) => return Ok(None),
+            Err(cs_actor::TryRecvError::Disconnected) => {
+                return Err("raw-receive: mailbox closed".into())
+            }
+        },
+        Some(ms) => {
+            // `receive_async` is cancel-safe (cs-actor issue #60), so dropping it
+            // when the timer fires neither loses a message nor wedges the mailbox.
+            match tokio::time::timeout(Duration::from_millis(ms), actor.receive_async()).await {
+                Ok(Some(m)) => m,
+                Ok(None) => return Err("raw-receive: mailbox closed".into()),
+                Err(_elapsed) => return Ok(None),
+            }
+        }
+    };
+    process_received(actor, msg)
 }
 
 /// Build a `Send + Sync` [`ActorEntry`] that runs a Scheme body. The closure
@@ -810,7 +858,7 @@ std::thread_local! {
     /// (same single-thread raw-pointer discipline as `ACTOR_CTX`). Non-null only
     /// while a coroutine-driven handler is on the stack; `(sleep)` reads it to
     /// decide cooperative-suspend vs. plain `thread::sleep`.
-    static YIELDER: std::cell::Cell<*const Yielder<(), CoYield>> =
+    static YIELDER: std::cell::Cell<*const Yielder<CoResume, CoYield>> =
         const { std::cell::Cell::new(std::ptr::null()) };
 
     /// Per-worker pool of recycled coroutine stacks (mmap-backed, with a guard
@@ -825,12 +873,27 @@ std::thread_local! {
 }
 
 /// What a coroutine-hosted activation handler asks its driver to do when it
-/// suspends. One variant today; a future `Recv { timeout }` would let a
-/// mid-handler `(raw-receive)` park cooperatively too (it still blocks the
-/// worker today — a clean, separable follow-on the same machinery enables).
+/// suspends — the coroutine's `Yield` type. The driver performs the async
+/// operation (releasing the worker so co-located actors run) and resumes the
+/// handler with a matching [`CoResume`].
 enum CoYield {
-    /// `(sleep)`/`(sleep-ms)` on a cooperative worker: park me this long.
+    /// `(sleep)`/`(sleep-ms)`: park me this long, then resume with `Woke`.
     Sleep(Duration),
+    /// `(raw-receive)`: park on the async mailbox (no timeout / try-once /
+    /// timeout per `timeout`), then resume with `Received(..)`.
+    Recv { timeout: Option<u64> },
+}
+
+/// What the driver passes back *into* the coroutine on resume — the coroutine's
+/// `Input` type. A `Sleep` resumes with `Woke`; a `Recv` resumes with the
+/// driver's processed mailbox result (same shape as [`primop_raw_receive`]:
+/// `Ok(Some)` = message, `Ok(None)` = timeout, `Err` = mailbox closed /
+/// trap-exit termination).
+enum CoResume {
+    /// Resume value after a `Sleep`, and the (ignored) value of the first resume.
+    Woke,
+    /// Resume value after a `Recv`.
+    Received(Result<Option<SendableValue>, String>),
 }
 
 /// Coroutine stack size. Matches the LocalSet worker thread's default 2 MiB
@@ -962,13 +1025,19 @@ pub fn primop_raw_receive(
         Some(m) => m,
         None => return Err("raw-receive: mailbox closed".into()),
     };
+    process_received(actor, msg)
+}
 
-    // BEAM trap-exit enforcement: a non-Normal Exit delivered
-    // to a non-trapping actor terminates the receiver. Surface
-    // as a Rust Err — the actor body's catch_unwind turns that
-    // into the actor's exit reason, and any actors LINKED to
-    // this one get a chained Exit propagation through
-    // on_actor_termination.
+/// Trap-exit enforcement + `Message` -> `SendableValue`, shared by the blocking
+/// [`primop_raw_receive`] and the cooperative [`driver_receive`] once a `Message`
+/// has been popped. BEAM trap-exit: a non-`Normal` `Exit` delivered to a
+/// non-trapping actor is surfaced as a Rust `Err` — the actor body's
+/// `catch_unwind` turns that into the actor's exit reason, and any LINKED actors
+/// get a chained `Exit` through `on_actor_termination`.
+fn process_received(
+    actor: &mut cs_actor::Actor,
+    msg: Message,
+) -> Result<Option<SendableValue>, String> {
     if let Message::Exit { from, reason } = &msg {
         if !actor.is_trapping_exits() && !matches!(reason, ExitReason::Normal) {
             return Err(format!(
@@ -978,7 +1047,6 @@ pub fn primop_raw_receive(
             ));
         }
     }
-
     Ok(Some(message_to_sendable(msg)))
 }
 
@@ -1612,10 +1680,40 @@ pub fn b_beam_sleep(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, St
     Ok(Value::Unspecified)
 }
 
+/// Cooperative `(raw-receive)`: if a coroutine driver is active on this thread
+/// (a [`YIELDER`] is installed — i.e. we are inside a `spawn-activation`
+/// handler), suspend with a `Recv` request so [`drive_handler`] parks on the
+/// async mailbox (letting co-located actors run) and resumes us with the result.
+/// Returns `None` if there is no driver, so the caller falls back to the
+/// blocking [`primop_raw_receive`] (correct for non-actor code and
+/// dedicated-thread `spawn`/`spawn-source` actors, which own their thread).
+fn cooperative_raw_receive(
+    timeout_ms: Option<u64>,
+) -> Option<Result<Option<SendableValue>, String>> {
+    let yielder = YIELDER.with(|c| c.get());
+    if yielder.is_null() {
+        return None;
+    }
+    // Sound: see `cooperative_sleep_hook` — we're inside the coroutine whose
+    // `Yielder` this is, on its thread, and the driver re-installs `YIELDER`
+    // before resuming us.
+    match unsafe {
+        (*yielder).suspend(CoYield::Recv {
+            timeout: timeout_ms,
+        })
+    } {
+        CoResume::Received(result) => Some(result),
+        CoResume::Woke => Some(Err(
+            "raw-receive: internal error (resumed without a message)".into(),
+        )),
+    }
+}
+
 /// `(raw-receive)` blocks until a message arrives;
-/// `(raw-receive timeout-ms)` returns `#f` if the deadline
+/// `(raw-receive timeout-ms)` returns `'*timeout*` if the deadline
 /// passes without one. System messages (Exit/Down) surface as
 /// tagged lists the Scheme `(receive)` macro can pattern-match.
+/// Cooperative inside an activation handler (see [`cooperative_raw_receive`]).
 pub fn b_beam_raw_receive(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     let timeout_ms = match args.len() {
         0 => None,
@@ -1632,8 +1730,11 @@ pub fn b_beam_raw_receive(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
         n => return Err(format!("raw-receive: expected 0 or 1 arguments, got {}", n)),
     };
 
-    let outcome = with_current_actor(|a| primop_raw_receive(a, timeout_ms))
-        .ok_or_else(|| "raw-receive: not inside an actor body".to_string())??;
+    let outcome = match cooperative_raw_receive(timeout_ms) {
+        Some(result) => result,
+        None => with_current_actor(|a| primop_raw_receive(a, timeout_ms))
+            .ok_or_else(|| "raw-receive: not inside an actor body".to_string())?,
+    }?;
 
     match outcome {
         Some(sv) => Ok(from_sendable(&sv, syms)),
