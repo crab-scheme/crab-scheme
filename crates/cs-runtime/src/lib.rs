@@ -2108,9 +2108,21 @@ impl Runtime {
     /// a user error — so it panics loudly rather than failing silently.
     #[cfg(feature = "bundled-scheme")]
     fn load_bundled_library(&mut self, name: &str, src: &str) {
+        // Load into BOTH tiers' global envs. The walker `top` and the VM
+        // `vm_env` are separate (Rust builtins are registered into both, but a
+        // Scheme `eval_str` only populates the walker), so a VM-tier program
+        // (e.g. a spawn-source actor body, which now runs on the VM tier)
+        // cannot see a library loaded only on the walker — that surfaced as
+        // `undefined variable: call` from the `(crab actor)` prelude.
         if let Err(d) = self.eval_str(name, src) {
             panic!(
-                "crabscheme: bundled library {} failed to load: {}",
+                "crabscheme: bundled library {} failed to load (walker): {}",
+                name, d.message
+            );
+        }
+        if let Err(d) = self.eval_str_via_vm(name, src) {
+            panic!(
+                "crabscheme: bundled library {} failed to load (vm): {}",
                 name, d.message
             );
         }
@@ -2965,15 +2977,13 @@ impl Runtime {
         })
     }
 
-    /// Look up a top-level binding.
+    /// Look up a top-level binding. Tier-agnostic: checks the walker `top`
+    /// frame first, then the VM `vm_env`. A binding `define`d via
+    /// `eval_str_via_vm` lands in `vm_env`, so a walker-only lookup would
+    /// spuriously miss it (e.g. an actor body loaded on the VM tier).
     pub fn lookup(&self, name: &str) -> Option<Value> {
-        // Note: this looks up in top frame only — sufficient for embed API tests.
-        let sym = self.syms.by_name_lookup(name).or_else(|| {
-            // Symbol may not exist yet. We can't insert because &self;
-            // return None.
-            None
-        })?;
-        self.top.get(sym)
+        let sym = self.syms.by_name_lookup(name)?;
+        self.top.get(sym).or_else(|| self.vm_env.get(sym))
     }
 }
 
