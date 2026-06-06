@@ -572,6 +572,20 @@ async fn pump_coroutine(
     // green-dedicated and the hook is a no-op whenever no coroutine is active
     // (YIELDER null), so it needs no teardown. See [`green_yield_hook`].
     ensure_green_yield_hook();
+    // Clear ACTOR_CTX / YIELDER on *every* exit from this driver — including a
+    // panic unwinding out of `co.resume` below (corosensei propagates a coroutine
+    // panic through `resume`, which then unwinds this frame past the inline
+    // clear). Without this, a panicking actor would leave its (freed) pointers
+    // installed for the next actor to run on this shared worker. Mirrors the RAII
+    // Guard `run_actor_body` uses on the dedicated path (P6.1 parity).
+    struct ClearCtx;
+    impl Drop for ClearCtx {
+        fn drop(&mut self) {
+            ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
+            YIELDER.with(|y| y.set(std::ptr::null()));
+        }
+    }
+    let _clear_ctx = ClearCtx;
     // The yielder pointer is stable for the coroutine's life; cache it after
     // the first resume so we can re-publish it before every later resume (a
     // co-located actor that ran during our suspend clobbered the thread-local).
@@ -685,9 +699,16 @@ async fn green_source_body(
                 .map_err(|d| format!("actor body raised: {d:?}"))
         });
 
-    // P6.1 maps the outcome to a proper ExitReason for link/monitor parity; for
-    // now match the dedicated path (`scheme_source_entry`): surface a body error
-    // loudly and exit (Article VI — never die silently).
+    // Termination parity with the dedicated path (`scheme_source_entry`) and the
+    // activation path (`activation_body`): a *Scheme-level* error (the body
+    // returned `Err` — including a trap-exit `Err` from `(raw-receive)`) is
+    // surfaced loudly and the actor exits cleanly → `ExitReason::Normal` via
+    // `spawn_local_activation`'s wrapper. A *Rust panic* propagates out of this
+    // future and that wrapper's `catch_unwind` maps it to `ExitReason::Error`,
+    // which `on_actor_termination` then chains to linked actors / monitors —
+    // identical to the dedicated `spawn_async` path. (No Scheme primitive exits
+    // with a custom Error reason; abnormal exits come only from panics.) The
+    // `pump_coroutine` ClearCtx guard keeps that panic path hygienic.
     if let Err(e) = pump_coroutine(co, actor_ptr).await {
         eprintln!("spawn-source(green): actor `{entry}` terminated: {e}");
     }
