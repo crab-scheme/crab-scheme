@@ -3000,10 +3000,10 @@ impl Runtime {
         name: &str,
         src: &str,
     ) -> Result<Value, Diagnostic> {
+        // source -> (compiled bytecode, the symbol table that compile produced).
+        type BodyCache = HashMap<String, (Rc<cs_vm::Bytecode>, Rc<cs_core::SymbolTable>)>;
         thread_local! {
-            static BODY_CACHE: RefCell<
-                HashMap<String, (Rc<cs_vm::Bytecode>, Rc<cs_core::SymbolTable>)>,
-            > = RefCell::new(HashMap::new());
+            static BODY_CACHE: RefCell<BodyCache> = RefCell::new(HashMap::new());
         }
         if let Some((bc, cached_syms)) = BODY_CACHE.with(|c| c.borrow().get(src).cloned()) {
             // Adopt the cached body symbols so the bytecode's body-symbol ids
