@@ -301,6 +301,13 @@ impl Runtime {
                 let sym = syms.intern(name);
                 vm_env.define(sym, cs_vm::vm::make_vm_builtin_syms(name, f));
             }
+            // Make the stdlib `(crab time)` `sleep-ms` cooperative inside an
+            // activation handler by routing it through beam's coroutine yielder.
+            // The hook is process-global + idempotent (OnceLock), so installing
+            // it per Runtime is cheap and only the first wins. cs-runtime owns
+            // this wiring because cs-stdlib-time can't depend on the actor layer
+            // (same shape as cs_vm::install_yield_hook <- cs_actor::tokio_yield_hook).
+            cs_stdlib_time::install_cooperative_sleep(builtins::beam::cooperative_sleep_hook);
         }
         // Cross-node transport primops (the `distrib` feature) — same Syms
         // shape, registered on the VM tier alongside the BEAM primops.

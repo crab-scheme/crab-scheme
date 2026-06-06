@@ -1527,18 +1527,31 @@ pub fn b_beam_yield(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, St
 /// doubles as a tick clock + sole I/O drainer, so *any* real wait there slows
 /// the protocol — that code keeps `(yield)` by choice, not because sleep can no
 /// longer cooperate.)
-fn do_sleep(ms: u64) {
-    if ms == 0 {
-        return;
-    }
+/// Cooperative-sleep hook for cs-stdlib-time's `sleep-ms` (installed at runtime
+/// startup) and the basis of beam's own `(sleep)`. If a coroutine driver is
+/// active on this thread (a `YIELDER` is installed — i.e. we are inside a
+/// `spawn-activation` handler), park the caller by suspending the coroutine
+/// onto [`drive_handler`]'s timer and return `true`. Otherwise return `false`
+/// so the caller does a normal blocking `thread::sleep`.
+pub fn cooperative_sleep_hook(ms: u64) -> bool {
     let yielder = YIELDER.with(|c| c.get());
     if yielder.is_null() {
-        std::thread::sleep(Duration::from_millis(ms));
+        false
     } else {
         // Sound: we're executing *inside* the coroutine whose `Yielder` this is
         // (it lives for the coroutine's life, on this thread), and
         // `drive_handler` re-installs `YIELDER` before every resume.
         unsafe { (*yielder).suspend(CoYield::Sleep(Duration::from_millis(ms))) };
+        true
+    }
+}
+
+fn do_sleep(ms: u64) {
+    if ms == 0 {
+        return;
+    }
+    if !cooperative_sleep_hook(ms) {
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
 
