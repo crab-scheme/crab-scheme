@@ -485,11 +485,12 @@ async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: St
 ///
 /// ## Drop order
 ///
-/// `co` is a local of this frame — deeper than `rt`/`actor` in
-/// `activation_body`. On shutdown, dropping the suspended `activation_body`
-/// future drops innermost-first: `co` (corosensei force-unwinds its frozen
-/// Scheme stack, running `Rc` destructors that touch `rt`'s heap) drops *before*
-/// `rt`/`actor`. Do not hoist `co` or the stack pool above `rt`/`actor`.
+/// `co` is built here and moved into `pump_coroutine`, whose frame is awaited
+/// from this one — so `co` stays deeper than `rt`/`actor` in `activation_body`.
+/// On shutdown, dropping the suspended `activation_body` future drops
+/// innermost-first: `co` (corosensei force-unwinds its frozen Scheme stack,
+/// running `Rc` destructors that touch `rt`'s heap) drops *before* `rt`/`actor`.
+/// Do not hoist `co` or the stack pool above `rt`/`actor`.
 async fn drive_handler(
     actor: &mut cs_actor::Actor,
     rt: &mut crate::Runtime,
@@ -500,7 +501,7 @@ async fn drive_handler(
     let actor_ptr: *mut cs_actor::Actor = actor;
     let handler = handler.clone();
 
-    let mut co: Coroutine<CoResume, CoYield, Result<Value, String>, DefaultStack> =
+    let co: Coroutine<CoResume, CoYield, Result<Value, String>, DefaultStack> =
         Coroutine::with_stack(checkout_stack(), move |yielder, _first: CoResume| {
             // Publish the yielder FIRST, before the handler can suspend: on the
             // first resume the driver can't pre-install it (the closure hasn't
@@ -511,6 +512,34 @@ async fn drive_handler(
             rt.apply_value(&handler, &[msg])
         });
 
+    // The suspend/resume loop is shared with the whole-body green driver
+    // (`green_source_body`) — the only difference is what the closure above runs.
+    pump_coroutine(co, actor_ptr).await
+}
+
+/// Drive a coroutine-hosted Scheme computation to completion, servicing each
+/// cooperative suspend by parking on the matching async primitive (releasing the
+/// LocalSet worker so co-located actors run) and resuming the coroutine with the
+/// result. Shared by the per-message [`drive_handler`] (one handler invocation)
+/// and the whole-body `green_source_body` (an entire free-form actor body) — the
+/// machinery is identical; only the coroutine closure differs.
+///
+/// Takes `co` by value: on `Return` it reclaims the stack via `into_stack`, and
+/// keeping `co` in this (innermost) frame preserves the drop-order guarantee its
+/// callers rely on — see [`drive_handler`]'s safety doc.
+///
+/// ## Safety
+///
+/// `actor_ptr` must point at the actor that owns `co` and outlive it. Sound for
+/// the same reason as elsewhere: one single-threaded worker; control strictly
+/// alternates (this driver is parked in `resume()` while the coroutine runs, and
+/// the coroutine is frozen while this driver `.await`s); and `ACTOR_CTX` /
+/// `YIELDER` are cleared before every `.await`, so a co-located actor never
+/// observes our stale pointers.
+async fn pump_coroutine(
+    mut co: Coroutine<CoResume, CoYield, Result<Value, String>, DefaultStack>,
+    actor_ptr: *mut cs_actor::Actor,
+) -> Result<Value, String> {
     // The yielder pointer is stable for the coroutine's life; cache it after
     // the first resume so we can re-publish it before every later resume (a
     // co-located actor that ran during our suspend clobbered the thread-local).
