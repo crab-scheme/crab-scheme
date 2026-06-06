@@ -657,6 +657,16 @@ async fn pump_coroutine(
                 tokio::task::yield_now().await;
                 resume_input = CoResume::Woke;
             }
+            #[cfg(feature = "stdlib-net")]
+            CoroutineResult::Yield(CoYield::Io { handle, max }) => {
+                // Cooperative socket read: await on the async stream (releasing
+                // the worker) instead of blocking it, then resume with the bytes.
+                resume_input = CoResume::Io(driver_tcp_recv(handle, max).await);
+            }
+            #[cfg(feature = "stdlib-net")]
+            CoroutineResult::Yield(CoYield::IoWrite { handle, bytes }) => {
+                resume_input = CoResume::IoWrite(driver_tcp_send(handle, bytes).await);
+            }
             CoroutineResult::Return(outcome) => {
                 // `into_stack` asserts the coroutine is done — only valid here.
                 checkin_stack(co.into_stack());
@@ -770,6 +780,76 @@ async fn driver_receive(
         }
     };
     process_received(actor, msg)
+}
+
+#[cfg(feature = "stdlib-net")]
+std::thread_local! {
+    /// Per-worker cache of tokio streams for cooperative socket I/O, keyed by the
+    /// cs-stdlib-net handle id. A long-lived green conn reuses its stream across
+    /// reads/writes rather than re-cloning the fd + re-registering with the
+    /// reactor each call. Evicted on EOF / error (the next op rebuilds from the
+    /// std stream cs-stdlib-net still holds).
+    static TOKIO_TCP: std::cell::RefCell<std::collections::HashMap<i64, tokio::net::TcpStream>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Take this handle's cached tokio stream, or build one from the std stream
+/// cs-stdlib-net holds (dup'd, set non-blocking, adopted onto the current
+/// reactor). The caller reinserts it on success; on EOF/error it stays evicted.
+#[cfg(feature = "stdlib-net")]
+fn take_tokio_tcp(handle: i64) -> Result<tokio::net::TcpStream, String> {
+    if let Some(s) = TOKIO_TCP.with(|m| m.borrow_mut().remove(&handle)) {
+        return Ok(s);
+    }
+    let std_stream = cs_stdlib_net::clone_tcp_std(handle)
+        .ok_or_else(|| format!("handle {handle} is not a live TCP socket"))?;
+    std_stream
+        .set_nonblocking(true)
+        .map_err(|e| format!("set_nonblocking failed: {e}"))?;
+    tokio::net::TcpStream::from_std(std_stream).map_err(|e| format!("tokio adopt failed: {e}"))
+}
+
+/// Driver side of a cooperative `(tcp-recv handle max)`: read up to `max` bytes,
+/// awaiting (releasing the worker) instead of blocking. `Ok(empty)` on a clean
+/// EOF — matching the blocking path. The conn actor owns its socket and is
+/// suspended here, so no peer touches this handle's cache entry meanwhile.
+#[cfg(feature = "stdlib-net")]
+async fn driver_tcp_recv(handle: i64, max: usize) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut stream = take_tokio_tcp(handle).map_err(|e| format!("tcp-recv: {e}"))?;
+    let mut buf = vec![0u8; max];
+    match stream.read(&mut buf).await {
+        Ok(0) => Ok(Vec::new()), // clean EOF — leave the stream evicted
+        Ok(n) => {
+            buf.truncate(n);
+            TOKIO_TCP.with(|m| m.borrow_mut().insert(handle, stream));
+            Ok(buf)
+        }
+        Err(e) => Err(format!("tcp-recv: {e}")), // evict on error; next op rebuilds
+    }
+}
+
+/// Driver side of a cooperative `(tcp-send handle bytes)`: write all of `bytes`,
+/// awaiting instead of blocking. Required for green conns: the cooperative recv
+/// put the shared fd in non-blocking mode, so the blocking `write_all` path
+/// would hit `WouldBlock`.
+#[cfg(feature = "stdlib-net")]
+async fn driver_tcp_send(handle: i64, bytes: Vec<u8>) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = take_tokio_tcp(handle).map_err(|e| format!("tcp-send: {e}"))?;
+    let result = async {
+        stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| format!("tcp-send: {e}"))?;
+        stream.flush().await.map_err(|e| format!("tcp-send: {e}"))?;
+        Ok(())
+    }
+    .await;
+    if result.is_ok() {
+        TOKIO_TCP.with(|m| m.borrow_mut().insert(handle, stream));
+    }
+    result
 }
 
 /// Build a `Send + Sync` [`ActorEntry`] that runs a Scheme body. The closure
@@ -1086,6 +1166,14 @@ enum CoYield {
     /// a CPU-bound body cooperatively yield to co-located actors instead of
     /// monopolizing its shared worker. See [`green_yield_hook`].
     Yield,
+    /// `(tcp-recv handle max)`: read up to `max` bytes asynchronously (releasing
+    /// the worker), then resume with `Io(..)`. See [`cooperative_tcp_recv_hook`].
+    #[cfg(feature = "stdlib-net")]
+    Io { handle: i64, max: usize },
+    /// `(tcp-send handle bytes)`: write `bytes` asynchronously (releasing the
+    /// worker), then resume with `IoWrite(..)`. See [`cooperative_tcp_send_hook`].
+    #[cfg(feature = "stdlib-net")]
+    IoWrite { handle: i64, bytes: Vec<u8> },
 }
 
 /// What the driver passes back *into* the coroutine on resume — the coroutine's
@@ -1099,6 +1187,12 @@ enum CoResume {
     Woke,
     /// Resume value after a `Recv`.
     Received(Result<Option<SendableValue>, String>),
+    /// Resume value after an `Io` read: the bytes read (`Ok(empty)` on clean EOF).
+    #[cfg(feature = "stdlib-net")]
+    Io(Result<Vec<u8>, String>),
+    /// Resume value after an `IoWrite`: success or the write error.
+    #[cfg(feature = "stdlib-net")]
+    IoWrite(Result<(), String>),
 }
 
 std::thread_local! {
@@ -1977,8 +2071,55 @@ fn cooperative_raw_receive(
         })
     } {
         CoResume::Received(result) => Some(result),
-        CoResume::Woke => Some(Err(
+        // Any other resume value for a Recv is a driver bug.
+        _ => Some(Err(
             "raw-receive: internal error (resumed without a message)".into(),
+        )),
+    }
+}
+
+/// Cooperative `(tcp-recv handle max)`: if a coroutine driver is active on this
+/// thread (a [`YIELDER`] is installed), suspend with an [`CoYield::Io`] request so
+/// the driver does the read on a tokio stream (releasing the worker) and resumes
+/// us with the bytes. `None` when there is no driver, so cs-stdlib-net falls back
+/// to its blocking read (dedicated thread / non-actor). Installed into
+/// cs-stdlib-net via [`cs_stdlib_net::install_async_recv`].
+#[cfg(feature = "stdlib-net")]
+pub fn cooperative_tcp_recv_hook(handle: i64, max: usize) -> Option<Result<Vec<u8>, String>> {
+    let yielder = YIELDER.with(|c| c.get());
+    if yielder.is_null() {
+        return None;
+    }
+    // Sound: see `cooperative_sleep_hook`.
+    match unsafe { (*yielder).suspend(CoYield::Io { handle, max }) } {
+        CoResume::Io(res) => Some(res),
+        _ => Some(Err(
+            "tcp-recv: internal error (resumed without bytes)".into()
+        )),
+    }
+}
+
+/// Cooperative `(tcp-send handle bytes)` — the write counterpart of
+/// [`cooperative_tcp_recv_hook`]. Required on the green path: the cooperative
+/// recv set the shared fd non-blocking, so a blocking `write_all` would
+/// `WouldBlock`. Installed via [`cs_stdlib_net::install_async_send`].
+#[cfg(feature = "stdlib-net")]
+pub fn cooperative_tcp_send_hook(handle: i64, bytes: &[u8]) -> Option<Result<(), String>> {
+    let yielder = YIELDER.with(|c| c.get());
+    if yielder.is_null() {
+        return None;
+    }
+    // Sound: see `cooperative_sleep_hook`. `bytes` is copied into the CoYield
+    // because the slice can't outlive this call across the suspend.
+    match unsafe {
+        (*yielder).suspend(CoYield::IoWrite {
+            handle,
+            bytes: bytes.to_vec(),
+        })
+    } {
+        CoResume::IoWrite(res) => Some(res),
+        _ => Some(Err(
+            "tcp-send: internal error (resumed without an ack)".into()
         )),
     }
 }
