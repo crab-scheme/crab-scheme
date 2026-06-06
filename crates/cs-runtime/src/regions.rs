@@ -225,11 +225,11 @@ pub fn region_lookup_diagnostic() -> RegionLookupDiagnostic {
     RegionLookupDiagnostic::NoTlsScope
 }
 
-/// Test/debug helper: current depth of the region stack.
-/// Sums the task-local depth (if inside a task scope) and the
-/// TLS depth — only one path should be non-zero at a time, but
-/// the sum is correct in either case.
-#[cfg(any(test, debug_assertions))]
+/// Current depth of the region stack — the task-local scope depth (if inside a
+/// task scope) plus the TLS depth. Only one path is non-zero at a time, but the
+/// sum is correct either way. Used by the green driver's region-park guard
+/// (`pump_coroutine`, which must run in release — a region scope spanning a
+/// suspend on a shared worker is unsound) and by tests.
 pub fn region_stack_depth() -> usize {
     let mut total = REGION_STACK_TLS.with(|s| s.borrow().len());
     #[cfg(feature = "actor")]
