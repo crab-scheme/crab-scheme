@@ -308,6 +308,14 @@ impl Runtime {
             // this wiring because cs-stdlib-time can't depend on the actor layer
             // (same shape as cs_vm::install_yield_hook <- cs_actor::tokio_yield_hook).
             cs_stdlib_time::install_cooperative_sleep(builtins::beam::cooperative_sleep_hook);
+            // Make `(crab net)` tcp-recv/tcp-send cooperative on the green path:
+            // a coroutine driver parks the worker for the socket I/O instead of
+            // blocking it. Same inverted-dependency wiring as the sleep hook.
+            #[cfg(feature = "stdlib-net")]
+            {
+                cs_stdlib_net::install_async_recv(builtins::beam::cooperative_tcp_recv_hook);
+                cs_stdlib_net::install_async_send(builtins::beam::cooperative_tcp_send_hook);
+            }
         }
         // Cross-node transport primops (the `distrib` feature) — same Syms
         // shape, registered on the VM tier alongside the BEAM primops.

@@ -108,6 +108,16 @@ pub fn install_async_recv(hook: AsyncRecvHook) {
     let _ = ASYNC_RECV.set(hook);
 }
 
+/// `(handle, bytes) -> Some(result)` if the cooperative path handled the write
+/// (parked the green worker), or `None` to fall through to the blocking write.
+type AsyncSendHook = fn(i64, &[u8]) -> Option<Result<(), String>>;
+static ASYNC_SEND: OnceLock<AsyncSendHook> = OnceLock::new();
+
+/// Install the cooperative async-send hook (idempotent; first wins).
+pub fn install_async_send(hook: AsyncSendHook) {
+    let _ = ASYNC_SEND.set(hook);
+}
+
 /// Clone the underlying std `TcpStream` for socket handle `id`, so a cooperative
 /// driver can build a tokio stream for the async read. `None` if `id` is not a
 /// live TCP socket. No tokio types cross this crate boundary.
@@ -295,6 +305,18 @@ fn tcp_accept(args: &[Value]) -> Result<Value, FfiError> {
 fn tcp_send(args: &[Value]) -> Result<Value, FfiError> {
     let id = expect_fixnum("tcp-send", args, 0)?;
     let payload = expect_bv("tcp-send", args, 1)?;
+    // Cooperative path (see tcp_recv): a green driver writes by parking instead
+    // of blocking the shared worker. None ⇒ no driver ⇒ blocking path below
+    // (unchanged). This must shadow the blocking write for green conns: the
+    // cooperative recv put this fd in nonblocking mode (shared file description),
+    // so a blocking write_all here would hit WouldBlock.
+    if let Some(hook) = ASYNC_SEND.get() {
+        if let Some(res) = hook(id, &payload) {
+            return res
+                .map(|()| Value::Unspecified)
+                .map_err(FfiError::HostFailure);
+        }
+    }
     // Clone the stream handle (a dup of the same fd) and RELEASE the registry
     // lock before the blocking write. Holding the global lock across the
     // syscall would serialize every socket in the process onto one mutex —
