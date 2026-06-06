@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use cs_runtime::builtins::beam::{
     beam_state, primop_raw_receive, primop_send, primop_spawn, primop_spawn_activation,
-    SendableValue,
+    primop_spawn_source_green, SendableValue,
 };
 
 mod common;
@@ -347,5 +347,79 @@ fn peer_error_does_not_disturb_a_sleeper() {
     assert!(
         got.contains(&"a-start".to_string()) && got.contains(&"a-done".to_string()),
         "A must complete despite a co-located peer erroring during its sleep; got {got:?}"
+    );
+}
+
+#[test]
+fn green_whole_body_sleep_lets_colocated_actor_progress() {
+    force_single_worker();
+
+    // P1.4: the WHOLE-BODY green driver (`spawn-source-green`) must cooperate
+    // exactly like the framework `spawn-activation` path. These are free-form
+    // bodies with their OWN `(raw-receive)` loop — the shape every spawn-source
+    // actor uses — yet a mid-body `(sleep)` parks via the same `pump_coroutine`
+    // Sleep arm, so a co-located green actor keeps running during the nap. No
+    // body or primop change makes this work (the body's own (sleep)/(raw-receive)
+    // route through the YIELDER-gated hooks `green_source_body` publishes).
+    let order = Arc::new(Mutex::new(Vec::<String>::new()));
+    register_order_collector("test:green-coop-order", 3, order.clone());
+    let col = primop_spawn("test:green-coop-order", vec![]).expect("spawn collector");
+
+    // A: first message is ('col . col-pid); then on 'go mark a-start, sleep,
+    // mark a-done, and return (the actor exits). A free-form loop, not a handler.
+    let a = primop_spawn_source_green(
+        r#"
+        (define (worker)
+          (let ((col (cdr (raw-receive))))
+            (let loop ()
+              (let ((m (raw-receive)))
+                (if (eq? m 'go)
+                    (begin (send col 'a-start) (sleep-ms 200) (send col 'a-done))
+                    (loop))))))
+        "#
+        .to_string(),
+        "worker".to_string(),
+        vec![],
+    )
+    .expect("spawn A");
+
+    // B: same shape; on 'go mark b-done and exit.
+    let b = primop_spawn_source_green(
+        r#"
+        (define (worker)
+          (let ((col (cdr (raw-receive))))
+            (let loop ()
+              (let ((m (raw-receive)))
+                (if (eq? m 'go) (send col 'b-done) (loop))))))
+        "#
+        .to_string(),
+        "worker".to_string(),
+        vec![],
+    )
+    .expect("spawn B");
+
+    primop_send(a, tagged("col", SendableValue::Pid(col))).unwrap();
+    primop_send(b, tagged("col", SendableValue::Pid(col))).unwrap();
+
+    // A goes first; wait until it is parked in `(sleep-ms 200)` (a-start
+    // recorded), THEN release B onto the same single worker.
+    primop_send(a, sym("go")).unwrap();
+    wait_until(
+        Duration::from_secs(2),
+        "green A never recorded a-start",
+        || order.lock().unwrap().iter().any(|s| s == "a-start"),
+    );
+    primop_send(b, sym("go")).unwrap();
+
+    wait_until(Duration::from_secs(3), "did not collect 3 markers", || {
+        order.lock().unwrap().len() >= 3
+    });
+
+    let got = order.lock().unwrap().clone();
+    assert_eq!(
+        got,
+        vec!["a-start", "b-done", "a-done"],
+        "b-done must arrive during green A's mid-body sleep (between a-start and a-done) — \
+         if (sleep) blocked the shared worker, b-done would land after a-done"
     );
 }
