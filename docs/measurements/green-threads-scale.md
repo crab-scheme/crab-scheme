@@ -185,3 +185,33 @@ once and share the bytecode across actors running the *same* body (e.g.
 crab-cache's identical per-conn `conn.scm`); that's a distinct optimization from
 the shared Runtime. 118 KiB already makes 50k practical (~6 GiB) and 100k feasible
 (~12 GiB) with a raised `vm.max_map_count`.
+
+## Result 2 — shared body compilation (`feat/shared-body-compilation`)
+
+Split the eval pipeline (`compile_program_via_vm` + `run_bytecode`, `ec4ae2d`)
+and added a per-worker, per-source compilation cache (`eval_str_via_vm_cached`,
+`84f7afd`): the first green actor with a given body compiles it; later actors
+adopt the cached symbol table as their syms base and re-run the cached
+`Bytecode` against their own overlay (the body's closures share the cached code
+chunks; only the closures + overlay bindings are per-actor). Sound because green
+actors share the per-worker base env, so the bytecode's builtin ids resolve and
+the compile-time const-fold saw only base builtins.
+
+Measured the per-actor cost as a function of body size (N=2000), with and without
+the body cache, on top of the shared Runtime:
+
+| body | shared Runtime | **+ body cache** |
+|---|--:|--:|
+| trivial (`idle`) | ~118 KiB | **~40 KiB** |
+| 200 `define`s | ~354 KiB | **~72 KiB** |
+
+So a non-trivial body drops **~5×** more (354 → 72), and even the trivial body
+~3× (the per-actor parse/expand/compile + its bytecode is eliminated). Combined
+with the shared Runtime that is **~20×** off the original 826 KiB for a small
+body. **At/under the <50 KiB target** for typical bodies. 50k actors ≈ 2–3.6 GiB,
+100k ≈ 4–7 GiB. All green suites + crab-cache conformance green.
+
+**Cumulative:** original 826 KiB/actor → shared env 230 → + shared syms 118 →
++ shared body compilation **~40–72 KiB/actor** (body-dependent). The remaining
+floor is the coroutine stack's touched pages + the per-actor closures/bindings —
+genuinely per-actor.
