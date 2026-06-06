@@ -764,8 +764,11 @@ async fn green_source_body(
     // memory lever (N actors → one base + N small overlays).
     let mut rt = crate::Runtime::from_image(&worker_runtime_image());
     // Load on the VM tier in the driver frame (no YIELDER installed yet:
-    // top-level `(define …)`s don't park). Mirrors `run_scheme_body`.
-    if let Err(d) = rt.eval_str_via_vm("<spawn-source-green>", &source) {
+    // top-level `(define …)`s don't park). Cached per source per worker — actors
+    // running the same body reuse the compiled bytecode (sharing its code
+    // chunks); only the closures + overlay bindings are per-actor. Mirrors
+    // `run_scheme_body` otherwise.
+    if let Err(d) = rt.eval_str_via_vm_cached("<spawn-source-green>", &source) {
         eprintln!("spawn-source(green): loading actor source failed: {d:?}");
         return;
     }

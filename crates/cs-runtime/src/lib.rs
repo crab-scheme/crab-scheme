@@ -2981,6 +2981,47 @@ impl Runtime {
         self.with_active(|rt| rt.eval_str_via_vm_inner(file_id, src))
     }
 
+    /// Like [`eval_str_via_vm`], but **caches the compiled bytecode per source**
+    /// (per worker thread). The first call for a given `src` compiles it and
+    /// caches the `Bytecode` + the symbol table it produced; later calls (e.g.
+    /// every green actor running the *same* body) skip parse/expand/compile and
+    /// re-run the cached bytecode against this runtime's `vm_env` — the body's
+    /// closures share the cached code chunks, so only the closures + their
+    /// bindings are per-actor.
+    ///
+    /// **Sound only when callers share the same base env** (the shared-Runtime
+    /// model — `Runtime::from_image`): the cached bytecode's builtin ids resolve
+    /// against the shared base, and adopting the cached symbol table as our base
+    /// makes the body-symbol ids resolve too. The body's top-level `(define …)`s
+    /// still land in *this* runtime's per-actor overlay (the define boundary), so
+    /// per-actor isolation is preserved. Intended for `green_source_body`.
+    pub(crate) fn eval_str_via_vm_cached(
+        &mut self,
+        name: &str,
+        src: &str,
+    ) -> Result<Value, Diagnostic> {
+        thread_local! {
+            static BODY_CACHE: RefCell<
+                HashMap<String, (Rc<cs_vm::Bytecode>, Rc<cs_core::SymbolTable>)>,
+            > = RefCell::new(HashMap::new());
+        }
+        if let Some((bc, cached_syms)) = BODY_CACHE.with(|c| c.borrow().get(src).cloned()) {
+            // Adopt the cached body symbols so the bytecode's body-symbol ids
+            // resolve; defines still land in our own overlay env.
+            self.syms = cs_core::SymbolTable::with_base(cached_syms);
+            return self.with_active(|rt| rt.run_bytecode(&bc));
+        }
+        let file_id = self.sources.add(name, src);
+        // Compile against the (empty-overlay) per-actor env: the globals snapshot
+        // folds only the shared base builtins, valid for every reusing actor.
+        let bc = Rc::new(self.with_active(|rt| rt.compile_program_via_vm(file_id, src))?);
+        BODY_CACHE.with(|c| {
+            c.borrow_mut()
+                .insert(src.to_string(), (bc.clone(), Rc::new(self.syms.clone())));
+        });
+        self.with_active(|rt| rt.run_bytecode(&bc))
+    }
+
     fn eval_str_via_vm_inner(&mut self, file_id: FileId, src: &str) -> Result<Value, Diagnostic> {
         let bc = self.compile_program_via_vm(file_id, src)?;
         self.run_bytecode(&bc)
