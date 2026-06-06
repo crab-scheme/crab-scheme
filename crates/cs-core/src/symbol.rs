@@ -11,7 +11,11 @@ use std::rc::Rc;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct Symbol(pub u32);
 
-#[derive(Default)]
+/// `Clone` gives a per-actor copy that shares the interned `Rc<str>` storage
+/// (refcount bumps, not string copies) — the shared-Runtime model clones a
+/// worker's canonical base table per actor so builtin symbol ids stay consistent
+/// with the shared base env, while each actor can still intern new symbols.
+#[derive(Clone, Default)]
 pub struct SymbolTable {
     by_name: HashMap<Rc<str>, Symbol>,
     by_id: Vec<Rc<str>>,
