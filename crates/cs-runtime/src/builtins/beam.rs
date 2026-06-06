@@ -565,6 +565,13 @@ async fn pump_coroutine(
     mut co: Coroutine<CoResume, CoYield, Result<Value, String>, DefaultStack>,
     actor_ptr: *mut cs_actor::Actor,
 ) -> Result<Value, String> {
+    // Enable reduction-budget preemption on this worker: when the cs-vm yield
+    // hook fires mid-evaluation it suspends the running coroutine (CoYield::Yield),
+    // so a CPU-bound body releases its shared worker instead of monopolizing it.
+    // Installed once per worker thread (idempotent); LocalSet workers are
+    // green-dedicated and the hook is a no-op whenever no coroutine is active
+    // (YIELDER null), so it needs no teardown. See [`green_yield_hook`].
+    ensure_green_yield_hook();
     // The yielder pointer is stable for the coroutine's life; cache it after
     // the first resume so we can re-publish it before every later resume (a
     // co-located actor that ran during our suspend clobbered the thread-local).
@@ -604,6 +611,13 @@ async fn pump_coroutine(
                 // this driver is single-threaded.
                 let act = unsafe { &mut *actor_ptr };
                 resume_input = CoResume::Received(driver_receive(act, timeout).await);
+            }
+            CoroutineResult::Yield(CoYield::Yield) => {
+                // Reduction-budget preemption: hand the worker back to the
+                // scheduler for one tick so a co-located actor runs, then resume
+                // the body exactly where the hook fired.
+                tokio::task::yield_now().await;
+                resume_input = CoResume::Woke;
             }
             CoroutineResult::Return(outcome) => {
                 // `into_stack` asserts the coroutine is done — only valid here.
@@ -1022,6 +1036,11 @@ enum CoYield {
     /// `(raw-receive)`: park on the async mailbox (no timeout / try-once /
     /// timeout per `timeout`), then resume with `Received(..)`.
     Recv { timeout: Option<u64> },
+    /// Reduction-budget preemption (the cs-vm yield hook fired mid-evaluation):
+    /// release the worker for one scheduler tick, then resume with `Woke`. Lets
+    /// a CPU-bound body cooperatively yield to co-located actors instead of
+    /// monopolizing its shared worker. See [`green_yield_hook`].
+    Yield,
 }
 
 /// What the driver passes back *into* the coroutine on resume — the coroutine's
@@ -1030,10 +1049,52 @@ enum CoYield {
 /// `Ok(Some)` = message, `Ok(None)` = timeout, `Err` = mailbox closed /
 /// trap-exit termination).
 enum CoResume {
-    /// Resume value after a `Sleep`, and the (ignored) value of the first resume.
+    /// Resume value after a `Sleep` or a `Yield`, and the (ignored) value of the
+    /// first resume.
     Woke,
     /// Resume value after a `Recv`.
     Received(Result<Option<SendableValue>, String>),
+}
+
+std::thread_local! {
+    /// Whether this worker thread has installed [`green_yield_hook`] yet. The
+    /// hook is per-thread (cs-vm's yield hook is a thread-local), so we install
+    /// it lazily on first use and leave it: LocalSet workers are green-dedicated,
+    /// and the hook is a no-op when no coroutine is active.
+    static GREEN_HOOK_INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// cs-vm yield hook for coroutine-driven actors (green `spawn-source-green` and
+/// framework `spawn-activation`). The bytecode dispatch loop calls this every
+/// reduction-budget tick; if we are inside a coroutine (a [`YIELDER`] is set),
+/// suspend with [`CoYield::Yield`] so the driver hands the worker back to the
+/// scheduler for one tick — cooperative CPU preemption — then resume right where
+/// the hook fired. Outside a coroutine (`YIELDER` null) it is a no-op.
+///
+/// This is the green replacement for [`cs_actor::tokio_yield_hook`], which
+/// `block_on`s `yield_now` and so **panics** on a current-thread LocalSet worker
+/// (`block_on` re-entrancy). Suspending the coroutine instead is the only way to
+/// release a current-thread worker cooperatively. Function-pointer compatible
+/// with `cs_vm::vm::VmYieldHook = fn()`.
+fn green_yield_hook() {
+    let yielder = YIELDER.with(|c| c.get());
+    if !yielder.is_null() {
+        // Sound: see [`cooperative_sleep_hook`] — we are executing inside the
+        // coroutine whose `Yielder` this is, on its thread, and the driver
+        // re-installs `YIELDER` before every resume.
+        unsafe { (*yielder).suspend(CoYield::Yield) };
+    }
+}
+
+/// Install [`green_yield_hook`] as this worker thread's cs-vm yield hook, once.
+/// Idempotent and never torn down (see [`GREEN_HOOK_INSTALLED`]).
+fn ensure_green_yield_hook() {
+    GREEN_HOOK_INSTALLED.with(|installed| {
+        if !installed.get() {
+            cs_vm::vm::install_yield_hook(Some(green_yield_hook));
+            installed.set(true);
+        }
+    });
 }
 
 /// Coroutine stack size. Matches the LocalSet worker thread's default 2 MiB

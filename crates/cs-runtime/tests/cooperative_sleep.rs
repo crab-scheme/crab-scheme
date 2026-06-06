@@ -423,3 +423,79 @@ fn green_whole_body_sleep_lets_colocated_actor_progress() {
          if (sleep) blocked the shared worker, b-done would land after a-done"
     );
 }
+
+#[test]
+fn green_cpu_bound_body_yields_to_colocated_actor() {
+    force_single_worker();
+
+    // P3.1 (S4): a CPU-bound green body must not monopolize its shared worker.
+    // The cs-vm reduction-budget yield hook (`green_yield_hook`) suspends the
+    // body every budget tick (CoYield::Yield), so a co-located responder is
+    // serviced DURING the busy loop — proven by b-done landing between a-start
+    // and a-done. Also proves the green path does NOT use
+    // `cs_actor::tokio_yield_hook`: its `block_on` would panic on this
+    // current-thread LocalSet worker, so A would never reach a-done.
+    let order = Arc::new(Mutex::new(Vec::<String>::new()));
+    register_order_collector("test:green-yield-order", 3, order.clone());
+    let col = primop_spawn("test:green-yield-order", vec![]).expect("spawn collector");
+
+    // A: on 'go, mark a-start, run a long CPU loop, then mark a-done. The loop is
+    // pure compute (no receive/sleep) — its only yield path is the hook.
+    let a = primop_spawn_source_green(
+        r#"
+        (define (busy n) (let loop ((i 0)) (if (= i n) i (loop (+ i 1)))))
+        (define (worker)
+          (let ((col (cdr (raw-receive))))
+            (let loop ()
+              (let ((m (raw-receive)))
+                (if (eq? m 'go)
+                    (begin (send col 'a-start) (busy 2000000) (send col 'a-done))
+                    (loop))))))
+        "#
+        .to_string(),
+        "worker".to_string(),
+        vec![],
+    )
+    .expect("spawn A");
+
+    // B: on 'go, mark b-done and exit.
+    let b = primop_spawn_source_green(
+        r#"
+        (define (worker)
+          (let ((col (cdr (raw-receive))))
+            (let loop ()
+              (let ((m (raw-receive)))
+                (if (eq? m 'go) (send col 'b-done) (loop))))))
+        "#
+        .to_string(),
+        "worker".to_string(),
+        vec![],
+    )
+    .expect("spawn B");
+
+    primop_send(a, tagged("col", SendableValue::Pid(col))).unwrap();
+    primop_send(b, tagged("col", SendableValue::Pid(col))).unwrap();
+
+    // A first; wait until it is inside the busy loop (a-start recorded), THEN
+    // release B onto the same single worker.
+    primop_send(a, sym("go")).unwrap();
+    wait_until(
+        Duration::from_secs(5),
+        "green A never started its CPU loop",
+        || order.lock().unwrap().iter().any(|s| s == "a-start"),
+    );
+    primop_send(b, sym("go")).unwrap();
+
+    wait_until(Duration::from_secs(20), "did not collect 3 markers", || {
+        order.lock().unwrap().len() >= 3
+    });
+
+    let got = order.lock().unwrap().clone();
+    assert_eq!(
+        got,
+        vec!["a-start", "b-done", "a-done"],
+        "b-done must arrive DURING green A's CPU loop (between a-start and a-done) — \
+         proving the reduction-budget hook yields the worker cooperatively; if A \
+         monopolized it (or panicked via a block_on hook) this ordering would not hold"
+    );
+}
