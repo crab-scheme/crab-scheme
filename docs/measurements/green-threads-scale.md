@@ -150,3 +150,32 @@ suite to keep green. A **milestone of its own**. The Env parent-chain + the
 canonical-ids approach make it *feasible without the 33-file `&mut` rewrite*;
 Walls 1–3 are the work. Success metric: < ~50 KiB/actor overlay (→ 50–100k
 feasible with a raised `vm.max_map_count`), full suite green.
+
+## Result (landed on `feat/shared-runtime`)
+
+Wall 1 (Env define-boundary, `fcab895`) + `SymbolTable: Clone` (`3e52142`) + the
+per-worker `RuntimeImage` + `Runtime::from_image` overlay (`902b274`) are in.
+`green_source_body` now overlays a per-worker shared base instead of
+`Runtime::new()` per actor.
+
+| green idle actors | before | **after (shared base)** | Δ/actor |
+|--:|--:|--:|--:|
+| 1 | 16.5 MiB | 16.6 MiB | (base) |
+| 2000 | 1631 MiB | **477 MiB** | ~826 KiB → **~230 KiB** |
+| 6000 | 2842 MiB | **1381 MiB** | (slope now flat: ~227 KiB) |
+
+**~826 → ~230 KiB/actor — 3.6×.** 50k ≈ 11.5 GiB (was 40), 100k ≈ 23 GiB (was
+80). The slope is now flat across N (cheap overlays build fast; before, 6000 full
+`Runtime::new()`s couldn't finish in the window). All green suites + crab-cache
+conformance stay green. Blast radius is `green_source_body` only — the dedicated
+and `spawn-activation` paths still `Runtime::new()` (activation can adopt
+`from_image` next).
+
+**Residual (~230 KiB) and the path to < 50 KiB.** The remaining per-actor cost is
+the **`macros` clone** (bundled-lib `syntax-rules`/`define-syntax-parser`,
+deep-cloned per actor) and the **`syms` clone** (HashMap+Vec of all builtin +
+bundled-lib names). Next refinements: (a) macros base/overlay (an `Rc` shared base
+macro map + a per-actor overlay for the body's own `define-syntax`, chained
+lookup) — tractable; (b) a shared syms interner — the 33-file `&mut SymbolTable`
+change, the hard one. (a)+(b) target the < 50 KiB goal; 230 KiB already makes 50k
+practical today.
