@@ -12,6 +12,9 @@ use cs_core::{Number, Pair, SymbolTable, Value};
 
 use cs_actor::{ActorPid, Payload};
 
+use corosensei::stack::DefaultStack;
+use corosensei::{Coroutine, CoroutineResult, Yielder};
+
 /// A subset of `cs_core::Value` safe to ship across actor
 /// boundaries.
 ///
@@ -439,14 +442,14 @@ async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: St
     while let Some(msg) = actor.receive_async().await {
         let sv = message_to_sendable(msg);
         let msg_val = rt.sendable_to_value(&sv);
-        // Scope ACTOR_CTX + a fresh reduction budget to *this* synchronous
-        // handler call. It is never held across the `.await` above, so actors
-        // sharing a worker thread never see each other's context. Mirrors
-        // run_actor_body's Guard, but per-activation.
-        let outcome = {
-            let _ctx = ActivationCtx::install(&mut actor);
-            rt.apply_value(&handler_proc, &[msg_val])
-        };
+        // Run the handler on a stackful coroutine so a `(sleep)` inside it
+        // suspends the synchronous evaluator and the driver parks on a tokio
+        // timer — co-located actors run meanwhile — instead of blocking the
+        // worker. `drive_handler` installs/clears ACTOR_CTX + the reduction
+        // budget around every resume, so actors sharing a worker thread never
+        // see each other's context (the guarantee the old per-call
+        // `ActivationCtx` gave, now spanning the suspend points too).
+        let outcome = drive_handler(&mut actor, &mut rt, &handler_proc, msg_val).await;
         match outcome {
             Ok(Value::Boolean(false)) => break, // handler asked to stop
             Ok(_) => {}
@@ -458,29 +461,85 @@ async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: St
     }
 }
 
-/// RAII guard for one activation: points `ACTOR_CTX` at `actor` (so `(self)`
-/// / `(send)` / a nested `(raw-receive)` reach it) and resets the per-actor
-/// reduction counter, clearing `ACTOR_CTX` again on drop. It deliberately
-/// installs **no** yield hook: a synchronous handler cannot cooperatively
-/// yield mid-call (the sync-VM constraint), so mid-handler preemption is out
-/// of scope for iter-2a — the win is parking *between* messages. A CPU-bound
-/// handler holds its worker until it returns (documented limitation).
-struct ActivationCtx;
-impl ActivationCtx {
-    fn install(actor: &mut cs_actor::Actor) -> Self {
-        // Raw pointer only — no live `&mut` borrow is retained across the
-        // handler call (the worker is single-threaded and runs one handler at
-        // a time, so the pointer never aliases a concurrent borrow).
-        let ptr: *mut cs_actor::Actor = actor;
-        ACTOR_CTX.with(|c| c.set(ptr));
+/// Drive one activation-handler invocation on a stackful coroutine, so a
+/// `(sleep)`/`(sleep-ms)` deep inside the *synchronous* handler can suspend the
+/// whole evaluator and hand control back here. We then park on a tokio timer —
+/// releasing the LocalSet worker so co-located actors run — and resume the
+/// handler exactly where it slept. Handlers that never sleep just run to
+/// `Return` on the first resume (one stack switch in + out).
+///
+/// ## Safety / aliasing
+///
+/// The coroutine closure must be `'static`, so it captures `rt`/`actor` as raw
+/// pointers (the exact discipline of [`ACTOR_CTX`] / `with_current_actor`). This
+/// is sound for the same reason: one worker thread, one handler at a time, and
+/// control *strictly alternates* — while the coroutine runs, this driver is
+/// parked inside `resume()` (it never touches `rt`/`actor`); while the coroutine
+/// is suspended at the `.await`, its frame is frozen and this driver only awaits
+/// a timer. So the pointers are never dereferenced concurrently and never cross
+/// a thread. `rt`/`actor` are borrowed from `activation_body` for strictly
+/// longer than every coroutine we build here.
+///
+/// ## Drop order
+///
+/// `co` is a local of this frame — deeper than `rt`/`actor` in
+/// `activation_body`. On shutdown, dropping the suspended `activation_body`
+/// future drops innermost-first: `co` (corosensei force-unwinds its frozen
+/// Scheme stack, running `Rc` destructors that touch `rt`'s heap) drops *before*
+/// `rt`/`actor`. Do not hoist `co` or the stack pool above `rt`/`actor`.
+async fn drive_handler(
+    actor: &mut cs_actor::Actor,
+    rt: &mut crate::Runtime,
+    handler: &Value,
+    msg: Value,
+) -> Result<Value, String> {
+    let rt_ptr: *mut crate::Runtime = rt;
+    let actor_ptr: *mut cs_actor::Actor = actor;
+    let handler = handler.clone();
+
+    let mut co: Coroutine<(), CoYield, Result<Value, String>, DefaultStack> =
+        Coroutine::with_stack(checkout_stack(), move |yielder, ()| {
+            // Publish the yielder FIRST, before the handler can `(sleep)`: on
+            // the first resume the driver can't pre-install it (the closure
+            // hasn't run yet), so the closure seeds it here.
+            YIELDER.with(|y| y.set(yielder as *const _));
+            // Sound: see fn doc — the driver is parked in `resume()` right now.
+            let rt = unsafe { &mut *rt_ptr };
+            rt.apply_value(&handler, &[msg])
+        });
+
+    // The yielder pointer is stable for the coroutine's life; cache it after
+    // the first resume so we can re-publish it before every later resume (a
+    // co-located actor that ran during our sleep clobbered the thread-local).
+    let mut cached_yielder: *const Yielder<(), CoYield> = std::ptr::null();
+
+    loop {
+        // Install OUR actor's context for the duration of this resume only.
+        ACTOR_CTX.with(|c| c.set(actor_ptr));
+        YIELDER.with(|y| y.set(cached_yielder));
         REDUCTIONS.with(|c| c.set(0));
-        ActivationCtx
-    }
-}
-impl Drop for ActivationCtx {
-    fn drop(&mut self) {
+
+        let result = co.resume(());
+
+        // Capture the yielder the closure published on the first resume.
+        if cached_yielder.is_null() {
+            cached_yielder = YIELDER.with(|y| y.get());
+        }
+        // Clear context BEFORE any await: while we sleep, the LocalSet may run
+        // a co-located actor, and it must never observe our stale pointers.
         ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
-        REDUCTIONS.with(|c| c.set(0));
+        YIELDER.with(|y| y.set(std::ptr::null()));
+
+        match result {
+            CoroutineResult::Yield(CoYield::Sleep(dur)) => {
+                tokio::time::sleep(dur).await;
+            }
+            CoroutineResult::Return(outcome) => {
+                // `into_stack` asserts the coroutine is done — only valid here.
+                checkin_stack(co.into_stack());
+                return outcome;
+            }
+        }
     }
 }
 
@@ -743,6 +802,68 @@ std::thread_local! {
     /// calling `(yield)` from Scheme — which keeps the seam in
     /// place without changing dispatch-loop perf.
     static REDUCTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Bridge from the deeply-nested `sleep` builtin up to the coroutine's
+    /// `Yielder`. corosensei passes the `Yielder` to the coroutine closure as a
+    /// parameter, but `(sleep)` runs hundreds of `eval` frames below that entry
+    /// and can't receive it that way — so [`drive_handler`] publishes it here
+    /// (same single-thread raw-pointer discipline as `ACTOR_CTX`). Non-null only
+    /// while a coroutine-driven handler is on the stack; `(sleep)` reads it to
+    /// decide cooperative-suspend vs. plain `thread::sleep`.
+    static YIELDER: std::cell::Cell<*const Yielder<(), CoYield>> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+
+    /// Per-worker pool of recycled coroutine stacks (mmap-backed, with a guard
+    /// page). A handler that never sleeps checks a stack out, runs to `Return`,
+    /// and checks it back in within one `drive_handler` call; only a handler
+    /// *suspended* in `(sleep)` holds its stack across the `.await`. So the
+    /// live-stack count tracks concurrent sleepers, not total actors — and a
+    /// shallow suspended handler only resides its touched pages, not the full
+    /// reservation.
+    static STACK_POOL: std::cell::RefCell<Vec<DefaultStack>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What a coroutine-hosted activation handler asks its driver to do when it
+/// suspends. One variant today; a future `Recv { timeout }` would let a
+/// mid-handler `(raw-receive)` park cooperatively too (it still blocks the
+/// worker today — a clean, separable follow-on the same machinery enables).
+enum CoYield {
+    /// `(sleep)`/`(sleep-ms)` on a cooperative worker: park me this long.
+    Sleep(Duration),
+}
+
+/// Coroutine stack size. Matches the LocalSet worker thread's default 2 MiB
+/// stack: the coroutine stack *replaces* the worker thread's stack while a
+/// handler runs, so 2 MiB preserves the non-tail Scheme recursion headroom a
+/// handler had before. mmap is lazily committed, so the virtual size is cheap.
+const ACTOR_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+/// Cap on recycled stacks retained per worker. Past this, checked-in stacks are
+/// dropped — so a transient burst of deep handlers can't permanently pin many
+/// fully-faulted 2 MiB stacks.
+const STACK_POOL_CAP: usize = 64;
+
+/// Take a coroutine stack from this worker's pool, or allocate one. Allocation
+/// only fails at OOM (mmap), where aborting is the right call — mirrors the
+/// `expect` on worker-thread spawn in `cs_actor::local_pool`.
+fn checkout_stack() -> DefaultStack {
+    STACK_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_else(|| {
+            DefaultStack::new(ACTOR_STACK_BYTES).expect("allocate activation coroutine stack")
+        })
+}
+
+/// Return a finished coroutine's stack to this worker's pool for reuse, up to
+/// [`STACK_POOL_CAP`]; drop it past the cap.
+fn checkin_stack(stack: DefaultStack) {
+    STACK_POOL.with(|p| {
+        let mut v = p.borrow_mut();
+        if v.len() < STACK_POOL_CAP {
+            v.push(stack);
+        }
+    });
 }
 
 /// Run `f` with a `&mut` reference to the currently-running
@@ -1389,44 +1510,44 @@ pub fn b_beam_yield(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, St
     Ok(Value::Unspecified)
 }
 
-/// True when the calling thread is a [`cs_actor::LocalWorkerPool`] worker —
-/// a *shared*, current-thread `LocalSet` host for `spawn-activation` actors
-/// (these threads are named `cs-actor-local-{i}`; see `cs_actor::local_pool`).
-/// Blocking such a thread starves every co-located activation actor, and a
-/// synchronous builtin cannot cooperatively yield mid-call (the sync-VM
-/// constraint — see `ActivationCtx`), so `sleep`/`sleep-ms` refuse to run
-/// here rather than silently stalling peers.
-fn on_cooperative_worker() -> bool {
-    std::thread::current()
-        .name()
-        .is_some_and(|n| n.starts_with("cs-actor-local-"))
+/// Sleep `ms` milliseconds, the right way for the calling context.
+///
+/// Inside a coroutine-driven `spawn-activation` handler — a [`YIELDER`] is
+/// installed — this **suspends** the handler back to [`drive_handler`], which
+/// parks on a tokio timer (so co-located actors on the shared LocalSet worker
+/// keep running) and resumes the handler when the timer fires. `suspend`
+/// returns `()` (the coroutine's `Input`) on resume.
+///
+/// Everywhere else — non-actor code (scripts, the main thread) and
+/// dedicated-thread `spawn`/`spawn-source` actors (one `block_in_place` thread
+/// each, where blocking starves no peer) — it is a plain `thread::sleep`, which
+/// is correct.
+///
+/// (The crab-cache Raft-poller lesson is orthogonal: a poller's idle loop often
+/// doubles as a tick clock + sole I/O drainer, so *any* real wait there slows
+/// the protocol — that code keeps `(yield)` by choice, not because sleep can no
+/// longer cooperate.)
+fn do_sleep(ms: u64) {
+    if ms == 0 {
+        return;
+    }
+    let yielder = YIELDER.with(|c| c.get());
+    if yielder.is_null() {
+        std::thread::sleep(Duration::from_millis(ms));
+    } else {
+        // Sound: we're executing *inside* the coroutine whose `Yielder` this is
+        // (it lives for the coroutine's life, on this thread), and
+        // `drive_handler` re-installs `YIELDER` before every resume.
+        unsafe { (*yielder).suspend(CoYield::Sleep(Duration::from_millis(ms))) };
+    }
 }
-
-const COOP_SLEEP_MSG: &str = "cannot block a shared cooperative actor worker \
-(a spawn-activation handler): it would starve co-located actors, and a synchronous \
-handler cannot yield mid-call. Run timed waits as a dedicated-thread `spawn`/`spawn-source` \
-actor, or park on `(receive)` with a timeout.";
 
 /// `(sleep-ms n)` — sleep for `n` milliseconds (non-negative integer).
 /// Returns unspecified; a zero-duration call returns immediately.
 ///
-/// # Execution model
-///
-/// `std::thread::sleep` is correct for the contexts where a *synchronous*
-/// sleep belongs: non-actor code (scripts, the main thread), and
-/// `spawn`/`spawn-source` actors, which run on a dedicated thread
-/// (`block_in_place` on the multi-thread runtime) so blocking that thread
-/// never starves another actor — tokio migrates other tasks away.
-///
-/// It is **rejected** inside a `spawn-activation` handler (see
-/// [`on_cooperative_worker`]). Those actors multiplex onto a shared
-/// current-thread `LocalSet` worker; a truly cooperative sleep there would
-/// have to park the task and wake on a timer, which needs an async-VM seam
-/// like `receive`'s between-message park (out of scope, ADR 0032). So
-/// instead of silently stalling co-located actors we error and point at the
-/// right pattern. (The Raft-poller lesson from crab-cache is separate: a
-/// poller's idle loop often doubles as a tick clock + sole I/O drainer, so
-/// *any* sleep there slows the protocol — keep `(yield)`.)
+/// Cooperative inside a `spawn-activation` handler (suspends the evaluator and
+/// parks on a timer, so co-located actors run); a blocking `thread::sleep`
+/// everywhere else. See [`do_sleep`].
 pub fn b_beam_sleep_ms(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("sleep-ms", args, 1)?;
     let ms = match &args[0] {
@@ -1444,12 +1565,7 @@ pub fn b_beam_sleep_ms(args: &[Value], _syms: &mut SymbolTable) -> Result<Value,
             ))
         }
     };
-    if ms > 0 {
-        if on_cooperative_worker() {
-            return Err(format!("sleep-ms: {COOP_SLEEP_MSG}"));
-        }
-        std::thread::sleep(Duration::from_millis(ms));
-    }
+    do_sleep(ms);
     Ok(Value::Unspecified)
 }
 
@@ -1457,9 +1573,8 @@ pub fn b_beam_sleep_ms(args: &[Value], _syms: &mut SymbolTable) -> Result<Value,
 /// non-negative). Fractional seconds are supported. Returns
 /// unspecified. Zero-duration call returns immediately.
 ///
-/// Converts to a `Duration` and delegates to `thread::sleep`; see
-/// [`b_beam_sleep_ms`] for the execution-model rules (rejected on a shared
-/// cooperative worker).
+/// Same execution model as [`b_beam_sleep_ms`] (cooperative inside an
+/// activation handler via [`do_sleep`], blocking elsewhere).
 pub fn b_beam_sleep(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("sleep", args, 1)?;
     let secs_f: f64 = match &args[0] {
@@ -1479,13 +1594,7 @@ pub fn b_beam_sleep(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, St
         }
     };
     if secs_f > 0.0 {
-        let ms = (secs_f * 1000.0).round() as u64;
-        if ms > 0 {
-            if on_cooperative_worker() {
-                return Err(format!("sleep: {COOP_SLEEP_MSG}"));
-            }
-            std::thread::sleep(Duration::from_millis(ms));
-        }
+        do_sleep((secs_f * 1000.0).round() as u64);
     }
     Ok(Value::Unspecified)
 }
@@ -2425,42 +2534,36 @@ mod tests {
     }
 
     #[test]
-    fn sleep_ms_rejects_cooperative_worker() {
-        // spawn-activation actors run on LocalSet workers named
-        // "cs-actor-local-{i}"; blocking one starves co-located actors, so
-        // sleep must error there instead of stalling them silently.
-        // (The closure maps away the !Send Value before returning.)
+    fn sleep_without_coroutine_driver_blocks() {
+        // Cooperative sleep is gated on a live coroutine driver (a `YIELDER`),
+        // NOT on the thread name. With no driver installed — the case on any
+        // bare thread, even one named like a LocalSet worker — `sleep`/`sleep-ms`
+        // fall back to a plain blocking `thread::sleep` and succeed, rather than
+        // erroring (the old F3 behavior). (The closure maps away the !Send Value
+        // before returning across the thread boundary.)
         let res: Result<(), String> = std::thread::Builder::new()
             .name("cs-actor-local-0".to_string())
             .spawn(|| {
+                let start = std::time::Instant::now();
                 let mut syms = SymbolTable::new();
-                b_beam_sleep_ms(&[Value::Number(Number::Fixnum(20))], &mut syms).map(|_| ())
+                b_beam_sleep_ms(&[Value::Number(Number::Fixnum(20))], &mut syms).map(|_| ())?;
+                b_beam_sleep(&[Value::Number(Number::Flonum(0.02))], &mut syms).map(|_| ())?;
+                assert!(
+                    start.elapsed() >= Duration::from_millis(30),
+                    "both sleeps should actually block when no driver is present"
+                );
+                Ok(())
             })
             .unwrap()
             .join()
             .unwrap();
-        let err = res.expect_err("sleep on a cooperative worker must error");
-        assert!(err.contains("cooperative"), "got: {err}");
-    }
-
-    #[test]
-    fn sleep_rejects_cooperative_worker() {
-        let res: Result<(), String> = std::thread::Builder::new()
-            .name("cs-actor-local-7".to_string())
-            .spawn(|| {
-                let mut syms = SymbolTable::new();
-                b_beam_sleep(&[Value::Number(Number::Flonum(0.02))], &mut syms).map(|_| ())
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-        assert!(res.is_err(), "sleep on a cooperative worker must error");
+        res.expect("sleep without a coroutine driver must just block + succeed");
     }
 
     #[test]
     fn sleep_ms_ok_on_dedicated_thread() {
-        // A normally-named thread (a dedicated spawn-source/block_in_place
-        // actor, or non-actor code) sleeps fine.
+        // A dedicated spawn-source / block_in_place actor (or non-actor code)
+        // has no coroutine driver, so it block-sleeps fine.
         let res: Result<(), String> = std::thread::Builder::new()
             .name("tokio-runtime-worker".to_string())
             .spawn(|| {
