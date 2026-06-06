@@ -61,7 +61,7 @@ tracing-cycle-collector = [
 # Scheme builtins. Disabled on WASM (tokio's rt-multi-thread needs
 # real threads) and on bare-AOT builds. The `lib/beam/prelude.scm`
 # library only loads when this feature is on.
-actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload", "dep:tokio"]
+actor = ["dep:cs-actor", "dep:cs-table", "dep:cs-hotreload", "dep:tokio", "dep:corosensei"]
 # Cross-node cluster transport. Exposes (node-make / node-link! / node-send /
 # node-poll) Scheme builtins that drive cs-distrib's Router over cs-net
 # transports (sim today; tcp/quic share the same Transport trait). Implies
@@ -265,6 +265,14 @@ tokio = { workspace = true, features = [
     "time",
 ], optional = true }
 cs-hotreload = { workspace = true, optional = true }
+# Stackful coroutines (the `actor` feature): each spawn-activation handler runs
+# on a corosensei coroutine so `(sleep)` can suspend the synchronous evaluator
+# mid-call and the LocalSet driver can park on a tokio timer — cooperative sleep
+# without starving co-located actors. Default features (default-stack + unwind)
+# are exactly what we need; `unwind` is mandatory (panic-through-resume + forced
+# unwind when a suspended coroutine is dropped at shutdown). Native-only, like
+# `actor`. See builtins/beam.rs `drive_handler`.
+corosensei = { version = "0.3", optional = true }
 cs-sandbox-wasm = { workspace = true, optional = true }
 # cs-web is pulled in when the `web` feature is on. Default
 # features include actor + table, both of which we already need
