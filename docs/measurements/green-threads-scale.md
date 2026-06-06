@@ -101,13 +101,52 @@ Split `Runtime` into:
 (the LocalSet worker is single-threaded, so the `Rc` base is never shared across
 threads — the same `!Send` isolation that makes per-actor Runtimes sound).
 
+## Refined approach — avoid the `&mut SymbolTable` surgery (canonical base ids)
+
+The `&mut SymbolTable` surface is **33 files** — rewriting it to a shared
+`Rc<RefCell<SymbolTable>>` interner is the worst of the work. A cheaper path
+shares the big thing (the env: builtins + bundled libs) *without* sharing the
+interner:
+
+1. **Canonical base ids.** Intern the builtins (+ bundled-lib top-level names) in
+   a fixed, deterministic order at base construction so every actor's table gives
+   them the *same* `Symbol` ids. Then a base env keyed by those ids is valid for
+   any actor.
+2. **Shared base env, per-actor child.** Build the base `vm_env` (builtins +
+   bundled libs) **once per worker thread** (`Rc`, thread-local — sound: the
+   LocalSet worker is single-threaded, same `!Send` isolation as today). Each
+   actor runs its body in `Env::child(base)`; its `(define …)`s land in the child.
+3. **Cheap per-actor syms clone.** Each actor still owns a `SymbolTable` (no API
+   change), but cloned from the canonical base — `Rc<str>` entries are refcount
+   bumps, so the clone is a HashMap+Vec copy of a few hundred entries (~tens of
+   KiB), not a rebuild of the whole env. New symbols the body interns extend the
+   clone at ids past the base.
+
+Per-actor cost then ≈ syms clone + child env + per-actor mutable state, instead of
+a full `Runtime::new()`. Estimate ~50–100 KiB/actor (vs ~826 KiB) → ~10× → 50k
+feasible (~3–5 GiB). A later `Rc<RefCell>` shared interner (the 33-file change)
+would shave the syms clone too, if needed.
+
+## Walls (precise)
+
+- **Wall 1 — define/`set!`-at-root.** The body's `(define …)` must land in the
+  per-actor child, not the shared base. The VM `Inst::DefineGlobal` handler and
+  the JIT `set!` helpers (`vm_env_set_fixnum`/`vm_env_set_nb`, `cs-vm/src/vm.rs`
+  ~387/430) both **walk the parent chain to the root** for an undefined define/
+  `set!`. Needs a per-actor "define boundary" so they stop at the child root.
+- **Wall 2 — canonical interning** (above): deterministic base-id assignment +
+  cheap per-actor clone.
+- **Wall 3 — per-actor isolation of the mutable rest.** `macros`,
+  `library_exports`, `pinned`, JIT state, `command_line` stay per-actor; the
+  const-folder (`eval_str_via_vm_inner`) must treat base bindings as immutable
+  (foldable) and child bindings as per-actor.
+
 ## Honest scoping
 
-This is a **major core-architectural change** (cs-runtime + cs-vm + cs-core),
-touching the `SymbolTable` `&mut` API surface, the `DefineGlobal`-at-root
-behavior, the const-folder, and the per-actor isolation invariants the whole
-actor model rests on — with the full ~1000-test suite to keep green. It is a
-**milestone of its own**, not a tail-of-PR change. The Env parent-chain makes it
-*feasible*; Walls 1–3 are the work. Recommended as the next focused effort, with
-the RSS numbers above as the success metric (target: < ~50 KiB/actor overlay →
-50–100k feasible alongside a raised `vm.max_map_count`).
+Still a **major core change** (cs-runtime + cs-vm), touching the VM+JIT
+define/`set!`-at-root paths, base construction + the per-worker image cache, the
+const-folder, and the per-actor isolation invariants — with the full ~1000-test
+suite to keep green. A **milestone of its own**. The Env parent-chain + the
+canonical-ids approach make it *feasible without the 33-file `&mut` rewrite*;
+Walls 1–3 are the work. Success metric: < ~50 KiB/actor overlay (→ 50–100k
+feasible with a raised `vm.max_map_count`), full suite green.
