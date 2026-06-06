@@ -527,19 +527,22 @@ async fn drive_handler(
     let handler = handler.clone();
 
     let co: Coroutine<CoResume, CoYield, Result<Value, String>, DefaultStack> =
-        Coroutine::with_stack(checkout_stack(), move |yielder, _first: CoResume| {
-            // Publish the yielder FIRST, before the handler can suspend: on the
-            // first resume the driver can't pre-install it (the closure hasn't
-            // run yet), so the closure seeds it here.
-            YIELDER.with(|y| y.set(yielder as *const _));
-            // Sound: see fn doc — the driver is parked in `resume()` right now.
-            let rt = unsafe { &mut *rt_ptr };
-            rt.apply_value(&handler, &[msg])
-        });
+        Coroutine::with_stack(
+            checkout_stack(StackClass::Activation),
+            move |yielder, _first: CoResume| {
+                // Publish the yielder FIRST, before the handler can suspend: on the
+                // first resume the driver can't pre-install it (the closure hasn't
+                // run yet), so the closure seeds it here.
+                YIELDER.with(|y| y.set(yielder as *const _));
+                // Sound: see fn doc — the driver is parked in `resume()` right now.
+                let rt = unsafe { &mut *rt_ptr };
+                rt.apply_value(&handler, &[msg])
+            },
+        );
 
     // The suspend/resume loop is shared with the whole-body green driver
     // (`green_source_body`) — the only difference is what the closure above runs.
-    pump_coroutine(co, actor_ptr).await
+    pump_coroutine(co, actor_ptr, StackClass::Activation).await
 }
 
 /// Drive a coroutine-hosted Scheme computation to completion, servicing each
@@ -564,6 +567,7 @@ async fn drive_handler(
 async fn pump_coroutine(
     mut co: Coroutine<CoResume, CoYield, Result<Value, String>, DefaultStack>,
     actor_ptr: *mut cs_actor::Actor,
+    stack_class: StackClass,
 ) -> Result<Value, String> {
     // Enable reduction-budget preemption on this worker: when the cs-vm yield
     // hook fires mid-evaluation it suspends the running coroutine (CoYield::Yield),
@@ -669,7 +673,7 @@ async fn pump_coroutine(
             }
             CoroutineResult::Return(outcome) => {
                 // `into_stack` asserts the coroutine is done — only valid here.
-                checkin_stack(co.into_stack());
+                checkin_stack(co.into_stack(), stack_class);
                 return outcome;
             }
         }
@@ -725,13 +729,16 @@ async fn green_source_body(
     // seeds the yielder, then runs the WHOLE body; its (raw-receive)/(sleep)
     // suspend back to `pump_coroutine`, which lives until the body returns.
     let co: Coroutine<CoResume, CoYield, Result<Value, String>, DefaultStack> =
-        Coroutine::with_stack(checkout_stack(), move |yielder, _first: CoResume| {
-            YIELDER.with(|y| y.set(yielder as *const _));
-            // Sound: the driver is parked in `resume()` right now (see fn doc).
-            let rt = unsafe { &mut *rt_ptr };
-            rt.eval_str_via_vm("<spawn-source-green-body>", &call)
-                .map_err(|d| format!("actor body raised: {d:?}"))
-        });
+        Coroutine::with_stack(
+            checkout_stack(StackClass::Green),
+            move |yielder, _first: CoResume| {
+                YIELDER.with(|y| y.set(yielder as *const _));
+                // Sound: the driver is parked in `resume()` right now (see fn doc).
+                let rt = unsafe { &mut *rt_ptr };
+                rt.eval_str_via_vm("<spawn-source-green-body>", &call)
+                    .map_err(|d| format!("actor body raised: {d:?}"))
+            },
+        );
 
     // Termination parity with the dedicated path (`scheme_source_entry`) and the
     // activation path (`activation_body`): a *Scheme-level* error (the body
@@ -743,7 +750,7 @@ async fn green_source_body(
     // identical to the dedicated `spawn_async` path. (No Scheme primitive exits
     // with a custom Error reason; abnormal exits come only from panics.) The
     // `pump_coroutine` ClearCtx guard keeps that panic path hygienic.
-    if let Err(e) = pump_coroutine(co, actor_ptr).await {
+    if let Err(e) = pump_coroutine(co, actor_ptr, StackClass::Green).await {
         eprintln!("spawn-source(green): actor `{entry}` terminated: {e}");
     }
 }
@@ -1149,6 +1156,23 @@ std::thread_local! {
     /// reservation.
     static STACK_POOL: std::cell::RefCell<Vec<DefaultStack>> =
         const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Separate pool for whole-body **green** coroutine stacks ([`GREEN_STACK_BYTES`],
+    /// smaller than the activation stack). Kept apart so checkin never hands a
+    /// small green stack to a deep activation handler, and vice versa. Green
+    /// actors are long-lived (held for life), so this pool mainly smooths
+    /// spawn/die churn rather than per-message reuse.
+    static GREEN_STACK_POOL: std::cell::RefCell<Vec<DefaultStack>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Which pool a coroutine stack belongs to (see [`checkout_stack`]).
+#[derive(Clone, Copy)]
+enum StackClass {
+    /// Per-message activation handler — the larger [`ACTOR_STACK_BYTES`] stack.
+    Activation,
+    /// Whole-body green actor — the smaller [`GREEN_STACK_BYTES`] stack.
+    Green,
 }
 
 /// What a coroutine-hosted activation handler asks its driver to do when it
@@ -1242,26 +1266,47 @@ fn ensure_green_yield_hook() {
 /// handler had before. mmap is lazily committed, so the virtual size is cheap.
 const ACTOR_STACK_BYTES: usize = 2 * 1024 * 1024;
 
-/// Cap on recycled stacks retained per worker. Past this, checked-in stacks are
-/// dropped — so a transient burst of deep handlers can't permanently pin many
-/// fully-faulted 2 MiB stacks.
+/// Whole-body green-actor coroutine stack size — smaller than the per-message
+/// activation stack because a green conn body parks shallow (its loop + a
+/// `(tcp-recv)`/`(receive)`), and a green actor holds its stack for its whole
+/// life (so the count tracks live conns, not churn). mmap is lazily committed,
+/// so this is a *virtual*-footprint lever, not the RSS lever (RSS = touched
+/// pages; the per-actor `Runtime` dominates at scale — see the green-threads
+/// P5.2 measurement). 1 MiB keeps generous non-tail headroom while halving the
+/// per-conn reservation.
+const GREEN_STACK_BYTES: usize = 1024 * 1024;
+
+/// Cap on recycled stacks retained per worker, per pool. Past this, checked-in
+/// stacks are dropped — so a transient burst can't permanently pin many
+/// fully-faulted stacks.
 const STACK_POOL_CAP: usize = 64;
 
-/// Take a coroutine stack from this worker's pool, or allocate one. Allocation
-/// only fails at OOM (mmap), where aborting is the right call — mirrors the
-/// `expect` on worker-thread spawn in `cs_actor::local_pool`.
-fn checkout_stack() -> DefaultStack {
-    STACK_POOL
-        .with(|p| p.borrow_mut().pop())
-        .unwrap_or_else(|| {
-            DefaultStack::new(ACTOR_STACK_BYTES).expect("allocate activation coroutine stack")
-        })
+/// Take a coroutine stack of the given [`StackClass`] from this worker's pool, or
+/// allocate one. Allocation only fails at OOM (mmap), where aborting is the right
+/// call — mirrors the `expect` on worker-thread spawn in `cs_actor::local_pool`.
+fn checkout_stack(class: StackClass) -> DefaultStack {
+    match class {
+        StackClass::Activation => STACK_POOL
+            .with(|p| p.borrow_mut().pop())
+            .unwrap_or_else(|| {
+                DefaultStack::new(ACTOR_STACK_BYTES).expect("allocate activation coroutine stack")
+            }),
+        StackClass::Green => GREEN_STACK_POOL
+            .with(|p| p.borrow_mut().pop())
+            .unwrap_or_else(|| {
+                DefaultStack::new(GREEN_STACK_BYTES).expect("allocate green coroutine stack")
+            }),
+    }
 }
 
-/// Return a finished coroutine's stack to this worker's pool for reuse, up to
+/// Return a finished coroutine's stack to its class's pool for reuse, up to
 /// [`STACK_POOL_CAP`]; drop it past the cap.
-fn checkin_stack(stack: DefaultStack) {
-    STACK_POOL.with(|p| {
+fn checkin_stack(stack: DefaultStack, class: StackClass) {
+    let pool = match class {
+        StackClass::Activation => &STACK_POOL,
+        StackClass::Green => &GREEN_STACK_POOL,
+    };
+    pool.with(|p| {
         let mut v = p.borrow_mut();
         if v.len() < STACK_POOL_CAP {
             v.push(stack);
