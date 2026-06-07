@@ -1,4 +1,4 @@
-# Green threads — scale & memory (P5.2)
+# Green threads — scale, memory & throughput (P5.2)
 
 > Measured on the `feat/green-threads` release binary (darwin-arm64), 2026-06-06.
 > Probe: `spawn-source-green` N idle actors, each parked forever on
@@ -48,7 +48,9 @@ N=2000 figure (~826 KiB/actor) is the reliable steady-state number.
 
 Green removes the thread-per-actor ceiling and the per-actor OS thread — a real,
 large win, validated end-to-end on crab-cache (conformance + crash-recovery +
-failover, throughput on par with Stage 1). But **50–100k concurrent actors is
+failover, throughput on par with Stage 1 — that parity is workload-specific; a
+*running* green actor pays a cooperative-scheduling tax, see **Throughput** at the
+end of this doc). But **50–100k concurrent actors is
 memory-bound by the per-actor `Runtime` (~826 KiB each), not by stacks** — so the
 next scale lever is a **shared Runtime** (below), not stack tuning.
 
@@ -215,3 +217,77 @@ body. **At/under the <50 KiB target** for typical bodies. 50k actors ≈ 2–3.6
 + shared body compilation **~40–72 KiB/actor** (body-dependent). The remaining
 floor is the coroutine stack's touched pages + the per-actor closures/bindings —
 genuinely per-actor.
+
+---
+
+# Throughput — the cooperative-scheduling tax (green vs dedicated)
+
+> Measured on the `feat/shared-body-compilation` release binary (darwin-arm64),
+> 2026-06-06, tip `a4ad8d2`. The numbers above answer "how many actors fit"; this
+> answers "how fast does one run". A/B is the **same binary, same VM tier**: green
+> = `spawn-source-green` (`from_image` overlay + per-worker body cache, on the
+> LocalSet pool) vs dedicated = `spawn-source-dedicated` (`Runtime::new` + one
+> `block_in_place` OS thread). Medians of 3 runs.
+
+| dimension | probe | green | dedicated | result |
+|---|---|--:|--:|---|
+| **spawn + first run** | build+run 2000 actors, identical trivial body | ~41 ms (~48k/s) | ~966 ms (~2.1k/s) | **green ~23× faster** |
+| **steady-state CPU** | 1 actor, tail-sum 1..20M | ~5.21 s | ~2.19 s | **green ~2.4× slower** |
+| **messaging** | 1 actor, 2M self-send + drain | ~2.23 s (~0.90M msg/s) | ~0.84 s (~2.37M msg/s) | **green ~2.6× slower** |
+| **idle RSS / actor** | 2000 parked actors, trivial body | ~40 KiB, no thread | ~389 KiB + 1 OS thread | **green ~9.7× lighter** |
+
+(The idle-RSS row re-measures the scale result on the current tip and against the
+*dedicated* path for contrast: green reproduces the ~40 KiB figure and its slope
+stays flat — ~37 KiB/actor at N=6000.)
+
+## The win is spawn + memory; the cost is steady-state throughput
+
+- **Spawn ~23× / memory ~10×** are exactly what the shared-Runtime + body-cache
+  work targeted: no per-actor `Runtime::new`, and the compiled body is shared
+  across actors running the same source. This is the regime green threads exist
+  for — many short-lived or mostly-parked actors (one per connection).
+- **A *running* green actor is ~2.4–2.7× slower** when it is actually on-CPU or
+  hammering its mailbox. Root cause (confirmed in code): every
+  `cs_vm::reduction_budget()` ops (default **2000**, BEAM's reduction unit) the
+  VM's reduction-budget hook fires. On the **green** path that hook
+  (`green_yield_hook`) does a full **coroutine suspend** —
+  `Yielder::suspend(CoYield::Yield)`: save the stack, bounce to the driver,
+  reschedule, resume — so a 20M-op loop pays ~10k suspends. On the **dedicated**
+  path the hook (`cs_actor::tokio_yield_hook`) does a near-free
+  `block_on(yield_now())` on its own otherwise-idle thread. Builtins const-fold
+  identically and the bytecode is the same on both paths, so the yield hook is
+  the dominant difference — not the env-chain overlay or the symbol-table base.
+
+## The tax is by design, and tunable
+
+The suspend-per-budget *is* the fairness mechanism: it is what stops one
+CPU-bound green actor from monopolizing a worker shared by thousands of peers (an
+actor that never parks on `receive`/`sleep`/I/O is still preempted every 2000 ops
+and the worker round-robins). A dedicated actor owns its OS thread, so preemption
+is the kernel's job and the in-VM yield is nearly free. The budget is a per-thread
+knob — `cs_vm::set_reduction_budget(n)` (Rust-only today; not yet exposed to
+Scheme or an env var) — so the tax can be traded against scheduling granularity:
+raising it lowers the running tax and coarsens fairness.
+
+## Consequence — the crab-cache spawn-site split is quantitatively right
+
+This is why the crab-cache migration kept some actors dedicated:
+
+- **conns / pusher / broker → green.** I/O-bound: parked on `tcp-recv` ~all the
+  time, one per connection, spawn- and scale-heavy. They collect the spawn +
+  memory wins and almost never sit on-CPU, so the running tax barely applies —
+  which is why end-to-end throughput held at Stage-1 parity.
+- **shards / peer-poller → dedicated.** CPU- + blocking-fsync-bound, few,
+  long-lived. Dedicated avoids the ~2.4× tax *and* lets concurrent RocksDB fsync
+  span real OS threads (the durable regime).
+
+So "throughput on par with Stage 1" (the conclusion above, and the exit report)
+holds *for crab-cache's I/O-bound shape*; it would mislead for a CPU-bound green
+actor. Rule of thumb: `spawn-source-dedicated` for compute- or fsync-heavy
+actors; green (the default) for the connection-style actors green threads exist
+to scale.
+
+(The dedicated ~389 KiB/actor here is a same-binary contrast figure measured with
+a trivial idle body; it is lighter than the ~826 KiB pre-sharing number at the top
+of this doc — trust the same-binary green:dedicated *ratio* over the absolute, and
+note the green ~40 KiB reproduces exactly.)
