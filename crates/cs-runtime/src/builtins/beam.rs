@@ -1792,6 +1792,44 @@ pub fn b_beam_table_delete(args: &[Value], syms: &mut SymbolTable) -> Result<Val
     Ok(Value::Boolean(removed))
 }
 
+/// `(table-get-resp-bulk name key)` — look up a **bytevector** value in table
+/// `name` and return its RESP *bulk* encoding (`$<len>\r\n<bytes>\r\n`) as a
+/// fresh bytevector, or `#f` if the key is absent or its value isn't a
+/// bytevector. The value bytes go straight from the stored table payload into
+/// the framed output buffer — with NO intermediate Scheme bytevector and NO
+/// separate encode pass, so it avoids both the `table-lookup` deep-clone
+/// (`payload_to_sendable`'s `.cloned()`) and the Scheme `resp-encode`. A read
+/// fast-path for byte-cache front-ends (crab-cache GET); semantics-free
+/// (length-prefixed framing only).
+pub fn b_beam_table_get_resp_bulk(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("table-get-resp-bulk", args, 2)?;
+    let name = value_to_str(&args[0], syms, "table-get-resp-bulk")?;
+    let key = to_sendable_in(&args[1], syms)?;
+    let k = key_of(&key)?;
+    let looked = beam_state()
+        .tables
+        .lookup(&name, &k)
+        .map_err(|e| format!("table-get-resp-bulk: {}", e))?;
+    // Borrow the stored payload's bytes (no clone) and frame them in one alloc.
+    match looked
+        .as_ref()
+        .and_then(|p| p.downcast_ref::<SendableValue>())
+    {
+        Some(SendableValue::ByteVector(bytes)) => {
+            let mut out = Vec::with_capacity(bytes.len() + 16);
+            out.push(b'$');
+            out.extend_from_slice(bytes.len().to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\r\n");
+            Ok(Value::ByteVector(cs_core::Gc::new(
+                std::cell::RefCell::new(out),
+            )))
+        }
+        _ => Ok(Value::Boolean(false)),
+    }
+}
+
 /// `(table-size name)` — returns the current cell count.
 pub fn b_beam_table_size(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("table-size", args, 1)?;
@@ -2479,6 +2517,7 @@ pub fn beam_syms_builtins() -> Vec<(
         ("table-lookup", b_beam_table_lookup),
         ("table-delete!", b_beam_table_delete),
         ("table-size", b_beam_table_size),
+        ("table-get-resp-bulk", b_beam_table_get_resp_bulk),
         // hot-reload
         ("load-module!", b_beam_load_module),
         ("lookup-code", b_beam_lookup_code),
