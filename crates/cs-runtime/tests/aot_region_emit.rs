@@ -60,9 +60,10 @@ fn vm_alloc_pair_region_gc_returns_nonzero_handle() {
 }
 
 /// Strip the NaN-box tag bits to get the raw Pair pointer.
-/// Mirrors cs-vm's internal NB_PAYLOAD_MASK + cast.
+/// Routes through cs-vm's public NB decode helpers (payload mask +
+/// region-flag strip + shift-decompression) so this test never drifts
+/// from the internal pointer encoding.
 fn extract_pair_ptr(nb_i64: i64) -> *const () {
-    const NB_PAYLOAD_MASK: u64 = (1u64 << 47) - 1;
-    let bits = nb_i64 as u64;
-    (bits & NB_PAYLOAD_MASK) as *const ()
+    let payload = cs_vm::vm::nb_payload_of(nb_i64 as u64);
+    cs_vm::vm::nb_decode_gc_ptr(payload).0
 }
