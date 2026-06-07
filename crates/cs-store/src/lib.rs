@@ -28,6 +28,7 @@
 //! | `store-iter-close`  | iter                              | unspecified       |
 //! | `store-checkpoint`  | db dir                            | unspecified       |
 //! | `store-flush`       | db                                | unspecified       |
+//! | `store-flush-wal`   | db [sync?]                        | unspecified       |
 //!
 //! Keys and values are **bytevectors**. Column-family names are strings.
 //! `sync?` is a boolean (default `#f`). `ops` for `store-write-batch` is a
@@ -62,6 +63,7 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("store-iter-close", store_iter_close),
         UntypedProc::new("store-checkpoint", store_checkpoint),
         UntypedProc::new("store-flush", store_flush),
+        UntypedProc::new("store-flush-wal", store_flush_wal),
     ]
 }
 
@@ -639,6 +641,38 @@ fn store_flush(args: &[Value]) -> Result<Value, FfiError> {
     Ok(Value::Unspecified)
 }
 
+/// `store-flush-wal db [sync?]` — flush the WAL buffer to its file, fsyncing
+/// it when `sync?` is true (default `#t`).
+///
+/// This is the group-commit primitive. With RocksDB's default settings
+/// (`manual_wal_flush = false`), each `store-put`/`store-delete` issued with
+/// `sync = #f` already flushes the WAL buffer to the OS but does NOT fsync.
+/// A single `store-flush-wal db #t` then issues ONE fsync that durably
+/// persists every such write accumulated since the last fsync — amortising
+/// one disk barrier across many writers (cf. Redis group-commit AOF). Callers
+/// MUST NOT ack a write as durable until this returns.
+fn store_flush_wal(args: &[Value]) -> Result<Value, FfiError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_err("store-flush-wal", "1 or 2", args.len()));
+    }
+    let id = expect_fixnum("store-flush-wal", args, 0)?;
+    // Default to a syncing flush (the durable group-commit case). Pass #f only
+    // to flush the WAL buffer to the OS without the fsync barrier.
+    let sync = if args.len() == 2 {
+        opt_bool(args, 1)
+    } else {
+        true
+    };
+    let r = db_lock()?;
+    let db = r
+        .slots
+        .get(&id)
+        .ok_or_else(|| FfiError::HostFailure(format!("store-flush-wal: bad handle {}", id)))?;
+    db.flush_wal(sync)
+        .map_err(|e| FfiError::HostFailure(format!("store-flush-wal: {}", e)))?;
+    Ok(Value::Unspecified)
+}
+
 // ---- Tests -------------------------------------------------------------
 
 #[cfg(test)]
@@ -836,6 +870,54 @@ mod tests {
             assert!(
                 matches!(&v, Value::ByteVector(bv) if bv.borrow().as_slice() == b"yes"),
                 "expected 'yes' after reopen"
+            );
+            store_close(&[fixnum(id)]).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_flush_wal_persists_unsynced_writes() {
+        // Group-commit invariant: writes made with sync=#f are durable once
+        // store-flush-wal(sync=#t) returns. Simulate by writing unsynced,
+        // flushing the WAL, dropping the handle (no explicit close = closest
+        // we can get to a crash in-process without kill -9), then reopening.
+        let path = tmp_dir();
+        {
+            let h = open(&path);
+            let id = as_fixnum(&h);
+            // sync = #f on every write (the group-commit batched-write regime)
+            store_put(&[
+                fixnum(id),
+                str_val("default"),
+                bv(b"g1"),
+                bv(b"v1"),
+                Value::Boolean(false),
+            ])
+            .unwrap();
+            store_put(&[
+                fixnum(id),
+                str_val("default"),
+                bv(b"g2"),
+                bv(b"v2"),
+                Value::Boolean(false),
+            ])
+            .unwrap();
+            // single fsync covering both writes
+            store_flush_wal(&[fixnum(id), Value::Boolean(true)]).unwrap();
+            store_close(&[fixnum(id)]).unwrap();
+        }
+        {
+            let h = open(&path);
+            let id = as_fixnum(&h);
+            let v1 = store_get(&[fixnum(id), str_val("default"), bv(b"g1")]).unwrap();
+            let v2 = store_get(&[fixnum(id), str_val("default"), bv(b"g2")]).unwrap();
+            assert!(
+                matches!(&v1, Value::ByteVector(b) if b.borrow().as_slice() == b"v1"),
+                "g1 lost after flush_wal+reopen"
+            );
+            assert!(
+                matches!(&v2, Value::ByteVector(b) if b.borrow().as_slice() == b"v2"),
+                "g2 lost after flush_wal+reopen"
             );
             store_close(&[fixnum(id)]).unwrap();
         }
