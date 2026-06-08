@@ -292,6 +292,9 @@ list.
   `define/typed`, library auto-contracting, intra-library elision.
 - **[`docs/user/aot.md`](docs/user/aot.md)** — AOT user guide
   (level 1 cargo, level 3 toolchain-free).
+- **[`docs/user/cache-builtins.md`](docs/user/cache-builtins.md)** — native
+  byte-cache / store builtins (group-commit `store-flush-wal`, RESP-bulk
+  framing, fused `conn-serve-gets`) for high-throughput caches like crab-cache.
 - **[`docs/user/lsp.md`](docs/user/lsp.md)** — LSP + headless CLI for
   editors and agents.
 - **[`docs/user/mcp.md`](docs/user/mcp.md)** — MCP server for
