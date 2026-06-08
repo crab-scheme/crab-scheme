@@ -1830,6 +1830,213 @@ pub fn b_beam_table_get_resp_bulk(args: &[Value], syms: &mut SymbolTable) -> Res
     }
 }
 
+// ---- native fused GET fast-path (crab-cache) ----
+//
+// CRC16-CCITT (XMODEM): polynomial 0x1021, init 0x0000, no input/output
+// reflection, no final XOR — byte-for-byte the same as crab-cache's
+// `crc16-bytes` (src/slotmap.scm) and Redis Cluster.
+fn cc_crc16(bytes: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &b in bytes {
+        crc ^= (b as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+/// {hashtag}: if the key has a '{' followed later by a '}' with at least one
+/// byte between them, hash ONLY that substring; otherwise hash the whole key.
+/// Mirrors crab-cache `hashtag-bytes` (src/slotmap.scm) byte-for-byte.
+fn cc_hashtag(key: &[u8]) -> &[u8] {
+    if let Some(open) = key.iter().position(|&c| c == b'{') {
+        // first '}' strictly after the '{'
+        if let Some(rel) = key[open + 1..].iter().position(|&c| c == b'}') {
+            let close = open + 1 + rel;
+            if close > open + 1 {
+                return &key[open + 1..close];
+            }
+        }
+    }
+    key
+}
+
+/// slot = CRC16(hashtag(key)) mod 16384; shard = (slot * nshards) / 16384.
+/// Mirrors crab-cache `key-slot` + `slot->shard`.
+fn cc_shard(key: &[u8], nshards: i64) -> i64 {
+    let slot = (cc_crc16(cc_hashtag(key)) as i64) % 16384;
+    (slot * nshards) / 16384
+}
+
+/// Read a base-10 length (no sign — RESP bulk/array headers are non-negative)
+/// from `buf[start..]` up to the next CRLF. Returns `(value, index-after-CRLF)`,
+/// or `None` if the CRLF hasn't arrived yet (incomplete) or a non-digit byte
+/// appears before it (malformed → treated as a non-servable frame → STOP).
+fn cc_read_len(buf: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut i = start;
+    let mut acc: usize = 0;
+    let mut any = false;
+    while i + 1 < buf.len() {
+        let c = buf[i];
+        if c == b'\r' && buf[i + 1] == b'\n' {
+            return if any { Some((acc, i + 2)) } else { None };
+        }
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add((c - b'0') as usize)?;
+        any = true;
+        i += 1;
+    }
+    None
+}
+
+/// Parse a single `$<len>\r\n<bytes>\r\n` bulk at `pos`, returning the byte
+/// slice and the index just past it, or `None` if it is incomplete / not a
+/// bulk header. Mirrors resp.scm `parse-bulk` for the complete-frame case.
+fn cc_parse_bulk(buf: &[u8], pos: usize) -> Option<(&[u8], usize)> {
+    if pos >= buf.len() || buf[pos] != b'$' {
+        return None;
+    }
+    let (len, data_start) = cc_read_len(buf, pos + 1)?;
+    let end = data_start.checked_add(len)?;
+    // need the value bytes AND the trailing CRLF
+    if end + 2 > buf.len() {
+        return None;
+    }
+    Some((&buf[data_start..end], end + 2))
+}
+
+/// `(conn-serve-gets data node-name nshards)` — serve the LEADING run of
+/// locally-led GET *hits* from the RESP read buffer `data` entirely in Rust,
+/// short-circuiting crab-cache's interpreted parse/dispatch/encode for the
+/// common case.
+///
+/// For each frame from offset 0: if it is exactly `*2\r\n$3\r\nGET\r\n$K\r\n
+/// <key>\r\n` (arg0 upcased == "GET", arity 1) AND this node leads the key's
+/// slot (cc-shard-leader["<node>:<shard>"] == node-name) AND cc-str holds the
+/// key as a ByteVector, append its bulk frame `$<len>\r\n<value>\r\n` (byte-for-
+/// byte identical to `table-get-resp-bulk`) to the output. STOP at the FIRST
+/// frame that is anything else — partial frame, non-GET, GET with arity != 1, a
+/// non-locally-led slot, or a GET miss — and consume nothing past it.
+///
+/// Returns `(cons out-bytevector consumed)`: `out` = concatenated hit frames,
+/// `consumed` = the byte offset where parsing stopped (0 if the first frame
+/// isn't a servable GET-hit). The caller tcp-sends `out` and runs the existing
+/// interpreted path on `data[consumed..]`, so SET / non-local / miss /
+/// SUBSCRIBE / inline / partial all flow through unchanged.
+pub fn b_beam_conn_serve_gets(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("conn-serve-gets", args, 3)?;
+    let data = match &args[0] {
+        Value::ByteVector(bv) => bv.borrow(),
+        other => {
+            return Err(format!(
+                "conn-serve-gets: data must be a bytevector, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let node = value_to_str(&args[1], syms, "conn-serve-gets")?;
+    let nshards = match &args[2] {
+        Value::Number(Number::Fixnum(n)) => *n,
+        other => {
+            return Err(format!(
+                "conn-serve-gets: nshards must be a fixnum, got {}",
+                other.type_name()
+            ));
+        }
+    };
+
+    let buf: &[u8] = &data;
+    let n = buf.len();
+    let mut out: Vec<u8> = Vec::new();
+    let mut consumed: usize = 0;
+    let tables = &beam_state().tables;
+
+    loop {
+        let frame_start = consumed;
+        // Must be a RESP array header `*…`. Anything else (inline, EOF, partial)
+        // stops the native run and falls back to the interpreted path.
+        if frame_start >= n || buf[frame_start] != b'*' {
+            break;
+        }
+        let (argc, mut pos) = match cc_read_len(buf, frame_start + 1) {
+            Some(x) => x,
+            None => break, // incomplete or malformed multibulk header
+        };
+        // A GET is exactly two bulk args; any other arity is not our fast path.
+        if argc != 2 {
+            break;
+        }
+        // arg0 must be the verb "GET" (case-insensitive, exactly 3 bytes).
+        let (verb, after_verb) = match cc_parse_bulk(buf, pos) {
+            Some(x) => x,
+            None => break,
+        };
+        if !verb.eq_ignore_ascii_case(b"GET") {
+            break;
+        }
+        pos = after_verb;
+        // arg1 = key.
+        let (key, after_key) = match cc_parse_bulk(buf, pos) {
+            Some(x) => x,
+            None => break,
+        };
+
+        // Leadership: serve locally iff cc-shard-leader["<node>:<shard>"] == node.
+        let shard = cc_shard(key, nshards);
+        let qk = format!("{}:{}", node, shard);
+        let leader = match tables.lookup("cc-shard-leader", &cs_table::Key::String(qk)) {
+            Ok(l) => l,
+            Err(_) => break, // table missing → let the interpreted path decide
+        };
+        let leads = matches!(
+            leader.as_ref().and_then(|p| p.downcast_ref::<SendableValue>()),
+            Some(SendableValue::Symbol(s)) if s == &node
+        );
+        if !leads {
+            break; // not locally led → fall back (interpreted path emits MOVED)
+        }
+
+        // Hit only if cc-str holds the key as a ByteVector. A miss must fall
+        // back to the shard (authoritative RocksDB read + warm-on-miss + TTL
+        // lazy-expiry), so STOP rather than emit nil.
+        let looked = match tables.lookup("cc-str", &cs_table::Key::Bytes(key.to_vec())) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        match looked
+            .as_ref()
+            .and_then(|p| p.downcast_ref::<SendableValue>())
+        {
+            Some(SendableValue::ByteVector(bytes)) => {
+                // byte-for-byte identical framing to table-get-resp-bulk
+                out.reserve(bytes.len() + 16);
+                out.push(b'$');
+                out.extend_from_slice(bytes.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(bytes);
+                out.extend_from_slice(b"\r\n");
+            }
+            _ => break, // miss / non-bytevector → fall back to the shard
+        }
+
+        // This frame was fully served natively; advance.
+        consumed = after_key;
+    }
+
+    let out_v = Value::ByteVector(cs_core::Gc::new(std::cell::RefCell::new(out)));
+    Ok(Value::Pair(Pair::new(
+        out_v,
+        Value::Number(Number::Fixnum(consumed as i64)),
+    )))
+}
+
 /// `(table-size name)` — returns the current cell count.
 pub fn b_beam_table_size(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("table-size", args, 1)?;
@@ -2518,6 +2725,7 @@ pub fn beam_syms_builtins() -> Vec<(
         ("table-delete!", b_beam_table_delete),
         ("table-size", b_beam_table_size),
         ("table-get-resp-bulk", b_beam_table_get_resp_bulk),
+        ("conn-serve-gets", b_beam_conn_serve_gets),
         // hot-reload
         ("load-module!", b_beam_load_module),
         ("lookup-code", b_beam_lookup_code),
