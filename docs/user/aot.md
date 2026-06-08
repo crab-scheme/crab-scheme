@@ -257,6 +257,8 @@ builtins AOTs and runs correctly.
 | Reading a top-level *value* binding | `(define c 10) (define (f) (+ c 1))` — `c` becomes an env capture (single `--entry` arg-mismatch; `--multi` skips the capturing fn). Same env-install gap as `set!` / closures. `--explain` over-reports this as compatible. | post-1.0 |
 | Bare top-level side effects | AOT needs ≥1 `(define (name …) …)`; a bare `(display …)` at top level isn't an entry — wrap it in `(define (main) …)` and use `--entry main` | by design |
 | FFI in AOT'd binaries | AOT'd binaries are short-lived; FFI assumes a long-running runtime | future (separate plan) |
+| Calling AOT output from a *running* program | AOT emits a **standalone binary** (a `[[bin]]`), not a loadable `cdylib`, and there is no runtime "load + call an AOT module" API. You can't AOT-compile a hot function and invoke it from inside a long-running embedded CrabScheme program (e.g. a cache server). | future |
+| Bitwise ops (`bitwise-and`/`-or`/`-xor`) at native speed | cs-aot lowers them to `aot_call_builtin("bitwise-and", …)` — walker-speed by-name dispatch. It has no `Inst::BitAnd/BitOr/BitXor` arms, even though `cs-rir` defines them and the JIT inlines them. A bitwise-heavy kernel (e.g. CRC16) compiles and runs correctly but barely speeds up. | post-1.0 (mechanical — see "How to extend") |
 | Constant-space *cross-procedure* tail calls | Only *self* tail-calls become loops (back-edges). A tail call to **another** procedure — including mutual recursion between two defines or two named-lets — builds a stack frame, so very deep mutual recursion can overflow. Self-recursive loops and bounded mutual recursion (e.g. mandelbrot's N×N grid) run fine. | post-1.0 |
 | Multi-shot `call/cc` | inherits the M8 walker-tier deferral | future |
 | Browser WASM | `wasm32-unknown-unknown` (no WASI; needs JS-bound stdio) | future |
@@ -324,6 +326,20 @@ For self-recursive Fixnum kernels (fib, fact, ack):
 
 See `docs/measurements/2026-05-16-rc2-aot-nb-inline.md` for the
 detailed RC2 perf numbers.
+
+**When AOT fits.** AOT targets *standalone compute kernels* — a program you
+compile and run to completion (fib / ack / mandelbrot-style numeric work). It is
+**not** a way to accelerate a hot path inside a long-running embedded runtime:
+there is no in-process embed ABI to call AOT output from a running program (see
+"What doesn't work yet"), and bitwise math isn't accelerated. A 2026-06-07 spike
+that AOT-compiled [crab-cache](https://github.com/crab-scheme/crab-cache)'s
+CRC16 slot-hash confirmed both walls — the kernel compiled and ran correctly, but
+only ~1.5× over the VM tier (its bitwise ops stayed walker-speed) and it could not
+be called from the running cache. For that shape the right tool is a **native
+runtime builtin** (e.g. a `(crc16 bv)` in `cs-stdlib`, in-process by construction
+and faster than the AOT kernel since it skips by-name dispatch), not AOT. See
+[`cache-builtins.md`](cache-builtins.md) for the native byte-cache builtins
+crab-cache uses instead.
 
 ## How to extend
 
