@@ -1866,11 +1866,20 @@ fn cc_hashtag(key: &[u8]) -> &[u8] {
     key
 }
 
+/// slot = CRC16(hashtag(key)) mod 16384. Mirrors crab-cache `key-slot`.
+fn cc_slot(key: &[u8]) -> i64 {
+    (cc_crc16(cc_hashtag(key)) as i64) % 16384
+}
+
+/// shard = (slot * nshards) / 16384. Mirrors crab-cache `slot->shard`.
+fn cc_slot_to_shard(slot: i64, nshards: i64) -> i64 {
+    (slot * nshards) / 16384
+}
+
 /// slot = CRC16(hashtag(key)) mod 16384; shard = (slot * nshards) / 16384.
 /// Mirrors crab-cache `key-slot` + `slot->shard`.
 fn cc_shard(key: &[u8], nshards: i64) -> i64 {
-    let slot = (cc_crc16(cc_hashtag(key)) as i64) % 16384;
-    (slot * nshards) / 16384
+    cc_slot_to_shard(cc_slot(key), nshards)
 }
 
 /// Read a base-10 length (no sign — RESP bulk/array headers are non-negative)
@@ -1910,6 +1919,137 @@ fn cc_parse_bulk(buf: &[u8], pos: usize) -> Option<(&[u8], usize)> {
         return None;
     }
     Some((&buf[data_start..end], end + 2))
+}
+
+/// A command's route — the Rust port of crab-cache `classify-route`
+/// (src/router.scm). `Shard(i)` is the single shard owning all the command's
+/// keys; the variants mirror router.scm's `'any`/`'all`/`'cluster`/`'crossslot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CcRoute {
+    Any,
+    All,
+    Cluster,
+    CrossSlot,
+    Shard(i64),
+}
+
+/// Which operand indices are keys, or a symbolic route — the port of
+/// router.scm `key-positions`. `name` must already be ASCII-upcased.
+enum CcKeySpec {
+    Any,
+    All,
+    Cluster,
+    Indices(Vec<usize>),
+}
+
+fn cc_in(name: &[u8], set: &[&[u8]]) -> bool {
+    set.iter().any(|s| *s == name)
+}
+
+fn cc_key_positions(name: &[u8], argc: usize) -> CcKeySpec {
+    if cc_in(
+        name,
+        &[
+            b"PING", b"ECHO", b"SELECT", b"COMMAND", b"INFO", b"QUIT", b"TICK",
+        ],
+    ) {
+        CcKeySpec::Any
+    } else if cc_in(name, &[b"DBSIZE", b"FLUSHALL", b"FLUSHDB", b"KEYS"]) {
+        CcKeySpec::All
+    } else if name == b"CLUSTER" {
+        CcKeySpec::Cluster
+    } else if cc_in(
+        name,
+        &[b"DEL", b"EXISTS", b"UNLINK", b"MGET", b"SMISMEMBER"],
+    ) {
+        CcKeySpec::Indices((0..argc).collect()) // every operand is a key
+    } else if name == b"MSET" {
+        CcKeySpec::Indices((0..argc).step_by(2).collect()) // even indices: key val key val …
+    } else {
+        CcKeySpec::Indices(vec![0]) // single key at operand 0
+    }
+}
+
+/// Classify a command into its route. `verb` is the raw arg0 (upcased here);
+/// `operands` are the post-verb bulk args. Byte-for-byte faithful to
+/// router.scm `classify-route` so the native fast-path and the interpreted
+/// fallback never disagree (asserted by the differential test
+/// `test/native-classify-diff.scm`).
+fn cc_classify(verb: &[u8], operands: &[&[u8]], nshards: i64) -> CcRoute {
+    let name = verb.to_ascii_uppercase();
+    match cc_key_positions(&name, operands.len()) {
+        CcKeySpec::Any => CcRoute::Any,
+        CcKeySpec::All => CcRoute::All,
+        CcKeySpec::Cluster => CcRoute::Cluster,
+        CcKeySpec::Indices(ps) => {
+            let n = operands.len();
+            let keys: Vec<&[u8]> = ps
+                .into_iter()
+                .filter(|&p| p < n)
+                .map(|p| operands[p])
+                .collect();
+            if keys.is_empty() {
+                CcRoute::Shard(0) // keyed command given no key -> shard 0 (arity-errs there)
+            } else {
+                let slot0 = cc_slot(keys[0]);
+                if keys.iter().all(|k| cc_slot(k) == slot0) {
+                    CcRoute::Shard(cc_slot_to_shard(slot0, nshards))
+                } else {
+                    CcRoute::CrossSlot
+                }
+            }
+        }
+    }
+}
+
+/// Append a RESP bulk `$<len>\r\n<bytes>\r\n` — byte-for-byte identical to
+/// `table-get-resp-bulk` and resp.scm `(resp-encode (r-bulk …))`.
+fn cc_append_bulk(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.reserve(bytes.len() + 16);
+    out.push(b'$');
+    out.extend_from_slice(bytes.len().to_string().as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Append a RESP error `-<msg>\r\n` (msg includes the code word).
+fn cc_append_err(out: &mut Vec<u8>, msg: &[u8]) {
+    out.push(b'-');
+    out.extend_from_slice(msg);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Append the RESP reply for an 'any (stateless) verb — byte-for-byte identical
+/// to conn.scm `stateless-reply` composed with resp.scm `resp-encode`. Only
+/// ever called for the closed 'any set {PING ECHO SELECT COMMAND INFO QUIT
+/// TICK} (cc_classify routes nothing else here); the catch-all mirrors
+/// stateless-reply's `(else (r-ok))`.
+fn cc_append_stateless(out: &mut Vec<u8>, verb: &[u8], operands: &[&[u8]]) {
+    let name = verb.to_ascii_uppercase();
+    match name.as_slice() {
+        b"PING" => {
+            if operands.is_empty() {
+                out.extend_from_slice(b"+PONG\r\n"); // (r-simple "PONG")
+            } else {
+                cc_append_bulk(out, operands[0]); // (r-bulk (car operands))
+            }
+        }
+        b"ECHO" => {
+            if !operands.is_empty() {
+                cc_append_bulk(out, operands[0]);
+            } else {
+                cc_append_err(out, b"ERR wrong number of arguments for 'echo' command");
+            }
+        }
+        b"COMMAND" => out.extend_from_slice(b"*0\r\n"), // (r-array '())
+        b"INFO" => cc_append_bulk(
+            out,
+            b"# Server\r\nredis_version:7.4.0-crabscheme\r\ncrab_cache:1\r\n",
+        ),
+        // SELECT, QUIT, TICK, and stateless-reply's `else` -> +OK
+        _ => out.extend_from_slice(b"+OK\r\n"),
+    }
 }
 
 /// `(conn-serve-gets data node-name nshards)` — serve the LEADING run of
@@ -2035,6 +2175,182 @@ pub fn b_beam_conn_serve_gets(args: &[Value], syms: &mut SymbolTable) -> Result<
         out_v,
         Value::Number(Number::Fixnum(consumed as i64)),
     )))
+}
+
+/// `(conn-serve-batch data node-name nshards fast?)` — the native
+/// decode→classify→local-dispatch loop (cc-5pw.2). A strict SUPERSET of
+/// [`b_beam_conn_serve_gets`]: from offset 0 it parses each complete RESP array
+/// frame, classifies it via [`cc_classify`] (≡ router.scm `classify-route`), and
+/// serves entirely in Rust the closed allowlist of side-effect-free verbs — the
+/// 'any stateless verbs (PING/ECHO/SELECT/COMMAND/INFO/QUIT/TICK) in BOTH
+/// consistency modes, and GET *hits* (cc-str) only when `fast?` is true
+/// (linearizable GET must take the ReadIndex shard path, cc-idc).
+///
+/// It STOPS — returning the bytes consumed so far — at the first frame that
+/// needs the interpreter: any write/Raft op or other Shard-routed non-GET
+/// (SET/DEL/INCR/MULTI/EXEC/SUBSCRIBE/PUBLISH/…), an 'all/'cluster route, a
+/// cross-slot command, a non-local or no-leader GET, a cc-str miss, a
+/// partial/non-array/`*0` frame, or an unknown verb (which classifies to a
+/// Shard route and falls through — never guessed). Returns
+/// `(cons out-bytevector consumed)`: the caller tcp-sends `out` and runs the
+/// unchanged interpreted path on `data[consumed..]`.
+pub fn b_beam_conn_serve_batch(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    check_arity("conn-serve-batch", args, 4)?;
+    let data = match &args[0] {
+        Value::ByteVector(bv) => bv.borrow(),
+        other => {
+            return Err(format!(
+                "conn-serve-batch: data must be a bytevector, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let node = value_to_str(&args[1], syms, "conn-serve-batch")?;
+    let nshards = match &args[2] {
+        Value::Number(Number::Fixnum(n)) => *n,
+        other => {
+            return Err(format!(
+                "conn-serve-batch: nshards must be a fixnum, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    // Scheme truthiness: anything but #f means fast mode (serve GET hits locally).
+    let fast = !matches!(&args[3], Value::Boolean(false));
+
+    let buf: &[u8] = &data;
+    let n = buf.len();
+    let mut out: Vec<u8> = Vec::new();
+    let mut consumed: usize = 0;
+    let tables = &beam_state().tables;
+
+    'frames: loop {
+        let frame_start = consumed;
+        // Must be a RESP array header `*…`. inline/EOF/partial → fallback.
+        if frame_start >= n || buf[frame_start] != b'*' {
+            break;
+        }
+        let (argc, mut pos) = match cc_read_len(buf, frame_start + 1) {
+            Some(x) => x,
+            None => break, // incomplete or malformed multibulk header
+        };
+        if argc == 0 {
+            break; // `*0` frame → hand to the interpreted parser
+        }
+        // Parse every bulk arg of this frame (slices borrowed from `buf`).
+        let mut frame_args: Vec<&[u8]> = Vec::with_capacity(argc);
+        for _ in 0..argc {
+            match cc_parse_bulk(buf, pos) {
+                Some((b, next)) => {
+                    frame_args.push(b);
+                    pos = next;
+                }
+                None => break 'frames, // incomplete/malformed → consume nothing of this frame
+            }
+        }
+        let verb = frame_args[0];
+        let operands = &frame_args[1..];
+
+        match cc_classify(verb, operands, nshards) {
+            // 'any → a stateless reply computed purely from the operands.
+            CcRoute::Any => cc_append_stateless(&mut out, verb, operands),
+            // A single owning shard: only GET *hits* serve natively; every write
+            // and every other read defers to the interpreter (Raft / ReadIndex).
+            CcRoute::Shard(shard) => {
+                if !fast || !verb.eq_ignore_ascii_case(b"GET") || operands.len() != 1 {
+                    break;
+                }
+                let key = operands[0];
+                let qk = format!("{}:{}", node, shard);
+                let leader = match tables.lookup("cc-shard-leader", &cs_table::Key::String(qk)) {
+                    Ok(l) => l,
+                    Err(_) => break, // table missing → let the interpreted path decide
+                };
+                let leads = matches!(
+                    leader.as_ref().and_then(|p| p.downcast_ref::<SendableValue>()),
+                    Some(SendableValue::Symbol(s)) if s == &node
+                );
+                if !leads {
+                    break; // not locally led → fall back (interpreted path emits MOVED)
+                }
+                let looked = match tables.lookup("cc-str", &cs_table::Key::Bytes(key.to_vec())) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                match looked
+                    .as_ref()
+                    .and_then(|p| p.downcast_ref::<SendableValue>())
+                {
+                    Some(SendableValue::ByteVector(bytes)) => cc_append_bulk(&mut out, bytes),
+                    _ => break, // miss / non-bytevector → fall back to the shard (warms cc-str)
+                }
+            }
+            // Fan-out / topology / cross-slot all need the interpreter (or cfg
+            // the native path doesn't hold) → stop and fall back.
+            CcRoute::All | CcRoute::Cluster | CcRoute::CrossSlot => break,
+        }
+
+        consumed = pos; // this frame was fully served natively; advance
+    }
+
+    let out_v = Value::ByteVector(cs_core::Gc::new(std::cell::RefCell::new(out)));
+    Ok(Value::Pair(Pair::new(
+        out_v,
+        Value::Number(Number::Fixnum(consumed as i64)),
+    )))
+}
+
+/// `(native-classify-route name operands nshards)` — expose [`cc_classify`] to
+/// Scheme so the differential test can assert it agrees with router.scm
+/// `classify-route` over a fuzz corpus. `name` is a bytevector (raw verb),
+/// `operands` a list of bytevectors, `nshards` a fixnum. Returns the route as
+/// router.scm does: the symbol `'any`/`'all`/`'cluster`/`'crossslot`, or the
+/// shard index as a fixnum.
+pub fn b_beam_native_classify_route(
+    args: &[Value],
+    syms: &mut SymbolTable,
+) -> Result<Value, String> {
+    check_arity("native-classify-route", args, 3)?;
+    let verb: Vec<u8> = match &args[0] {
+        Value::ByteVector(bv) => bv.borrow().clone(),
+        other => {
+            return Err(format!(
+                "native-classify-route: name must be a bytevector, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let ops_vals = proper_list(&args[1])
+        .ok_or_else(|| "native-classify-route: operands must be a proper list".to_string())?;
+    let mut ops: Vec<Vec<u8>> = Vec::with_capacity(ops_vals.len());
+    for v in &ops_vals {
+        match v {
+            Value::ByteVector(bv) => ops.push(bv.borrow().clone()),
+            other => {
+                return Err(format!(
+                    "native-classify-route: each operand must be a bytevector, got {}",
+                    other.type_name()
+                ));
+            }
+        }
+    }
+    let nshards = match &args[2] {
+        Value::Number(Number::Fixnum(n)) => *n,
+        other => {
+            return Err(format!(
+                "native-classify-route: nshards must be a fixnum, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let op_slices: Vec<&[u8]> = ops.iter().map(|v| v.as_slice()).collect();
+    Ok(match cc_classify(&verb, &op_slices, nshards) {
+        CcRoute::Any => Value::Symbol(syms.intern("any")),
+        CcRoute::All => Value::Symbol(syms.intern("all")),
+        CcRoute::Cluster => Value::Symbol(syms.intern("cluster")),
+        CcRoute::CrossSlot => Value::Symbol(syms.intern("crossslot")),
+        CcRoute::Shard(s) => Value::Number(Number::Fixnum(s)),
+    })
 }
 
 /// `(table-size name)` — returns the current cell count.
@@ -2726,6 +3042,8 @@ pub fn beam_syms_builtins() -> Vec<(
         ("table-size", b_beam_table_size),
         ("table-get-resp-bulk", b_beam_table_get_resp_bulk),
         ("conn-serve-gets", b_beam_conn_serve_gets),
+        ("conn-serve-batch", b_beam_conn_serve_batch),
+        ("native-classify-route", b_beam_native_classify_route),
         // hot-reload
         ("load-module!", b_beam_load_module),
         ("lookup-code", b_beam_lookup_code),
@@ -3690,5 +4008,52 @@ mod tests {
             .join()
             .unwrap();
         assert!(res.is_ok());
+    }
+
+    // cc_classify must agree with crab-cache router.scm `classify-route`. (The
+    // exhaustive fuzz lives in crab-cache test/native-classify-diff.scm; this
+    // pins the index math — 'any/'all/'cluster, single-key, no-key, multi-key
+    // same/cross slot, and MSET's even-index key selection.)
+    #[test]
+    fn cc_classify_matches_router_scm() {
+        let ns = 3;
+        // 'any stateless verbs (case-insensitive arg0).
+        assert_eq!(cc_classify(b"PING", &[], ns), CcRoute::Any);
+        assert_eq!(cc_classify(b"ping", &[b"hi"], ns), CcRoute::Any);
+        assert_eq!(cc_classify(b"INFO", &[], ns), CcRoute::Any);
+        // 'all fan-out.
+        assert_eq!(cc_classify(b"DBSIZE", &[], ns), CcRoute::All);
+        assert_eq!(cc_classify(b"KEYS", &[b"*"], ns), CcRoute::All);
+        // 'cluster.
+        assert_eq!(cc_classify(b"CLUSTER", &[b"SLOTS"], ns), CcRoute::Cluster);
+        // Single-key commands route to one shard; SET == GET for the same key.
+        let get = cc_classify(b"GET", &[b"foo"], ns);
+        assert!(matches!(get, CcRoute::Shard(_)));
+        assert_eq!(cc_classify(b"SET", &[b"foo", b"bar"], ns), get);
+        // Unknown verb -> else branch -> single key at operand 0.
+        assert!(matches!(
+            cc_classify(b"WHATEVER", &[b"k"], ns),
+            CcRoute::Shard(_)
+        ));
+        // Keyed command with NO key -> shard 0 (where it arity-errs).
+        assert_eq!(cc_classify(b"GET", &[], ns), CcRoute::Shard(0));
+        // Multi-key DEL: shared {hashtag} co-locates -> one shard; else CrossSlot.
+        assert!(matches!(
+            cc_classify(b"DEL", &[b"{t}1", b"{t}2"], ns),
+            CcRoute::Shard(_)
+        ));
+        assert_eq!(
+            cc_classify(b"DEL", &[b"{a}", b"{b}"], ns),
+            CcRoute::CrossSlot
+        );
+        // MSET keys are the EVEN operands; the (cross-slot) values must not count.
+        assert!(matches!(
+            cc_classify(b"MSET", &[b"{t}1", b"{a}", b"{t}2", b"{b}"], ns),
+            CcRoute::Shard(_)
+        ));
+        assert_eq!(
+            cc_classify(b"MSET", &[b"{a}", b"v1", b"{b}", b"v2"], ns),
+            CcRoute::CrossSlot
+        );
     }
 }
