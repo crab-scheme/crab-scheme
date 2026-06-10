@@ -46,6 +46,7 @@
 //! cs-runtime actor bridge: each call/message becomes a mailbox
 //! message to a Scheme actor (the runtime is `!Send`).
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -97,6 +98,29 @@ pub struct GrpcRequest {
     /// etcd-Auth-over-TLS hook (`.26`) — the Scheme handler reads it
     /// via `grpc-request-peer-identity`.
     pub peer_identity: Option<Arc<str>>,
+    /// The request's gRPC metadata (HTTP/2 headers), lowercased keys →
+    /// string values. gRPC carries call metadata as HTTP/2 headers, so
+    /// this is exactly the `token` / `authorization` header an auth
+    /// client presents. Pseudo-headers (`:path` etc.) live elsewhere
+    /// (path is its own field). Binary (`-bin`) or non-UTF-8 header
+    /// values that don't render as a string are dropped. The Scheme
+    /// handler reads one by name via `grpc-request-metadata` — the
+    /// etcd-Auth token hook (`.26`).
+    pub metadata: HashMap<String, String>,
+}
+
+/// Extract the gRPC metadata (HTTP/2 headers) into a lowercase-keyed
+/// string map. Header values that aren't valid UTF-8 (e.g. binary
+/// `-bin` metadata) are skipped — the auth headers (`token`,
+/// `authorization`) are always ASCII.
+fn extract_metadata(headers: &HeaderMap) -> HashMap<String, String> {
+    let mut m = HashMap::with_capacity(headers.len());
+    for (name, value) in headers.iter() {
+        if let Ok(v) = value.to_str() {
+            m.insert(name.as_str().to_ascii_lowercase(), v.to_string());
+        }
+    }
+    m
 }
 
 // ---------------------------------------------------------------
@@ -411,6 +435,9 @@ async fn handle_call(
     peer_identity: Option<Arc<str>>,
 ) -> Result<Response<GrpcBody>, Infallible> {
     let path = req.uri().path().to_string();
+    // Capture the gRPC metadata (HTTP/2 headers) before consuming the
+    // body — this is where the auth `token` / `authorization` headers ride.
+    let metadata = extract_metadata(req.headers());
     let call_id = next_call_id();
     let (tx, rx) = mpsc::unbounded_channel::<GrpcFrame>();
     let sink = GrpcResponseSink { tx };
@@ -434,6 +461,7 @@ async fn handle_call(
             path,
             message: first,
             peer_identity,
+            metadata,
         },
         sink,
     );
