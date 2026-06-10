@@ -8,7 +8,7 @@
 //!    `hyper::server::conn::http2::Builder` in *prior-knowledge*
 //!    mode (no TLS, no ALPN — the client knows it's h2 up front).
 //!    TLS/mTLS is a separate concern (`.21`); etcd permits insecure
-//!    transport, so an h2c listener is a complete unary substrate.
+//!    transport, so an h2c listener is a complete substrate.
 //! 2. **gRPC framing** — every gRPC message on the wire is
 //!    `compressed-flag(1) ‖ length(4, big-endian) ‖ message`. We
 //!    de-frame the request body to recover the protobuf bytes and
@@ -21,48 +21,39 @@
 //!    bespoke [`GrpcBody`] whose final `poll_frame` yields a
 //!    `Frame::trailers`.
 //!
-//! ## What stays out of this module
+//! ## Streaming (.23)
 //!
-//! gRPC *semantics* (which method maps to which etcd RPC, protobuf
-//! encode/decode, leader redirects) live in Scheme. This module
-//! hands the handler a [`GrpcRequest`] (`:path` + de-framed message
-//! bytes) and ships back whatever [`GrpcReply`] the handler
-//! produces. The handler is an async closure so the cs-runtime
-//! side can bounce the request onto a Scheme actor's mailbox and
-//! await the reply (the runtime is `!Send`, so the actor bridge is
-//! how Scheme runs under the multi-thread tokio server — exactly
-//! like [`crate::actor::ActorHandler`] does for HTTP).
+//! Both unary and streaming RPCs use ONE uniform path:
 //!
-//! ## Streaming (.23) — how this extends
+//! - **Request side** — the body is read *incrementally*. Each gRPC
+//!   message (which may span several HTTP/2 DATA frames, or share
+//!   one) is de-framed and delivered to the handler as it arrives:
+//!   the FIRST message via [`GrpcHandler::begin`], every subsequent
+//!   client-streamed message via [`GrpcHandler::client_message`],
+//!   and the client half-close via [`GrpcHandler::client_end`]. A
+//!   unary handler simply replies after `begin` and ignores the
+//!   rest; a bidi handler interleaves.
+//! - **Response side** — [`GrpcBody`] is backed by an mpsc channel.
+//!   The handler pushes response messages through a
+//!   [`GrpcResponseSink`] (`send_message`), each becoming a framed
+//!   DATA frame, and ends the stream with `close` (which flushes the
+//!   gRPC-status trailers). Unary is just "one message then close".
 //!
-//! Unary is `1 request frame → 1 response frame → trailers`. A
-//! server-streaming or bidi RPC is the same transport with a
-//! different body:
-//!
-//! - The request side already collects *all* DATA frames; a
-//!   client-streaming handler would instead be hyper's `Incoming`
-//!   body fed frame-by-frame to the handler (de-framing across
-//!   DATA-frame boundaries, since one gRPC message can span
-//!   several HTTP/2 DATA frames or several messages can share one).
-//! - The response side would swap [`GrpcBody`] (single buffered
-//!   DATA frame) for a body backed by an mpsc channel: the
-//!   streaming actor calls a `grpc-stream-send!` primop that pushes
-//!   a framed message onto the channel, and a final
-//!   `grpc-stream-close!` pushes the trailers. `poll_frame` drains
-//!   the channel. The HEADERS + trailers handling here is already
-//!   correct for that case — only the DATA-frame source changes.
+//! gRPC *semantics* (method → etcd RPC, protobuf encode/decode,
+//! leader redirects) live in Scheme. This module hands the handler a
+//! [`GrpcRequest`] (`:path` + de-framed message bytes) plus a sink,
+//! and the handler drives the response. The handler is the
+//! cs-runtime actor bridge: each call/message becomes a mailbox
+//! message to a Scheme actor (the runtime is `!Send`).
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::{BufMut, Bytes, BytesMut};
-// Re-exported (`pub`) so downstream crates (cs-runtime's grpc
-// bridge) can name the `GrpcHandler::call` return type without an
-// explicit `futures-util` dependency.
-pub use futures_util::future::BoxFuture;
 use http::{HeaderMap, HeaderName, HeaderValue, Response};
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
@@ -70,78 +61,83 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 use crate::WebError;
 
-/// A de-framed unary gRPC request handed to the handler.
+/// A de-framed gRPC request message handed to the handler.
 ///
 /// `path` is the HTTP/2 `:path`, e.g. `/etcdserverpb.KV/Range`.
 /// gRPC encodes the (service, method) pair as `/Package.Service/Method`.
 /// `message` is the request protobuf bytes with the 5-byte gRPC
-/// length prefix already stripped.
+/// length prefix already stripped — for a streaming call this is the
+/// FIRST client message.
 #[derive(Debug, Clone)]
 pub struct GrpcRequest {
     pub path: String,
     pub message: Bytes,
 }
 
-/// A handler's reply: a gRPC status code plus the response message
-/// bytes (which are framed onto the wire). Status `0` is OK.
-///
-/// On a non-zero status the `message` is conventionally empty and
-/// `error` carries a human-readable `grpc-message`. A handler that
-/// wants to return data *and* a non-zero status may do both.
-#[derive(Debug, Clone)]
-pub struct GrpcReply {
-    pub status: u32,
-    pub message: Bytes,
-    /// Optional `grpc-message` trailer (percent-encoded by us per
-    /// the gRPC spec). Sent only when present; typically set on
-    /// error.
-    pub error: Option<String>,
+// ---------------------------------------------------------------
+// Response sink: the handler pushes framed messages then closes.
+// ---------------------------------------------------------------
+
+/// One unit the response body emits: a message (framed onto the wire
+/// as a DATA frame) or the terminal gRPC-status trailers.
+enum GrpcFrame {
+    Message(Bytes),
+    Trailers {
+        status: u32,
+        message: Option<String>,
+    },
 }
 
-impl GrpcReply {
-    /// OK reply carrying `message`.
-    pub fn ok(message: impl Into<Bytes>) -> Self {
-        Self {
-            status: 0,
-            message: message.into(),
-            error: None,
-        }
+/// The handle a handler uses to drive a call's response stream. It is
+/// `Clone + Send + Sync` (the underlying mpsc sender is), so the
+/// Scheme bridge can stash it in a registry and push frames from any
+/// thread. Unary = one `send_message` then `close`; streaming =
+/// many `send_message` then `close`.
+#[derive(Clone)]
+pub struct GrpcResponseSink {
+    tx: mpsc::UnboundedSender<GrpcFrame>,
+}
+
+impl GrpcResponseSink {
+    /// Queue one response message — framed onto the wire as a DATA
+    /// frame. Returns `false` if the client already went away (the
+    /// response body was dropped), so a streaming handler can stop.
+    pub fn send_message(&self, message: Bytes) -> bool {
+        self.tx.send(GrpcFrame::Message(message)).is_ok()
     }
 
-    /// Error reply: a non-zero status and an optional message. No
-    /// response payload.
-    pub fn error(status: u32, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: Bytes::new(),
-            error: Some(message.into()),
-        }
+    /// End the response stream: flush the `grpc-status` (+ optional
+    /// `grpc-message`) trailers. Idempotent-ish — a second close just
+    /// fails to send. Returns `false` if the client already went away.
+    pub fn close(&self, status: u32, message: Option<String>) -> bool {
+        self.tx
+            .send(GrpcFrame::Trailers { status, message })
+            .is_ok()
     }
 }
 
 /// The handler the transport drives. `&self` so one handler serves
 /// every connection without locks (the cs-runtime side holds an
-/// `ActorRef` and sends a mailbox message per call).
+/// `ActorRef` and sends a mailbox message per event). `call_id` is a
+/// transport-assigned, process-unique id correlating the three
+/// callbacks of one call; the Scheme bridge uses it directly as the
+/// handle Scheme sees.
 pub trait GrpcHandler: Send + Sync + 'static {
-    fn call(&self, req: GrpcRequest) -> BoxFuture<'static, GrpcReply>;
+    /// A new call: its `:path`, the first request message, and the
+    /// sink to drive the response. Must not block.
+    fn begin(&self, call_id: u64, req: GrpcRequest, sink: GrpcResponseSink);
+    /// A subsequent client-streamed request message for `call_id`.
+    fn client_message(&self, call_id: u64, message: Bytes);
+    /// The client half-closed the request stream for `call_id`.
+    fn client_end(&self, call_id: u64);
 }
 
 /// Boxed, refcounted handler handle.
 pub type ArcGrpcHandler = Arc<dyn GrpcHandler>;
-
-// Blanket impl so a plain async closure can be a handler — handy
-// for the echo smoke and for Rust-side tests.
-impl<F> GrpcHandler for F
-where
-    F: Fn(GrpcRequest) -> BoxFuture<'static, GrpcReply> + Send + Sync + 'static,
-{
-    fn call(&self, req: GrpcRequest) -> BoxFuture<'static, GrpcReply> {
-        (self)(req)
-    }
-}
 
 // ---------------------------------------------------------------
 // gRPC length-prefix framing.
@@ -159,19 +155,11 @@ pub fn frame_message(message: &[u8]) -> Bytes {
     buf.freeze()
 }
 
-/// Strip the 5-byte gRPC frame header from a *single-message*
-/// request body and return the message bytes. Returns an error if
-/// the body is too short, declares a compressed payload (we don't
-/// negotiate compression), or the declared length doesn't match
-/// what's present.
-///
-/// Unary requests carry exactly one frame; a body shorter than the
-/// declared length is a truncated/streaming frame this unary path
-/// rejects (streaming is `.23`).
+/// Strip the 5-byte gRPC frame header from a *single-message* body
+/// and return the message bytes. Retained for tests and ad-hoc
+/// callers; the serve path uses the incremental [`BodyReader`].
 pub fn deframe_message(body: &[u8]) -> Result<Bytes, String> {
     if body.is_empty() {
-        // No frame at all — treat as an empty message. Some clients
-        // send a header-only body for no-arg RPCs.
         return Ok(Bytes::new());
     }
     if body.len() < 5 {
@@ -192,47 +180,101 @@ pub fn deframe_message(body: &[u8]) -> Result<Bytes, String> {
             rest.len()
         ));
     }
-    // Exactly one frame for unary. Trailing bytes would be a second
-    // frame (client streaming) — out of scope here.
     Ok(Bytes::copy_from_slice(&rest[..len]))
 }
 
+/// Try to split one complete gRPC message off the front of `buf`.
+/// Returns `Ok(None)` if more bytes are needed, `Ok(Some(msg))` on a
+/// full frame (consuming it), or `Err` on a compressed frame.
+fn try_take_message(buf: &mut BytesMut) -> Result<Option<Bytes>, String> {
+    if buf.len() < 5 {
+        return Ok(None);
+    }
+    let flag = buf[0];
+    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    if buf.len() < 5 + len {
+        return Ok(None);
+    }
+    let _ = buf.split_to(5);
+    let msg = buf.split_to(len).freeze();
+    if flag != 0 {
+        return Err("grpc: compressed request frames are not supported".into());
+    }
+    Ok(Some(msg))
+}
+
+/// Incremental re-framer over an HTTP/2 request body: yields one gRPC
+/// message at a time, de-framing across DATA-frame boundaries.
+struct BodyReader {
+    body: Incoming,
+    buf: BytesMut,
+    eof: bool,
+}
+
+impl BodyReader {
+    fn new(body: Incoming) -> Self {
+        Self {
+            body,
+            buf: BytesMut::new(),
+            eof: false,
+        }
+    }
+
+    /// Next complete gRPC message, or `None` at end of stream.
+    async fn next_message(&mut self) -> Result<Option<Bytes>, String> {
+        loop {
+            if let Some(m) = try_take_message(&mut self.buf)? {
+                return Ok(Some(m));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            match self.body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        self.buf.put_slice(&data);
+                    }
+                    // TRAILERS frames on the request side carry no
+                    // message payload — ignore.
+                }
+                Some(Err(e)) => return Err(format!("grpc: request body error: {e}")),
+                None => {
+                    self.eof = true;
+                    if self.buf.is_empty() {
+                        return Ok(None);
+                    }
+                    // Leftover bytes that don't form a full frame:
+                    // a truncated request. Surface it once.
+                    return Err("grpc: truncated request frame at end of stream".into());
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------
-// Response body that carries one DATA frame then gRPC trailers.
+// Response body: drains the sink's mpsc channel into DATA frames
+// then a TRAILERS frame.
 // ---------------------------------------------------------------
 
-/// A minimal [`http_body::Body`] that yields the framed response
-/// message as a single DATA frame, then a TRAILERS frame carrying
+/// A minimal [`http_body::Body`] that yields each queued response
+/// message as a framed DATA frame, then a TRAILERS frame carrying
 /// `grpc-status` (and optional `grpc-message`).
 ///
-/// hyper sends trailers on HTTP/2 automatically when the body's
-/// final `poll_frame` returns `Frame::trailers(..)` — this is the
-/// piece the plain HTTP path never used.
+/// hyper sends trailers on HTTP/2 automatically when the body's final
+/// `poll_frame` returns `Frame::trailers(..)`. If the sink is dropped
+/// without an explicit close we synthesise an UNKNOWN(2) status so the
+/// client always gets a well-formed trailers response.
 pub struct GrpcBody {
-    /// `Some` until the DATA frame has been emitted.
-    data: Option<Bytes>,
-    /// `Some` until the TRAILERS frame has been emitted.
-    trailers: Option<HeaderMap>,
+    rx: mpsc::UnboundedReceiver<GrpcFrame>,
+    /// Set once a TRAILERS frame has been emitted — the stream then
+    /// ends on the next poll.
+    ended: bool,
 }
 
 impl GrpcBody {
-    fn new(reply: &GrpcReply) -> Self {
-        let mut trailers = HeaderMap::new();
-        // grpc-status is the canonical out-of-band status code.
-        trailers.insert(
-            HeaderName::from_static("grpc-status"),
-            HeaderValue::from_str(&reply.status.to_string())
-                .unwrap_or_else(|_| HeaderValue::from_static("2")), // 2 = UNKNOWN
-        );
-        if let Some(msg) = &reply.error {
-            if let Ok(v) = HeaderValue::from_str(&pct_encode_grpc_message(msg)) {
-                trailers.insert(HeaderName::from_static("grpc-message"), v);
-            }
-        }
-        Self {
-            data: Some(frame_message(&reply.message)),
-            trailers: Some(trailers),
-        }
+    fn new(rx: mpsc::UnboundedReceiver<GrpcFrame>) -> Self {
+        Self { rx, ended: false }
     }
 }
 
@@ -242,31 +284,57 @@ impl Body for GrpcBody {
 
     fn poll_frame(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        // DATA frame first.
-        if let Some(data) = this.data.take() {
-            return Poll::Ready(Some(Ok(Frame::data(data))));
+        if this.ended {
+            return Poll::Ready(None);
         }
-        // Then the trailers frame — this is what makes hyper emit
-        // the gRPC status on the wire.
-        if let Some(trailers) = this.trailers.take() {
-            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        match this.rx.poll_recv(cx) {
+            Poll::Ready(Some(GrpcFrame::Message(bytes))) => {
+                Poll::Ready(Some(Ok(Frame::data(frame_message(&bytes)))))
+            }
+            Poll::Ready(Some(GrpcFrame::Trailers { status, message })) => {
+                this.ended = true;
+                Poll::Ready(Some(Ok(Frame::trailers(build_trailers(status, message)))))
+            }
+            // Sink dropped without an explicit close — synthesise a
+            // status so the wire is never a torn stream.
+            Poll::Ready(None) => {
+                this.ended = true;
+                Poll::Ready(Some(Ok(Frame::trailers(build_trailers(
+                    2,
+                    Some("handler closed stream without status".into()),
+                )))))
+            }
+            Poll::Pending => Poll::Pending,
         }
-        Poll::Ready(None)
     }
 
     fn is_end_stream(&self) -> bool {
-        self.data.is_none() && self.trailers.is_none()
+        self.ended
     }
 
     fn size_hint(&self) -> SizeHint {
-        // Only the DATA frame contributes to the byte length;
-        // trailers aren't counted by `SizeHint`.
-        let len = self.data.as_ref().map(|d| d.len() as u64).unwrap_or(0);
-        SizeHint::with_exact(len)
+        // Length is unknown for a streamed body.
+        SizeHint::default()
     }
+}
+
+/// Build the gRPC trailers HeaderMap.
+fn build_trailers(status: u32, message: Option<String>) -> HeaderMap {
+    let mut trailers = HeaderMap::new();
+    trailers.insert(
+        HeaderName::from_static("grpc-status"),
+        HeaderValue::from_str(&status.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("2")), // 2 = UNKNOWN
+    );
+    if let Some(msg) = message {
+        if let Ok(v) = HeaderValue::from_str(&pct_encode_grpc_message(&msg)) {
+            trailers.insert(HeaderName::from_static("grpc-message"), v);
+        }
+    }
+    trailers
 }
 
 /// Percent-encode a `grpc-message` per the gRPC spec: any byte
@@ -289,11 +357,18 @@ fn pct_encode_grpc_message(s: &str) -> String {
 // Per-request handling + accept loop.
 // ---------------------------------------------------------------
 
-/// Build the framed HTTP/2 response for one unary call. Always a
-/// `200` HTTP status with `content-type: application/grpc`; the
-/// gRPC status rides in the trailers via [`GrpcBody`].
-fn build_response(reply: &GrpcReply) -> Response<GrpcBody> {
-    let mut resp = Response::new(GrpcBody::new(reply));
+/// Process-unique call ids correlate the three handler callbacks of
+/// one call (and double as the handle the Scheme bridge exposes).
+fn next_call_id() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Build the framed HTTP/2 response shell for a call: always a `200`
+/// HTTP status with `content-type: application/grpc`; the gRPC status
+/// rides in the trailers via [`GrpcBody`].
+fn build_response(rx: mpsc::UnboundedReceiver<GrpcFrame>) -> Response<GrpcBody> {
+    let mut resp = Response::new(GrpcBody::new(rx));
     *resp.status_mut() = http::StatusCode::OK;
     resp.headers_mut().insert(
         http::header::CONTENT_TYPE,
@@ -302,43 +377,74 @@ fn build_response(reply: &GrpcReply) -> Response<GrpcBody> {
     resp
 }
 
-/// Handle a single HTTP/2 request as a unary gRPC call: read the
-/// `:path`, collect + de-frame the request body, dispatch to the
-/// handler, and frame the reply (DATA + trailers). De-framing
-/// errors map to gRPC `INTERNAL` (13) with a `grpc-message`, so the
-/// client always gets a well-formed trailers response rather than a
-/// torn stream.
-async fn handle_unary(
+/// Handle a single HTTP/2 request as a (possibly streaming) gRPC call.
+///
+/// Reads the FIRST request message, hands it + a response sink to the
+/// handler via `begin`, returns the streaming response shell, and
+/// spawns a task to drain the rest of the request body into
+/// `client_message` / `client_end`. Framing errors map to gRPC
+/// `INTERNAL` (13) so the client gets a clean trailers response.
+async fn handle_call(
     handler: ArcGrpcHandler,
     req: http::Request<Incoming>,
 ) -> Result<Response<GrpcBody>, Infallible> {
     let path = req.uri().path().to_string();
-    let collected = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
+    let call_id = next_call_id();
+    let (tx, rx) = mpsc::unbounded_channel::<GrpcFrame>();
+    let sink = GrpcResponseSink { tx };
+
+    let mut reader = BodyReader::new(req.into_body());
+    let first = match reader.next_message().await {
+        Ok(Some(msg)) => msg,
+        // Headers-only / empty body: deliver an empty first message
+        // (matches the old unary no-arg behaviour).
+        Ok(None) => Bytes::new(),
         Err(e) => {
-            return Ok(build_response(&GrpcReply::error(
-                13, // INTERNAL
-                format!("read request body: {e}"),
-            )));
+            // Malformed framing: close immediately with INTERNAL.
+            let _ = sink.close(13, Some(e));
+            return Ok(build_response(rx));
         }
     };
-    let message = match deframe_message(&collected) {
-        Ok(m) => m,
-        Err(e) => {
-            return Ok(build_response(&GrpcReply::error(13, e)));
+
+    handler.begin(
+        call_id,
+        GrpcRequest {
+            path,
+            message: first,
+        },
+        sink,
+    );
+
+    // Drain the remainder of the request body concurrently with the
+    // response. Subsequent messages → client_message; EOF → client_end.
+    let h = Arc::clone(&handler);
+    tokio::spawn(async move {
+        loop {
+            match reader.next_message().await {
+                Ok(Some(msg)) => h.client_message(call_id, msg),
+                Ok(None) => {
+                    h.client_end(call_id);
+                    break;
+                }
+                Err(_) => {
+                    h.client_end(call_id);
+                    break;
+                }
+            }
         }
-    };
-    let reply = handler.call(GrpcRequest { path, message }).await;
-    Ok(build_response(&reply))
+    });
+
+    Ok(build_response(rx))
 }
 
 /// Run an h2c (prior-knowledge HTTP/2) accept loop on `listener`,
-/// dispatching every request to `handler` as a unary gRPC call.
+/// dispatching every request to `handler` as a (possibly streaming)
+/// gRPC call.
 ///
 /// Each accepted TCP connection is served on its own tokio task by
 /// `http2::Builder` — no ALPN, no TLS; the client must open with
-/// HTTP/2 prior knowledge (this is what gRPC clients do for an
-/// `insecure` / h2c target).
+/// HTTP/2 prior knowledge (what gRPC clients do for an `insecure` /
+/// h2c target).
 ///
 /// `shutdown` is an optional future that, when it resolves, breaks
 /// the accept loop. Returns the number of connections accepted.
@@ -375,7 +481,7 @@ where
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req: http::Request<Incoming>| {
                 let handler = Arc::clone(&handler);
-                async move { handle_unary(handler, req).await }
+                async move { handle_call(handler, req).await }
             });
             // Prior-knowledge h2c: serve HTTP/2 directly on the
             // cleartext socket. `TokioExecutor` lets request futures
@@ -424,14 +530,12 @@ mod tests {
 
     #[test]
     fn deframe_rejects_compressed() {
-        // compressed-flag = 1
         let framed = [1u8, 0, 0, 0, 1, 0xAA];
         assert!(deframe_message(&framed).is_err());
     }
 
     #[test]
     fn deframe_rejects_truncated_length() {
-        // declares 4 bytes but only 1 present
         let framed = [0u8, 0, 0, 0, 4, 0xAA];
         assert!(deframe_message(&framed).is_err());
     }
@@ -443,26 +547,58 @@ mod tests {
         assert_eq!(pct_encode_grpc_message("100%"), "100%25");
     }
 
+    // Re-framer: two messages packed into one buffer, plus a message
+    // split across appends.
+    #[test]
+    fn try_take_message_splits_frames() {
+        let mut buf = BytesMut::new();
+        buf.put_slice(&frame_message(b"aa"));
+        buf.put_slice(&frame_message(b"bbb"));
+        let m1 = try_take_message(&mut buf).unwrap().unwrap();
+        assert_eq!(&m1[..], b"aa");
+        let m2 = try_take_message(&mut buf).unwrap().unwrap();
+        assert_eq!(&m2[..], b"bbb");
+        assert!(try_take_message(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn try_take_message_waits_for_full_payload() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0);
+        buf.put_u32(4);
+        buf.put_slice(b"ab"); // only 2 of 4 payload bytes
+        assert!(try_take_message(&mut buf).unwrap().is_none());
+        buf.put_slice(b"cd");
+        let m = try_take_message(&mut buf).unwrap().unwrap();
+        assert_eq!(&m[..], b"abcd");
+    }
+
+    // GrpcBody drains messages then trailers from the sink channel.
     #[tokio::test]
-    async fn grpc_body_emits_data_then_trailers() {
-        let reply = GrpcReply::ok(Bytes::from_static(b"hi"));
-        let mut body = GrpcBody::new(&reply);
-        // First frame: DATA = framed("hi").
+    async fn grpc_body_streams_messages_then_trailers() {
+        let (tx, rx) = mpsc::unbounded_channel::<GrpcFrame>();
+        let sink = GrpcResponseSink { tx };
+        let mut body = GrpcBody::new(rx);
+        assert!(sink.send_message(Bytes::from_static(b"one")));
+        assert!(sink.send_message(Bytes::from_static(b"two")));
+        assert!(sink.close(0, None));
+
         let f1 = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
             .await
             .unwrap()
             .unwrap();
-        assert!(f1.is_data());
-        assert_eq!(&f1.into_data().unwrap()[..], &frame_message(b"hi")[..]);
-        // Second frame: TRAILERS with grpc-status: 0.
+        assert_eq!(&f1.into_data().unwrap()[..], &frame_message(b"one")[..]);
         let f2 = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
             .await
             .unwrap()
             .unwrap();
-        assert!(f2.is_trailers());
-        let t = f2.into_trailers().unwrap();
+        assert_eq!(&f2.into_data().unwrap()[..], &frame_message(b"two")[..]);
+        let f3 = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let t = f3.into_trailers().unwrap();
         assert_eq!(t.get("grpc-status").unwrap(), "0");
-        // Stream ends.
         assert!(
             std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
                 .await
@@ -472,24 +608,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_body_error_carries_message_trailer() {
-        // Embed a newline to prove control bytes get percent-encoded
-        // (a raw \n in a header value would be illegal). Printable
-        // ASCII incl. space is left as-is, matching grpc-go.
-        let reply = GrpcReply::error(5, "not found\n"); // 5 = NOT_FOUND
-        let mut body = GrpcBody::new(&reply);
-        // DATA frame (empty message → just the 5-byte header).
-        let f1 = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+    async fn grpc_body_error_close_carries_message_trailer() {
+        let (tx, rx) = mpsc::unbounded_channel::<GrpcFrame>();
+        let sink = GrpcResponseSink { tx };
+        let mut body = GrpcBody::new(rx);
+        assert!(sink.close(5, Some("not found\n".into()))); // 5 = NOT_FOUND
+        let f = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
             .await
             .unwrap()
             .unwrap();
-        assert!(f1.is_data());
-        let f2 = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
-            .await
-            .unwrap()
-            .unwrap();
-        let t = f2.into_trailers().unwrap();
+        let t = f.into_trailers().unwrap();
         assert_eq!(t.get("grpc-status").unwrap(), "5");
         assert_eq!(t.get("grpc-message").unwrap(), "not found%0A");
+    }
+
+    // Dropping the sink without closing still yields a status trailer.
+    #[tokio::test]
+    async fn grpc_body_synthesises_status_on_drop() {
+        let (tx, rx) = mpsc::unbounded_channel::<GrpcFrame>();
+        let sink = GrpcResponseSink { tx };
+        let mut body = GrpcBody::new(rx);
+        drop(sink);
+        let f = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let t = f.into_trailers().unwrap();
+        assert_eq!(t.get("grpc-status").unwrap(), "2");
     }
 }

@@ -13,146 +13,140 @@
 //! The cs-runtime evaluator is `!Send`, so a Scheme procedure can't
 //! be called directly from hyper's multi-thread tokio task. We use
 //! the same bridge cs-web uses for dynamic HTTP handlers: each gRPC
-//! request becomes a mailbox message to a Scheme **actor**. The
+//! call/message becomes a mailbox message to a Scheme **actor**. The
 //! actor's `(raw-receive)` loop sees `('*grpc-request* <handle>)`,
-//! reads the method path + request bytes, dispatches, and ships the
-//! response back through a respond primop.
+//! reads the method path + request bytes, dispatches, and drives the
+//! response through the respond/stream primops.
 //!
 //! ## Surface
 //!
 //! ```ignore
 //! ; Start an h2c gRPC server. `addr` is "host:port" (port 0 lets
-//! ; the OS pick). `handler-pid` is a spawned actor that will
-//! ; receive one ('*grpc-request* h) message per unary call.
-//! ; Returns an integer server handle.
+//! ; the OS pick). `handler-pid` is a spawned actor that receives a
+//! ; ('*grpc-request* h) per call. Returns an integer server handle.
 //! (grpc-serve "127.0.0.1:2379" handler-pid)        => 1
-//! (grpc-serve "127.0.0.1:0"    handler-pid 5000)   => 2   ; opt. reply-timeout-ms
+//! (grpc-serve "127.0.0.1:0"    handler-pid 5000)   => 2  ; opt arg accepted (unused)
 //!
 //! ; Stop the server. Idempotent.
 //! (grpc-server-stop sid)
 //!
-//! ; --- inside the handler actor, on ('*grpc-request* h) ---
+//! ; --- inside the handler actor ---
+//! ; ('*grpc-request*    h)       first/only client message of a call
+//! ; ('*grpc-stream-msg* h bytes) a subsequent client-streamed message (bidi)
+//! ; ('*grpc-stream-end* h)       the client half-closed the request stream
 //! (grpc-request-path  h)   => "/etcdserverpb.KV/Range"   ; the :path
-//! (grpc-request-bytes h)   => #u8(...)                    ; de-framed request protobuf
+//! (grpc-request-bytes h)   => #u8(...)                    ; FIRST request message
 //!
-//! ; Reply OK (status 0) with response protobuf bytes. Frames the
-//! ; response + sends the grpc-status: 0 trailer. Consumes h.
+//! ; UNARY: one response message + grpc-status:0 trailer; consumes h.
 //! (grpc-respond! h response-bytevector)
-//!
-//! ; Reply with a non-OK gRPC status + grpc-message. No payload.
-//! ; e.g. 5 = NOT_FOUND, 13 = INTERNAL, 14 = UNAVAILABLE.
+//! ; UNARY error: a non-OK grpc-status + grpc-message; consumes h.
 //! (grpc-respond-error! h 5 "key not found")
+//!
+//! ; STREAMING: queue one response message (does NOT consume h) ->
+//! ; returns #t, or #f if the client already hung up.
+//! (grpc-stream-send! h response-bytevector)        => #t|#f
+//! ; STREAMING: end the response stream with trailers; consumes h.
+//! (grpc-stream-close! h)                  ; status 0
+//! (grpc-stream-close! h 14 "no leader")   ; status + grpc-message
 //! ```
-//!
-//! ## How streaming (.23) extends this
-//!
-//! Unary delivers one `('*grpc-request* h)` and expects one
-//! `grpc-respond!`. A server-streaming / bidi RPC keeps the same
-//! delivery but swaps the single reply for a stream: the actor
-//! would call a `grpc-stream-send!` primop repeatedly (each pushes
-//! one framed message onto an mpsc-backed response body) then
-//! `grpc-stream-close!` to flush the trailers. The transport seam
-//! for that already exists in `cs_web::grpc` (see its module docs);
-//! only the response-body source changes.
 
 #![cfg(feature = "grpc")]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 use cs_actor::{ActorPid, Payload};
 use cs_core::{SymbolTable, Value};
 
 use cs_web::grpc::{
-    bind_grpc, serve_grpc, ArcGrpcHandler, BoxFuture, GrpcHandler, GrpcReply, GrpcRequest,
+    bind_grpc, serve_grpc, ArcGrpcHandler, GrpcHandler, GrpcRequest, GrpcResponseSink,
 };
 use cs_web::Bytes;
 
 use crate::builtins::beam::SendableValue;
 
 // ---------------------------------------------------------------
-// Envelope: a gRPC request crossing from hyper's task to a Scheme
-// actor's mailbox, plus the reply channel back.
+// Envelopes: a gRPC call event crossing from hyper's task to a
+// Scheme actor's mailbox.
 // ---------------------------------------------------------------
 
-/// What a Scheme handler ships back through the reply channel.
-struct GrpcReplyMsg {
-    status: u32,
-    message: Bytes,
-    error: Option<String>,
-}
-
-/// One in-flight unary gRPC request. Mirrors `cs_web::actor::WebMessage`:
-/// the request data plus a `Mutex<Option<oneshot::Sender>>` so the
-/// envelope can cross the `Arc<dyn Any + Send + Sync>` payload
-/// boundary (oneshot senders are `Send` but not `Sync`).
-pub struct GrpcMessage {
+/// A new call: the first request message + the sink driving the
+/// response. The sink (`Clone + Send + Sync`) is stashed in the
+/// registry so the respond/stream primops can reach it by handle.
+struct GrpcBeginMsg {
+    call_id: i64,
     path: String,
     message: Bytes,
-    reply: Mutex<Option<tokio::sync::oneshot::Sender<GrpcReplyMsg>>>,
+    sink: GrpcResponseSink,
 }
 
-impl GrpcMessage {
-    fn reply_with(&self, msg: GrpcReplyMsg) -> bool {
-        if let Some(tx) = self.reply.lock().expect("grpc reply lock poisoned").take() {
-            tx.send(msg).is_ok()
-        } else {
-            false
-        }
-    }
+/// A subsequent client-streamed request message (bidi).
+struct GrpcStreamMsg {
+    call_id: i64,
+    message: Bytes,
+}
+
+/// The client half-closed the request stream.
+struct GrpcStreamEnd {
+    call_id: i64,
+}
+
+/// One in-flight call's response state, keyed by the handle Scheme
+/// sees. `grpc-respond!` / `grpc-respond-error!` / `grpc-stream-close!`
+/// consume the entry; `grpc-stream-send!` leaves it in place.
+struct StreamSlot {
+    path: String,
+    first_message: Bytes,
+    sink: GrpcResponseSink,
 }
 
 // ---------------------------------------------------------------
-// Handler: sends each request to a Scheme actor and awaits reply.
+// Handler: forwards every call event to a Scheme actor's mailbox.
 // ---------------------------------------------------------------
 
-/// A [`GrpcHandler`] that forwards every unary call to a Scheme
-/// actor's mailbox and waits up to `timeout` for the actor to
-/// respond. Slow / dead actors map to gRPC status codes the client
-/// understands (DEADLINE_EXCEEDED / UNAVAILABLE / INTERNAL) rather
-/// than a torn stream.
+/// A [`GrpcHandler`] that forwards every call event to a Scheme
+/// actor's mailbox. The Scheme side drives the response asynchronously
+/// through the sink (no server-side reply timeout — gRPC deadlines are
+/// client-driven; a dead handler simply never produces frames and the
+/// client's deadline fires).
 struct ActorGrpcHandler {
     target: cs_actor::ActorRef,
-    timeout: Duration,
 }
 
 impl GrpcHandler for ActorGrpcHandler {
-    fn call(&self, req: GrpcRequest) -> BoxFuture<'static, GrpcReply> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let envelope = Arc::new(GrpcMessage {
+    fn begin(&self, call_id: u64, req: GrpcRequest, sink: GrpcResponseSink) {
+        let envelope = Arc::new(GrpcBeginMsg {
+            call_id: call_id as i64,
             path: req.path,
             message: req.message,
-            reply: Mutex::new(Some(tx)),
+            sink: sink.clone(),
         });
         let payload: Payload = envelope;
-        let send_result = self.target.send(payload);
-        let timeout = self.timeout;
-        Box::pin(async move {
-            if let Err(e) = send_result {
-                // 14 = UNAVAILABLE — the handler actor's mailbox is
-                // closed (terminated).
-                return GrpcReply::error(14, format!("grpc handler actor send failed: {e}"));
-            }
-            match tokio::time::timeout(timeout, rx).await {
-                Ok(Ok(r)) => GrpcReply {
-                    status: r.status,
-                    message: r.message,
-                    error: r.error,
-                },
-                // 13 = INTERNAL — actor dropped the reply channel
-                // without responding.
-                Ok(Err(_)) => GrpcReply::error(13, "grpc handler dropped reply channel"),
-                // 4 = DEADLINE_EXCEEDED.
-                Err(_) => GrpcReply::error(4, "grpc handler reply timeout"),
-            }
-        })
+        if self.target.send(payload).is_err() {
+            // 14 = UNAVAILABLE — the handler actor's mailbox is closed.
+            sink.close(14, Some("grpc handler actor unavailable".into()));
+        }
+    }
+
+    fn client_message(&self, call_id: u64, message: Bytes) {
+        let envelope = Arc::new(GrpcStreamMsg {
+            call_id: call_id as i64,
+            message,
+        });
+        let _ = self.target.send(envelope as Payload);
+    }
+
+    fn client_end(&self, call_id: u64) {
+        let envelope = Arc::new(GrpcStreamEnd {
+            call_id: call_id as i64,
+        });
+        let _ = self.target.send(envelope as Payload);
     }
 }
 
 // ---------------------------------------------------------------
-// Registry: running servers + the request slab.
+// Registry: running servers + the in-flight call slab.
 // ---------------------------------------------------------------
 
 enum Slot {
@@ -167,11 +161,9 @@ enum Slot {
 struct Registry {
     next_id: i64,
     slots: HashMap<i64, Slot>,
-    /// In-flight request envelopes, keyed by the handle Scheme sees
-    /// in `('*grpc-request* <handle>)`. `grpc-respond!` /
-    /// `grpc-respond-error!` consume the entry.
-    requests: HashMap<i64, Arc<GrpcMessage>>,
-    next_request_id: i64,
+    /// In-flight calls, keyed by the transport-assigned `call_id`
+    /// (which is the handle Scheme sees in `('*grpc-request* h)`).
+    requests: HashMap<i64, StreamSlot>,
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -181,7 +173,6 @@ fn registry() -> &'static Mutex<Registry> {
             next_id: 1,
             slots: HashMap::new(),
             requests: HashMap::new(),
-            next_request_id: 1,
         })
     })
 }
@@ -194,8 +185,6 @@ fn lock() -> std::sync::MutexGuard<'static, Registry> {
 // Background tokio runtime. Shared with the same rationale as
 // cs-web: the Scheme caller is `!Send` and can't sit on a tokio
 // task, so gRPC servers run on a dedicated multi-thread runtime.
-// (Kept separate from cs-web's so enabling `grpc` without `web`
-// still works.)
 // ---------------------------------------------------------------
 
 fn rt() -> &'static tokio::runtime::Runtime {
@@ -239,9 +228,7 @@ fn value_to_i64(v: &Value, who: &str) -> Result<i64, String> {
 fn value_to_bytes(v: &Value, who: &str) -> Result<Bytes, String> {
     match v {
         Value::ByteVector(b) => Ok(Bytes::copy_from_slice(&b.borrow())),
-        // A string is accepted as a convenience (UTF-8 bytes) — gRPC
-        // payloads are usually bytevectors, but an echo of text is
-        // handy.
+        // A string is accepted as a convenience (UTF-8 bytes).
         Value::String(g) => Ok(Bytes::from(g.borrow().clone().into_bytes())),
         other => Err(format!(
             "{}: expected bytevector, got {}",
@@ -283,16 +270,13 @@ fn value_to_pid(v: &Value, syms: &SymbolTable, who: &str) -> Result<ActorPid, St
 // Server lifecycle.
 // ---------------------------------------------------------------
 
-fn primop_serve(addr: &str, pid: ActorPid, timeout_ms: u64) -> Result<(i64, String), String> {
+fn primop_serve(addr: &str, pid: ActorPid) -> Result<(i64, String), String> {
     let addr: SocketAddr = addr
         .parse()
         .map_err(|e| format!("grpc-serve: invalid addr {:?}: {}", addr, e))?;
     let actor_ref = crate::builtins::beam::lookup_pid(pid)
         .ok_or_else(|| format!("grpc-serve: handler actor {} not found (terminated?)", pid))?;
-    let handler: ArcGrpcHandler = Arc::new(ActorGrpcHandler {
-        target: actor_ref,
-        timeout: Duration::from_millis(timeout_ms),
-    });
+    let handler: ArcGrpcHandler = Arc::new(ActorGrpcHandler { target: actor_ref });
 
     // Bind synchronously so the Scheme caller sees bind errors
     // immediately (e.g. address in use), not from a detached task.
@@ -336,79 +320,117 @@ fn primop_server_stop(sid: i64) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------
-// Request bridge: intern an incoming GrpcMessage, expose its data,
-// consume it on respond.
+// Request bridge: intern an incoming call event, expose its data,
+// drive the response.
 // ---------------------------------------------------------------
 
-/// Called by `beam::message_to_sendable` when a User payload isn't
-/// a plain `SendableValue`. If it's a [`GrpcMessage`], stash it and
-/// return the tagged pair `('*grpc-request* <handle>)` the Scheme
-/// actor pattern-matches. Returns `None` for other payloads so the
-/// caller can keep trying (e.g. the web bridge).
+/// Called by `beam::message_to_sendable` when a User payload isn't a
+/// plain `SendableValue`. Recognises the three gRPC call envelopes and
+/// returns the tagged pair the Scheme actor pattern-matches. A
+/// [`GrpcBeginMsg`] also stashes the call's [`StreamSlot`]. Returns
+/// `None` for other payloads so the caller can keep trying.
 pub fn try_intern_grpc_request(payload: &Payload) -> Option<SendableValue> {
-    let msg: Arc<GrpcMessage> = Arc::clone(payload).downcast::<GrpcMessage>().ok()?;
-    let mut reg = lock();
-    let id = reg.next_request_id;
-    reg.next_request_id += 1;
-    reg.requests.insert(id, msg);
-    Some(SendableValue::Pair(
-        Box::new(SendableValue::Symbol("*grpc-request*".into())),
-        Box::new(SendableValue::Pair(
-            Box::new(SendableValue::Fixnum(id)),
-            Box::new(SendableValue::Null),
-        )),
-    ))
+    if let Ok(begin) = Arc::clone(payload).downcast::<GrpcBeginMsg>() {
+        let mut reg = lock();
+        reg.requests.insert(
+            begin.call_id,
+            StreamSlot {
+                path: begin.path.clone(),
+                first_message: begin.message.clone(),
+                sink: begin.sink.clone(),
+            },
+        );
+        return Some(tagged("*grpc-request*", begin.call_id, None));
+    }
+    if let Ok(m) = Arc::clone(payload).downcast::<GrpcStreamMsg>() {
+        return Some(tagged(
+            "*grpc-stream-msg*",
+            m.call_id,
+            Some(m.message.to_vec()),
+        ));
+    }
+    if let Ok(e) = Arc::clone(payload).downcast::<GrpcStreamEnd>() {
+        return Some(tagged("*grpc-stream-end*", e.call_id, None));
+    }
+    None
 }
 
-fn with_request<R>(who: &str, handle: i64, f: impl FnOnce(&GrpcMessage) -> R) -> Result<R, String> {
+/// Build `(tag handle)` or `(tag handle #u8(bytes))`.
+fn tagged(tag: &str, handle: i64, bytes: Option<Vec<u8>>) -> SendableValue {
+    let tail = match bytes {
+        Some(b) => SendableValue::Pair(
+            Box::new(SendableValue::Fixnum(handle)),
+            Box::new(SendableValue::Pair(
+                Box::new(SendableValue::ByteVector(b)),
+                Box::new(SendableValue::Null),
+            )),
+        ),
+        None => SendableValue::Pair(
+            Box::new(SendableValue::Fixnum(handle)),
+            Box::new(SendableValue::Null),
+        ),
+    };
+    SendableValue::Pair(Box::new(SendableValue::Symbol(tag.into())), Box::new(tail))
+}
+
+/// Read a field of a live slot without consuming it.
+fn with_slot<R>(who: &str, handle: i64, f: impl FnOnce(&StreamSlot) -> R) -> Result<R, String> {
     let reg = lock();
-    let msg = reg.requests.get(&handle).ok_or_else(|| {
+    let slot = reg.requests.get(&handle).ok_or_else(|| {
         format!(
-            "{}: grpc request #{} not found (already responded?)",
+            "{}: grpc call #{} not found (already responded/closed?)",
             who, handle
         )
     })?;
-    Ok(f(msg.as_ref()))
+    Ok(f(slot))
 }
 
-fn take_request(who: &str, handle: i64) -> Result<Arc<GrpcMessage>, String> {
-    lock().requests.remove(&handle).ok_or_else(|| {
-        format!(
-            "{}: grpc request #{} not found (already responded?)",
-            who, handle
-        )
-    })
+/// Remove and return a call's sink (ending the call's lifecycle).
+fn take_slot(who: &str, handle: i64) -> Result<GrpcResponseSink, String> {
+    lock()
+        .requests
+        .remove(&handle)
+        .map(|s| s.sink)
+        .ok_or_else(|| {
+            format!(
+                "{}: grpc call #{} not found (already responded/closed?)",
+                who, handle
+            )
+        })
 }
 
 fn primop_request_path(handle: i64) -> Result<String, String> {
-    with_request("grpc-request-path", handle, |m| m.path.clone())
+    with_slot("grpc-request-path", handle, |s| s.path.clone())
 }
 
 fn primop_request_bytes(handle: i64) -> Result<Vec<u8>, String> {
-    with_request("grpc-request-bytes", handle, |m| m.message.to_vec())
+    with_slot("grpc-request-bytes", handle, |s| s.first_message.to_vec())
 }
 
 fn primop_respond(handle: i64, message: Bytes) -> Result<(), String> {
-    let msg = take_request("grpc-respond!", handle)?;
-    if !msg.reply_with(GrpcReplyMsg {
-        status: 0,
-        message,
-        error: None,
-    }) {
-        return Err("grpc-respond!: reply channel already consumed".into());
-    }
+    let sink = take_slot("grpc-respond!", handle)?;
+    sink.send_message(message);
+    sink.close(0, None);
     Ok(())
 }
 
 fn primop_respond_error(handle: i64, status: u32, message: String) -> Result<(), String> {
-    let msg = take_request("grpc-respond-error!", handle)?;
-    if !msg.reply_with(GrpcReplyMsg {
-        status,
-        message: Bytes::new(),
-        error: Some(message),
-    }) {
-        return Err("grpc-respond-error!: reply channel already consumed".into());
-    }
+    let sink = take_slot("grpc-respond-error!", handle)?;
+    sink.close(status, Some(message));
+    Ok(())
+}
+
+/// Queue one streaming response message. Returns whether the client is
+/// still attached (false once it hangs up) so the handler can stop.
+fn primop_stream_send(handle: i64, message: Bytes) -> Result<bool, String> {
+    with_slot("grpc-stream-send!", handle, |s| {
+        s.sink.send_message(message)
+    })
+}
+
+fn primop_stream_close(handle: i64, status: u32, message: Option<String>) -> Result<(), String> {
+    let sink = take_slot("grpc-stream-close!", handle)?;
+    sink.close(status, message);
     Ok(())
 }
 
@@ -433,16 +455,13 @@ pub fn b_grpc_serve(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Str
     }
     let addr = value_to_str(&args[0], syms, "grpc-serve")?;
     let pid = value_to_pid(&args[1], syms, "grpc-serve")?;
-    let timeout_ms = if args.len() == 3 {
-        let n = value_to_i64(&args[2], "grpc-serve")?;
-        if n < 0 {
-            return Err("grpc-serve: timeout-ms must be non-negative".into());
-        }
-        n as u64
-    } else {
-        30_000
-    };
-    let (id, _bound) = primop_serve(&addr, pid, timeout_ms)?;
+    // The optional 3rd arg (legacy reply-timeout-ms) is accepted for
+    // backward compatibility but unused — streaming has no single
+    // reply to time out; gRPC deadlines are client-driven.
+    if args.len() == 3 {
+        let _ = value_to_i64(&args[2], "grpc-serve")?;
+    }
+    let (id, _bound) = primop_serve(&addr, pid)?;
     Ok(Value::Number(cs_core::Number::Fixnum(id)))
 }
 
@@ -513,6 +532,47 @@ pub fn b_grpc_respond_error(args: &[Value], syms: &mut SymbolTable) -> Result<Va
     Ok(Value::Unspecified)
 }
 
+pub fn b_grpc_stream_send(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "grpc-stream-send!: expected 2 arguments (handle response-bytes), got {}",
+            args.len()
+        ));
+    }
+    let h = value_to_i64(&args[0], "grpc-stream-send!")?;
+    let bytes = value_to_bytes(&args[1], "grpc-stream-send!")?;
+    Ok(Value::Boolean(primop_stream_send(h, bytes)?))
+}
+
+pub fn b_grpc_stream_close(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(format!(
+            "grpc-stream-close!: expected 1 to 3 arguments (handle [status [message]]), got {}",
+            args.len()
+        ));
+    }
+    let h = value_to_i64(&args[0], "grpc-stream-close!")?;
+    let status = if args.len() >= 2 {
+        let s = value_to_i64(&args[1], "grpc-stream-close!")?;
+        if !(0..=u32::MAX as i64).contains(&s) {
+            return Err(format!(
+                "grpc-stream-close!: status {} out of range 0..4294967295",
+                s
+            ));
+        }
+        s as u32
+    } else {
+        0
+    };
+    let message = if args.len() == 3 {
+        Some(value_to_str(&args[2], syms, "grpc-stream-close!")?)
+    } else {
+        None
+    };
+    primop_stream_close(h, status, message)?;
+    Ok(Value::Unspecified)
+}
+
 pub fn grpc_syms_builtins() -> Vec<(
     &'static str,
     fn(&[Value], &mut SymbolTable) -> Result<Value, String>,
@@ -524,6 +584,8 @@ pub fn grpc_syms_builtins() -> Vec<(
         ("grpc-request-bytes", b_grpc_request_bytes),
         ("grpc-respond!", b_grpc_respond),
         ("grpc-respond-error!", b_grpc_respond_error),
+        ("grpc-stream-send!", b_grpc_stream_send),
+        ("grpc-stream-close!", b_grpc_stream_close),
     ]
 }
 
@@ -531,74 +593,54 @@ pub fn grpc_syms_builtins() -> Vec<(
 mod tests {
     use super::*;
 
-    // Build a GrpcMessage envelope by hand and run it through the
-    // bridge — no server needed. Proves the request slab + respond
-    // path the Scheme actor uses.
+    // The GrpcResponseSink is constructed by the transport (its inner
+    // sender is private), so the Rust-side tests assert the tagged-pair
+    // shapes the bridge hands Scheme — the bridge's contract. The full
+    // begin/stream/respond round-trip is proven end-to-end by the
+    // cs-web hyper-client integration test and the crab-watchstore
+    // etcdctl proof.
     #[test]
-    fn bridge_interns_and_responds() {
-        let (tx, rx) = tokio::sync::oneshot::channel::<GrpcReplyMsg>();
-        let envelope: Arc<GrpcMessage> = Arc::new(GrpcMessage {
-            path: "/etcdserverpb.KV/Range".into(),
-            message: Bytes::from_static(b"req-bytes"),
-            reply: Mutex::new(Some(tx)),
-        });
-        let payload: Payload = envelope;
-
-        let sv = try_intern_grpc_request(&payload).expect("bridge should match");
-        let handle = match sv {
+    fn tagged_request_shape() {
+        let sv = tagged("*grpc-request*", 7, None);
+        match sv {
             SendableValue::Pair(head, tail) => {
                 assert!(matches!(*head, SendableValue::Symbol(ref s) if s == "*grpc-request*"));
                 match *tail {
-                    SendableValue::Pair(boxed_id, _) => match *boxed_id {
-                        SendableValue::Fixnum(n) => n,
-                        _ => panic!("handle not fixnum"),
-                    },
+                    SendableValue::Pair(id, rest) => {
+                        assert!(matches!(*id, SendableValue::Fixnum(7)));
+                        assert!(matches!(*rest, SendableValue::Null));
+                    }
                     _ => panic!("tail not pair"),
                 }
             }
             _ => panic!("not a pair"),
-        };
-
-        assert_eq!(
-            primop_request_path(handle).unwrap(),
-            "/etcdserverpb.KV/Range"
-        );
-        assert_eq!(primop_request_bytes(handle).unwrap(), b"req-bytes");
-
-        // Respond OK; the slot is consumed.
-        primop_respond(handle, Bytes::from_static(b"resp-bytes")).unwrap();
-        let got = rx.blocking_recv().expect("reply");
-        assert_eq!(got.status, 0);
-        assert_eq!(&got.message[..], b"resp-bytes");
-
-        // Second respond / inspect must error — slot was taken.
-        assert!(primop_respond(handle, Bytes::new()).is_err());
-        assert!(primop_request_path(handle).is_err());
+        }
     }
 
     #[test]
-    fn bridge_error_reply() {
-        let (tx, rx) = tokio::sync::oneshot::channel::<GrpcReplyMsg>();
-        let envelope: Arc<GrpcMessage> = Arc::new(GrpcMessage {
-            path: "/etcdserverpb.KV/Put".into(),
-            message: Bytes::new(),
-            reply: Mutex::new(Some(tx)),
-        });
-        let sv = try_intern_grpc_request(&(envelope as Payload)).expect("bridge");
-        let handle = match sv {
-            SendableValue::Pair(_, tail) => match *tail {
-                SendableValue::Pair(boxed_id, _) => match *boxed_id {
-                    SendableValue::Fixnum(n) => n,
-                    _ => panic!(),
-                },
-                _ => panic!(),
-            },
-            _ => panic!(),
-        };
-        primop_respond_error(handle, 5, "key not found".into()).unwrap();
-        let got = rx.blocking_recv().expect("reply");
-        assert_eq!(got.status, 5);
-        assert_eq!(got.error.as_deref(), Some("key not found"));
+    fn tagged_stream_msg_shape() {
+        let sv = tagged("*grpc-stream-msg*", 9, Some(vec![1, 2, 3]));
+        match sv {
+            SendableValue::Pair(head, tail) => {
+                assert!(matches!(*head, SendableValue::Symbol(ref s) if s == "*grpc-stream-msg*"));
+                match *tail {
+                    SendableValue::Pair(id, rest) => {
+                        assert!(matches!(*id, SendableValue::Fixnum(9)));
+                        match *rest {
+                            SendableValue::Pair(bv, nil) => {
+                                assert!(
+                                    matches!(*bv, SendableValue::ByteVector(ref b) if b == &[1,2,3])
+                                );
+                                assert!(matches!(*nil, SendableValue::Null));
+                            }
+                            _ => panic!("no bytevector"),
+                        }
+                    }
+                    _ => panic!("tail not pair"),
+                }
+            }
+            _ => panic!("not a pair"),
+        }
     }
 
     #[test]
